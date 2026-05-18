@@ -10,9 +10,15 @@ a personal research project. Apple Silicon only. Currently validated:
 - `/v1/embeddings` via Qwen3-Embedding-0.6B (MLX 8-bit)
 - `/v1/chat/completions` via Gemma 4 26B-A4B MoE (MLX 3- or 4-bit)
 
-Other model paths exist in the codebase (GGUF Gemma, Candle Qwen, Qwen3.5/3.6
-MoE behind a feature flag) but should be treated as exploratory and may not
-work without local tweaks.
+Other model paths exist in the codebase and should be treated as exploratory
+(may not work without local tweaks):
+
+- **Qwen3.5 30B-A3B / Qwen3.6 27B MoE** — full Candle backend including a
+  256-expert MoE assembly + native MLX runner. Opt-in via
+  `--features qwen3_5_moe` (off by default). Mostly working; see source
+  comments and the `LUMEN_QWEN35_SHARDS` env var.
+- **GGUF Gemma** via candle's gguf loader (CPU/Metal).
+- **Candle Qwen** legacy path.
 
 ---
 
@@ -349,7 +355,7 @@ Two pieces of custom kernel work that the public release covers:
 | `lumen-model` | `turboquant` *(default)* | Candle TurboQuant attention. |
 | `lumen-model` | `turboquant-gpu` *(default)* | GPU dispatch for affine quantization kernels. |
 | `lumen-model` | `paged-kv` *(default)* | PagedAttention KV-cache scaffolding. |
-| `lumen-model` | `qwen3_5_moe` | WIP Qwen3.5/3.6 MoE backend (off by default; source files gitignored). |
+| `lumen-model` | `qwen3_5_moe` | Qwen3.5 30B-A3B / Qwen3.6 27B MoE backend (Candle path). Off by default; opt-in for chat completions on these checkpoints. |
 | `lumen-mlx` | `mlx-native` | Pure-Rust Gemma 4 26B-A4B path via mlx-rs. **Required for `/v1/chat/completions`.** |
 | `lumen-mlx` | `mlx-pyo3` | PyO3 / mlx-lm subprocess fallback (development only). |
 | `lumen-server` | `qwen3_5_moe` | Forwards the lumen-model qwen3_5_moe feature. |
@@ -363,7 +369,7 @@ cargo build --release
 # Embedding + Gemma 4 chat (recommended dev / prod build).
 cargo build --release --features mlx-native
 
-# Add Qwen3.5/3.6 (requires local source files — gitignored).
+# Add the Qwen3.5 / Qwen3.6 MoE backend.
 cargo build --release --features mlx-native --features lumen-server/qwen3_5_moe
 ```
 

@@ -43,7 +43,7 @@ patch lands there.
 
 Several integration tests under `crates/lumen-model/tests/` consume
 `.safetensors` weight dumps that are not committed to git. They are
-tied to the in-progress Qwen3.5/3.6 MoE backend (gated behind
+tied to the Qwen3.5 / Qwen3.6 MoE backend (gated behind
 `--features qwen3_5_moe`); the default-feature build does not need
 them. They will become downloadable from a HuggingFace Hub dataset in
 a future revision of this repo.

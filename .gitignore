@@ -40,45 +40,8 @@ scaffold.mjs
 # ── Workspace symlinks ──
 /lumen-rs
 
-# ── Qwen3.5/3.6 MoE WIP (excluded from the first public release; comes back
-#    once cleaned up. Local dev uses `cargo build --features qwen3_5_moe`)
-#    Note: `crates/lumen-mlx/src/qwen3_5_moe.rs` is kept because the native
-#    MLX runner / Gemma 4 shares infra with it; only the candle-side and
-#    accompanying examples/fixtures/scripts/docs are gitignored. ──
-crates/lumen-model/src/qwen3_5_moe.rs
-crates/lumen-model/src/qwen3_5_moe/
-crates/lumen-model/src/qwen3_5_moe_native.rs
-crates/lumen-model/src/qwen3_5_moe_native/
-crates/lumen-model/examples/bench_cb_qwen35.rs
-crates/lumen-model/examples/dump_qwen35_decode.rs
-crates/lumen-model/examples/dump_qwen35_hidden.rs
-crates/lumen-model/examples/bench_lever_h_ab.rs
-crates/lumen-model/examples/bench_linear_attn.rs
-crates/lumen-model/examples/bench_lookahead_decode_ab.rs
-crates/lumen-model/examples/moe_timing_probe.rs
-crates/lumen-model/examples/preflight_n_step_eq.rs
-crates/lumen-model/tests/affine4_gpu_parity.rs
-crates/lumen-model/tests/bf16_residual_chain.rs
-crates/lumen-model/tests/compute_g_dispatch_microbench.rs
-crates/lumen-model/tests/int8_affine_ref_parity.rs
-crates/lumen-model/tests/linear_attn_bf16_chain.rs
-crates/lumen-model/tests/linear_attn_fixture.rs
-crates/lumen-model/tests/mlp_icb_pipelined_microbench.rs
-crates/lumen-model/tests/mlp_icb_production_microbench.rs
-crates/lumen-model/tests/moe_fixture.rs
-crates/lumen-model/tests/moe_trace.rs
-crates/lumen-model/tests/mxfp4_self_attn_synthetic.rs
-crates/lumen-model/tests/post_attn_bf16_chain.rs
-crates/lumen-model/tests/rope_dispatch_microbench.rs
-crates/lumen-model/tests/self_attn_bf16_chain.rs
-crates/lumen-model/tests/self_attn_fixture.rs
-crates/lumen-model/tests/self_attn_trace.rs
-crates/lumen-model/tests/fixtures/qwen3_5_moe_config.json
-crates/lumen-model/tests/fixtures/qwen3_5_moe_index.json
-crates/paged-attention/tests/kernel_tests.rs
-docs/plans/qwen3_5-moe-mxfp4-adoption.md
-scripts/dump_qwen3_5_moe_layer_weights.py
-scripts/generate_qwen3_5_moe_fixtures.py
+# Qwen3.5 / Qwen3.6 MoE backend is now included as an opt-in feature
+# (`cargo build --features qwen3_5_moe`). All source files are tracked.
 
 # ── Local debug / investigation artifacts ──
 worker-hang-investigation.html
