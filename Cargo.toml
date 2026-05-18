@@ -1,0 +1,65 @@
+[workspace]
+members = [
+    "crates/lumen-core",
+    "crates/turboquant-cache",
+    "crates/lumen-metal",
+    "crates/lumen-mlx",
+    "crates/lumen-model",
+    "crates/lumen-server",
+    "crates/paged-attention",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# TurboQuant workspace crates
+lumen-core = { path = "crates/lumen-core" }
+turboquant-cache = { path = "crates/turboquant-cache" }
+lumen-metal = { path = "crates/lumen-metal" }
+lumen-model = { path = "crates/lumen-model" }
+paged-attention = { path = "crates/paged-attention" }
+
+# Linear algebra & numerics
+faer = "0.24"
+rand = "0.10.1"
+rand_distr = "0.6.0"
+
+# ── ML inference (Candle) ──────────────────────────────────────────────
+# Currently consumed via a local path because the workspace depends on a
+# small patch to `candle-transformers` (`pub fn clear_kv_cache` on the
+# Qwen3 model) plus a Gemma-4-aware loader. See `DEPENDENCIES.md` for
+# setup. Public release follow-up: pin to a public fork commit or land
+# the patches upstream and switch to a published version. For now: clone
+# the candle fork next to this repo (`../candle/`) before `cargo build`.
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-transformers = { path = "../candle/candle-transformers" }
+candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
+
+# Metal GPU (objc2 stack — matches Candle's Metal backend)
+objc2-metal = "0.3.2"
+objc2-metal-performance-shaders = "0.3.2"
+objc2-metal-performance-shaders-graph = "0.3.2"
+
+# Tokenizer & model loading
+tokenizers = "0.23.1"
+hf-hub = "0.5"
+safetensors = "0.7.0"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# HTTP server
+atomic_http = { version = "0.11.1", features = ["arena", "router"] }
+
+# Async runtime
+tokio = { version = "1.52.1", features = ["full"] }
+
+# Error handling
+anyhow = "1.0.102"
+thiserror = "2.0.18"

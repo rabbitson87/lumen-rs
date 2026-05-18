@@ -1,0 +1,152 @@
+[package]
+name = "lumen-model"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Candle-based LLM model with TurboQuant attention"
+
+[dependencies]
+lumen-core = { workspace = true }
+turboquant-cache = { workspace = true }
+lumen-metal = { workspace = true, optional = true }
+paged-attention = { workspace = true, optional = true }
+candle-metal-kernels = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+
+tokenizers = { workspace = true }
+hf-hub = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = "0.9.10"
+half = "2.7.1"
+rayon = "1"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[dev-dependencies]
+half = "2.7.1"
+
+[features]
+default = ["metal", "turboquant", "turboquant-gpu", "paged-kv"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+turboquant = ["candle-transformers/turboquant"]
+turboquant-gpu = ["lumen-metal"]
+paged-kv = ["paged-attention", "dep:candle-metal-kernels", "dep:objc2-metal"]
+mpsgraph = ["lumen-metal/mpsgraph"]
+# WIP: Qwen3.5/3.6 MoE backend. Source files live under
+# `src/qwen3_5_moe*` but are gitignored until the integration is
+# cleaned up. Enable locally with `cargo build --features qwen3_5_moe`.
+# Implies `turboquant-gpu` because the MoE kernels use the 4-bit affine
+# GPU backend from `lumen-metal`.
+qwen3_5_moe = ["turboquant-gpu"]
+
+# ── qwen3.5 / qwen3.6 examples — kept on disk for local dev (gitignored
+# from the public commit). All require the `qwen3_5_moe` feature so the
+# default `cargo build` / `cargo test` matrix stays green even when the
+# source files exist locally. ──
+[[example]]
+name = "bench_lever_h_ab"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "bench_linear_attn"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "bench_lookahead_decode_ab"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "moe_timing_probe"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "preflight_n_step_eq"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "bench_cb_qwen35"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "dump_qwen35_decode"
+required-features = ["qwen3_5_moe"]
+
+[[example]]
+name = "dump_qwen35_hidden"
+required-features = ["qwen3_5_moe"]
+
+# ── qwen3.5 / qwen3.6 integration tests (same gating policy as examples). ──
+[[test]]
+name = "affine4_gpu_parity"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "bf16_residual_chain"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "compute_g_dispatch_microbench"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "int8_affine_ref_parity"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "linear_attn_bf16_chain"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "linear_attn_fixture"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "mlp_icb_pipelined_microbench"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "mlp_icb_production_microbench"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "moe_fixture"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "moe_trace"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "mxfp4_self_attn_synthetic"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "post_attn_bf16_chain"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "rope_dispatch_microbench"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "self_attn_bf16_chain"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "self_attn_fixture"
+required-features = ["qwen3_5_moe"]
+
+[[test]]
+name = "self_attn_trace"
+required-features = ["qwen3_5_moe"]

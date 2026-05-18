@@ -1,0 +1,62 @@
+[package]
+name = "lumen-mlx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokenizers = "0.23.1"
+hf-hub = "0.5.0"
+# TurboQuant primitives — Haar rotation matrix generator for KV pre-quant
+# Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
+# sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).
+lumen-core = { path = "../lumen-core" }
+# Native MLX runner scaffold. This stays opt-in until model parity and perf
+# gates pass; default builds keep using the PyO3 baseline.
+#
+# 2026-04-30: Switched from upstream mlx-rs/mlx-sys to pmetal-maintained forks
+# because upstream 0.25.3 / 0.2.0 lacked the `mode` parameter required for
+# MXFP4 quantization (Qwen3.6-35B-A3B-mxfp4 production weights).
+# 2026-05-01 (Session 32): Switched from crates.io `pmetal-mlx-*` to a local
+# path-based `rabbitson87/mlx-rs` fork at `../../../mlx-rs` whose mlx-c
+# submodule is already MLX v0.30.6 / mlx-c v0.5.0 with `const char* mode`
+# support; bindgen on that header set automatically exposes the same
+# C ABI we previously got from pmetal. See active/mlx-rs-native-port/
+# CONTEXT.md Session 32 for the rationale and parity verification.
+mlx-rs = { path = "../../../mlx-rs/mlx-rs", optional = true, default-features = false, features = [
+    "accelerate",
+] }
+mlx-sys = { path = "../../../mlx-rs/mlx-sys", optional = true }
+
+# Phase 1.8 M1.5 — direct Metal kernel dispatch against mlx-allocated buffers.
+# Uses objc2 + objc2-metal for raw MTLDevice / MTLCommandQueue / pipeline
+# compilation. Lighter than pulling all of lumen-metal (which depends
+# on candle); proves the round-trip Array → MTL::Buffer → kernel → MTL::Buffer
+# → Array works end-to-end before committing to a heavier dep graph for M2+.
+objc2 = { version = "0.6.4", optional = true }
+objc2-metal = { workspace = true, optional = true }
+objc2-foundation = { version = "0.3.2", optional = true }
+# PyO3 — in-process Python interpreter for the mlx-lm Pyo3Runner (Qwen
+# backend only). Gemma 4 native path is pure Rust + mlx-rs. Gate behind
+# the `mlx-pyo3` feature so production builds (Gemma 4) can be PyO3-free
+# and ship a Python.framework-independent binary.
+pyo3 = { version = "0.28.3", features = ["auto-initialize"], optional = true }
+
+[features]
+default = []
+mlx-pyo3 = ["dep:pyo3"]
+mlx-native = [
+    "dep:mlx-rs",
+    "dep:mlx-sys",
+    "mlx-rs/safetensors",
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+]
+mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros"] }

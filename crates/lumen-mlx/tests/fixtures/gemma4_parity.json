@@ -1,0 +1,315 @@
+{
+  "model_dir": "/path/to/models/gemma-4-26b-a4b-mlx-4bit",
+  "max_new_tokens": 32,
+  "thinking": false,
+  "eos_ids": [
+    1,
+    50,
+    106
+  ],
+  "fixtures": [
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        10979,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        9259,
+        236888,
+        2088,
+        740,
+        564,
+        1601,
+        611,
+        3124,
+        236881,
+        106
+      ],
+      "generated_text": "Hello! How can I help you today?",
+      "stopped_on_eos": true
+    },
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "Say hi in one word."
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        37889,
+        5631,
+        528,
+        886,
+        3658,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        10979,
+        236761,
+        106
+      ],
+      "generated_text": "Hi.",
+      "stopped_on_eos": true
+    },
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        3689,
+        563,
+        236743,
+        236778,
+        236862,
+        236778,
+        236881,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        236778,
+        900,
+        236743,
+        236778,
+        578,
+        236743,
+        236812,
+        106
+      ],
+      "generated_text": "2 + 2 = 4",
+      "stopped_on_eos": true
+    },
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "List three primary colors."
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        1613,
+        1806,
+        5905,
+        7913,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        818,
+        1806,
+        5905,
+        7913,
+        659,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        9264,
+        1018,
+        107,
+        236778,
+        236761,
+        5213,
+        16520,
+        1018,
+        107,
+        236800,
+        236761,
+        5213,
+        37154,
+        1018,
+        106
+      ],
+      "generated_text": "The three primary colors are:\n\n1. **Red**\n2. **Blue**\n3. **Yellow**",
+      "stopped_on_eos": true
+    },
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "Define recursion in one short sentence."
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        43234,
+        74175,
+        528,
+        886,
+        2822,
+        13315,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        195893,
+        526,
+        563,
+        496,
+        1657,
+        528,
+        837,
+        496,
+        1292,
+        9139,
+        4850,
+        618,
+        496,
+        199472,
+        531,
+        8974,
+        496,
+        2608,
+        684,
+        15512,
+        625,
+        1679,
+        1131,
+        7100,
+        236764,
+        15779,
+        1159,
+        105275,
+        236761,
+        106
+      ],
+      "generated_text": "Recursion is a process in which a function calls itself as a subroutine to solve a problem by breaking it down into smaller, identical subproblems.",
+      "stopped_on_eos": true
+    },
+    {
+      "prompt_messages": [
+        {
+          "role": "user",
+          "content": "Translate 'hello' to Korean."
+        }
+      ],
+      "prompt_token_ids": [
+        2,
+        105,
+        2364,
+        107,
+        40414,
+        756,
+        23391,
+        236789,
+        531,
+        21568,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107,
+        100,
+        45518,
+        107,
+        101
+      ],
+      "generated_token_ids": [
+        3810,
+        659,
+        496,
+        2321,
+        4861,
+        531,
+        1879,
+        623,
+        23391,
+        236775,
+        528,
+        21568,
+        236764,
+        10167,
+        580,
+        506,
+        1984,
+        529,
+        3475,
+        17412,
+        532,
+        506,
+        5371,
+        236787,
+        108,
+        236770,
+        236761,
+        5213,
+        61659,
+        568,
+        2267,
+        236772
+      ],
+      "generated_text": "There are a few ways to say \"hello\" in Korean, depending on the level of politeness and the situation:\n\n1. **안녕하세요 (An-",
+      "stopped_on_eos": false
+    }
+  ]
+}

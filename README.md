@@ -1,0 +1,458 @@
+# lumen-rs
+
+> Experimental in-process LLM inference server in Rust for Apple Silicon.
+> OpenAI-compatible HTTP endpoints, custom Metal kernels, MLX-quantized
+> weights, single binary. No Python subprocess, no PyO3 hops.
+
+**Status: alpha / experimental.** This is a working-in-progress snapshot of
+a personal research project. Apple Silicon only. Currently validated:
+
+- `/v1/embeddings` via Qwen3-Embedding-0.6B (MLX 8-bit)
+- `/v1/chat/completions` via Gemma 4 26B-A4B MoE (MLX 3- or 4-bit)
+
+Other model paths exist in the codebase (GGUF Gemma, Candle Qwen, Qwen3.5/3.6
+MoE behind a feature flag) but should be treated as exploratory and may not
+work without local tweaks.
+
+---
+
+## Table of contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [Configure models](#configure-models)
+- [Run the server](#run-the-server)
+- [API reference](#api-reference)
+- [Run the bundled examples](#run-the-bundled-examples)
+- [Environment variables](#environment-variables)
+- [Architecture](#architecture)
+- [Build flags / Cargo features](#build-flags--cargo-features)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Repo layout](#repo-layout)
+- [License](#license)
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| Hardware | Apple Silicon (M1 / M2 / M3 / M4) |
+| OS | macOS 14+ |
+| Toolchain | Rust 1.85+ (edition 2024). Install via `rustup`. |
+| Disk | ~50 GB free for a full Gemma 4 26B MoE checkpoint + workspace target/ |
+| Memory | Embedding alone: ~1 GB. Gemma 4 26B-A4B MLX 4-bit: ~22 GB unified memory at steady state. |
+
+Optional (only if running mlx-lm parity benches or regenerating fixtures):
+
+- Python 3.10+ with `mlx-lm`
+- A separate clone of the [mlx](https://github.com/ml-explore/mlx) source
+  pointed to by `MLX_LOCAL_SOURCE_DIR` (used by some benchmark scripts)
+
+---
+
+## Install
+
+### 1. Clone the repo plus the patched candle fork
+
+The workspace currently depends on a sibling `candle/` directory with a
+one-line patch on `candle-transformers` (see [DEPENDENCIES.md](DEPENDENCIES.md)
+for the exact change).
+
+```bash
+cd ~/your-projects/
+git clone <THIS_REPO_URL> lumen-rs
+
+# Sibling candle checkout — required because Cargo.toml uses path = "../candle".
+git clone https://github.com/huggingface/candle.git
+# Apply the clear_kv_cache patch — see DEPENDENCIES.md for the diff.
+```
+
+Your tree should look like:
+
+```
+your-projects/
+  ├── candle/         (the patched fork)
+  └── lumen-rs/       (this repo)
+```
+
+### 2. Build
+
+```bash
+cd lumen-rs
+cargo build --release                          # default features: Metal + TurboQuant GPU
+cargo build --release --features mlx-native    # add the native Gemma 4 MLX backend
+```
+
+The first build downloads dependencies and compiles ~250 crates. Allow
+~5–10 minutes on a clean M-series machine.
+
+### 3. Smoke test the embedding stack (no checkpoint setup required)
+
+```bash
+cargo test -p lumen-metal --release --test affine8_parity
+# expected: 7 passed; 0 failed
+```
+
+---
+
+## Configure models
+
+`lumen-rs` does not bundle any model weights. You point env vars at local
+directories holding MLX checkpoints (`config.json` + `tokenizer.json` +
+`model*.safetensors`).
+
+### Embedding model
+
+Download a Qwen3-Embedding MLX 8-bit checkpoint. For example:
+
+```bash
+huggingface-cli download \
+  mlx-community/Qwen3-Embedding-0.6B-8bit-mlx \
+  --local-dir ~/models/qwen3-embedding-0.6b-8bit
+```
+
+(Substitute any MLX 8-bit Qwen3-Embedding fork that suits you.)
+
+Then:
+
+```bash
+export EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit
+```
+
+### Chat model (Gemma 4 26B-A4B MoE)
+
+Download an MLX 4-bit or 3-bit Gemma 4 26B-A4B checkpoint:
+
+```bash
+huggingface-cli download \
+  mlx-community/gemma-4-26b-a4b-mlx-4bit \
+  --local-dir ~/models/gemma-4-26b-a4b-mlx-4bit
+```
+
+Then point either of:
+
+```bash
+export MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit
+# or
+export LUMEN_GEMMA4_DIR=~/models/gemma-4-26b-a4b-mlx-4bit
+```
+
+---
+
+## Run the server
+
+```bash
+# Both endpoints enabled:
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
+  cargo run --release --features mlx-native --bin lumen-server
+```
+
+The server listens on `127.0.0.1:8080` by default. Override with `PORT` /
+`HOST` env vars if needed.
+
+### Embedding-only mode
+
+If you only want the embedding endpoint (no Gemma 4 checkpoint required):
+
+```bash
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release --bin lumen-server
+```
+
+The `/v1/chat/completions` route will return 503 when no chat model is
+configured; `/v1/embeddings` will work.
+
+---
+
+## API reference
+
+### `POST /v1/embeddings`
+
+OpenAI-compatible. Single string or array of strings.
+
+```bash
+curl -s localhost:8080/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "qwen3-embedding-0.6b",
+    "input": ["hello world", "안녕 세계"]
+  }' | jq '.data[0].embedding | length'
+# 1024
+```
+
+Response:
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.012, -0.034, ...] },
+    { "object": "embedding", "index": 1, "embedding": [-0.001,  0.027, ...] }
+  ],
+  "model": "qwen3-embedding-0.6b",
+  "usage": { "prompt_tokens": 6, "total_tokens": 6 }
+}
+```
+
+All vectors are L2-normalized and 1024-dimensional.
+
+### `POST /v1/chat/completions`
+
+OpenAI-compatible. Non-streaming greedy decode (sampling lands in a
+follow-up).
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "gemma-4-26b-a4b",
+    "messages": [
+      {"role": "user", "content": "What is the capital of South Korea?"}
+    ],
+    "max_tokens": 64
+  }' | jq .
+```
+
+### `POST /v1/completions`
+
+OpenAI-compatible legacy completions endpoint. Same backend as
+`/v1/chat/completions` but with a plain `prompt` field.
+
+### `GET /v1/models`
+
+Returns the loaded model identifiers.
+
+---
+
+## Run the bundled examples
+
+### Embedding smoke test
+
+```bash
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release -p lumen-model --example embedding_smoke
+```
+
+Loads the model, embeds three Korean+English phrases, prints timings, RSS,
+norm validation, and cosine similarities.
+
+```
+[smoke] model loaded — dim=1024 max_seq_len=32768
+[smoke] RSS: 6 MB → 890 MB (+884 MB at load)
+[smoke] embed b=3 over 5 iters: median=19.35ms min=18.72ms max=22.35ms
+[smoke] OK: semantic ordering preserved
+```
+
+### Embedding quality eval
+
+```bash
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release -p lumen-model --example embedding_quality
+```
+
+Embeds a 25-item KR/EN multi-domain corpus (KBO baseball, NBA basketball,
+programming languages, Korean cities, Korean food). Reports retrieval
+metrics:
+
+```
+[quality] embed b=25 in 251ms (10.05ms/item)
+[quality] P@1 = 0.960   P@3 = 0.880   MRR = 0.980
+[quality] per-category MRR:
+  baseball_kbo       (5 items)  MRR = 0.900
+  basketball_nba     (5 items)  MRR = 1.000
+  city_korea         (5 items)  MRR = 1.000
+  food_korean        (5 items)  MRR = 1.000
+  programming        (5 items)  MRR = 1.000
+```
+
+### Compare the qmv_fast vs naive 8-bit kernel
+
+```bash
+# qmv_fast (default — cooperative simdgroup):
+cargo run --release -p lumen-model --example embedding_smoke
+
+# Naive 1-thread/output (slow path; useful for A/B testing):
+LUMEN_AFFINE8_NAIVE=1 \
+  cargo run --release -p lumen-model --example embedding_smoke
+```
+
+On an M3 Max you should see ~19 ms/batch with qmv_fast vs ~35 ms with
+naive, with identical cosine ordering — proof that the kernel-level
+optimization preserves model quality.
+
+---
+
+## Environment variables
+
+### Required (for the relevant endpoint)
+
+| Var | Purpose |
+|---|---|
+| `EMBEDDING_MODEL_ID` | Local path or HF Hub repo id to a MLX 8-bit Qwen3-Embedding checkpoint. |
+| `MODEL_ID` / `LUMEN_GEMMA4_DIR` | Local path to a MLX Gemma 4 26B-A4B checkpoint (either env works). |
+
+### Optional knobs
+
+| Var | Purpose |
+|---|---|
+| `PORT`, `HOST` | HTTP listen address (defaults `127.0.0.1:8080`). |
+| `LUMEN_MODE` | `mlx` \| `candle` \| `auto`. Selects the backend mode for batching. Defaults to `candle`. |
+| `LUMEN_AFFINE8_NAIVE=1` | Force the naive 8-bit GEMM kernel path (A/B testing). |
+| `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |
+| `BATCHED_ENGINE=1` | Continuous-batching scheduler for the GGUF and Qwen3.6 backends. |
+| `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
+| `KESTREL_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
+
+A full list of advanced flags lives in source-level docstrings under
+[crates/lumen-mlx/src/env_state.rs](crates/lumen-mlx/src/env_state.rs).
+
+---
+
+## Architecture
+
+Three layered components separated by traits so the codec stays portable:
+
+1. **TurboQuant codec** (`lumen-core`) — pure Rust, hardware-agnostic.
+   Lloyd-Max scalar quantization + random orthogonal rotation + 1-bit
+   QJL residual. Implements the [TurboQuant ICLR'26
+   paper](https://arxiv.org/abs/2504.19874).
+2. **KV-cache strategies + model code** (`turboquant-cache`,
+   `lumen-model`, `lumen-mlx`). Candle-based models for embedding and
+   GGUF/Gemma paths; native MLX-rs assembly for Gemma 4 26B-A4B and the
+   shared Qwen3 native runner.
+3. **Serving** (`lumen-server`). atomic_http-based OpenAI-compatible
+   HTTP server. Optional continuous-batching scheduler.
+
+Two pieces of custom kernel work that the public release covers:
+
+- **`affine8_qmv_fast_bf16`** in `crates/lumen-metal/src/shaders/affine8.metal`
+  — cooperative simdgroup 8-bit MLX-format GEMM. NSG=2 × RPS=4
+  (8 outputs per threadgroup, 32-lane K-dimension split). Bit-parity
+  with a CPU reference; ~45 % latency reduction over the naive
+  1-thread/output kernel at Qwen3-Embedding shapes.
+- **`kestrel_flash_attn_bf16`** mlx Primitive. Bit-near-identical
+  (max|Δ|=1.95e-3) to `mlx::fast::sdpa`. Registered as a first-class
+  mlx Primitive — keeps the kernel in mlx's own command-buffer
+  batching, avoiding the bridge-dispatch cost (~30 ms/step when the
+  pattern is violated).
+
+---
+
+## Build flags / Cargo features
+
+| Crate | Feature | Effect |
+|---|---|---|
+| `lumen-model` | `metal` *(default)* | Metal backend on `candle-*`. |
+| `lumen-model` | `turboquant` *(default)* | Candle TurboQuant attention. |
+| `lumen-model` | `turboquant-gpu` *(default)* | GPU dispatch for affine quantization kernels. |
+| `lumen-model` | `paged-kv` *(default)* | PagedAttention KV-cache scaffolding. |
+| `lumen-model` | `qwen3_5_moe` | WIP Qwen3.5/3.6 MoE backend (off by default; source files gitignored). |
+| `lumen-mlx` | `mlx-native` | Pure-Rust Gemma 4 26B-A4B path via mlx-rs. **Required for `/v1/chat/completions`.** |
+| `lumen-mlx` | `mlx-pyo3` | PyO3 / mlx-lm subprocess fallback (development only). |
+| `lumen-server` | `qwen3_5_moe` | Forwards the lumen-model qwen3_5_moe feature. |
+
+Typical command lines:
+
+```bash
+# Minimum: embedding-only server.
+cargo build --release
+
+# Embedding + Gemma 4 chat (recommended dev / prod build).
+cargo build --release --features mlx-native
+
+# Add Qwen3.5/3.6 (requires local source files — gitignored).
+cargo build --release --features mlx-native --features lumen-server/qwen3_5_moe
+```
+
+---
+
+## Performance
+
+Indicative numbers on an Apple M3 Max:
+
+| Workload | Latency | Notes |
+|---|---|---|
+| Embedding b=3, len≈18 tokens | 19.4 ms/batch | naive 8-bit kernel: 35.5 ms (−45 %) |
+| Embedding b=25 quality eval | 251 ms (≈10 ms/item) | P@1 = 0.960 on the labelled corpus |
+| Gemma 4 26B-A4B decode | 17.4 ms/step | mlx-lm: 17.0 ms (within ~0.4 ms parity) |
+| Gemma 4 26B-A4B prefill 4 k tokens | ~1.1 s | Full path including JIT-compile warmup |
+
+Resident memory:
+
+- Qwen3-Embedding 8-bit: ~900 MB GPU footprint (vs ~1.4 GB for plain bf16,
+  −37 %).
+- Gemma 4 26B-A4B MLX 4-bit: ~22 GB unified memory at steady state.
+
+---
+
+## Troubleshooting
+
+**`error: failed to load source for dependency`candle-core`** — you don't
+have the candle fork at `../candle/`. See [DEPENDENCIES.md](DEPENDENCIES.md).
+
+**Server starts but `/v1/embeddings` returns 503** — `EMBEDDING_MODEL_ID`
+is not set or the path doesn't exist. Confirm `ls $EMBEDDING_MODEL_ID`
+shows `config.json` + `tokenizer.json` + safetensors shards.
+
+**`/v1/chat/completions` returns 503** — `MODEL_ID` / `LUMEN_GEMMA4_DIR`
+is unset, or you built without `--features mlx-native`.
+
+**Slow embedding latency (~35 ms instead of ~19 ms)** — the `qmv_fast`
+kernel needs `in_features % 512 == 0 AND out_features % 8 == 0`. The
+Qwen3-Embedding-0.6B shapes (1024 / 3072 in; 512 / 1024 / 3072 / vocab out)
+satisfy both, so this should not trigger. If you see naive-kernel speed,
+unset `LUMEN_AFFINE8_NAIVE`.
+
+**`thread panicked at 'metal command buffer not enqueued'`** — known
+intermittent issue when interleaving Candle and mlx kernels on the same
+queue. Restart the server; this happens during shutdown for the most
+part.
+
+**Out-of-memory on Gemma 4** — the 26B-A4B model needs ~22 GB unified
+memory. On 24 GB machines, switch to the 3-bit MLX variant
+(`mlx-community/gemma-4-26b-a4b-mlx-3bit`) which fits in ~16 GB.
+
+---
+
+## Repo layout
+
+```
+crates/
+  lumen-core/         pure-Rust TurboQuant codec (Lloyd-Max + QJL, hardware-agnostic)
+  lumen-metal/        Metal compute kernels: affine 3/4/8-bit quant GEMM,
+                      MXFP4, flash-attn, rms_norm, silu_mul, sampling
+  lumen-mlx/          MLX-native Gemma 4 26B-A4B MoE backend + custom mlx
+                      primitives (kestrel_flash_attn_bf16) + bridge crates
+  lumen-model/        candle-based model assemblies (Gemma, Gemma-GGUF,
+                      Qwen, Qwen3-Embedding) + KV-cache strategies
+  lumen-server/       atomic_http-based OpenAI-compatible HTTP server
+                      (/v1/embeddings, /v1/chat/completions, /v1/completions)
+  turboquant-cache/   KVCache trait + SimpleCache / PagedCache scaffolding
+  paged-attention/    PagedAttention scaffolding (WIP)
+
+deploy/               example .env + launchd plist for macOS service install
+examples/             end-to-end demo binaries
+docs/                 design notes
+```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## Acknowledgements
+
+- The [candle](https://github.com/huggingface/candle) project — the Rust
+  ML stack this builds on.
+- [mlx](https://github.com/ml-explore/mlx) and `mlx-lm` — the reference
+  point for parity comparisons and the kernel-layout patterns that the
+  cooperative 8-bit kernel mirrors.
+- Google ICLR 2026 [**TurboQuant**](https://arxiv.org/abs/2504.19874)
+  paper — the KV-cache compression algorithm at the heart of the codec
+  module.

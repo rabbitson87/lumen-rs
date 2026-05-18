@@ -1,0 +1,17 @@
+[package]
+name = "lumen-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TurboQuant KV cache vector quantization — pure Rust core"
+
+[dependencies]
+faer = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

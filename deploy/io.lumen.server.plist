@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plist for lumen-server (Mac Mini production).
+
+  Install:
+    1. Copy this file to ~/Library/LaunchAgents/io.lumen.server.plist
+    2. Replace `__HOME__` with your absolute home path (e.g. /Users/dev)
+    3. Ensure ~/.env exists next to the binary (see deploy/example.env)
+    4. launchctl load ~/Library/LaunchAgents/io.lumen.server.plist
+    5. launchctl start io.lumen.server
+
+  Stop:        launchctl stop io.lumen.server
+  Unregister:  launchctl unload ~/Library/LaunchAgents/io.lumen.server.plist
+  Logs:        ~/logs/lumen-server.log (stdout) + .err (stderr)
+
+  Environment: the binary auto-loads `.env` from the binary's directory
+  (dotenvy), so env vars don't need to be duplicated here. Setting
+  WorkingDirectory ensures relative .env lookup is consistent.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.lumen.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/lumen-server</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+        <key>Crashed</key><true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/logs/lumen-server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/logs/lumen-server.err</string>
+
+    <!-- Optional: pin to performance cores on Apple Silicon. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
