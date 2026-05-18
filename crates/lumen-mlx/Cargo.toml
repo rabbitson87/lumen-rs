@@ -14,22 +14,20 @@ hf-hub = "0.5.0"
 # Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
 # sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).
 lumen-core = { path = "../lumen-core" }
-# Native MLX runner scaffold. This stays opt-in until model parity and perf
-# gates pass; default builds keep using the PyO3 baseline.
+# Native MLX runner scaffold. This stays opt-in (off by default; gate
+# via `--features mlx-native`) because the dependency tree includes a
+# patched mlx-rs / mlx-sys fork with our Kestrel custom primitives
+# (`kestrel_flash_attn_bf16`), MXFP4 `mode` parameter, and the
+# `memory` / `metal` modules used by direct kernel dispatch.
 #
-# 2026-04-30: Switched from upstream mlx-rs/mlx-sys to pmetal-maintained forks
-# because upstream 0.25.3 / 0.2.0 lacked the `mode` parameter required for
-# MXFP4 quantization (Qwen3.6-35B-A3B-mxfp4 production weights).
-# 2026-05-01 (Session 32): Switched from crates.io `pmetal-mlx-*` to a local
-# path-based `rabbitson87/mlx-rs` fork at `../../../mlx-rs` whose mlx-c
-# submodule is already MLX v0.30.6 / mlx-c v0.5.0 with `const char* mode`
-# support; bindgen on that header set automatically exposes the same
-# C ABI we previously got from pmetal. See active/mlx-rs-native-port/
-# CONTEXT.md Session 32 for the rationale and parity verification.
-mlx-rs = { path = "../../../mlx-rs/mlx-rs", optional = true, default-features = false, features = [
+# Pinned to the `lumen-rs-patches` branch of rabbitson87/mlx-rs (single
+# squashed commit on top of upstream's mlx-rs main). Local devs can
+# override to a sibling `../../../mlx-rs` checkout via the workspace
+# `[patch]` section in the top-level Cargo.toml.
+mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "4db2402d105ac25f0379134aa2dd8fa9ad52671d", optional = true, default-features = false, features = [
     "accelerate",
 ] }
-mlx-sys = { path = "../../../mlx-rs/mlx-sys", optional = true }
+mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "4db2402d105ac25f0379134aa2dd8fa9ad52671d", optional = true }
 
 # Phase 1.8 M1.5 — direct Metal kernel dispatch against mlx-allocated buffers.
 # Uses objc2 + objc2-metal for raw MTLDevice / MTLCommandQueue / pipeline

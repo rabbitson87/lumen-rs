@@ -32,3 +32,8 @@ mlx-native = ["lumen-mlx/mlx-native"]
 # backend code is excluded from the first public release. Implies
 # `turboquant-gpu` (the qwen3.6 MoE path depends on the 4-bit affine GPU kernel).
 qwen3_5_moe = ["turboquant-gpu", "lumen-model/qwen3_5_moe"]
+# Forwards lumen-model's turboquant feature (candle-side Gemma 4 E4B
+# path). Off by default — needs a sibling lumen-rs / candle checkout
+# active via the workspace `[patch]` override because the candle fork's
+# turboquant cfg blocks depend on local paths into this workspace.
+turboquant = ["lumen-model/turboquant"]

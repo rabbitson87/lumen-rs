@@ -29,16 +29,18 @@ rand = "0.10.1"
 rand_distr = "0.6.0"
 
 # ── ML inference (Candle) ──────────────────────────────────────────────
-# Currently consumed via a local path because the workspace depends on a
-# small patch to `candle-transformers` (`pub fn clear_kv_cache` on the
-# Qwen3 model) plus a Gemma-4-aware loader. See `DEPENDENCIES.md` for
-# setup. Public release follow-up: pin to a public fork commit or land
-# the patches upstream and switch to a published version. For now: clone
-# the candle fork next to this repo (`../candle/`) before `cargo build`.
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
-candle-transformers = { path = "../candle/candle-transformers" }
-candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
+# Pinned to the `lumen-rs-patches` branch of rabbitson87/candle, a fork
+# of huggingface/candle carrying the small set of patches required by
+# lumen-rs (notably `pub fn clear_kv_cache` on the Qwen3 transformer
+# model + supporting Metal / quantized helpers). The branch is a single
+# squashed commit on top of `huggingface/candle` main so future rebases
+# are atomic. Local devs can override these git deps with a sibling
+# `../candle/` checkout via the workspace `[patch]` section at the
+# bottom of this file.
+candle-core          = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
+candle-nn            = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
+candle-transformers  = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
+candle-metal-kernels = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
 
 # Metal GPU (objc2 stack — matches Candle's Metal backend)
 objc2-metal = "0.3.2"
@@ -63,3 +65,17 @@ tokio = { version = "1.52.1", features = ["full"] }
 # Error handling
 anyhow = "1.0.102"
 thiserror = "2.0.18"
+
+# ── Local-dev override (uncomment when you want to edit the candle /
+#    mlx-rs forks in place instead of going through the git URL pin).
+#    A clean clone of lumen-rs uses the git refs above; only enable
+#    these path overrides if you have the sibling checkouts.
+# [patch."https://github.com/rabbitson87/candle"]
+# candle-core          = { path = "../candle/candle-core" }
+# candle-nn            = { path = "../candle/candle-nn" }
+# candle-transformers  = { path = "../candle/candle-transformers" }
+# candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
+#
+# [patch."https://github.com/rabbitson87/mlx-rs"]
+# mlx-rs  = { path = "../../../mlx-rs/mlx-rs" }
+# mlx-sys = { path = "../../../mlx-rs/mlx-sys" }

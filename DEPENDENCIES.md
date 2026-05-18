@@ -4,40 +4,49 @@ This is an experimental Phase-1 release. A few dependencies need explicit setup
 beyond `cargo build` because the workspace currently depends on local-path
 versions of some libraries.
 
-## Candle (required)
+## Fork dependencies (auto-fetched)
 
-`Cargo.toml` points the four `candle-*` crates at a sibling directory:
+`lumen-rs` consumes four upstream-fork dependencies pinned to specific
+commit SHAs on `github.com/rabbitson87/<fork>` branches named
+`lumen-rs-patches`. A clean `cargo build` fetches them automatically —
+**no sibling clones required for the default + qwen3_5_moe paths**.
+The `mlx-native` feature triggers a longer first build (cmake +
+fetched mlx C++ source) but works end-to-end without manual setup.
+
+| Fork | Source | Why we fork |
+|---|---|---|
+| `rabbitson87/candle` | `huggingface/candle` | `pub fn clear_kv_cache` on Qwen3 + Metal / quantized helpers used by the lumen-rs Metal kernel integration. |
+| `rabbitson87/mlx-rs` | `oxiglade/mlx-rs` | `kestrel_flash_attn_bf16` primitive bindings + `memory` / `metal` modules for direct kernel dispatch. |
+| `rabbitson87/mlx-c` | `ml-explore/mlx-c` | Kestrel C ABI (`lumen.h` / `lumen.cpp`) + array byte_offset / metal_buffer accessors. |
+| `rabbitson87/mlx` | `ml-explore/mlx` | Kestrel custom primitive declarations + Metal-backend telemetry counters consumed by the perf-gate infrastructure. |
+
+Each fork carries a single squashed `lumen-rs-patches` commit on top
+of a known upstream baseline so future rebases are atomic. The
+Cargo.toml pins to specific commit SHAs — upstream churn does not
+affect lumen-rs until the SHA is explicitly bumped.
+
+### Local override for fork development
+
+The top-level `Cargo.toml` has a commented `[patch]` section that
+redirects the git deps back to sibling local clones (`../candle/`,
+`../../../mlx-rs/`). Uncomment it when iterating on a fork's
+`lumen-rs-patches` branch:
 
 ```toml
-candle-core           = { path = "../candle/candle-core" }
-candle-nn             = { path = "../candle/candle-nn" }
-candle-transformers   = { path = "../candle/candle-transformers" }
-candle-metal-kernels  = { path = "../candle/candle-metal-kernels" }
+[patch."https://github.com/rabbitson87/candle"]
+candle-core          = { path = "../candle/candle-core" }
+candle-nn            = { path = "../candle/candle-nn" }
+candle-transformers  = { path = "../candle/candle-transformers" }
+candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
+
+[patch."https://github.com/rabbitson87/mlx-rs"]
+mlx-rs  = { path = "../../../mlx-rs/mlx-rs" }
+mlx-sys = { path = "../../../mlx-rs/mlx-sys" }
 ```
 
-We carry a small patch on `candle-transformers`:
-
-- `candle-transformers/src/models/qwen3.rs` — make `Model::clear_kv_cache`
-  `pub` so the stateless embedding loader (`lumen_model::qwen3_stateless`)
-  can drop the KV cache between forward passes.
-
-### Setup
-
-Clone the candle fork next to this repo:
-
-```bash
-cd ..
-git clone https://github.com/huggingface/candle.git
-cd candle
-# Apply the clear_kv_cache patch — see the diff in this repo's
-# `docs/candle-patches/qwen3-clear-kv-cache.patch` (if not present,
-# the one-line change is: drop the `fn` visibility on the existing
-# `Model::clear_kv_cache` so it becomes `pub fn`).
-```
-
-A future revision of this repo will replace the path dependencies with
-a pinned commit on a public fork, or with the upstream `candle` once the
-patch lands there.
+A `[patch]` for mlx-c / mlx is handled by mlx-c's CMakeLists.txt env
+override: set `MLX_LOCAL_SOURCE_DIR=<your-mlx-checkout>` to redirect
+the FetchContent call to a local mlx source tree.
 
 ## Test fixtures (3.4 GB, optional)
 

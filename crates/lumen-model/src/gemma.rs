@@ -93,6 +93,9 @@ impl GemmaModel {
     }
 
     /// Enable GPU TurboQuant compressed KV cache for all attention layers.
+    /// Only compiled when the `turboquant` feature is on (forwards to the
+    /// matching `candle-transformers/turboquant` cfg block).
+    #[cfg(feature = "turboquant")]
     pub fn enable_turboquant(
         &mut self,
         bits: u32,

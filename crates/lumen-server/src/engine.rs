@@ -648,7 +648,13 @@ impl InferenceEngine {
             "gemma4" => {
                 let mut model = GemmaModel::load(model_id)?;
 
-                // Enable TurboQuant if TQ_BITS is set
+                // Enable TurboQuant if TQ_BITS is set. The hook lives on the
+                // candle-side Gemma 4 E4B path and only compiles when the
+                // optional `turboquant` feature on `lumen-model` is enabled
+                // (it pulls in the candle-transformers turboquant cfg
+                // block and reactivates the circular workspace deps via
+                // the workspace `[patch]` override).
+                #[cfg(feature = "turboquant")]
                 if let Ok(bits_str) = std::env::var("TQ_BITS") {
                     let bits: u32 = bits_str.parse().unwrap_or(4);
                     let text_cfg = model.text_config();

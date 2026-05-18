@@ -36,9 +36,15 @@ rand_distr = { workspace = true }
 half = "2.7.1"
 
 [features]
-default = ["metal", "turboquant", "turboquant-gpu", "paged-kv"]
+default = ["metal", "turboquant-gpu", "paged-kv"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# The `turboquant` feature in our candle fork would re-import lumen-core
+# / turboquant-cache by relative path (circular workspace dep). It only
+# wires the candle-side Gemma 4 E4B path and is off-path for the
+# validated embedding + mlx-native chat completion targets. Disabled
+# here so a clean clone builds without a sibling lumen-rs checkout
+# inside the candle git fetch.
 turboquant = ["candle-transformers/turboquant"]
 turboquant-gpu = ["lumen-metal"]
 paged-kv = ["paged-attention", "dep:candle-metal-kernels", "dep:objc2-metal"]
