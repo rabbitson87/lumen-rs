@@ -43,6 +43,13 @@ server → benches → fixture download → A/B switches), see
 [**docs/getting-started.md**](docs/getting-started.md). The rest of
 this README is reference material.
 
+For maintainers (and AI agents operating on this repo): see
+[**docs/maintainer-workflow.md**](docs/maintainer-workflow.md) for the
+commit-message conventions, fork-SHA bump procedure, validated-path
+table, perf-regression gates, and feature-flag policy that the `main`
+branch is currently maintained against. Read it before authoring a
+commit on this repo.
+
 ---
 
 ## Requirements
