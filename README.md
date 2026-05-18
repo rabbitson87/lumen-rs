@@ -38,6 +38,11 @@ Other model paths exist in the codebase and should be treated as exploratory
 - [Repo layout](#repo-layout)
 - [License](#license)
 
+For a step-by-step walkthrough from a clean clone (build → models →
+server → benches → fixture download → A/B switches), see
+[**docs/getting-started.md**](docs/getting-started.md). The rest of
+this README is reference material.
+
 ---
 
 ## Requirements
