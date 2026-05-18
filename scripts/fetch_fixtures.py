@@ -26,7 +26,7 @@ from pathlib import Path
 
 # Default HF Hub dataset for the lumen-rs integration-test fixtures.
 # Override with `LUMEN_FIXTURES_REPO=<USER>/<dataset>` at runtime.
-DEFAULT_REPO: str | None = "rabbitson87/lumen-rs-fixtures"
+DEFAULT_REPO: str | None = "hsng95/lumen-rs-fixtures"
 
 # (file in the HF Hub dataset, destination path relative to repo root).
 FIXTURES: list[tuple[str, str]] = [

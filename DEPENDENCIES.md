@@ -55,7 +55,7 @@ python scripts/fetch_fixtures.py
 ```
 
 This pulls the safetensors files from
-[rabbitson87/lumen-rs-fixtures](https://huggingface.co/datasets/rabbitson87/lumen-rs-fixtures)
+[hsng95/lumen-rs-fixtures](https://huggingface.co/datasets/hsng95/lumen-rs-fixtures)
 into `crates/lumen-model/tests/fixtures/` so the `--features qwen3_5_moe`
 integration tests can run. Override with `LUMEN_FIXTURES_REPO=<USER>/<repo>`
 if you maintain a private fork.
@@ -64,18 +64,18 @@ if you maintain a private fork.
 
 ```bash
 hf auth login                       # one-time
-hf upload rabbitson87/lumen-rs-fixtures \
+hf upload hsng95/lumen-rs-fixtures \
   crates/lumen-model/tests/fixtures/layer0_moe_weights.safetensors \
   --repo-type dataset
-hf upload rabbitson87/lumen-rs-fixtures \
+hf upload hsng95/lumen-rs-fixtures \
   crates/lumen-model/tests/fixtures/layer0_linear_attn_weights.safetensors \
   --repo-type dataset
-hf upload rabbitson87/lumen-rs-fixtures \
+hf upload hsng95/lumen-rs-fixtures \
   crates/lumen-model/tests/fixtures/layer3_self_attn_weights.safetensors \
   --repo-type dataset
 ```
 
-(Create the dataset repo first with `hf repo create rabbitson87/lumen-rs-fixtures --type dataset`
+(Create the dataset repo first with `hf repos create hsng95/lumen-rs-fixtures --type dataset`
 if it doesn't exist yet.)
 
 ## Model checkpoints (required at runtime)
