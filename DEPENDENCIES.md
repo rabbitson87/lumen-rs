@@ -42,11 +42,41 @@ patch lands there.
 ## Test fixtures (3.4 GB, optional)
 
 Several integration tests under `crates/lumen-model/tests/` consume
-`.safetensors` weight dumps that are not committed to git. They are
-tied to the Qwen3.5 / Qwen3.6 MoE backend (gated behind
-`--features qwen3_5_moe`); the default-feature build does not need
-them. They will become downloadable from a HuggingFace Hub dataset in
-a future revision of this repo.
+`.safetensors` weight dumps that are not committed to git (GitHub's
+100 MB per-file limit). They are tied to the Qwen3.5 / Qwen3.6 MoE
+backend (gated behind `--features qwen3_5_moe`); the default-feature
+build does not need them.
+
+### Download (clone-ers)
+
+```bash
+pip install huggingface_hub
+python scripts/fetch_fixtures.py
+```
+
+This pulls the safetensors files from
+[rabbitson87/lumen-rs-fixtures](https://huggingface.co/datasets/rabbitson87/lumen-rs-fixtures)
+into `crates/lumen-model/tests/fixtures/` so the `--features qwen3_5_moe`
+integration tests can run. Override with `LUMEN_FIXTURES_REPO=<USER>/<repo>`
+if you maintain a private fork.
+
+### Upload (maintainer)
+
+```bash
+hf auth login                       # one-time
+hf upload rabbitson87/lumen-rs-fixtures \
+  crates/lumen-model/tests/fixtures/layer0_moe_weights.safetensors \
+  --repo-type dataset
+hf upload rabbitson87/lumen-rs-fixtures \
+  crates/lumen-model/tests/fixtures/layer0_linear_attn_weights.safetensors \
+  --repo-type dataset
+hf upload rabbitson87/lumen-rs-fixtures \
+  crates/lumen-model/tests/fixtures/layer3_self_attn_weights.safetensors \
+  --repo-type dataset
+```
+
+(Create the dataset repo first with `hf repo create rabbitson87/lumen-rs-fixtures --type dataset`
+if it doesn't exist yet.)
 
 ## Model checkpoints (required at runtime)
 

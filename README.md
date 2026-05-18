@@ -383,14 +383,28 @@ Indicative numbers on an Apple M3 Max:
 |---|---|---|
 | Embedding b=3, len≈18 tokens | 19.4 ms/batch | naive 8-bit kernel: 35.5 ms (−45 %) |
 | Embedding b=25 quality eval | 251 ms (≈10 ms/item) | P@1 = 0.960 on the labelled corpus |
-| Gemma 4 26B-A4B decode | 17.4 ms/step | mlx-lm: 17.0 ms (within ~0.4 ms parity) |
-| Gemma 4 26B-A4B prefill 4 k tokens | ~1.1 s | Full path including JIT-compile warmup |
+| Gemma 4 26B-A4B decode | 18.8 ms/step | mlx default sdpa: 19.9 ms (custom flash-attn −5 %) |
+| Gemma 4 26B-A4B prefill 4 k tokens | ~4.0 s | Full path including JIT-compile warmup |
+| Qwen3.6-35B-A3B-mxfp4 decode (N=1) | 48.4 ms/step p50 | fused kernels; aggregate 20.8 tok/s |
+| Qwen3.6-35B-A3B-mxfp4 decode (N=2 CB) | 81.9 ms/step | aggregate 24.4 tok/s (+17 % over N=1) |
 
-Resident memory:
+### Kernel fusion impact (Qwen3.6-35B-A3B-mxfp4, N=1)
+
+| Config | p50 step latency | aggregate tps | vs fused |
+|---|---|---|---|
+| Fused (default) | 48.4 ms / 57.4 ms | 20.8 / 13.9 tok/s | baseline |
+| All `LUMEN_DISABLE_*=1` | 66.3 ms / 77.7 ms | 15.1 / 10.3 tok/s | **+27 % slower** |
+
+(Two runs shown to highlight thermal sensitivity; p50 is the stable metric.)
+Fused kernels covered: flash-attn, residual+RMSNorm, input RMSNorm, dense MLP
+residual, MoE gate/up/SiLU/mul, MoE weighted-sum.
+
+### Resident memory
 
 - Qwen3-Embedding 8-bit: ~900 MB GPU footprint (vs ~1.4 GB for plain bf16,
   −37 %).
 - Gemma 4 26B-A4B MLX 4-bit: ~22 GB unified memory at steady state.
+- Qwen3.6-35B-A3B-mxfp4: ~22 GB unified memory at steady state.
 
 ---
 

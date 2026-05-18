@@ -47,6 +47,7 @@ scaffold.mjs
 worker-hang-investigation.html
 
 # ── Personal benchmarking + dev scripts (kept local; not part of the
-#    public project). Add curated, clone-er-friendly scripts back to the
-#    repo selectively as needed. ──
-scripts/
+#    public project). Curated clone-er-friendly scripts are allowlisted
+#    individually below. ──
+scripts/*
+!scripts/fetch_fixtures.py
