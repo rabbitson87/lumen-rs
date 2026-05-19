@@ -11,9 +11,6 @@ use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
 /// Gemma 4 26B-A4B native MLX backend wrapper. See
 /// `crates/lumen-mlx/src/gemma4_backend.rs` for the trait-shape API
 /// this dispatches into.
-#[cfg(feature = "mlx-native")]
-use lumen_mlx::gemma4::Gemma4Backend;
-
 use crate::types::*;
 
 /// Adaptive routing mode (selected at startup; cannot switch at runtime
@@ -92,12 +89,10 @@ enum ModelBackend {
     Qwen35Moe(Qwen35MoeBackend),
     /// Track B Phase 1: MLX backend via Python subprocess + JSON-RPC. Greedy
     /// only at B1; sampling lands in B2.
+    /// Unified mlx-native backend — covers Qwen 2.5 / 3.5 / 3.6 dense + MoE
+    /// AND Gemma 4 26B-A4B. Family-specific dispatch happens inside
+    /// `MlxBackend`; the engine sees one variant.
     Mlx(lumen_mlx::MlxBackend),
-    /// native-Rust Gemma 4 26B-A4B MoE on MLX. Avoids the
-    /// PyO3 subprocess hop entirely — `NativeGemma4Model` + the chat /
-    /// response parser live in `lumen-mlx::gemma4::*`.
-    #[cfg(feature = "mlx-native")]
-    Gemma4Native(Gemma4Backend),
 }
 
 impl ModelBackend {
@@ -109,8 +104,6 @@ impl ModelBackend {
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.encode(text),
             Self::Mlx(m) => m.encode(text),
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => m.encode(text),
         }
     }
 
@@ -122,8 +115,6 @@ impl ModelBackend {
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.decode(tokens),
             Self::Mlx(m) => m.decode(tokens),
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => m.decode(tokens),
         }
     }
 
@@ -137,8 +128,6 @@ impl ModelBackend {
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.build_chat_input(messages, thinking),
             Self::Mlx(m) => m.build_chat_input(messages, thinking),
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => m.build_chat_input(messages, thinking),
         };
         match res {
             Ok(ids) => ids.len() as u32,
@@ -189,38 +178,7 @@ impl ModelBackend {
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
             Self::Mlx(m) => {
-                // MLX backend B1: greedy-only via chat_streaming-style loop.
-                // Generate path used by `/v1/completions` — drive prefill +
-                // decode_step with no message wrapping. When `session_id` is
-                // provided, route through `completion_session` so the cached
-                // token prefix from prior turns is reused.
-                let _ = (temperature, top_p);
-                if let Some(sid) = session_id {
-                    return m.completion_session(input_ids, max_new_tokens, sid);
-                }
-                let seq_id = m.alloc_seq_id();
-                let (mut last, mut pos) = m.prefill(seq_id, input_ids)?;
-                let mut out: Vec<u32> = vec![last];
-                let eos = m.eos_tokens().to_vec();
-                if !eos.contains(&last) {
-                    for _ in 1..max_new_tokens {
-                        let (n, p) = m.decode_step(seq_id, last, pos)?;
-                        last = n;
-                        pos = p;
-                        out.push(n);
-                        if eos.contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                m.remove_seq(seq_id).ok();
-                Ok(out)
-            }
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => {
-                // greedy only; sampling lands in W5.
-                let _ = session_id;
-                m.generate(input_ids, max_new_tokens, temperature, top_p)
+                m.generate(input_ids, max_new_tokens, temperature, top_p, session_id)
             }
         }
     }
@@ -236,12 +194,10 @@ impl ModelBackend {
     }
 
     /// Drop an A1 prefix-cache entry by its auto-generated key. Returns true
-    /// if the entry existed. MLX-only feature (Mlx + Gemma4Native back-ends).
+    /// if the entry existed. MLX-only feature.
     fn drop_prefix_cache(&mut self, key: &str) -> bool {
         match self {
             Self::Mlx(m) => m.drop_prefix_cache(key),
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => m.drop_prefix_cache(key),
             _ => false,
         }
     }
@@ -250,8 +206,6 @@ impl ModelBackend {
     fn clear_prefix_cache(&mut self) -> usize {
         match self {
             Self::Mlx(m) => m.clear_prefix_cache(),
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => m.clear_prefix_cache(),
             _ => 0,
         }
     }
@@ -272,48 +226,7 @@ impl ModelBackend {
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.chat(messages, max_new_tokens, temperature, thinking),
-            Self::Mlx(m) => {
-                let _ = temperature; // greedy at B1
-                if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})
-                } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})
-                }
-            }
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => {
-                // W4 (c): greedy only — temperature/session_id ignored. The
-                // parsed response carries reasoning + tool_calls separately,
-                // but the wire-level engine contract is a single visible
-                // string; HTTP layer can re-render structured fields once
-                // the OpenAI shapes are extended.
-                //
-                // `thinking=true` empty-content fix (2026-05-14): when the
-                // model is asked to think and the budget runs out before it
-                // closes the `<|channel|>thought\n…<|channel|>` block, all
-                // tokens end up in `resp.reasoning` and `resp.visible` is
-                // empty. Returning the empty string to the HTTP layer
-                // surfaces as `content: ""` — which client SDKs treat as a
-                // failed turn. Fall back to reasoning so the user at least
-                // sees the chain of thought rather than nothing.
-                let _ = temperature;
-                // Prefix-cache integration: when caller supplies `session_id`,
-                // route through `chat_with_prefix_cache` so the system prompt
-                // prefill is shared across batch requests with the same id.
-                // Without `session_id`, fall back to the stateless `chat()`
-                // path so single-shot requests stay zero-overhead.
-                let resp = if let Some(sid) = session_id {
-                    m.chat_with_prefix_cache(messages, max_new_tokens, temperature, thinking, sid)?
-                } else {
-                    m.chat(messages, max_new_tokens, temperature, thinking)?
-                };
-                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
-                    Ok(resp.reasoning)
-                } else {
-                    Ok(resp.visible)
-                }
-            }
+            Self::Mlx(m) => m.chat(messages, max_new_tokens, temperature, thinking, session_id),
         }
     }
 
@@ -351,39 +264,7 @@ impl ModelBackend {
                 m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)
             }
             Self::Mlx(m) => {
-                let _ = temperature; // greedy at B1
-                if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)
-                } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, on_token)
-                }
-            }
-            #[cfg(feature = "mlx-native")]
-            Self::Gemma4Native(m) => {
-                // W4 (c): same greedy-only constraint as `chat()`. Adapts
-                // the FnMut(&str) -> Result<()> shape that Gemma4Backend
-                // uses to the engine's FnMut(&str) (return type `()`) by
-                // swallowing the result — token-flush errors are best-effort.
-                //
-                // Note: streaming on_token still only fires for *visible*
-                // tokens (parser-side filter), so when thinking=true and the
-                // thought channel never closes, the client sees no SSE
-                // chunks. The post-stream fallback below makes the final
-                // `Ok(...)` carry the reasoning text so non-streaming
-                // callers (e.g. final-message accumulation) still get
-                // something useful.
-                let _ = (temperature, session_id);
-                let mut on_token = on_token;
-                let resp = m.chat_streaming(messages, max_new_tokens, thinking, |chunk| {
-                    on_token(chunk);
-                    Ok(())
-                })?;
-                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
-                    Ok(resp.reasoning)
-                } else {
-                    Ok(resp.visible)
-                }
+                m.chat_streaming(messages, max_new_tokens, temperature, thinking, session_id, on_token)
             }
         }
     }
@@ -479,8 +360,12 @@ impl InferenceEngine {
         // `notes/adaptive_backend_routing_plan.md` for deployment guide.
         let mode = resolve_backend_mode();
         if mode == BackendMode::Mlx {
+            // MlxBackend::load now handles arch detection internally —
+            // Qwen3.5 family vs Gemma 4 vs (future) any other mlx-native
+            // model. The engine only sees one variant.
             eprintln!("Loading MLX backend (mode={mode:?}): {model_id}");
             let backend = lumen_mlx::MlxBackend::load(model_id)?;
+            eprintln!("[mlx] family={:?}", backend.kind());
             return Ok(Self {
                 backend: ModelBackend::Mlx(backend),
                 model_id: model_id.to_string(),
@@ -604,33 +489,9 @@ impl InferenceEngine {
             });
         }
 
-        // native Gemma 4 26B-A4B MoE on MLX. Source the
-        // model directory from either:
-        //   1. `model_id` itself, if it's an existing local path, OR
-        //   2. `LUMEN_GEMMA4_DIR` env var.
-        // The directory must contain `config.json`, `tokenizer.json`, and
-        // the safetensors shards (`model-XXXXX-of-YYYYY.safetensors` +
-        // `model.safetensors.index.json`).
-        #[cfg(feature = "mlx-native")]
-        if arch == "gemma4_native" {
-            use std::path::PathBuf;
-            let dir = if std::path::Path::new(model_id).is_dir() {
-                PathBuf::from(model_id)
-            } else if let Ok(d) = std::env::var("LUMEN_GEMMA4_DIR") {
-                PathBuf::from(d)
-            } else {
-                return Err(anyhow::anyhow!(
-                    "gemma4_native requires either MODEL_ID pointing at an existing \
-                     local directory or LUMEN_GEMMA4_DIR=<dir> with config.json + \
-                     tokenizer.json + safetensors shards"
-                ));
-            };
-            let backend = Gemma4Backend::from_dir(model_id, &dir)?;
-            return Ok(Self {
-                backend: ModelBackend::Gemma4Native(backend),
-                model_id: model_id.to_string(),
-            });
-        }
+        // Note: `arch == "gemma4_native"` is now handled by `MlxBackend::load`
+        // upstream (see the `if mode == BackendMode::Mlx` early-return). The
+        // Candle fallback path below only sees non-mlx arches.
 
         let backend = match arch {
             "gemma4" => {
@@ -874,10 +735,17 @@ impl InferenceEngine {
         // (`make_attention_mask_for_layer_chunked`). Cap protects against
         // runaway KV growth from misbehaving clients while letting normal
         // long-context (≤32K) requests flow.
-        const PREFILL_TOKEN_CAP: u32 = 32_768;
-        if prompt_tokens > PREFILL_TOKEN_CAP {
+        //
+        // Override via `LUMEN_PREFILL_CHUNK` (driven by the CONTEXT card in the
+        // desktop app). Server falls back to the safe 32K default if unset or
+        // unparseable.
+        let prefill_token_cap: u32 = std::env::var("LUMEN_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32_768);
+        if prompt_tokens > prefill_token_cap {
             let msg = format!(
-                "prompt too large: {prompt_tokens} tokens > server cap {PREFILL_TOKEN_CAP}. \
+                "prompt too large: {prompt_tokens} tokens > server cap {prefill_token_cap}. \
                  Reduce system prompt / message history, or wait for chunked prefill support."
             );
             eprintln!("[chat-stream] REJECTED ({msg})");

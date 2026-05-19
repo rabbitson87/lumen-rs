@@ -1410,8 +1410,37 @@ pub(crate) mod imp {
         pub fn load(path: &Path) -> Result<Self> {
             let raw = std::fs::read_to_string(path)
                 .map_err(|err| anyhow!("config.json read failed at {}: {err}", path.display()))?;
-            serde_json::from_str(&raw)
-                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))
+            let mut cfg: Self = serde_json::from_str(&raw)
+                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))?;
+            // `LUMEN_SLIDING_WINDOW` (desktop CONTEXT card → server) overrides the
+            // model's built-in sliding window size. 0 means "no override".
+            if let Ok(s) = std::env::var("LUMEN_SLIDING_WINDOW") {
+                if let Ok(n) = s.parse::<usize>() {
+                    if n > 0 {
+                        eprintln!(
+                            "[gemma4] sliding_window override via LUMEN_SLIDING_WINDOW: {} → {n}",
+                            cfg.text_config.sliding_window
+                        );
+                        cfg.text_config.sliding_window = n;
+                    }
+                }
+            }
+            // `LUMEN_MAX_CTX` caps the maximum position embeddings the model
+            // advertises — useful to keep KV cache pool sizing predictable
+            // when the model config claims e.g. 128K but the host RAM can't
+            // hold it.
+            if let Ok(s) = std::env::var("LUMEN_MAX_CTX") {
+                if let Ok(n) = s.parse::<usize>() {
+                    if n > 0 && n < cfg.text_config.max_position_embeddings {
+                        eprintln!(
+                            "[gemma4] max_position_embeddings capped via LUMEN_MAX_CTX: {} → {n}",
+                            cfg.text_config.max_position_embeddings
+                        );
+                        cfg.text_config.max_position_embeddings = n;
+                    }
+                }
+            }
+            Ok(cfg)
         }
 
         /// Returns whichever of `quantization` / `quantization_config` is
