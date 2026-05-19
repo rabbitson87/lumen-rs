@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lumen",
+  "version": "0.1.0",
+  "identifier": "ai.lumen.app",
+  "build": {
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Lumen",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [],
+    "category": "DeveloperTool",
+    "shortDescription": "Local LLM control plane",
+    "longDescription": "Lumen is a desktop control plane for the lumen-server inference engine — model management, quantization settings, and server lifecycle in one dashboard.",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "entitlements": null,
+      "exceptionDomain": "localhost",
+      "signingIdentity": null
+    },
+    "externalBin": []
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/hsng95/lumen-rs/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJEOEIyRUFEQzVBODE1N0UKUldSK0ZhakZyUzZMdmFpdGdWSDlBQkhiaHZHYVJnaXpoUnFlNzFWalZKSEtSZFpFdnBhV29ZbEkK"
+    }
+  }
+}

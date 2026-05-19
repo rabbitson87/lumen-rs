@@ -1,0 +1,132 @@
+:root {
+  color-scheme: dark;
+  --bg: #0e1014;
+  --panel: #161922;
+  --panel-2: #1d2230;
+  --border: #2a2f3d;
+  --text: #e6e7ea;
+  --text-dim: #8a8f9c;
+  --accent: #7fb3ff;
+  --ok: #5bd6a3;
+  --warn: #f0b65c;
+  --err: #ff7a7a;
+  --mono: ui-monospace, SF Mono, "JetBrains Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  /* Reserve space for the fixed footer-tabs bar (36 px) so the last card row
+     isn't hidden behind it. */
+  padding-bottom: 36px;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+  white-space: nowrap;
+}
+button:hover {
+  background: #242a3a;
+  border-color: #3a4254;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.primary {
+  background: #2b3a5c;
+  border-color: #3d5384;
+}
+button.primary:hover {
+  background: #34466e;
+}
+button.danger {
+  background: #3a1f24;
+  border-color: #5a2a30;
+  color: #ffb8b8;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select {
+  font: inherit;
+  font-family: var(--mono);
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 7px 10px;
+  width: 100%;
+  min-height: 32px;
+  box-sizing: border-box;
+}
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 18px) calc(50% - 2px),
+    calc(100% - 13px) calc(50% - 2px);
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 28px;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--text-dim);
+}
+.dot.running {
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+.dot.starting,
+.dot.stopping {
+  background: var(--warn);
+}
+.dot.crashed {
+  background: var(--err);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+.dim {
+  color: var(--text-dim);
+}

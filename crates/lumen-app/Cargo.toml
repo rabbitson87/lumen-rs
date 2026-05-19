@@ -1,0 +1,55 @@
+[package]
+name = "lumen-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lumen desktop control plane — Tauri 2.x dashboard for the lumen-server inference engine"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
+# Async runtime — shared with lumen-server
+tokio = { workspace = true }
+
+# Process lifecycle (SIGTERM / kill / pipe streaming) + statvfs for doctor
+nix = { version = "0.29", features = ["signal"] }
+libc = "0.2"
+
+# HTTP health check against /v1/models
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Config persistence (TOML at ~/Library/Application Support/Lumen/config.toml)
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+# Model registry — local scan + HF Hub download
+hf-hub = { workspace = true, features = ["tokio"] }
+walkdir = "2"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# OS dirs (~/Library/Application Support on macOS, etc.)
+directories = "5"
+
+# Locate the lumen-server binary on PATH (dev fallback)
+which = "6"
+
+[features]
+# `bundled-server` includes the lumen-server binary as a Tauri sidecar in the
+# .app bundle. Off by default — during dev the app finds the binary via PATH or
+# the `binary_path` config field. Production builds (`cargo tauri build`) flip
+# this on.
+default = []
+bundled-server = []

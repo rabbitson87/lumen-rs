@@ -7,6 +7,20 @@ members = [
     "crates/lumen-model",
     "crates/lumen-server",
     "crates/paged-attention",
+    "crates/lumen-app",
+]
+# lumen-app pulls in the Tauri + webview stack (~hundreds of crates). Excluding
+# it from `default-members` keeps `cargo build` / `cargo test` at the workspace
+# root fast — build the desktop app explicitly with `cargo build -p lumen-app`
+# (dev) or `cargo tauri build` (release bundle).
+default-members = [
+    "crates/lumen-core",
+    "crates/turboquant-cache",
+    "crates/lumen-metal",
+    "crates/lumen-mlx",
+    "crates/lumen-model",
+    "crates/lumen-server",
+    "crates/paged-attention",
 ]
 resolver = "2"
 
