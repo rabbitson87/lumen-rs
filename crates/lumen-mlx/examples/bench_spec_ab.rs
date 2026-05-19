@@ -83,7 +83,6 @@ fn run_one(
     // Instead, just do the full chat_streaming and compute decode-only via
     // (total - prefill_ms_observed). For this bench we use the "cheap" trick:
     // run twice (warmup + measure) so prefill is amortized; report total tok/s.
-    drop(t_prefill);
     let text = qwen.chat_streaming(&messages, max_tokens, false, seq_id, |_| {})?;
     let total_elapsed = t_total.elapsed().as_secs_f64();
     drop(be);

@@ -13,7 +13,7 @@
 
 #![cfg(feature = "model-integration")]
 
-use candle_core::{D, DType, Device, Tensor};
+use candle_core::{D, Device, Tensor};
 use lumen_metal::gated_delta::{gated_delta_step_candle, set_enabled};
 
 fn metal_device() -> Option<Device> {

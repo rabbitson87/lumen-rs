@@ -10,7 +10,7 @@
 #![cfg(feature = "paged-kv")]
 
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_gemma4::CompressedKVBackend;
 use lumen_model::paged_kv::PagedKVBackend;
 

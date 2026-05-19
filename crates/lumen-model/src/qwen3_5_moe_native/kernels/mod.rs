@@ -2695,7 +2695,7 @@ mod tests {
         let theta = 1_000_000.0_f32;
 
         let x: Vec<f32> = (0..batch * seq * heads * head_dim)
-            .map(|i| (((i as f32) * 0.009).sin() + 0.1 * (i as f32 * 0.01).cos()))
+            .map(|i| ((i as f32) * 0.009).sin() + 0.1 * (i as f32 * 0.01).cos())
             .collect();
 
         let (cos_t, sin_t) = build_rope_tables(&ctx, rotary_dim, seq, 0, theta).unwrap();
@@ -3529,7 +3529,7 @@ mod tests {
                 })
                 .collect()
         };
-        let mut state_v = make(0x10, b * hv * dv * dk);
+        let state_v = make(0x10, b * hv * dv * dk);
         let q_v = make(0x20, b * hv * dk);
         let k_v = make(0x30, b * hv * dk);
         let v_v = make(0x40, b * hv * dv);

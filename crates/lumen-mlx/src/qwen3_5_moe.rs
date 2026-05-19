@@ -72,7 +72,11 @@ mod imp {
     use crate::native_norm::rms_norm;
     use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, quantized_matmul_with_mode};
     use crate::native_rope::{precompute_rope_freqs, rope, rope_with_freqs};
+    use crate::native_snapshot::PromptCacheSnapshot;
     use crate::native_ssm::{compute_g, gated_delta_step_kernel, rms_norm_gated};
+    use crate::qwen3_5_mtp::{Qwen35MtpBlock, Qwen35MtpLinear};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     pub(crate) fn sigmoid_mul_fuse_enabled_pub() -> bool {
         sigmoid_mul_fuse_enabled()
@@ -966,6 +970,23 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.
+    ///
+    /// `committed`: tokens the caller should append to its generation stream.
+    ///   Layout `[next_token, accepted_drafts.., correction_token]`. Length =
+    ///   `1 + n_accepted + 1`. The LAST element is the token that must be
+    ///   passed as `committed_token` to the next `mtp_step()` call (the
+    ///   correction on partial reject or the bonus on full accept — neither
+    ///   is in the trunk cache yet).
+    /// `n_attempted = n_draft` (drafter proposals).
+    /// `n_accepted` = drafts that matched the trunk's verify prediction.
+    #[derive(Debug, Clone)]
+    pub struct MtpStepOutput {
+        pub committed: Vec<u32>,
+        pub n_attempted: usize,
+        pub n_accepted: usize,
+    }
+
     pub struct NativeQwen3_5MoeModel {
         config: NativeModelConfig,
         weights: NativeWeights,
@@ -991,6 +1012,18 @@ mod imp {
         // Forwarded to MLX's `fast::rope(freqs=...)` when
         // `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS=1` is set. Default-off opt-in.
         const_rope_freqs: Array,
+        // MTP (Multi-Token Prediction) speculative-decode head. `None` until
+        // `try_enable_mtp(block)` is called post-load. The block exposes
+        // `forward()` consuming (embeds, h_pre, mtp_kv, ...) — see
+        // `qwen3_5_mtp::Qwen35MtpBlock`.
+        mtp: Option<Qwen35MtpBlock>,
+        // Last-hidden capture slot — written by `forward_impl` at the end of
+        // the layer loop (post-MLP residual, pre-final-norm) when
+        // `mtp_capture_enabled` is set. Read once per `mtp_step` via
+        // `take_captured_h()` and reset to `None`. Shape `[1, L, hidden]`
+        // matches the MTP block's `h_pre` input contract.
+        mtp_capture_slot: Mutex<Option<Array>>,
+        mtp_capture_enabled: AtomicBool,
     }
 
     impl NativeQwen3_5MoeModel {
@@ -1054,6 +1087,9 @@ mod imp {
                 is_linear_per_layer,
                 layer_weights,
                 linear_attn_constants,
+                mtp: None,
+                mtp_capture_slot: Mutex::new(None),
+                mtp_capture_enabled: AtomicBool::new(false),
                 embed_weight,
                 embed_scales,
                 embed_group,
@@ -1949,6 +1985,17 @@ mod imp {
                 }
             }
 
+            // MTP capture: stash the post-MLP residual (pre-final-norm hidden)
+            // when the MTP path is active. Consumed by `mtp_step` as the MTP
+            // block's `h_pre` input. Cheap refcount clone — captured even when
+            // the slot already holds a stale value (overwritten). The slot is
+            // drained by `take_captured_h()` after the trunk forward returns.
+            if self.mtp_capture_enabled.load(Ordering::Relaxed) {
+                if let Ok(mut slot) = self.mtp_capture_slot.lock() {
+                    *slot = Some(hidden_states.clone());
+                }
+            }
+
             // Final RMSNorm + lm_head projection. `tie_word_embeddings = false`
             // for the 35B production checkpoint; we still cover the tied path
             // for forward-compat with smaller variants.
@@ -2003,6 +2050,304 @@ mod imp {
             Ok((logits_f32, captured))
         }
 
+        // ─────────────────────────────────────────────────────────────────
+        // MTP (Multi-Token Prediction) — speculative decode head wiring.
+        // Mirrors `gemma4_moe::mtp_step` Steps A-E, retargeted for Qwen3.6's
+        // hybrid (linear-attn + full-attn) trunk. The MTP block lives at
+        // `qwen3_5_mtp::Qwen35MtpBlock` and is loaded separately (see
+        // `qwen3_5_mtp::load_block_from_hf`).
+        // ─────────────────────────────────────────────────────────────────
+
+        /// Install a loaded MTP block onto this trunk. Validates that the
+        /// block's static dims line up with the trunk's `text_config`. Idempotent
+        /// in spirit — re-enabling replaces the prior block.
+        pub fn try_enable_mtp(&mut self, block: Qwen35MtpBlock) -> Result<()> {
+            let cfg = self.text_config();
+            if block.dims.hidden_size != cfg.hidden_size {
+                return Err(anyhow!(
+                    "try_enable_mtp: block.hidden_size {} != trunk.hidden_size {}",
+                    block.dims.hidden_size,
+                    cfg.hidden_size
+                ));
+            }
+            if block.dims.num_attention_heads != cfg.num_attention_heads {
+                return Err(anyhow!(
+                    "try_enable_mtp: block.num_attention_heads {} != trunk {}",
+                    block.dims.num_attention_heads,
+                    cfg.num_attention_heads
+                ));
+            }
+            if block.dims.num_key_value_heads != cfg.num_key_value_heads {
+                return Err(anyhow!(
+                    "try_enable_mtp: block.num_key_value_heads {} != trunk {}",
+                    block.dims.num_key_value_heads,
+                    cfg.num_key_value_heads
+                ));
+            }
+            if block.dims.head_dim != cfg.head_dim {
+                return Err(anyhow!(
+                    "try_enable_mtp: block.head_dim {} != trunk {}",
+                    block.dims.head_dim,
+                    cfg.head_dim
+                ));
+            }
+            self.mtp = Some(block);
+            Ok(())
+        }
+
+        /// True once `try_enable_mtp` has installed a drafter block.
+        pub fn mtp_enabled(&self) -> bool {
+            self.mtp.is_some()
+        }
+
+        fn set_mtp_capture_enabled(&self, on: bool) {
+            self.mtp_capture_enabled.store(on, Ordering::Relaxed);
+        }
+
+        fn take_captured_h(&self) -> Option<Array> {
+            self.mtp_capture_slot.lock().ok().and_then(|mut s| s.take())
+        }
+
+        /// Build a `Qwen35MtpLinear` view of the trunk's lm_head — direct
+        /// reference (refcount bump) to the same packed/scales/biases tensors.
+        /// Falls back to the tied-embed tensors when `lm_head` is None
+        /// (matches the trunk forward path's tied lm_head branch).
+        fn trunk_lm_head_view(&self) -> Qwen35MtpLinear {
+            if let Some(lm) = &self.lm_head {
+                Qwen35MtpLinear {
+                    weight: lm.weight.clone(),
+                    scales: lm.scales.clone(),
+                    biases: lm.biases.clone(),
+                    group_size: lm.group_size,
+                    bits: lm.bits,
+                    mode: lm.mode,
+                }
+            } else {
+                Qwen35MtpLinear {
+                    weight: self.embed_weight.clone(),
+                    scales: self.embed_scales.clone(),
+                    biases: None,
+                    group_size: self.embed_group,
+                    bits: self.embed_bits,
+                    mode: self.embed_mode,
+                }
+            }
+        }
+
+        /// Look up the embedding for a single token id and reshape to
+        /// `[1, 1, hidden]`. Mirrors the embed lookup at the head of
+        /// `forward_impl` — same quant path, dtype cast, reshape — but as a
+        /// standalone helper for the MTP drafter loop (Step B). No embed scale
+        /// multiply (Qwen3.6's MTP convention; cf. gemma4 which multiplies by
+        /// `sqrt(hidden_size)`).
+        fn embed_lookup_single(&self, token_id: u32) -> Result<Array> {
+            let ids_arr = Array::from_slice(&[token_id as i32], &[1]);
+            let raw = quantized_embedding_lookup_with_mode(
+                &self.embed_weight,
+                &self.embed_scales,
+                &ids_arr,
+                self.embed_group,
+                self.embed_bits,
+                self.embed_mode,
+            )
+            .context("mtp_step: embed_lookup_single failed")?;
+            let f32 = Self::to_f32(raw, "mtp_step.embed")?;
+            let hidden = self.text_config().hidden_size as i32;
+            mlx_rs::ops::reshape(&f32, &[1, 1, hidden])
+                .context("mtp_step: embed reshape [1, 1, hidden] failed")
+        }
+
+        /// One MTP speculative step.
+        ///
+        /// Pre-state contract: `trunk_cache` is positioned at offset `M` —
+        /// `committed_token` is NOT yet in the cache. `mtp_kv` is the MTP
+        /// block's own KV cache (one full-attention layer); cleared at the
+        /// start of every call (fresh K-step extrapolation, no cross-call
+        /// drafter context).
+        ///
+        /// Steps:
+        ///   A. Trunk decode `committed_token` (T=1) under `mtp_capture_enabled`.
+        ///      Cache offset M → M+1. Captures the trunk's post-MLP residual
+        ///      (pre-final-norm hidden) into `mtp_capture_slot`. Argmax of the
+        ///      trunk's logits → `next_token`.
+        ///   B. Drafter loop k=0..n_draft — `mtp_block.forward(embed(last_tok),
+        ///      last_h, mtp_kv, false, trunk_final_norm, trunk_lm_head)`. The
+        ///      block's own KV cache advances by 1 per iteration. `last_h`
+        ///      threads the post-residual `new_h_pre` into the next iteration.
+        ///   C. Trunk verify forward `[next_token, draft_0..draft_{K-1}]` at
+        ///      S=K+1. Cache offset M+1 → M+K+2. Returns `[1, K+1, vocab]`
+        ///      logits.
+        ///   D. Accept-reject: argmax verify_logits per position → `preds`.
+        ///      Sequentially accept while `preds[k] == drafts[k]`, break on
+        ///      first mismatch.
+        ///   E. On partial reject (n_accepted < K): restore the pre-Step-C
+        ///      trunk-cache snapshot (back to M+1) and replay
+        ///      `[next_token, drafts[..n_accepted]]` at S=1+n_accepted via the
+        ///      regular trunk forward to land the cache at
+        ///      target = M+1+1+n_accepted. The snapshot+replay path is
+        ///      mandatory because the trunk's linear-attention (Mamba) layers
+        ///      have non-truncatable SSM state — gemma4's `truncate_to`
+        ///      shortcut works only for KV-based caches.
+        ///
+        /// Returns `MtpStepOutput { committed, n_attempted, n_accepted }`.
+        /// The last element of `committed` is `preds[n_accepted]` — the
+        /// trunk's prediction at the first non-accepted position, which is
+        /// NOT in the cache yet and must be fed as `committed_token` to the
+        /// next `mtp_step()` call.
+        pub fn mtp_step(
+            &self,
+            trunk_cache: &mut NativePromptCache,
+            mtp_kv: &mut NativeKvCache,
+            committed_token: u32,
+            n_draft: usize,
+        ) -> Result<MtpStepOutput> {
+            if n_draft == 0 {
+                return Err(anyhow!("mtp_step: n_draft must be >= 1"));
+            }
+            let block = self
+                .mtp
+                .as_ref()
+                .ok_or_else(|| anyhow!("mtp_step: MTP not enabled (call try_enable_mtp first)"))?;
+
+            let m_pre = trunk_cache.full_attn_offset();
+
+            // Reset the MTP block's own KV cache — every mtp_step is a fresh
+            // K-step extrapolation. Cross-call attention context lives in the
+            // TRUNK cache; the drafter only needs intra-step (draft-token)
+            // attention which is what `mtp_kv` carries.
+            mtp_kv.clear();
+
+            // === Step A: trunk decode `committed_token` + capture last hidden ===
+            self.set_mtp_capture_enabled(true);
+            let logits_a = self
+                .forward_with_opts(&[committed_token], trunk_cache, /* last_only */ true)
+                .context("mtp_step: Step A trunk forward")?;
+            self.set_mtp_capture_enabled(false);
+            let trunk_h = self
+                .take_captured_h()
+                .ok_or_else(|| anyhow!("mtp_step: Step A failed to capture trunk last hidden"))?;
+            let next_token = self
+                .argmax_last_token(&logits_a)
+                .context("mtp_step: Step A argmax next_token")?;
+            // trunk_cache offset is now M+1.
+
+            // === Step B: drafter loop ===
+            let trunk_final_norm_w = self.final_norm_weight.clone();
+            let trunk_lm_head = self.trunk_lm_head_view();
+            let mut last_h = trunk_h;
+            let mut last_tok = next_token;
+            let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
+            for k in 0..n_draft {
+                let embeds = self
+                    .embed_lookup_single(last_tok)
+                    .with_context(|| format!("mtp_step: Step B embed k={k}"))?;
+                let (logits_b, new_h) = block
+                    .forward(
+                        &embeds,
+                        &last_h,
+                        mtp_kv,
+                        /* causal */ false,
+                        &trunk_final_norm_w,
+                        &trunk_lm_head,
+                    )
+                    .with_context(|| format!("mtp_step: Step B block.forward k={k}"))?;
+                let draft_tok = self
+                    .argmax_last_token(&logits_b)
+                    .with_context(|| format!("mtp_step: Step B argmax k={k}"))?;
+                drafts.push(draft_tok);
+                last_h = new_h;
+                last_tok = draft_tok;
+            }
+            // mtp_kv offset is now n_draft (drafter wrote one slot per draft).
+
+            // Snapshot trunk_cache pre-Step-C. Shallow snapshot is cheap
+            // (refcount bump per layer) and consumed once on partial reject.
+            // Position recorded is `m_pre + 1` — the offset of the cache
+            // RIGHT BEFORE the verify forward.
+            let snap = PromptCacheSnapshot::capture_shallow(trunk_cache, m_pre + 1)
+                .context("mtp_step: snapshot pre-Step-C failed")?;
+
+            // === Step C: trunk verify [next_token, draft_0..draft_{K-1}] ===
+            let mut verify_in: Vec<u32> = Vec::with_capacity(1 + n_draft);
+            verify_in.push(next_token);
+            verify_in.extend_from_slice(&drafts);
+            let verify_logits = self
+                .forward(&verify_in, trunk_cache)
+                .context("mtp_step: Step C trunk verify forward")?;
+            // trunk_cache offset is now M + 1 + (K + 1) = M + K + 2.
+
+            // === Step D: accept-reject ===
+            // Argmax along the vocab (last) axis → [1, K+1] u32 row of
+            // trunk's true predictions per verify position.
+            let argmax_per_pos =
+                mlx_rs::ops::indexing::argmax_axis(&verify_logits, -1, /* keep_dims */ false)
+                    .context("mtp_step: Step D argmax")?
+                    .as_dtype(mlx_rs::Dtype::Int32)
+                    .context("mtp_step: Step D cast to Int32")?;
+            argmax_per_pos
+                .eval()
+                .context("mtp_step: Step D eval argmax")?;
+            let preds_i32: &[i32] = argmax_per_pos.as_slice();
+            let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
+            if std::env::var("LUMEN_MTP_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "[qwen3_5 mtp_step m_pre={m_pre}] next_token={next_token} drafts={drafts:?} preds={preds:?}"
+                );
+            }
+            let mut n_accepted = 0usize;
+            for k in 0..n_draft {
+                if preds[k] == drafts[k] {
+                    n_accepted += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // === Step E: rollback trunk_cache on partial reject ===
+            //
+            // Snapshot+replay (not gemma4's `truncate_to`) because Qwen3.6's
+            // hybrid layer stack includes Mamba-style linear-attention layers
+            // whose SSM state cannot be naively truncated after K+1 token
+            // advances. Restoring the shallow snapshot reattaches the layers
+            // to their pre-verify state; the replay forward feeds only the
+            // accepted-trajectory tokens so the SSM state lands on the
+            // committed history.
+            //
+            // Full accept (n_accepted == n_draft) skips both — the verify
+            // forward already advanced the cache to the correct offset.
+            let target_offset = m_pre + 1 + 1 + n_accepted; // committed + next + accepted drafts
+            let cur_offset = trunk_cache.full_attn_offset();
+            if cur_offset > target_offset {
+                snap.restore_into(trunk_cache)
+                    .context("mtp_step: Step E snapshot restore failed")?;
+                // After restore, trunk_cache.full_attn_offset() == m_pre + 1.
+                // Replay `[next_token, accepted_drafts..]` (length 1 + n_accepted)
+                // to advance to target_offset = m_pre + 1 + 1 + n_accepted.
+                let mut replay: Vec<u32> = Vec::with_capacity(1 + n_accepted);
+                replay.push(next_token);
+                replay.extend_from_slice(&drafts[..n_accepted]);
+                self.forward_with_opts(&replay, trunk_cache, /* last_only */ true)
+                    .context("mtp_step: Step E replay forward failed")?;
+            }
+
+            // Commit list — last element is `preds[n_accepted]`, the
+            // correction/bonus token NOT in the cache. Caller threads it
+            // into the next `mtp_step` call as `committed_token`.
+            let mut committed = Vec::with_capacity(1 + n_accepted + 1);
+            committed.push(next_token);
+            committed.extend_from_slice(&drafts[..n_accepted]);
+            committed.push(preds[n_accepted]);
+
+            Ok(MtpStepOutput {
+                committed,
+                n_attempted: n_draft,
+                n_accepted,
+            })
+        }
+
         /// Argmax of the last token's logits along the vocab axis. Wired for
         /// when `forward` lands; keeps the prefill / decode boundary clean.
         ///
@@ -2046,6 +2391,11 @@ pub(crate) use imp::{
     NativeLayerType, NativeModelConfig, NativeQuantizationConfig, NativeQuantizationOverride,
     NativeQwen3_5MoeModel, NativeTextConfig, NativeWeights,
 };
+
+// MTP types are part of the public surface (Phase 2 S3) — re-exported from
+// the crate root via `lumen_mlx::MtpStepOutput`.
+#[cfg(feature = "mlx-native")]
+pub use imp::MtpStepOutput;
 
 // ───────────────────────── unit tests ─────────────────────────
 //

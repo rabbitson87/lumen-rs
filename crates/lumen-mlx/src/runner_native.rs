@@ -110,16 +110,22 @@ mod imp {
         Ok(())
     }
 
-    use crate::native_cache::NativePromptCache;
+    use crate::native_cache::{NativeKvCache, NativePromptCache};
     use crate::native_runtime::{FineTimings, take_fine_timings};
     use crate::native_snapshot::PromptCacheSnapshot;
-    use crate::qwen3_5_moe::NativeQwen3_5MoeModel;
+    use crate::qwen3_5_moe::{MtpStepOutput, NativeQwen3_5MoeModel};
+    use crate::qwen3_5_mtp::Qwen35MtpBlock;
     use std::collections::HashMap;
 
     /// Per-sequence runtime state held by the native runner.
     struct NativeSeqState {
         cache: NativePromptCache,
         position: usize,
+        /// MTP block's own KV cache (one full-attention layer; see
+        /// `qwen3_5_mtp::Qwen35MtpBlock`). Cleared at the start of every
+        /// `mtp_step` call (fresh K-step extrapolation). Idle / unused when
+        /// MTP is not enabled.
+        mtp_kv: NativeKvCache,
     }
 
     /// process-wide background worker that runs
@@ -1049,7 +1055,14 @@ mod imp {
                 );
             }
             let position = tokens.len();
-            self.seqs.insert(seq_id, NativeSeqState { cache, position });
+            self.seqs.insert(
+                seq_id,
+                NativeSeqState {
+                    cache,
+                    position,
+                    mtp_kv: NativeKvCache::new(),
+                },
+            );
             Ok((next_tok, position))
         }
 
@@ -1117,7 +1130,14 @@ mod imp {
                 })?;
             let next_tok = model.argmax_last_token(&logits)?;
             let position = tokens.len();
-            self.seqs.insert(seq_id, NativeSeqState { cache, position });
+            self.seqs.insert(
+                seq_id,
+                NativeSeqState {
+                    cache,
+                    position,
+                    mtp_kv: NativeKvCache::new(),
+                },
+            );
             Ok((next_tok, position, captured))
         }
 
@@ -1334,6 +1354,64 @@ mod imp {
             Ok((next_tok, state.position))
         }
 
+        // ─────────────────────────────────────────────────────────────────
+        // MTP (Multi-Token Prediction) speculative-decode wiring.
+        // `enable_mtp` installs a pre-loaded `Qwen35MtpBlock` onto the trunk
+        // model. `mtp_step` advances one MTP cycle (Steps A-E in
+        // `qwen3_5_moe::mtp_step`) and returns the committed token list
+        // (1 + n_accepted + 1 entries). Caller drives the decode loop with
+        // `mtp_step` instead of `decode_step` while the MTP path is active.
+        // Gating + opt-in lives in the upper engine (Phase 2 S4).
+        // ─────────────────────────────────────────────────────────────────
+
+        pub(crate) fn enable_mtp(&mut self, block: Qwen35MtpBlock) -> Result<()> {
+            let model = self
+                .model
+                .as_mut()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: enable_mtp before model loaded"))?;
+            model
+                .try_enable_mtp(block)
+                .context("native mlx-rs runner: try_enable_mtp failed")
+        }
+
+        pub(crate) fn mtp_enabled(&self) -> bool {
+            self.model.as_ref().is_some_and(|m| m.mtp_enabled())
+        }
+
+        pub(crate) fn mtp_step(
+            &mut self,
+            seq_id: u64,
+            committed_token: u32,
+            n_draft: usize,
+        ) -> Result<MtpStepOutput> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            if !model.mtp_enabled() {
+                return Err(anyhow!(
+                    "native mlx-rs runner: mtp_step called but MTP not enabled (call enable_mtp first)"
+                ));
+            }
+            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: mtp_step on unknown seq_id {seq_id}")
+            })?;
+            let out = model
+                .mtp_step(
+                    &mut state.cache,
+                    &mut state.mtp_kv,
+                    committed_token,
+                    n_draft,
+                )
+                .with_context(|| {
+                    format!("native mlx-rs runner: mtp_step orchestration (seq_id={seq_id})")
+                })?;
+            // Position advances by the number of committed tokens — same
+            // semantics as a series of `decode_step` calls.
+            state.position += out.committed.len();
+            Ok(out)
+        }
+
         pub(crate) fn forward_probe(&mut self, seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
             if tokens.is_empty() {
                 return Err(anyhow!(
@@ -1486,6 +1564,7 @@ mod imp {
                 NativeSeqState {
                     cache: fresh,
                     position,
+                    mtp_kv: NativeKvCache::new(),
                 },
             );
             Ok(position)

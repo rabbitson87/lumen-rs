@@ -97,21 +97,79 @@ pub struct Qwen35MtpAttnWeights {
 /// Dense MLP weights — SwiGLU with separate gate/up projections.
 ///
 /// 27B Qwen3.6 uses Dense in the MTP block (and in every trunk layer).
-/// 35B-A3B uses MoE in the trunk's middle layers but its MTP block is
-/// also Dense (per HF checkpoint inspection — the MTP head is intentionally
-/// simpler than a full trunk layer to keep cycle latency down).
 pub struct Qwen35MtpDenseMlp {
     pub gate_proj: Qwen35MtpLinear,
     pub up_proj: Qwen35MtpLinear,
     pub down_proj: Qwen35MtpLinear,
 }
 
-/// MLP variant. Phase 2 ships the Dense path first (covers both 27B-style
-/// and the 35B-A3B MTP head). MoE variant slot is reserved for any future
-/// checkpoint that publishes a routed-MoE MTP head.
+/// MoE MLP weights — `gate` router + per-expert switch_glu tiles + a dense
+/// `shared_expert` with its own sigmoid gating. Layout mirrors the trunk's
+/// `ResolvedMoeWeights` so we can hand a `MoeBlockWeights<'_>` view to
+/// `native_moe::moe_block_forward`.
+///
+/// Used by Qwen3.6-35B-A3B (`mtp.layers.0.mlp.experts.gate_up_proj` etc).
+pub struct Qwen35MtpMoeMlp {
+    // Router gate (AFFINE 8-bit, with biases — convention from native_moe).
+    pub gate_w: Array,
+    pub gate_s: Array,
+    pub gate_b: Array,
+    pub gate_gs: i32,
+    pub gate_bits: i32,
+    // Shared expert sigmoid gate (AFFINE 8-bit, with biases).
+    pub sg_w: Array,
+    pub sg_s: Array,
+    pub sg_b: Array,
+    pub sg_gs: i32,
+    pub sg_bits: i32,
+    // Switch GLU experts — 3D quantized [E, I, H_packed].
+    pub sw_gate_w: Array,
+    pub sw_gate_s: Array,
+    pub sw_up_w: Array,
+    pub sw_up_s: Array,
+    pub sw_down_w: Array,
+    pub sw_down_s: Array,
+    pub sw_gs: i32,
+    pub sw_bits: i32,
+    pub sw_mode: &'static CStr,
+    // Shared dense expert (MXFP4 group 32 — matches trunk).
+    pub se_gate_w: Array,
+    pub se_gate_s: Array,
+    pub se_up_w: Array,
+    pub se_up_s: Array,
+    pub se_down_w: Array,
+    pub se_down_s: Array,
+    pub se_gs: i32,
+    pub se_bits: i32,
+    pub se_mode: &'static CStr,
+    // Routing meta.
+    pub top_k: i32,
+    pub norm_topk_prob: bool,
+}
+
+/// MLP variant. Dense for 27B Qwen3.6, MoE for 35B-A3B.
 pub enum Qwen35MtpMlp {
     Dense(Qwen35MtpDenseMlp),
-    // Reserved: Moe(ResolvedMoeWeights),
+    Moe(Qwen35MtpMoeMlp),
+}
+
+/// Config for the MoE MTP variant — passed by the caller (parsed from
+/// `config.json` text_config).
+#[derive(Debug, Clone, Copy)]
+pub struct MtpMoeConfig {
+    pub num_experts: i32,
+    pub num_experts_per_tok: i32,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    pub norm_topk_prob: bool,
+}
+
+/// MLP topology + size config for `load_block_from_hf`. Dense for 27B, MoE
+/// for 35B-A3B.
+#[derive(Debug, Clone, Copy)]
+pub enum MtpMlpConfig {
+    Dense { intermediate_size: usize },
+    Moe(MtpMoeConfig),
 }
 
 /// Full resolved MTP block — input, attention, MLP, output norm/head.
@@ -197,16 +255,15 @@ impl Qwen35MtpBlock {
         let eps = self.dims.rms_norm_eps;
 
         // ── (1) enorm + hnorm + concat ───────────────────────────────────
-        let e_n = rms_norm(embeds, &self.enorm, eps)
-            .context("Qwen35MtpBlock: enorm failed")?;
-        let h_n = rms_norm(h_pre, &self.hnorm, eps)
-            .context("Qwen35MtpBlock: hnorm failed")?;
+        let e_n = rms_norm(embeds, &self.enorm, eps).context("Qwen35MtpBlock: enorm failed")?;
+        let h_n = rms_norm(h_pre, &self.hnorm, eps).context("Qwen35MtpBlock: hnorm failed")?;
         // DeepSeek-V3 / Qwen3.6 convention: [embed_norm, hidden_norm].
         let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)
             .context("Qwen35MtpBlock: concat(e_norm, h_norm) failed")?;
 
         // ── (2) eh_proj: [2*hidden] -> [hidden] ──────────────────────────
-        let mut cur = self.linear_pre(&self.eh_proj, &concat)
+        let mut cur = self
+            .linear_pre(&self.eh_proj, &concat)
             .context("Qwen35MtpBlock: eh_proj failed")?;
         cur = self.to_f32(cur, "eh_proj_out")?;
 
@@ -228,6 +285,9 @@ impl Qwen35MtpBlock {
             Qwen35MtpMlp::Dense(d) => self
                 .dense_mlp_forward(&cur_n, d)
                 .context("Qwen35MtpBlock: dense_mlp_forward failed")?,
+            Qwen35MtpMlp::Moe(m) => self
+                .moe_mlp_forward(&cur_n, m)
+                .context("Qwen35MtpBlock: moe_mlp_forward failed")?,
         };
         cur = mlx_rs::ops::add(&mlp_out, &res_ffn)
             .context("Qwen35MtpBlock: residual add (ffn) failed")?;
@@ -241,8 +301,7 @@ impl Qwen35MtpBlock {
             Some(w) => w,
             None => trunk_final_norm_weight,
         };
-        let norm_out = rms_norm(&cur, norm_w, eps)
-            .context("Qwen35MtpBlock: head norm failed")?;
+        let norm_out = rms_norm(&cur, norm_w, eps).context("Qwen35MtpBlock: head norm failed")?;
         let logits = self
             .linear_pre(trunk_lm_head, &norm_out)
             .context("Qwen35MtpBlock: lm_head failed")?;
@@ -289,8 +348,7 @@ impl Qwen35MtpBlock {
         let q_4d = mlx_rs::ops::reshape(&q_proj, &[b, t, num_heads, q_last_dim])
             .context("mtp.q reshape")?;
         let (queries, gate_opt) = if self.dims.attn_output_gate {
-            let parts = mlx_rs::ops::split(&q_4d, 2, -1)
-                .context("mtp.q split (queries|gate)")?;
+            let parts = mlx_rs::ops::split(&q_4d, 2, -1).context("mtp.q split (queries|gate)")?;
             if parts.len() != 2 {
                 return Err(anyhow!(
                     "mtp.q split returned {} parts (want 2)",
@@ -313,16 +371,14 @@ impl Qwen35MtpBlock {
             .context("mtp.queries transpose")?;
 
         // (2b) k/v: [B, T, num_kv, head_dim] -> k_norm -> transpose.
-        let k_4d = mlx_rs::ops::reshape(&k_proj, &[b, t, num_kv, head_dim])
-            .context("mtp.k reshape")?;
+        let k_4d =
+            mlx_rs::ops::reshape(&k_proj, &[b, t, num_kv, head_dim]).context("mtp.k reshape")?;
         let k_n = rms_norm(&k_4d, &attn.k_norm_weight, eps)?;
-        let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
-            .context("mtp.k transpose")?;
+        let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3]).context("mtp.k transpose")?;
 
-        let v_4d = mlx_rs::ops::reshape(&v_proj, &[b, t, num_kv, head_dim])
-            .context("mtp.v reshape")?;
-        let v_t = mlx_rs::ops::transpose_axes(&v_4d, &[0, 2, 1, 3])
-            .context("mtp.v transpose")?;
+        let v_4d =
+            mlx_rs::ops::reshape(&v_proj, &[b, t, num_kv, head_dim]).context("mtp.v reshape")?;
+        let v_t = mlx_rs::ops::transpose_axes(&v_4d, &[0, 2, 1, 3]).context("mtp.v transpose")?;
 
         // (4) Partial-rotary RoPE on queries + keys.
         let offset = cache.offset() as i32;
@@ -338,15 +394,12 @@ impl Qwen35MtpBlock {
         // (7) Reshape to [B, T, num_heads * head_dim] and apply optional gate.
         let attn_back = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3])
             .context("mtp.attn_out transpose")?;
-        let attn_flat =
-            mlx_rs::ops::reshape(&attn_back, &[b, t, num_heads * head_dim])
-                .context("mtp.attn_out reshape")?;
+        let attn_flat = mlx_rs::ops::reshape(&attn_back, &[b, t, num_heads * head_dim])
+            .context("mtp.attn_out reshape")?;
         let gated = match gate_opt {
             Some(gate) => {
-                let gate_sig = mlx_rs::ops::sigmoid(&gate)
-                    .context("mtp.sigmoid(gate)")?;
-                mlx_rs::ops::multiply(&attn_flat, &gate_sig)
-                    .context("mtp.gated multiply")?
+                let gate_sig = mlx_rs::ops::sigmoid(&gate).context("mtp.sigmoid(gate)")?;
+                mlx_rs::ops::multiply(&attn_flat, &gate_sig).context("mtp.gated multiply")?
             }
             None => attn_flat,
         };
@@ -359,11 +412,7 @@ impl Qwen35MtpBlock {
     /// Dense SwiGLU MLP. Same dispatch shape as the trunk's `shared_mlp`
     /// path in `native_moe::shared_mlp`: separate gate_proj + up_proj +
     /// silu(gate) * up + down_proj.
-    fn dense_mlp_forward(
-        &self,
-        x: &Array,
-        w: &Qwen35MtpDenseMlp,
-    ) -> Result<Array> {
+    fn dense_mlp_forward(&self, x: &Array, w: &Qwen35MtpDenseMlp) -> Result<Array> {
         let gate = self.linear_pre(&w.gate_proj, x)?;
         let gate = self.to_f32(gate, "mtp.mlp.gate")?;
         let up = self.linear_pre(&w.up_proj, x)?;
@@ -371,14 +420,71 @@ impl Qwen35MtpBlock {
         // SwiGLU: silu(gate) * up == sigmoid(gate) * gate * up. Mirrors the
         // expansion used in `native_moe::swiglu_compiled_inner` so a future
         // fuse pass can swap in the compiled-graph variant trivially.
-        let sig = mlx_rs::ops::sigmoid(&gate)
-            .context("mtp.mlp sigmoid(gate)")?;
-        let silu_gate = mlx_rs::ops::multiply(&gate, &sig)
-            .context("mtp.mlp gate * sig")?;
-        let activated = mlx_rs::ops::multiply(&silu_gate, &up)
-            .context("mtp.mlp silu(gate) * up")?;
+        let sig = mlx_rs::ops::sigmoid(&gate).context("mtp.mlp sigmoid(gate)")?;
+        let silu_gate = mlx_rs::ops::multiply(&gate, &sig).context("mtp.mlp gate * sig")?;
+        let activated =
+            mlx_rs::ops::multiply(&silu_gate, &up).context("mtp.mlp silu(gate) * up")?;
         let down = self.linear_pre(&w.down_proj, &activated)?;
         self.to_f32(down, "mtp.mlp.down")
+    }
+
+    /// MoE MLP — wraps `native_moe::moe_block_forward` with the MTP block's
+    /// resolved weights. Matches the trunk's middle-layer MoE dispatch.
+    fn moe_mlp_forward(&self, x: &Array, w: &Qwen35MtpMoeMlp) -> Result<Array> {
+        use crate::native_moe::{
+            AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
+            SwitchGluWeights, moe_block_forward,
+        };
+        let view = MoeBlockWeights {
+            gate: AffineGateWeights {
+                weight: &w.gate_w,
+                scales: &w.gate_s,
+                biases: &w.gate_b,
+                group_size: w.gate_gs,
+                bits: w.gate_bits,
+            },
+            switch_glu: SwitchGluWeights {
+                gate_proj: SwitchExpertWeights {
+                    weight: &w.sw_gate_w,
+                    scales: &w.sw_gate_s,
+                    biases: None,
+                },
+                up_proj: SwitchExpertWeights {
+                    weight: &w.sw_up_w,
+                    scales: &w.sw_up_s,
+                    biases: None,
+                },
+                down_proj: SwitchExpertWeights {
+                    weight: &w.sw_down_w,
+                    scales: &w.sw_down_s,
+                    biases: None,
+                },
+                group_size: w.sw_gs,
+                bits: w.sw_bits,
+                mode: w.sw_mode,
+            },
+            shared_expert: SharedMlpWeights {
+                gate_proj_w: &w.se_gate_w,
+                gate_proj_s: &w.se_gate_s,
+                up_proj_w: &w.se_up_w,
+                up_proj_s: &w.se_up_s,
+                down_proj_w: &w.se_down_w,
+                down_proj_s: &w.se_down_s,
+                group_size: w.se_gs,
+                bits: w.se_bits,
+                mode: w.se_mode,
+            },
+            shared_gate: AffineGateWeights {
+                weight: &w.sg_w,
+                scales: &w.sg_s,
+                biases: &w.sg_b,
+                group_size: w.sg_gs,
+                bits: w.sg_bits,
+            },
+            top_k: w.top_k,
+            norm_topk_prob: w.norm_topk_prob,
+        };
+        moe_block_forward(x, &view)
     }
 
     fn linear_pre(&self, lin: &Qwen35MtpLinear, x: &Array) -> Result<Array> {
@@ -533,7 +639,7 @@ impl MtpLoadQuant {
 pub fn load_block_from_hf(
     hf_dir: &std::path::Path,
     dims: Qwen35MtpDims,
-    intermediate_size: usize,
+    mlp_config: MtpMlpConfig,
     quant: MtpLoadQuant,
 ) -> Result<Qwen35MtpBlock> {
     use crate::native_quant::quantize_with_mode;
@@ -601,27 +707,22 @@ pub fn load_block_from_hf(
     }
 
     // 4) Helpers for fetching + validating named tensors.
-    let take_tensor = |tensors: &mut HashMap<String, Array>,
-                       name: &str,
-                       expect_shape: &[i32]|
-     -> Result<Array> {
-        let arr = tensors
-            .remove(name)
-            .ok_or_else(|| anyhow!("HF mtp.* missing key `{name}`"))?;
-        let got: Vec<i32> = arr.shape().to_vec();
-        if got != expect_shape {
-            return Err(anyhow!(
-                "{name}: shape mismatch (got {got:?}, want {expect_shape:?})"
-            ));
-        }
-        Ok(arr)
-    };
+    let take_tensor =
+        |tensors: &mut HashMap<String, Array>, name: &str, expect_shape: &[i32]| -> Result<Array> {
+            let arr = tensors
+                .remove(name)
+                .ok_or_else(|| anyhow!("HF mtp.* missing key `{name}`"))?;
+            let got: Vec<i32> = arr.shape().to_vec();
+            if got != expect_shape {
+                return Err(anyhow!(
+                    "{name}: shape mismatch (got {got:?}, want {expect_shape:?})"
+                ));
+            }
+            Ok(arr)
+        };
 
     // Norm tensors stay bf16 (or whatever the original ships) -- no quant.
-    let take_norm = |tensors: &mut HashMap<String, Array>,
-                     name: &str,
-                     dim: i32|
-     -> Result<Array> {
+    let take_norm = |tensors: &mut HashMap<String, Array>, name: &str, dim: i32| -> Result<Array> {
         let arr = take_tensor(tensors, name, &[dim])?;
         Ok(arr)
     };
@@ -661,7 +762,6 @@ pub fn load_block_from_hf(
     let q_out = num_heads * head_dim * if dims.attn_output_gate { 2 } else { 1 };
     let kv_out = num_kv * head_dim;
     let v_dim = num_heads * head_dim;
-    let inter = intermediate_size as i32;
 
     // 5) Build linears + norms.
     let eh_proj = take_linear(&mut tensors, "mtp.fc.weight", [hidden, 2 * hidden])?;
@@ -673,11 +773,7 @@ pub fn load_block_from_hf(
         // the checkpoint omits it the block falls back to trunk's final_norm.
         Err(_) => None,
     };
-    let input_layernorm = take_norm(
-        &mut tensors,
-        "mtp.layers.0.input_layernorm.weight",
-        hidden,
-    )?;
+    let input_layernorm = take_norm(&mut tensors, "mtp.layers.0.input_layernorm.weight", hidden)?;
     let post_attention_layernorm = take_norm(
         &mut tensors,
         "mtp.layers.0.post_attention_layernorm.weight",
@@ -717,23 +813,31 @@ pub fn load_block_from_hf(
         )?,
     };
 
-    let mlp = Qwen35MtpMlp::Dense(Qwen35MtpDenseMlp {
-        gate_proj: take_linear(
-            &mut tensors,
-            "mtp.layers.0.mlp.gate_proj.weight",
-            [inter, hidden],
-        )?,
-        up_proj: take_linear(
-            &mut tensors,
-            "mtp.layers.0.mlp.up_proj.weight",
-            [inter, hidden],
-        )?,
-        down_proj: take_linear(
-            &mut tensors,
-            "mtp.layers.0.mlp.down_proj.weight",
-            [hidden, inter],
-        )?,
-    });
+    let mlp = match mlp_config {
+        MtpMlpConfig::Dense { intermediate_size } => {
+            let inter = intermediate_size as i32;
+            Qwen35MtpMlp::Dense(Qwen35MtpDenseMlp {
+                gate_proj: take_linear(
+                    &mut tensors,
+                    "mtp.layers.0.mlp.gate_proj.weight",
+                    [inter, hidden],
+                )?,
+                up_proj: take_linear(
+                    &mut tensors,
+                    "mtp.layers.0.mlp.up_proj.weight",
+                    [inter, hidden],
+                )?,
+                down_proj: take_linear(
+                    &mut tensors,
+                    "mtp.layers.0.mlp.down_proj.weight",
+                    [hidden, inter],
+                )?,
+            })
+        }
+        MtpMlpConfig::Moe(moe) => {
+            Qwen35MtpMlp::Moe(load_moe_mlp_from_tensors(&mut tensors, hidden, moe)?)
+        }
+    };
 
     // 6) Drain check: if any mtp.* tensors are left over we likely missed
     //    an intentionally optional field — warn but don't fail.
@@ -755,6 +859,155 @@ pub fn load_block_from_hf(
         post_attention_layernorm,
         mlp,
         shared_head_norm,
+    })
+}
+
+/// Helper for `load_block_from_hf`: pull the MoE MTP tensors out of the
+/// `mtp.*` bag, quantize the bf16 originals into trunk-matching layouts, and
+/// produce a `Qwen35MtpMoeMlp` ready for `moe_block_forward`.
+///
+/// Conventions (matching the trunk's middle-layer MoE in `qwen3_5_moe.rs`):
+///   * `mtp.layers.0.mlp.gate` + `shared_expert_gate` — AFFINE 8-bit, group 64,
+///     biases generated by `mlx_quantize`.
+///   * `mtp.layers.0.mlp.shared_expert.{gate,up,down}_proj` — MXFP4 group 32.
+///   * `mtp.layers.0.mlp.experts.gate_up_proj` — bf16 fused
+///     `[E, 2*I, H]`; split along axis 1 into 2x `[E, I, H]` then MXFP4 group 32.
+///   * `mtp.layers.0.mlp.experts.down_proj` — bf16 `[E, H, I]`; MXFP4 group 32.
+fn load_moe_mlp_from_tensors(
+    tensors: &mut std::collections::HashMap<String, Array>,
+    hidden: i32,
+    moe: MtpMoeConfig,
+) -> Result<Qwen35MtpMoeMlp> {
+    use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, quantize_with_mode};
+
+    let e = moe.num_experts;
+    let i_per_expert = moe.moe_intermediate_size as i32;
+    let i_shared = moe.shared_expert_intermediate_size as i32;
+
+    // Helpers for fetching/validating named tensors out of the bag.
+    let take = |tensors: &mut std::collections::HashMap<String, Array>,
+                name: &str,
+                expect: &[i32]|
+     -> Result<Array> {
+        let arr = tensors
+            .remove(name)
+            .ok_or_else(|| anyhow!("MoE MTP loader: missing key `{name}`"))?;
+        let got: Vec<i32> = arr.shape().to_vec();
+        if got != expect {
+            return Err(anyhow!(
+                "{name}: shape mismatch (got {got:?}, want {expect:?})"
+            ));
+        }
+        Ok(arr)
+    };
+
+    // ── Router gate (AFFINE 8-bit, group 64) ──────────────────────────────
+    let gate_w_bf16 = take(tensors, "mtp.layers.0.mlp.gate.weight", &[e, hidden])?;
+    let (gate_w, gate_s, gate_b_opt) = quantize_with_mode(&gate_w_bf16, 64, 8, MODE_AFFINE)
+        .context("MoE MTP: quantize gate.weight")?;
+    let gate_b = gate_b_opt
+        .ok_or_else(|| anyhow!("MoE MTP: gate quant must produce biases (AFFINE mode)"))?;
+
+    // ── Shared-expert sigmoid gate (AFFINE 8-bit, group 64, output 1) ─────
+    let sg_w_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+        &[1, hidden],
+    )?;
+    let (sg_w, sg_s, sg_b_opt) = quantize_with_mode(&sg_w_bf16, 64, 8, MODE_AFFINE)
+        .context("MoE MTP: quantize shared_expert_gate.weight")?;
+    let sg_b =
+        sg_b_opt.ok_or_else(|| anyhow!("MoE MTP: shared_expert_gate quant must produce biases"))?;
+
+    // ── Switch GLU experts (MXFP4 group 32) ───────────────────────────────
+    // Fused `experts.gate_up_proj` ships as bf16 [E, 2*I, H]. We split along
+    // axis 1 — first I rows are gate_proj, next I rows are up_proj — then
+    // quantize each 3D tile independently. Matches what mlx-lm's
+    // sanitize() + MXFP4 conversion script would have produced for the
+    // trunk's middle layers.
+    let gu_fused_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        &[e, 2 * i_per_expert, hidden],
+    )?;
+    let halves =
+        mlx_rs::ops::split(&gu_fused_bf16, 2, 1).context("MoE MTP: split fused gate_up_proj")?;
+    if halves.len() != 2 {
+        return Err(anyhow!(
+            "MoE MTP: split(gate_up_proj) returned {} parts (want 2)",
+            halves.len()
+        ));
+    }
+    let mut halves_iter = halves.into_iter();
+    let gate_tile_bf16 = halves_iter.next().expect("gate half present");
+    let up_tile_bf16 = halves_iter.next().expect("up half present");
+    let (sw_gate_w, sw_gate_s, _) = quantize_with_mode(&gate_tile_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize experts.gate tile (MXFP4)")?;
+    let (sw_up_w, sw_up_s, _) = quantize_with_mode(&up_tile_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize experts.up tile (MXFP4)")?;
+
+    let down_3d_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.experts.down_proj",
+        &[e, hidden, i_per_expert],
+    )?;
+    let (sw_down_w, sw_down_s, _) = quantize_with_mode(&down_3d_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize experts.down (MXFP4)")?;
+
+    // ── Shared dense expert (MXFP4 group 32) ──────────────────────────────
+    let se_gate_w_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        &[i_shared, hidden],
+    )?;
+    let se_up_w_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        &[i_shared, hidden],
+    )?;
+    let se_down_w_bf16 = take(
+        tensors,
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        &[hidden, i_shared],
+    )?;
+    let (se_gate_w, se_gate_s, _) = quantize_with_mode(&se_gate_w_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize shared_expert.gate_proj")?;
+    let (se_up_w, se_up_s, _) = quantize_with_mode(&se_up_w_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize shared_expert.up_proj")?;
+    let (se_down_w, se_down_s, _) = quantize_with_mode(&se_down_w_bf16, 32, 4, MODE_MXFP4)
+        .context("MoE MTP: quantize shared_expert.down_proj")?;
+
+    Ok(Qwen35MtpMoeMlp {
+        gate_w,
+        gate_s,
+        gate_b,
+        gate_gs: 64,
+        gate_bits: 8,
+        sg_w,
+        sg_s,
+        sg_b,
+        sg_gs: 64,
+        sg_bits: 8,
+        sw_gate_w,
+        sw_gate_s,
+        sw_up_w,
+        sw_up_s,
+        sw_down_w,
+        sw_down_s,
+        sw_gs: 32,
+        sw_bits: 4,
+        sw_mode: MODE_MXFP4,
+        se_gate_w,
+        se_gate_s,
+        se_up_w,
+        se_up_s,
+        se_down_w,
+        se_down_s,
+        se_gs: 32,
+        se_bits: 4,
+        se_mode: MODE_MXFP4,
+        top_k: moe.num_experts_per_tok,
+        norm_topk_prob: moe.norm_topk_prob,
     })
 }
 
@@ -780,13 +1033,9 @@ pub fn smoke_forward_with_synth_trunk(
     // group_size matching eh_proj). For mature wiring the real trunk lm_head
     // gets threaded in here.
     let group_size = block.eh_proj.group_size;
-    let lm_head_w_f32 = mlx_rs::random::uniform::<_, f32>(
-        -0.05f32,
-        0.05f32,
-        &[vocab_size as i32, hidden],
-        None,
-    )
-    .context("smoke_forward: random lm_head failed")?;
+    let lm_head_w_f32 =
+        mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[vocab_size as i32, hidden], None)
+            .context("smoke_forward: random lm_head failed")?;
     let lm_head_w_bf16 = lm_head_w_f32
         .as_dtype(mlx_rs::Dtype::Bfloat16)
         .context("smoke_forward: bf16 cast")?;
@@ -807,24 +1056,21 @@ pub fn smoke_forward_with_synth_trunk(
         .context("smoke_forward: final_norm bf16 cast")?;
 
     // Synthetic inputs at [1, 1, hidden].
-    let embeds = mlx_rs::random::uniform::<_, f32>(
-        -0.05f32,
-        0.05f32,
-        &[1, 1, hidden],
-        None,
-    )
-    .context("smoke_forward: random embeds")?;
-    let h_pre = mlx_rs::random::uniform::<_, f32>(
-        -0.05f32,
-        0.05f32,
-        &[1, 1, hidden],
-        None,
-    )
-    .context("smoke_forward: random h_pre")?;
+    let embeds = mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[1, 1, hidden], None)
+        .context("smoke_forward: random embeds")?;
+    let h_pre = mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[1, 1, hidden], None)
+        .context("smoke_forward: random h_pre")?;
     let mut cache = NativeKvCache::new();
 
     let (logits, _new_h) = block
-        .forward(&embeds, &h_pre, &mut cache, false, &trunk_final_norm_w, &trunk_lm_head)
+        .forward(
+            &embeds,
+            &h_pre,
+            &mut cache,
+            false,
+            &trunk_final_norm_w,
+            &trunk_lm_head,
+        )
         .context("smoke_forward: block.forward")?;
     logits.eval().context("smoke_forward: eval logits")?;
 
@@ -838,8 +1084,8 @@ pub fn smoke_forward_with_synth_trunk(
     let argmax_val: u32 = argmax
         .try_item::<i32>()
         .context("smoke_forward: argmax item")? as u32;
-    let max_val_arr = mlx_rs::ops::max_axis(&logits_flat, 0, false)
-        .context("smoke_forward: max")?;
+    let max_val_arr =
+        mlx_rs::ops::max_axis(&logits_flat, 0, false).context("smoke_forward: max")?;
     max_val_arr.eval().context("smoke_forward: max eval")?;
     let max_val: f32 = max_val_arr
         .try_item::<f32>()
@@ -885,10 +1131,7 @@ pub struct StepBBenchPoint {
 ///
 /// `t_values`: input row counts to probe. AR draft: T=1; verify-with-K=1: T=2.
 /// `runs`: number of forward calls per T. First is dropped as warmup.
-pub fn run_step_b_synthetic_bench(
-    t_values: &[i32],
-    runs: usize,
-) -> Result<Vec<StepBBenchPoint>> {
+pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<StepBBenchPoint>> {
     use crate::native_cache::NativeKvCache;
     use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
@@ -935,19 +1178,13 @@ pub fn run_step_b_synthetic_bench(
         // a synthetic weight payload. The exact distribution doesn't affect
         // latency (FFI graph is shape-only) — but matching real-weight
         // magnitudes (small) avoids overflow paths in MXFP4 dequant.
-        let w_f32 = mlx_rs::random::uniform::<_, f32>(
-            -0.05f32,
-            0.05f32,
-            &[out, in_],
-            None,
-        )
-        .with_context(|| format!("{label}: random.uniform failed"))?;
+        let w_f32 = mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[out, in_], None)
+            .with_context(|| format!("{label}: random.uniform failed"))?;
         let w_bf16 = w_f32
             .as_dtype(mlx_rs::Dtype::Bfloat16)
             .with_context(|| format!("{label}: cast bf16 failed"))?;
-        let (packed, scales, biases) =
-            quantize_with_mode(&w_bf16, group_size, bits, mode)
-                .with_context(|| format!("{label}: quantize_with_mode failed"))?;
+        let (packed, scales, biases) = quantize_with_mode(&w_bf16, group_size, bits, mode)
+            .with_context(|| format!("{label}: quantize_with_mode failed"))?;
         Ok(Qwen35MtpLinear {
             weight: packed,
             scales,
@@ -960,8 +1197,8 @@ pub fn run_step_b_synthetic_bench(
 
     // Helper: bf16 ones vector for RMSNorm weights.
     let ones_bf16 = |dim: i32, label: &str| -> Result<Array> {
-        let v = mlx_rs::ops::ones::<f32>(&[dim])
-            .with_context(|| format!("{label}: ones failed"))?;
+        let v =
+            mlx_rs::ops::ones::<f32>(&[dim]).with_context(|| format!("{label}: ones failed"))?;
         v.as_dtype(mlx_rs::Dtype::Bfloat16)
             .with_context(|| format!("{label}: bf16 cast failed"))
     };
@@ -1013,20 +1250,10 @@ pub fn run_step_b_synthetic_bench(
 
         // Random embeds + h_pre at [1, T, hidden]. f32 to match the trunk
         // hidden's working dtype (post mlx-fast.rms_norm).
-        let embeds = mlx_rs::random::uniform::<_, f32>(
-            -0.05f32,
-            0.05f32,
-            &[1, t, hidden],
-            None,
-        )
-        .context("random embeds")?;
-        let h_pre = mlx_rs::random::uniform::<_, f32>(
-            -0.05f32,
-            0.05f32,
-            &[1, t, hidden],
-            None,
-        )
-        .context("random h_pre")?;
+        let embeds = mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[1, t, hidden], None)
+            .context("random embeds")?;
+        let h_pre = mlx_rs::random::uniform::<_, f32>(-0.05f32, 0.05f32, &[1, t, hidden], None)
+            .context("random h_pre")?;
 
         // causal=true when T>1 (matches the verify-batch path).
         let causal = t > 1;

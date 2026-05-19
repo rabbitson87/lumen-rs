@@ -10,7 +10,7 @@
 
 #![cfg(feature = "model-integration")]
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use lumen_metal::flash_attn::{flash_attn_candle, set_disabled, set_sdpa_vector_enabled};
 
 fn metal_device() -> Option<Device> {
@@ -99,7 +99,7 @@ fn make_qkv(
     // Deterministic test data — sin/cos based, range [-1, 1].
     let make = |elems: usize, phase: f32| -> Vec<f32> {
         (0..elems)
-            .map(|i| ((i as f32 * 0.013 + phase).sin() * 0.5))
+            .map(|i| (i as f32 * 0.013 + phase).sin() * 0.5)
             .collect()
     };
     let q_data = make(b * h * sq * d, 0.0);

@@ -450,15 +450,9 @@ mod imp {
             if s0 != 0 || s1 != 0 {
                 let _ = mlx_sys::mlx_array_free(packed);
                 let _ = mlx_sys::mlx_array_free(scales);
-                return Err(anyhow!(
-                    "mlx_vector_array_get failed: statuses {s0}/{s1}"
-                ));
+                return Err(anyhow!("mlx_vector_array_get failed: statuses {s0}/{s1}"));
             }
-            Ok((
-                Array::from_ptr(packed),
-                Array::from_ptr(scales),
-                biases_opt,
-            ))
+            Ok((Array::from_ptr(packed), Array::from_ptr(scales), biases_opt))
         }
     }
 }

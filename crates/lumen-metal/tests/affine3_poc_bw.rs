@@ -24,7 +24,6 @@
 
 use lumen_metal::affine3_gpu::{AFFINE3_GROUP_SIZE, Affine3Context, Affine3Weight};
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
-use lumen_metal::device::MetalContext;
 use std::time::Instant;
 
 const ITERS: usize = 1000;

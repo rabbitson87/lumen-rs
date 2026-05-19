@@ -74,15 +74,13 @@ fn make_qmv_fast_pipeline(
     desc.setComputeFunction(Some(&function));
     desc.setSupportIndirectCommandBuffers(true);
 
-    unsafe {
-        device
-            .newComputePipelineStateWithDescriptor_options_reflection_error(
-                &desc,
-                MTLPipelineOption::None,
-                None,
-            )
-            .expect("pipeline failed")
-    }
+    device
+        .newComputePipelineStateWithDescriptor_options_reflection_error(
+            &desc,
+            MTLPipelineOption::None,
+            None,
+        )
+        .expect("pipeline failed")
 }
 
 fn alloc_buffer(
@@ -189,7 +187,7 @@ fn run_64_standard(
     }
     enc.endEncoding();
     cb.commit();
-    unsafe { cb.waitUntilCompleted() };
+    cb.waitUntilCompleted();
 }
 
 fn run_64_icb(
@@ -215,7 +213,7 @@ fn run_64_icb(
     }
     enc.endEncoding();
     cb.commit();
-    unsafe { cb.waitUntilCompleted() };
+    cb.waitUntilCompleted();
 }
 
 fn record_64_icb(

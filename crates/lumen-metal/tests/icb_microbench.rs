@@ -72,11 +72,9 @@ fn make_pipeline(
 ) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
     let opts = MTLCompileOptions::new();
     let src = objc2_foundation::NSString::from_str(NOOP_SHADER);
-    let library = unsafe {
-        device
-            .newLibraryWithSource_options_error(&src, Some(&opts))
-            .expect("newLibraryWithSource failed")
-    };
+    let library = device
+        .newLibraryWithSource_options_error(&src, Some(&opts))
+        .expect("newLibraryWithSource failed");
     let name = objc2_foundation::NSString::from_str("noop_7bufs");
     let function = library
         .newFunctionWithName(&name)
@@ -89,15 +87,13 @@ fn make_pipeline(
     desc.setComputeFunction(Some(&function));
     desc.setSupportIndirectCommandBuffers(true);
 
-    unsafe {
-        device
-            .newComputePipelineStateWithDescriptor_options_reflection_error(
-                &desc,
-                MTLPipelineOption::None,
-                None,
-            )
-            .expect("newComputePipelineStateWithDescriptor failed")
-    }
+    device
+        .newComputePipelineStateWithDescriptor_options_reflection_error(
+            &desc,
+            MTLPipelineOption::None,
+            None,
+        )
+        .expect("newComputePipelineStateWithDescriptor failed")
 }
 
 /// Submit an empty CB and block until done. Forces all previously committed
@@ -106,7 +102,7 @@ fn make_pipeline(
 fn drain_queue(queue: &ProtocolObject<dyn MTLCommandQueue>) {
     let cb = queue.commandBuffer().expect("commandBuffer nil");
     cb.commit();
-    unsafe { cb.waitUntilCompleted() };
+    cb.waitUntilCompleted();
 }
 
 fn alloc_buf(
@@ -147,7 +143,7 @@ fn run_standard_n(
     enc.endEncoding();
     cb.commit();
     if wait {
-        unsafe { cb.waitUntilCompleted() };
+        cb.waitUntilCompleted();
     }
 }
 
@@ -183,7 +179,7 @@ fn run_icb_n(
     enc.endEncoding();
     cb.commit();
     if wait {
-        unsafe { cb.waitUntilCompleted() };
+        cb.waitUntilCompleted();
     }
 }
 

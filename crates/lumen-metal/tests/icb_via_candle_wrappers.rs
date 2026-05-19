@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use lumen_metal::device::MetalContext;
 use lumen_metal::metal::{Buffer, IndirectCommandBuffer};
-use objc2_metal::{MTLBuffer, MTLResourceUsage, MTLSize};
+use objc2_metal::{MTLResourceUsage, MTLSize};
 
 const SHADER_SRC: &str = include_str!("../src/shaders/affine4.metal");
 const N_PER_CB: usize = 64;

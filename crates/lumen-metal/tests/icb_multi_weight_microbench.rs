@@ -70,15 +70,13 @@ fn make_qmv_fast_pipeline(
     let desc = MTLComputePipelineDescriptor::new();
     desc.setComputeFunction(Some(&function));
     desc.setSupportIndirectCommandBuffers(true);
-    unsafe {
-        device
-            .newComputePipelineStateWithDescriptor_options_reflection_error(
-                &desc,
-                MTLPipelineOption::None,
-                None,
-            )
-            .expect("pipeline failed")
-    }
+    device
+        .newComputePipelineStateWithDescriptor_options_reflection_error(
+            &desc,
+            MTLPipelineOption::None,
+            None,
+        )
+        .expect("pipeline failed")
 }
 
 fn alloc_buffer(
@@ -187,7 +185,7 @@ fn run_64_standard_cycle(
     }
     enc.endEncoding();
     cb.commit();
-    unsafe { cb.waitUntilCompleted() };
+    cb.waitUntilCompleted();
 }
 
 fn run_64_icb(
@@ -213,7 +211,7 @@ fn run_64_icb(
     }
     enc.endEncoding();
     cb.commit();
-    unsafe { cb.waitUntilCompleted() };
+    cb.waitUntilCompleted();
 }
 
 fn record_icb_cycle(

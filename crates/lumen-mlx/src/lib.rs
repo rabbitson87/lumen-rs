@@ -114,9 +114,11 @@ mod qwen3_5_mtp;
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
 // math before investing in the HF-native loader + runner wiring.
+#[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::MtpStepOutput;
 pub use qwen3_5_mtp::{
-    MtpLoadQuant, Qwen35MtpBlock, Qwen35MtpDims, StepBBenchPoint, load_block_from_hf,
-    run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
+    MtpLoadQuant, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock, Qwen35MtpDims, StepBBenchPoint,
+    load_block_from_hf, run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
 };
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
@@ -470,6 +472,43 @@ impl RunnerImpl {
             )),
         }
     }
+
+    /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
+    /// Phase 2 S3 wiring — see `qwen3_5_moe::mtp_step` for cycle semantics.
+    #[cfg(feature = "mlx-native")]
+    fn enable_qwen35_mtp(&mut self, block: crate::qwen3_5_mtp::Qwen35MtpBlock) -> Result<()> {
+        match self {
+            Self::Native(r) => r.enable_mtp(block),
+            _ => Err(anyhow!(
+                "enable_qwen35_mtp is only supported on the native (mlx-rs) backend; \
+                 set LUMEN_MLX_BACKEND=native"
+            )),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn qwen35_mtp_enabled(&self) -> bool {
+        match self {
+            Self::Native(r) => r.mtp_enabled(),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn qwen35_mtp_step(
+        &mut self,
+        seq_id: u64,
+        committed_token: u32,
+        n_draft: usize,
+    ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
+        match self {
+            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft),
+            _ => Err(anyhow!(
+                "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
+                 set LUMEN_MLX_BACKEND=native"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,6 +636,25 @@ fn read_prefix_cache_limits() -> (bool, Option<Duration>, Option<usize>) {
 /// Compute a process-stable cache key for a chat request based on the system
 /// message content. Returns `None` if there is no system message to share —
 /// the prefix cache only ever shares the system-prompt block.
+/// Phase 2 S4 — opt-in MTP routing for the Qwen3.5 streaming decode.
+/// Returns `Some(k)` when `LUMEN_SPEC=mtp` is set; respects `LUMEN_SPEC_K`
+/// for the draft count (default 2 to match the S1.5 cycle-math sweet spot).
+/// Returns `None` for any other `LUMEN_SPEC` value (`ngram`, unset, ...) so
+/// the existing n-gram path keeps working unchanged.
+#[cfg(feature = "mlx-native")]
+fn read_qwen35_mtp_k_from_env() -> Option<usize> {
+    let spec = std::env::var("LUMEN_SPEC").ok()?;
+    if !spec.eq_ignore_ascii_case("mtp") {
+        return None;
+    }
+    let k: usize = std::env::var("LUMEN_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(2);
+    Some(k)
+}
+
 fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     let (role, content) = messages.first()?;
     if role != "system" || content.is_empty() {
@@ -1016,7 +1074,7 @@ impl MlxQwen35Backend {
             }
         }
 
-        Ok(Self {
+        let mut me = Self {
             runner,
             model_id: model_id.to_string(),
             eos_tokens,
@@ -1030,7 +1088,15 @@ impl MlxQwen35Backend {
             prefix_cache_enabled,
             prefix_cache_ttl,
             prefix_cache_max,
-        })
+        };
+        // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
+        // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
+        // non-fatal: we log + continue with the baseline decode path.
+        #[cfg(feature = "mlx-native")]
+        if let Err(err) = me.try_enable_qwen35_mtp_from_env() {
+            eprintln!("[mlx] qwen3.5 MTP auto-enable skipped: {err}");
+        }
+        Ok(me)
     }
 
     pub fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
@@ -1109,6 +1175,133 @@ impl MlxQwen35Backend {
     ) -> Result<(u32, usize, Vec<mlx_rs::Array>)> {
         self.runner
             .prefill_with_capture(seq_id, tokens, capture_layer_ids)
+    }
+
+    /// Install a loaded Qwen3.5/3.6 MTP drafter block. Native-only (errors on
+    /// PyO3 / Subprocess runners). After enable, callers may use
+    /// [`Self::qwen35_mtp_step`] to advance one speculative cycle. Phase 2
+    /// S3 surface — gating + opt-in env lives in the upper engine.
+    #[cfg(feature = "mlx-native")]
+    pub fn enable_qwen35_mtp(&mut self, block: crate::qwen3_5_mtp::Qwen35MtpBlock) -> Result<()> {
+        self.runner.enable_qwen35_mtp(block)
+    }
+
+    /// True once an MTP drafter has been installed on this backend.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_mtp_enabled(&self) -> bool {
+        self.runner.qwen35_mtp_enabled()
+    }
+
+    /// Advance one MTP speculative cycle. See `qwen3_5_moe::mtp_step` for
+    /// the Step A-E contract. Returns the committed token list (length
+    /// `1 + n_accepted + 1`); the LAST element must be fed as
+    /// `committed_token` to the next call.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_mtp_step(
+        &mut self,
+        seq_id: u64,
+        committed_token: u32,
+        n_draft: usize,
+    ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
+        self.runner
+            .qwen35_mtp_step(seq_id, committed_token, n_draft)
+    }
+
+    /// Env-driven MTP auto-enable hook called at the end of `load()`.
+    /// Triggered by `LUMEN_QWEN35_MTP=1`. Resolves the HF-original snapshot
+    /// directory holding the bf16 `mtp.*` tensors from
+    /// `LUMEN_QWEN35_HF_ORIGINAL` (required when MTP is enabled), detects the
+    /// trunk variant (27B Dense vs 35B-A3B MoE) from the model_id substring,
+    /// loads the block via `load_block_from_hf` (AFFINE4 group_size=64), and
+    /// installs it through `enable_qwen35_mtp`. Returns `Err` only when the
+    /// user-facing config is broken (env present but path missing / invalid
+    /// dims / dtype) — propagated by the caller as a non-fatal warning so
+    /// the server boots even if MTP weights are absent.
+    #[cfg(feature = "mlx-native")]
+    fn try_enable_qwen35_mtp_from_env(&mut self) -> Result<()> {
+        let on = std::env::var("LUMEN_QWEN35_MTP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !on {
+            return Ok(());
+        }
+        // Honored only on the native runner — non-native runners surface a
+        // clear error so misconfigured deployments fail loudly.
+        if !matches!(self.runner, RunnerImpl::Native(_)) {
+            return Err(anyhow!(
+                "LUMEN_QWEN35_MTP=1 requires the native runner (set LUMEN_MLX_BACKEND=native)"
+            ));
+        }
+        let hf_dir = std::env::var("LUMEN_QWEN35_HF_ORIGINAL").map_err(|_| {
+            anyhow!(
+                "LUMEN_QWEN35_MTP=1 requires LUMEN_QWEN35_HF_ORIGINAL to point at an HF-original \
+                 snapshot directory holding `mtp.*` tensors (e.g. \
+                 ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/<hash>)"
+            )
+        })?;
+        let hf_path = std::path::PathBuf::from(&hf_dir);
+        if !hf_path.is_dir() {
+            return Err(anyhow!(
+                "LUMEN_QWEN35_HF_ORIGINAL `{hf_dir}` is not a directory"
+            ));
+        }
+        // Dim detection from model_id — same substring rules as the server's
+        // `is_qwen3_5_dense`. 27B = Dense; everything else under the Qwen3.6
+        // family with mtp.* = MoE (35B-A3B currently).
+        let lower = self.model_id.to_lowercase();
+        let is_27b_dense = (lower.contains("qwen3.6") || lower.contains("qwen3_5"))
+            && !lower.contains("a3b")
+            && !lower.contains("moe")
+            && (lower.contains("27b") || lower.contains("-27-") || lower.contains("-dense"));
+        let (dims, mlp_cfg, label) = if is_27b_dense {
+            (
+                crate::qwen3_5_mtp::Qwen35MtpDims {
+                    hidden_size: 5120,
+                    num_attention_heads: 24,
+                    num_key_value_heads: 4,
+                    head_dim: 256,
+                    rope_theta: 10_000_000.0,
+                    rope_dim: 64,
+                    rms_norm_eps: 1e-6,
+                    attn_output_gate: true,
+                },
+                crate::qwen3_5_mtp::MtpMlpConfig::Dense {
+                    intermediate_size: 17_408,
+                },
+                "Qwen3.6-27B (Dense)",
+            )
+        } else {
+            // Default to the 35B-A3B MoE shape — matches the published
+            // checkpoint and the bench_qwen35_mtp_loader_smoke.rs 35b branch.
+            (
+                crate::qwen3_5_mtp::Qwen35MtpDims {
+                    hidden_size: 2048,
+                    num_attention_heads: 16,
+                    num_key_value_heads: 2,
+                    head_dim: 256,
+                    rope_theta: 10_000_000.0,
+                    rope_dim: 64,
+                    rms_norm_eps: 1e-6,
+                    attn_output_gate: true,
+                },
+                crate::qwen3_5_mtp::MtpMlpConfig::Moe(crate::qwen3_5_mtp::MtpMoeConfig {
+                    num_experts: 256,
+                    num_experts_per_tok: 8,
+                    moe_intermediate_size: 512,
+                    shared_expert_intermediate_size: 512,
+                    norm_topk_prob: true,
+                }),
+                "Qwen3.6-35B-A3B (MoE)",
+            )
+        };
+        let quant = crate::qwen3_5_mtp::MtpLoadQuant::Affine4 { group_size: 64 };
+        let t0 = std::time::Instant::now();
+        let block = crate::qwen3_5_mtp::load_block_from_hf(&hf_path, dims, mlp_cfg, quant)
+            .with_context(|| format!("load_block_from_hf({})", hf_path.display()))?;
+        self.enable_qwen35_mtp(block)?;
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[mlx] qwen3.5 MTP ENABLED ({label}, AFFINE4 gs=64) in {dt:.0}ms");
+        Ok(())
     }
 
     /// Capture the seq's per-layer cache state. Returns an opaque snapshot id.
@@ -1205,6 +1398,25 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
+        // Phase 2 S4 — MTP routing. `LUMEN_SPEC=mtp` activates the
+        // qwen3_5_mtp speculative path when (1) the native runner installed
+        // a drafter (via LUMEN_QWEN35_MTP=1 at load), and (2) the request
+        // hasn't opted out. Falls back to baseline decode_step otherwise so
+        // unmtp-loaded deployments behave identically.
+        #[cfg(feature = "mlx-native")]
+        if let Some(k) = read_qwen35_mtp_k_from_env() {
+            if self.qwen35_mtp_enabled() {
+                return self.chat_streaming_qwen35_mtp(
+                    messages,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    k,
+                    on_token,
+                );
+            }
+        }
+
         if let Some(cfg) = spec_decode::read_spec_config() {
             return self.chat_streaming_spec_ngram(
                 messages,
@@ -1855,6 +2067,121 @@ impl MlxQwen35Backend {
         eprintln!(
             "[mlx-spec] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
             n_gen as f64 / (decode_ms / 1000.0)
+        );
+        let out = self.decode(&generated).unwrap_or_default();
+        self.remove_seq(seq_id).ok();
+        Ok(out)
+    }
+
+    /// Phase 2 S4 — Qwen3.5 MTP streaming chat. Drop-in replacement for
+    /// `chat_streaming` that routes the decode loop through
+    /// `qwen35_mtp_step` (Step A-E orchestration) instead of `decode_step`.
+    /// Each cycle commits 1 + n_accepted + 1 tokens at once; EOS detection
+    /// and `max_new_tokens` clamp apply per-emitted-token within the cycle.
+    /// Stats logged: per-cycle wallclock, accept_rate, emit_mean.
+    #[cfg(feature = "mlx-native")]
+    fn chat_streaming_qwen35_mtp<F>(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        k: usize,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        if prompt_ids.is_empty() {
+            return Err(anyhow!("empty prompt after tokenization"));
+        }
+        let t_prefill = std::time::Instant::now();
+        let (mut last, _pos) = self.prefill(seq_id, &prompt_ids)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx-mtp] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms (K={k}) -> tok={last}",
+            prompt_ids.len(),
+        );
+
+        let mut generated: Vec<u32> = vec![last];
+        let mut prev_text = String::new();
+        if let Ok(text) = self.decode(&generated) {
+            if !text.is_empty() && !text.contains('\u{FFFD}') {
+                on_token(&text);
+                prev_text = text;
+            }
+        }
+        if self.eos_tokens.contains(&last) {
+            let out = self.decode(&generated).unwrap_or_default();
+            self.remove_seq(seq_id).ok();
+            return Ok(out);
+        }
+
+        let t_decode = std::time::Instant::now();
+        let mut cycles: usize = 0;
+        let mut accepted_total: usize = 0;
+        let mut attempted_total: usize = 0;
+        let mut stop = false;
+        while generated.len() < max_new_tokens && !stop {
+            let t_cycle = std::time::Instant::now();
+            let out = self.qwen35_mtp_step(seq_id, last, k).with_context(|| {
+                format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
+            })?;
+            let cycle_ms = t_cycle.elapsed().as_secs_f64() * 1000.0;
+            cycles += 1;
+            accepted_total += out.n_accepted;
+            attempted_total += out.n_attempted;
+            // Emit committed tokens one-by-one, honoring EOS + max_new_tokens
+            // mid-cycle. We always keep the LAST committed token as `last` for
+            // the next mtp_step call (it's the correction/bonus not yet in
+            // cache), even if EOS was emitted earlier in the cycle.
+            for tok in &out.committed {
+                if generated.len() >= max_new_tokens {
+                    stop = true;
+                    break;
+                }
+                generated.push(*tok);
+                if let Ok(text) = self.decode(&generated) {
+                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
+                        on_token(&text[prev_text.len()..]);
+                        prev_text = text;
+                    }
+                }
+                if self.eos_tokens.contains(tok) {
+                    stop = true;
+                    break;
+                }
+            }
+            last = *out.committed.last().expect("mtp_step committed non-empty");
+            if std::env::var("LUMEN_MTP_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "[mlx-mtp-cycle] seq {seq_id} {cycle_ms:.2} ms  n_acc={}/{}  emitted={}",
+                    out.n_accepted,
+                    out.n_attempted,
+                    out.committed.len(),
+                );
+            }
+        }
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let n_gen = generated.len();
+        let accept_rate = if attempted_total > 0 {
+            (accepted_total as f64) / (attempted_total as f64)
+        } else {
+            0.0
+        };
+        let emit_per_cycle = if cycles > 0 {
+            ((n_gen - 1) as f64) / (cycles as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[mlx-mtp] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s); \
+             cycles={cycles} accept={accept_rate:.3} emit/cycle={emit_per_cycle:.2}",
+            n_gen as f64 / (decode_ms / 1000.0),
         );
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
