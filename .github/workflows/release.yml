@@ -109,6 +109,9 @@ jobs:
       - name: Build, sign + upload (.app, .dmg, latest.json)
         uses: tauri-apps/tauri-action@v0
         env:
+          # Automatically provisioned by Actions — needed for the action to
+          # create the draft release and upload the bundle + signature.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Apple notary credentials (optional; only set on real releases —
@@ -122,8 +125,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: crates/lumen-app
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Lumen ${{ github.ref_name }}'
+          # Tag push → use the pushed tag (e.g. v0.2.0). Manual dispatch →
+          # vTEST-<sha-7> so dry-runs don't collide with real releases.
+          tagName: ${{ github.event_name == 'push' && github.ref_name || format('vTEST-{0}', github.sha) }}
+          releaseName: ${{ github.event_name == 'push' && format('Lumen {0}', github.ref_name) || format('Lumen vTEST-{0} (dry-run)', github.sha) }}
           releaseDraft: true
           prerelease: false
           # `--config` injects the sidecar binding so the default
