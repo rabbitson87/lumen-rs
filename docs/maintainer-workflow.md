@@ -186,7 +186,7 @@ should return only mid-prose references (Phase X mid-sentence is OK).
 | `turboquant-gpu` | `lumen-model`, `lumen-server` | GPU-resident affine 4/8-bit dispatch | ✅ on |
 | `paged-kv` | `lumen-model` | PagedAttention KV cache scaffolding | ✅ on |
 | `qwen3_5_moe` | `lumen-model`, `lumen-server` | Qwen3.5 / Qwen3.6 MoE Candle backend (opt-in) | ❌ off |
-| `mlx-native` | `lumen-mlx`, `lumen-server` | Native MLX Gemma 4 26B-A4B path | ❌ off |
+| `mlx-native` | `lumen-mlx`, `lumen-server` | Native MLX runner (Gemma 4 26B-A4B + Qwen3.6-35B-A3B-mxfp4 `gather_qmm`). When compiled, this becomes the runtime default — `LUMEN_MODE` falls back to `mlx` and `LUMEN_MLX_BACKEND` to `native`. | ✅ **on** (default) |
 | `mlx-pyo3` | `lumen-mlx` | PyO3 subprocess fallback (development only) | ❌ off |
 | `turboquant` | `lumen-model`, `lumen-server` | Candle-side Gemma 4 E4B turboquant path (requires `[patch]` override — uses workspace-relative deps) | ❌ off |
 | `legacy-tests` | `lumen-metal`, `paged-attention` | Re-enable broken integration tests that drifted out of sync with current APIs | ❌ off |
@@ -228,7 +228,9 @@ before pushing.
 | Embedding b=3, default kernel | ~19 ms/batch | naive (`LUMEN_AFFINE8_NAIVE=1`): ~35 ms |
 | Embedding quality eval (25-item KR/EN) | P@1 ≥ 0.95, MRR ≥ 0.97 | — |
 | Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
-| Qwen3.6-35B-A3B-mxfp4 N=1 decode | 48 ms/step p50, 20 tok/s | all `LUMEN_DISABLE_*=1`: ~66 ms p50 |
+| Qwen3.6-35B-A3B-mxfp4 N=1 decode (mlx-native default) | 13.9 ms/step p50, **71.6 tok/s** | Candle backend (`LUMEN_MODE=candle`): 22.0 ms / 45.5 tok/s |
+| Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode (mlx-native) | 14.85 ms/step p50, **67.3 tok/s** | Candle backend: 486 ms / 2.0 tok/s — Candle SDPA does not scale to long KV |
+| Qwen3.6-35B-A3B-mxfp4 Candle N=1 fused | 48 ms/step p50, 20 tok/s | all `LUMEN_DISABLE_*=1`: ~66 ms p50 |
 | Qwen3.6 N=1 → N=2 CB | aggregate +17% | per-seq −41% (known MoE limitation) |
 
 **Always report `p50` for thermal-sensitive measurements** — `mean` is
@@ -248,7 +250,8 @@ Update this table whenever a path graduates from "WIP" to "validated".
 |---|---|---|
 | `/v1/embeddings` (Qwen3-Embedding-0.6B MLX 8-bit) | ✅ validated | `embedding_smoke` runs ~19 ms; `embedding_quality` P@1 = 0.960 |
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit, mlx-native) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
-| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4, qwen3_5_moe) | ✅ validated | `bench_cb_qwen35` p50 48 ms / 20 tok/s |
+| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4, mlx-native **default**) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
+| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4, Candle fallback `LUMEN_MODE=candle`) | ✅ validated | `bench_cb_qwen35` p50 22 ms / 45 tok/s (short), 486 ms / 2 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense, qwen3_5_moe) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
 | GGUF Gemma | ⚠ exploratory | No active CI |
 | Candle Qwen legacy | ⚠ exploratory | Pre-mlx-native; left in place |

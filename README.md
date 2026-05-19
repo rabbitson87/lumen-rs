@@ -317,7 +317,8 @@ optimization preserves model quality.
 | Var | Purpose |
 |---|---|
 | `PORT`, `HOST` | HTTP listen address (defaults `127.0.0.1:8080`). |
-| `LUMEN_MODE` | `mlx` \| `candle` \| `auto`. Selects the backend mode for batching. Defaults to `candle`. |
+| `LUMEN_MODE` | `mlx` \| `candle` \| `auto`. Selects the backend mode. Defaults to `mlx` when built with `mlx-native` (default); `candle` otherwise. |
+| `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native` under the `mlx-native` feature (+57% tok/s vs Candle, 33× at PROMPT_LEN=2048 on Qwen3.6-35B-A3B-mxfp4). |
 | `LUMEN_AFFINE8_NAIVE=1` | Force the naive 8-bit GEMM kernel path (A/B testing). |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |
 | `BATCHED_ENGINE=1` | Continuous-batching scheduler for the GGUF and Qwen3.6 backends. |
@@ -397,19 +398,40 @@ Indicative numbers on an Apple M3 Max:
 | Embedding b=25 quality eval | 251 ms (≈10 ms/item) | P@1 = 0.960 on the labelled corpus |
 | Gemma 4 26B-A4B decode | 18.8 ms/step | mlx default sdpa: 19.9 ms (custom flash-attn −5 %) |
 | Gemma 4 26B-A4B prefill 4 k tokens | ~4.0 s | Full path including JIT-compile warmup |
-| Qwen3.6-35B-A3B-mxfp4 decode (N=1) | 48.4 ms/step p50 | fused kernels; aggregate 20.8 tok/s |
-| Qwen3.6-35B-A3B-mxfp4 decode (N=2 CB) | 81.9 ms/step | aggregate 24.4 tok/s (+17 % over N=1) |
+| Qwen3.6-35B-A3B-mxfp4 decode (N=1, **mlx-native default**) | 13.94 ms/step p50 | **71.6 tok/s** — gather_qmm reads only top-K experts |
+| Qwen3.6-35B-A3B-mxfp4 decode (N=1, Candle) | 22.0 ms/step p50 | 45.5 tok/s (−36 % step latency / +57 % tps when switched to mlx) |
+| Qwen3.6-35B-A3B-mxfp4 decode (PROMPT_LEN=2048, mlx-native) | 14.85 ms/step p50 | 67.3 tok/s |
+| Qwen3.6-35B-A3B-mxfp4 decode (PROMPT_LEN=2048, Candle) | 486 ms/step p50 | 2.0 tok/s — Candle SDPA does not scale to long KV |
+| Qwen3.6-35B-A3B-mxfp4 decode (N=2 CB, Candle) | 81.9 ms/step | aggregate 24.4 tok/s (+17 % over N=1 Candle) |
 
-### Kernel fusion impact (Qwen3.6-35B-A3B-mxfp4, N=1)
+### Why mlx-native is the default
+
+At single-batch decode the bottleneck is bandwidth, not FLOPs. A 35B-A3B
+MoE *should* read only the top-K active experts per step (~0.5 GB) instead
+of all 256 (~17 GB). The mlx runner achieves this via `gather_qmm`, which
+fuses expert routing + quantized matmul into a single scatter-gather
+kernel. Candle's per-expert loop pays close to full-model bandwidth, which
+shows up as a 1.6× slowdown at short prompts and a 33× cliff at
+PROMPT_LEN=2048 once attention KV joins the read budget.
+
+The server defaults to `LUMEN_MODE=mlx` + `LUMEN_MLX_BACKEND=native`
+whenever the `mlx-native` feature is compiled in. Pass
+`LUMEN_MODE=candle` to opt into the multi-tenant CB path (Candle still
+wins on aggregate throughput at N≥4 because mlx-rs single-tenant
+microbatching does not fan out).
+
+### Kernel fusion impact (Qwen3.6-35B-A3B-mxfp4, N=1, Candle backend only)
 
 | Config | p50 step latency | aggregate tps | vs fused |
 |---|---|---|---|
-| Fused (default) | 48.4 ms / 57.4 ms | 20.8 / 13.9 tok/s | baseline |
+| Fused (Candle default) | 48.4 ms / 57.4 ms | 20.8 / 13.9 tok/s | baseline |
 | All `LUMEN_DISABLE_*=1` | 66.3 ms / 77.7 ms | 15.1 / 10.3 tok/s | **+27 % slower** |
 
 (Two runs shown to highlight thermal sensitivity; p50 is the stable metric.)
 Fused kernels covered: flash-attn, residual+RMSNorm, input RMSNorm, dense MLP
-residual, MoE gate/up/SiLU/mul, MoE weighted-sum.
+residual, MoE gate/up/SiLU/mul, MoE weighted-sum. These apply to the Candle
+path only — the mlx-native runner relies on mlx's `gather_qmm` + custom
+`kestrel_flash_attn_bf16` primitive instead.
 
 ### Resident memory
 

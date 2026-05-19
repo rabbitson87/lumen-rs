@@ -34,11 +34,11 @@ use anyhow::{Context, Result, anyhow};
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
+mod gemma4_backend;
+mod gemma4_chat;
 mod gemma4_moe;
 mod gemma4_mtp;
-mod gemma4_chat;
 mod gemma4_response;
-mod gemma4_backend;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).
@@ -61,20 +61,20 @@ pub mod metal_memory {
 /// existing native-vs-pyo3 split.
 #[cfg(feature = "mlx-native")]
 pub mod gemma4 {
+    pub use crate::gemma4_backend::imp::Gemma4Backend;
     pub use crate::gemma4_chat::imp::{
         ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions, TOK_BOS, TOK_CHANNEL_CLOSE,
         TOK_CHANNEL_OPEN, TOK_EOS, TOK_PAD, TOK_QUOTE_DELIM, TOK_THINK, TOK_TOOL_RESPONSE_CLOSE,
         TOK_TOOL_RESPONSE_OPEN, TOK_TURN_CLOSE, TOK_TURN_OPEN,
     };
     pub use crate::gemma4_moe::imp::{
-        GenerateConfig, GenerateStats, Gemma4Breakdown, MtpStepOutput, NativeGemma4Config,
+        Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
         NativeGemma4Model, NativeGemma4PromptCache, set_forward_step, take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
         TOK_TOOL_CALL_OPEN,
     };
-    pub use crate::gemma4_backend::imp::Gemma4Backend;
 
     /// MTP (Multi-Token Prediction) drafter for Gemma 4. Phase 1: types +
     /// weight loader only — forward pass and decode-loop integration are
@@ -88,23 +88,21 @@ pub mod gemma4 {
         };
     }
 }
+pub mod env_state;
 mod golden;
 mod metal_kernel;
 pub mod native_attention;
-#[cfg(feature = "mlx-native")]
-pub mod native_metal_bridge;
 mod native_cache;
 mod native_compile_cache;
-#[cfg(feature = "mlx-native")]
-mod turboquant;
 mod native_conv1d;
 mod native_embedding;
 mod native_kernels;
 mod native_lm_head;
+#[cfg(feature = "mlx-native")]
+pub mod native_metal_bridge;
 mod native_moe;
 mod native_norm;
 mod native_quant;
-pub mod env_state;
 mod native_rope;
 mod native_router;
 mod native_runtime;
@@ -116,6 +114,8 @@ mod runner_native;
 mod runner_pyo3;
 mod runner_subprocess;
 mod spec_decode;
+#[cfg(feature = "mlx-native")]
+mod turboquant;
 
 use runner_native::NativeMlxRunner;
 
@@ -315,6 +315,17 @@ impl Runner for NativeMlxRunner {
 /// Loads the HF tokenizer that mirrors what mlx_lm uses internally. We keep a
 /// Rust copy so encode/decode happen without crossing the Python boundary.
 fn load_tokenizer_via_hub(model_id: &str) -> Result<Tokenizer> {
+    // If `model_id` is itself a local directory (the desktop control plane
+    // passes absolute paths for models already on disk), try `tokenizer.json`
+    // from that directory before reaching out to HF Hub. Avoids 404s for repos
+    // whose canonical org prefix the caller didn't know.
+    let local = std::path::Path::new(model_id);
+    if local.is_dir() {
+        let tj = local.join("tokenizer.json");
+        if tj.is_file() {
+            return Tokenizer::from_file(&tj).map_err(|e| anyhow!("tokenizer from_file: {e}"));
+        }
+    }
     let api = ApiBuilder::new().build().context("hf_hub api init")?;
     let repo = api.model(model_id.to_string());
     let path = repo
@@ -473,7 +484,8 @@ fn runner_kind_from_env(
     if let Some(raw) = backend {
         let normalized = raw.trim().to_ascii_lowercase();
         return match normalized.as_str() {
-            "" | "pyo3" | "python" | "in-process" | "in_process" => Ok(RunnerKind::Pyo3),
+            "" => Ok(default_runner_kind()),
+            "pyo3" | "python" | "in-process" | "in_process" => Ok(RunnerKind::Pyo3),
             "subprocess" | "process" | "json-rpc" | "json_rpc" => Ok(RunnerKind::Subprocess),
             "native" | "mlx-rs" | "mlx_rs" => Ok(RunnerKind::Native),
             _ => Err(anyhow!(
@@ -485,7 +497,23 @@ fn runner_kind_from_env(
     if truthy_env(legacy_subprocess) {
         Ok(RunnerKind::Subprocess)
     } else {
-        Ok(RunnerKind::Pyo3)
+        Ok(default_runner_kind())
+    }
+}
+
+/// Built-in default runner. When the `mlx-native` feature is compiled in we
+/// prefer the native mlx-rs path because it lands ~+57% throughput vs PyO3
+/// on Qwen3.6-35B-A3B-mxfp4 (and 33× vs Candle at PROMPT_LEN=2048). PyO3
+/// remains the fallback when the native feature isn't compiled in.
+#[inline]
+fn default_runner_kind() -> RunnerKind {
+    #[cfg(feature = "mlx-native")]
+    {
+        RunnerKind::Native
+    }
+    #[cfg(not(feature = "mlx-native"))]
+    {
+        RunnerKind::Pyo3
     }
 }
 
@@ -1888,9 +1916,14 @@ mod tests {
         compare_runner_to_golden_transcript, load_runner_transcript,
     };
 
+    #[cfg(feature = "mlx-native")]
+    const DEFAULT_RUNNER: RunnerKind = RunnerKind::Native;
+    #[cfg(not(feature = "mlx-native"))]
+    const DEFAULT_RUNNER: RunnerKind = RunnerKind::Pyo3;
+
     #[test]
-    fn runner_kind_defaults_to_pyo3() {
-        assert_eq!(runner_kind_from_env(None, None).unwrap(), RunnerKind::Pyo3);
+    fn runner_kind_default_matches_compiled_feature() {
+        assert_eq!(runner_kind_from_env(None, None).unwrap(), DEFAULT_RUNNER);
     }
 
     #[test]
@@ -1913,7 +1946,7 @@ mod tests {
         );
         assert_eq!(
             runner_kind_from_env(None, Some("0")).unwrap(),
-            RunnerKind::Pyo3
+            DEFAULT_RUNNER
         );
     }
 
@@ -1960,10 +1993,8 @@ mod tests {
         // when the model is already on disk. We point at a tempdir without
         // the required config.json so the call fails *locally* with a
         // typed error from NativeQwen3_5MoeModel::load (no HF Hub wrapper).
-        let dir = std::env::temp_dir().join(format!(
-            "lumen_native_resolve_local_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("lumen_native_resolve_local_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
         let mut runner = NativeMlxRunner::new().unwrap();

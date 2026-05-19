@@ -24,7 +24,16 @@ anyhow = { workspace = true }
 dotenvy = "0.15"
 
 [features]
-default = ["turboquant-gpu"]
+# mlx-native makes the mlx-rs gather_qmm path the runtime default
+# (LUMEN_MODE=mlx + LUMEN_MLX_BACKEND=native auto-selected when neither env
+# is set). +57% tok/s vs Candle at short prompts, 33× vs Candle at
+# PROMPT_LEN=2048 on Qwen3.6-35B-A3B-mxfp4 (M3 Max).
+#
+# qwen3_5_moe enables the Candle backend for the Qwen3.5/3.6 family
+# (both 35B-A3B MoE and 27B Dense — shared loader/scheduler). It's the
+# `LUMEN_MODE=candle` fallback path and the only path that currently
+# wires MTP (`LUMEN_SPEC=mtp` requires the Candle backend).
+default = ["turboquant-gpu", "mlx-native", "qwen3_5_moe"]
 turboquant-gpu = ["lumen-model/turboquant-gpu", "dep:lumen-metal"]
 mpsgraph = ["lumen-model/mpsgraph", "lumen-metal/mpsgraph"]
 mlx-native = ["lumen-mlx/mlx-native"]

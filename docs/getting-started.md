@@ -251,7 +251,8 @@ fork. Default-feature tests do not need this.
 | `LUMEN_DISABLE_MOE_GATE_UP_SILU_MUL_FUSION=1` | off | Disable Qwen3.6 MoE gate/up/silu/mul fusion |
 | `LUMEN_DISABLE_MOE_WSUM_FUSION=1` | off | Disable Qwen3.6 MoE weighted-sum fusion |
 | `BATCHED_ENGINE=1` | off | Continuous-batching scheduler (GGUF / Qwen3.6) |
-| `LUMEN_MODE=mlx\|candle\|auto` | candle | Backend selection (MLX vs Candle) |
+| `LUMEN_MODE=mlx\|candle\|auto` | **mlx** (under `mlx-native` feature) / candle otherwise | Backend selection. `mlx` enables the +57 % tok/s gather_qmm path on Qwen3.6-35B-A3B-mxfp4 |
+| `LUMEN_MLX_BACKEND=native\|pyo3\|subprocess` | **native** (under `mlx-native`) / pyo3 otherwise | Picks the mlx runner. `native` is the Apple-silicon-optimized mlx-rs path |
 
 ## 8. Troubleshooting
 
