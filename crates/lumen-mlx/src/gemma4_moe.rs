@@ -2752,7 +2752,7 @@ pub(crate) mod imp {
         Ok(ResolvedGemma4QuantLinear {
             weight: packed,
             scales,
-            biases: Some(biases),
+            biases,
             group_size: lin.group_size,
             bits: target_bits,
             mode: lin.mode,
@@ -2820,7 +2820,7 @@ pub(crate) mod imp {
         Ok(ResolvedGemma4QuantLinear {
             weight: packed,
             scales,
-            biases: Some(biases),
+            biases,
             group_size: lin.group_size,
             bits: lin.bits,
             mode: lin.mode,

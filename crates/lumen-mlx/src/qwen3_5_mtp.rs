@@ -437,6 +437,418 @@ impl Qwen35MtpDrafter {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HF-native loader (Qwen3.6 `mtp.*` shards -> Qwen35MtpBlock)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The MLX-converted snapshots ship by mlx-community DROP the `mtp.*` tensors
+// at conversion time (mlx-lm never wired MTP). To recover them we read from
+// the HuggingFace original snapshot — the `Qwen/Qwen3.6-*` repos under the
+// user's HF cache — which carries the 15 `mtp.*` tensors as bf16. We
+// quantize at load time to match the trunk's quant convention (AFFINE
+// 4-bit or MXFP4) so the dispatch graph in `Qwen35MtpBlock::forward`
+// stays homogeneous.
+//
+// HF original tensor names (verified against Qwen/Qwen3.6-27B's
+// model.safetensors.index.json):
+//
+//   mtp.fc.weight                                  [hidden, 2*hidden]   eh_proj
+//   mtp.pre_fc_norm_embedding.weight               [hidden]             enorm
+//   mtp.pre_fc_norm_hidden.weight                  [hidden]             hnorm
+//   mtp.norm.weight                                [hidden]             shared_head_norm
+//   mtp.layers.0.input_layernorm.weight            [hidden]             input_layernorm
+//   mtp.layers.0.post_attention_layernorm.weight   [hidden]             post_attention_layernorm
+//   mtp.layers.0.self_attn.q_proj.weight           [q_out, hidden]      attention.q_proj
+//   mtp.layers.0.self_attn.k_proj.weight           [kv_out, hidden]     attention.k_proj
+//   mtp.layers.0.self_attn.v_proj.weight           [kv_out, hidden]     attention.v_proj
+//   mtp.layers.0.self_attn.o_proj.weight           [hidden, v_dim]      attention.o_proj
+//   mtp.layers.0.self_attn.q_norm.weight           [head_dim]           attention.q_norm_weight
+//   mtp.layers.0.self_attn.k_norm.weight           [head_dim]           attention.k_norm_weight
+//   mtp.layers.0.mlp.gate_proj.weight              [intermediate, hidden] mlp.gate_proj
+//   mtp.layers.0.mlp.up_proj.weight                [intermediate, hidden] mlp.up_proj
+//   mtp.layers.0.mlp.down_proj.weight              [hidden, intermediate] mlp.down_proj
+//
+// where:
+//   q_out = num_heads * head_dim * (attn_output_gate ? 2 : 1)
+//   kv_out = num_kv_heads * head_dim
+//   v_dim = num_heads * head_dim
+
+/// Quant mode to use at load time when materializing `mtp.*` bf16 tensors
+/// into mlx-native quantized linears.
+///
+/// `Mxfp4` matches the trunk's production quant — fastest at inference but
+/// requires mlx-c's `mlx_quantize(mode=mxfp4)` to be available (lands in
+/// mlx-rs >= 0.30). `Affine4` is the universal fallback (every mlx build
+/// supports it) and matches the Phase 2 S1.5 synth bench numbers
+/// (Step B = 2.12 ms).
+#[derive(Debug, Clone, Copy)]
+pub enum MtpLoadQuant {
+    /// AFFINE 4-bit, group_size=64 (or 32 to halve scale memory).
+    Affine4 { group_size: i32 },
+    /// MXFP4 block-scaled exponents, group_size=32. Production trunk format.
+    Mxfp4,
+    /// Keep bf16. Slower per step but no quant-time at load.
+    Bf16,
+}
+
+impl MtpLoadQuant {
+    fn group_size(&self) -> i32 {
+        match self {
+            MtpLoadQuant::Affine4 { group_size } => *group_size,
+            MtpLoadQuant::Mxfp4 => 32,
+            MtpLoadQuant::Bf16 => 0,
+        }
+    }
+    fn bits(&self) -> i32 {
+        match self {
+            MtpLoadQuant::Affine4 { .. } | MtpLoadQuant::Mxfp4 => 4,
+            MtpLoadQuant::Bf16 => 16,
+        }
+    }
+    fn mode_cstr(&self) -> Option<&'static std::ffi::CStr> {
+        use crate::native_quant::{MODE_AFFINE, MODE_MXFP4};
+        match self {
+            MtpLoadQuant::Affine4 { .. } => Some(MODE_AFFINE),
+            MtpLoadQuant::Mxfp4 => Some(MODE_MXFP4),
+            MtpLoadQuant::Bf16 => None,
+        }
+    }
+}
+
+/// Load a Qwen3.5/3.6 MTP block from an HF original snapshot directory.
+///
+/// `hf_dir` is the snapshot root holding `model.safetensors.index.json`
+/// plus the multi-shard safetensors files. Typically:
+///   `~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/<hash>`
+///
+/// `dims` describes the **target** trunk's attention shape — `mtp.*` tensors
+/// are validated against these. For 35B-A3B the loader pairs the HF-original
+/// `Qwen/Qwen3.6-35B-A3B` snapshot's bf16 mtp.* against the mlx-community
+/// 35B-A3B-mxfp4 trunk dims.
+///
+/// `intermediate_size` and `vocab_size` come from the trunk's `text_config`.
+///
+/// `quant` controls the load-time quant. Phase 2 S2 ships with `Affine4 { 64 }`
+/// because it's universally supported and matches the synth bench cost
+/// estimate; users can flip to `Mxfp4` once the trunk path verifies it.
+pub fn load_block_from_hf(
+    hf_dir: &std::path::Path,
+    dims: Qwen35MtpDims,
+    intermediate_size: usize,
+    quant: MtpLoadQuant,
+) -> Result<Qwen35MtpBlock> {
+    use crate::native_quant::quantize_with_mode;
+    use std::collections::HashMap;
+
+    // 1) Parse `model.safetensors.index.json` to find which shard holds each
+    //    `mtp.*` tensor. The HF index also exists for some MLX-converted
+    //    snapshots without mtp.* in which case we error out with a hint.
+    let index_path = hf_dir.join("model.safetensors.index.json");
+    let index_str = std::fs::read_to_string(&index_path).with_context(|| {
+        format!(
+            "load_block_from_hf: reading {} failed (does the HF original snapshot exist?)",
+            index_path.display()
+        )
+    })?;
+    let index: serde_json::Value = serde_json::from_str(&index_str)
+        .with_context(|| format!("parse {} as JSON", index_path.display()))?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow!("missing `weight_map` object in {}", index_path.display()))?;
+
+    let mut mtp_to_shard: HashMap<String, String> = HashMap::new();
+    for (key, val) in weight_map {
+        if key.starts_with("mtp.") {
+            if let Some(shard) = val.as_str() {
+                mtp_to_shard.insert(key.clone(), shard.to_string());
+            }
+        }
+    }
+    if mtp_to_shard.is_empty() {
+        return Err(anyhow!(
+            "no `mtp.*` tensors in {} -- HF original snapshot needed (the \
+             mlx-community MXFP4 conversions drop mtp.*)",
+            index_path.display()
+        ));
+    }
+
+    // 2) Group keys by shard so we mmap each safetensors file exactly once.
+    let mut shard_to_keys: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, shard) in &mtp_to_shard {
+        shard_to_keys
+            .entry(shard.clone())
+            .or_default()
+            .push(key.clone());
+    }
+
+    // 3) Load tensors from each relevant shard into a single key->Array map.
+    //    Only the `mtp.*` keys are retained — the rest get dropped immediately.
+    let mut tensors: HashMap<String, Array> = HashMap::with_capacity(mtp_to_shard.len());
+    for (shard, keys) in shard_to_keys {
+        let path = hf_dir.join(&shard);
+        let map = Array::load_safetensors(&path)
+            .map_err(|err| anyhow!("load_safetensors({}) failed: {err}", path.display()))?;
+        for k in keys {
+            if let Some(arr) = map.get(&k) {
+                tensors.insert(k, arr.clone());
+            } else {
+                return Err(anyhow!(
+                    "expected key `{k}` in {} (per index.json) but it was absent",
+                    path.display(),
+                ));
+            }
+        }
+    }
+
+    // 4) Helpers for fetching + validating named tensors.
+    let take_tensor = |tensors: &mut HashMap<String, Array>,
+                       name: &str,
+                       expect_shape: &[i32]|
+     -> Result<Array> {
+        let arr = tensors
+            .remove(name)
+            .ok_or_else(|| anyhow!("HF mtp.* missing key `{name}`"))?;
+        let got: Vec<i32> = arr.shape().to_vec();
+        if got != expect_shape {
+            return Err(anyhow!(
+                "{name}: shape mismatch (got {got:?}, want {expect_shape:?})"
+            ));
+        }
+        Ok(arr)
+    };
+
+    // Norm tensors stay bf16 (or whatever the original ships) -- no quant.
+    let take_norm = |tensors: &mut HashMap<String, Array>,
+                     name: &str,
+                     dim: i32|
+     -> Result<Array> {
+        let arr = take_tensor(tensors, name, &[dim])?;
+        Ok(arr)
+    };
+
+    // Linear tensors: bf16 -> mlx_rs::ops::quantize at requested mode.
+    // `expect_shape` is the f32 logical shape [out, in].
+    let take_linear = |tensors: &mut HashMap<String, Array>,
+                       name: &str,
+                       expect_shape: [i32; 2]|
+     -> Result<Qwen35MtpLinear> {
+        let w = take_tensor(tensors, name, &expect_shape)?;
+        if let Some(mode) = quant.mode_cstr() {
+            let (packed, scales, biases) =
+                quantize_with_mode(&w, quant.group_size(), quant.bits(), mode)
+                    .with_context(|| format!("{name}: quantize at load failed"))?;
+            Ok(Qwen35MtpLinear {
+                weight: packed,
+                scales,
+                biases,
+                group_size: quant.group_size(),
+                bits: quant.bits(),
+                mode,
+            })
+        } else {
+            Err(anyhow!(
+                "load_block_from_hf: Bf16 carrier path not yet implemented \
+                 (Qwen35MtpLinear assumes a quantized weight layout); use \
+                 Affine4 or Mxfp4"
+            ))
+        }
+    };
+
+    let hidden = dims.hidden_size as i32;
+    let num_heads = dims.num_attention_heads as i32;
+    let num_kv = dims.num_key_value_heads as i32;
+    let head_dim = dims.head_dim as i32;
+    let q_out = num_heads * head_dim * if dims.attn_output_gate { 2 } else { 1 };
+    let kv_out = num_kv * head_dim;
+    let v_dim = num_heads * head_dim;
+    let inter = intermediate_size as i32;
+
+    // 5) Build linears + norms.
+    let eh_proj = take_linear(&mut tensors, "mtp.fc.weight", [hidden, 2 * hidden])?;
+    let enorm = take_norm(&mut tensors, "mtp.pre_fc_norm_embedding.weight", hidden)?;
+    let hnorm = take_norm(&mut tensors, "mtp.pre_fc_norm_hidden.weight", hidden)?;
+    let shared_head_norm = match take_norm(&mut tensors, "mtp.norm.weight", hidden) {
+        Ok(t) => Some(t),
+        // `mtp.norm.weight` is optional per llama.cpp / DeepSeek-V3 spec; if
+        // the checkpoint omits it the block falls back to trunk's final_norm.
+        Err(_) => None,
+    };
+    let input_layernorm = take_norm(
+        &mut tensors,
+        "mtp.layers.0.input_layernorm.weight",
+        hidden,
+    )?;
+    let post_attention_layernorm = take_norm(
+        &mut tensors,
+        "mtp.layers.0.post_attention_layernorm.weight",
+        hidden,
+    )?;
+
+    let attention = Qwen35MtpAttnWeights {
+        q_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.self_attn.q_proj.weight",
+            [q_out, hidden],
+        )?,
+        k_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.self_attn.k_proj.weight",
+            [kv_out, hidden],
+        )?,
+        v_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.self_attn.v_proj.weight",
+            [kv_out, hidden],
+        )?,
+        o_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.self_attn.o_proj.weight",
+            [hidden, v_dim],
+        )?,
+        q_norm_weight: take_norm(
+            &mut tensors,
+            "mtp.layers.0.self_attn.q_norm.weight",
+            head_dim,
+        )?,
+        k_norm_weight: take_norm(
+            &mut tensors,
+            "mtp.layers.0.self_attn.k_norm.weight",
+            head_dim,
+        )?,
+    };
+
+    let mlp = Qwen35MtpMlp::Dense(Qwen35MtpDenseMlp {
+        gate_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.mlp.gate_proj.weight",
+            [inter, hidden],
+        )?,
+        up_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.mlp.up_proj.weight",
+            [inter, hidden],
+        )?,
+        down_proj: take_linear(
+            &mut tensors,
+            "mtp.layers.0.mlp.down_proj.weight",
+            [hidden, inter],
+        )?,
+    });
+
+    // 6) Drain check: if any mtp.* tensors are left over we likely missed
+    //    an intentionally optional field — warn but don't fail.
+    if !tensors.is_empty() {
+        let leftover: Vec<&str> = tensors.keys().map(String::as_str).collect();
+        eprintln!(
+            "[qwen3_5_mtp loader] note: {} unused mtp.* tensors in checkpoint: {leftover:?}",
+            leftover.len()
+        );
+    }
+
+    Ok(Qwen35MtpBlock {
+        dims,
+        eh_proj,
+        enorm,
+        hnorm,
+        input_layernorm,
+        attention,
+        post_attention_layernorm,
+        mlp,
+        shared_head_norm,
+    })
+}
+
+/// Smoke-test the MTP block forward with synthetic trunk inputs.
+///
+/// Used by `examples/bench_qwen35_mtp_loader_smoke.rs` to validate that a
+/// real-weight `Qwen35MtpBlock` (constructed via [`load_block_from_hf`])
+/// dispatches end-to-end without a trunk hookup. The trunk's `lm_head` +
+/// `final_norm` are synthesized at the loader's quant convention so the
+/// dispatch graph is realistic but the argmax content is arbitrary.
+///
+/// Returns `(argmax_token_id, max_logit_value)` for the last row at T=1.
+pub fn smoke_forward_with_synth_trunk(
+    block: &Qwen35MtpBlock,
+    vocab_size: usize,
+) -> Result<(u32, f32)> {
+    use crate::native_cache::NativeKvCache;
+    use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
+
+    let hidden = block.dims.hidden_size as i32;
+
+    // Synthetic trunk lm_head at the block's quant convention (AFFINE 4-bit,
+    // group_size matching eh_proj). For mature wiring the real trunk lm_head
+    // gets threaded in here.
+    let group_size = block.eh_proj.group_size;
+    let lm_head_w_f32 = mlx_rs::random::uniform::<_, f32>(
+        -0.05f32,
+        0.05f32,
+        &[vocab_size as i32, hidden],
+        None,
+    )
+    .context("smoke_forward: random lm_head failed")?;
+    let lm_head_w_bf16 = lm_head_w_f32
+        .as_dtype(mlx_rs::Dtype::Bfloat16)
+        .context("smoke_forward: bf16 cast")?;
+    let (lm_packed, lm_scales, lm_biases) =
+        quantize_with_mode(&lm_head_w_bf16, group_size, 4, MODE_AFFINE)
+            .context("smoke_forward: quantize lm_head")?;
+    let trunk_lm_head = Qwen35MtpLinear {
+        weight: lm_packed,
+        scales: lm_scales,
+        biases: lm_biases,
+        group_size,
+        bits: 4,
+        mode: MODE_AFFINE,
+    };
+    let trunk_final_norm_w = mlx_rs::ops::ones::<f32>(&[hidden])
+        .context("smoke_forward: ones final_norm")?
+        .as_dtype(mlx_rs::Dtype::Bfloat16)
+        .context("smoke_forward: final_norm bf16 cast")?;
+
+    // Synthetic inputs at [1, 1, hidden].
+    let embeds = mlx_rs::random::uniform::<_, f32>(
+        -0.05f32,
+        0.05f32,
+        &[1, 1, hidden],
+        None,
+    )
+    .context("smoke_forward: random embeds")?;
+    let h_pre = mlx_rs::random::uniform::<_, f32>(
+        -0.05f32,
+        0.05f32,
+        &[1, 1, hidden],
+        None,
+    )
+    .context("smoke_forward: random h_pre")?;
+    let mut cache = NativeKvCache::new();
+
+    let (logits, _new_h) = block
+        .forward(&embeds, &h_pre, &mut cache, false, &trunk_final_norm_w, &trunk_lm_head)
+        .context("smoke_forward: block.forward")?;
+    logits.eval().context("smoke_forward: eval logits")?;
+
+    // Pull max logit + argmax from the single output row.
+    let logits_flat = logits
+        .reshape(&[vocab_size as i32])
+        .context("smoke_forward: reshape logits")?;
+    let argmax = mlx_rs::ops::indexing::argmax_axis(&logits_flat, 0, false)
+        .context("smoke_forward: argmax")?;
+    argmax.eval().context("smoke_forward: argmax eval")?;
+    let argmax_val: u32 = argmax
+        .try_item::<i32>()
+        .context("smoke_forward: argmax item")? as u32;
+    let max_val_arr = mlx_rs::ops::max_axis(&logits_flat, 0, false)
+        .context("smoke_forward: max")?;
+    max_val_arr.eval().context("smoke_forward: max eval")?;
+    let max_val: f32 = max_val_arr
+        .try_item::<f32>()
+        .context("smoke_forward: max item")?;
+
+    Ok((argmax_val, max_val))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Step B synthetic-weight microbench
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -539,7 +951,7 @@ pub fn run_step_b_synthetic_bench(
         Ok(Qwen35MtpLinear {
             weight: packed,
             scales,
-            biases: Some(biases),
+            biases,
             group_size,
             bits,
             mode,

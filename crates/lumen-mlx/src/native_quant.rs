@@ -391,17 +391,19 @@ mod imp {
     }
 
     /// Quantize a dense matrix `w` with explicit mode. Returns
-    /// `(packed_weights, scales, biases)` — same convention as Python
-    /// `mx.quantize`. For MXFP4 mode, biases is typically a zeros tensor
-    /// or unused. Used by tests + dev tools, not the production load path.
-    #[allow(dead_code)]
+    /// `(packed_weights, scales, biases_opt)` — `biases_opt` is `Some` for
+    /// AFFINE (matches Python `mx.quantize`'s 3-tuple) and `None` for
+    /// MXFP4 (block-scaled exponents, no per-group bias term — mlx-c
+    /// returns just `[packed, scales]`).
+    ///
+    /// Used by the Qwen3.5 MTP loader (HF original ships bf16 mtp.* weights;
+    /// we quantize at startup) and by dev/test microbenches.
     pub fn quantize_with_mode(
         w: &Array,
         group_size: i32,
         bits: i32,
         mode: &CStr,
-    ) -> Result<(Array, Array, Array)> {
-        // dev/test only (#[allow(dead_code)] above); always uses singleton.
+    ) -> Result<(Array, Array, Option<Array>)> {
         let stream_raw = cached_gpu_stream_raw();
         unsafe {
             let mut vec_raw: mlx_sys::mlx_vector_array = mlx_sys::mlx_vector_array_new();
@@ -419,32 +421,43 @@ mod imp {
             }
 
             let len = mlx_sys::mlx_vector_array_size(vec_raw);
-            if len != 3 {
+            if len != 2 && len != 3 {
                 let _ = mlx_sys::mlx_vector_array_free(vec_raw);
                 return Err(anyhow!(
-                    "mlx_quantize produced {len} arrays, expected 3 (weights, scales, biases)"
+                    "mlx_quantize produced {len} arrays, expected 2 (MXFP4) or 3 (AFFINE)"
                 ));
             }
 
             let mut packed: mlx_sys::mlx_array = mlx_sys::mlx_array_new();
             let mut scales: mlx_sys::mlx_array = mlx_sys::mlx_array_new();
-            let mut biases: mlx_sys::mlx_array = mlx_sys::mlx_array_new();
             let s0 = mlx_sys::mlx_vector_array_get(&mut packed, vec_raw, 0);
             let s1 = mlx_sys::mlx_vector_array_get(&mut scales, vec_raw, 1);
-            let s2 = mlx_sys::mlx_vector_array_get(&mut biases, vec_raw, 2);
+            let biases_opt = if len == 3 {
+                let mut biases: mlx_sys::mlx_array = mlx_sys::mlx_array_new();
+                let s2 = mlx_sys::mlx_vector_array_get(&mut biases, vec_raw, 2);
+                if s2 != 0 {
+                    let _ = mlx_sys::mlx_array_free(packed);
+                    let _ = mlx_sys::mlx_array_free(scales);
+                    let _ = mlx_sys::mlx_array_free(biases);
+                    let _ = mlx_sys::mlx_vector_array_free(vec_raw);
+                    return Err(anyhow!("mlx_vector_array_get biases failed: status {s2}"));
+                }
+                Some(Array::from_ptr(biases))
+            } else {
+                None
+            };
             let _ = mlx_sys::mlx_vector_array_free(vec_raw);
-            if s0 != 0 || s1 != 0 || s2 != 0 {
+            if s0 != 0 || s1 != 0 {
                 let _ = mlx_sys::mlx_array_free(packed);
                 let _ = mlx_sys::mlx_array_free(scales);
-                let _ = mlx_sys::mlx_array_free(biases);
                 return Err(anyhow!(
-                    "mlx_vector_array_get failed: statuses {s0}/{s1}/{s2}"
+                    "mlx_vector_array_get failed: statuses {s0}/{s1}"
                 ));
             }
             Ok((
                 Array::from_ptr(packed),
                 Array::from_ptr(scales),
-                Array::from_ptr(biases),
+                biases_opt,
             ))
         }
     }

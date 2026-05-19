@@ -114,7 +114,10 @@ mod qwen3_5_mtp;
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
 // math before investing in the HF-native loader + runner wiring.
-pub use qwen3_5_mtp::{StepBBenchPoint, run_step_b_synthetic_bench};
+pub use qwen3_5_mtp::{
+    MtpLoadQuant, Qwen35MtpBlock, Qwen35MtpDims, StepBBenchPoint, load_block_from_hf,
+    run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
+};
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
 mod runner_pyo3;
