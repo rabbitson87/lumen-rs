@@ -73,7 +73,24 @@ jobs:
           fi
           ls candle/Cargo.toml
 
-      # ── Sidecar: build lumen-server first, drop it into the bundle path ──
+      # ── mlx-sys: force-build first so the metallib lands on disk before
+      #    lumen-server's build.rs runs. Without this, a `Swatinem/rust-cache`
+      #    hit can restore mlx-sys's metadata but skip the `out/` directory,
+      #    leaving lumen-server with no metallib to embed.
+      - name: Pre-build mlx-sys (writes mlx.metallib)
+        run: |
+          # mlx-sys's own default features (accelerate + metal) drive the
+          # CMake build that produces mlx.metallib. No `mlx-native` feature
+          # exists at the mlx-sys layer — that knob lives one crate up.
+          cargo clean -p mlx-sys || true
+          cargo build -p mlx-sys --release --target ${{ matrix.target }}
+          # Surface the metallib path so the next step (or a failure log) can
+          # cross-check what build.rs will discover.
+          echo "--- mlx.metallib search ---"
+          find target/${{ matrix.target }}/release/build -name mlx.metallib -print 2>/dev/null || true
+          find target/release/build -name mlx.metallib -print 2>/dev/null || true
+
+      # ── Sidecar: build lumen-server, drop it into the bundle path ──
       - name: Build lumen-server (sidecar)
         run: |
           cargo build -p lumen-server --release \
