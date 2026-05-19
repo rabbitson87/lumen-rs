@@ -435,3 +435,223 @@ impl Qwen35MtpDrafter {
         &self.block
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step B synthetic-weight microbench
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Phase 1 (94ff5c2) measured trunk S-scaling at 1.12x and estimated Step B
+// (MTP block forward) cost at ~10 ms. Step B is the swing factor for the K=2
+// vs K=3 cycle decision:
+//
+//   K=2 cycle = trunk_decode(14.4) + mtp_draft(2 * step_B) + trunk_verify(19.2)
+//             + ~3 (snap/restore/accept)
+//             = ~47 ms + 2 * step_B_marginal
+//   K=3 cycle = trunk_decode(14.4) + mtp_draft(3 * step_B) + trunk_verify(22.6)
+//             + ~3
+//             = ~50 ms + 3 * step_B_marginal
+//
+// where step_B_marginal is the AR-step cost (T=1 forward, post-warmup).
+//
+// This synth bench measures step_B at the real Qwen3.6-35B-A3B-mxfp4 shapes
+// before we invest in the HF-native loader. Weights are random + MXFP4
+// quantized via `mlx_rs::ops::quantize` (mode=MXFP4) — the dispatch graph
+// matches the production block exactly; only the values differ.
+
+/// Per-T benchmark result. `t` is the row count fed to `forward`; `median_ms`
+/// is the post-warmup-drop median over `runs - 1` measurements.
+#[derive(Debug, Clone)]
+pub struct StepBBenchPoint {
+    pub t: i32,
+    pub min_ms: f64,
+    pub median_ms: f64,
+    pub max_ms: f64,
+}
+
+/// Run a synthetic-weight Step B latency probe at Qwen3.6-35B-A3B-mxfp4
+/// shapes. Returns one [`StepBBenchPoint`] per requested `T` row count.
+///
+/// `t_values`: input row counts to probe. AR draft: T=1; verify-with-K=1: T=2.
+/// `runs`: number of forward calls per T. First is dropped as warmup.
+pub fn run_step_b_synthetic_bench(
+    t_values: &[i32],
+    runs: usize,
+) -> Result<Vec<StepBBenchPoint>> {
+    use crate::native_cache::NativeKvCache;
+    use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
+
+    // Qwen3.6-35B-A3B-mxfp4 production dims (sourced from the HF config.json
+    // text_config block at the snapshot we ship).
+    let dims = Qwen35MtpDims {
+        hidden_size: 2048,
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: 256,
+        rope_theta: 10_000_000.0,
+        rope_dim: 64, // partial_rotary_factor 0.25 * head_dim 256
+        rms_norm_eps: 1e-6,
+        attn_output_gate: true,
+    };
+    // intermediate_size from config.json is 4304 which isn't divisible by 64
+    // (the AFFINE group_size). Pad up to 4352 (= 64*68 = 32*136) for the
+    // synth bench -- adds <1.2% to MLP matmul cost vs. real 4304.
+    let intermediate_size: usize = 4352;
+    let vocab_size: usize = 248320;
+
+    // NOTE: synthetic bench uses AFFINE 4-bit instead of the production MXFP4
+    // because `mlx_quantize` with MXFP4 returns only 2 arrays (no biases),
+    // which our `quantize_with_mode` wrapper currently asserts == 3. The
+    // dispatch graph (one `quantized_matmul_with_mode` per linear) is the
+    // same shape; only the mode bytes differ. Real-weight bench in Phase 2
+    // S2+ will hit the production MXFP4 path.
+    let group_size: i32 = 64;
+    let bits: i32 = 4;
+    let mode = MODE_AFFINE;
+
+    let hidden = dims.hidden_size as i32;
+    let num_heads = dims.num_attention_heads as i32;
+    let num_kv = dims.num_key_value_heads as i32;
+    let head_dim = dims.head_dim as i32;
+    let q_out = num_heads * head_dim * if dims.attn_output_gate { 2 } else { 1 };
+    let kv_out = num_kv * head_dim;
+    let value_dim = num_heads * head_dim;
+    let inter = intermediate_size as i32;
+
+    // Helper: random f32 array of given shape -> quantized Linear at mode.
+    let make_linear = |out: i32, in_: i32, label: &str| -> Result<Qwen35MtpLinear> {
+        // mlx_rs `random::uniform` returns a small-range array suitable as
+        // a synthetic weight payload. The exact distribution doesn't affect
+        // latency (FFI graph is shape-only) — but matching real-weight
+        // magnitudes (small) avoids overflow paths in MXFP4 dequant.
+        let w_f32 = mlx_rs::random::uniform::<_, f32>(
+            -0.05f32,
+            0.05f32,
+            &[out, in_],
+            None,
+        )
+        .with_context(|| format!("{label}: random.uniform failed"))?;
+        let w_bf16 = w_f32
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .with_context(|| format!("{label}: cast bf16 failed"))?;
+        let (packed, scales, biases) =
+            quantize_with_mode(&w_bf16, group_size, bits, mode)
+                .with_context(|| format!("{label}: quantize_with_mode failed"))?;
+        Ok(Qwen35MtpLinear {
+            weight: packed,
+            scales,
+            biases: Some(biases),
+            group_size,
+            bits,
+            mode,
+        })
+    };
+
+    // Helper: bf16 ones vector for RMSNorm weights.
+    let ones_bf16 = |dim: i32, label: &str| -> Result<Array> {
+        let v = mlx_rs::ops::ones::<f32>(&[dim])
+            .with_context(|| format!("{label}: ones failed"))?;
+        v.as_dtype(mlx_rs::Dtype::Bfloat16)
+            .with_context(|| format!("{label}: bf16 cast failed"))
+    };
+
+    // ── Build synthetic MTP block ─────────────────────────────────────────
+    let eh_proj = make_linear(hidden, 2 * hidden, "eh_proj")?;
+    let enorm = ones_bf16(hidden, "enorm")?;
+    let hnorm = ones_bf16(hidden, "hnorm")?;
+    let input_layernorm = ones_bf16(hidden, "input_layernorm")?;
+    let post_attention_layernorm = ones_bf16(hidden, "post_attn_layernorm")?;
+    let shared_head_norm = Some(ones_bf16(hidden, "shared_head_norm")?);
+
+    let attention = Qwen35MtpAttnWeights {
+        q_proj: make_linear(q_out, hidden, "q_proj")?,
+        k_proj: make_linear(kv_out, hidden, "k_proj")?,
+        v_proj: make_linear(kv_out, hidden, "v_proj")?,
+        o_proj: make_linear(hidden, value_dim, "o_proj")?,
+        q_norm_weight: ones_bf16(head_dim, "q_norm")?,
+        k_norm_weight: ones_bf16(head_dim, "k_norm")?,
+    };
+    let mlp = Qwen35MtpMlp::Dense(Qwen35MtpDenseMlp {
+        gate_proj: make_linear(inter, hidden, "gate_proj")?,
+        up_proj: make_linear(inter, hidden, "up_proj")?,
+        down_proj: make_linear(hidden, inter, "down_proj")?,
+    });
+    let block = Qwen35MtpBlock {
+        dims,
+        eh_proj,
+        enorm,
+        hnorm,
+        input_layernorm,
+        attention,
+        post_attention_layernorm,
+        mlp,
+        shared_head_norm,
+    };
+
+    // trunk_lm_head is the largest matmul in Step B's output stage; synth at
+    // real vocab size so cost matches production.
+    let trunk_lm_head = make_linear(vocab_size as i32, hidden, "trunk_lm_head")?;
+    let trunk_final_norm_w = ones_bf16(hidden, "trunk_final_norm")?;
+
+    // ── Run probes ────────────────────────────────────────────────────────
+    let mut report = Vec::with_capacity(t_values.len());
+    for &t in t_values {
+        // Fresh cache per T so the offset starts at 0 (deterministic input
+        // shape). Cache lifetime is per-T inside this loop.
+        let mut cache = NativeKvCache::new();
+
+        // Random embeds + h_pre at [1, T, hidden]. f32 to match the trunk
+        // hidden's working dtype (post mlx-fast.rms_norm).
+        let embeds = mlx_rs::random::uniform::<_, f32>(
+            -0.05f32,
+            0.05f32,
+            &[1, t, hidden],
+            None,
+        )
+        .context("random embeds")?;
+        let h_pre = mlx_rs::random::uniform::<_, f32>(
+            -0.05f32,
+            0.05f32,
+            &[1, t, hidden],
+            None,
+        )
+        .context("random h_pre")?;
+
+        // causal=true when T>1 (matches the verify-batch path).
+        let causal = t > 1;
+
+        let mut times_ms = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t0 = std::time::Instant::now();
+            let (logits, _new_h) = block
+                .forward(
+                    &embeds,
+                    &h_pre,
+                    &mut cache,
+                    causal,
+                    &trunk_final_norm_w,
+                    &trunk_lm_head,
+                )
+                .context("block.forward in bench")?;
+            // Force eval — mlx is lazy; without this the timer measures
+            // only graph construction, not execution.
+            logits.eval().context("eval(logits)")?;
+            times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // Reset cache between iters so each call starts from offset=0
+            // (otherwise position grows, KV length grows, latency drifts).
+            cache = NativeKvCache::new();
+        }
+        // Drop first run as warmup; sort remaining and pick min/median/max.
+        let warm = &times_ms[1..];
+        let mut sorted: Vec<f64> = warm.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = sorted.len();
+        report.push(StepBBenchPoint {
+            t,
+            min_ms: sorted[0],
+            median_ms: sorted[n / 2],
+            max_ms: sorted[n - 1],
+        });
+    }
+
+    Ok(report)
+}
