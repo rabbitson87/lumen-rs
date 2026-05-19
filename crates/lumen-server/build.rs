@@ -29,11 +29,14 @@ fn main() {
     }
 
     let target_dir = locate_target_dir();
-    let candidate = find_metallib(&target_dir).expect(
-        "lumen-server build.rs: mlx.metallib not found under target/. \
-         Build mlx-sys first (`cargo build -p mlx-sys`) or check that \
-         `--features mlx-native` was passed to a prior build.",
-    );
+    let candidate = find_metallib(&target_dir).unwrap_or_else(|| {
+        panic!(
+            "lumen-server build.rs: mlx.metallib not found under {}. \
+             Build mlx-sys first (`cargo build -p mlx-sys`) or check \
+             that `--features mlx-native` was passed to a prior build.",
+            target_dir.display()
+        )
+    });
     println!("cargo:rerun-if-changed={}", candidate.display());
     println!(
         "cargo:rustc-env=LUMEN_MLX_METALLIB_PATH={}",
@@ -57,11 +60,17 @@ fn locate_target_dir() -> PathBuf {
 }
 
 fn find_metallib(target_dir: &PathBuf) -> Option<PathBuf> {
-    // mlx-sys writes to:
-    //   <target>/<profile>/build/mlx-sys-<hash>/out/build/lib/mlx.metallib
-    // Walk that subtree and pick the newest match.
+    // mlx-sys writes the metallib somewhere under
+    //   <target>/<profile>/build/mlx-sys-<hash>/out/build/...
+    // The exact depth depends on the mlx CMake layout (sometimes
+    // `out/build/lib/mlx.metallib`, sometimes
+    // `out/build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib`).
+    // Walk a generous depth so cross-compiled CI builds (which add an
+    // extra `<triple>/` segment) and any future CMake layout change
+    // still find it. Walking under target/ is fast — only a few
+    // hundred dirs even on a busy workspace.
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    walk(target_dir, &mut best, 8);
+    walk(target_dir, &mut best, 16);
     best.map(|(_, p)| p)
 }
 
