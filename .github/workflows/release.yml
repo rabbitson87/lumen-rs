@@ -1,0 +1,112 @@
+name: Release
+
+# Triggered by pushing a tag matching `v*` (e.g. `v0.2.0`). Builds both
+# aarch64-apple-darwin and x86_64-apple-darwin matrix entries, signs the
+# `.app.tar.gz` updater bundle with the Ed25519 key stored in the
+# `TAURI_SIGNING_PRIVATE_KEY` secret, and uploads the artifacts (plus a
+# `latest.json` manifest) to a draft GitHub Release. Flip the release from
+# draft to published once both matrix jobs finish to expose the new
+# version to the in-app updater.
+#
+# Maintainer setup (one-time): see crates/lumen-app/docs/release.md for
+# how to generate the signing keypair + register the secrets on the repo.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual dispatch for trial runs without a tag (uploads to a draft
+  # release named `vTEST-<sha>`). Useful when iterating on this workflow.
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tauri's sidecar bundling references the on-disk `lumen-server`
+          # binary path; the workflow places it relative to the workspace
+          # root, so the checkout depth must be full (not shallow).
+          fetch-depth: 0
+
+      # ── Toolchains ────────────────────────────────────────────────
+      - name: Install Rust toolchain (with matrix target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + git + target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          # Don't cache the lumen-app target/ — Tauri's bundle step
+          # writes large `.app` directories that bloat the cache key.
+          workspaces: |
+            . -> target
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/lumen-app/frontend/package-lock.json
+
+      # ── Sibling candle fork (required because Cargo.toml uses path = "../candle") ──
+      - name: Clone candle fork next to the workspace
+        run: |
+          cd ..
+          if [ ! -d candle ]; then
+            git clone --depth 1 https://github.com/huggingface/candle.git
+          fi
+          ls candle/Cargo.toml
+
+      # ── Sidecar: build lumen-server first, drop it into the bundle path ──
+      - name: Build lumen-server (sidecar)
+        run: |
+          cargo build -p lumen-server --release \
+            --target ${{ matrix.target }} \
+            --features mlx-native,qwen3_5_moe
+          mkdir -p crates/lumen-app/binaries
+          cp target/${{ matrix.target }}/release/lumen-server \
+             crates/lumen-app/binaries/lumen-server-${{ matrix.target }}
+
+      # ── Frontend install ──────────────────────────────────────────
+      - name: Install frontend deps
+        working-directory: crates/lumen-app/frontend
+        run: npm ci
+
+      # ── Tauri build + sign + upload ───────────────────────────────
+      - name: Build, sign + upload (.app, .dmg, latest.json)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple notary credentials (optional; only set on real releases —
+          # without these the app is signed by the Tauri key but not notarized,
+          # so users see a Gatekeeper warning on first launch).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: crates/lumen-app
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Lumen ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false
+          # `--config` injects the sidecar binding so the default
+          # tauri.conf.json stays clean for `cargo tauri dev`.
+          args: >-
+            --target ${{ matrix.target }}
+            --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'

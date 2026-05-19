@@ -10,6 +10,16 @@ a personal research project. Apple Silicon only. Currently validated:
 - `/v1/embeddings` via Qwen3-Embedding-0.6B (MLX 8-bit)
 - `/v1/chat/completions` via Gemma 4 26B-A4B MoE (MLX 3- or 4-bit)
 
+Ships in two forms:
+
+1. **Desktop app (`lumen-app`)** — a Tauri 2.x app that wraps the server as
+   a sidecar process, exposes every env-var knob as a typed UI field, and
+   self-updates via GitHub Releases. Recommended for end users who just
+   want to run a local LLM.
+2. **CLI server (`lumen-server`)** — the same engine as a plain HTTP
+   binary you launch with env vars. Recommended for headless deployments
+   and library/research use.
+
 Other model paths exist in the codebase and should be treated as exploratory
 (may not work without local tweaks):
 
@@ -25,7 +35,8 @@ Other model paths exist in the codebase and should be treated as exploratory
 ## Table of contents
 
 - [Requirements](#requirements)
-- [Install](#install)
+- [Desktop app](#desktop-app) — install + run the GUI
+- [Install](#install) — CLI / library / source build
 - [Configure models](#configure-models)
 - [Run the server](#run-the-server)
 - [API reference](#api-reference)
@@ -67,6 +78,63 @@ Optional (only if running mlx-lm parity benches or regenerating fixtures):
 - Python 3.10+ with `mlx-lm`
 - A separate clone of the [mlx](https://github.com/ml-explore/mlx) source
   pointed to by `MLX_LOCAL_SOURCE_DIR` (used by some benchmark scripts)
+
+---
+
+## Desktop app
+
+The Tauri-based GUI (`crates/lumen-app`) is the recommended onboarding
+path. It wraps `lumen-server` as a sidecar, manages model downloads from
+HuggingFace Hub, exposes every memory/context/generation knob the engine
+reads, and self-updates from GitHub Releases.
+
+### Install from a release
+
+1. Open the [latest GitHub Release](https://github.com/hsng95/lumen-rs/releases/latest).
+2. Download the `.dmg` matching your CPU (`aarch64` for Apple Silicon,
+   `x86_64` for Intel Macs).
+3. Drag `Lumen.app` to `/Applications` and launch it. The first run
+   prompts macOS to verify the developer signature — accept it once.
+4. On the **Models & Server** tab, pick a recommended model from the
+   dropdown and hit **Download**. Wait for completion, then **Use** →
+   **Start**.
+
+The app handles the rest:
+
+- Metal memory caps are auto-tuned to the active model + context size
+  (wired = byte-precise model size via `LUMEN_WIRED_LIMIT_BYTES`, cache
+  = flat 2 GB, memory = ceil(model + 2 + ctx/8K)).
+- The **API** tab generates copy-pasteable `curl` examples in
+  OpenAI-style or Claude-style with your configured API key already
+  interpolated.
+- **Doctor** runs preflight diagnostics (RAM / disk / port / HF
+  reachability) and auto-opens when anything is `blocked` or
+  `degraded`.
+- **Update** checks GitHub Releases on demand; signed installs
+  atomically swap both the `.app` bundle and the sidecar
+  `lumen-server` binary.
+
+### Build the desktop app from source
+
+```bash
+cd crates/lumen-app/frontend
+npm install
+cd ..
+cargo install tauri-cli --version "^2"   # if not already installed
+cargo tauri dev                          # hot-reloading dev mode
+# or
+cargo tauri build                        # release .app + .dmg bundle
+```
+
+The desktop app is excluded from `default-members` in the workspace
+`Cargo.toml`, so `cargo build` at the repo root still builds only the
+core crates (no Tauri / webview dependencies). Build it explicitly with
+`cargo build -p lumen-app` when you do need the Rust side without the
+frontend.
+
+For release maintainers (signing keys, GitHub Actions workflow,
+schema-migration policy), see
+[crates/lumen-app/docs/release.md](crates/lumen-app/docs/release.md).
 
 ---
 
