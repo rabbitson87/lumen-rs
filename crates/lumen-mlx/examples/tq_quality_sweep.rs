@@ -31,11 +31,23 @@ use anyhow::{Context, Result};
 
 #[cfg(feature = "mlx-native")]
 const DEFAULT_PROMPTS: &[(&str, &str)] = &[
-    ("factual", "Explain why the sky is blue in two short sentences."),
-    ("code", "Write a Python function that returns the nth Fibonacci number using dynamic programming."),
-    ("math", "What is 27 times 43? Show your reasoning step by step."),
+    (
+        "factual",
+        "Explain why the sky is blue in two short sentences.",
+    ),
+    (
+        "code",
+        "Write a Python function that returns the nth Fibonacci number using dynamic programming.",
+    ),
+    (
+        "math",
+        "What is 27 times 43? Show your reasoning step by step.",
+    ),
     ("creative", "Write a haiku about morning coffee."),
-    ("technical", "In one sentence, explain the difference between bfloat16 and float16."),
+    (
+        "technical",
+        "In one sentence, explain the difference between bfloat16 and float16.",
+    ),
 ];
 
 #[cfg(feature = "mlx-native")]
@@ -74,8 +86,8 @@ fn main() -> Result<()> {
     }
 
     let model_path = PathBuf::from(&model_id);
-    let mut backend = Gemma4Backend::from_dir("tq-sweep", &model_path)
-        .context("Gemma4Backend::from_dir")?;
+    let mut backend =
+        Gemma4Backend::from_dir("tq-sweep", &model_path).context("Gemma4Backend::from_dir")?;
     eprintln!("[tq-sweep] model loaded");
 
     println!("===CONFIG={config_label}===");
@@ -83,8 +95,7 @@ fn main() -> Result<()> {
 
     for (category, prompt) in DEFAULT_PROMPTS {
         eprintln!("[tq-sweep] running prompt: {category}");
-        let messages: Vec<(String, String)> =
-            vec![("user".to_string(), prompt.to_string())];
+        let messages: Vec<(String, String)> = vec![("user".to_string(), prompt.to_string())];
         let prompt_ids = backend
             .build_chat_input(&messages, false)
             .with_context(|| format!("build_chat_input for {category}"))?;
@@ -101,8 +112,7 @@ fn main() -> Result<()> {
         println!("text: {prompt}");
         println!("---TOKENS---");
         // Single line, space-separated, for easy diffing.
-        let line: Vec<String> =
-            out_tokens.iter().map(|t| t.to_string()).collect();
+        let line: Vec<String> = out_tokens.iter().map(|t| t.to_string()).collect();
         println!("{}", line.join(" "));
         println!("---TEXT---");
         println!("{}", out_text.trim_end());

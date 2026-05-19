@@ -3,7 +3,7 @@ pub mod embedding;
 pub mod gemma;
 pub mod gemma_gguf;
 pub mod loader;
-pub mod qwen3_stateless;
+pub mod lookahead;
 #[cfg(feature = "paged-kv")]
 pub mod paged_kv;
 pub mod qwen;
@@ -11,6 +11,6 @@ pub mod qwen;
 pub mod qwen3_5_moe;
 #[cfg(feature = "qwen3_5_moe")]
 pub mod qwen3_5_moe_native;
-pub mod lookahead;
+pub mod qwen3_stateless;
 pub mod sampling;
 pub mod spec_decode;

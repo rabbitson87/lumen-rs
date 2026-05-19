@@ -46,11 +46,9 @@ mod imp {
     use crate::native_compile_cache::{
         CompiledMulti, CompiledMultiRefs, invoke_compiled_multi, invoke_compiled_multi_refs,
     };
+    use crate::native_quant::{MODE_AFFINE, gather_qmm_with_mode, quantized_matmul_with_mode};
     use crate::native_runtime::{
         bump_moe_routing_ms, bump_moe_shared_expert_ms, bump_moe_switch_glu_ms, fine_timing_active,
-    };
-    use crate::native_quant::{
-        MODE_AFFINE, gather_qmm_with_mode, quantized_matmul_with_mode,
     };
 
     // pipeline persistent compile cache.
@@ -68,9 +66,7 @@ mod imp {
     //
     // The matmul (`gate(x)` quantized linear) stays outside the closure —
     // quantized op compile compatibility is a separate question.
-    fn routing_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn routing_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         let gate_logits = &args[0];
         let last_axis_idx = gate_logits.ndim() - 1;
         let last_axis = last_axis_idx as i32;
@@ -105,9 +101,7 @@ mod imp {
     //
     // Gated by LUMEN_NATIVE_FUSE_SWIGLU=1 (default OFF for A/B).
     // Mirrors Python's `_precise_swiglu` pattern from mlx_lm.
-    fn swiglu_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn swiglu_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         let gate = &args[0];
         let up = &args[1];
         let sig = mlx_rs::ops::sigmoid(gate)?;
@@ -137,8 +131,7 @@ mod imp {
             &args,
         )
         .context("swiglu_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("swiglu_fused: empty output vec")
+        out.pop().context("swiglu_fused: empty output vec")
     }
 
     // ──────────── GeGLU fusion (Gemma 4) ────────────────────────────
@@ -171,9 +164,7 @@ mod imp {
     // Gate: `LUMEN_NATIVE_FUSE_SWIGLU` env var (default ON, shared with
     // SwiGLU so a single off-switch covers all activation fuses for A/B
     // rollback). Set `=0` to disable.
-    fn gelu_mul_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn gelu_mul_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         use mlx_rs::ops::tanh;
         let gate = &args[0];
         let up = &args[1];
@@ -270,11 +261,7 @@ mod imp {
     ///
     /// Returns `[B, S, K, hidden]` (per-expert outputs, ready for the
     /// `(y * scores[..., None]).sum(axis=-2)` reduction in the MoE block).
-    pub fn switch_glu(
-        x: &Array,
-        indices: &Array,
-        weights: &SwitchGluWeights<'_>,
-    ) -> Result<Array> {
+    pub fn switch_glu(x: &Array, indices: &Array, weights: &SwitchGluWeights<'_>) -> Result<Array> {
         if x.ndim() != 3 {
             return Err(anyhow!(
                 "switch_glu: expected x of rank 3 [B, S, hidden], got ndim={}",
@@ -412,8 +399,7 @@ mod imp {
         };
 
         // squeeze axis -2 (the leftover M=1 from x's expand_dims).
-        mlx_rs::ops::squeeze_axes(&recombined, &[-2])
-            .context("switch_glu: squeeze(-2) failed")
+        mlx_rs::ops::squeeze_axes(&recombined, &[-2]).context("switch_glu: squeeze(-2) failed")
     }
 
     /// Resolved tensors for the dense `Qwen3NextMLP` shared expert.
@@ -454,10 +440,8 @@ mod imp {
         let activated = if swiglu_fuse_enabled() {
             swiglu_fused(&gate, &up).context("shared_mlp: fused swiglu failed")?
         } else {
-            let silu_gate =
-                mlx_rs::nn::silu(&gate).context("shared_mlp: silu(gate) failed")?;
-            mlx_rs::ops::multiply(&silu_gate, &up)
-                .context("shared_mlp: silu(gate) * up failed")?
+            let silu_gate = mlx_rs::nn::silu(&gate).context("shared_mlp: silu(gate) failed")?;
+            mlx_rs::ops::multiply(&silu_gate, &up).context("shared_mlp: silu(gate) * up failed")?
         };
         linear_with_mode(
             &activated,
@@ -575,8 +559,8 @@ mod imp {
         // returns f32 when x is f32; the cast was breaking
         // multiply/sum fusion across the wsum reduction.
         let t_glu = timing_on.then(Instant::now);
-        let y = switch_glu(x, &inds, &w.switch_glu)
-            .context("moe_block_forward: switch_glu failed")?;
+        let y =
+            switch_glu(x, &inds, &w.switch_glu).context("moe_block_forward: switch_glu failed")?;
         let scores_exp = mlx_rs::ops::expand_dims(&scores, -1)
             .context("moe_block_forward: expand_dims(scores) failed")?;
         let weighted = mlx_rs::ops::multiply(&y, &scores_exp)
@@ -643,7 +627,6 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d.4 wiring in native_model.rs.
 pub(crate) use imp::{
-    AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
-    SwitchGluWeights, dense_mlp_forward, gelu_mul_fuse_enabled, gelu_mul_fused,
-    moe_block_forward, switch_glu,
+    AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights, SwitchGluWeights,
+    dense_mlp_forward, gelu_mul_fuse_enabled, gelu_mul_fused, moe_block_forward, switch_glu,
 };

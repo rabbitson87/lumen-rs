@@ -18,8 +18,8 @@
 use anyhow::Result;
 
 use crate::device::MetalContext;
-use crate::metal::{Buffer, ComputePipelineState, Library, MTLSize};
 use crate::metal::ComputeEncoderCompat;
+use crate::metal::{Buffer, ComputePipelineState, Library, MTLSize};
 
 const SHADER_SRC: &str = include_str!("shaders/affine8.metal");
 
@@ -181,9 +181,13 @@ impl Affine8Context {
             !force_naive && Self::qmv_fast_supports(weight.in_features, weight.out_features);
 
         if can_qmv_fast {
-            self.encode_qmv_fast_bf16_dispatch(encoder, weight, x_buf, x_offset, y_buf, y_offset, batch);
+            self.encode_qmv_fast_bf16_dispatch(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, batch,
+            );
         } else {
-            self.encode_naive_bf16_dispatch(encoder, weight, x_buf, x_offset, y_buf, y_offset, batch);
+            self.encode_naive_bf16_dispatch(
+                encoder, weight, x_buf, x_offset, y_buf, y_offset, batch,
+            );
         }
     }
 
@@ -246,7 +250,10 @@ impl Affine8Context {
         y_offset: u64,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast_bf16);
         encoder.set_buffer(0, Some(&weight.packed), 0);
         encoder.set_buffer(1, Some(&weight.scales), 0);
@@ -312,7 +319,9 @@ impl Affine8Context {
             self.encode_matmul_bf16_dispatch(encoder.as_ref(), weight, &x_buf, 0, &y_buf, 0, batch);
             drop(encoder);
         }
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(self
             .ctx
             .read_buffer::<u16>(&y_buf, batch * weight.out_features))

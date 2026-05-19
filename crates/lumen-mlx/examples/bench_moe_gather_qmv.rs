@@ -93,26 +93,30 @@ fn main() -> anyhow::Result<()> {
     // mlx_lm: weight stored as [E, out, in] with quantize along last axis.
     // gate/up: out=intermediate, in=hidden
     // down:    out=hidden,       in=intermediate
-    let gate_full =
-        random::normal::<f32>(&[experts, intermediate, hidden], None, None, None)?
-            .as_dtype(Dtype::Bfloat16)
-            .context("gate as_dtype")?;
+    let gate_full = random::normal::<f32>(&[experts, intermediate, hidden], None, None, None)?
+        .as_dtype(Dtype::Bfloat16)
+        .context("gate as_dtype")?;
     let up_full = random::normal::<f32>(&[experts, intermediate, hidden], None, None, None)?
         .as_dtype(Dtype::Bfloat16)
         .context("up as_dtype")?;
-    let down_full =
-        random::normal::<f32>(&[experts, hidden, intermediate], None, None, None)?
-            .as_dtype(Dtype::Bfloat16)
-            .context("down as_dtype")?;
+    let down_full = random::normal::<f32>(&[experts, hidden, intermediate], None, None, None)?
+        .as_dtype(Dtype::Bfloat16)
+        .context("down as_dtype")?;
 
     let (gate_w, gate_s, gate_b) = quantize(&gate_full, group_size, bits)?;
     let (up_w, up_s, up_b) = quantize(&up_full, group_size, bits)?;
     let (down_w, down_s, down_b) = quantize(&down_full, group_size, bits)?;
 
     // Eagerly evaluate so the timed loop doesn't include allocation/compile.
-    gate_w.eval()?; gate_s.eval()?; gate_b.eval()?;
-    up_w.eval()?;   up_s.eval()?;   up_b.eval()?;
-    down_w.eval()?; down_s.eval()?; down_b.eval()?;
+    gate_w.eval()?;
+    gate_s.eval()?;
+    gate_b.eval()?;
+    up_w.eval()?;
+    up_s.eval()?;
+    up_b.eval()?;
+    down_w.eval()?;
+    down_s.eval()?;
+    down_b.eval()?;
 
     let bytes_per_call: u64 = {
         // packed last-axis dim = in / (32 / bits) for bits=4 → in/8 uint32
@@ -125,9 +129,7 @@ fn main() -> anyhow::Result<()> {
         packed_bytes + scales_bytes + biases_bytes
     };
     let mb_per_call = bytes_per_call as f64 / (1024.0 * 1024.0);
-    eprintln!(
-        "[bench-moe-gather-qmv] approx bytes/call (gate or up): {mb_per_call:.2} MB"
-    );
+    eprintln!("[bench-moe-gather-qmv] approx bytes/call (gate or up): {mb_per_call:.2} MB");
 
     // Decode-shape input: [B=1, L=1, K=top_k, hidden]
     let x_in = random::normal::<f32>(&[1, 1, top_k, hidden], None, None, None)?
@@ -145,7 +147,9 @@ fn main() -> anyhow::Result<()> {
             // Rotate the K=top_k window through [0, experts) so each chain
             // touches a disjoint slab of expert weights when feasible.
             let start = ((p * top_k as usize) % experts as usize) as u32;
-            (0..top_k as u32).map(|i| (start + i) % experts as u32).collect()
+            (0..top_k as u32)
+                .map(|i| (start + i) % experts as u32)
+                .collect()
         } else {
             (0..top_k as u32).collect()
         };
@@ -249,15 +253,26 @@ fn main() -> anyhow::Result<()> {
     println!("  iters:            {iters} (chains: {total_chains}, groups: {groups})");
     println!("  warmup:           {warmup}");
     println!("  chains_per_eval:  {chains_per_eval}");
-    println!("  shape:            B=1 L=1 K={top_k} hidden={hidden} intermediate={intermediate} experts={experts}");
-    println!("  bytes/chain:      {:.2} MB ({} bytes)", (bytes_per_iter as f64) / (1024.0 * 1024.0), bytes_per_iter);
+    println!(
+        "  shape:            B=1 L=1 K={top_k} hidden={hidden} intermediate={intermediate} experts={experts}"
+    );
+    println!(
+        "  bytes/chain:      {:.2} MB ({} bytes)",
+        (bytes_per_iter as f64) / (1024.0 * 1024.0),
+        bytes_per_iter
+    );
     println!("  time/chain:       {us_per_iter:.2} μs");
     println!("  effective BW:     {gbps:.1} GB/s");
     println!();
     println!("Reference for 8K decode budget:");
-    println!("  MoE 25 layers × {us_per_iter:.2} μs = {:.2} ms per token", us_per_iter * 25.0 / 1000.0);
-    println!("  vs current 8K decode 17.5 ms → MoE = {:.1}%",
-        (us_per_iter * 25.0 / 1000.0 / 17.5) * 100.0);
+    println!(
+        "  MoE 25 layers × {us_per_iter:.2} μs = {:.2} ms per token",
+        us_per_iter * 25.0 / 1000.0
+    );
+    println!(
+        "  vs current 8K decode 17.5 ms → MoE = {:.1}%",
+        (us_per_iter * 25.0 / 1000.0 / 17.5) * 100.0
+    );
 
     Ok(())
 }

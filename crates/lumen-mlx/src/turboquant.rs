@@ -248,8 +248,8 @@ pub fn rotate_last_axis(x: &Array, rotation_f32: &Array) -> Result<Array> {
     let x_f32 = x
         .as_dtype(Dtype::Float32)
         .context("turboquant: cast input to f32 for rotation")?;
-    let rotated = mlx_rs::ops::matmul(&x_f32, rotation_f32)
-        .context("turboquant: rotate (matmul with R)")?;
+    let rotated =
+        mlx_rs::ops::matmul(&x_f32, rotation_f32).context("turboquant: rotate (matmul with R)")?;
     rotated
         .as_dtype(Dtype::Bfloat16)
         .context("turboquant: cast rotated output back to bf16")
@@ -338,11 +338,11 @@ pub fn lloyd_max_encode(x: &Array, centroids: &Array) -> Result<Array> {
         .context("turboquant: lloyd_max_encode reshape centroids")?;
     let diff = mlx_rs::ops::subtract(&x_expanded, &c_reshaped)
         .context("turboquant: lloyd_max_encode subtract")?;
-    let abs_diff = mlx_rs::ops::abs(&diff)
-        .context("turboquant: lloyd_max_encode abs")?;
+    let abs_diff = mlx_rs::ops::abs(&diff).context("turboquant: lloyd_max_encode abs")?;
     let last_axis = (abs_diff.ndim() as i32) - 1;
-    let codes_i32 = mlx_rs::ops::indexing::argmin_axis(&abs_diff, last_axis, /* keepdims */ false)
-        .context("turboquant: lloyd_max_encode argmin")?;
+    let codes_i32 =
+        mlx_rs::ops::indexing::argmin_axis(&abs_diff, last_axis, /* keepdims */ false)
+            .context("turboquant: lloyd_max_encode argmin")?;
     codes_i32
         .as_dtype(Dtype::Uint8)
         .context("turboquant: lloyd_max_encode cast to uint8")
@@ -365,15 +365,11 @@ pub fn lloyd_max_decode(codes: &Array, centroids: &Array) -> Result<Array> {
 pub fn per_vector_sigma(x_f32: &Array) -> Result<Array> {
     let last_axis = (x_f32.ndim() as i32) - 1;
     let d = x_f32.shape().last().copied().unwrap_or(1) as f32;
-    let x_sq = mlx_rs::ops::multiply(x_f32, x_f32)
-        .context("turboquant: sigma square")?;
+    let x_sq = mlx_rs::ops::multiply(x_f32, x_f32).context("turboquant: sigma square")?;
     let sum_sq = mlx_rs::ops::sum_axis(&x_sq, last_axis, /* keepdims */ true)
         .context("turboquant: sigma sum")?;
-    let mean_sq = mlx_rs::ops::divide(
-        &sum_sq,
-        &Array::from_f32(d),
-    )
-    .context("turboquant: sigma divide")?;
+    let mean_sq =
+        mlx_rs::ops::divide(&sum_sq, &Array::from_f32(d)).context("turboquant: sigma divide")?;
     mlx_rs::ops::sqrt(&mean_sq).context("turboquant: sigma sqrt")
 }
 
@@ -391,16 +387,13 @@ pub fn per_vector_sigma(x_f32: &Array) -> Result<Array> {
 ///
 /// Use `lloyd_max_dequantize_scaled` to reverse: `centroids[codes] * σ`.
 #[cfg(feature = "mlx-native")]
-pub fn lloyd_max_quantize_stage1(
-    x_bf16: &Array,
-    centroids: &Array,
-) -> Result<(Array, Array)> {
+pub fn lloyd_max_quantize_stage1(x_bf16: &Array, centroids: &Array) -> Result<(Array, Array)> {
     let x_f32 = x_bf16
         .as_dtype(Dtype::Float32)
         .context("turboquant: quantize cast x → f32")?;
     let sigma = per_vector_sigma(&x_f32)?;
-    let x_norm_f32 = mlx_rs::ops::divide(&x_f32, &sigma)
-        .context("turboquant: quantize normalize x / σ")?;
+    let x_norm_f32 =
+        mlx_rs::ops::divide(&x_f32, &sigma).context("turboquant: quantize normalize x / σ")?;
     let x_norm_bf16 = x_norm_f32
         .as_dtype(Dtype::Bfloat16)
         .context("turboquant: cast x_norm to bf16 for kernel")?;
@@ -409,12 +402,8 @@ pub fn lloyd_max_quantize_stage1(
     let bits = (n_levels as f32).log2() as u32;
     let boundaries_inner = lloyd_max_boundaries_inner(bits)?;
     let stream = mlx_rs::Stream::gpu();
-    let codes = mlx_rs::metal::lumen_turboquant_encode(
-        &x_norm_bf16,
-        &boundaries_inner,
-        &stream,
-    )
-    .map_err(|e| anyhow!("turboquant: lumen_tq_encode kernel: {e}"))?;
+    let codes = mlx_rs::metal::lumen_turboquant_encode(&x_norm_bf16, &boundaries_inner, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_tq_encode kernel: {e}"))?;
     Ok((codes, sigma))
 }
 
@@ -427,8 +416,8 @@ pub fn lloyd_max_dequantize_scaled(
     centroids: &Array,
 ) -> Result<Array> {
     let dequant_f32 = lloyd_max_decode(codes, centroids)?;
-    let scaled = mlx_rs::ops::multiply(&dequant_f32, sigma_f32)
-        .context("turboquant: dequant multiply σ")?;
+    let scaled =
+        mlx_rs::ops::multiply(&dequant_f32, sigma_f32).context("turboquant: dequant multiply σ")?;
     scaled
         .as_dtype(Dtype::Bfloat16)
         .context("turboquant: dequant cast back to bf16")
@@ -461,8 +450,7 @@ pub fn lloyd_max_dequantize_scaled(
 // reuse that matrix and the same scale constant.
 
 #[cfg(feature = "mlx-native")]
-static QJL_PROJECTION_CACHE: OnceLock<Mutex<HashMap<(usize, usize, u64), Array>>> =
-    OnceLock::new();
+static QJL_PROJECTION_CACHE: OnceLock<Mutex<HashMap<(usize, usize, u64), Array>>> = OnceLock::new();
 
 /// QJL projection matrix Φ as a f32 mlx Array shaped `[m, dim]`. Entries
 /// ~ N(0, 1/m) — matches `lumen_core::qjl::QJLProjector::new`. Cached per
@@ -528,23 +516,21 @@ pub fn qjl_encode_stage2(
         .context("qjl_encode_stage2: residual square")?;
     let r_sumsq = mlx_rs::ops::sum_axis(&r_sq, last_axis, /* keepdims */ true)
         .context("qjl_encode_stage2: residual sumsq")?;
-    let r_norm = mlx_rs::ops::sqrt(&r_sumsq)
-        .context("qjl_encode_stage2: residual L2 norm")?;
+    let r_norm = mlx_rs::ops::sqrt(&r_sumsq).context("qjl_encode_stage2: residual L2 norm")?;
 
     // r_proj = residual @ Φᵀ   →   shape [..., m]
     // projection is [m, D] → use transposed in matmul to get @ Φᵀ.
     let proj_t = mlx_rs::ops::transpose_axes(projection, &[1, 0])
         .context("qjl_encode_stage2: projection transpose for matmul")?;
-    let r_proj = mlx_rs::ops::matmul(&residual, &proj_t)
-        .context("qjl_encode_stage2: residual @ Φᵀ")?;
+    let r_proj =
+        mlx_rs::ops::matmul(&residual, &proj_t).context("qjl_encode_stage2: residual @ Φᵀ")?;
 
     // signs = where(r_proj >= 0, +1, -1) — kept as bf16 ±1 so downstream
     // correction is one matmul against Φ. We avoid `sign(x)` because it
     // returns 0 for x == 0 (rare with Gaussian residuals but conceptually
     // wrong for an unbiased ±1 estimator).
     let zero = Array::from_f32(0.0);
-    let positive = mlx_rs::ops::ge(&r_proj, &zero)
-        .context("qjl_encode_stage2: r_proj >= 0")?;
+    let positive = mlx_rs::ops::ge(&r_proj, &zero).context("qjl_encode_stage2: r_proj >= 0")?;
     let plus_one_f32 = Array::from_f32(1.0);
     let minus_one_f32 = Array::from_f32(-1.0);
     let signs_f32 = mlx_rs::ops::r#where(&positive, &plus_one_f32, &minus_one_f32)
@@ -587,8 +573,8 @@ pub fn qjl_encode_stage2_packed(
         .context("qjl_encode_stage2_packed: residual square")?;
     let r_sumsq = mlx_rs::ops::sum_axis(&r_sq, last_axis, true)
         .context("qjl_encode_stage2_packed: residual sumsq")?;
-    let r_norm = mlx_rs::ops::sqrt(&r_sumsq)
-        .context("qjl_encode_stage2_packed: residual L2 norm")?;
+    let r_norm =
+        mlx_rs::ops::sqrt(&r_sumsq).context("qjl_encode_stage2_packed: residual L2 norm")?;
 
     let proj_t = mlx_rs::ops::transpose_axes(projection, &[1, 0])
         .context("qjl_encode_stage2_packed: projection transpose")?;
@@ -617,12 +603,8 @@ pub fn qjl_apply_correction_packed(
     qjl_m: usize,
 ) -> Result<Array> {
     let stream = mlx_rs::Stream::gpu();
-    let signs_bf16 = mlx_rs::metal::lumen_qjl_unpack_signs(
-        packed_signs,
-        qjl_m as i32,
-        &stream,
-    )
-    .map_err(|e| anyhow!("turboquant: lumen_qjl_unpack_signs kernel: {e}"))?;
+    let signs_bf16 = mlx_rs::metal::lumen_qjl_unpack_signs(packed_signs, qjl_m as i32, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_qjl_unpack_signs kernel: {e}"))?;
     qjl_apply_correction_to_k_dq(k_dq_bf16, &signs_bf16, r_norm_f32, projection, qjl_m)
 }
 
@@ -646,8 +628,8 @@ pub fn qjl_apply_correction_to_k_dq(
     let signs_f32 = signs_bf16_pm1
         .as_dtype(Dtype::Float32)
         .context("qjl_apply_correction: cast signs to f32")?;
-    let phi_inv_matmul = mlx_rs::ops::matmul(&signs_f32, projection)
-        .context("qjl_apply_correction: signs @ Φ")?;
+    let phi_inv_matmul =
+        mlx_rs::ops::matmul(&signs_f32, projection).context("qjl_apply_correction: signs @ Φ")?;
 
     // Scale by ‖r‖_k × √(π/2)/√m.
     let scale = qjl_correction_scale(qjl_m);
@@ -712,13 +694,8 @@ pub fn rotate_and_lloyd_max_quantize_stage1_fused(
     let bits = (n_levels as f32).log2() as u32;
     let boundaries_inner = lloyd_max_boundaries_inner(bits)?;
     let stream = mlx_rs::Stream::gpu();
-    mlx_rs::metal::lumen_turboquant_rot_encode_fused(
-        x_bf16,
-        r_f32,
-        &boundaries_inner,
-        &stream,
-    )
-    .map_err(|e| anyhow!("turboquant: lumen_tq_rot_encode_fused kernel: {e}"))
+    mlx_rs::metal::lumen_turboquant_rot_encode_fused(x_bf16, r_f32, &boundaries_inner, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_tq_rot_encode_fused kernel: {e}"))
 }
 
 /// Q @ K_codes inline matmul: computes `scores = Q · K_dq^T` without ever
@@ -753,14 +730,8 @@ pub fn turboquant_qk_inline(
         k_sigma.clone()
     };
     let stream = mlx_rs::Stream::gpu();
-    mlx_rs::metal::lumen_turboquant_qk_inline(
-        q,
-        k_codes,
-        &k_sigma_3d,
-        centroids,
-        &stream,
-    )
-    .map_err(|e| anyhow!("turboquant: lumen_tq_qk_inline kernel: {e}"))
+    mlx_rs::metal::lumen_turboquant_qk_inline(q, k_codes, &k_sigma_3d, centroids, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_tq_qk_inline kernel: {e}"))
 }
 
 /// Stage-1 fused encode with **packed 4-bit output**. Emits codes as uint32
@@ -783,14 +754,8 @@ pub fn lloyd_max_quantize_stage1_packed4(
     let bits = 4u32;
     let boundaries_inner = lloyd_max_boundaries_inner(bits)?;
     let stream = mlx_rs::Stream::gpu();
-    mlx_rs::metal::lumen_turboquant_encode_fused_packed4(
-        x_bf16,
-        &boundaries_inner,
-        &stream,
-    )
-    .map_err(|e| {
-        anyhow!("turboquant: lumen_tq_encode_fused_packed4 kernel: {e}")
-    })
+    mlx_rs::metal::lumen_turboquant_encode_fused_packed4(x_bf16, &boundaries_inner, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_tq_encode_fused_packed4 kernel: {e}"))
 }
 
 /// Q @ K_codes_packed inline matmul (4-bit packed). Symmetric to
@@ -819,9 +784,7 @@ pub fn turboquant_qk_inline_packed4(
         centroids,
         &stream,
     )
-    .map_err(|e| {
-        anyhow!("turboquant: lumen_tq_qk_inline_packed4 kernel: {e}")
-    })
+    .map_err(|e| anyhow!("turboquant: lumen_tq_qk_inline_packed4 kernel: {e}"))
 }
 
 /// softmax_scores @ V_codes inline matmul: computes `O = S · V_dq` without
@@ -855,14 +818,8 @@ pub fn turboquant_sv_inline(
         v_sigma.clone()
     };
     let stream = mlx_rs::Stream::gpu();
-    mlx_rs::metal::lumen_turboquant_sv_inline(
-        s,
-        v_codes,
-        &v_sigma_3d,
-        centroids,
-        &stream,
-    )
-    .map_err(|e| anyhow!("turboquant: lumen_tq_sv_inline kernel: {e}"))
+    mlx_rs::metal::lumen_turboquant_sv_inline(s, v_codes, &v_sigma_3d, centroids, &stream)
+        .map_err(|e| anyhow!("turboquant: lumen_tq_sv_inline kernel: {e}"))
 }
 
 // ────────────────────── QJL Stage-2 correctness tests ──────────────────────
@@ -885,7 +842,7 @@ pub fn turboquant_sv_inline(
 #[cfg(all(test, feature = "mlx-native"))]
 mod qjl_correctness_tests {
     use super::*;
-    use mlx_rs::{random, Array, Dtype};
+    use mlx_rs::{Array, Dtype, random};
 
     /// One-sided cosine similarity ⟨x, y⟩ / (‖x‖ ‖y‖) computed in f32 and
     /// reduced to a Rust scalar.
@@ -893,12 +850,8 @@ mod qjl_correctness_tests {
         let xf = x.as_dtype(Dtype::Float32)?;
         let yf = y.as_dtype(Dtype::Float32)?;
         let dot = mlx_rs::ops::sum(&mlx_rs::ops::multiply(&xf, &yf)?, false)?;
-        let nx = mlx_rs::ops::sqrt(
-            &mlx_rs::ops::sum(&mlx_rs::ops::multiply(&xf, &xf)?, false)?,
-        )?;
-        let ny = mlx_rs::ops::sqrt(
-            &mlx_rs::ops::sum(&mlx_rs::ops::multiply(&yf, &yf)?, false)?,
-        )?;
+        let nx = mlx_rs::ops::sqrt(&mlx_rs::ops::sum(&mlx_rs::ops::multiply(&xf, &xf)?, false)?)?;
+        let ny = mlx_rs::ops::sqrt(&mlx_rs::ops::sum(&mlx_rs::ops::multiply(&yf, &yf)?, false)?)?;
         let denom = mlx_rs::ops::multiply(&nx, &ny)?;
         let cos = mlx_rs::ops::divide(&dot, &denom)?;
         Ok(cos.item::<f32>())
@@ -959,22 +912,18 @@ mod qjl_correctness_tests {
         let mut rows = Vec::new();
         for &bits in bits_sweep {
             let centroids = lloyd_max_centroids(bits)?;
-            let (codes, sigma) =
-                lloyd_max_quantize_stage1_fused(&k_true_bf16, &centroids)?;
-            let k_dq =
-                lloyd_max_dequantize_scaled(&codes, &sigma, &centroids)?;
+            let (codes, sigma) = lloyd_max_quantize_stage1_fused(&k_true_bf16, &centroids)?;
+            let k_dq = lloyd_max_dequantize_scaled(&codes, &sigma, &centroids)?;
 
-            let (signs, r_norm) =
-                qjl_encode_stage2(&k_true_bf16, &k_dq, &proj)?;
-            let k_eff =
-                qjl_apply_correction_to_k_dq(&k_dq, &signs, &r_norm, &proj, m)?;
+            let (signs, r_norm) = qjl_encode_stage2(&k_true_bf16, &k_dq, &proj)?;
+            let k_eff = qjl_apply_correction_to_k_dq(&k_dq, &signs, &r_norm, &proj, m)?;
 
             let cos_s1 = cosine_sim(&k_dq, &k_true_bf16)?;
-            let cos_q  = cosine_sim(&k_eff, &k_true_bf16)?;
+            let cos_q = cosine_sim(&k_eff, &k_true_bf16)?;
             let mse_s1 = mse(&k_dq, &k_true_bf16)?;
-            let mse_q  = mse(&k_eff, &k_true_bf16)?;
-            let ip_s1  = inner_product_rmse(&k_dq, &k_true_bf16, &q_bf16)?;
-            let ip_q   = inner_product_rmse(&k_eff, &k_true_bf16, &q_bf16)?;
+            let mse_q = mse(&k_eff, &k_true_bf16)?;
+            let ip_s1 = inner_product_rmse(&k_dq, &k_true_bf16, &q_bf16)?;
+            let ip_q = inner_product_rmse(&k_eff, &k_true_bf16, &q_bf16)?;
 
             rows.push((bits, cos_s1, cos_q, mse_s1, mse_q, ip_s1, ip_q));
         }
@@ -996,11 +945,11 @@ mod qjl_correctness_tests {
 
         eprintln!(
             "\nQJL m sweep at D={} bits={} (threshold m* = D·π/2 ≈ {:.0})",
-            d, bits, (d as f32) * std::f32::consts::FRAC_PI_2
+            d,
+            bits,
+            (d as f32) * std::f32::consts::FRAC_PI_2
         );
-        eprintln!(
-            "m    | cos_dq      | cos_eff     | Δcos    | MSE_dq    | MSE_eff   | MSE ratio"
-        );
+        eprintln!("m    | cos_dq      | cos_eff     | Δcos    | MSE_dq    | MSE_eff   | MSE ratio");
         let mut results = Vec::new();
         for &m in &m_sweep {
             let row = run_pipeline(&shape, m, &[bits]).expect("QJL pipeline ran");
@@ -1008,7 +957,13 @@ mod qjl_correctness_tests {
             let ratio = mq / ms1;
             eprintln!(
                 "{:>4} | {:>11.5} | {:>11.5} | {:>7.5} | {:>9.5} | {:>9.5} | {:>9.3}",
-                m, cs1, cq, cq - cs1, ms1, mq, ratio
+                m,
+                cs1,
+                cq,
+                cq - cs1,
+                ms1,
+                mq,
+                ratio
             );
             results.push((m, cs1, cq, ms1, mq, ratio));
         }
@@ -1021,7 +976,9 @@ mod qjl_correctness_tests {
             assert!(
                 (ratio / theoretical - 1.0).abs() < 0.30,
                 "m={}: measured MSE ratio {:.3} far from theoretical {:.3}",
-                m, ratio, theoretical
+                m,
+                ratio,
+                theoretical
             );
         }
 
@@ -1031,7 +988,8 @@ mod qjl_correctness_tests {
         assert!(
             m1024.4 < m1024.3,
             "m=1024: QJL MSE {:.5} should beat Stage 1 MSE {:.5}",
-            m1024.4, m1024.3
+            m1024.4,
+            m1024.3
         );
     }
 
@@ -1052,13 +1010,11 @@ mod qjl_correctness_tests {
         let proj = qjl_projection_matrix_f32(d, m, TURBOQUANT_SEED).unwrap();
         let centroids = lloyd_max_centroids(bits).unwrap();
 
-        let (codes, sigma) =
-            lloyd_max_quantize_stage1_fused(&k_true_bf16, &centroids).unwrap();
+        let (codes, sigma) = lloyd_max_quantize_stage1_fused(&k_true_bf16, &centroids).unwrap();
         let k_dq = lloyd_max_dequantize_scaled(&codes, &sigma, &centroids).unwrap();
 
         // ── bf16 reference path ──
-        let (signs_bf16, r_norm_a) =
-            qjl_encode_stage2(&k_true_bf16, &k_dq, &proj).unwrap();
+        let (signs_bf16, r_norm_a) = qjl_encode_stage2(&k_true_bf16, &k_dq, &proj).unwrap();
         let k_eff_a =
             qjl_apply_correction_to_k_dq(&k_dq, &signs_bf16, &r_norm_a, &proj, m).unwrap();
 
@@ -1099,8 +1055,10 @@ mod qjl_correctness_tests {
         eprintln!(
             "QJL signs storage: bf16={} elems × 2 B = {} B; packed={} elems × 4 B = {} B; \
              ratio = {:.1}× smaller (raw bytes)",
-            bf16_elems, bf16_elems * 2.0,
-            packed_elems, packed_elems * 4.0,
+            bf16_elems,
+            bf16_elems * 2.0,
+            packed_elems,
+            packed_elems * 4.0,
             (bf16_elems * 2.0) / (packed_elems * 4.0)
         );
         assert!(
@@ -1117,11 +1075,12 @@ mod qjl_correctness_tests {
     fn qjl_at_default_m128_is_variance_dominated() {
         let shape = [1, 4, 64, 256];
         let m = 128;
-        let table = run_pipeline(&shape, m, &[8, 6, 4, 3, 2])
-            .expect("QJL pipeline ran");
+        let table = run_pipeline(&shape, m, &[8, 6, 4, 3, 2]).expect("QJL pipeline ran");
 
         eprintln!("\nQJL Stage-2 at D=256 m=128 (DEFAULT — variance-dominated)");
-        eprintln!("bits | cos_dq    | cos_eff   | MSE_dq    | MSE_eff   | IP_rmse_dq | IP_rmse_eff");
+        eprintln!(
+            "bits | cos_dq    | cos_eff   | MSE_dq    | MSE_eff   | IP_rmse_dq | IP_rmse_eff"
+        );
         for (bits, cs1, cq, ms1, mq, ips1, ipq) in &table {
             eprintln!(
                 "{:>4} | {:>9.5} | {:>9.5} | {:>9.5} | {:>9.5} | {:>10.4} | {:>11.4}",
@@ -1140,7 +1099,9 @@ mod qjl_correctness_tests {
                     *mq > *ms1,
                     "bits={}: at m=128 QJL is expected to be worse than Stage 1 \
                      (variance-dominated); got MSE_dq={:.5} MSE_eff={:.5}",
-                    bits, ms1, mq
+                    bits,
+                    ms1,
+                    mq
                 );
             }
         }
@@ -1164,8 +1125,7 @@ mod qjl_correctness_tests {
 
         // Simulate a trained weight: small-magnitude trained-like values.
         let key_w = random::key(0xFACE0001u64).unwrap();
-        let wv_f32 = random::normal::<f32>(&[h_kv * d, hidden], None, None, &key_w)
-            .unwrap();
+        let wv_f32 = random::normal::<f32>(&[h_kv * d, hidden], None, None, &key_w).unwrap();
         // Trained weights are ~N(0, 0.02²) typical. Scale down.
         let scale = Array::from_f32(0.02f32);
         let wv_f32 = mlx_rs::ops::multiply(&wv_f32, &scale).unwrap();
@@ -1198,18 +1158,14 @@ mod qjl_correctness_tests {
         // post-projection, modulo per-vector scope).
         let wv_dq_3d = mlx_rs::ops::reshape(&wv_dq, &[h_kv, d, hidden]).unwrap();
         let wv_dq_t = mlx_rs::ops::transpose_axes(&wv_dq_3d, &[0, 2, 1]).unwrap();
-        let wv_dq_rot_t =
-            mlx_rs::ops::matmul(&wv_dq_t, &r_bf16).unwrap();
-        let wv_dq_rot_3d =
-            mlx_rs::ops::transpose_axes(&wv_dq_rot_t, &[0, 2, 1]).unwrap();
-        let wv_dq_rot =
-            mlx_rs::ops::reshape(&wv_dq_rot_3d, &[h_kv * d, hidden]).unwrap();
+        let wv_dq_rot_t = mlx_rs::ops::matmul(&wv_dq_t, &r_bf16).unwrap();
+        let wv_dq_rot_3d = mlx_rs::ops::transpose_axes(&wv_dq_rot_t, &[0, 2, 1]).unwrap();
+        let wv_dq_rot = mlx_rs::ops::reshape(&wv_dq_rot_3d, &[h_kv * d, hidden]).unwrap();
 
         // Path B: bake — rotate dense Wv, requant, dequant.
         let wv_rot_for_bake = wv_rot_ref.clone();
         let (wv_b_q, wv_b_scales, wv_b_biases) =
-            quantize_with_mode(&wv_rot_for_bake, group_size, bits, MODE_AFFINE)
-                .unwrap();
+            quantize_with_mode(&wv_rot_for_bake, group_size, bits, MODE_AFFINE).unwrap();
         let wv_b_dq = dequantize_with_mode(
             &wv_b_q,
             &wv_b_scales,
@@ -1222,9 +1178,7 @@ mod qjl_correctness_tests {
 
         let mse_runtime = mse(&wv_rot_ref, &wv_dq_rot).unwrap();
         let mse_baked = mse(&wv_rot_ref, &wv_b_dq).unwrap();
-        eprintln!(
-            "\nbake_r affine 4-bit roundtrip:"
-        );
+        eprintln!("\nbake_r affine 4-bit roundtrip:");
         eprintln!(
             "  MSE(runtime: dequant-then-rotate vs dense_rot) = {:.5e}",
             mse_runtime
@@ -1244,7 +1198,8 @@ mod qjl_correctness_tests {
         assert!(
             mse_baked < 10.0 * mse_runtime,
             "baked MSE {:.3e} >> runtime MSE {:.3e}",
-            mse_baked, mse_runtime
+            mse_baked,
+            mse_runtime
         );
     }
 
@@ -1286,13 +1241,15 @@ mod qjl_correctness_tests {
         let v_baked_4d = mlx_rs::ops::reshape(&v_baked, &[2, h_kv, d]).unwrap();
 
         let v_diff = mse(&v_rot, &v_baked_4d).unwrap();
-        eprintln!("\nbake_r v_proj identity: MSE(V_rot, V_baked) = {:.3e}", v_diff);
+        eprintln!(
+            "\nbake_r v_proj identity: MSE(V_rot, V_baked) = {:.3e}",
+            v_diff
+        );
         assert!(v_diff < 1e-4, "V_rot vs V_baked: MSE too large {v_diff}");
 
         // Wo bake identity: with attn in rotated space, baked Wo should
         // give the same output as (un-rotation @ original Wo).
-        let attn_rot =
-            random::normal::<f32>(&[2, h_q, d], None, None, &key_x).unwrap();
+        let attn_rot = random::normal::<f32>(&[2, h_q, d], None, None, &key_x).unwrap();
         // Path A (un-baked): un-rotate then matmul with original Wo.
         let r_t = mlx_rs::ops::transpose_axes(&r, &[1, 0]).unwrap();
         let attn_unrot = mlx_rs::ops::matmul(&attn_rot, &r_t).unwrap();
@@ -1309,7 +1266,10 @@ mod qjl_correctness_tests {
         let out_b = mlx_rs::ops::matmul(&attn_rot_flat, &wo_rot_t).unwrap();
 
         let o_diff = mse(&out_a, &out_b).unwrap();
-        eprintln!("bake_r o_proj identity: MSE(out_unbaked, out_baked) = {:.3e}", o_diff);
+        eprintln!(
+            "bake_r o_proj identity: MSE(out_unbaked, out_baked) = {:.3e}",
+            o_diff
+        );
         assert!(o_diff < 1e-3, "Wo bake identity MSE too large {o_diff}");
     }
 
@@ -1334,13 +1294,11 @@ mod qjl_correctness_tests {
 
         // Reference: rotate (bf16→f32 matmul→bf16) → encode_fused.
         let v_rot = rotate_last_axis(&v_bf16, &r_arr).unwrap();
-        let (codes_ref, sigma_ref) =
-            lloyd_max_quantize_stage1_fused(&v_rot, &centroids).unwrap();
+        let (codes_ref, sigma_ref) = lloyd_max_quantize_stage1_fused(&v_rot, &centroids).unwrap();
 
         // Fused: rotate+encode in one kernel.
         let (codes_f, sigma_f) =
-            rotate_and_lloyd_max_quantize_stage1_fused(&v_bf16, &r_arr, &centroids)
-                .unwrap();
+            rotate_and_lloyd_max_quantize_stage1_fused(&v_bf16, &r_arr, &centroids).unwrap();
 
         // σ comparison in f32 — both kernels write f32 σ directly; the only
         // numeric difference is the bf16 round-trip on y in the reference
@@ -1366,7 +1324,10 @@ mod qjl_correctness_tests {
             .as_dtype(Dtype::Float32)
             .unwrap()
             .item::<f32>();
-        eprintln!("rot+encode fused vs reference: code agreement = {:.4}", agree);
+        eprintln!(
+            "rot+encode fused vs reference: code agreement = {:.4}",
+            agree
+        );
         assert!(
             agree > 0.99,
             "code agreement {:.4} below 0.99 — kernel divergence likely",
@@ -1376,8 +1337,7 @@ mod qjl_correctness_tests {
         // End-to-end V_dq reconstruction parity. Build V_dq via both paths
         // (dequant uses the SAME centroids; only codes/σ differ slightly)
         // and assert MSE against V_rot is comparable.
-        let v_dq_ref = lloyd_max_dequantize_scaled(&codes_ref, &sigma_ref, &centroids)
-            .unwrap();
+        let v_dq_ref = lloyd_max_dequantize_scaled(&codes_ref, &sigma_ref, &centroids).unwrap();
         let v_dq_f = lloyd_max_dequantize_scaled(&codes_f, &sigma_f, &centroids).unwrap();
         let dq_mse = mse(&v_dq_ref, &v_dq_f).unwrap();
         eprintln!("rot+encode fused vs reference: V_dq MSE = {:.3e}", dq_mse);
@@ -1404,7 +1364,7 @@ mod qjl_correctness_tests {
         let bits = 4u32;
         let b: i32 = 1;
         let h: i32 = 8;
-        let h_kv: i32 = 8;  // no GQA in this unit test
+        let h_kv: i32 = 8; // no GQA in this unit test
         let t: i32 = 1;
         let n: i32 = 128;
         let d: i32 = 256;
@@ -1421,16 +1381,14 @@ mod qjl_correctness_tests {
             .as_dtype(Dtype::Bfloat16)
             .unwrap();
 
-        let (k_codes, k_sigma) =
-            lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
+        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
         // Reference: materialize K_dq, transpose last two axes, then matmul.
         let k_dq = lloyd_max_dequantize_scaled(&k_codes, &k_sigma, &centroids).unwrap();
         let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq, &[0, 1, 3, 2]).unwrap();
         let scores_ref = mlx_rs::ops::matmul(&q_bf16, &k_dq_t).unwrap();
 
         let scores_fused =
-            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids)
-                .unwrap();
+            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
 
         let r = scores_ref.as_dtype(Dtype::Float32).unwrap();
         let f = scores_fused.as_dtype(Dtype::Float32).unwrap();
@@ -1473,7 +1431,7 @@ mod qjl_correctness_tests {
         let bits = 4u32;
         let b: i32 = 1;
         let h: i32 = 8;
-        let h_kv: i32 = 8;  // no GQA in this unit test
+        let h_kv: i32 = 8; // no GQA in this unit test
         let t: i32 = 1;
         let n: i32 = 128;
         let d: i32 = 256;
@@ -1481,39 +1439,32 @@ mod qjl_correctness_tests {
 
         let key_s = random::key(0xB055ED01u64).unwrap();
         let key_v = random::key(0xB055ED02u64).unwrap();
-        let scores_bf16 =
-            random::normal::<f32>(&[b, h, t, n], None, None, &key_s)
-                .unwrap()
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-        let v_rot_bf16 =
-            random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
-                .unwrap()
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
+        let scores_bf16 = random::normal::<f32>(&[b, h, t, n], None, None, &key_s)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let v_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
 
-        let (v_codes, v_sigma) =
-            lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
+        let (v_codes, v_sigma) = lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
         // Reference: materialize V_dq, then S · V_dq.
-        let v_dq =
-            lloyd_max_dequantize_scaled(&v_codes, &v_sigma, &centroids).unwrap();
+        let v_dq = lloyd_max_dequantize_scaled(&v_codes, &v_sigma, &centroids).unwrap();
         let out_ref = mlx_rs::ops::matmul(&scores_bf16, &v_dq).unwrap();
 
         let out_fused =
-            super::turboquant_sv_inline(&scores_bf16, &v_codes, &v_sigma, &centroids)
-                .unwrap();
+            super::turboquant_sv_inline(&scores_bf16, &v_codes, &v_sigma, &centroids).unwrap();
 
         let r = out_ref.as_dtype(Dtype::Float32).unwrap();
         let f = out_fused.as_dtype(Dtype::Float32).unwrap();
         let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
         let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
         let nelems = (b * h * t * d) as f32;
-        let mse_val =
-            mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
+        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
 
         let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var =
-            mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
+        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
 
         let rel = mse_val / (r_var + 1e-12);
         eprintln!(
@@ -1537,7 +1488,7 @@ mod qjl_correctness_tests {
         let bits = 4u32;
         let b: i32 = 1;
         let h: i32 = 8;
-        let h_kv: i32 = 8;  // no GQA for this test
+        let h_kv: i32 = 8; // no GQA for this test
         let t: i32 = 1;
         let n: i32 = 128;
         let d: i32 = 256;
@@ -1555,16 +1506,13 @@ mod qjl_correctness_tests {
             .unwrap();
 
         // Unpacked path (reference).
-        let (k_codes, k_sigma) =
-            lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
+        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
         let scores_unpacked =
-            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids)
-                .unwrap();
+            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
 
         // Packed path.
         let (k_codes_pkd, k_sigma_pkd) =
-            super::lloyd_max_quantize_stage1_packed4(&k_rot_bf16, &centroids)
-                .unwrap();
+            super::lloyd_max_quantize_stage1_packed4(&k_rot_bf16, &centroids).unwrap();
         // Sanity: packed shape must be [..., D/8] uint32.
         assert_eq!(
             k_codes_pkd.shape(),
@@ -1573,10 +1521,9 @@ mod qjl_correctness_tests {
         );
         assert_eq!(k_codes_pkd.dtype(), Dtype::Uint32);
 
-        let scores_packed = super::turboquant_qk_inline_packed4(
-            &q_bf16, &k_codes_pkd, &k_sigma_pkd, &centroids,
-        )
-        .unwrap();
+        let scores_packed =
+            super::turboquant_qk_inline_packed4(&q_bf16, &k_codes_pkd, &k_sigma_pkd, &centroids)
+                .unwrap();
 
         // Compare f32 versions.
         let r = scores_unpacked.as_dtype(Dtype::Float32).unwrap();
@@ -1584,11 +1531,9 @@ mod qjl_correctness_tests {
         let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
         let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
         let nelems = (b * h * t * n) as f32;
-        let mse_val =
-            mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
+        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
         let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var =
-            mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
+        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
         let rel = mse_val / (r_var + 1e-12);
         eprintln!(
             "packed4 path vs unpacked: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
@@ -1616,10 +1561,10 @@ mod qjl_correctness_tests {
 
         let bits = 4u32;
         let b: i32 = 1;
-        let h: i32 = 16;       // production GQA: H=16 query heads
-        let h_kv: i32 = 8;     // 8 KV heads
+        let h: i32 = 16; // production GQA: H=16 query heads
+        let h_kv: i32 = 8; // 8 KV heads
         let t: i32 = 1;
-        let n: i32 = 1024;     // sliding-window size
+        let n: i32 = 1024; // sliding-window size
         let d: i32 = 256;
         let centroids = lloyd_max_centroids(bits).unwrap();
         let key_q = random::key(0xC0FFEE01u64).unwrap();
@@ -1638,18 +1583,19 @@ mod qjl_correctness_tests {
         let (k_codes_u8, k_sigma_u8) =
             lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
         let (k_codes_pkd, k_sigma_pkd) =
-            super::lloyd_max_quantize_stage1_packed4(&k_rot_bf16, &centroids)
-                .unwrap();
+            super::lloyd_max_quantize_stage1_packed4(&k_rot_bf16, &centroids).unwrap();
         mlx_rs::transforms::eval([&k_codes_u8, &k_sigma_u8, &k_codes_pkd, &k_sigma_pkd]).unwrap();
 
         // Warmup.
         let warmup_iters = 16;
         for _ in 0..warmup_iters {
             let s_u =
-                super::turboquant_qk_inline(&q_bf16, &k_codes_u8, &k_sigma_u8, &centroids)
-                    .unwrap();
+                super::turboquant_qk_inline(&q_bf16, &k_codes_u8, &k_sigma_u8, &centroids).unwrap();
             let s_p = super::turboquant_qk_inline_packed4(
-                &q_bf16, &k_codes_pkd, &k_sigma_pkd, &centroids,
+                &q_bf16,
+                &k_codes_pkd,
+                &k_sigma_pkd,
+                &centroids,
             )
             .unwrap();
             mlx_rs::transforms::eval([&s_u, &s_p]).unwrap();
@@ -1659,10 +1605,8 @@ mod qjl_correctness_tests {
         let bench_iters = 500;
         let t0 = Instant::now();
         for _ in 0..bench_iters {
-            let s = super::turboquant_qk_inline(
-                &q_bf16, &k_codes_u8, &k_sigma_u8, &centroids,
-            )
-            .unwrap();
+            let s =
+                super::turboquant_qk_inline(&q_bf16, &k_codes_u8, &k_sigma_u8, &centroids).unwrap();
             mlx_rs::transforms::eval([&s]).unwrap();
         }
         let t_unpacked = t0.elapsed();
@@ -1670,7 +1614,10 @@ mod qjl_correctness_tests {
         let t1 = Instant::now();
         for _ in 0..bench_iters {
             let s = super::turboquant_qk_inline_packed4(
-                &q_bf16, &k_codes_pkd, &k_sigma_pkd, &centroids,
+                &q_bf16,
+                &k_codes_pkd,
+                &k_sigma_pkd,
+                &centroids,
             )
             .unwrap();
             mlx_rs::transforms::eval([&s]).unwrap();

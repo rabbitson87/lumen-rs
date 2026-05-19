@@ -66,8 +66,7 @@ fn main() -> Result<()> {
     );
 
     eprintln!("[gemma4-native] loading {model_id}");
-    let model =
-        NativeGemma4Model::load(Path::new(&model_id)).context("NativeGemma4Model::load")?;
+    let model = NativeGemma4Model::load(Path::new(&model_id)).context("NativeGemma4Model::load")?;
     eprintln!("[gemma4-native] loaded");
 
     let vocab = model.vocab_size() as u32;
@@ -86,14 +85,18 @@ fn main() -> Result<()> {
     if saved_capture.is_some() {
         // SAFETY: bench is single-threaded at this point; no concurrent
         // readers of the env block.
-        unsafe { std::env::remove_var("LUMEN_METAL_CAPTURE"); }
+        unsafe {
+            std::env::remove_var("LUMEN_METAL_CAPTURE");
+        }
     }
     let _ = model
         .generate(&prompt, &warm_cfg)
         .context("warmup generate")?;
     if let Some(v) = saved_capture {
         // SAFETY: same — still single-threaded.
-        unsafe { std::env::set_var("LUMEN_METAL_CAPTURE", v); }
+        unsafe {
+            std::env::set_var("LUMEN_METAL_CAPTURE", v);
+        }
     }
 
     // Reset MLX-side + mlx-c + mlx-rs SDPA stage counters AFTER warmup
@@ -152,8 +155,10 @@ fn main() -> Result<()> {
     if count_ops || count_breakdown {
         let total = mlx_rs::utils::read_op_counter();
         let per_step = total as f64 / stats.decode_steps.max(1) as f64;
-        println!("  [count-ops] total={total} steps={} per_step={per_step:.1}",
-                 stats.decode_steps);
+        println!(
+            "  [count-ops] total={total} steps={} per_step={per_step:.1}",
+            stats.decode_steps
+        );
         if count_breakdown {
             let breakdown = mlx_rs::utils::take_op_breakdown();
             println!("  [count-ops] top 30 callsites:");
@@ -191,7 +196,10 @@ fn main() -> Result<()> {
         .unwrap_or(false)
     {
         let n = stats.generated_tokens.len().min(20);
-        eprintln!("[smoke] first {n} tokens = {:?}", &stats.generated_tokens[..n]);
+        eprintln!(
+            "[smoke] first {n} tokens = {:?}",
+            &stats.generated_tokens[..n]
+        );
     }
 
     // Per-stage breakdown. Two modes are supported:
@@ -286,7 +294,9 @@ fn main() -> Result<()> {
         .map(|v| v != "0")
         .unwrap_or(false)
     {
-        unsafe { mlx_dump_sdpa_timing(); }
+        unsafe {
+            mlx_dump_sdpa_timing();
+        }
     }
 
     // mlx-c wrapper stage breakdown (input_extract / sdpa_call / output_wrap).
@@ -296,7 +306,9 @@ fn main() -> Result<()> {
         .map(|v| v != "0")
         .unwrap_or(false)
     {
-        unsafe { mlxc_dump_sdpa_timing(); }
+        unsafe {
+            mlxc_dump_sdpa_timing();
+        }
     }
 
     // mlx-rs wrapper stage breakdown (pre_ffi / try_from_op).
@@ -332,10 +344,16 @@ fn main() -> Result<()> {
     {
         if let Ok((calls, ns)) = mlx_rs::metal::eval_gpu_stats() {
             let total_ms = ns as f64 / 1e6;
-            let per_call_us = if calls > 0 { ns as f64 / 1000.0 / calls as f64 } else { 0.0 };
+            let per_call_us = if calls > 0 {
+                ns as f64 / 1000.0 / calls as f64
+            } else {
+                0.0
+            };
             let per_step = if stats.decode_steps > 0 {
                 calls as f64 / stats.decode_steps as f64
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             eprintln!(
                 "[eval-gpu] calls={calls}  ns_total={ns}  ms={:.1}  per_call_us={:.2}  approx_per_step={:.1}",
                 total_ms, per_call_us, per_step

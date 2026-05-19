@@ -87,10 +87,16 @@ struct Variant {
 
 impl Variant {
     fn baseline() -> Self {
-        Self { label_w: 0, label_g: 0 }
+        Self {
+            label_w: 0,
+            label_g: 0,
+        }
     }
     fn lookahead(w: usize, g: usize) -> Self {
-        Self { label_w: w, label_g: g }
+        Self {
+            label_w: w,
+            label_g: g,
+        }
     }
     fn is_baseline(&self) -> bool {
         self.label_w == 0
@@ -190,7 +196,10 @@ fn run_subrun(
              tokens={}",
             1000.0 / avg_token_ms.max(1e-9),
             variant.label(),
-            out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","),
+            out.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
         );
 
         samples.push(PromptSample {
@@ -271,11 +280,10 @@ fn build_variants() -> Vec<Variant> {
 }
 
 fn main() -> Result<()> {
-    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
-        .context("LUMEN_QWEN35_SHARDS required")?;
+    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS").context("LUMEN_QWEN35_SHARDS required")?;
     let shard_dir = PathBuf::from(shard_dir);
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
 
     let quick = std::env::var("LD_BENCH_QUICK")
         .map(|v| v == "1")
@@ -307,9 +315,7 @@ fn main() -> Result<()> {
     let variants = build_variants();
     eprintln!("=== Lookahead-decode A/B bench (single-process) ===");
     eprintln!("model: {model_id}");
-    eprintln!(
-        "n_prompts={n_prompts}, n_tokens={n_tokens}, cool-down={cool_s}s, quick={quick}"
-    );
+    eprintln!("n_prompts={n_prompts}, n_tokens={n_tokens}, cool-down={cool_s}s, quick={quick}");
     eprintln!(
         "variants: {}",
         variants
@@ -324,7 +330,10 @@ fn main() -> Result<()> {
 
     // Pre-warm each variant's path (1 prompt × 4 tokens) so JIT/cache costs
     // aren't billed to measurement.
-    eprintln!("\n[warmup] pre-warming {} variant paths ...", variants.len());
+    eprintln!(
+        "\n[warmup] pre-warming {} variant paths ...",
+        variants.len()
+    );
     let warm_ids = backend.encode(PROMPTS[0])?;
     for v in &variants {
         apply_variant(*v, ngram_n);
@@ -513,10 +522,7 @@ fn main() -> Result<()> {
         } else {
             "INFO (G>0, divergence allowed)"
         };
-        println!(
-            "  {:<8} match={match_count}/{n}  [{verdict}]",
-            v.label()
-        );
+        println!("  {:<8} match={match_count}/{n}  [{verdict}]", v.label());
         if let Some((p, idx, b_id, v_id)) = first_div {
             println!(
                 "      first divergence: prompt {p} at token {idx}: BASE={} {}={}",

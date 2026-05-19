@@ -33,7 +33,9 @@ pub fn compressed_attention_scores(
     n_qjl_packed: u32,
     n_levels: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores");
     let pipeline = pipelines.get("tq_compressed_attention_scores")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -62,7 +64,9 @@ pub fn compressed_attention_scores(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
 
     Ok(())
 }
@@ -91,7 +95,9 @@ pub fn compressed_value_gather(
     n_packed: u32,
     n_levels: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_value_gather");
     let pipeline = pipelines.get("tq_compressed_value_gather")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -115,7 +121,9 @@ pub fn compressed_value_gather(
     );
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
 
     Ok(())
 }
@@ -133,7 +141,9 @@ pub fn qjl_project_query(
     dim: u32,
     qjl_m: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_qjl_project_query");
     let pipeline = pipelines.get("tq_qjl_project_query")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -150,7 +160,9 @@ pub fn qjl_project_query(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -177,7 +189,9 @@ pub fn compressed_attention_scores_v2(
     n_qjl_packed: u32,
     n_levels: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores_v2");
     let pipeline = pipelines.get("tq_compressed_attention_scores_v2")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -204,7 +218,9 @@ pub fn compressed_attention_scores_v2(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -231,7 +247,9 @@ pub fn compressed_attention_scores_v3(
 ) -> Result<()> {
     assert!(dim % 4 == 0, "v3 requires dim % 4 == 0 (got dim={dim})");
 
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores_v3");
     let pipeline = pipelines.get("tq_compressed_attention_scores_v3")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -258,7 +276,9 @@ pub fn compressed_attention_scores_v3(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -285,7 +305,9 @@ pub fn compressed_attention_scores_v4(
 ) -> Result<()> {
     assert!(dim % 4 == 0, "v4 requires dim % 4 == 0 (got dim={dim})");
 
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores_v4");
     let pipeline = pipelines.get("tq_compressed_attention_scores_v4")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -316,7 +338,9 @@ pub fn compressed_attention_scores_v4(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -343,7 +367,9 @@ pub fn compressed_attention_scores_v5(
 ) -> Result<()> {
     assert!(dim % 4 == 0, "v5 requires dim % 4 == 0 (got dim={dim})");
 
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores_v5");
     let pipeline = pipelines.get("tq_compressed_attention_scores_v5")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -371,7 +397,9 @@ pub fn compressed_attention_scores_v5(
     encoder.dispatch_threads(grid, threadgroup);
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -396,7 +424,9 @@ pub fn compressed_attention_scores_v6(
     n_qjl_packed: u32,
     n_levels: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_attention_scores_v6");
     let pipeline = pipelines.get("tq_compressed_attention_scores_v6")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -427,7 +457,9 @@ pub fn compressed_attention_scores_v6(
     );
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -451,7 +483,9 @@ pub fn compressed_value_gather_multi(
     n_levels: u32,
     gqa_ratio: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_compressed_value_gather_multi");
     let pipeline = pipelines.get("tq_compressed_value_gather_multi")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -475,7 +509,9 @@ pub fn compressed_value_gather_multi(
     );
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 
@@ -488,7 +524,9 @@ pub fn softmax_parallel(
     scores: &crate::metal::Buffer, // [n] f32 in/out
     n: u32,
 ) -> Result<()> {
-    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+    let encoder = crate::metal::process_commands()
+        .command_encoder()
+        .expect("ce");
     encoder.set_label("lumen:tq_softmax_parallel");
     let pipeline = pipelines.get("tq_softmax_parallel")?;
     encoder.set_compute_pipeline_state(pipeline);
@@ -498,13 +536,12 @@ pub fn softmax_parallel(
 
     let max_tg = pipeline.max_total_threads_per_threadgroup() as u64;
     let tg = (n as u64).next_power_of_two().min(max_tg);
-    encoder.dispatch_thread_groups(
-        crate::mtl_size!(1, 1, 1),
-        crate::mtl_size!(tg, 1, 1),
-    );
+    encoder.dispatch_thread_groups(crate::mtl_size!(1, 1, 1), crate::mtl_size!(tg, 1, 1));
 
     drop(encoder);
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
     Ok(())
 }
 

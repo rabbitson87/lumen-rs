@@ -182,7 +182,9 @@ impl Affine3Context {
             in_features: weight.in_features as u32,
         };
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine3_matvec");
         encoder.set_compute_pipeline_state(&self.matvec_bf16in_bf16out);
         encoder.set_buffer(0, Some(&weight.packed), 0);
@@ -240,7 +242,9 @@ impl Affine3Context {
         };
         let batch_u32 = batch as u32;
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine3_qmv_fast");
         encoder.set_compute_pipeline_state(&self.qmv_fast_bf16in_bf16out);
         encoder.set_buffer(0, Some(&weight.packed), 0);
@@ -286,7 +290,9 @@ impl Affine3Context {
         self.matvec_bf16in_bf16out_pipelined(weight, x_buf, y_buf)?;
         // Drain through the shared cmk Commands scheduler so the caller sees
         // a fully-realized GPU result, including any prior pipelined work.
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 }
@@ -334,9 +340,7 @@ mod tests {
 
         // CPU reference: per row, sum codes for that row.
         for row in 0..out {
-            let cpu_sum: f32 = (0..in_f)
-                .map(|k| codes[row * in_f + k] as f32)
-                .sum();
+            let cpu_sum: f32 = (0..in_f).map(|k| codes[row * in_f + k] as f32).sum();
             let gpu = y_f32[row];
             // bf16 has ~7-bit mantissa → relative tol ~ 1/128 = 0.78%.
             let rel_err = (gpu - cpu_sum).abs() / cpu_sum.abs().max(1e-6);

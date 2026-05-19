@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;

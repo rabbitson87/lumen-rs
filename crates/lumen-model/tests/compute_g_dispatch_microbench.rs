@@ -20,10 +20,10 @@
 
 #![cfg(feature = "turboquant-gpu")]
 
-use lumen_metal::metal::CommandBufferExt;
 use candle_core::Device;
+use lumen_metal::metal::CommandBufferExt;
+use lumen_model::qwen3_5_moe_native::{NativeDType, shared_native_resources_for};
 use std::time::Instant;
-use lumen_model::qwen3_5_moe_native::{shared_native_resources_for, NativeDType};
 
 const HV: usize = 48;
 const N_LIN_LAYERS: usize = 48;
@@ -202,9 +202,7 @@ fn compute_g_dispatch_microbench() {
     eprintln!();
     eprintln!("  Run #1: 5-dispatch loop (production)        : {avg_5_us:.2} µs/dispatch-set");
     eprintln!("  Run #2: 1-dispatch loop (sigmoid alone)     : {avg_1_us:.2} µs/dispatch");
-    eprintln!(
-        "  Run #fused: compute_g_full loop (NEW 5→1)   : {avg_fused_us:.2} µs/dispatch"
-    );
+    eprintln!("  Run #fused: compute_g_full loop (NEW 5→1)   : {avg_fused_us:.2} µs/dispatch");
     eprintln!("  Run #3: 0-dispatch (commit/wait only)        : {avg_0_us:.2} µs/cmdbuf-roundtrip");
     let realised_saving_us = (avg_5_us - avg_fused_us).max(0.0);
     let realised_per_token_ms = realised_saving_us * N_LIN_LAYERS as f64 / 1000.0;
@@ -215,12 +213,8 @@ fn compute_g_dispatch_microbench() {
     );
     eprintln!();
     eprintln!("  Per-dispatch overhead inside cmdbuf      : {dispatch_overhead_us:.2} µs");
-    eprintln!(
-        "  5→1 fusion saving per linear-attn layer  : {saving_per_layer_us:.2} µs"
-    );
-    eprintln!(
-        "  Per-token saving (× {N_LIN_LAYERS} layers)        : {saving_per_token_ms:.3} ms"
-    );
+    eprintln!("  5→1 fusion saving per linear-attn layer  : {saving_per_layer_us:.2} µs");
+    eprintln!("  Per-token saving (× {N_LIN_LAYERS} layers)        : {saving_per_token_ms:.3} ms");
     eprintln!(
         "  % of {PRODUCTION_DECODE_MS:.0} ms decode                       : {saving_pct:.2}%"
     );

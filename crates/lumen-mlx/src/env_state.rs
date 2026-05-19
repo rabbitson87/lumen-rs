@@ -36,33 +36,51 @@
 const KNOWN_DEFAULTS: &[(&str, &str)] = &[
     // Gemma 4
     ("LUMEN_GEMMA4_FUSE_DENSE_MLP", "1 (compile-slot fuse)"),
-    ("LUMEN_GEMMA4_FUSE_EXPERTS",   "1 (compile-slot fuse)"),
-    ("LUMEN_GEMMA4_FUSE_ROUTER",    "1 (compile-slot fuse)"),
-    ("LUMEN_GEMMA4_CUSTOM_FLASH_ATTN",
-     "1 (M4.8 LANDED 2026-05-14, stride-aware kernel, zero-copy strided K/V)"),
-    ("LUMEN_GEMMA4_PREFILL_SYNC",
-     "1 (Phase 1.8 RESOLVED 2026-05-14, drain prefill GPU before decode)"),
+    ("LUMEN_GEMMA4_FUSE_EXPERTS", "1 (compile-slot fuse)"),
+    ("LUMEN_GEMMA4_FUSE_ROUTER", "1 (compile-slot fuse)"),
+    (
+        "LUMEN_GEMMA4_CUSTOM_FLASH_ATTN",
+        "1 (M4.8 LANDED 2026-05-14, stride-aware kernel, zero-copy strided K/V)",
+    ),
+    (
+        "LUMEN_GEMMA4_PREFILL_SYNC",
+        "1 (Phase 1.8 RESOLVED 2026-05-14, drain prefill GPU before decode)",
+    ),
     // Native MLX runner (Qwen3.5-MoE / Qwen3.6-27B / Qwen3.6-35B)
     ("LUMEN_NATIVE_KV_STEP_PREALLOC", "1 (G2 LANDED)"),
-    ("LUMEN_NATIVE_ALLOC_REUSE",      "1 (LANDED 2026-05-11)"),
-    ("LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE",
-     "1 (LANDED 2026-05-11, scale_fuse −3.33σ win)"),
+    ("LUMEN_NATIVE_ALLOC_REUSE", "1 (LANDED 2026-05-11)"),
+    (
+        "LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE",
+        "1 (LANDED 2026-05-11, scale_fuse −3.33σ win)",
+    ),
     ("LUMEN_NATIVE_DEFER_CLEAR_CACHE", "1 (Phase C #5 LANDED)"),
-    ("LUMEN_NATIVE_FUSE_SWIGLU",      "1 (LANDED)"),
-    ("LUMEN_NATIVE_COMPILE",          "1 (compute_g compile cache LANDED)"),
-    ("LUMEN_NATIVE_COMPILE_ROUTING",  "0 (A/B WASH)"),
-    ("LUMEN_NATIVE_CACHED_STREAM",    "0 (A/B WASH)"),
-    ("LUMEN_NATIVE_CONV_SLICE",       "0 (A/B WASH)"),
-    ("LUMEN_NATIVE_RMS_NORM_GATED_FUSED",
-     "0 (reserved for super-kernel composition)"),
-    ("LUMEN_NATIVE_FUSE_SIGMOID_MUL", "0 (anti-pattern #30 calibration)"),
-    ("LUMEN_NATIVE_STREAM_INCR",      "0 (FALSIFIED, regression at warmup)"),
-    ("LUMEN_NATIVE_NO_CLEAR_CACHE",   "0 (clear_cache fix opt-out)"),
-    ("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS",
-     "0 (opt-in; mirrors Gemma 4 — A/B WASH expected per MLX lazy dedup)"),
+    ("LUMEN_NATIVE_FUSE_SWIGLU", "1 (LANDED)"),
+    ("LUMEN_NATIVE_COMPILE", "1 (compute_g compile cache LANDED)"),
+    ("LUMEN_NATIVE_COMPILE_ROUTING", "0 (A/B WASH)"),
+    ("LUMEN_NATIVE_CACHED_STREAM", "0 (A/B WASH)"),
+    ("LUMEN_NATIVE_CONV_SLICE", "0 (A/B WASH)"),
+    (
+        "LUMEN_NATIVE_RMS_NORM_GATED_FUSED",
+        "0 (reserved for super-kernel composition)",
+    ),
+    (
+        "LUMEN_NATIVE_FUSE_SIGMOID_MUL",
+        "0 (anti-pattern #30 calibration)",
+    ),
+    (
+        "LUMEN_NATIVE_STREAM_INCR",
+        "0 (FALSIFIED, regression at warmup)",
+    ),
+    ("LUMEN_NATIVE_NO_CLEAR_CACHE", "0 (clear_cache fix opt-out)"),
+    (
+        "LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS",
+        "0 (opt-in; mirrors Gemma 4 — A/B WASH expected per MLX lazy dedup)",
+    ),
     // Compute-g fusion (Qwen3.6-27B)
-    ("LUMEN_FUSED_COMPUTE_G",
-     "0 (Phase 19.A.4.1 production +3% NEGATIVE, anti-pattern #27)"),
+    (
+        "LUMEN_FUSED_COMPUTE_G",
+        "0 (Phase 19.A.4.1 production +3% NEGATIVE, anti-pattern #27)",
+    ),
     // Backend / harness selection
     ("LUMEN_MLX_BACKEND", "native (default)"),
 ];

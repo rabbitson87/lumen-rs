@@ -10,8 +10,8 @@
 //!     passes. `matmul_with_weight` supports batch > 1 by dispatching matvec per row.
 
 use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
-use anyhow::Result;
 use crate::metal::{Buffer, ComputePipelineState, Library, MTLSize};
+use anyhow::Result;
 
 /// Aggregated profiling counters for `matmul_zero_copy`. Active only when
 /// `LUMEN_MXFP4_PROFILE=1`. Read + reset via [`take_profile_counts`].
@@ -637,23 +637,17 @@ impl MxFp4Context {
         let gate_up_silu_mul_f32_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&gate_up_silu_mul_v3_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_gate_up_silu_mul_f32_v3` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_gate_up_silu_mul_f32_v3` failed: {e}"))?;
         let moe_gate_up_silu_mul_v3_func = library
             .get_function("mxfp4_moe_gate_up_silu_mul_f32_v3", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_moe_gate_up_silu_mul_f32_v3` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_moe_gate_up_silu_mul_f32_v3` not found: {e}")
             })?;
         let moe_gate_up_silu_mul_f32_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_gate_up_silu_mul_v3_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_moe_gate_up_silu_mul_f32_v3` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_moe_gate_up_silu_mul_f32_v3` failed: {e}")
             })?;
         let moe_wsum_func = library
             .get_function("moe_wsum_f32", None)
@@ -664,55 +658,39 @@ impl MxFp4Context {
             .map_err(|e| anyhow::anyhow!("pipeline `moe_wsum_f32` failed: {e}"))?;
         let moe_matmul_wsum_v3_func = library
             .get_function("mxfp4_matmul_moe_wsum_f32_v3", None)
-            .map_err(|e| {
-                anyhow::anyhow!("kernel `mxfp4_matmul_moe_wsum_f32_v3` not found: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `mxfp4_matmul_moe_wsum_f32_v3` not found: {e}"))?;
         let matmul_moe_wsum_f32_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_matmul_wsum_v3_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_matmul_moe_wsum_f32_v3` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_moe_wsum_f32_v3` failed: {e}"))?;
         let moe_matmul_wsum_atomic_v3_func = library
             .get_function("mxfp4_matmul_moe_wsum_atomic_f32_v3", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_moe_wsum_atomic_f32_v3` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_matmul_moe_wsum_atomic_f32_v3` not found: {e}")
             })?;
         let matmul_moe_wsum_atomic_f32_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_matmul_wsum_atomic_v3_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_moe_wsum_atomic_f32_v3` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_matmul_moe_wsum_atomic_f32_v3` failed: {e}")
             })?;
         let topk_partial_func = library
             .get_function("topk_partial_select_f32", None)
-            .map_err(|e| {
-                anyhow::anyhow!("kernel `topk_partial_select_f32` not found: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `topk_partial_select_f32` not found: {e}"))?;
         let topk_partial_select_f32 = ctx
             .device
             .new_compute_pipeline_state_with_function(&topk_partial_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `topk_partial_select_f32` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `topk_partial_select_f32` failed: {e}"))?;
         let router_fused_func = library
             .get_function("router_softmax_topk_renorm_f32", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `router_softmax_topk_renorm_f32` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `router_softmax_topk_renorm_f32` not found: {e}")
             })?;
         let router_softmax_topk_renorm_f32 = ctx
             .device
             .new_compute_pipeline_state_with_function(&router_fused_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `router_softmax_topk_renorm_f32` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `router_softmax_topk_renorm_f32` failed: {e}")
             })?;
         let moe_gate_up_bf16_func = library
             .get_function("mxfp4_moe_gate_up_silu_mul_f32in_bf16out_v3", None)
@@ -732,93 +710,61 @@ impl MxFp4Context {
         let moe_down_bf16in_func = library
             .get_function("mxfp4_matmul_moe_bf16in_f32out_v3", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_moe_bf16in_f32out_v3` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_matmul_moe_bf16in_f32out_v3` not found: {e}")
             })?;
         let matmul_moe_bf16in_f32out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_down_bf16in_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_moe_bf16in_f32out_v3` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_matmul_moe_bf16in_f32out_v3` failed: {e}")
             })?;
         let moe_gate_up_rmsnorm_func = library
             .get_function("mxfp4_moe_gate_up_silu_mul_rmsnorm_f32_v3", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_moe_gate_up_silu_mul_rmsnorm_f32_v3` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_moe_gate_up_silu_mul_rmsnorm_f32_v3` not found: {e}")
             })?;
         let moe_gate_up_silu_mul_rmsnorm_f32_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_gate_up_rmsnorm_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_moe_gate_up_silu_mul_rmsnorm_f32_v3` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_moe_gate_up_silu_mul_rmsnorm_f32_v3` failed: {e}")
             })?;
         let matmul_v3_rmsnorm_func = library
             .get_function("mxfp4_matmul_f32_v3_rmsnorm", None)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_f32_v3_rmsnorm` not found: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `mxfp4_matmul_f32_v3_rmsnorm` not found: {e}"))?;
         let matmul_f32_v3_rmsnorm = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_v3_rmsnorm_func)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_f32_v3_rmsnorm` failed: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_f32_v3_rmsnorm` failed: {e}"))?;
         let matmul_v3_rmsnorm_large_func = library
             .get_function("mxfp4_matmul_f32_v3_rmsnorm_large", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_f32_v3_rmsnorm_large` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_matmul_f32_v3_rmsnorm_large` not found: {e}")
             })?;
         let matmul_f32_v3_rmsnorm_large = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_v3_rmsnorm_large_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_f32_v3_rmsnorm_large` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_matmul_f32_v3_rmsnorm_large` failed: {e}")
             })?;
         let matmul_v3_rmsnorm_xlarge_func = library
             .get_function("mxfp4_matmul_f32_v3_rmsnorm_xlarge", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_f32_v3_rmsnorm_xlarge` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_matmul_f32_v3_rmsnorm_xlarge` not found: {e}")
             })?;
         let matmul_f32_v3_rmsnorm_xlarge = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_v3_rmsnorm_xlarge_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_f32_v3_rmsnorm_xlarge` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_matmul_f32_v3_rmsnorm_xlarge` failed: {e}")
             })?;
         let matmul_v3_residual_func = library
             .get_function("mxfp4_matmul_f32_v3_residual", None)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_f32_v3_residual` not found: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `mxfp4_matmul_f32_v3_residual` not found: {e}"))?;
         let matmul_f32_v3_residual = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_v3_residual_func)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_f32_v3_residual` failed: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_f32_v3_residual` failed: {e}"))?;
         let tri_add_func = library
             .get_function("tri_add_f32", None)
             .map_err(|e| anyhow::anyhow!("kernel `tri_add_f32` not found: {e}"))?;
@@ -828,9 +774,7 @@ impl MxFp4Context {
             .map_err(|e| anyhow::anyhow!("pipeline `tri_add_f32` failed: {e}"))?;
         let scalar_mul_tri_add_func = library
             .get_function("scalar_mul_tri_add_f32", None)
-            .map_err(|e| {
-                anyhow::anyhow!("kernel `scalar_mul_tri_add_f32` not found: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `scalar_mul_tri_add_f32` not found: {e}"))?;
         let scalar_mul_tri_add_f32 = ctx
             .device
             .new_compute_pipeline_state_with_function(&scalar_mul_tri_add_func)
@@ -848,19 +792,11 @@ impl MxFp4Context {
             })?;
         let dense_matmul_rmsnorm_func = library
             .get_function("dense_f32_matmul_rmsnorm", None)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `dense_f32_matmul_rmsnorm` not found: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `dense_f32_matmul_rmsnorm` not found: {e}"))?;
         let dense_f32_matmul_rmsnorm = ctx
             .device
             .new_compute_pipeline_state_with_function(&dense_matmul_rmsnorm_func)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `dense_f32_matmul_rmsnorm` failed: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `dense_f32_matmul_rmsnorm` failed: {e}"))?;
         let small_out_v1_func = library
             .get_function("mxfp4_matmul_small_out_f32_v1", None)
             .map_err(|e| {
@@ -869,9 +805,7 @@ impl MxFp4Context {
         let matmul_small_out_f32_v1 = ctx
             .device
             .new_compute_pipeline_state_with_function(&small_out_v1_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_matmul_small_out_f32_v1` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_small_out_f32_v1` failed: {e}"))?;
 
         // bf16-output sister of v3. Same buffer slots, same dispatch
         // topology — only the output store is narrowed to bfloat16.
@@ -883,9 +817,7 @@ impl MxFp4Context {
         let matmul_f32in_bf16out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_f32in_bf16out_v3_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_matmul_f32in_bf16out_v3` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_f32in_bf16out_v3` failed: {e}"))?;
 
         // Lever B L.2: bf16-input sister of v3. Same buffer slots, dispatch
         // topology, and threadgroup memory size as the f32-in path; only the
@@ -899,9 +831,7 @@ impl MxFp4Context {
         let matmul_bf16in_f32out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_bf16in_f32out_v3_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_matmul_bf16in_f32out_v3` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_bf16in_f32out_v3` failed: {e}"))?;
 
         // bf16-output sisters of moe_v3, gate_up_silu_mul_v3,
         // and small_out_v1. Same dispatch topology each — only output narrows.
@@ -919,32 +849,24 @@ impl MxFp4Context {
         let gate_up_bf16_func = library
             .get_function("mxfp4_gate_up_silu_mul_f32in_bf16out_v3", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_gate_up_silu_mul_f32in_bf16out_v3` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_gate_up_silu_mul_f32in_bf16out_v3` not found: {e}")
             })?;
         let gate_up_silu_mul_f32in_bf16out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&gate_up_bf16_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_gate_up_silu_mul_f32in_bf16out_v3` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_gate_up_silu_mul_f32in_bf16out_v3` failed: {e}")
             })?;
         let small_out_bf16_func = library
             .get_function("mxfp4_matmul_small_out_f32in_bf16out_v1", None)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "kernel `mxfp4_matmul_small_out_f32in_bf16out_v1` not found: {e}"
-                )
+                anyhow::anyhow!("kernel `mxfp4_matmul_small_out_f32in_bf16out_v1` not found: {e}")
             })?;
         let matmul_small_out_f32in_bf16out_v1 = ctx
             .device
             .new_compute_pipeline_state_with_function(&small_out_bf16_func)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "pipeline `mxfp4_matmul_small_out_f32in_bf16out_v1` failed: {e}"
-                )
+                anyhow::anyhow!("pipeline `mxfp4_matmul_small_out_f32in_bf16out_v1` failed: {e}")
             })?;
 
         // CB 3 new pipelines.
@@ -971,20 +893,14 @@ impl MxFp4Context {
         let matmul_moe_f32_v3_multi = ctx
             .device
             .new_compute_pipeline_state_with_function(&matmul_moe_v3_multi_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `mxfp4_matmul_moe_f32_v3_multi` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `mxfp4_matmul_moe_f32_v3_multi` failed: {e}"))?;
         let moe_wsum_multi_func = library
             .get_function("moe_wsum_f32_multi", None)
-            .map_err(|e| {
-                anyhow::anyhow!("kernel `moe_wsum_f32_multi` not found: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("kernel `moe_wsum_f32_multi` not found: {e}"))?;
         let moe_wsum_f32_multi = ctx
             .device
             .new_compute_pipeline_state_with_function(&moe_wsum_multi_func)
-            .map_err(|e| {
-                anyhow::anyhow!("pipeline `moe_wsum_f32_multi` failed: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("pipeline `moe_wsum_f32_multi` failed: {e}"))?;
 
         let kernel_version = read_kernel_version_env();
         match kernel_version {
@@ -1350,11 +1266,23 @@ impl MxFp4Context {
         let x_buf = self.ctx.buffer_with_data(x);
         let y_buf = self.ctx.buffer_for::<f32>(batch * inter);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_gate_up_silu_mul");
-        self.encode_gate_up_silu_mul_dispatch(encoder.as_ref(), weight, &x_buf, 0, &y_buf, 0, batch);
+        self.encode_gate_up_silu_mul_dispatch(
+            encoder.as_ref(),
+            weight,
+            &x_buf,
+            0,
+            &y_buf,
+            0,
+            batch,
+        );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self.ctx.read_buffer::<f32>(&y_buf, batch * inter))
     }
@@ -1425,13 +1353,23 @@ impl MxFp4Context {
         if batch == 0 {
             return Ok(());
         }
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul_small_out");
         self.encode_matmul_small_out_dispatch(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1499,13 +1437,23 @@ impl MxFp4Context {
         if batch == 0 {
             return Ok(());
         }
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul_small_out_bf16_out");
         self.encode_matmul_small_out_dispatch_bf16_out(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1574,13 +1522,23 @@ impl MxFp4Context {
         if batch == 0 {
             return Ok(());
         }
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_gate_up_silu_mul_bf16_out");
         self.encode_gate_up_silu_mul_dispatch_bf16_out(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1606,11 +1564,23 @@ impl MxFp4Context {
         let x_buf = self.ctx.buffer_with_data(x);
         let y_buf = self.ctx.buffer_for::<f32>(batch * weight.out_features);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul_small_out");
-        self.encode_matmul_small_out_dispatch(encoder.as_ref(), weight, &x_buf, 0, &y_buf, 0, batch);
+        self.encode_matmul_small_out_dispatch(
+            encoder.as_ref(),
+            weight,
+            &x_buf,
+            0,
+            &y_buf,
+            0,
+            batch,
+        );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self
             .ctx
@@ -1643,11 +1613,15 @@ impl MxFp4Context {
         let x_buf = self.ctx.buffer_with_data(x);
         let y_buf = self.ctx.buffer_for::<f32>(batch * weight.out_features);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul");
         self.encode_matmul_dispatch(encoder.as_ref(), weight, &x_buf, 0, &y_buf, 0, batch);
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self
             .ctx
@@ -1690,9 +1664,19 @@ impl MxFp4Context {
             return Ok(());
         }
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul");
-        self.encode_matmul_dispatch(encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch);
+        self.encode_matmul_dispatch(
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
+        );
 
         let profile = std::env::var("LUMEN_MXFP4_PROFILE")
             .map(|v| v == "1")
@@ -1702,7 +1686,9 @@ impl MxFp4Context {
             let commit_ns = t_commit.elapsed().as_nanos() as u64;
             let t_wait = std::time::Instant::now();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let wait_ns = t_wait.elapsed().as_nanos() as u64;
             use std::sync::atomic::Ordering::Relaxed;
             PROF_CALLS.fetch_add(1, Relaxed);
@@ -1710,7 +1696,9 @@ impl MxFp4Context {
             PROF_WAIT_NS.fetch_add(wait_ns, Relaxed);
         } else {
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         Ok(())
     }
@@ -1735,13 +1723,23 @@ impl MxFp4Context {
             return Ok(());
         }
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul_bf16_out");
         self.encode_matmul_dispatch_bf16_out(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1763,13 +1761,23 @@ impl MxFp4Context {
             return Ok(());
         }
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matmul_bf16_in");
         self.encode_matmul_dispatch_bf16_in(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1789,13 +1797,23 @@ impl MxFp4Context {
             return Ok(());
         }
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_gate_up_silu_mul");
         self.encode_gate_up_silu_mul_dispatch(
-            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1830,9 +1848,12 @@ impl MxFp4Context {
             if job.batch == 0 {
                 continue;
             }
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             encoder.set_label("lumen:mxfp4_matmul_multi_cmdbuf");
-            self.encode_matmul_dispatch(encoder.as_ref(),
+            self.encode_matmul_dispatch(
+                encoder.as_ref(),
                 job.weight,
                 job.x_buf,
                 job.x_offset,
@@ -1846,7 +1867,9 @@ impl MxFp4Context {
         let commit_ns = t_commit.elapsed().as_nanos() as u64;
 
         let t_wait = std::time::Instant::now();
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         let wait_ns = t_wait.elapsed().as_nanos() as u64;
 
         if profile {
@@ -1870,7 +1893,6 @@ impl MxFp4Context {
             return Ok(());
         }
 
-
         let profile = std::env::var("LUMEN_MXFP4_PROFILE")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -1881,9 +1903,12 @@ impl MxFp4Context {
             if job.batch == 0 {
                 continue;
             }
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             encoder.set_label("lumen:mxfp4_matmul_batch");
-            self.encode_matmul_dispatch(encoder.as_ref(),
+            self.encode_matmul_dispatch(
+                encoder.as_ref(),
                 job.weight,
                 job.x_buf,
                 job.x_offset,
@@ -1897,7 +1922,9 @@ impl MxFp4Context {
             let t_commit = std::time::Instant::now();
             let commit_ns = t_commit.elapsed().as_nanos() as u64;
             let t_wait = std::time::Instant::now();
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let wait_ns = t_wait.elapsed().as_nanos() as u64;
             use std::sync::atomic::Ordering::Relaxed;
             // Attribute one "call" per job so avg math stays meaningful.
@@ -1905,7 +1932,9 @@ impl MxFp4Context {
             PROF_COMMIT_NS.fetch_add(commit_ns, Relaxed);
             PROF_WAIT_NS.fetch_add(wait_ns, Relaxed);
         } else {
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         Ok(())
     }
@@ -3531,15 +3560,10 @@ impl MxFp4Context {
             depth: 1,
         };
         // shared_v[256] f32, shared_i[256] u32, reduce_buf[max(8,k)] f32.
-        encoder
-            .set_threadgroup_memory_length(0, TG_SIZE * std::mem::size_of::<f32>());
-        encoder
-            .set_threadgroup_memory_length(1, TG_SIZE * std::mem::size_of::<u32>());
+        encoder.set_threadgroup_memory_length(0, TG_SIZE * std::mem::size_of::<f32>());
+        encoder.set_threadgroup_memory_length(1, TG_SIZE * std::mem::size_of::<u32>());
         let reduce_buf_len = std::cmp::max(8, k);
-        encoder.set_threadgroup_memory_length(
-            2,
-            reduce_buf_len * std::mem::size_of::<f32>(),
-        );
+        encoder.set_threadgroup_memory_length(2, reduce_buf_len * std::mem::size_of::<f32>());
         encoder.dispatch_thread_groups(groups, tg);
         Ok(())
     }
@@ -3582,7 +3606,9 @@ impl MxFp4Context {
             broadcast_x: if broadcast_x { 1 } else { 0 },
         };
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_moe_matmul");
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(packed_all), (0) as usize);
@@ -3643,7 +3669,9 @@ impl MxFp4Context {
             let commit_ns = t_commit.elapsed().as_nanos() as u64;
             let t_wait = std::time::Instant::now();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let wait_ns = t_wait.elapsed().as_nanos() as u64;
             use std::sync::atomic::Ordering::Relaxed;
             // Charge one "call" per expert slot for commensurable averages.
@@ -3652,7 +3680,9 @@ impl MxFp4Context {
             PROF_WAIT_NS.fetch_add(wait_ns, Relaxed);
         } else {
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         Ok(())
     }
@@ -3708,7 +3738,9 @@ impl MxFp4Context {
         };
         let dims_buf = self.ctx.buffer_with_data(std::slice::from_ref(&dims));
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:mxfp4_matvec");
         encoder.set_compute_pipeline_state(&self.matvec_f32);
         encoder.set_buffer(0, Some(&packed_buf), (0) as usize);
@@ -3731,7 +3763,9 @@ impl MxFp4Context {
         };
         encoder.dispatch_threads(grid, tg);
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self.ctx.read_buffer::<f32>(&y_buf, out_features))
     }
@@ -3747,7 +3781,11 @@ mod tests {
     use crate::mxfp4::dequantize_f32;
 
     /// Build a deterministic MXFP4 weight + its CPU-dequantized f32 reference.
-    fn synth_weight(out_features: usize, in_features: usize, seed: u32) -> (Vec<u32>, Vec<u8>, Vec<f32>) {
+    fn synth_weight(
+        out_features: usize,
+        in_features: usize,
+        seed: u32,
+    ) -> (Vec<u32>, Vec<u8>, Vec<f32>) {
         assert!(in_features.is_multiple_of(32));
         let n_groups = out_features * in_features / 32;
         let n_words = out_features * in_features / 8;
@@ -3768,7 +3806,13 @@ mod tests {
         (packed, scales, dense)
     }
 
-    fn cpu_matmul(dense_weight: &[f32], x: &[f32], batch: usize, out: usize, ins: usize) -> Vec<f32> {
+    fn cpu_matmul(
+        dense_weight: &[f32],
+        x: &[f32],
+        batch: usize,
+        out: usize,
+        ins: usize,
+    ) -> Vec<f32> {
         let mut y = vec![0.0_f32; batch * out];
         for b in 0..batch {
             for r in 0..out {
@@ -3879,7 +3923,9 @@ mod tests {
 
         // Case 1: broadcast_x=true. One x of shape [batch, ins] shared across k slots.
         {
-            let x: Vec<f32> = (0..batch * ins).map(|i| (i as f32 * 0.019).cos() * 0.6).collect();
+            let x: Vec<f32> = (0..batch * ins)
+                .map(|i| (i as f32 * 0.019).cos() * 0.6)
+                .collect();
             let x_buf = ctx.ctx.buffer_with_data(&x);
             let y_buf = ctx.ctx.buffer_for::<f32>(k * batch * out);
 
@@ -3979,7 +4025,9 @@ mod tests {
         ];
         for &(out, ins, batch, k) in cases {
             let num_experts_total = 5usize;
-            let selected: Vec<u32> = (0..k).map(|i| ((i + 1) * 7 % num_experts_total) as u32).collect();
+            let selected: Vec<u32> = (0..k)
+                .map(|i| ((i + 1) * 7 % num_experts_total) as u32)
+                .collect();
 
             let mut all_packed = Vec::<u32>::new();
             let mut all_scales = Vec::<u8>::new();
@@ -4000,16 +4048,36 @@ mod tests {
 
             let y_v2 = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy_with_version(
-                KernelVersion::V2, &packed_all, &scales_all, &selected,
-                &x_buf, 0, &y_v2, 0, out, ins, batch, true,
+                KernelVersion::V2,
+                &packed_all,
+                &scales_all,
+                &selected,
+                &x_buf,
+                0,
+                &y_v2,
+                0,
+                out,
+                ins,
+                batch,
+                true,
             )
             .unwrap();
             let y_v2_vec = ctx.ctx.read_buffer::<f32>(&y_v2, k * batch * out);
 
             let y_v3 = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy_with_version(
-                KernelVersion::V3, &packed_all, &scales_all, &selected,
-                &x_buf, 0, &y_v3, 0, out, ins, batch, true,
+                KernelVersion::V3,
+                &packed_all,
+                &scales_all,
+                &selected,
+                &x_buf,
+                0,
+                &y_v3,
+                0,
+                out,
+                ins,
+                batch,
+                true,
             )
             .unwrap();
             let y_v3_vec = ctx.ctx.read_buffer::<f32>(&y_v3, k * batch * out);
@@ -4022,11 +4090,21 @@ mod tests {
             }
             // Cosine similarity sanity (FMA reduction order differs between
             // v2 and v3 but the result should still be numerically equivalent).
-            let dot: f64 = y_v2_vec.iter().zip(y_v3_vec.iter())
+            let dot: f64 = y_v2_vec
+                .iter()
+                .zip(y_v3_vec.iter())
                 .map(|(a, b)| (*a as f64) * (*b as f64))
                 .sum();
-            let na: f64 = y_v2_vec.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-            let nb: f64 = y_v3_vec.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let na: f64 = y_v2_vec
+                .iter()
+                .map(|x| (*x as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let nb: f64 = y_v3_vec
+                .iter()
+                .map(|x| (*x as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
             let cos = if na * nb > 0.0 { dot / (na * nb) } else { 1.0 };
             let rel = max_abs / max_mag.max(1e-6);
             assert!(
@@ -4078,8 +4156,17 @@ mod tests {
             // Reference: host slice path.
             let y_slice = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy(
-                &packed_all, &scales_all, &selected,
-                &x_buf, 0, &y_slice, 0, out, ins, batch, true,
+                &packed_all,
+                &scales_all,
+                &selected,
+                &x_buf,
+                0,
+                &y_slice,
+                0,
+                out,
+                ins,
+                batch,
+                true,
             )
             .unwrap();
             let y_slice_vec = ctx.ctx.read_buffer::<f32>(&y_slice, k * batch * out);
@@ -4088,8 +4175,19 @@ mod tests {
             let inds_buf = ctx.ctx.buffer_with_data(&selected);
             let y_buf_path = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &y_buf_path, 0, out, ins, batch, true,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &y_buf_path,
+                0,
+                out,
+                ins,
+                batch,
+                true,
             )
             .unwrap();
             let y_buf_vec = ctx.ctx.read_buffer::<f32>(&y_buf_path, k * batch * out);
@@ -4097,7 +4195,8 @@ mod tests {
             // Bit-identical (same kernel, same bytes).
             for (i, (a, b)) in y_slice_vec.iter().zip(y_buf_vec.iter()).enumerate() {
                 assert_eq!(
-                    a.to_bits(), b.to_bits(),
+                    a.to_bits(),
+                    b.to_bits(),
                     "shape (out={out}, in={ins}, b={batch}, k={k}) idx {i}: slice={a} vs buf={b}"
                 );
             }
@@ -4111,8 +4210,19 @@ mod tests {
             let inds_offset_bytes = (k * 3 * std::mem::size_of::<u32>()) as u64;
             let y_off = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf_off, inds_offset_bytes, k,
-                &x_buf, 0, &y_off, 0, out, ins, batch, true,
+                &packed_all,
+                &scales_all,
+                &inds_buf_off,
+                inds_offset_bytes,
+                k,
+                &x_buf,
+                0,
+                &y_off,
+                0,
+                out,
+                ins,
+                batch,
+                true,
             )
             .unwrap();
             let y_off_vec = ctx.ctx.read_buffer::<f32>(&y_off, k * batch * out);
@@ -4211,10 +4321,10 @@ mod tests {
             Err(_) => return,
         };
         let cases: &[(usize, usize)] = &[
-            (4, 64),       // tiny smoke
-            (8, 128),      // typical k
-            (8, 2048),     // production decode shape (top-8, hidden=2048)
-            (16, 1024),    // larger k
+            (4, 64),    // tiny smoke
+            (8, 128),   // typical k
+            (8, 2048),  // production decode shape (top-8, hidden=2048)
+            (16, 1024), // larger k
         ];
         for &(k, hidden) in cases {
             let downs: Vec<f32> = (0..k * hidden)
@@ -4238,7 +4348,9 @@ mod tests {
             let weights_buf = ctx.ctx.buffer_with_data(&weights);
             let out_buf = ctx.ctx.buffer_for::<f32>(hidden);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.moe_wsum_zero_copy_inline(
                 encoder.as_ref(),
                 &downs_buf,
@@ -4252,7 +4364,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let got = ctx.ctx.read_buffer::<f32>(&out_buf, hidden);
 
             // Single-pass FMA in row-major order — match CPU bit-exactly.
@@ -4283,10 +4397,10 @@ mod tests {
         // (inter, hidden, batch, k) — `inter` is half the gate_up out_features
         // per expert. Each expert weight slab is `[2*inter, hidden/8]` packed.
         let cases: &[(usize, usize, usize, usize)] = &[
-            (16, 64, 1, 3),     // tiny smoke
-            (24, 96, 2, 4),     // tail TG (3 row-tgs)
-            (32, 128, 3, 2),    // small batch
-            (512, 2048, 1, 8),  // production decode shape (top-8 routing)
+            (16, 64, 1, 3),    // tiny smoke
+            (24, 96, 2, 4),    // tail TG (3 row-tgs)
+            (32, 128, 3, 2),   // small batch
+            (512, 2048, 1, 8), // production decode shape (top-8 routing)
         ];
 
         for &(inter, hidden, batch, k) in cases {
@@ -4318,8 +4432,19 @@ mod tests {
             // Reference: non-fused routed matmul → CPU split + silu*up.
             let y_combined = ctx.ctx.buffer_for::<f32>(k * batch * out);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &y_combined, 0, out, hidden, batch, true,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &y_combined,
+                0,
+                out,
+                hidden,
+                batch,
+                true,
             )
             .unwrap();
             let combined_vec = ctx.ctx.read_buffer::<f32>(&y_combined, k * batch * out);
@@ -4337,7 +4462,9 @@ mod tests {
 
             // Subject: fused single-kernel dispatch via inline encoder helper.
             let y_fused = ctx.ctx.buffer_for::<f32>(k * batch * inter);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_zero_copy_with_indices_buffer_inline(
                 encoder.as_ref(),
                 &packed_all,
@@ -4355,7 +4482,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let fused_vec = ctx.ctx.read_buffer::<f32>(&y_fused, k * batch * inter);
 
             // Cosine similarity vs reference.
@@ -4397,10 +4526,10 @@ mod tests {
         // exercised in the routed MoE hot path, so we restrict to batch=1 to
         // keep the reference path (`moe_wsum_f32` 1D-over-hidden) one-shot.
         let cases: &[(usize, usize, usize)] = &[
-            (64, 32, 3),     // tiny smoke
-            (96, 32, 4),     // tail TG (12 row-tgs)
-            (128, 64, 6),    // small inter
-            (2048, 512, 8),  // production decode shape (top-8 routing)
+            (64, 32, 3),    // tiny smoke
+            (96, 32, 4),    // tail TG (12 row-tgs)
+            (128, 64, 6),   // small inter
+            (2048, 512, 8), // production decode shape (top-8 routing)
         ];
 
         for &(hidden, inter, k) in cases {
@@ -4439,24 +4568,48 @@ mod tests {
             // then moe_wsum.
             let downs_big = ctx.ctx.buffer_for::<f32>(k * batch * hidden);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &downs_big, 0, hidden, inter, batch, false,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &downs_big,
+                0,
+                hidden,
+                inter,
+                batch,
+                false,
             )
             .unwrap();
             let out_ref = ctx.ctx.buffer_for::<f32>(batch * hidden);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.moe_wsum_zero_copy_inline(
-                encoder.as_ref(), &downs_big, 0, &weights_buf, 0,
-                &out_ref, 0, k, hidden,
+                encoder.as_ref(),
+                &downs_big,
+                0,
+                &weights_buf,
+                0,
+                &out_ref,
+                0,
+                k,
+                hidden,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let reference = ctx.ctx.read_buffer::<f32>(&out_ref, batch * hidden);
 
             // Subject: single fused dispatch.
             let y_fused = ctx.ctx.buffer_for::<f32>(batch * hidden);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_wsum_zero_copy_with_indices_buffer_inline(
                 encoder.as_ref(),
                 &packed_all,
@@ -4476,7 +4629,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let fused_vec = ctx.ctx.read_buffer::<f32>(&y_fused, batch * hidden);
 
             let mut dot = 0.0_f64;
@@ -4507,10 +4662,10 @@ mod tests {
             Err(_) => return,
         };
         let cases: &[(usize, usize, usize)] = &[
-            (64, 32, 3),     // tiny smoke
-            (96, 32, 4),     // tail TG
-            (128, 64, 6),    // small inter
-            (2048, 512, 8),  // production decode shape (top-8 routing)
+            (64, 32, 3),    // tiny smoke
+            (96, 32, 4),    // tail TG
+            (128, 64, 6),   // small inter
+            (2048, 512, 8), // production decode shape (top-8 routing)
         ];
 
         for &(hidden, inter, k) in cases {
@@ -4545,15 +4700,36 @@ mod tests {
             // Reference chain
             let downs_big = ctx.ctx.buffer_for::<f32>(k * batch * hidden);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &downs_big, 0, hidden, inter, batch, false,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &downs_big,
+                0,
+                hidden,
+                inter,
+                batch,
+                false,
             )
             .unwrap();
             let out_ref = ctx.ctx.buffer_for::<f32>(batch * hidden);
-            let enc_ref = cmd_ref; let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc_ref = cmd_ref;
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.moe_wsum_zero_copy_inline(
-                &enc_ref, &downs_big, 0, &weights_buf, 0,
-                &out_ref, 0, k, hidden,
+                &enc_ref,
+                &downs_big,
+                0,
+                &weights_buf,
+                0,
+                &out_ref,
+                0,
+                k,
+                hidden,
             )
             .unwrap();
             enc_ref.end_encoding();
@@ -4564,7 +4740,9 @@ mod tests {
             // Subject: pre-zero output (kernel only adds), then dispatch.
             let zeros = vec![0.0_f32; batch * hidden];
             let y_atomic = ctx.ctx.buffer_with_data(&zeros);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_wsum_atomic_zero_copy_with_indices_buffer_inline(
                 encoder.as_ref(),
                 &packed_all,
@@ -4584,7 +4762,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let atomic_vec = ctx.ctx.read_buffer::<f32>(&y_atomic, batch * hidden);
 
             let mut dot = 0.0_f64;
@@ -4678,53 +4858,117 @@ mod tests {
 
         // Warm-up.
         for _ in 0..WARMUP {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_zero_copy_with_indices_buffer_inline(
-                &enc, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_norm_buf, 0, &y_buf, 0, inter, hidden, batch,
+                &enc,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_norm_buf,
+                0,
+                &y_buf,
+                0,
+                inter,
+                hidden,
+                batch,
             )
             .unwrap();
             drop(enc);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         for _ in 0..WARMUP {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_rmsnorm_zero_copy_with_indices_buffer_inline(
-                &enc, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_raw_buf, 0, &rms_w_buf, 0, &y_buf, 0,
-                inter, hidden, batch, rms_eps,
+                &enc,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_raw_buf,
+                0,
+                &rms_w_buf,
+                0,
+                &y_buf,
+                0,
+                inter,
+                hidden,
+                batch,
+                rms_eps,
             )
             .unwrap();
             drop(enc);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
 
         // Time unfused (Lever A baseline).
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_zero_copy_with_indices_buffer_inline(
-                &enc, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_norm_buf, 0, &y_buf, 0, inter, hidden, batch,
+                &enc,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_norm_buf,
+                0,
+                &y_buf,
+                0,
+                inter,
+                hidden,
+                batch,
             )
             .unwrap();
             drop(enc);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         let unfused_ns = t0.elapsed().as_nanos() / ITERS as u128;
 
         // Time fused.
         let t1 = std::time::Instant::now();
         for _ in 0..ITERS {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_rmsnorm_zero_copy_with_indices_buffer_inline(
-                &enc, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_raw_buf, 0, &rms_w_buf, 0, &y_buf, 0,
-                inter, hidden, batch, rms_eps,
+                &enc,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_raw_buf,
+                0,
+                &rms_w_buf,
+                0,
+                &y_buf,
+                0,
+                inter,
+                hidden,
+                batch,
+                rms_eps,
             )
             .unwrap();
             drop(enc);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
         }
         let fused_ns = t1.elapsed().as_nanos() / ITERS as u128;
 
@@ -4759,9 +5003,9 @@ mod tests {
         };
         // (inter, hidden, batch, k)
         let cases: &[(usize, usize, usize, usize)] = &[
-            (16, 64, 1, 3),     // tiny smoke
-            (32, 128, 2, 4),    // small
-            (512, 2048, 1, 8),  // production decode
+            (16, 64, 1, 3),    // tiny smoke
+            (32, 128, 2, 4),   // small
+            (512, 2048, 1, 8), // production decode
         ];
         let rms_eps: f32 = 1e-6;
 
@@ -4806,10 +5050,24 @@ mod tests {
             let x_norm_buf = ctx.ctx.buffer_with_data(&xs_normalized);
             let inds_buf = ctx.ctx.buffer_with_data(&selected);
             let y_ref = ctx.ctx.buffer_for::<f32>(k * batch * inter);
-            let enc_ref = cmd_ref; let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc_ref = cmd_ref;
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_zero_copy_with_indices_buffer_inline(
-                &enc_ref, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_norm_buf, 0, &y_ref, 0, inter, hidden, batch,
+                &enc_ref,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_norm_buf,
+                0,
+                &y_ref,
+                0,
+                inter,
+                hidden,
+                batch,
             )
             .unwrap();
             enc_ref.end_encoding();
@@ -4821,15 +5079,32 @@ mod tests {
             let x_raw_buf = ctx.ctx.buffer_with_data(&xs_raw);
             let rms_w_buf = ctx.ctx.buffer_with_data(&rms_w);
             let y_subj = ctx.ctx.buffer_for::<f32>(k * batch * inter);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_rmsnorm_zero_copy_with_indices_buffer_inline(
-                encoder.as_ref(), &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_raw_buf, 0, &rms_w_buf, 0, &y_subj, 0,
-                inter, hidden, batch, rms_eps,
+                encoder.as_ref(),
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_raw_buf,
+                0,
+                &rms_w_buf,
+                0,
+                &y_subj,
+                0,
+                inter,
+                hidden,
+                batch,
+                rms_eps,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, k * batch * inter);
 
             let mut dot = 0.0_f64;
@@ -4889,10 +5164,24 @@ mod tests {
 
             // Reference: f32-output Lever A kernel.
             let y_f32 = ctx.ctx.buffer_for::<f32>(k * batch * inter);
-            let enc_ref = cmd_ref; let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc_ref = cmd_ref;
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_zero_copy_with_indices_buffer_inline(
-                &enc_ref, &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &y_f32, 0, inter, hidden, batch,
+                &enc_ref,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &y_f32,
+                0,
+                inter,
+                hidden,
+                batch,
             )
             .unwrap();
             enc_ref.end_encoding();
@@ -4902,14 +5191,29 @@ mod tests {
 
             // Subject: bf16-output kernel.
             let y_bf16 = ctx.ctx.buffer_for::<u16>(k * batch * inter);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_gate_up_silu_mul_bf16out_zero_copy_with_indices_buffer_inline(
-                encoder.as_ref(), &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_buf, 0, &y_bf16, 0, inter, hidden, batch,
+                encoder.as_ref(),
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_buf,
+                0,
+                &y_bf16,
+                0,
+                inter,
+                hidden,
+                batch,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let bf16_bits = ctx.ctx.read_buffer::<u16>(&y_bf16, k * batch * inter);
             let subject: Vec<f32> = bf16_bits
                 .iter()
@@ -4970,10 +5274,7 @@ mod tests {
             let xs_f32: Vec<f32> = (0..k * batch * inter)
                 .map(|i| (i as f32 * 0.013 + 0.17).sin() * 0.42)
                 .collect();
-            let xs_bf16: Vec<u16> = xs_f32
-                .iter()
-                .map(|&v| (v.to_bits() >> 16) as u16)
-                .collect();
+            let xs_bf16: Vec<u16> = xs_f32.iter().map(|&v| (v.to_bits() >> 16) as u16).collect();
             let x_f32_buf = ctx.ctx.buffer_with_data(&xs_f32);
             let x_bf16_buf = ctx.ctx.buffer_with_data(&xs_bf16);
             let inds_buf = ctx.ctx.buffer_with_data(&selected);
@@ -4988,22 +5289,49 @@ mod tests {
             let x_f32_rounded_buf = ctx.ctx.buffer_with_data(&xs_f32_rounded);
             let y_ref = ctx.ctx.buffer_for::<f32>(k * batch * hidden);
             ctx.matmul_moe_zero_copy_with_indices_buffer(
-                &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_f32_rounded_buf, 0, &y_ref, 0, hidden, inter, batch, false,
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_f32_rounded_buf,
+                0,
+                &y_ref,
+                0,
+                hidden,
+                inter,
+                batch,
+                false,
             )
             .unwrap();
             let reference = ctx.ctx.read_buffer::<f32>(&y_ref, k * batch * hidden);
 
             // Subject: bf16-in down dispatch.
             let y_subj = ctx.ctx.buffer_for::<f32>(k * batch * hidden);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_moe_bf16in_zero_copy_with_indices_buffer_inline(
-                encoder.as_ref(), &packed_all, &scales_all, &inds_buf, 0, k,
-                &x_bf16_buf, 0, &y_subj, 0, hidden, inter, batch, false,
+                encoder.as_ref(),
+                &packed_all,
+                &scales_all,
+                &inds_buf,
+                0,
+                k,
+                &x_bf16_buf,
+                0,
+                &y_subj,
+                0,
+                hidden,
+                inter,
+                batch,
+                false,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, k * batch * hidden);
 
             // With identical x (bf16-rounded both sides), the two paths
@@ -5030,10 +5358,10 @@ mod tests {
         };
         // (BL, num_experts, k)
         let cases: &[(usize, usize, usize)] = &[
-            (1, 8, 3),       // tiny smoke
+            (1, 8, 3), // tiny smoke
             (1, 16, 4),
-            (3, 32, 5),      // multi-row
-            (1, 256, 8),     // production decode shape (Qwen3.5-MoE)
+            (3, 32, 5),  // multi-row
+            (1, 256, 8), // production decode shape (Qwen3.5-MoE)
         ];
 
         for &(bl, e, k) in cases {
@@ -5053,9 +5381,8 @@ mod tests {
             let mut ref_vals = vec![0.0f32; bl * k];
             for b in 0..bl {
                 let base = b * e;
-                let mut idx_val: Vec<(u32, f32)> = (0..e)
-                    .map(|i| (i as u32, probs[base + i]))
-                    .collect();
+                let mut idx_val: Vec<(u32, f32)> =
+                    (0..e).map(|i| (i as u32, probs[base + i])).collect();
                 idx_val.sort_by(|a, b| {
                     // Descending value, ties → ascending index
                     match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
@@ -5074,7 +5401,9 @@ mod tests {
             let inds_buf = ctx.ctx.buffer_for::<u32>(bl * k);
             let vals_buf = ctx.ctx.buffer_for::<f32>(bl * k);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.topk_partial_select_zero_copy_inline(
                 encoder.as_ref(),
                 &probs_buf,
@@ -5089,7 +5418,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
 
             let got_inds = ctx.ctx.read_buffer::<u32>(&inds_buf, bl * k);
             let got_vals = ctx.ctx.read_buffer::<f32>(&vals_buf, bl * k);
@@ -5155,15 +5486,12 @@ mod tests {
                 let max_v = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exps: Vec<f32> = row.iter().map(|&x| (x - max_v).exp()).collect();
                 let sum_exp: f32 = exps.iter().sum();
-                let probs: Vec<f32> =
-                    exps.iter().map(|&e| e / sum_exp).collect();
+                let probs: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
 
                 // argsort desc, tie → ascending index.
-                let mut idx_val: Vec<(u32, f32)> =
-                    (0..e).map(|i| (i as u32, probs[i])).collect();
+                let mut idx_val: Vec<(u32, f32)> = (0..e).map(|i| (i as u32, probs[i])).collect();
                 idx_val.sort_by(|a, b| {
-                    match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    {
+                    match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
                         std::cmp::Ordering::Equal => a.0.cmp(&b.0),
                         o => o,
                     }
@@ -5183,7 +5511,9 @@ mod tests {
             let inds_buf = ctx.ctx.buffer_for::<u32>(bl * k);
             let vals_buf = ctx.ctx.buffer_for::<f32>(bl * k);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.router_softmax_topk_renorm_zero_copy_inline(
                 encoder.as_ref(),
                 &logits_buf,
@@ -5198,7 +5528,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
 
             let got_inds = ctx.ctx.read_buffer::<u32>(&inds_buf, bl * k);
             let got_vals = ctx.ctx.read_buffer::<f32>(&vals_buf, bl * k);
@@ -5251,11 +5583,11 @@ mod tests {
         };
         // (out_features, in_features, batch). r_gate hits (256, 2048, 1) at decode.
         let cases: &[(usize, usize, usize)] = &[
-            (8, 64, 1),      // tiny smoke
-            (16, 128, 2),    // small batch
+            (8, 64, 1),   // tiny smoke
+            (16, 128, 2), // small batch
             (64, 512, 1),
-            (256, 2048, 1),  // production r_gate decode shape
-            (256, 2048, 4),  // small prefill
+            (256, 2048, 1), // production r_gate decode shape
+            (256, 2048, 4), // small prefill
         ];
 
         for &(out, ins, batch) in cases {
@@ -5317,10 +5649,10 @@ mod tests {
         };
         // (out_features, in_features, batch) — covers both production consumers.
         let cases: &[(usize, usize, usize)] = &[
-            (16, 64, 1),       // tiny smoke
-            (32, 128, 2),      // small batch
-            (256, 2048, 1),    // production routing gate (E=256, hidden=2048)
-            (1024, 2048, 1),   // production shared expert gate_up (2*512, hidden=2048)
+            (16, 64, 1),     // tiny smoke
+            (32, 128, 2),    // small batch
+            (256, 2048, 1),  // production routing gate (E=256, hidden=2048)
+            (1024, 2048, 1), // production shared expert gate_up (2*512, hidden=2048)
         ];
         let rms_eps: f32 = 1e-6;
 
@@ -5349,13 +5681,17 @@ mod tests {
                 }
             }
             let weight = Mxfp4Weight::from_host(&ctx.ctx, &packed, &scales, out, ins).unwrap();
-            let reference = ctx.matmul_with_weight(&weight, &xs_normalized, batch).unwrap();
+            let reference = ctx
+                .matmul_with_weight(&weight, &xs_normalized, batch)
+                .unwrap();
 
             // Subject: RmsNorm-fused kernel reads raw x.
             let x_raw_buf = ctx.ctx.buffer_with_data(&xs_raw);
             let rms_w_buf = ctx.ctx.buffer_with_data(&rms_w);
             let y_subj = ctx.ctx.buffer_for::<f32>(batch * out);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_f32_v3_rmsnorm_zero_copy_inline(
                 encoder.as_ref(),
                 &packed_buf,
@@ -5373,7 +5709,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, batch * out);
 
             let mut dot = 0.0_f64;
@@ -5405,9 +5743,9 @@ mod tests {
         let cases: &[(usize, usize, usize)] = &[
             (16, 64, 1),
             (32, 128, 2),
-            (256, 2048, 1),    // routing gate shape
-            (2048, 2048, 1),   // self_attn o_proj shape (Qwen3.6 hidden=2048)
-            (2048, 2048, 4),   // o_proj with prefill batch
+            (256, 2048, 1),  // routing gate shape
+            (2048, 2048, 1), // self_attn o_proj shape (Qwen3.6 hidden=2048)
+            (2048, 2048, 4), // o_proj with prefill batch
         ];
 
         for &(out, ins, batch) in cases {
@@ -5436,7 +5774,9 @@ mod tests {
             let x_buf = ctx.ctx.buffer_with_data(&xs);
             let res_buf = ctx.ctx.buffer_with_data(&residual);
             let y_buf = ctx.ctx.buffer_for::<f32>(batch * out);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_f32_v3_residual_zero_copy_inline(
                 encoder.as_ref(),
                 &packed_buf,
@@ -5453,7 +5793,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_buf, batch * out);
 
             // Bit-identical contract (single tail add — no reduction reorder).
@@ -5479,9 +5821,15 @@ mod tests {
         let cases: &[usize] = &[1, 7, 256, 257, 1023, 2048, 8 * 2048];
 
         for &n in cases {
-            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 + 0.31).sin() * 0.6).collect();
-            let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.027 + 0.11).cos() * 0.4).collect();
-            let c: Vec<f32> = (0..n).map(|i| (i as f32 * 0.041 + 0.07).sin() * 0.5).collect();
+            let a: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.013 + 0.31).sin() * 0.6)
+                .collect();
+            let b: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.027 + 0.11).cos() * 0.4)
+                .collect();
+            let c: Vec<f32> = (0..n)
+                .map(|i| (i as f32 * 0.041 + 0.07).sin() * 0.5)
+                .collect();
             let reference: Vec<f32> = (0..n).map(|i| a[i] + b[i] + c[i]).collect();
 
             let a_buf = ctx.ctx.buffer_with_data(&a);
@@ -5489,25 +5837,30 @@ mod tests {
             let c_buf = ctx.ctx.buffer_with_data(&c);
             let y_buf = ctx.ctx.buffer_for::<f32>(n);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.tri_add_f32_zero_copy_inline(
                 encoder.as_ref(),
-                &a_buf, 0,
-                &b_buf, 0,
-                &c_buf, 0,
-                &y_buf, 0,
+                &a_buf,
+                0,
+                &b_buf,
+                0,
+                &c_buf,
+                0,
+                &y_buf,
+                0,
                 n,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_buf, n);
 
             for (i, (s, r)) in subject.iter().zip(reference.iter()).enumerate() {
-                assert!(
-                    (s - r).abs() < 1e-6,
-                    "n={n} idx={i}: subj={s} ref={r}"
-                );
+                assert!((s - r).abs() < 1e-6, "n={n} idx={i}: subj={s} ref={r}");
             }
         }
     }
@@ -5523,8 +5876,8 @@ mod tests {
         };
         let cases: &[(usize, usize)] = &[
             (1, 256),
-            (1, 2048),    // production decode
-            (8, 2048),    // small prefill
+            (1, 2048), // production decode
+            (8, 2048), // small prefill
             (1, 2049),
             (3, 1023),
         ];
@@ -5552,19 +5905,29 @@ mod tests {
             let d_buf = ctx.ctx.buffer_with_data(&d);
             let y_buf = ctx.ctx.buffer_for::<f32>(n);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.scalar_mul_tri_add_f32_zero_copy_inline(
                 encoder.as_ref(),
-                &a_buf, 0,
-                &b_buf, 0,
-                &coef_buf, 0,
-                &d_buf, 0,
-                &y_buf, 0,
-                bl, hidden,
+                &a_buf,
+                0,
+                &b_buf,
+                0,
+                &coef_buf,
+                0,
+                &d_buf,
+                0,
+                &y_buf,
+                0,
+                bl,
+                hidden,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_buf, n);
 
             for (i, (s, r)) in subject.iter().zip(reference.iter()).enumerate() {
@@ -5589,7 +5952,7 @@ mod tests {
         };
         let cases: &[(usize, usize)] = &[
             (1, 256),
-            (1, 2048),    // production decode shape
+            (1, 2048), // production decode shape
             (8, 2048),
             (1, 1024),
             (3, 512),
@@ -5602,7 +5965,9 @@ mod tests {
             let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.027).cos() * 0.4).collect();
             let coef: Vec<f32> = (0..bl).map(|t| (t as f32 * 0.13 - 0.4).tanh()).collect();
             let d: Vec<f32> = (0..n).map(|i| (i as f32 * 0.041).sin() * 0.5).collect();
-            let rms_w: Vec<f32> = (0..hidden).map(|h| (h as f32 * 0.029).cos() * 0.3 + 1.0).collect();
+            let rms_w: Vec<f32> = (0..hidden)
+                .map(|h| (h as f32 * 0.029).cos() * 0.3 + 1.0)
+                .collect();
 
             // Host reference.
             let mut ref_out = vec![0.0f32; n];
@@ -5635,21 +6000,34 @@ mod tests {
             let out_buf = ctx.ctx.buffer_for::<f32>(n);
             let attn_buf = ctx.ctx.buffer_for::<f32>(n);
 
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.scalar_mul_tri_add_rmsnorm_f32_zero_copy_inline(
                 encoder.as_ref(),
-                &a_buf, 0,
-                &b_buf, 0,
-                &coef_buf, 0,
-                &d_buf, 0,
-                &rms_buf, 0,
-                &out_buf, 0,
-                &attn_buf, 0,
-                bl, hidden, rms_eps,
+                &a_buf,
+                0,
+                &b_buf,
+                0,
+                &coef_buf,
+                0,
+                &d_buf,
+                0,
+                &rms_buf,
+                0,
+                &out_buf,
+                0,
+                &attn_buf,
+                0,
+                bl,
+                hidden,
+                rms_eps,
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subj_out = ctx.ctx.read_buffer::<f32>(&out_buf, n);
             let subj_attn = ctx.ctx.read_buffer::<f32>(&attn_buf, n);
 
@@ -5693,10 +6071,10 @@ mod tests {
             Err(_) => return,
         };
         let cases: &[(usize, usize, usize)] = &[
-            (64, 64, 1),       // tiny smoke (4 TGs)
-            (256, 2048, 1),    // small case (16 TGs)
-            (9216, 2048, 1),   // production qkv_proj (576 TGs)
-            (12352, 2048, 1),  // production in_proj_combined (772 TGs)
+            (64, 64, 1),      // tiny smoke (4 TGs)
+            (256, 2048, 1),   // small case (16 TGs)
+            (9216, 2048, 1),  // production qkv_proj (576 TGs)
+            (12352, 2048, 1), // production in_proj_combined (772 TGs)
         ];
         let rms_eps: f32 = 1e-6;
 
@@ -5724,13 +6102,17 @@ mod tests {
                 }
             }
             let weight = Mxfp4Weight::from_host(&ctx.ctx, &packed, &scales, out, ins).unwrap();
-            let reference = ctx.matmul_with_weight(&weight, &xs_normalized, batch).unwrap();
+            let reference = ctx
+                .matmul_with_weight(&weight, &xs_normalized, batch)
+                .unwrap();
 
             // Subject: large-out kernel reads raw x.
             let x_raw_buf = ctx.ctx.buffer_with_data(&xs_raw);
             let rms_w_buf = ctx.ctx.buffer_with_data(&rms_w);
             let y_subj = ctx.ctx.buffer_for::<f32>(batch * out);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_f32_v3_rmsnorm_large_zero_copy_inline(
                 encoder.as_ref(),
                 &packed_buf,
@@ -5748,7 +6130,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, batch * out);
 
             let mut dot = 0.0_f64;
@@ -5781,10 +6165,10 @@ mod tests {
             Err(_) => return,
         };
         let cases: &[(usize, usize, usize)] = &[
-            (64, 64, 1),       // tiny smoke (2 TGs)
-            (256, 2048, 1),    // small case (8 TGs)
-            (9216, 2048, 1),   // production qkv_proj (288 TGs)
-            (12352, 2048, 1),  // production in_proj_combined (386 TGs)
+            (64, 64, 1),      // tiny smoke (2 TGs)
+            (256, 2048, 1),   // small case (8 TGs)
+            (9216, 2048, 1),  // production qkv_proj (288 TGs)
+            (12352, 2048, 1), // production in_proj_combined (386 TGs)
         ];
         let rms_eps: f32 = 1e-6;
 
@@ -5812,13 +6196,17 @@ mod tests {
                 }
             }
             let weight = Mxfp4Weight::from_host(&ctx.ctx, &packed, &scales, out, ins).unwrap();
-            let reference = ctx.matmul_with_weight(&weight, &xs_normalized, batch).unwrap();
+            let reference = ctx
+                .matmul_with_weight(&weight, &xs_normalized, batch)
+                .unwrap();
 
             // Subject: xlarge-out kernel reads raw x.
             let x_raw_buf = ctx.ctx.buffer_with_data(&xs_raw);
             let rms_w_buf = ctx.ctx.buffer_with_data(&rms_w);
             let y_subj = ctx.ctx.buffer_for::<f32>(batch * out);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.matmul_f32_v3_rmsnorm_xlarge_zero_copy_inline(
                 encoder.as_ref(),
                 &packed_buf,
@@ -5836,7 +6224,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, batch * out);
 
             let mut dot = 0.0_f64;
@@ -5870,10 +6260,10 @@ mod tests {
             Err(_) => return,
         };
         let cases: &[(usize, usize, usize)] = &[
-            (16, 64, 1),       // tiny smoke
-            (32, 128, 2),      // small batch
-            (256, 2048, 1),    // production routing gate
-            (1, 2048, 1),      // production shared_expert_gate (out=1 degenerate)
+            (16, 64, 1),    // tiny smoke
+            (32, 128, 2),   // small batch
+            (256, 2048, 1), // production routing gate
+            (1, 2048, 1),   // production shared_expert_gate (out=1 degenerate)
         ];
         let rms_eps: f32 = 1e-6;
 
@@ -5907,7 +6297,9 @@ mod tests {
             let x_raw_buf = ctx.ctx.buffer_with_data(&xs_raw);
             let rms_w_buf = ctx.ctx.buffer_with_data(&rms_w);
             let y_subj = ctx.ctx.buffer_for::<f32>(batch * out);
-            let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+            let encoder = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             ctx.dense_f32_matmul_rmsnorm_zero_copy_inline(
                 encoder.as_ref(),
                 &weight_buf,
@@ -5925,7 +6317,9 @@ mod tests {
             )
             .unwrap();
             drop(encoder);
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
             let subject = ctx.ctx.read_buffer::<f32>(&y_subj, batch * out);
 
             let mut dot = 0.0_f64;

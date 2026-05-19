@@ -68,23 +68,18 @@ fn bf16_rmsnorm_enabled() -> bool {
 ///     `MlpBlock::forward_bf16_in` to keep the post-attn bf16 chain alive
 ///     through the MLP gate_up matmul on the Affine4 fast path).
 #[cfg(feature = "turboquant-gpu")]
-fn apply_rms_norm_bf16_out(
-    x: &Tensor,
-    weight: &Tensor,
-    eps: f32,
-) -> CandleResult<Tensor> {
+fn apply_rms_norm_bf16_out(x: &Tensor, weight: &Tensor, eps: f32) -> CandleResult<Tensor> {
+    use lumen_metal::rms_norm::RmsNormBf16Out;
     use std::sync::Mutex;
     use std::sync::OnceLock;
-    use lumen_metal::rms_norm::RmsNormBf16Out;
 
     static CACHE: OnceLock<Mutex<Option<(u32, RmsNormBf16Out)>>> = OnceLock::new();
     let lock = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().expect("RmsNormBf16Out cache poisoned");
     let eps_bits = eps.to_bits();
     if guard.as_ref().map(|(b, _)| *b) != Some(eps_bits) {
-        let runtime = RmsNormBf16Out::new(eps).map_err(|e| {
-            candle_core::Error::Msg(format!("RmsNormBf16Out init: {e}"))
-        })?;
+        let runtime = RmsNormBf16Out::new(eps)
+            .map_err(|e| candle_core::Error::Msg(format!("RmsNormBf16Out init: {e}")))?;
         *guard = Some((eps_bits, runtime));
     }
     let runtime = &guard.as_ref().expect("just set above").1;
@@ -96,23 +91,18 @@ fn apply_rms_norm_bf16_out(
 /// layer-level `h` carrier never has to be cast back to f32 at the
 /// layernorm boundary. Same eps-keyed cache pattern as `apply_rms_norm_bf16_out`.
 #[cfg(feature = "turboquant-gpu")]
-fn apply_rms_norm_bf16_in_bf16_out(
-    x: &Tensor,
-    weight: &Tensor,
-    eps: f32,
-) -> CandleResult<Tensor> {
+fn apply_rms_norm_bf16_in_bf16_out(x: &Tensor, weight: &Tensor, eps: f32) -> CandleResult<Tensor> {
+    use lumen_metal::rms_norm::RmsNormBf16InBf16Out;
     use std::sync::Mutex;
     use std::sync::OnceLock;
-    use lumen_metal::rms_norm::RmsNormBf16InBf16Out;
 
     static CACHE: OnceLock<Mutex<Option<(u32, RmsNormBf16InBf16Out)>>> = OnceLock::new();
     let lock = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().expect("RmsNormBf16InBf16Out cache poisoned");
     let eps_bits = eps.to_bits();
     if guard.as_ref().map(|(b, _)| *b) != Some(eps_bits) {
-        let runtime = RmsNormBf16InBf16Out::new(eps).map_err(|e| {
-            candle_core::Error::Msg(format!("RmsNormBf16InBf16Out init: {e}"))
-        })?;
+        let runtime = RmsNormBf16InBf16Out::new(eps)
+            .map_err(|e| candle_core::Error::Msg(format!("RmsNormBf16InBf16Out init: {e}")))?;
         *guard = Some((eps_bits, runtime));
     }
     let runtime = &guard.as_ref().expect("just set above").1;
@@ -206,9 +196,7 @@ impl AttentionBlock {
         compressed_kv: &mut CompressedKvHandle,
     ) -> CandleResult<Tensor> {
         match self {
-            Self::Linear(la) => {
-                la.forward_with_input_rmsnorm(x_raw, rms_weight, rms_eps, ssm_mask)
-            }
+            Self::Linear(la) => la.forward_with_input_rmsnorm(x_raw, rms_weight, rms_eps, ssm_mask),
             Self::Full(sa) => sa.forward_with_input_rmsnorm(
                 x_raw,
                 rms_weight,
@@ -409,9 +397,8 @@ impl DecoderLayer {
         fa_mask: Option<&Tensor>,
         ssm_mask: Option<&Tensor>,
     ) -> CandleResult<Tensor> {
-        let (out, _) = self.forward_with_tq(
-            x, pos_offset, fa_mask, ssm_mask, &mut None, None, None,
-        )?;
+        let (out, _) =
+            self.forward_with_tq(x, pos_offset, fa_mask, ssm_mask, &mut None, None, None)?;
         Ok(out)
     }
 
@@ -576,10 +563,8 @@ impl DecoderLayer {
         if do_dump {
             if let Some(attn_in) = attn_in_opt.as_ref() {
                 if let Some(d) = &dump_dir {
-                    let _ = super::model::dump_tensor_f32_public(
-                        attn_in,
-                        &format!("{d}/attn_in.bin"),
-                    );
+                    let _ =
+                        super::model::dump_tensor_f32_public(attn_in, &format!("{d}/attn_in.bin"));
                 }
             }
         }
@@ -692,7 +677,11 @@ impl DecoderLayer {
         // bf16 (boundary cast lifted in self_attn / linear_attn) and
         // `x_carrier` is bf16 → the add stays bf16. Otherwise behaviour
         // matches the legacy f32 stream.
-        let h = if residual_fusion_active { r } else { (x_carrier + r)? };
+        let h = if residual_fusion_active {
+            r
+        } else {
+            (x_carrier + r)?
+        };
         if do_dump {
             if let Some(d) = &dump_dir {
                 let _ = super::model::dump_tensor_f32_public(
@@ -876,35 +865,69 @@ impl DecoderLayer {
             }
         } else {
             match (&self.mlp, fusion_active) {
-            (MlpBlock::Moe(moe), true) => {
-                let (out, attn_in_opt_next) = moe.forward_with_rmsnorm(
-                    &h,
-                    self.post_attention_layernorm.weight(),
-                    self.post_attention_layernorm.eps() as f32,
-                    if moe_residual_fused { Some(&h) } else { None },
-                    if l4_active { next_input_rmsnorm } else { None },
-                )?;
-                (out, attn_in_opt_next, false)
-            }
-            _ => {
-                // First try the Dense fully-fused post-attn path.
-                if dense_post_attn_fusion_enabled {
-                    if let Some(res) = self.mlp.forward_post_attn_fused(
+                (MlpBlock::Moe(moe), true) => {
+                    let (out, attn_in_opt_next) = moe.forward_with_rmsnorm(
                         &h,
                         self.post_attention_layernorm.weight(),
                         self.post_attention_layernorm.eps() as f32,
-                        &h,
-                    ) {
-                        // Fully fused — skip the external mlp_in_opt path entirely.
-                        (res?, None, true)
+                        if moe_residual_fused { Some(&h) } else { None },
+                        if l4_active { next_input_rmsnorm } else { None },
+                    )?;
+                    (out, attn_in_opt_next, false)
+                }
+                _ => {
+                    // First try the Dense fully-fused post-attn path.
+                    if dense_post_attn_fusion_enabled {
+                        if let Some(res) = self.mlp.forward_post_attn_fused(
+                            &h,
+                            self.post_attention_layernorm.weight(),
+                            self.post_attention_layernorm.eps() as f32,
+                            &h,
+                        ) {
+                            // Fully fused — skip the external mlp_in_opt path entirely.
+                            (res?, None, true)
+                        } else if dense_res_fusion_enabled {
+                            let mlp_in =
+                                mlp_in_opt.as_ref().expect("mlp_in present when fusion off");
+                            // Workstream B Phase 5: bf16-in residual-fused path
+                            // when mlp_in is bf16 (set above).
+                            if bf16_mlp_in_active {
+                                match self.mlp.forward_with_residual_bf16_in(mlp_in, &h) {
+                                    Some(res) => (res?, None, true),
+                                    None => (
+                                        self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?,
+                                        None,
+                                        false,
+                                    ),
+                                }
+                            } else if let Some(res) = self.mlp.forward_with_residual(mlp_in, &h) {
+                                (res?, None, true)
+                            } else {
+                                (self.mlp.forward(mlp_in)?, None, false)
+                            }
+                        } else {
+                            let mlp_in =
+                                mlp_in_opt.as_ref().expect("mlp_in present when fusion off");
+                            if bf16_mlp_in_active {
+                                (
+                                    self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?,
+                                    None,
+                                    false,
+                                )
+                            } else {
+                                (self.mlp.forward(mlp_in)?, None, false)
+                            }
+                        }
                     } else if dense_res_fusion_enabled {
                         let mlp_in = mlp_in_opt.as_ref().expect("mlp_in present when fusion off");
-                        // Workstream B Phase 5: bf16-in residual-fused path
-                        // when mlp_in is bf16 (set above).
                         if bf16_mlp_in_active {
                             match self.mlp.forward_with_residual_bf16_in(mlp_in, &h) {
                                 Some(res) => (res?, None, true),
-                                None => (self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?, None, false),
+                                None => (
+                                    self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?,
+                                    None,
+                                    false,
+                                ),
                             }
                         } else if let Some(res) = self.mlp.forward_with_residual(mlp_in, &h) {
                             (res?, None, true)
@@ -923,36 +946,13 @@ impl DecoderLayer {
                             (self.mlp.forward(mlp_in)?, None, false)
                         }
                     }
-                } else if dense_res_fusion_enabled {
-                    let mlp_in = mlp_in_opt.as_ref().expect("mlp_in present when fusion off");
-                    if bf16_mlp_in_active {
-                        match self.mlp.forward_with_residual_bf16_in(mlp_in, &h) {
-                            Some(res) => (res?, None, true),
-                            None => (self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?, None, false),
-                        }
-                    } else if let Some(res) = self.mlp.forward_with_residual(mlp_in, &h) {
-                        (res?, None, true)
-                    } else {
-                        (self.mlp.forward(mlp_in)?, None, false)
-                    }
-                } else {
-                    let mlp_in = mlp_in_opt.as_ref().expect("mlp_in present when fusion off");
-                    if bf16_mlp_in_active {
-                        (
-                            self.mlp.forward_bf16_in(mlp_in).expect("Dense arm")?,
-                            None,
-                            false,
-                        )
-                    } else {
-                        (self.mlp.forward(mlp_in)?, None, false)
-                    }
                 }
-            }
             }
         };
         #[cfg(not(feature = "turboquant-gpu"))]
         let (mlp_out, attn_in_for_next, dense_res_fused): (Tensor, Option<Tensor>, bool) = (
-            self.mlp.forward(mlp_in_opt.as_ref().expect("mlp_in present"))?,
+            self.mlp
+                .forward(mlp_in_opt.as_ref().expect("mlp_in present"))?,
             None,
             false,
         );
@@ -962,7 +962,11 @@ impl DecoderLayer {
             }
         }
         let t4 = mark(timing);
-        let out = if moe_residual_fused || dense_res_fused { mlp_out } else { (&h + mlp_out)? };
+        let out = if moe_residual_fused || dense_res_fused {
+            mlp_out
+        } else {
+            (&h + mlp_out)?
+        };
         // no layer-exit cast. The model-wide bf16 carrier rides
         // through every layer in bf16; the single f32 cast happens at the
         // lm_head boundary in `model.rs`.
@@ -1139,8 +1143,7 @@ impl DecoderLayer {
         // Pass `Some(h)` as residual when active so MoE folds `(h + mlp_out)?`
         // into its final tri_add — and skip the layer-level add here.
         #[cfg(feature = "turboquant-gpu")]
-        let moe_residual_fused =
-            super::self_attn::residual_fusion_enabled() && fusion_active;
+        let moe_residual_fused = super::self_attn::residual_fusion_enabled() && fusion_active;
         #[cfg(not(feature = "turboquant-gpu"))]
         let moe_residual_fused = false;
 

@@ -184,9 +184,9 @@ mod imp {
                 ));
             }
             for (i, snap) in self.layers.iter().enumerate() {
-                let layer = cache
-                    .layer_mut(i)
-                    .ok_or_else(|| anyhow!("PromptCacheSnapshot::restore_into: layer {i} missing"))?;
+                let layer = cache.layer_mut(i).ok_or_else(|| {
+                    anyhow!("PromptCacheSnapshot::restore_into: layer {i} missing")
+                })?;
                 apply_layer(layer, snap, /* fork = */ false, i)?;
             }
             Ok(())

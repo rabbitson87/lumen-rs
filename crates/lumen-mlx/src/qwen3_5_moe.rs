@@ -229,12 +229,10 @@ mod imp {
 
     impl NativeModelConfig {
         pub fn load(path: &Path) -> Result<Self> {
-            let raw = std::fs::read_to_string(path).map_err(|err| {
-                anyhow!("config.json read failed at {}: {err}", path.display())
-            })?;
-            serde_json::from_str(&raw).map_err(|err| {
-                anyhow!("config.json parse failed at {}: {err}", path.display())
-            })
+            let raw = std::fs::read_to_string(path)
+                .map_err(|err| anyhow!("config.json read failed at {}: {err}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))
         }
 
         /// Validate that this config belongs to the Qwen3.5 family (either MoE or Dense)
@@ -329,8 +327,7 @@ mod imp {
             let kind = self.mlp_kind();
             match kind {
                 MlpKind::Moe => {
-                    if self.num_experts_per_tok == 0
-                        || self.num_experts_per_tok > self.num_experts
+                    if self.num_experts_per_tok == 0 || self.num_experts_per_tok > self.num_experts
                     {
                         return Err(anyhow!(
                             "num_experts_per_tok {} invalid against num_experts {}",
@@ -426,26 +423,16 @@ mod imp {
             let mut shard_paths = std::fs::read_dir(dir)
                 .with_context(|| format!("read_dir({}) failed", dir.display()))?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .is_some_and(|ext| ext == "safetensors")
-                })
+                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
                 .collect::<Vec<_>>();
             shard_paths.sort();
             if shard_paths.is_empty() {
-                return Err(anyhow!(
-                    "no *.safetensors found under {}",
-                    dir.display()
-                ));
+                return Err(anyhow!("no *.safetensors found under {}", dir.display()));
             }
             let mut tensors: HashMap<String, Array> = HashMap::new();
             for shard in shard_paths {
                 let map = Array::load_safetensors(&shard).map_err(|err| {
-                    anyhow!(
-                        "load_safetensors({}) failed: {err}",
-                        shard.display()
-                    )
+                    anyhow!("load_safetensors({}) failed: {err}", shard.display())
                 })?;
                 tensors.reserve(map.len());
                 for (k, v) in map {
@@ -483,9 +470,7 @@ mod imp {
                     format!("language_model.{key}")
                 };
                 if out.insert(new_key.clone(), value).is_some() {
-                    return Err(anyhow!(
-                        "sanitize: duplicate normalized key `{new_key}`"
-                    ));
+                    return Err(anyhow!("sanitize: duplicate normalized key `{new_key}`"));
                 }
             }
             // Detect the unsanitized legacy layout and surface a clear error.
@@ -686,10 +671,7 @@ mod imp {
 
     /// Resolve `(group_size, bits, mode)` for a quantized layer — same logic
     /// as `quant_params_with_mode` but free-standing for use during load().
-    fn quant_params_resolve(
-        config: &NativeModelConfig,
-        base: &str,
-    ) -> (i32, i32, &'static CStr) {
+    fn quant_params_resolve(config: &NativeModelConfig, base: &str) -> (i32, i32, &'static CStr) {
         let cfg = config.quantization_config.as_ref();
         if let Some(q) = cfg
             && let Some(o) = q.overrides.get(base)
@@ -920,19 +902,20 @@ mod imp {
             // op does NOT count toward decode_step op count.
             let scaled_w_q_dn = mlx_rs::ops::multiply(&ones_w_dn, &scale_q)
                 .context("LinearAttnConstants: ones × scale_q failed")?;
-            scaled_w_q_dn.eval()
+            scaled_w_q_dn
+                .eval()
                 .context("LinearAttnConstants: eval(scaled_w_q) failed")?;
             let scaled_w_k_dn = mlx_rs::ops::multiply(&ones_w_dn, &scale_k)
                 .context("LinearAttnConstants: ones × scale_k failed")?;
-            scaled_w_k_dn.eval()
+            scaled_w_k_dn
+                .eval()
                 .context("LinearAttnConstants: eval(scaled_w_k) failed")?;
             // Decode regime (s=1, the dominant per-step path):
             // keep_indices = (s..s+n_keep).collect() = [1, 2, ..., n_keep].
             // Prefill (s>>1) needs a dynamic path; this cache only covers
             // the decode hot path.
             let keep_indices: Vec<i32> = (1..=n_keep).collect();
-            let keep_indices_decode =
-                Array::from_slice(&keep_indices, &[n_keep]);
+            let keep_indices_decode = Array::from_slice(&keep_indices, &[n_keep]);
             Ok(Self {
                 ones_w_dn,
                 scale_q,
@@ -1038,9 +1021,7 @@ mod imp {
                         &weights, &config, layer_idx,
                     )?)
                 } else {
-                    AttnLayerWeights::Full(resolve_full_attn_layer(
-                        &weights, &config, layer_idx,
-                    )?)
+                    AttnLayerWeights::Full(resolve_full_attn_layer(&weights, &config, layer_idx)?)
                 };
                 let moe = resolve_moe_layer(&weights, &config, layer_idx)?;
                 layer_weights.push(LayerWeights { attn, moe });
@@ -1050,10 +1031,8 @@ mod imp {
             let embed_base = "language_model.model.embed_tokens";
             let embed_weight = require_clone(&weights, &format!("{embed_base}.weight"))?;
             let embed_scales = require_clone(&weights, &format!("{embed_base}.scales"))?;
-            let (embed_group, embed_bits, embed_mode) =
-                quant_params_resolve(&config, embed_base);
-            let final_norm_weight =
-                require_clone(&weights, "language_model.model.norm.weight")?;
+            let (embed_group, embed_bits, embed_mode) = quant_params_resolve(&config, embed_base);
+            let final_norm_weight = require_clone(&weights, "language_model.model.norm.weight")?;
             let lm_head = if config.text_config.tie_word_embeddings {
                 None
             } else {
@@ -1061,15 +1040,13 @@ mod imp {
             };
 
             // Layer-A — pre-build linear-attn forward-path constants once.
-            let linear_attn_constants =
-                LinearAttnConstants::from_config(&config.text_config)?;
+            let linear_attn_constants = LinearAttnConstants::from_config(&config.text_config)?;
 
             // RoPE inv-freq table for full-attn
             // layers (linear-attn layers don't use RoPE).
             let rope_dim = config.text_config.rope_dim() as i32;
-            let const_rope_freqs =
-                precompute_rope_freqs(rope_dim, config.text_config.rope_theta)
-                    .context("qwen3_5_moe: precompute rope freqs")?;
+            let const_rope_freqs = precompute_rope_freqs(rope_dim, config.text_config.rope_theta)
+                .context("qwen3_5_moe: precompute rope freqs")?;
 
             Ok(Self {
                 config,
@@ -1118,7 +1095,6 @@ mod imp {
         pub fn make_cache(&self) -> NativePromptCache {
             NativePromptCache::new(&self.is_linear_per_layer, /* ssm_slots */ 2)
         }
-
 
         /// Resolve `(group_size, bits)` for a quantized linear layer.
         /// Looks up per-tensor overrides in the config (keyed by the tensor
@@ -1307,10 +1283,9 @@ mod imp {
             // kept available for future verification and parity with
             // mlx-lm shader trace.
             let offset = cache.offset() as i32;
-            let use_precomputed_freqs =
-                std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+            let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let (q_rope, k_rope) = if use_precomputed_freqs {
                 let freqs = &self.const_rope_freqs;
                 let q = rope_with_freqs(&queries_t, rope_dim, false, 1.0, offset, freqs)?;
@@ -1331,9 +1306,8 @@ mod imp {
             // (7) Reshape attention output back to [B, L, hidden] and gate.
             let attn_t = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose attn_out failed")?;
-            let attn_flat =
-                mlx_rs::ops::reshape(&attn_t, &[b, l, num_heads * head_dim])
-                    .context("layer_full_attn_forward: reshape attn_out failed")?;
+            let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, num_heads * head_dim])
+                .context("layer_full_attn_forward: reshape attn_out failed")?;
             let gated = if sigmoid_mul_fuse_enabled_pub() {
                 sigmoid_mul_fused(&gate, &attn_flat)
                     .context("layer_full_attn_forward: fused sigmoid_mul failed")?
@@ -1464,11 +1438,9 @@ mod imp {
             let conv_state: &Array = match cache.get(0) {
                 Some(arr) => arr,
                 None => {
-                    _conv_state_owned = mlx_rs::ops::zeros_dtype(
-                        &[b, n_keep, conv_dim],
-                        mlx_rs::Dtype::Float32,
-                    )
-                    .context("layer_linear_attn_forward: zero-init conv_state failed")?;
+                    _conv_state_owned =
+                        mlx_rs::ops::zeros_dtype(&[b, n_keep, conv_dim], mlx_rs::Dtype::Float32)
+                            .context("layer_linear_attn_forward: zero-init conv_state failed")?;
                     &_conv_state_owned
                 }
             };
@@ -1504,13 +1476,17 @@ mod imp {
             };
             cache.set(0, new_conv_state)?;
             let conv_w = &lw.conv1d_weight;
-            let conv_raw =
-                conv1d(&conv_input, conv_w, /* stride */ 1, /* padding */ 0, conv_dim)?;
+            let conv_raw = conv1d(
+                &conv_input,
+                conv_w,
+                /* stride */ 1,
+                /* padding */ 0,
+                conv_dim,
+            )?;
             let conv_out = mlx_rs::nn::silu(&conv_raw)
                 .context("layer_linear_attn_forward: silu(conv1d) failed")?;
-            let conv_parts =
-                mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
-                    .context("layer_linear_attn_forward: split conv_out failed")?;
+            let conv_parts = mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
+                .context("layer_linear_attn_forward: split conv_out failed")?;
             if conv_parts.len() != 3 {
                 return Err(anyhow!(
                     "layer_linear_attn_forward: conv split returned {} parts (want 3)",
@@ -1561,16 +1537,10 @@ mod imp {
                         .context("layer_linear_attn_forward: rms_norm(q, cached) failed")?;
                     let k_n = mlx_rs::fast::rms_norm(&k_post, ones_w, 1e-6)
                         .context("layer_linear_attn_forward: rms_norm(k, cached) failed")?;
-                    let q_scaled =
-                        mlx_rs::ops::multiply(&q_n, &self.linear_attn_constants.scale_q)
-                            .context(
-                                "layer_linear_attn_forward: q_scaled multiply (cached) failed",
-                            )?;
-                    let k_scaled =
-                        mlx_rs::ops::multiply(&k_n, &self.linear_attn_constants.scale_k)
-                            .context(
-                                "layer_linear_attn_forward: k_scaled multiply (cached) failed",
-                            )?;
+                    let q_scaled = mlx_rs::ops::multiply(&q_n, &self.linear_attn_constants.scale_q)
+                        .context("layer_linear_attn_forward: q_scaled multiply (cached) failed")?;
+                    let k_scaled = mlx_rs::ops::multiply(&k_n, &self.linear_attn_constants.scale_k)
+                        .context("layer_linear_attn_forward: k_scaled multiply (cached) failed")?;
                     (q_n, k_n, q_scaled, k_scaled)
                 }
             } else {
@@ -1609,17 +1579,14 @@ mod imp {
             let state_in: &Array = match cache.get(1) {
                 Some(arr) => arr,
                 None => {
-                    _state_in_owned = mlx_rs::ops::zeros_dtype(
-                        &[b, nv, dv, dn],
-                        mlx_rs::Dtype::Float32,
-                    )
-                    .context("layer_linear_attn_forward: zero-init ssm_state failed")?;
+                    _state_in_owned =
+                        mlx_rs::ops::zeros_dtype(&[b, nv, dv, dn], mlx_rs::Dtype::Float32)
+                            .context("layer_linear_attn_forward: zero-init ssm_state failed")?;
                     &_state_in_owned
                 }
             };
-            let (out_kernel, new_state) = gated_delta_step_kernel(
-                &q_scaled, &k_scaled, &v_post, &g, &beta, state_in,
-            )?;
+            let (out_kernel, new_state) =
+                gated_delta_step_kernel(&q_scaled, &k_scaled, &v_post, &g, &beta, state_in)?;
             cache.set(1, new_state)?;
             cache.advance(s as usize);
             if let Some(t0) = t_ssm {
@@ -1636,8 +1603,7 @@ mod imp {
             let out_flat = mlx_rs::ops::reshape(&out_normed, &[b, s, value_dim])
                 .context("layer_linear_attn_forward: reshape out_flat failed")?;
             let out_proj_raw = self.linear_pre(&lw.out_proj, &out_flat)?;
-            let out_final =
-                Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.out_proj"))?;
+            let out_final = Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.out_proj"))?;
             if let Some(t0) = t_out {
                 out_final
                     .eval()
@@ -1650,10 +1616,7 @@ mod imp {
         /// Resolve the per-tensor `(group_size, bits, mode)` and weight
         /// references into the structures `native_moe::moe_block_forward`
         /// needs.
-        fn moe_weights(
-            &self,
-            layer_idx: usize,
-        ) -> Result<MoeBlockWeights<'_>> {
+        fn moe_weights(&self, layer_idx: usize) -> Result<MoeBlockWeights<'_>> {
             let cfg = self.text_config();
             let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
 
@@ -1776,11 +1739,7 @@ mod imp {
         /// post-attention-layernorm output of shape `[B, L, hidden]`; the
         /// returned tensor is the additive update to the residual stream
         /// (the caller adds `h + mlp_out`).
-        pub(crate) fn layer_moe_forward(
-            &self,
-            x: &Array,
-            layer_idx: usize,
-        ) -> Result<Array> {
+        pub(crate) fn layer_moe_forward(&self, x: &Array, layer_idx: usize) -> Result<Array> {
             let weights = self.layer_weights[layer_idx].moe.view();
             let raw = moe_block_forward(x, &weights)
                 .with_context(|| format!("layer_moe_forward({layer_idx}) failed"))?;
@@ -1792,11 +1751,7 @@ mod imp {
         /// MoE → +residual`, the final `model.norm` is applied, and either
         /// `lm_head` (untied) or the embedding `as_linear` (tied) projects
         /// the hidden states into vocab logits with shape `[B, L, vocab]`.
-        pub fn forward(
-            &self,
-            input_ids: &[u32],
-            cache: &mut NativePromptCache,
-        ) -> Result<Array> {
+        pub fn forward(&self, input_ids: &[u32], cache: &mut NativePromptCache) -> Result<Array> {
             let (logits, _) =
                 self.forward_impl(input_ids, cache, /* last_only */ false, &[])?;
             Ok(logits)
@@ -1968,9 +1923,7 @@ mod imp {
                 let t_moe = timing_on.then(Instant::now);
                 let mlp_out = self.layer_moe_forward(&h_normed, layer_idx)?;
                 if let Some(t0) = t_moe {
-                    mlp_out
-                        .eval()
-                        .context("forward: timing eval(moe) failed")?;
+                    mlp_out.eval().context("forward: timing eval(moe) failed")?;
                     fine.moe_ms += t0.elapsed().as_secs_f64() * 1000.0;
                     fine.moe_count += 1;
                     let sub = drain_layer_sub_timings();
@@ -2022,8 +1975,7 @@ mod imp {
                 hidden_states.clone()
             };
             let t_lm = timing_on.then(Instant::now);
-            let normed_out =
-                rms_norm(&hidden_for_head, &self.final_norm_weight, cfg.rms_norm_eps)?;
+            let normed_out = rms_norm(&hidden_for_head, &self.final_norm_weight, cfg.rms_norm_eps)?;
             let logits = if let Some(lm_head) = &self.lm_head {
                 self.linear_pre(lm_head, &normed_out)?
             } else {

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use candle_core::{Device, Tensor};
-use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight, AFFINE4_GROUP_SIZE};
+use lumen_metal::affine4_gpu::{AFFINE4_GROUP_SIZE, Affine4Context, Affine4Weight};
 use lumen_metal::affine4_linear::Affine4Linear;
 use lumen_model::qwen3_5_moe::loader::debug_dequant_int4_affine;
 
@@ -257,8 +257,7 @@ fn affine4_tiled_matches_cpu_dequant_matmul() -> anyhow::Result<()> {
     // Shape that forces the tiled path.
     let out_features = 20;
     let in_features = 16384; // 256 groups per row, > 8192 → tiled path
-    let (tile_in, n_chunks) =
-        pick_tile_for_in(in_features).expect("tile expected for in=16384");
+    let (tile_in, n_chunks) = pick_tile_for_in(in_features).expect("tile expected for in=16384");
     assert_eq!(tile_in * n_chunks, in_features);
     assert!(tile_in <= 8192);
 
@@ -391,13 +390,8 @@ fn affine4_qmv_fast_matches_cpu_dequant() -> anyhow::Result<()> {
             .map(|i| bf16_from_f32(-0.02 + 0.005 * ((i % 7) as f32)))
             .collect();
 
-        let w_dequant = debug_dequant_int4_affine(
-            &packed,
-            &scales,
-            &biases,
-            AFFINE4_GROUP_SIZE,
-        )
-        .unwrap();
+        let w_dequant =
+            debug_dequant_int4_affine(&packed, &scales, &biases, AFFINE4_GROUP_SIZE).unwrap();
 
         let x: Vec<f32> = (0..in_features)
             .map(|_| {

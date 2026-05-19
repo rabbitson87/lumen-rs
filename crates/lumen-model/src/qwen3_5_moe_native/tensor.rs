@@ -14,7 +14,7 @@
 //! forward path, replacing every `Tensor` round-trip through Candle's metal
 //! storage layer.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lumen_metal::metal::Buffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,16 +185,11 @@ impl NativeTensor {
     /// Read F32 contents to host (copy). Used for parity checks; not on hot path.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         if self.dtype != NativeDType::F32 {
-            return Err(anyhow!(
-                "to_vec_f32 requires F32, got {:?}",
-                self.dtype
-            ));
+            return Err(anyhow!("to_vec_f32 requires F32, got {:?}", self.dtype));
         }
         let n = self.numel();
-        let ptr = unsafe {
-            (self.buffer.contents() as *const u8).add(self.offset_bytes)
-                as *const f32
-        };
+        let ptr =
+            unsafe { (self.buffer.contents() as *const u8).add(self.offset_bytes) as *const f32 };
         let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
         Ok(slice.to_vec())
     }
@@ -202,16 +197,11 @@ impl NativeTensor {
     /// Read U32 contents to host (copy).
     pub fn to_vec_u32(&self) -> Result<Vec<u32>> {
         if self.dtype != NativeDType::U32 {
-            return Err(anyhow!(
-                "to_vec_u32 requires U32, got {:?}",
-                self.dtype
-            ));
+            return Err(anyhow!("to_vec_u32 requires U32, got {:?}", self.dtype));
         }
         let n = self.numel();
-        let ptr = unsafe {
-            (self.buffer.contents() as *const u8).add(self.offset_bytes)
-                as *const u32
-        };
+        let ptr =
+            unsafe { (self.buffer.contents() as *const u8).add(self.offset_bytes) as *const u32 };
         let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
         Ok(slice.to_vec())
     }
@@ -223,8 +213,10 @@ mod tests {
     use lumen_metal::metal::{Device, MTLResourceOptions};
 
     fn make_buffer(bytes: usize) -> Option<Buffer> {
-        Device::system_default()
-            .and_then(|d| d.new_buffer(bytes, MTLResourceOptions::StorageModeShared).ok())
+        Device::system_default().and_then(|d| {
+            d.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+                .ok()
+        })
     }
 
     #[test]

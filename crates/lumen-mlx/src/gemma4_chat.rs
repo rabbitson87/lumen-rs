@@ -112,8 +112,8 @@ pub(crate) mod imp {
 
         pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
             let p = path.as_ref();
-            let tokenizer = Tokenizer::from_file(p)
-                .map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
+            let tokenizer =
+                Tokenizer::from_file(p).map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
             // Sanity: confirm a couple of the constants resolve to the
             // strings we think they do. Catches a swapped tokenizer file.
             let bos = tokenizer
@@ -122,7 +122,8 @@ pub(crate) mod imp {
             if bos != "<bos>" {
                 return Err(anyhow!(
                     "tokenizer id {} maps to {:?}, expected <bos>",
-                    TOK_BOS, bos
+                    TOK_BOS,
+                    bos
                 ));
             }
             let turn_open = tokenizer
@@ -131,7 +132,8 @@ pub(crate) mod imp {
             if turn_open != "<|turn>" {
                 return Err(anyhow!(
                     "tokenizer id {} maps to {:?}, expected <|turn>",
-                    TOK_TURN_OPEN, turn_open
+                    TOK_TURN_OPEN,
+                    turn_open
                 ));
             }
             Ok(Self { tokenizer })
@@ -188,7 +190,10 @@ pub(crate) mod imp {
             let need_header = opts.enable_thinking || has_system;
             if need_header {
                 out.push(TOK_TURN_OPEN);
-                out.extend(self.encode_plain("system\n").context("encode 'system\\n'")?);
+                out.extend(
+                    self.encode_plain("system\n")
+                        .context("encode 'system\\n'")?,
+                );
                 if opts.enable_thinking {
                     out.push(TOK_THINK);
                     out.extend(self.encode_plain("\n").context("encode '\\n'")?);
@@ -233,7 +238,8 @@ pub(crate) mod imp {
                     // straight to the visible answer.
                     out.push(TOK_CHANNEL_OPEN);
                     out.extend(
-                        self.encode_plain("thought\n").context("encode 'thought\\n'")?,
+                        self.encode_plain("thought\n")
+                            .context("encode 'thought\\n'")?,
                     );
                     out.push(TOK_CHANNEL_CLOSE);
                 }
@@ -286,7 +292,10 @@ pub(crate) mod imp {
                     .context("encode tool_response content")?,
             );
             out.push(TOK_QUOTE_DELIM);
-            out.extend(self.encode_plain("}").context("encode tool_response close brace")?);
+            out.extend(
+                self.encode_plain("}")
+                    .context("encode tool_response close brace")?,
+            );
             out.push(TOK_TOOL_RESPONSE_CLOSE);
             Ok(out)
         }
@@ -345,7 +354,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn render_tool_response_block_has_expected_structure() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let ids = tpl
                 .render_tool_response_block("get_weather", "20C sunny")
                 .expect("render tool_response");
@@ -389,7 +400,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn render_tool_response_block_rejects_empty_name() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let err = tpl
                 .render_tool_response_block("", "anything")
                 .expect_err("empty name must error");
@@ -418,7 +431,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn turn_2_stitching_assistant_toolcall_plus_response() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
 
             // Turn 1: user asks for weather (no tool definitions rendered
             // here — those land with Phase 2).
@@ -501,7 +516,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn renders_user_only_with_generation_prompt() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [ChatMessage {
                 role: ChatRole::User,
                 content: "Hello",
@@ -536,7 +553,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn renders_system_and_user_with_thinking_enabled() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [
                 ChatMessage {
                     role: ChatRole::System,
@@ -565,16 +584,15 @@ pub(crate) mod imp {
             // channel — last token should be the role string's tail, not
             // <channel|>.
             assert_ne!(*ids.last().unwrap(), TOK_CHANNEL_CLOSE);
-            assert!(
-                ids.contains(&TOK_TURN_OPEN),
-                "contains <|turn> openers"
-            );
+            assert!(ids.contains(&TOK_TURN_OPEN), "contains <|turn> openers");
         }
 
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn renders_without_generation_prompt() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [
                 ChatMessage {
                     role: ChatRole::User,
@@ -610,7 +628,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn decode_round_trip_skips_specials() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let plain = "Hello, world!";
             let ids = tpl.encode_plain(plain).expect("encode plain");
             let decoded = tpl
@@ -632,7 +652,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn parity_user_only_no_thinking() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [ChatMessage {
                 role: ChatRole::User,
                 content: "Hello",
@@ -652,7 +674,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn parity_system_user_thinking_enabled() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [
                 ChatMessage {
                     role: ChatRole::System,
@@ -673,8 +697,8 @@ pub(crate) mod imp {
                 )
                 .expect("render");
             let golden: Vec<u32> = vec![
-                2, 105, 9731, 107, 98, 107, 3912, 63510, 236761, 106, 107, 105, 2364, 107,
-                10979, 106, 107, 105, 4368, 107,
+                2, 105, 9731, 107, 98, 107, 3912, 63510, 236761, 106, 107, 105, 2364, 107, 10979,
+                106, 107, 105, 4368, 107,
             ];
             assert_eq!(ids, golden, "sys+user think-enabled parity");
         }
@@ -682,7 +706,9 @@ pub(crate) mod imp {
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn parity_user_assistant_no_generation_prompt() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [
                 ChatMessage {
                     role: ChatRole::User,
@@ -702,15 +728,18 @@ pub(crate) mod imp {
                     },
                 )
                 .expect("render");
-            let golden: Vec<u32> =
-                vec![2, 105, 2364, 107, 236935, 106, 107, 105, 4368, 107, 236776, 106, 107];
+            let golden: Vec<u32> = vec![
+                2, 105, 2364, 107, 236935, 106, 107, 105, 4368, 107, 236776, 106, 107,
+            ];
             assert_eq!(ids, golden, "u+a no-gen-prompt parity");
         }
 
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn rejects_extra_system_message_mid_conversation() {
-            let Some(tpl) = load_template_if_present() else { return };
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
             let msgs = [
                 ChatMessage {
                     role: ChatRole::User,

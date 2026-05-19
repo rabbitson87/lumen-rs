@@ -66,11 +66,15 @@ fn synth_x(n: usize) -> Vec<f32> {
 }
 
 fn f32_to_bf16_bits(xs: &[f32]) -> Vec<u16> {
-    xs.iter().map(|x| half::bf16::from_f32(*x).to_bits()).collect()
+    xs.iter()
+        .map(|x| half::bf16::from_f32(*x).to_bits())
+        .collect()
 }
 
 fn bf16_bits_to_f32(xs: &[u16]) -> Vec<f32> {
-    xs.iter().map(|b| half::bf16::from_bits(*b).to_f32()).collect()
+    xs.iter()
+        .map(|b| half::bf16::from_bits(*b).to_f32())
+        .collect()
 }
 
 fn round_trip_bf16(xs: &[f32]) -> Vec<f32> {
@@ -223,10 +227,8 @@ fn affine4_linear_forward_bf16_in_bf16_out_tensor_parity() {
         Err(_) => return,
     };
 
-    let shapes: &[(&str, usize, usize, usize)] = &[
-        ("qkv_decode", 7680, 5120, 1),
-        ("o_decode", 5120, 5120, 1),
-    ];
+    let shapes: &[(&str, usize, usize, usize)] =
+        &[("qkv_decode", 7680, 5120, 1), ("o_decode", 5120, 5120, 1)];
 
     for &(name, out, ins, batch) in shapes {
         let packed = synth_packed(out, ins, 0xAAAA0000 ^ name.len() as u32);
@@ -371,11 +373,7 @@ fn affine4_bf16_chain_synthetic_microbench() {
 /// Bench helper: median of `n_runs` × `iters_per_run` calls. Median is robust
 /// to scheduler jitter on the dev machine; a single mean is too noisy to
 /// classify σ.
-fn bench_median_ms(
-    runs: usize,
-    iters: usize,
-    mut call: impl FnMut(),
-) -> f64 {
+fn bench_median_ms(runs: usize, iters: usize, mut call: impl FnMut()) -> f64 {
     let mut samples = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t0 = Instant::now();
@@ -455,8 +453,7 @@ fn affine4_qmv_fast_bf16_microbench_within_baseline() {
     }
 
     // Aggregate: average ratio across shapes.
-    let avg_ratio: f64 =
-        results.iter().map(|r| r.3).sum::<f64>() / results.len() as f64;
+    let avg_ratio: f64 = results.iter().map(|r| r.3).sum::<f64>() / results.len() as f64;
     eprintln!(
         "\n  → mean ratio {avg_ratio:.3}  (mean Δ {:+.1}%)",
         (1.0 - avg_ratio) * 100.0

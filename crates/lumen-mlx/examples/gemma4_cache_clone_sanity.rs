@@ -19,7 +19,9 @@ fn main() -> Result<()> {
     let model = NativeGemma4Model::load(Path::new(&model_id)).context("trunk load")?;
 
     // Step 1 — build a cache, fill with 10 tokens (the prefix).
-    let prefix: Vec<u32> = vec![2, 105, 2364, 107, 213229, 78622, 126623, 237223, 42813, 189515];
+    let prefix: Vec<u32> = vec![
+        2, 105, 2364, 107, 213229, 78622, 126623, 237223, 42813, 189515,
+    ];
     let mut master = model.make_cache();
     let _ = model
         .forward_last_token(&prefix, &mut master)

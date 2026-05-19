@@ -70,7 +70,11 @@ fn main() -> Result<()> {
     println!("loaded in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     let prompt_ids = backend.encode(&prompt)?;
-    println!("prompt: {} chars → {} tokens", prompt.len(), prompt_ids.len());
+    println!(
+        "prompt: {} chars → {} tokens",
+        prompt.len(),
+        prompt_ids.len()
+    );
 
     // ── Phase 1: prefill on src ──
     let src = backend.alloc_seq_id();
@@ -98,9 +102,7 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let dst1_pos = backend.fork_from_snapshot(master, dst1)?;
     let fork1_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "fork_from_snapshot(master → dst1={dst1}): pos={dst1_pos} in {fork1_ms:.1}ms"
-    );
+    println!("fork_from_snapshot(master → dst1={dst1}): pos={dst1_pos} in {fork1_ms:.1}ms");
 
     if dst1_pos != prompt_ids.len() {
         return Err(anyhow!(
@@ -141,9 +143,7 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let dst2_pos = backend.fork_from_snapshot(master, dst2)?;
     let fork2_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "fork_from_snapshot(master → dst2={dst2}): pos={dst2_pos} in {fork2_ms:.1}ms"
-    );
+    println!("fork_from_snapshot(master → dst2={dst2}): pos={dst2_pos} in {fork2_ms:.1}ms");
 
     let mut tokens_dst2: Vec<u32> = vec![after_prompt_pred];
     let mut last = after_prompt_pred;
@@ -177,10 +177,15 @@ fn main() -> Result<()> {
     println!("\n--- result ---");
     let mut ok = true;
     if mismatch_a_b.is_empty() {
-        println!("✅ PASS axis 1+2 (dst1 == src) — fork reproduces source trajectory + src untouched");
+        println!(
+            "✅ PASS axis 1+2 (dst1 == src) — fork reproduces source trajectory + src untouched"
+        );
     } else {
         ok = false;
-        println!("❌ FAIL axis 1+2 (dst1 != src): {} mismatches", mismatch_a_b.len());
+        println!(
+            "❌ FAIL axis 1+2 (dst1 != src): {} mismatches",
+            mismatch_a_b.len()
+        );
         for (i, a, b) in mismatch_a_b.iter().take(5) {
             println!("  step {i}: dst1={a} src={b}");
         }
@@ -189,7 +194,10 @@ fn main() -> Result<()> {
         println!("✅ PASS axis 3+4 (dst1 == dst2) — master reusable + sibling isolation");
     } else {
         ok = false;
-        println!("❌ FAIL axis 3+4 (dst1 != dst2): {} mismatches", mismatch_a_c.len());
+        println!(
+            "❌ FAIL axis 3+4 (dst1 != dst2): {} mismatches",
+            mismatch_a_c.len()
+        );
         for (i, a, b) in mismatch_a_c.iter().take(5) {
             println!("  step {i}: dst1={a} dst2={b}");
         }
@@ -199,8 +207,6 @@ fn main() -> Result<()> {
         return Err(anyhow!("fork roundtrip failed"));
     }
 
-    println!(
-        "\nTimings: snap={snap_ms:.1}ms fork1={fork1_ms:.1}ms fork2={fork2_ms:.1}ms"
-    );
+    println!("\nTimings: snap={snap_ms:.1}ms fork1={fork1_ms:.1}ms fork2={fork2_ms:.1}ms");
     Ok(())
 }

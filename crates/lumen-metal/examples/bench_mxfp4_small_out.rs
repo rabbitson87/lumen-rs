@@ -10,8 +10,8 @@
 //! Run: `cargo run --release --example bench_mxfp4_small_out -p lumen-metal`
 
 use anyhow::Result;
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 use std::time::Instant;
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
 
 const N_REPS: usize = 200;
 const WARMUP: usize = 10;
@@ -26,7 +26,9 @@ struct Shape {
 
 fn random_packed(out_f: usize, in_f: usize) -> Vec<u32> {
     let n = out_f * in_f / 8;
-    (0..n).map(|i| 0x12345678u32.wrapping_add(i as u32)).collect()
+    (0..n)
+        .map(|i| 0x12345678u32.wrapping_add(i as u32))
+        .collect()
 }
 
 fn random_scales(out_f: usize, in_f: usize) -> Vec<u8> {

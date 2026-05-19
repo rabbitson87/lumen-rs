@@ -12,9 +12,9 @@
 #![cfg(feature = "model-integration")]
 
 use candle_core::{DType, Device, Tensor};
-use std::sync::Arc;
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 use lumen_metal::affine4_linear::Affine4Linear;
+use std::sync::Arc;
 
 const OUT: usize = 5120;
 const IN: usize = 5120;
@@ -61,7 +61,9 @@ fn metal_device() -> Option<Device> {
 #[test]
 fn forward_bf16_in_bf16_out_icb_matches_standard() {
     // Force the env-gate ON for the duration of this test.
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let dev = match metal_device() {
         Some(d) => d,
@@ -96,19 +98,33 @@ fn forward_bf16_in_bf16_out_icb_matches_standard() {
         .unwrap();
 
     // Drain the env-gate and call the standard path for the reference.
-    unsafe { std::env::set_var("LUMEN_ICB", "0"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "0");
+    }
     let y_ref = linear.forward_bf16_in_bf16_out(&x).unwrap();
 
     // Now flip the env-gate back ON and call the ICB path N times.
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
     let mut diffs_total = 0usize;
     let mut compared = 0usize;
     for i in 0..ITERS {
         let y_icb = linear.forward_bf16_in_bf16_out_icb(&x).unwrap();
-        let ref_cpu = y_ref.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap();
-        let icb_cpu = y_icb.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap();
+        let ref_cpu = y_ref
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let icb_cpu = y_icb
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_eq!(ref_cpu.len(), icb_cpu.len());
         let mut diffs = 0usize;
         for (a, b) in ref_cpu.iter().zip(icb_cpu.iter()) {
@@ -118,9 +134,11 @@ fn forward_bf16_in_bf16_out_icb_matches_standard() {
         }
         diffs_total += diffs;
         compared += ref_cpu.len();
-        eprintln!("  iter {i}: diffs={diffs} / {} {}",
+        eprintln!(
+            "  iter {i}: diffs={diffs} / {} {}",
             ref_cpu.len(),
-            if diffs == 0 { "✓" } else { "✗" });
+            if diffs == 0 { "✓" } else { "✗" }
+        );
     }
 
     eprintln!();
@@ -140,7 +158,9 @@ fn forward_bf16_in_bf16_out_icb_matches_standard() {
 /// bit-identical to the standard path for both inputs.
 #[test]
 fn forward_bf16_in_bf16_out_icb_re_records_on_buffer_change() {
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let dev = match metal_device() {
         Some(d) => d,
@@ -184,21 +204,36 @@ fn forward_bf16_in_bf16_out_icb_re_records_on_buffer_change() {
         .unwrap();
 
     // References computed via standard path.
-    unsafe { std::env::set_var("LUMEN_ICB", "0"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "0");
+    }
     let ya_ref = linear.forward_bf16_in_bf16_out(&xa).unwrap();
     let yb_ref = linear.forward_bf16_in_bf16_out(&xb).unwrap();
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let to_bits = |t: &Tensor| -> Vec<u32> {
-        t.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap().iter().map(|f| f.to_bits()).collect()
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect()
     };
     let ya_bits = to_bits(&ya_ref);
     let yb_bits = to_bits(&yb_ref);
 
     // Sanity — distinct inputs must produce distinct outputs (otherwise the
     // test would pass trivially).
-    let differing = ya_bits.iter().zip(yb_bits.iter()).filter(|(a, b)| a != b).count();
+    let differing = ya_bits
+        .iter()
+        .zip(yb_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     assert!(
         differing > 0,
         "test invalid: synthetic inputs xa/xb produced identical outputs"
@@ -214,12 +249,26 @@ fn forward_bf16_in_bf16_out_icb_re_records_on_buffer_change() {
             ("xb", &xb, &yb_bits)
         };
         let y_icb = linear.forward_bf16_in_bf16_out_icb(x_in).unwrap();
-        let icb_bits: Vec<u32> = y_icb.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap().iter().map(|f| f.to_bits()).collect();
-        let diffs = icb_bits.iter().zip(ref_bits.iter()).filter(|(a, b)| a != b).count();
+        let icb_bits: Vec<u32> = y_icb
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        let diffs = icb_bits
+            .iter()
+            .zip(ref_bits.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         diffs_total += diffs;
-        eprintln!("  iter {i} ({label}): diffs={diffs} {}",
-            if diffs == 0 { "✓" } else { "✗" });
+        eprintln!(
+            "  iter {i} ({label}): diffs={diffs} {}",
+            if diffs == 0 { "✓" } else { "✗" }
+        );
     }
 
     if diffs_total > 0 {
@@ -232,7 +281,9 @@ fn forward_bf16_in_bf16_out_icb_re_records_on_buffer_change() {
 /// batch=1; the cache must re-record both variants on the batch change.
 #[test]
 fn forward_bf16_in_bf16_out_icb_handles_batch_change() {
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let dev = match metal_device() {
         Some(d) => d,
@@ -273,33 +324,68 @@ fn forward_bf16_in_bf16_out_icb_handles_batch_change() {
         .contiguous()
         .unwrap();
 
-    unsafe { std::env::set_var("LUMEN_ICB", "0"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "0");
+    }
     let y2_ref = linear.forward_bf16_in_bf16_out(&x2).unwrap();
     let y1_ref = linear.forward_bf16_in_bf16_out(&x1).unwrap();
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let to_bits = |t: &Tensor| -> Vec<u32> {
-        t.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap().iter().map(|f| f.to_bits()).collect()
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect()
     };
     let y2_bits = to_bits(&y2_ref);
     let y1_bits = to_bits(&y1_ref);
 
     let y2_icb = linear.forward_bf16_in_bf16_out_icb(&x2).unwrap();
     let y2_icb_bits = to_bits(&y2_icb);
-    let d2 = y2_icb_bits.iter().zip(y2_bits.iter()).filter(|(a, b)| a != b).count();
-    eprintln!("  batch=2: diffs={d2} / {} {}", y2_bits.len(), if d2 == 0 { "✓" } else { "✗" });
+    let d2 = y2_icb_bits
+        .iter()
+        .zip(y2_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "  batch=2: diffs={d2} / {} {}",
+        y2_bits.len(),
+        if d2 == 0 { "✓" } else { "✗" }
+    );
 
     let y1_icb = linear.forward_bf16_in_bf16_out_icb(&x1).unwrap();
     let y1_icb_bits = to_bits(&y1_icb);
-    let d1 = y1_icb_bits.iter().zip(y1_bits.iter()).filter(|(a, b)| a != b).count();
-    eprintln!("  batch=1: diffs={d1} / {} {}", y1_bits.len(), if d1 == 0 { "✓" } else { "✗" });
+    let d1 = y1_icb_bits
+        .iter()
+        .zip(y1_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "  batch=1: diffs={d1} / {} {}",
+        y1_bits.len(),
+        if d1 == 0 { "✓" } else { "✗" }
+    );
 
     // And back to batch=2 to validate symmetric re-record.
     let y2_again = linear.forward_bf16_in_bf16_out_icb(&x2).unwrap();
     let y2_again_bits = to_bits(&y2_again);
-    let d2b = y2_again_bits.iter().zip(y2_bits.iter()).filter(|(a, b)| a != b).count();
-    eprintln!("  batch=2 (return): diffs={d2b} / {} {}", y2_bits.len(), if d2b == 0 { "✓" } else { "✗" });
+    let d2b = y2_again_bits
+        .iter()
+        .zip(y2_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "  batch=2 (return): diffs={d2b} / {} {}",
+        y2_bits.len(),
+        if d2b == 0 { "✓" } else { "✗" }
+    );
 
     if d1 > 0 || d2 > 0 || d2b > 0 {
         panic!("batch-change re-record produced incorrect output: d1={d1} d2={d2} d2b={d2b}");
@@ -308,7 +394,9 @@ fn forward_bf16_in_bf16_out_icb_handles_batch_change() {
 
 #[test]
 fn forward_with_residual_bf16_in_bf16_out_icb_matches_standard() {
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
 
     let dev = match metal_device() {
         Some(d) => d,
@@ -348,22 +436,36 @@ fn forward_with_residual_bf16_in_bf16_out_icb_matches_standard() {
         .contiguous()
         .unwrap();
 
-    unsafe { std::env::set_var("LUMEN_ICB", "0"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "0");
+    }
     let y_ref = linear
         .forward_with_residual_bf16_in_bf16_out(&x, &residual)
         .unwrap();
 
-    unsafe { std::env::set_var("LUMEN_ICB", "1"); }
+    unsafe {
+        std::env::set_var("LUMEN_ICB", "1");
+    }
     let mut diffs_total = 0usize;
     let mut compared = 0usize;
     for i in 0..ITERS {
         let y_icb = linear
             .forward_with_residual_bf16_in_bf16_out_icb(&x, &residual)
             .unwrap();
-        let ref_cpu = y_ref.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap();
-        let icb_cpu = y_icb.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-            .to_vec1::<f32>().unwrap();
+        let ref_cpu = y_ref
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let icb_cpu = y_icb
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let mut diffs = 0usize;
         for (a, b) in ref_cpu.iter().zip(icb_cpu.iter()) {
             if a.to_bits() != b.to_bits() {
@@ -372,9 +474,11 @@ fn forward_with_residual_bf16_in_bf16_out_icb_matches_standard() {
         }
         diffs_total += diffs;
         compared += ref_cpu.len();
-        eprintln!("  iter {i}: diffs={diffs} / {} {}",
+        eprintln!(
+            "  iter {i}: diffs={diffs} / {} {}",
             ref_cpu.len(),
-            if diffs == 0 { "✓" } else { "✗" });
+            if diffs == 0 { "✓" } else { "✗" }
+        );
     }
 
     eprintln!();

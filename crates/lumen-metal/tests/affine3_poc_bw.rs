@@ -22,10 +22,10 @@
 //!   cargo test --test affine3_poc_bw -p lumen-metal --release \
 //!     -- --nocapture --test-threads=1
 
-use std::time::Instant;
-use lumen_metal::affine3_gpu::{Affine3Context, Affine3Weight, AFFINE3_GROUP_SIZE};
-use lumen_metal::device::MetalContext;
+use lumen_metal::affine3_gpu::{AFFINE3_GROUP_SIZE, Affine3Context, Affine3Weight};
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
+use lumen_metal::device::MetalContext;
+use std::time::Instant;
 
 const ITERS: usize = 1000;
 const WARMUP: usize = 50;
@@ -225,9 +225,7 @@ fn affine3_poc_gate_up() {
 
     // POC decision logic (saving = how much faster Affine3 is vs Affine4)
     let saving_pct = (aff4_us - aff3_us) / aff4_us * 100.0;
-    eprintln!(
-        "Saving (Affine3 vs Affine4): {saving_pct:+.1}%   (positive = Affine3 faster)"
-    );
+    eprintln!("Saving (Affine3 vs Affine4): {saving_pct:+.1}%   (positive = Affine3 faster)");
     eprintln!();
     eprintln!("=== POC.0 Decision ===");
     if saving_pct >= 15.0 {
@@ -249,7 +247,9 @@ fn affine3_poc_gate_up() {
     }
     eprintln!();
     eprintln!("Caveat: this POC uses the SIMPLEST topology (1-thread/row matvec).");
-    eprintln!("Production qmv_fast (NSG=2 RPS=4 VPT=16) has different compute/BW balance — POC.1 needed for production projection.");
+    eprintln!(
+        "Production qmv_fast (NSG=2 RPS=4 VPT=16) has different compute/BW balance — POC.1 needed for production projection."
+    );
 }
 
 #[test]
@@ -422,9 +422,7 @@ fn affine3_poc1_qmv_fast_gate_up() {
         "Pipelined µs:   Affine3 {aff3_us:.1} vs Affine4 {aff4_us:.1}  (Affine3 / Affine4 = {:.2}×)",
         aff3_us / aff4_us
     );
-    eprintln!(
-        "BW utilization: Affine3 {aff3_bw_pct:.1}%  vs Affine4 {aff4_bw_pct:.1}%"
-    );
+    eprintln!("BW utilization: Affine3 {aff3_bw_pct:.1}%  vs Affine4 {aff4_bw_pct:.1}%");
     eprintln!();
     eprintln!("Saving (Affine3 vs Affine4): {saving_pct:+.2}%   (positive = Affine3 faster)");
     eprintln!(
@@ -444,19 +442,29 @@ fn affine3_poc1_qmv_fast_gate_up() {
     eprintln!("=== Production projection (gate_up only, 64 calls/token) ===");
     eprintln!("  saving per call:   {saving_per_call_us:+.1} µs");
     eprintln!("  saving per token:  {prod_saving_ms:+.2} ms (from gate_up alone)");
-    eprintln!("  decode 67 ms → {new_decode_ms:.2} ms = 15.04 → {new_tps:.2} tok/s ({:+.1}%)",
-        (new_tps / 15.04 - 1.0) * 100.0);
+    eprintln!(
+        "  decode 67 ms → {new_decode_ms:.2} ms = 15.04 → {new_tps:.2} tok/s ({:+.1}%)",
+        (new_tps / 15.04 - 1.0) * 100.0
+    );
 
     eprintln!();
     eprintln!("=== POC.1 Decision ===");
     if saving_pct >= 15.0 {
-        eprintln!("✅ Saving ≥ 15% — Affine3 qmv_fast achieves production-level BW saving. PROCEED to full impl (18.A.1+).");
+        eprintln!(
+            "✅ Saving ≥ 15% — Affine3 qmv_fast achieves production-level BW saving. PROCEED to full impl (18.A.1+)."
+        );
     } else if saving_pct >= 5.0 {
-        eprintln!("⚠️  Saving 5-15% — meaningful but below 17.8% projection. Consider full impl OR optimization (kernel tuning).");
+        eprintln!(
+            "⚠️  Saving 5-15% — meaningful but below 17.8% projection. Consider full impl OR optimization (kernel tuning)."
+        );
     } else if saving_pct >= -5.0 {
-        eprintln!("❌ Saving ≈ 0% — dequant compute exhausts BW headroom even at qmv_fast topology. ABANDON 18.A. Pivot to 18.B (KV compression).");
+        eprintln!(
+            "❌ Saving ≈ 0% — dequant compute exhausts BW headroom even at qmv_fast topology. ABANDON 18.A. Pivot to 18.B (KV compression)."
+        );
     } else {
-        eprintln!("❌ NEGATIVE — Affine3 SLOWER than Affine4 production. Lever DEFINITIVELY DEAD. Skip to 18.B.");
+        eprintln!(
+            "❌ NEGATIVE — Affine3 SLOWER than Affine4 production. Lever DEFINITIVELY DEAD. Skip to 18.B."
+        );
     }
 }
 
@@ -508,7 +516,9 @@ fn affine3_qmv_fast_parity_small() {
         sum_rel_err += rel_err;
     }
     let avg_rel_err = sum_rel_err / OUT as f32;
-    eprintln!("affine3 qmv_fast parity: max_rel_err={max_rel_err:.4e}, avg_rel_err={avg_rel_err:.4e}");
+    eprintln!(
+        "affine3 qmv_fast parity: max_rel_err={max_rel_err:.4e}, avg_rel_err={avg_rel_err:.4e}"
+    );
     assert!(
         max_rel_err < 0.02,
         "qmv_fast parity violated: max_rel_err={max_rel_err}"

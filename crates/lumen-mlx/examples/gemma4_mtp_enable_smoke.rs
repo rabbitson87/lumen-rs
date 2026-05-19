@@ -22,22 +22,33 @@ fn main() -> Result<()> {
 
     let model_id = std::env::var("MODEL_ID")
         .unwrap_or_else(|_| "/path/to/models/gemma-4-26b-a4b-mlx-4bit".into());
-    let drafter_dir = std::env::var("DRAFTER_DIR").unwrap_or_else(|_| {
-        "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into()
-    });
+    let drafter_dir = std::env::var("DRAFTER_DIR")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
 
     eprintln!("[mtp-enable-smoke] loading trunk {model_id}");
     let mut model = NativeGemma4Model::load(Path::new(&model_id)).context("trunk load")?;
-    eprintln!("[mtp-enable-smoke] trunk loaded; mtp_enabled? {}", model.mtp_enabled());
-    assert!(!model.mtp_enabled(), "expected mtp_enabled=false before try_enable_mtp");
+    eprintln!(
+        "[mtp-enable-smoke] trunk loaded; mtp_enabled? {}",
+        model.mtp_enabled()
+    );
+    assert!(
+        !model.mtp_enabled(),
+        "expected mtp_enabled=false before try_enable_mtp"
+    );
 
     eprintln!("[mtp-enable-smoke] try_enable_mtp({drafter_dir})");
     let ok = model
         .try_enable_mtp(Path::new(&drafter_dir))
         .context("try_enable_mtp")?;
-    eprintln!("[mtp-enable-smoke] enabled = {ok}, mtp_enabled? {}", model.mtp_enabled());
+    eprintln!(
+        "[mtp-enable-smoke] enabled = {ok}, mtp_enabled? {}",
+        model.mtp_enabled()
+    );
     assert!(ok, "try_enable_mtp returned false");
-    assert!(model.mtp_enabled(), "expected mtp_enabled=true after try_enable_mtp");
+    assert!(
+        model.mtp_enabled(),
+        "expected mtp_enabled=true after try_enable_mtp"
+    );
 
     println!("\n=== Phase 3 (scaffold) try_enable_mtp: PASS ===");
     println!("  trunk hidden_size matched drafter backbone_hidden_size");

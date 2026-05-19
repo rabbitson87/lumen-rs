@@ -96,8 +96,7 @@ mod imp {
     where
         F: FnMut(&[Array]) -> Result<Vec<Array>, Exception> + 'static + Send,
     {
-        let mutex =
-            slot.get_or_init(|| Mutex::new(compile_boxed_slice_refs(inner_fn, shapeless)));
+        let mutex = slot.get_or_init(|| Mutex::new(compile_boxed_slice_refs(inner_fn, shapeless)));
         let mut guard = match mutex.lock() {
             Ok(g) => g,
             Err(_) => {

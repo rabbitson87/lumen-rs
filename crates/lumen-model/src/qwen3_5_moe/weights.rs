@@ -378,10 +378,7 @@ pub struct LayerInventory {
 
 impl Classification {
     /// Build a classified view from `index` and cross-check against `config`.
-    pub fn build(
-        index: &WeightIndex,
-        config: &Qwen3_5MoeConfig,
-    ) -> Result<Self, ClassifyError> {
+    pub fn build(index: &WeightIndex, config: &Qwen3_5MoeConfig) -> Result<Self, ClassifyError> {
         let groups = index.groups().map_err(ClassifyError::Index)?;
         let n_layers = config.text_config.num_hidden_layers;
 
@@ -440,12 +437,7 @@ impl Classification {
         // and the model-wide MLP variant (MoE vs Dense).
         let mlp_kind = config.text_config.mlp_kind();
         for (idx, inv) in per_layer.iter().enumerate() {
-            validate_layer(
-                idx,
-                &config.text_config.layer_types[idx],
-                mlp_kind,
-                inv,
-            )?;
+            validate_layer(idx, &config.text_config.layer_types[idx], mlp_kind, inv)?;
         }
 
         // Top-level presence checks (one embed, one lm_head, one final norm).
@@ -495,10 +487,7 @@ fn ensure_unique(
 ) -> Result<(), ClassifyError> {
     let count = roles.iter().filter(|r| ***r == target).count();
     if count != 1 {
-        return Err(ClassifyError::TopLevelCount {
-            role: name,
-            count,
-        });
+        return Err(ClassifyError::TopLevelCount { role: name, count });
     }
     Ok(())
 }
@@ -512,10 +501,7 @@ fn ensure_at_most_one(
 ) -> Result<(), ClassifyError> {
     let count = roles.iter().filter(|r| ***r == target).count();
     if count > 1 {
-        return Err(ClassifyError::TopLevelCount {
-            role: name,
-            count,
-        });
+        return Err(ClassifyError::TopLevelCount { role: name, count });
     }
     Ok(())
 }
@@ -748,36 +734,28 @@ pub enum ClassifyError {
     #[error("layer {layer} missing input_layernorm or post_attention_layernorm")]
     LayerMissingLayerNorm { layer: usize },
 
-    #[error(
-        "layer {layer} attention kind mismatch: declared {declared:?} but {reason}"
-    )]
+    #[error("layer {layer} attention kind mismatch: declared {declared:?} but {reason}")]
     LayerAttentionKindMismatch {
         layer: usize,
         declared: LayerType,
         reason: &'static str,
     },
 
-    #[error(
-        "layer {layer} linear_attn roster mismatch — missing: {missing:?}, extra: {extra:?}"
-    )]
+    #[error("layer {layer} linear_attn roster mismatch — missing: {missing:?}, extra: {extra:?}")]
     LayerLinearAttnMismatch {
         layer: usize,
         missing: Vec<LinearAttnPart>,
         extra: Vec<LinearAttnPart>,
     },
 
-    #[error(
-        "layer {layer} self_attn roster mismatch — missing: {missing:?}, extra: {extra:?}"
-    )]
+    #[error("layer {layer} self_attn roster mismatch — missing: {missing:?}, extra: {extra:?}")]
     LayerSelfAttnMismatch {
         layer: usize,
         missing: Vec<SelfAttnPart>,
         extra: Vec<SelfAttnPart>,
     },
 
-    #[error(
-        "layer {layer} mlp roster mismatch — missing: {missing:?}, extra: {extra:?}"
-    )]
+    #[error("layer {layer} mlp roster mismatch — missing: {missing:?}, extra: {extra:?}")]
     LayerMlpMismatch {
         layer: usize,
         missing: Vec<MlpPart>,
@@ -836,10 +814,22 @@ mod tests {
         // across 40 layers). MXFP4 groups contribute 2 tensors each (weight+scales), and plain
         // groups (norms, SSM state) contribute 1 each. Verifying the raw partition count is a
         // cheap sanity check without enumerating every role yet.
-        let int8_count = groups.iter().filter(|g| g.kind == StorageKind::Int8Affine).count();
-        let mxfp4_count = groups.iter().filter(|g| g.kind == StorageKind::Mxfp4).count();
-        let plain_count = groups.iter().filter(|g| g.kind == StorageKind::Plain).count();
-        assert_eq!(int8_count, 80, "40 layers × 2 gates = 80 int8-affine groups");
+        let int8_count = groups
+            .iter()
+            .filter(|g| g.kind == StorageKind::Int8Affine)
+            .count();
+        let mxfp4_count = groups
+            .iter()
+            .filter(|g| g.kind == StorageKind::Mxfp4)
+            .count();
+        let plain_count = groups
+            .iter()
+            .filter(|g| g.kind == StorageKind::Plain)
+            .count();
+        assert_eq!(
+            int8_count, 80,
+            "40 layers × 2 gates = 80 int8-affine groups"
+        );
         // Reconstruct the total tensor count from group storage kinds and compare.
         let reconstructed = int8_count * 3 + mxfp4_count * 2 + plain_count;
         assert_eq!(reconstructed, idx.weight_map.len());
@@ -867,15 +857,20 @@ mod tests {
         //   + 333 vision                             = 333
         //   --------------------------------------------
         //                                          total 1,066 logical groups
-        let counts = |pred: fn(&WeightRole) -> bool| {
-            c.groups.iter().filter(|g| pred(&g.role)).count()
-        };
+        let counts =
+            |pred: fn(&WeightRole) -> bool| c.groups.iter().filter(|g| pred(&g.role)).count();
         assert_eq!(counts(|r| matches!(r, WeightRole::Embed)), 1);
         assert_eq!(counts(|r| matches!(r, WeightRole::LmHead)), 1);
         assert_eq!(counts(|r| matches!(r, WeightRole::FinalNorm)), 1);
         assert_eq!(counts(|r| matches!(r, WeightRole::InputLayerNorm(_))), 40);
-        assert_eq!(counts(|r| matches!(r, WeightRole::PostAttentionLayerNorm(_))), 40);
-        assert_eq!(counts(|r| matches!(r, WeightRole::LinearAttn { .. })), 30 * 9);
+        assert_eq!(
+            counts(|r| matches!(r, WeightRole::PostAttentionLayerNorm(_))),
+            40
+        );
+        assert_eq!(
+            counts(|r| matches!(r, WeightRole::LinearAttn { .. })),
+            30 * 9
+        );
         assert_eq!(counts(|r| matches!(r, WeightRole::SelfAttn { .. })), 10 * 6);
         assert_eq!(counts(|r| matches!(r, WeightRole::Mlp { .. })), 40 * 8);
         assert_eq!(counts(|r| matches!(r, WeightRole::Vision(_))), 333);
@@ -1025,7 +1020,11 @@ mod tests {
         let cfg = load_config();
         let err = Classification::build(&idx, &cfg).unwrap_err();
         match err {
-            ClassifyError::StorageMismatch { prefix, expected, found } => {
+            ClassifyError::StorageMismatch {
+                prefix,
+                expected,
+                found,
+            } => {
                 assert_eq!(prefix, "language_model.model.layers.0.mlp.gate");
                 assert_eq!(expected, StorageKind::Int8Affine);
                 assert_eq!(found, StorageKind::Mxfp4);

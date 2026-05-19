@@ -20,9 +20,9 @@ fn metal_device() -> Option<Device> {
 /// Reference scaled dot-product attention on CPU at f32. GQA is handled via
 /// `repeat` (kv_head[i / group] for q_head[i]).
 fn cpu_sdpa_reference(
-    q: &Tensor,    // [B, H, Sq, D]
-    k: &Tensor,    // [B, H_kv, Skv, D]
-    v: &Tensor,    // [B, H_kv, Skv, D]
+    q: &Tensor, // [B, H, Sq, D]
+    k: &Tensor, // [B, H_kv, Skv, D]
+    v: &Tensor, // [B, H_kv, Skv, D]
     scale: f32,
 ) -> Tensor {
     let cpu = Device::Cpu;
@@ -57,7 +57,11 @@ fn cpu_sdpa_reference(
         .unwrap();
 
     let scores = q
-        .matmul(&k_full.transpose(candle_core::D::Minus2, candle_core::D::Minus1).unwrap())
+        .matmul(
+            &k_full
+                .transpose(candle_core::D::Minus2, candle_core::D::Minus1)
+                .unwrap(),
+        )
         .unwrap();
     let scores = (scores * (scale as f64)).unwrap();
     let weights = candle_nn::ops::softmax_last_dim(&scores).unwrap();
@@ -117,10 +121,10 @@ fn sdpa_vector_matches_flash_attn() {
 
     let cases = [
         // (B, H, Sq, Skv, H_kv, D)
-        (1usize, 8, 1, 64, 2, 256),    // small Skv, small H
-        (1, 40, 1, 256, 8, 256),       // Qwen3.6-27B Dense decode shape, mid Skv
-        (1, 40, 1, 1024, 8, 256),      // long context decode
-        (1, 16, 1, 128, 4, 256),       // mid case
+        (1usize, 8, 1, 64, 2, 256), // small Skv, small H
+        (1, 40, 1, 256, 8, 256),    // Qwen3.6-27B Dense decode shape, mid Skv
+        (1, 40, 1, 1024, 8, 256),   // long context decode
+        (1, 16, 1, 128, 4, 256),    // mid case
     ];
 
     for &(b, h, sq, skv, h_kv, d) in cases.iter() {

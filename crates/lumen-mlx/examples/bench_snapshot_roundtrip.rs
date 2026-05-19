@@ -61,15 +61,17 @@ fn main() -> Result<()> {
     println!("loaded in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     let prompt_ids = backend.encode(&prompt)?;
-    println!("prompt: {} chars → {} tokens", prompt.len(), prompt_ids.len());
+    println!(
+        "prompt: {} chars → {} tokens",
+        prompt.len(),
+        prompt_ids.len()
+    );
 
     // ── Phase 1: prefill + snapshot ──
     let seq = backend.alloc_seq_id();
     let (after_prompt_pred, mut pos_a) = backend.prefill(seq, &prompt_ids)?;
     let snap = backend.snapshot_state(seq)?;
-    println!(
-        "prefilled: pos={pos_a}, pred_after_prompt={after_prompt_pred}, snapshot_id={snap}"
-    );
+    println!("prefilled: pos={pos_a}, pred_after_prompt={after_prompt_pred}, snapshot_id={snap}");
 
     // ── Phase 2: decode N steps (path A) ──
     let mut tokens_a: Vec<u32> = vec![after_prompt_pred];
@@ -84,7 +86,10 @@ fn main() -> Result<()> {
 
     // ── Phase 3: restore snapshot ──
     let restored_pos = backend.restore_state(seq, snap)?;
-    println!("restored to pos={restored_pos} (expected {})", prompt_ids.len());
+    println!(
+        "restored to pos={restored_pos} (expected {})",
+        prompt_ids.len()
+    );
 
     if restored_pos != prompt_ids.len() {
         return Err(anyhow!(
@@ -123,7 +128,9 @@ fn main() -> Result<()> {
         for (i, a, b) in &mismatches {
             println!("  step {i}: A={a} B={b}");
         }
-        return Err(anyhow!("snapshot/restore roundtrip broke decode determinism"));
+        return Err(anyhow!(
+            "snapshot/restore roundtrip broke decode determinism"
+        ));
     }
 
     Ok(())

@@ -193,10 +193,7 @@ impl LookaheadProposer {
         let jacobi: Vec<u32> = self.jacobi.iter().copied().collect();
 
         let mut guesses: Vec<Vec<u32>> = Vec::new();
-        if self.cfg.guesses > 0
-            && self.cfg.ngram > 0
-            && history.len() >= self.cfg.ngram
-        {
+        if self.cfg.guesses > 0 && self.cfg.ngram > 0 && history.len() >= self.cfg.ngram {
             let n = self.cfg.ngram;
             let suffix = &history[history.len() - n..];
             if let Some(continuations) = self.pool.get(suffix) {
@@ -453,10 +450,7 @@ mod tests {
             jacobi: vec![10, 20, 30, 40],
             guesses: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
         };
-        assert_eq!(
-            prop.flatten(),
-            vec![10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8]
-        );
+        assert_eq!(prop.flatten(), vec![10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

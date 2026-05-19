@@ -93,7 +93,15 @@ pub fn affine8_matmul_bf16_tensor(
             .command_encoder()
             .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
         encoder.set_label("lumen:affine8_matmul_bf16");
-        ctx.encode_matmul_bf16_dispatch(encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch);
+        ctx.encode_matmul_bf16_dispatch(
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
+        );
         drop(encoder);
         return Ok(y);
     }

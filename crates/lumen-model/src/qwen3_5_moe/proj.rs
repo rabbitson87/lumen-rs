@@ -20,9 +20,7 @@ use lumen_metal::affine4_linear::Affine4Linear;
 #[cfg(feature = "turboquant-gpu")]
 use lumen_metal::mxfp4_gpu::MxFp4Context;
 #[cfg(feature = "turboquant-gpu")]
-use lumen_metal::mxfp4_linear::{
-    dense_f32_matmul_rmsnorm_candle_queue_into, Mxfp4Linear,
-};
+use lumen_metal::mxfp4_linear::{Mxfp4Linear, dense_f32_matmul_rmsnorm_candle_queue_into};
 
 pub enum ProjLinear {
     Dense(Linear),
@@ -139,9 +137,9 @@ impl ProjLinear {
                     .map_err(|e| candle_core::Error::Msg(format!("mxfp4 proj bf16-in: {e}")))?;
                 y_f32.to_dtype(candle_core::DType::BF16)
             }
-            Self::Affine4(l) => l
-                .forward_bf16_in_bf16_out_icb(x)
-                .map_err(|e| candle_core::Error::Msg(format!("affine4 proj bf16-in-bf16-out: {e}"))),
+            Self::Affine4(l) => l.forward_bf16_in_bf16_out_icb(x).map_err(|e| {
+                candle_core::Error::Msg(format!("affine4 proj bf16-in-bf16-out: {e}"))
+            }),
         }
     }
 
@@ -197,9 +195,9 @@ impl ProjLinear {
                 let h = (candle_nn::ops::silu(&gate)? * up)?;
                 h.to_dtype(candle_core::DType::BF16)
             }
-            Self::Mxfp4(l) => l.forward_gate_up_silu_mul_bf16_out(x).map_err(|e| {
-                candle_core::Error::Msg(format!("mxfp4 gate_up_silu_mul bf16: {e}"))
-            }),
+            Self::Mxfp4(l) => l
+                .forward_gate_up_silu_mul_bf16_out(x)
+                .map_err(|e| candle_core::Error::Msg(format!("mxfp4 gate_up_silu_mul bf16: {e}"))),
             Self::Affine4(l) => {
                 // Sanity: caller's `inter` must match the kernel's view of inter
                 // (= weight.out_features / 2). For Dense MLP this is always true.
@@ -222,9 +220,9 @@ impl ProjLinear {
                 .forward_small_out_bf16_out(x)
                 .map_err(|e| candle_core::Error::Msg(format!("mxfp4 small_out bf16: {e}"))),
             Self::Affine4(l) => {
-                let y = l.forward(x).map_err(|e| {
-                    candle_core::Error::Msg(format!("affine4 small_out bf16: {e}"))
-                })?;
+                let y = l
+                    .forward(x)
+                    .map_err(|e| candle_core::Error::Msg(format!("affine4 small_out bf16: {e}")))?;
                 y.to_dtype(candle_core::DType::BF16)
             }
         }
@@ -239,11 +237,7 @@ impl ProjLinear {
     ///
     /// `inter` is the intermediate width (half of the gate_up weight rows);
     /// the output's last dimension equals `inter`.
-    pub fn forward_gate_up_silu_mul(
-        &self,
-        x: &Tensor,
-        inter: usize,
-    ) -> CandleResult<Tensor> {
+    pub fn forward_gate_up_silu_mul(&self, x: &Tensor, inter: usize) -> CandleResult<Tensor> {
         match self {
             Self::Dense(l) => {
                 let combined = l.forward(x)?;
@@ -253,15 +247,14 @@ impl ProjLinear {
                 candle_nn::ops::silu(&gate)? * up
             }
             #[cfg(feature = "turboquant-gpu")]
-            Self::Mxfp4(l) => l.forward_gate_up_silu_mul(x).map_err(|e| {
-                candle_core::Error::Msg(format!("mxfp4 gate_up_silu_mul: {e}"))
-            }),
+            Self::Mxfp4(l) => l
+                .forward_gate_up_silu_mul(x)
+                .map_err(|e| candle_core::Error::Msg(format!("mxfp4 gate_up_silu_mul: {e}"))),
             #[cfg(feature = "turboquant-gpu")]
             Self::Affine4(l) => {
                 let _ = inter;
-                l.forward_gate_up_silu_mul(x).map_err(|e| {
-                    candle_core::Error::Msg(format!("affine4 gate_up_silu_mul: {e}"))
-                })
+                l.forward_gate_up_silu_mul(x)
+                    .map_err(|e| candle_core::Error::Msg(format!("affine4 gate_up_silu_mul: {e}")))
             }
         }
     }
@@ -294,9 +287,9 @@ impl ProjLinear {
                 let y = l.forward(x)?;
                 y.broadcast_add(residual)
             }
-            Self::Mxfp4(l) => l.forward_with_residual_f32(x, residual).map_err(|e| {
-                candle_core::Error::Msg(format!("mxfp4 forward_with_residual: {e}"))
-            }),
+            Self::Mxfp4(l) => l
+                .forward_with_residual_f32(x, residual)
+                .map_err(|e| candle_core::Error::Msg(format!("mxfp4 forward_with_residual: {e}"))),
             Self::Affine4(l) => l.forward_with_residual_f32(x, residual).map_err(|e| {
                 candle_core::Error::Msg(format!("affine4 forward_with_residual: {e}"))
             }),
@@ -330,14 +323,10 @@ impl ProjLinear {
             ),
             Self::Mxfp4(l) => l
                 .forward_with_rmsnorm(x_raw, rms_weight, rms_eps)
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("mxfp4 forward_with_rmsnorm: {e}"))
-                }),
+                .map_err(|e| candle_core::Error::Msg(format!("mxfp4 forward_with_rmsnorm: {e}"))),
             Self::Affine4(l) => l
                 .forward_with_rmsnorm(x_raw, rms_weight, rms_eps)
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("affine4 forward_with_rmsnorm: {e}"))
-                }),
+                .map_err(|e| candle_core::Error::Msg(format!("affine4 forward_with_rmsnorm: {e}"))),
         }
     }
 

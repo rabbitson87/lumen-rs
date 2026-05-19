@@ -18,8 +18,8 @@ use anyhow::Result;
 use lumen_mlx::MlxBackend;
 
 fn main() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let prompt_len: usize = std::env::var("PROMPT_LEN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -85,7 +85,10 @@ fn main() -> Result<()> {
     b.remove_seq(1)?;
 
     // Optional: dump per-step latencies in positional order before we sort.
-    if std::env::var("LUMEN_DUMP_STEP_MS").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("LUMEN_DUMP_STEP_MS")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         for (i, ms) in step_ms.iter().enumerate() {
             println!("[step-ms] {i} {ms:.4}");
         }
@@ -123,9 +126,15 @@ fn main() -> Result<()> {
             let split_total = fwd_mean + tail_mean;
             let fwd_pct = 100.0 * fwd_mean / split_total;
             let tail_pct = 100.0 * tail_mean / split_total;
-            println!("  [breakdown] forward: mean={fwd_mean:.2}ms p50={fwd_p50:.2}ms p95={fwd_p95:.2}ms ({fwd_pct:.1}%)");
-            println!("  [breakdown] tail:    mean={tail_mean:.2}ms p50={tail_p50:.2}ms p95={tail_p95:.2}ms ({tail_pct:.1}%)");
-            println!("  [breakdown] sum (forward+tail) = {split_total:.2}ms vs measured mean={mean:.2}ms");
+            println!(
+                "  [breakdown] forward: mean={fwd_mean:.2}ms p50={fwd_p50:.2}ms p95={fwd_p95:.2}ms ({fwd_pct:.1}%)"
+            );
+            println!(
+                "  [breakdown] tail:    mean={tail_mean:.2}ms p50={tail_p50:.2}ms p95={tail_p95:.2}ms ({tail_pct:.1}%)"
+            );
+            println!(
+                "  [breakdown] sum (forward+tail) = {split_total:.2}ms vs measured mean={mean:.2}ms"
+            );
         } else {
             eprintln!(
                 "[breakdown] timing log has {} entries but {steps} steps requested; skipping",
@@ -150,11 +159,26 @@ fn main() -> Result<()> {
             let tail_us = sum_ns(|t| t.3) / 1000.0 / n;
             let total_us = arr_us + fwd_us + sync_us + tail_us;
             let pct = |v: f64| 100.0 * v / total_us;
-            println!("  [pyo3-stage] arr:     {arr_us:>8.2}us ({:>5.1}%)", pct(arr_us));
-            println!("  [pyo3-stage] forward: {fwd_us:>8.2}us ({:>5.1}%)  (lazy graph build)", pct(fwd_us));
-            println!("  [pyo3-stage] sync:    {sync_us:>8.2}us ({:>5.1}%)  (argmax + .item() forces GPU)", pct(sync_us));
-            println!("  [pyo3-stage] tail:    {tail_us:>8.2}us ({:>5.1}%)  (kv quant + state)", pct(tail_us));
-            println!("  [pyo3-stage] sum = {:.3}ms (measured mean = {mean:.3}ms)", total_us / 1000.0);
+            println!(
+                "  [pyo3-stage] arr:     {arr_us:>8.2}us ({:>5.1}%)",
+                pct(arr_us)
+            );
+            println!(
+                "  [pyo3-stage] forward: {fwd_us:>8.2}us ({:>5.1}%)  (lazy graph build)",
+                pct(fwd_us)
+            );
+            println!(
+                "  [pyo3-stage] sync:    {sync_us:>8.2}us ({:>5.1}%)  (argmax + .item() forces GPU)",
+                pct(sync_us)
+            );
+            println!(
+                "  [pyo3-stage] tail:    {tail_us:>8.2}us ({:>5.1}%)  (kv quant + state)",
+                pct(tail_us)
+            );
+            println!(
+                "  [pyo3-stage] sum = {:.3}ms (measured mean = {mean:.3}ms)",
+                total_us / 1000.0
+            );
         }
     }
 
@@ -163,9 +187,7 @@ fn main() -> Result<()> {
         if fine_log.len() >= steps {
             let timed = &fine_log[fine_log.len() - steps..];
             let n = timed.len() as f64;
-            let sum_f64 = |f: fn(&lumen_mlx::FineTimings) -> f64| {
-                timed.iter().map(f).sum::<f64>()
-            };
+            let sum_f64 = |f: fn(&lumen_mlx::FineTimings) -> f64| timed.iter().map(f).sum::<f64>();
             let embed = sum_f64(|t| t.embed_ms) / n;
             let full_attn = sum_f64(|t| t.full_attn_ms) / n;
             let linear_attn = sum_f64(|t| t.linear_attn_ms) / n;
@@ -175,15 +197,21 @@ fn main() -> Result<()> {
             let pct = |v: f64| 100.0 * v / total;
             // Per-layer means (average cost of one layer of each kind).
             let last = &timed[timed.len() - 1];
-            let per_full =
-                if last.full_attn_count > 0 { full_attn / last.full_attn_count as f64 } else { 0.0 };
+            let per_full = if last.full_attn_count > 0 {
+                full_attn / last.full_attn_count as f64
+            } else {
+                0.0
+            };
             let per_lin = if last.linear_attn_count > 0 {
                 linear_attn / last.linear_attn_count as f64
             } else {
                 0.0
             };
-            let per_moe =
-                if last.moe_count > 0 { moe / last.moe_count as f64 } else { 0.0 };
+            let per_moe = if last.moe_count > 0 {
+                moe / last.moe_count as f64
+            } else {
+                0.0
+            };
             println!(
                 "  [fine] embed:        mean={embed:.3}ms ({:.1}%)",
                 pct(embed)
@@ -215,8 +243,7 @@ fn main() -> Result<()> {
             let lin_norm_qk = sum_f64(|t| t.linear_norm_qk_ms) / n;
             let lin_ssm = sum_f64(|t| t.linear_ssm_ms) / n;
             let lin_out = sum_f64(|t| t.linear_out_proj_ms) / n;
-            let lin_sub_total =
-                lin_in_proj + lin_conv + lin_norm_qk + lin_ssm + lin_out;
+            let lin_sub_total = lin_in_proj + lin_conv + lin_norm_qk + lin_ssm + lin_out;
             let lin_pct = |v: f64| 100.0 * v / lin_sub_total.max(1e-9);
             let n_lin = last.linear_attn_count.max(1) as f64;
             println!(
@@ -270,9 +297,7 @@ fn main() -> Result<()> {
                 moe_pct(moe_shared),
                 moe_shared / n_moe
             );
-            println!(
-                "  [moe sub] sum = {moe_sub_total:.2}ms vs outer moe={moe:.2}ms"
-            );
+            println!("  [moe sub] sum = {moe_sub_total:.2}ms vs outer moe={moe:.2}ms");
         } else {
             eprintln!(
                 "[fine] fine_timing_log has {} entries but {steps} steps requested; skipping",

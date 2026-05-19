@@ -27,11 +27,10 @@ const PROMPT: &str = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
 const MAX_NEW_TOKENS: usize = 8;
 
 fn main() -> Result<()> {
-    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
-        .context("LUMEN_QWEN35_SHARDS required")?;
+    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS").context("LUMEN_QWEN35_SHARDS required")?;
     let shard_dir = PathBuf::from(shard_dir);
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
 
     eprintln!(
         "env: MXFP4_VER={} MOE_GROUPED={} MOE_BATCHED={} MOE_LEGACY={}",
@@ -56,7 +55,11 @@ fn main() -> Result<()> {
     let greedy = std::env::var("LUMEN_GREEDY")
         .map(|v| v != "0")
         .unwrap_or(true);
-    let (top_k, repeat_penalty) = if greedy { (0usize, 1.0f32) } else { (20usize, 1.1f32) };
+    let (top_k, repeat_penalty) = if greedy {
+        (0usize, 1.0f32)
+    } else {
+        (20usize, 1.1f32)
+    };
     eprintln!("greedy={greedy} (top_k={top_k}, repeat_penalty={repeat_penalty})");
     let out = backend.generate_with_opts(&ids, MAX_NEW_TOKENS, 0.0, 1.0, top_k, repeat_penalty)?;
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;

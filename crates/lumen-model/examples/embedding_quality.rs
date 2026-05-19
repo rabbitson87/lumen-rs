@@ -35,33 +35,32 @@ fn corpus() -> Vec<(&'static str, &'static str)> {
         ("baseball_kbo", "두산 베어스 KBO 리그"),
         ("baseball_kbo", "LG Twins KBO professional baseball"),
         ("baseball_kbo", "삼성 라이온즈 대구 홈구장"),
-
         // ── 2. NBA basketball ───────────────────────────────────────────────
         ("basketball_nba", "Los Angeles Lakers basketball team"),
         ("basketball_nba", "LA 레이커스 NBA 농구"),
         ("basketball_nba", "Golden State Warriors NBA championship"),
         ("basketball_nba", "Chicago Bulls Michael Jordan era"),
         ("basketball_nba", "보스턴 셀틱스 NBA 농구팀"),
-
         // ── 3. Programming languages ────────────────────────────────────────
         ("programming", "Python programming language general purpose"),
         ("programming", "러스트 시스템 프로그래밍 언어"),
         ("programming", "Rust memory-safe systems programming"),
         ("programming", "TypeScript static typing for JavaScript"),
         ("programming", "Go 동시성 프로그래밍 언어"),
-
         // ── 4. Korean cities ────────────────────────────────────────────────
         ("city_korea", "서울 대한민국의 수도"),
         ("city_korea", "Seoul capital of South Korea"),
         ("city_korea", "부산 한국 제2의 도시 항구"),
         ("city_korea", "Busan major port city in Korea"),
         ("city_korea", "제주도 한국의 휴양 섬"),
-
         // ── 5. Korean food ──────────────────────────────────────────────────
         ("food_korean", "김치찌개 매콤한 한국 전통 요리"),
         ("food_korean", "Bibimbap Korean mixed rice bowl"),
         ("food_korean", "불고기 한국식 양념 소고기 구이"),
-        ("food_korean", "Tteokbokki spicy rice cakes Korean street food"),
+        (
+            "food_korean",
+            "Tteokbokki spicy rice cakes Korean street food",
+        ),
         ("food_korean", "삼겹살 한국 돼지고기 구이"),
     ]
 }
@@ -121,16 +120,13 @@ fn main() -> Result<()> {
     let labels: Vec<&str> = data.iter().map(|(l, _)| *l).collect();
     let texts: Vec<String> = data.iter().map(|(_, t)| t.to_string()).collect();
     let n = texts.len();
-    eprintln!(
-        "[quality] corpus: {n} items across {} categories",
-        {
-            let mut set = std::collections::BTreeSet::new();
-            for l in &labels {
-                set.insert(*l);
-            }
-            set.len()
+    eprintln!("[quality] corpus: {n} items across {} categories", {
+        let mut set = std::collections::BTreeSet::new();
+        for l in &labels {
+            set.insert(*l);
         }
-    );
+        set.len()
+    });
 
     // Warm up + measure once.
     let _ = model.embed(&texts)?;
@@ -192,7 +188,9 @@ fn main() -> Result<()> {
                 texts[i].clone(),
                 texts[top.0].clone(),
                 top.1,
-                first_same.map(|(j, _)| texts[j].clone()).unwrap_or_default(),
+                first_same
+                    .map(|(j, _)| texts[j].clone())
+                    .unwrap_or_default(),
                 first_same.map(|(_, s)| s).unwrap_or(0.0),
             ));
         }
@@ -200,7 +198,10 @@ fn main() -> Result<()> {
     if misses.is_empty() {
         eprintln!("[quality] all top-1 neighbors were same-category");
     } else {
-        eprintln!("[quality] {} misses (top-1 different category):", misses.len());
+        eprintln!(
+            "[quality] {} misses (top-1 different category):",
+            misses.len()
+        );
         for (q, top, ts, want, ws) in misses {
             eprintln!("  ?  {q:?}");
             eprintln!("     top  : {top:?}  cos={ts:.4}");

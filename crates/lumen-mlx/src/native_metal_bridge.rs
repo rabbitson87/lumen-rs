@@ -21,7 +21,7 @@
 
 #![cfg(feature = "mlx-native")]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use mlx_rs::Array;
 
 /// M4.8 — bf16 flash-attention via the registered `lumen_flash_attn_bf16`

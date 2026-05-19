@@ -37,9 +37,7 @@ mod imp {
     // `&[Array] -> Result<Vec<Array>, Exception>` form. Keep this body
     // equivalent to `compute_g_legacy` — both are exercised by the parity
     // fixtures.
-    fn compute_g_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn compute_g_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         let a_log = &args[0];
         let a = &args[1];
         let dt_bias = &args[2];
@@ -100,9 +98,7 @@ mod imp {
         let a_log_f32 = a_log
             .as_dtype(mlx_rs::Dtype::Float32)
             .context("compute_g: A_log → f32 cast failed")?;
-        let exp_a_log = a_log_f32
-            .exp()
-            .context("compute_g: exp(A_log) failed")?;
+        let exp_a_log = a_log_f32.exp().context("compute_g: exp(A_log) failed")?;
         let a_plus_bias = a
             .add(dt_bias)
             .context("compute_g: a + dt_bias failed (check broadcast)")?;
@@ -111,9 +107,7 @@ mod imp {
         let prod = exp_a_log
             .multiply(&softplus)
             .context("compute_g: exp(A_log) * softplus failed (check broadcast)")?;
-        let neg = prod
-            .negative()
-            .context("compute_g: negate failed")?;
+        let neg = prod.negative().context("compute_g: negate failed")?;
         neg.exp().context("compute_g: outer exp failed")
     }
 
@@ -279,14 +273,8 @@ mod imp {
         config.set_grid(32, head_v_dim, b * n_v_heads)?;
         config.set_thread_group(32, 4, 1)?;
 
-        config.add_output_arg(
-            &[b, seq, n_v_heads, head_v_dim],
-            q.dtype(),
-        )?;
-        config.add_output_arg(
-            &[b, n_v_heads, head_v_dim, head_k_dim],
-            state_in.dtype(),
-        )?;
+        config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
+        config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
 
         // T is a 0-d int scalar input. MLX dereferences scalar arrays at
         // call sites, so the kernel sees T as an int value.
@@ -341,8 +329,7 @@ mod imp {
         let gate_f32 = gate
             .as_dtype(mlx_rs::Dtype::Float32)
             .context("rms_norm_gated: gate → f32 cast failed")?;
-        let gate_silu =
-            mlx_rs::nn::silu(&gate_f32).context("rms_norm_gated: silu(gate) failed")?;
+        let gate_silu = mlx_rs::nn::silu(&gate_f32).context("rms_norm_gated: silu(gate) failed")?;
         let x_f32 = x
             .as_dtype(mlx_rs::Dtype::Float32)
             .context("rms_norm_gated: x → f32 cast failed")?;
@@ -491,11 +478,7 @@ mod imp {
         config.add_output_arg(h_shape, hidden_states.dtype())?;
 
         let eps_scalar = Array::from_f32(eps);
-        let outputs = kernel.apply(
-            &[hidden_states, gate, weight, &eps_scalar],
-            &config,
-            1,
-        )?;
+        let outputs = kernel.apply(&[hidden_states, gate, weight, &eps_scalar], &config, 1)?;
         let mut iter = outputs.into_iter();
         let y = iter
             .next()
@@ -507,8 +490,7 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b.5 SSM block assembly.
 pub use imp::{
-    compute_g, gated_delta_step_kernel, rms_norm_gated, rms_norm_gated_fused,
-    rms_norm_gated_legacy,
+    compute_g, gated_delta_step_kernel, rms_norm_gated, rms_norm_gated_fused, rms_norm_gated_legacy,
 };
 
 // compute_g bit-identical vs MLX reference.
@@ -635,7 +617,8 @@ mod parity_tests {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "{name}: {mismatches}/{} elements diverged from MLX reference",
             observed.len()
         );
@@ -714,18 +697,11 @@ mod parity_tests {
             return;
         };
 
-        let h = Array::from_slice(
-            &fx.h,
-            &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
-        );
-        let z = Array::from_slice(
-            &fx.z,
-            &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
-        );
+        let h = Array::from_slice(&fx.h, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
+        let z = Array::from_slice(&fx.z, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
         let w = Array::from_slice(&fx.w, &[fx.hidden as i32]);
 
-        let out =
-            rms_norm_gated(&h, &z, &w, fx.eps).expect("rms_norm_gated must succeed");
+        let out = rms_norm_gated(&h, &z, &w, fx.eps).expect("rms_norm_gated must succeed");
         assert_eq!(
             out.shape(),
             &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
@@ -762,7 +738,8 @@ mod parity_tests {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "{name}: {mismatches}/{} elements diverged from MLX reference",
             observed.len()
         );
@@ -809,20 +786,14 @@ mod parity_tests {
             return;
         }
 
-        let h = Array::from_slice(
-            &fx.h,
-            &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
-        );
-        let z = Array::from_slice(
-            &fx.z,
-            &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
-        );
+        let h = Array::from_slice(&fx.h, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
+        let z = Array::from_slice(&fx.z, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
         let w = Array::from_slice(&fx.w, &[fx.hidden as i32]);
 
-        let legacy = rms_norm_gated_legacy(&h, &z, &w, fx.eps)
-            .expect("rms_norm_gated_legacy must succeed");
-        let fused = rms_norm_gated_fused(&h, &z, &w, fx.eps)
-            .expect("rms_norm_gated_fused must succeed");
+        let legacy =
+            rms_norm_gated_legacy(&h, &z, &w, fx.eps).expect("rms_norm_gated_legacy must succeed");
+        let fused =
+            rms_norm_gated_fused(&h, &z, &w, fx.eps).expect("rms_norm_gated_fused must succeed");
 
         assert_eq!(
             legacy.shape(),
@@ -874,7 +845,8 @@ mod parity_tests {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "{name}: {mismatches}/{} elements outside tolerance (max abs={:.3e} max rel={:.3e})",
             fused_slice.len(),
             max_abs_err,
@@ -1098,7 +1070,10 @@ mod parity_tests {
                 state_mismatches += 1;
             }
         }
-        assert_eq!(state_mismatches, 0, "{name}: {state_mismatches} state mismatches");
+        assert_eq!(
+            state_mismatches, 0,
+            "{name}: {state_mismatches} state mismatches"
+        );
     }
 
     #[test]

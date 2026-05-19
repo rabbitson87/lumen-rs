@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
@@ -51,7 +51,9 @@ fn synth_x(n: usize) -> Vec<f32> {
 }
 
 fn f32_vec_to_bf16_bits(xs: &[f32]) -> Vec<u16> {
-    xs.iter().map(|x| half::bf16::from_f32(*x).to_bits()).collect()
+    xs.iter()
+        .map(|x| half::bf16::from_f32(*x).to_bits())
+        .collect()
 }
 
 /// Round-trip f32 → bf16 → f32 to recover the exact value the bf16-in kernel
@@ -100,9 +102,7 @@ fn assert_bf16_in_parity(name: &str, ref_f32: &[f32], bf16_in: &[f32]) {
     let cos = cosine_similarity(ref_f32, bf16_in);
     let rel = rel_max_err(ref_f32, bf16_in);
     let abs = max_abs_err(ref_f32, bf16_in);
-    eprintln!(
-        "  {name}: cos={cos:.6}  rel_max={rel:.3e}  abs_max={abs:.3e}"
-    );
+    eprintln!("  {name}: cos={cos:.6}  rel_max={rel:.3e}  abs_max={abs:.3e}");
     assert!(
         cos >= 0.9999,
         "{name}: cosine {cos} below 0.9999 (abs={abs}, rel={rel})"
@@ -195,8 +195,7 @@ fn mxfp4_linear_forward_bf16_in_tensor_parity() {
 
         // f32-in reference fed the round-tripped activation.
         let x_round_trip_vec = f32_through_bf16(&x_vec);
-        let x_round_trip =
-            Tensor::from_vec(x_round_trip_vec, (batch, ins), &device).unwrap();
+        let x_round_trip = Tensor::from_vec(x_round_trip_vec, (batch, ins), &device).unwrap();
         let y_ref = linear.forward(&x_round_trip).unwrap();
         assert_eq!(y_ref.dtype(), DType::F32);
         let y_ref_vec = y_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();

@@ -77,8 +77,12 @@ fn main() {
         let after = c.metal_buffer_ptr();
         println!(
             "(4) lazy add then eval: before_eval={} after_eval={}  OK",
-            before.map(|p| format!("{p:p}")).unwrap_or_else(|| "None".to_string()),
-            after.map(|p| format!("{p:p}")).unwrap_or_else(|| "None".to_string()),
+            before
+                .map(|p| format!("{p:p}"))
+                .unwrap_or_else(|| "None".to_string()),
+            after
+                .map(|p| format!("{p:p}"))
+                .unwrap_or_else(|| "None".to_string()),
         );
         if after.is_none() {
             println!("    FAIL — post-eval buffer should not be None");
@@ -101,7 +105,8 @@ fn main() {
         let off = slice.metal_byte_offset();
         println!(
             "(5) sliced row 3 of [8,4] f32: buffer={} offset={off} bytes  OK",
-            p.map(|p| format!("{p:p}")).unwrap_or_else(|| "None".to_string()),
+            p.map(|p| format!("{p:p}"))
+                .unwrap_or_else(|| "None".to_string()),
         );
     }
 

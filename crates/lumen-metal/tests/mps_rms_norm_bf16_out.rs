@@ -23,8 +23,7 @@ fn cpu_reference(x: &[f32], weight: &[f32], m: usize, hidden: usize, eps: f32) -
     let mut y = vec![0.0_f32; m * hidden];
     for row in 0..m {
         let off = row * hidden;
-        let mean_sq: f32 =
-            x[off..off + hidden].iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let mean_sq: f32 = x[off..off + hidden].iter().map(|v| v * v).sum::<f32>() / hidden as f32;
         let inv = (mean_sq + eps).sqrt().recip();
         for c in 0..hidden {
             y[off + c] = x[off + c] * inv * weight[c];
@@ -41,9 +40,7 @@ fn synth_inputs(m: usize, hidden: usize, seed: u32) -> (Vec<f32>, Vec<f32>) {
             (((s >> 8) & 0xFFFF) as f32 / 32768.0 - 1.0) * 1.5
         })
         .collect();
-    let weight: Vec<f32> = (0..hidden)
-        .map(|i| 0.5 + 0.01 * (i as f32).sin())
-        .collect();
+    let weight: Vec<f32> = (0..hidden).map(|i| 0.5 + 0.01 * (i as f32).sin()).collect();
     (x, weight)
 }
 
@@ -175,7 +172,8 @@ fn determinism_repeat_call_bit_identical() {
         bits1.len()
     );
     assert_eq!(
-        mismatches, 0,
+        mismatches,
+        0,
         "MpsRmsNormBf16Out is non-deterministic across calls — \
          {mismatches}/{} bits differ on identical inputs. \
          This is the source of the chain bench's KH=1 R1↔R2: 0/12 regression.",
@@ -228,8 +226,10 @@ fn microbench_cost_within_baseline() {
     }
     let bf16_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    eprintln!("f32 per-call: {f32_ms:.4} ms   bf16-out per-call: {bf16_ms:.4} ms   ratio: {:.3}",
-        bf16_ms / f32_ms);
+    eprintln!(
+        "f32 per-call: {f32_ms:.4} ms   bf16-out per-call: {bf16_ms:.4} ms   ratio: {:.3}",
+        bf16_ms / f32_ms
+    );
 
     // Generous ceiling: dev-profile + readback overhead dominates kernel cost
     // for tiny m=1 shapes. The gate guards against structural regressions

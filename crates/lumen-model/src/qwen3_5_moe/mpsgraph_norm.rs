@@ -6,8 +6,8 @@
 //! (final norm) and `layer::DecoderLayer::forward_with_tq`
 //! (input/post-attention norms) so all 81 RmsNorm callsites share one cache.
 
-use std::sync::OnceLock;
 use lumen_metal::mpsgraph::MpsRmsNorm;
+use std::sync::OnceLock;
 
 /// Qwen3.5-MoE config has all RmsNorm ops at eps=1e-6 (verified via
 /// `qwen3_5_moe::config`). If a future checkpoint uses a different eps the

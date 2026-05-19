@@ -25,10 +25,10 @@
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::Linear;
-use std::sync::Mutex;
 use lumen_model::qwen3_5_moe::linear_attn::{
     GatedDeltaNet, GatedDeltaNetRuntime, LinearAttnDims, conv1d_from_mlx_weight,
 };
+use std::sync::Mutex;
 
 /// Serializes both tests in this file: `lumen_metal::gated_delta::set_enabled`
 /// flips a process-wide atomic. With cargo's default parallel test scheduler,
@@ -44,10 +44,14 @@ fn metal_device() -> Option<Device> {
 
 fn random_f32(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
     let n: usize = shape.iter().product();
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = ((s >> 32) as u32) as f32 / u32::MAX as f32;
         data.push((bits - 0.5) * scale);
     }
@@ -169,7 +173,9 @@ fn bf16_chain_forward_matches_f32_within_tolerance() {
     let y_f32 = net_f32.forward(&x_f32, Some(&mask)).expect("f32 forward");
     assert_eq!(y_f32.dtype(), DType::F32);
 
-    let y_bf16 = net_bf16.forward(&x_bf16, Some(&mask)).expect("bf16 forward");
+    let y_bf16 = net_bf16
+        .forward(&x_bf16, Some(&mask))
+        .expect("bf16 forward");
     assert_eq!(
         y_bf16.dtype(),
         DType::F32,
@@ -191,9 +197,7 @@ fn bf16_chain_forward_matches_f32_within_tolerance() {
         .to_scalar::<f32>()
         .unwrap();
 
-    eprintln!(
-        "B.4 bf16 chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}"
-    );
+    eprintln!("B.4 bf16 chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}");
 
     assert!(cos > 0.998, "cosine sim {cos} must exceed 0.998");
     assert!(
@@ -229,9 +233,7 @@ fn bf16_chain_determinism_repeat_call() {
     let mut runs: Vec<Vec<f32>> = Vec::with_capacity(5);
     for _ in 0..5 {
         let mut net = build_net(&dev);
-        let y = net
-            .forward(&x, Some(&mask))
-            .expect("bf16 forward");
+        let y = net.forward(&x, Some(&mask)).expect("bf16 forward");
         runs.push(y.flatten_all().unwrap().to_vec1::<f32>().unwrap());
     }
 

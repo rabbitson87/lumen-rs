@@ -34,10 +34,10 @@
 #![cfg(feature = "model-integration")]
 
 use candle_core::{DType, Device, Tensor, backend::BackendDevice as _};
-use std::sync::Arc;
-use std::time::Instant;
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 use lumen_metal::affine4_linear::Affine4Linear;
+use std::sync::Arc;
+use std::time::Instant;
 
 const HIDDEN: usize = 5120;
 const INTER: usize = 17408;
@@ -100,8 +100,9 @@ fn measure_shape(ctx: &Arc<Affine4Context>, dev: &Device, shape: Shape) -> (f64,
     let packed = synth_packed(shape.out, shape.ins, 0xDEAD_BEEF ^ shape.name.len() as u32);
     let scales = synth_meta(shape.out, shape.ins, 0xCAFE_BABE, false);
     let biases = synth_meta(shape.out, shape.ins, 0x1234_5678, true);
-    let weight = Affine4Weight::from_host(&ctx.ctx, &packed, &scales, &biases, shape.out, shape.ins)
-        .expect("affine4 weight");
+    let weight =
+        Affine4Weight::from_host(&ctx.ctx, &packed, &scales, &biases, shape.out, shape.ins)
+            .expect("affine4 weight");
     let lin = Affine4Linear::new(weight, None, ctx.clone());
 
     // Activation in bf16 (production decode dtype).

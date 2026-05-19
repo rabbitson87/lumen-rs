@@ -37,7 +37,6 @@ pub fn compress_vectors(
     qjl_m: u32,
     n_qjl_packed: u32,
 ) -> Result<()> {
-
     // Intermediate buffers (temporary, within this command buffer)
     let rotated_buf = ctx.buffer_for::<f32>(n_vecs as usize * dim as usize);
     let codes_buf = ctx.buffer_for::<u8>(n_vecs as usize * dim as usize);
@@ -47,7 +46,9 @@ pub fn compress_vectors(
 
     // --- Kernel 1: Rotate and Normalize ---
     {
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:tq_rotate_and_normalize");
         let pipeline = pipelines.get("tq_rotate_and_normalize")?;
         encoder.set_compute_pipeline_state(pipeline);
@@ -67,7 +68,9 @@ pub fn compress_vectors(
 
     // --- Kernel 2: Lloyd-Max Quantize ---
     {
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:tq_lloyd_max_quantize");
         let pipeline = pipelines.get("tq_lloyd_max_quantize")?;
         encoder.set_compute_pipeline_state(pipeline);
@@ -86,7 +89,9 @@ pub fn compress_vectors(
 
     // --- Kernel 3: Bitpack and Residual ---
     {
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:tq_bitpack_and_residual");
         let pipeline = pipelines.get("tq_bitpack_and_residual")?;
         encoder.set_compute_pipeline_state(pipeline);
@@ -111,7 +116,9 @@ pub fn compress_vectors(
 
     // --- Kernel 4: QJL Project Signs (1 thread per vector) ---
     {
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:tq_qjl_project_signs");
         let pipeline = pipelines.get("tq_qjl_project_signs")?;
         encoder.set_compute_pipeline_state(pipeline);
@@ -130,7 +137,9 @@ pub fn compress_vectors(
         encoder.dispatch_threads(grid, threadgroup);
     }
 
-    crate::metal::process_commands().flush_and_wait().expect("flush");
+    crate::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
 
     Ok(())
 }
@@ -183,7 +192,9 @@ pub fn encode_compress(
     // assertions on long-prompt prefill (BL ≥ 2048) when many encoders queue
     // up in one command buffer.
     {
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:tq_rotate_normalize_quantize");
         let p = pipelines.get("tq_rotate_normalize_quantize")?;
         enc.set_compute_pipeline_state(p);
@@ -202,7 +213,9 @@ pub fn encode_compress(
     }
     // Kernel 3: Bitpack and Residual
     {
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:tq_bitpack_and_residual");
         let p = pipelines.get("tq_bitpack_and_residual")?;
         enc.set_compute_pipeline_state(p);
@@ -224,7 +237,9 @@ pub fn encode_compress(
     }
     // Kernel 4: QJL Project Signs
     {
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:tq_qjl_project_signs");
         let p = pipelines.get("tq_qjl_project_signs")?;
         enc.set_compute_pipeline_state(p);

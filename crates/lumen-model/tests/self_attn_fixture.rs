@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, safetensors as cst};
 use candle_nn::{Linear, RmsNorm};
 use lumen_model::qwen3_5_moe::self_attn::{SelfAttention, SelfAttnDims, SelfAttnRuntime};
 
@@ -172,13 +172,7 @@ fn self_attn_forward_matches_mlx_fixture_layer3() {
         None,
     );
 
-    let mut attn = SelfAttention::new(
-        rt,
-        qkv_proj.into(),
-        o_proj.into(),
-        q_norm,
-        k_norm,
-    );
+    let mut attn = SelfAttention::new(rt, qkv_proj.into(), o_proj.into(), q_norm, k_norm);
 
     // MLX's `layer.self_attn(x)` defaults to `mask=None` (bidirectional). The golden fixture
     // was dumped with that default, so the parity check here also uses `None`. Production

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
-use candle_metal_kernels::metal::{Commands, ResidencySet};
 use crate::metal::{CommandQueue, Device, MTLResourceOptions};
+use anyhow::{Result, anyhow};
+use candle_metal_kernels::metal::{Commands, ResidencySet};
 
 /// Wrapper around Metal device and command queue.
 ///
@@ -97,14 +97,9 @@ impl MetalContext {
         use objc2::rc::Retained;
         use objc2::runtime::ProtocolObject;
         use objc2_metal::MTLDevice;
-        let raw: Retained<ProtocolObject<dyn MTLDevice>> =
-            Retained::from(self.device.as_ref());
-        crate::metal::IndirectCommandBuffer::new(
-            &raw,
-            max_commands,
-            max_kernel_buffer_bind_count,
-        )
-        .map_err(|e| anyhow!("ICB alloc: {e:?}"))
+        let raw: Retained<ProtocolObject<dyn MTLDevice>> = Retained::from(self.device.as_ref());
+        crate::metal::IndirectCommandBuffer::new(&raw, max_commands, max_kernel_buffer_bind_count)
+            .map_err(|e| anyhow!("ICB alloc: {e:?}"))
     }
 }
 

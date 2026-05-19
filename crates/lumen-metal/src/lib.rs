@@ -7,26 +7,26 @@
 /// with Candle tensors so zero-copy bridges work.
 pub mod metal;
 
+pub mod affine3_gpu;
+pub mod affine4_gpu;
+#[cfg(feature = "model-integration")]
+pub mod affine4_linear;
+pub mod affine8_gpu;
+#[cfg(feature = "model-integration")]
+pub mod affine8_linear;
 pub mod buffer;
 pub mod device;
+#[cfg(feature = "model-integration")]
+pub mod flash_attn;
+#[cfg(feature = "model-integration")]
+pub mod gated_delta;
 pub mod kernels;
 #[cfg(feature = "mpsgraph")]
 pub mod mpsgraph;
 pub mod mxfp4;
 pub mod mxfp4_gpu;
-pub mod affine4_gpu;
-pub mod affine8_gpu;
-#[cfg(feature = "model-integration")]
-pub mod affine8_linear;
-pub mod affine3_gpu;
-#[cfg(feature = "model-integration")]
-pub mod flash_attn;
-#[cfg(feature = "model-integration")]
-pub mod gated_delta;
 #[cfg(feature = "model-integration")]
 pub mod mxfp4_linear;
-#[cfg(feature = "model-integration")]
-pub mod affine4_linear;
 pub mod pipeline;
 #[cfg(feature = "model-integration")]
 pub mod rms_norm;
@@ -244,7 +244,9 @@ impl GpuCompressor {
             );
             // BlitCommandsGuard auto-end on drop
         }
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         let head_buf = self.pool.head_mut(layer, head);
         if is_key {
@@ -443,7 +445,9 @@ mod candle_integration {
                 let hb = self.pool.head(layer, h);
                 let k_off = hb.key_seq_len;
                 let src_vec_off = h * seq_len; // offset within batched output
-                let mut blit = crate::metal::process_commands().blit_command_encoder().expect("blit");
+                let mut blit = crate::metal::process_commands()
+                    .blit_command_encoder()
+                    .expect("blit");
                 blit.copy_from_buffer(
                     &self.scratch_tmp_packed,
                     (src_vec_off * n_packed * 8) as usize,
@@ -510,7 +514,9 @@ mod candle_integration {
                 let hb = self.pool.head(layer, h);
                 let v_off = hb.val_seq_len;
                 let src_vec_off = h * seq_len;
-                let mut blit = crate::metal::process_commands().blit_command_encoder().expect("blit");
+                let mut blit = crate::metal::process_commands()
+                    .blit_command_encoder()
+                    .expect("blit");
                 blit.copy_from_buffer(
                     &self.scratch_tmp_packed,
                     (src_vec_off * n_packed * 8) as usize,
@@ -542,7 +548,9 @@ mod candle_integration {
             }
 
             // ONE sync for ALL heads
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
 
             // Update seq_lens
             for h in 0..n_kv_head {
@@ -578,7 +586,10 @@ mod candle_integration {
             // dump pool scales/res_norms to
             // localise outlier source. Reads from pool buffer for layer 0 head 0
             // first n_kv vecs. Activated by LUMEN_TQ_DEBUG_DUMP=1.
-            if std::env::var("LUMEN_TQ_DEBUG_DUMP").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("LUMEN_TQ_DEBUG_DUMP")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 let hb = self.pool.head(layer, 0);
                 let scales_vec: Vec<f32> = self.ctx.read_buffer(&hb.key.scales, n_kv);
                 let rn_vec: Vec<f32> = self.ctx.read_buffer(&hb.key.res_norms, n_kv);
@@ -674,7 +685,9 @@ mod candle_integration {
             // Note: compute encoders auto-end via Drop; no explicit end_encoding().
             for slot in 0..rq_slots {
                 let qh = if gqa_fix { slot } else { slot * gqa_ratio };
-                let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                let enc = crate::metal::process_commands()
+                    .command_encoder()
+                    .expect("ce");
                 let p = self.pipelines.get("tq_rotate_query").ok()?;
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(q_buf), q_base + (qh * dim * 4) as usize);
@@ -698,7 +711,9 @@ mod candle_integration {
 
                     // QJL project Q[qh]
                     {
-                        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                        let enc = crate::metal::process_commands()
+                            .command_encoder()
+                            .expect("ce");
                         let p = self.pipelines.get("tq_qjl_project_query").ok()?;
                         enc.set_compute_pipeline_state(p);
                         enc.set_buffer(0, Some(q_buf), q_base + (qh * dim * 4) as usize);
@@ -721,7 +736,9 @@ mod candle_integration {
 
                     // Scores: rq[qh] · K_comp[kv_h]
                     {
-                        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                        let enc = crate::metal::process_commands()
+                            .command_encoder()
+                            .expect("ce");
                         let use_v6 = dim % 4 == 0;
                         let kernel_name = if use_v6 {
                             "tq_compressed_attention_scores_v6"
@@ -770,7 +787,9 @@ mod candle_integration {
 
                     // Softmax scores[qh]
                     {
-                        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                        let enc = crate::metal::process_commands()
+                            .command_encoder()
+                            .expect("ce");
                         let p = self.pipelines.get("tq_softmax_parallel").ok()?;
                         enc.set_compute_pipeline_state(p);
                         enc.set_buffer(0, Some(scores_per_q), (qh * n_kv * 4) as usize);
@@ -785,7 +804,9 @@ mod candle_integration {
 
                     // Single-output value gather → out[qh]
                     {
-                        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                        let enc = crate::metal::process_commands()
+                            .command_encoder()
+                            .expect("ce");
                         let p = self.pipelines.get("tq_compressed_value_gather").ok()?;
                         enc.set_compute_pipeline_state(p);
                         enc.set_buffer(0, Some(scores_per_q), (qh * n_kv * 4) as usize);
@@ -806,7 +827,9 @@ mod candle_integration {
                     }
                 }
 
-                crate::metal::process_commands().flush_and_wait().expect("flush");
+                crate::metal::process_commands()
+                    .flush_and_wait()
+                    .expect("flush");
                 return Some(output_tensor);
             }
 
@@ -820,7 +843,9 @@ mod candle_integration {
                 //   scratch_qjl_proj[j] = qjl_matrix[j] · query
                 // Replaces the per-kv_idx O(qjl_m * dim) recomputation in v1 score kernel.
                 {
-                    let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                    let enc = crate::metal::process_commands()
+                        .command_encoder()
+                        .expect("ce");
                     let p = self.pipelines.get("tq_qjl_project_query").ok()?;
                     enc.set_compute_pipeline_state(p);
                     enc.set_buffer(0, Some(q_buf), q_base + (first_qh * dim * 4) as usize);
@@ -831,10 +856,7 @@ mod candle_integration {
                     let max_tg = p.max_total_threads_per_threadgroup() as u64;
                     let qjl_m = self.config.qjl_m as u64;
                     let tg = qjl_m.min(max_tg);
-                    enc.dispatch_threads(
-                        crate::mtl_size!(qjl_m, 1, 1),
-                        crate::mtl_size!(tg, 1, 1),
-                    );
+                    enc.dispatch_threads(crate::mtl_size!(qjl_m, 1, 1), crate::mtl_size!(tg, 1, 1));
                 }
 
                 // Compressed attention scores via SIMD-group cooperative reduction (v6).
@@ -843,7 +865,9 @@ mod candle_integration {
                 // Fallback to v2 when dim % 4 != 0 (v6 also requires the float4-style
                 // contiguous load implicitly via simd-cooperative dim stride).
                 {
-                    let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                    let enc = crate::metal::process_commands()
+                        .command_encoder()
+                        .expect("ce");
                     let use_v6 = dim % 4 == 0;
                     let kernel_name = if use_v6 {
                         "tq_compressed_attention_scores_v6"
@@ -891,7 +915,9 @@ mod candle_integration {
                 // Fixes the silent-corruption bug of fused single-threadgroup softmax
                 // when n_kv > max_threads_per_threadgroup.
                 {
-                    let enc = crate::metal::process_commands().command_encoder().expect("ce");
+                    let enc = crate::metal::process_commands()
+                        .command_encoder()
+                        .expect("ce");
                     let p = self.pipelines.get("tq_softmax_parallel").ok()?;
                     enc.set_compute_pipeline_state(p);
                     enc.set_buffer(0, Some(&self.scratch_scores), 0);
@@ -910,8 +936,13 @@ mod candle_integration {
                 // and V cache → identical compute → fan out result.
                 {
                     let first_qh = kv_h * gqa_ratio;
-                    let enc = crate::metal::process_commands().command_encoder().expect("ce");
-                    let p = self.pipelines.get("tq_compressed_value_gather_multi").ok()?;
+                    let enc = crate::metal::process_commands()
+                        .command_encoder()
+                        .expect("ce");
+                    let p = self
+                        .pipelines
+                        .get("tq_compressed_value_gather_multi")
+                        .ok()?;
                     enc.set_compute_pipeline_state(p);
                     enc.set_buffer(0, Some(&self.scratch_scores), 0);
                     enc.set_buffer(1, Some(&hb.value.packed_codes), 0);
@@ -932,7 +963,9 @@ mod candle_integration {
                 }
             }
 
-            crate::metal::process_commands().flush_and_wait().expect("flush");
+            crate::metal::process_commands()
+                .flush_and_wait()
+                .expect("flush");
 
             // output_tensor already has the data on GPU — zero copy return
             Some(output_tensor)

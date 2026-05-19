@@ -4,10 +4,10 @@
 //! [`KernelLib::new`] time. Pipelines are cached on the lib and dispatched
 //! against `NativeContext`'s queue so every op shares one cmd-buffer lineage.
 
-use anyhow::{anyhow, Result};
-use lumen_metal::metal::{CommandBufferExt, 
-    CompileOptions, ComputeCommandEncoderRef, ComputeEncoderCompat, BatchedEncoderExt, ComputePipelineState, Library,
-    MTLLanguageVersion, MTLSize,
+use anyhow::{Result, anyhow};
+use lumen_metal::metal::{
+    BatchedEncoderExt, CommandBufferExt, CompileOptions, ComputeCommandEncoderRef,
+    ComputeEncoderCompat, ComputePipelineState, Library, MTLLanguageVersion, MTLSize,
 };
 
 use super::context::NativeContext;
@@ -185,7 +185,9 @@ impl KernelLib {
         let hidden_u32 = hidden as u32;
         enc.set_bytes_directly(3, 4, &hidden_u32 as *const _ as *const _);
 
-        let max_threads = self.embedding_lookup_f32.max_total_threads_per_threadgroup();
+        let max_threads = self
+            .embedding_lookup_f32
+            .max_total_threads_per_threadgroup();
         let threads_per_tg = max_threads.min(256);
         let grid = MTLSize {
             width: hidden as usize,
@@ -369,10 +371,7 @@ impl KernelLib {
     ) -> Result<()> {
         for (name, t) in [("x", x), ("cos", cos), ("sin", sin), ("y", y)] {
             if t.dtype() != NativeDType::F32 {
-                return Err(anyhow!(
-                    "rope_partial: {name} dtype {:?} != F32",
-                    t.dtype()
-                ));
+                return Err(anyhow!("rope_partial: {name} dtype {:?} != F32", t.dtype()));
             }
         }
         if x.rank() != 4 {
@@ -442,10 +441,7 @@ impl KernelLib {
     ) -> Result<()> {
         for (name, t) in [("x", x), ("cos", cos), ("sin", sin), ("y", y)] {
             if t.dtype() != NativeDType::F32 {
-                return Err(anyhow!(
-                    "rope_partial: {name} dtype {:?} != F32",
-                    t.dtype()
-                ));
+                return Err(anyhow!("rope_partial: {name} dtype {:?} != F32", t.dtype()));
             }
         }
         if x.rank() != 4 {
@@ -625,12 +621,7 @@ impl KernelLib {
                 ));
             }
         }
-        let (b, q_heads, l_q, d) = (
-            q.shape()[0],
-            q.shape()[1],
-            q.shape()[2],
-            q.shape()[3],
-        );
+        let (b, q_heads, l_q, d) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
         let kv_heads = k.shape()[1];
         if k.shape() != [b, kv_heads, kv_layout_stride, d]
             || v.shape() != [b, kv_heads, kv_layout_stride, d]
@@ -716,12 +707,7 @@ impl KernelLib {
                 ));
             }
         }
-        let (b, q_heads, l_q, d) = (
-            q.shape()[0],
-            q.shape()[1],
-            q.shape()[2],
-            q.shape()[3],
-        );
+        let (b, q_heads, l_q, d) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
         let kv_heads = k.shape()[1];
         if k.shape() != [b, kv_heads, kv_layout_stride, d]
             || v.shape() != [b, kv_heads, kv_layout_stride, d]
@@ -790,7 +776,9 @@ impl KernelLib {
         kv_layout_stride: usize,
     ) {
         let scale = 1.0_f32 / (d as f32).sqrt();
-        let max_threads = self.attention_causal_f32.max_total_threads_per_threadgroup();
+        let max_threads = self
+            .attention_causal_f32
+            .max_total_threads_per_threadgroup();
         let tg_w = (d as usize).min(max_threads).min(256).max(1);
 
         enc.set_compute_pipeline_state(&self.attention_causal_f32);
@@ -1051,10 +1039,7 @@ impl KernelLib {
             ("y", y),
         ] {
             if t.dtype() != NativeDType::F32 {
-                return Err(anyhow!(
-                    "ssm_step: {name} dtype {:?} != F32",
-                    t.dtype()
-                ));
+                return Err(anyhow!("ssm_step: {name} dtype {:?} != F32", t.dtype()));
             }
         }
         if state.rank() != 4 {
@@ -1360,12 +1345,7 @@ impl KernelLib {
     }
 
     /// Element-wise softplus: `y = ln(1 + exp(x))` (numerically stable).
-    pub fn softplus(
-        &self,
-        ctx: &NativeContext,
-        x: &NativeTensor,
-        y: &NativeTensor,
-    ) -> Result<()> {
+    pub fn softplus(&self, ctx: &NativeContext, x: &NativeTensor, y: &NativeTensor) -> Result<()> {
         self.dispatch_elementwise(ctx, &self.softplus_f32, x, y, "softplus")
     }
 
@@ -1395,12 +1375,7 @@ impl KernelLib {
     }
 
     /// Element-wise sigmoid: `y = 1 / (1 + exp(-x))`.
-    pub fn sigmoid(
-        &self,
-        ctx: &NativeContext,
-        x: &NativeTensor,
-        y: &NativeTensor,
-    ) -> Result<()> {
+    pub fn sigmoid(&self, ctx: &NativeContext, x: &NativeTensor, y: &NativeTensor) -> Result<()> {
         self.dispatch_elementwise(ctx, &self.sigmoid_f32, x, y, "sigmoid")
     }
 
@@ -1415,12 +1390,7 @@ impl KernelLib {
     }
 
     /// Element-wise `y = exp(-x)`. Last step of the GatedDeltaNet decay chain.
-    pub fn neg_exp(
-        &self,
-        ctx: &NativeContext,
-        x: &NativeTensor,
-        y: &NativeTensor,
-    ) -> Result<()> {
+    pub fn neg_exp(&self, ctx: &NativeContext, x: &NativeTensor, y: &NativeTensor) -> Result<()> {
         self.dispatch_elementwise(ctx, &self.neg_exp_f32, x, y, "neg_exp")
     }
 
@@ -1850,9 +1820,7 @@ impl KernelLib {
         n: usize,
         tg_w_hint: usize,
     ) {
-        let max_threads = self
-            .affine_scalar_f32
-            .max_total_threads_per_threadgroup();
+        let max_threads = self.affine_scalar_f32.max_total_threads_per_threadgroup();
         let tg_w = tg_w_hint.min(max_threads).max(1);
         enc.set_compute_pipeline_state(&self.affine_scalar_f32);
         enc.set_buffer(0, Some(x.buffer()), x.offset_bytes());
@@ -1927,7 +1895,10 @@ impl KernelLib {
     ) -> Result<Option<(usize, usize, usize, usize)>> {
         for (name, t) in [("x", x), ("w", w), ("y", y)] {
             if t.dtype() != NativeDType::F32 {
-                return Err(anyhow!("depthwise_conv1d {name} dtype {:?} != F32", t.dtype()));
+                return Err(anyhow!(
+                    "depthwise_conv1d {name} dtype {:?} != F32",
+                    t.dtype()
+                ));
             }
         }
         if x.rank() != 3 || y.rank() != 3 {
@@ -1938,7 +1909,10 @@ impl KernelLib {
             ));
         }
         if w.rank() != 2 {
-            return Err(anyhow!("depthwise_conv1d: w must be rank 2 [C, K], got rank {}", w.rank()));
+            return Err(anyhow!(
+                "depthwise_conv1d: w must be rank 2 [C, K], got rank {}",
+                w.rank()
+            ));
         }
         let (b, x_total, c_x) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let (b_y, s, c_y) = (y.shape()[0], y.shape()[1], y.shape()[2]);
@@ -2216,9 +2190,7 @@ impl KernelLib {
         if n == 0 {
             return Ok(());
         }
-        let max_threads = self
-            .affine_scalar_bf16
-            .max_total_threads_per_threadgroup();
+        let max_threads = self.affine_scalar_bf16.max_total_threads_per_threadgroup();
         let tg_w = n.min(max_threads).min(256).max(1);
         enc.set_compute_pipeline_state(&self.affine_scalar_bf16);
         enc.set_buffer(0, Some(x.buffer()), x.offset_bytes());
@@ -2576,13 +2548,10 @@ mod tests {
 
         let vocab = 5;
         let hidden = 8;
-        let table: Vec<f32> = (0..vocab * hidden)
-            .map(|i| (i as f32) * 0.25)
-            .collect();
+        let table: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32) * 0.25).collect();
         let table_t = ctx.from_slice_f32(&table, vec![vocab, hidden]).unwrap();
         let token_ids: Vec<u32> = vec![3, 0, 4, 2];
-        let mut tok_buf =
-            ctx.uninit(vec![token_ids.len()], NativeDType::U32).unwrap();
+        let mut tok_buf = ctx.uninit(vec![token_ids.len()], NativeDType::U32).unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(
                 token_ids.as_ptr(),
@@ -2596,7 +2565,8 @@ mod tests {
             .zeros(vec![token_ids.len(), hidden], NativeDType::F32)
             .unwrap();
 
-        lib.embedding_lookup(&ctx, &tok_buf, &table_t, &out_t).unwrap();
+        lib.embedding_lookup(&ctx, &tok_buf, &table_t, &out_t)
+            .unwrap();
 
         let got = out_t.to_vec_f32().unwrap();
         let mut expected = Vec::with_capacity(token_ids.len() * hidden);
@@ -2677,8 +2647,7 @@ mod tests {
 
         // Build cos/sin via builder so the kernel exercises the same path
         // production callers use.
-        let (cos_t, sin_t) =
-            build_rope_tables(&ctx, rotary_dim, seq, 0, theta).unwrap();
+        let (cos_t, sin_t) = build_rope_tables(&ctx, rotary_dim, seq, 0, theta).unwrap();
         let cos_v = cos_t.to_vec_f32().unwrap();
         let sin_v = sin_t.to_vec_f32().unwrap();
         assert_eq!(cos_v.len(), seq * half);
@@ -2690,7 +2659,8 @@ mod tests {
             .zeros(vec![batch, seq, heads, head_dim], NativeDType::F32)
             .unwrap();
 
-        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half).unwrap();
+        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half)
+            .unwrap();
 
         let got = y_t.to_vec_f32().unwrap();
         let expected =
@@ -2728,8 +2698,7 @@ mod tests {
             .map(|i| (((i as f32) * 0.009).sin() + 0.1 * (i as f32 * 0.01).cos()))
             .collect();
 
-        let (cos_t, sin_t) =
-            build_rope_tables(&ctx, rotary_dim, seq, 0, theta).unwrap();
+        let (cos_t, sin_t) = build_rope_tables(&ctx, rotary_dim, seq, 0, theta).unwrap();
         let cos_v = cos_t.to_vec_f32().unwrap();
         let sin_v = sin_t.to_vec_f32().unwrap();
 
@@ -2739,7 +2708,8 @@ mod tests {
         let y_t = ctx
             .zeros(vec![batch, seq, heads, head_dim], NativeDType::F32)
             .unwrap();
-        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half).unwrap();
+        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half)
+            .unwrap();
         let got = y_t.to_vec_f32().unwrap();
 
         // Candle reference. `rotary_emb::rope` expects [B, H, L, D] with cos/sin
@@ -2811,7 +2781,8 @@ mod tests {
         let out = ctx
             .zeros(vec![b, q_heads, l, head_dim], NativeDType::F32)
             .unwrap();
-        lib.attention_causal(&ctx, &q, &k, &v, &out, pos_offset).unwrap();
+        lib.attention_causal(&ctx, &q, &k, &v, &out, pos_offset)
+            .unwrap();
         let got = out.to_vec_f32().unwrap();
 
         let expected = cpu_attention(
@@ -2820,14 +2791,27 @@ mod tests {
         let mut max_abs = 0.0_f32;
         for (g, e) in got.iter().zip(expected.iter()) {
             let err = (g - e).abs();
-            if err > max_abs { max_abs = err; }
+            if err > max_abs {
+                max_abs = err;
+            }
         }
-        let dot: f64 = got.iter().zip(expected.iter()).map(|(a, b)| (*a as f64)*(*b as f64)).sum();
+        let dot: f64 = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
         let na: f64 = got.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-        let nb: f64 = expected.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = expected
+            .iter()
+            .map(|x| (*x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos = dot / (na * nb);
         eprintln!("attention_causal production-size: cos={cos:.6} max_abs={max_abs:.6}");
-        assert!(cos > 0.9999, "attention_causal production-size cos {cos} max_abs {max_abs}");
+        assert!(
+            cos > 0.9999,
+            "attention_causal production-size cos {cos} max_abs {max_abs}"
+        );
     }
 
     /// Production-size weighted RMSNorm: head_dim=256, rows=176 (B*L*H = 1*11*16).
@@ -2867,14 +2851,27 @@ mod tests {
         let mut max_abs = 0.0_f32;
         for (g, e) in got.iter().zip(expected.iter()) {
             let err = (g - e).abs();
-            if err > max_abs { max_abs = err; }
+            if err > max_abs {
+                max_abs = err;
+            }
         }
-        let dot: f64 = got.iter().zip(expected.iter()).map(|(a, b)| (*a as f64)*(*b as f64)).sum();
+        let dot: f64 = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
         let na: f64 = got.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-        let nb: f64 = expected.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = expected
+            .iter()
+            .map(|x| (*x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos = dot / (na * nb);
         eprintln!("rms_norm production-size: cos={cos:.6} max_abs={max_abs:.6}");
-        assert!(cos > 0.9999, "rms_norm production-size cos {cos} max_abs {max_abs}");
+        assert!(
+            cos > 0.9999,
+            "rms_norm production-size cos {cos} max_abs {max_abs}"
+        );
     }
 
     /// Production-size partial rope test: head_dim=256, rotary_dim=64, num_heads=16.
@@ -2902,8 +2899,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.001).sin() * 0.5 + ((i as f32) * 0.013).cos() * 0.3)
             .collect();
 
-        let (cos_t, sin_t) =
-            build_rope_tables(&ctx, rotary_dim, seq, pos_offset, theta).unwrap();
+        let (cos_t, sin_t) = build_rope_tables(&ctx, rotary_dim, seq, pos_offset, theta).unwrap();
         let cos_v = cos_t.to_vec_f32().unwrap();
         let sin_v = sin_t.to_vec_f32().unwrap();
 
@@ -2913,11 +2909,12 @@ mod tests {
         let y_t = ctx
             .zeros(vec![batch, seq, heads, head_dim], NativeDType::F32)
             .unwrap();
-        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half).unwrap();
+        lib.rope_partial(&ctx, &x_t, &cos_t, &sin_t, &y_t, half)
+            .unwrap();
         let got = y_t.to_vec_f32().unwrap();
 
         // Candle reference: same partial rope, on BHLD layout.
-        use candle_core::{Device, Tensor, D};
+        use candle_core::{D, Device, Tensor};
         use candle_nn::rotary_emb;
         let device = Device::Cpu;
         let x_bhld = Tensor::from_vec(x.clone(), (batch, seq, heads, head_dim), &device)
@@ -2946,15 +2943,28 @@ mod tests {
         let mut max_abs = 0.0_f32;
         for (g, e) in got.iter().zip(expected.iter()) {
             let err = (g - e).abs();
-            if err > max_abs { max_abs = err; }
+            if err > max_abs {
+                max_abs = err;
+            }
         }
         // cosine
-        let dot: f64 = got.iter().zip(expected.iter()).map(|(a, b)| (*a as f64)*(*b as f64)).sum();
+        let dot: f64 = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
         let na: f64 = got.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-        let nb: f64 = expected.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = expected
+            .iter()
+            .map(|x| (*x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos = dot / (na * nb);
         eprintln!("rope_partial production-size: cos={cos:.6} max_abs={max_abs:.6}");
-        assert!(cos > 0.9999, "rope_partial production-size cos {cos} max_abs {max_abs}");
+        assert!(
+            cos > 0.9999,
+            "rope_partial production-size cos {cos} max_abs {max_abs}"
+        );
     }
 
     fn cpu_attention(
@@ -3055,7 +3065,8 @@ mod tests {
         let v_t = ctx.from_slice_f32(&v, vec![b, h, l_kv, d]).unwrap();
         let o_t = ctx.zeros(vec![b, h, l_q, d], NativeDType::F32).unwrap();
 
-        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset).unwrap();
+        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset)
+            .unwrap();
 
         let got = o_t.to_vec_f32().unwrap();
         let expected = cpu_attention(&q, &k, &v, b, h, h, l_q, l_kv, d, pos_offset);
@@ -3101,7 +3112,8 @@ mod tests {
         let v_t = ctx.from_slice_f32(&v, vec![b, kv_h, l_kv, d]).unwrap();
         let o_t = ctx.zeros(vec![b, q_h, l_q, d], NativeDType::F32).unwrap();
 
-        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset).unwrap();
+        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset)
+            .unwrap();
 
         let got = o_t.to_vec_f32().unwrap();
         let expected = cpu_attention(&q, &k, &v, b, q_h, kv_h, l_q, l_kv, d, pos_offset);
@@ -3184,7 +3196,8 @@ mod tests {
         let v_t = ctx.from_slice_f32(&v, vec![b, h, l, d]).unwrap();
         let o_t = ctx.zeros(vec![b, h, l, d], NativeDType::F32).unwrap();
 
-        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset).unwrap();
+        lib.attention_causal(&ctx, &q_t, &k_t, &v_t, &o_t, pos_offset)
+            .unwrap();
 
         let got = o_t.to_vec_f32().unwrap();
         let expected = cpu_attention(&q, &k, &v, b, h, h, l, l, d, pos_offset);
@@ -3290,9 +3303,7 @@ mod tests {
         apply_rope(&mut k_bhld, kv_h);
 
         // 4. GQA-aware attention (BHLD layout).
-        let attn = cpu_attention(
-            &q_bhld, &k_bhld, &v_bhld, b, q_h, kv_h, l, l, d, pos_offset,
-        );
+        let attn = cpu_attention(&q_bhld, &k_bhld, &v_bhld, b, q_h, kv_h, l, l, d, pos_offset);
 
         // 5. Transpose [B,H,L,D] → [B,L,H,D].
         let mut out_blhd = vec![0.0_f32; b * l * q_h * d];
@@ -3346,8 +3357,7 @@ mod tests {
         let gamma_k: Vec<f32> = (0..d).map(|i| 0.95 + (i as f32) * 0.011).collect();
 
         // RoPE tables.
-        let (cos_t, sin_t) =
-            build_rope_tables(&ctx, rotary_dim, l, pos_offset, theta).unwrap();
+        let (cos_t, sin_t) = build_rope_tables(&ctx, rotary_dim, l, pos_offset, theta).unwrap();
         let cos_v = cos_t.to_vec_f32().unwrap();
         let sin_v = sin_t.to_vec_f32().unwrap();
 
@@ -3359,8 +3369,10 @@ mod tests {
         let gamma_k_t = ctx.from_slice_f32(&gamma_k, vec![d]).unwrap();
         let q_normed_2d = ctx.zeros(vec![b * l * q_h, d], NativeDType::F32).unwrap();
         let k_normed_2d = ctx.zeros(vec![b * l * kv_h, d], NativeDType::F32).unwrap();
-        lib.rms_norm(&ctx, &q_buf, &gamma_q_t, rms_eps, &q_normed_2d).unwrap();
-        lib.rms_norm(&ctx, &k_buf, &gamma_k_t, rms_eps, &k_normed_2d).unwrap();
+        lib.rms_norm(&ctx, &q_buf, &gamma_q_t, rms_eps, &q_normed_2d)
+            .unwrap();
+        lib.rms_norm(&ctx, &k_buf, &gamma_k_t, rms_eps, &k_normed_2d)
+            .unwrap();
 
         // Reinterpret as [B, L, H, D] BLHD.
         let q_blhd = q_normed_2d.reshape(vec![b, l, q_h, d]).unwrap();
@@ -3386,14 +3398,19 @@ mod tests {
         // back. But Q/K already came from BLHD; do RoPE directly on the BLHD buffer.
         let q_blhd_roped = ctx.zeros(vec![b, l, q_h, d], NativeDType::F32).unwrap();
         let k_blhd_roped = ctx.zeros(vec![b, l, kv_h, d], NativeDType::F32).unwrap();
-        lib.rope_partial(&ctx, &q_blhd, &cos_t, &sin_t, &q_blhd_roped, half).unwrap();
-        lib.rope_partial(&ctx, &k_blhd, &cos_t, &sin_t, &k_blhd_roped, half).unwrap();
+        lib.rope_partial(&ctx, &q_blhd, &cos_t, &sin_t, &q_blhd_roped, half)
+            .unwrap();
+        lib.rope_partial(&ctx, &k_blhd, &cos_t, &sin_t, &k_blhd_roped, half)
+            .unwrap();
         // Transpose roped Q/K to BHLD for attention.
-        lib.transpose_blhd(&ctx, &q_blhd_roped, &q_roped, 0).unwrap();
-        lib.transpose_blhd(&ctx, &k_blhd_roped, &k_roped, 0).unwrap();
+        lib.transpose_blhd(&ctx, &q_blhd_roped, &q_roped, 0)
+            .unwrap();
+        lib.transpose_blhd(&ctx, &k_blhd_roped, &k_roped, 0)
+            .unwrap();
 
         let attn_out = ctx.zeros(vec![b, q_h, l, d], NativeDType::F32).unwrap();
-        lib.attention_causal(&ctx, &q_roped, &k_roped, &v_bhld, &attn_out, pos_offset).unwrap();
+        lib.attention_causal(&ctx, &q_roped, &k_roped, &v_bhld, &attn_out, pos_offset)
+            .unwrap();
 
         let out_blhd = ctx.zeros(vec![b, l, q_h, d], NativeDType::F32).unwrap();
         lib.transpose_blhd(&ctx, &attn_out, &out_blhd, 1).unwrap();
@@ -3402,8 +3419,8 @@ mod tests {
 
         // ─── CPU reference ─────────────────────────────────────────────────
         let expected = cpu_attention_block(
-            &q_in, &k_in, &v_in, &gamma_q, &gamma_k, &cos_v, &sin_v,
-            b, l, q_h, kv_h, d, rotary_dim, rms_eps, pos_offset,
+            &q_in, &k_in, &v_in, &gamma_q, &gamma_k, &cos_v, &sin_v, b, l, q_h, kv_h, d,
+            rotary_dim, rms_eps, pos_offset,
         );
 
         // Compare with cosine + relative max error.
@@ -3413,7 +3430,11 @@ mod tests {
             .map(|(a, b)| (*a as f64) * (*b as f64))
             .sum();
         let na: f64 = got.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
-        let nb: f64 = expected.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = expected
+            .iter()
+            .map(|v| (*v as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos = (dot / (na * nb)) as f32;
         let max_mag = got
             .iter()
@@ -3517,9 +3538,7 @@ mod tests {
         let g_v: Vec<f32> = (0..b * hv).map(|i| 0.95 - (i as f32) * 0.01).collect();
 
         // ─── Native ─────────────────────────────────────────────────────────
-        let state_t = ctx
-            .from_slice_f32(&state_v, vec![b, hv, dv, dk])
-            .unwrap();
+        let state_t = ctx.from_slice_f32(&state_v, vec![b, hv, dv, dk]).unwrap();
         let q_t = ctx.from_slice_f32(&q_v, vec![b, hv, dk]).unwrap();
         let k_t = ctx.from_slice_f32(&k_v, vec![b, hv, dk]).unwrap();
         let v_t = ctx.from_slice_f32(&v_v, vec![b, hv, dv]).unwrap();
@@ -3536,7 +3555,16 @@ mod tests {
         // ─── CPU reference ──────────────────────────────────────────────────
         let mut state_ref = state_v.clone();
         let exp_y = cpu_ssm_step(
-            &mut state_ref, &q_v, &k_v, &v_v, &beta_v, &g_v, b, hv, dv, dk,
+            &mut state_ref,
+            &q_v,
+            &k_v,
+            &v_v,
+            &beta_v,
+            &g_v,
+            b,
+            hv,
+            dv,
+            dk,
         );
 
         for (i, (g, e)) in got_y.iter().zip(exp_y.iter()).enumerate() {
@@ -3781,8 +3809,7 @@ mod tests {
             let x: Vec<f32> = (0..rows * hidden)
                 .map(|i| ((i as f32) * 0.013).sin() * 1.7)
                 .collect();
-            let gamma: Vec<f32> =
-                (0..hidden).map(|i| 1.0 + (i as f32) * 0.001).collect();
+            let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.001).collect();
             let eps = 1e-6_f32;
 
             let x_t = ctx.from_slice_f32(&x, vec![rows, hidden]).unwrap();
@@ -3829,7 +3856,8 @@ mod tests {
         let x_t = ctx.from_slice_f32(&x, vec![b, s, hv]).unwrap();
         let bias_t = ctx.from_slice_f32(&bias, vec![hv]).unwrap();
         let y_t = ctx.zeros(vec![b, s, hv], NativeDType::F32).unwrap();
-        lib.broadcast_add_per_head(&ctx, &x_t, &bias_t, &y_t).unwrap();
+        lib.broadcast_add_per_head(&ctx, &x_t, &bias_t, &y_t)
+            .unwrap();
         let got = y_t.to_vec_f32().unwrap();
         for i in 0..b * s * hv {
             let exp = x[i] + bias[i % hv];
@@ -3902,10 +3930,8 @@ mod tests {
                 for hvi in 0..hv {
                     for di in 0..head_dim {
                         let hk_src = hvi / repeats;
-                        let x_i =
-                            ((bi * s + si) * hk + hk_src) * head_dim + di;
-                        let y_i =
-                            ((bi * s + si) * hv + hvi) * head_dim + di;
+                        let x_i = ((bi * s + si) * hk + hk_src) * head_dim + di;
+                        let y_i = ((bi * s + si) * hv + hvi) * head_dim + di;
                         let err = (got[y_i] - x[x_i]).abs();
                         assert!(
                             err < 1e-6,
@@ -3959,9 +3985,7 @@ mod tests {
         let x_host = lcg(0xC01D, b * x_total * c, 0.7);
         let w_host = lcg(0xC02D, c * k, 0.4);
 
-        let x_t = ctx
-            .from_slice_f32(&x_host, vec![b, x_total, c])
-            .unwrap();
+        let x_t = ctx.from_slice_f32(&x_host, vec![b, x_total, c]).unwrap();
         let w_t = ctx.from_slice_f32(&w_host, vec![c, k]).unwrap();
         let y_t = ctx.zeros(vec![b, s, c], NativeDType::F32).unwrap();
 
@@ -4022,11 +4046,15 @@ mod tests {
         let blhd_x = ctx
             .from_slice_f32(&x_blhd, vec![b, s, hk, head_dim])
             .unwrap();
-        lib.broadcast_add_per_head(&ctx, &bs_x, &bias_t, &y1_ref).unwrap();
-        lib.mul_broadcast_per_head(&ctx, &y1_ref, &bias_t, &y2_ref).unwrap();
+        lib.broadcast_add_per_head(&ctx, &bs_x, &bias_t, &y1_ref)
+            .unwrap();
+        lib.mul_broadcast_per_head(&ctx, &y1_ref, &bias_t, &y2_ref)
+            .unwrap();
         lib.neg_exp(&ctx, &y2_ref, &y3_ref).unwrap();
-        lib.repeat_heads_blhd(&ctx, &blhd_x, &y4_ref, repeats).unwrap();
-        lib.affine_scalar(&ctx, &y3_ref, 0.5, 0.25, &y5_ref).unwrap();
+        lib.repeat_heads_blhd(&ctx, &blhd_x, &y4_ref, repeats)
+            .unwrap();
+        lib.affine_scalar(&ctx, &y3_ref, 0.5, 0.25, &y5_ref)
+            .unwrap();
 
         // fused-encoder run
         let y1 = ctx.zeros(vec![b, s, hv], NativeDType::F32).unwrap();
@@ -4038,10 +4066,13 @@ mod tests {
         let y5 = ctx.zeros(vec![b, s, hv], NativeDType::F32).unwrap();
         let cmd = lumen_metal::metal::new_command_buffer(&ctx.queue);
         let enc = cmd.auto_compute_encoder();
-        lib.encode_broadcast_add_per_head(&enc, &bs_x, &bias_t, &y1).unwrap();
-        lib.encode_mul_broadcast_per_head(&enc, &y1, &bias_t, &y2).unwrap();
+        lib.encode_broadcast_add_per_head(&enc, &bs_x, &bias_t, &y1)
+            .unwrap();
+        lib.encode_mul_broadcast_per_head(&enc, &y1, &bias_t, &y2)
+            .unwrap();
         lib.encode_neg_exp(&enc, &y2, &y3).unwrap();
-        lib.encode_repeat_heads_blhd(&enc, &blhd_x, &y4, repeats).unwrap();
+        lib.encode_repeat_heads_blhd(&enc, &blhd_x, &y4, repeats)
+            .unwrap();
         lib.encode_affine_scalar(&enc, &y3, 0.5, 0.25, &y5).unwrap();
         enc.end_encoding();
         cmd.commit();

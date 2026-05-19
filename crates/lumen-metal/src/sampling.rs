@@ -8,10 +8,8 @@
 //! All as additions to [`SamplingKernels`].
 
 use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
-use anyhow::{anyhow, Result};
-use crate::metal::{
-    Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize, NSUInteger,
-};
+use crate::metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize, NSUInteger};
+use anyhow::{Result, anyhow};
 
 const SHADER_SRC: &str = include_str!("shaders/sampling.metal");
 
@@ -110,14 +108,12 @@ impl SamplingKernels {
             let dst = idx_buf.contents() as *mut u32;
             std::ptr::copy_nonoverlapping(token_idx_data.as_ptr(), dst, token_idx_data.len());
             let dst = mul_buf.contents() as *mut f32;
-            std::ptr::copy_nonoverlapping(
-                multipliers_data.as_ptr(),
-                dst,
-                multipliers_data.len(),
-            );
+            std::ptr::copy_nonoverlapping(multipliers_data.as_ptr(), dst, multipliers_data.len());
         }
 
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:apply_token_penalties");
         enc.set_compute_pipeline_state(&self.apply_token_penalties_f32);
         enc.set_buffer(0, Some(logits_buf), logits_offset as usize);
@@ -125,8 +121,9 @@ impl SamplingKernels {
         enc.set_buffer(2, Some(mul_buf), 0);
         enc.set_bytes_directly(3, 4, &n as *const _ as *const _);
 
-        let max_threads =
-            self.apply_token_penalties_f32.max_total_threads_per_threadgroup() as u64;
+        let max_threads = self
+            .apply_token_penalties_f32
+            .max_total_threads_per_threadgroup() as u64;
         let tg_size = (n as u64).min(max_threads).max(1);
         enc.dispatch_threads(
             MTLSize {
@@ -141,7 +138,9 @@ impl SamplingKernels {
             },
         );
         drop(enc);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -194,7 +193,9 @@ impl SamplingKernels {
             )
             .map_err(|e| anyhow!("apply_token_penalties_f32: mul buffer alloc: {e}"))?;
 
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:apply_token_penalties");
         enc.set_compute_pipeline_state(&self.apply_token_penalties_f32);
         enc.set_buffer(0, Some(logits_buf), logits_offset as usize);
@@ -202,8 +203,9 @@ impl SamplingKernels {
         enc.set_buffer(2, Some(&mul_buf), 0);
         enc.set_bytes_directly(3, 4, &n as *const _ as *const _);
 
-        let max_threads =
-            self.apply_token_penalties_f32.max_total_threads_per_threadgroup() as u64;
+        let max_threads = self
+            .apply_token_penalties_f32
+            .max_total_threads_per_threadgroup() as u64;
         let tg_size = (n as u64).min(max_threads).max(1);
         // 1D dispatch with `dispatch_threads` so out-of-range threads bail.
         enc.dispatch_threads(
@@ -219,7 +221,9 @@ impl SamplingKernels {
             },
         );
         drop(enc);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -285,22 +289,24 @@ impl SamplingKernels {
             }
         }
 
-
         // Encoder 1 — penalty (skip when no pairs).
         // candle_metal_kernels::ComputeCommandEncoder has a Drop impl that
         // calls end_encoding(), so we MUST NOT call it explicitly (B4 found
         // that the double-end raises an Apple runtime assertion). Each
         // encoder is scoped so it drops before the next one is created.
         if n_pen > 0 {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             enc.set_label("lumen:apply_token_penalties");
             enc.set_compute_pipeline_state(&self.apply_token_penalties_f32);
             enc.set_buffer(0, Some(logits_buf), logits_offset as usize);
             enc.set_buffer(1, Some(idx_buf), 0);
             enc.set_buffer(2, Some(mul_buf), 0);
             enc.set_bytes_directly(3, 4, &n_pen as *const _ as *const _);
-            let max_threads =
-                self.apply_token_penalties_f32.max_total_threads_per_threadgroup() as u64;
+            let max_threads = self
+                .apply_token_penalties_f32
+                .max_total_threads_per_threadgroup() as u64;
             let tg_size = (n_pen as u64).min(max_threads).max(1);
             enc.dispatch_threads(
                 MTLSize {
@@ -327,7 +333,9 @@ impl SamplingKernels {
             tg_size *= 2;
         }
         {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             enc.set_label("lumen:argmax");
             enc.set_compute_pipeline_state(&self.argmax_f32);
             enc.set_buffer(0, Some(logits_buf), logits_offset as usize);
@@ -350,7 +358,9 @@ impl SamplingKernels {
             // enc drops at end of inner block → Drop ends the encoder before commit.
         }
 
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -383,7 +393,9 @@ impl SamplingKernels {
             tg_size *= 2;
         }
 
-        let enc = crate::metal::process_commands().command_encoder().expect("ce");
+        let enc = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         enc.set_label("lumen:argmax");
         enc.set_compute_pipeline_state(&self.argmax_f32);
         enc.set_buffer(0, Some(x_buf), x_offset as usize);
@@ -405,7 +417,9 @@ impl SamplingKernels {
             },
         );
         drop(enc);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -442,7 +456,9 @@ impl SamplingKernels {
         out_off: u64,
     ) -> Result<()> {
         if n_logits == 0 {
-            return Err(anyhow!("topk_topp_gumbel_argmax_f32_into: n_logits must be > 0"));
+            return Err(anyhow!(
+                "topk_topp_gumbel_argmax_f32_into: n_logits must be > 0"
+            ));
         }
         if top_k == 0 || top_k > TOPK_K_MAX {
             return Err(anyhow!(
@@ -469,7 +485,9 @@ impl SamplingKernels {
         let tg_mem_bytes = (tg_size * k_max * 4) as usize; // 8 KiB per array
 
         {
-            let enc = crate::metal::process_commands().command_encoder().expect("ce");
+            let enc = crate::metal::process_commands()
+                .command_encoder()
+                .expect("ce");
             enc.set_label("lumen:topk_topp_gumbel");
             enc.set_compute_pipeline_state(&self.topk_topp_gumbel);
             enc.set_buffer(0, Some(logits_buf), logits_off as usize);
@@ -496,7 +514,9 @@ impl SamplingKernels {
             );
             // enc drops here → ComputeCommandEncoder Drop calls end_encoding().
         }
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -536,7 +556,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         let v: Vec<f32> = vec![0.1, 0.5, -1.0, 0.7, 0.6, 0.7001, 0.2];
@@ -562,7 +584,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         // 248K vocab, deterministic LCG-style fill, with one inserted spike.
@@ -600,7 +624,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         // Buffer of 8 floats; argmax over the trailing 4 starting at offset 16.
@@ -639,7 +665,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         // Logits with a clear pre-penalty winner that gets penalized below
@@ -706,7 +734,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         let logits: Vec<f32> = vec![0.1, 0.7, 0.2, 0.5];
@@ -740,7 +770,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let queue = device.new_command_queue().expect("new_command_queue failed");
+        let queue = device
+            .new_command_queue()
+            .expect("new_command_queue failed");
         let kernels = SamplingKernels::new(&device).unwrap();
 
         let n = 248_320usize;

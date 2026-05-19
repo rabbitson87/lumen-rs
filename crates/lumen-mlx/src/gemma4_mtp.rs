@@ -350,11 +350,13 @@ pub mod imp {
         for _ in 0..half_inf {
             freqs_vals.push(f32::INFINITY);
         }
-        let rope_freqs_full =
-            Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
+        let rope_freqs_full = Array::from_slice(&freqs_vals, &[freqs_vals.len() as i32]);
 
-        let rope_base_sliding =
-            config.text_config.rope_parameters.sliding_attention.rope_theta as f32;
+        let rope_base_sliding = config
+            .text_config
+            .rope_parameters
+            .sliding_attention
+            .rope_theta as f32;
 
         Ok(ResolvedGemma4MtpDrafter {
             config,
@@ -415,24 +417,18 @@ pub mod imp {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             let x = if concat_he {
-                mlx_rs::ops::concatenate_axis(
-                    &[last_hidden_state, trunk_embed_of_last],
-                    -1,
-                )
-                .context("draft_step: concat(last_hidden, target_embed)")?
+                mlx_rs::ops::concatenate_axis(&[last_hidden_state, trunk_embed_of_last], -1)
+                    .context("draft_step: concat(last_hidden, target_embed)")?
             } else {
-                mlx_rs::ops::concatenate_axis(
-                    &[trunk_embed_of_last, last_hidden_state],
-                    -1,
-                )
-                .context("draft_step: concat(target_embed, last_hidden)")?
+                mlx_rs::ops::concatenate_axis(&[trunk_embed_of_last, last_hidden_state], -1)
+                    .context("draft_step: concat(target_embed, last_hidden)")?
             };
             // pre_projection.weight is [out=drafter_hidden, in=2*backbone_hidden].
             // y = x @ W.T  →  matmul(x, W.transpose())
             let pre_w_t = mlx_rs::ops::transpose(&self.pre_projection)
                 .context("draft_step: transpose(pre_projection)")?;
-            let mut h = mlx_rs::ops::matmul(&x, &pre_w_t)
-                .context("draft_step: pre_projection matmul")?;
+            let mut h =
+                mlx_rs::ops::matmul(&x, &pre_w_t).context("draft_step: pre_projection matmul")?;
 
             // (2) 4 decoder layers (Q-only attention against trunk-shared KV).
             for lw in self.layers.iter() {
@@ -486,8 +482,7 @@ pub mod imp {
             // logits = h @ embed.T → matmul(h, transpose(embed)).
             let embed_t = mlx_rs::ops::transpose(&self.embed_tokens)
                 .context("lm_head: transpose(embed_tokens)")?;
-            mlx_rs::ops::matmul(h_drafter_space, &embed_t)
-                .context("lm_head: matmul(h, embed.T)")
+            mlx_rs::ops::matmul(h_drafter_space, &embed_t).context("lm_head: matmul(h, embed.T)")
         }
 
         /// Single drafter layer forward. Q-only attention; K/V come from the
@@ -508,10 +503,9 @@ pub mod imp {
             // n_heads / n_kv is an integer broadcast factor. Captured here
             // for documentation; underscore-prefixed to silence unused-warn.
             let (head_dim, _n_kv) = match lw.kind {
-                NativeGemma4MtpLayerType::Sliding => (
-                    tc.head_dim as i32,
-                    tc.num_key_value_heads as i32,
-                ),
+                NativeGemma4MtpLayerType::Sliding => {
+                    (tc.head_dim as i32, tc.num_key_value_heads as i32)
+                }
                 NativeGemma4MtpLayerType::Full => (
                     tc.global_head_dim as i32,
                     tc.num_global_key_value_heads as i32,
@@ -524,8 +518,8 @@ pub mod imp {
                 .context("draft_layer: input_layernorm")?;
             let q_w_t = mlx_rs::ops::transpose(&lw.attn.q_proj)
                 .context("draft_layer: transpose(q_proj)")?;
-            let q_flat = mlx_rs::ops::matmul(&h_in, &q_w_t)
-                .context("draft_layer: q_proj matmul")?;
+            let q_flat =
+                mlx_rs::ops::matmul(&h_in, &q_w_t).context("draft_layer: q_proj matmul")?;
 
             // (b) reshape Q to [B, 1, H, head_dim] then transpose to [B, H, 1, head_dim]
             let q_4d = mlx_rs::ops::reshape(&q_flat, &[1, 1, n_heads, head_dim])
@@ -574,11 +568,7 @@ pub mod imp {
             let scale = 1.0_f32;
             let _ = head_dim; // silence unused if we kept the var name above
             let attn = mlx_rs::fast::scaled_dot_product_attention(
-                &q_rope,
-                k_shared,
-                v_shared,
-                scale,
-                None, /* mask */
+                &q_rope, k_shared, v_shared, scale, None, /* mask */
                 None, /* sinks */
             )
             .context("draft_layer: scaled_dot_product_attention")?;
@@ -590,16 +580,12 @@ pub mod imp {
                 .context("draft_layer: reshape attn flat")?;
             let o_w_t = mlx_rs::ops::transpose(&lw.attn.o_proj)
                 .context("draft_layer: transpose(o_proj)")?;
-            let attn_out = mlx_rs::ops::matmul(&attn_flat, &o_w_t)
-                .context("draft_layer: o_proj matmul")?;
+            let attn_out =
+                mlx_rs::ops::matmul(&attn_flat, &o_w_t).context("draft_layer: o_proj matmul")?;
 
             // (f) post_attention_layernorm + residual
-            let post_attn_n = mlx_rs::fast::rms_norm(
-                &attn_out,
-                &lw.post_attention_layernorm,
-                eps,
-            )
-            .context("draft_layer: post_attention_layernorm")?;
+            let post_attn_n = mlx_rs::fast::rms_norm(&attn_out, &lw.post_attention_layernorm, eps)
+                .context("draft_layer: post_attention_layernorm")?;
             let h = mlx_rs::ops::add(&residual, &post_attn_n)
                 .context("draft_layer: +residual (attn)")?;
             let residual = h.clone();
@@ -613,45 +599,48 @@ pub mod imp {
                 .context("draft_layer: transpose(up_proj)")?;
             let down_w_t = mlx_rs::ops::transpose(&lw.mlp.down_proj)
                 .context("draft_layer: transpose(down_proj)")?;
-            let gate = mlx_rs::ops::matmul(&h_n2, &gate_w_t)
-                .context("draft_layer: gate matmul")?;
-            let up = mlx_rs::ops::matmul(&h_n2, &up_w_t)
-                .context("draft_layer: up matmul")?;
+            let gate = mlx_rs::ops::matmul(&h_n2, &gate_w_t).context("draft_layer: gate matmul")?;
+            let up = mlx_rs::ops::matmul(&h_n2, &up_w_t).context("draft_layer: up matmul")?;
             // GeGLU = gelu_approx(gate) * up  (mirrors trunk dense_mlp).
             let dt = gate.dtype();
-            let half = Array::from_f32(0.5).as_dtype(dt).context("draft_layer: const half")?;
-            let one = Array::from_f32(1.0).as_dtype(dt).context("draft_layer: const one")?;
-            let c3 = Array::from_f32(0.044715).as_dtype(dt).context("draft_layer: const c3")?;
-            let coeff =
-                Array::from_f32(0.7978845608028654_f32).as_dtype(dt).context("draft_layer: const coeff")?;
-            let x_sq = mlx_rs::ops::multiply(&gate, &gate)
-                .context("draft_layer: gelu x_sq")?;
-            let x_cubed = mlx_rs::ops::multiply(&x_sq, &gate)
-                .context("draft_layer: gelu x_cubed")?;
+            let half = Array::from_f32(0.5)
+                .as_dtype(dt)
+                .context("draft_layer: const half")?;
+            let one = Array::from_f32(1.0)
+                .as_dtype(dt)
+                .context("draft_layer: const one")?;
+            let c3 = Array::from_f32(0.044715)
+                .as_dtype(dt)
+                .context("draft_layer: const c3")?;
+            let coeff = Array::from_f32(0.7978845608028654_f32)
+                .as_dtype(dt)
+                .context("draft_layer: const coeff")?;
+            let x_sq = mlx_rs::ops::multiply(&gate, &gate).context("draft_layer: gelu x_sq")?;
+            let x_cubed =
+                mlx_rs::ops::multiply(&x_sq, &gate).context("draft_layer: gelu x_cubed")?;
             let inner_add = mlx_rs::ops::add(
                 &gate,
                 &mlx_rs::ops::multiply(&x_cubed, &c3).context("draft_layer: gelu cubed*c3")?,
             )
             .context("draft_layer: gelu inner_add")?;
-            let scaled = mlx_rs::ops::multiply(&coeff, &inner_add)
-                .context("draft_layer: gelu scaled")?;
+            let scaled =
+                mlx_rs::ops::multiply(&coeff, &inner_add).context("draft_layer: gelu scaled")?;
             let t = mlx_rs::ops::tanh(&scaled).context("draft_layer: gelu tanh")?;
             let one_plus_t = mlx_rs::ops::add(&one, &t).context("draft_layer: gelu 1+tanh")?;
-            let half_gate = mlx_rs::ops::multiply(&half, &gate)
-                .context("draft_layer: gelu 0.5*gate")?;
+            let half_gate =
+                mlx_rs::ops::multiply(&half, &gate).context("draft_layer: gelu 0.5*gate")?;
             let gelu_g = mlx_rs::ops::multiply(&half_gate, &one_plus_t)
                 .context("draft_layer: gelu (0.5g)(1+t)")?;
-            let activated = mlx_rs::ops::multiply(&gelu_g, &up)
-                .context("draft_layer: gelu * up")?;
-            let down = mlx_rs::ops::matmul(&activated, &down_w_t)
-                .context("draft_layer: down matmul")?;
-            let mlp_out =
-                mlx_rs::fast::rms_norm(&down, &lw.post_feedforward_layernorm, eps)
-                    .context("draft_layer: post_feedforward_layernorm")?;
+            let activated =
+                mlx_rs::ops::multiply(&gelu_g, &up).context("draft_layer: gelu * up")?;
+            let down =
+                mlx_rs::ops::matmul(&activated, &down_w_t).context("draft_layer: down matmul")?;
+            let mlp_out = mlx_rs::fast::rms_norm(&down, &lw.post_feedforward_layernorm, eps)
+                .context("draft_layer: post_feedforward_layernorm")?;
 
             // (h) +residual, ×layer_scalar
-            let h = mlx_rs::ops::add(&residual, &mlp_out)
-                .context("draft_layer: +residual (mlp)")?;
+            let h =
+                mlx_rs::ops::add(&residual, &mlp_out).context("draft_layer: +residual (mlp)")?;
             let h = mlx_rs::ops::multiply(&h, &lw.layer_scalar)
                 .context("draft_layer: × layer_scalar")?;
             Ok(h)
@@ -664,11 +653,7 @@ pub mod imp {
         let mut shard_paths = std::fs::read_dir(dir)
             .with_context(|| format!("load_safetensors_dir: read_dir {}", dir.display()))?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.is_file()
-                    && p.extension()
-                        .is_some_and(|ext| ext == "safetensors")
-            })
+            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
             .collect::<Vec<_>>();
         shard_paths.sort();
         if shard_paths.is_empty() {
@@ -679,9 +664,8 @@ pub mod imp {
         }
         let mut tensors: HashMap<String, Array> = HashMap::new();
         for shard in shard_paths {
-            let map = Array::load_safetensors(&shard).map_err(|err| {
-                anyhow!("load_safetensors({}) failed: {err}", shard.display())
-            })?;
+            let map = Array::load_safetensors(&shard)
+                .map_err(|err| anyhow!("load_safetensors({}) failed: {err}", shard.display()))?;
             tensors.reserve(map.len());
             for (k, v) in map {
                 if tensors.insert(k.clone(), v).is_some() {

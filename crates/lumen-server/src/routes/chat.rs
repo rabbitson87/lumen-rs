@@ -111,8 +111,7 @@ async fn handle_streaming(
     // Hot-path delta envelope: precompute the static prefix/suffix once. The only
     // per-token cost is JSON-escaping the content text and a single TCP send.
     // Eliminates 5+ allocations per token (id/model clones, format!, double serde).
-    let id_json =
-        serde_json::to_string(&id).map_err(|e| SendableError::from(e.to_string()))?;
+    let id_json = serde_json::to_string(&id).map_err(|e| SendableError::from(e.to_string()))?;
     let model_json =
         serde_json::to_string(&model).map_err(|e| SendableError::from(e.to_string()))?;
     let delta_prefix = format!(

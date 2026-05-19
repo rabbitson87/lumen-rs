@@ -207,7 +207,10 @@ fn run_64_icb(
     unsafe {
         enc.executeCommandsInBuffer_withRange(
             icb,
-            NSRange { location: 0, length: N_PER_CB },
+            NSRange {
+                location: 0,
+                length: N_PER_CB,
+            },
         );
     }
     enc.endEncoding();
@@ -305,22 +308,49 @@ fn icb_qmv_fast_real_kernel_microbench() {
         height: out / 8,
         depth: 1,
     };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
 
     // ── Bit-identity check first ────────────────────────────────────────
     let icb = record_64_icb(
-        &device, &pipeline, &weight_packed, &weight_scales, &weight_biases,
-        &x_buf, &y_buf_b, &dims_buf, &batch_buf, grid, tg,
+        &device,
+        &pipeline,
+        &weight_packed,
+        &weight_scales,
+        &weight_biases,
+        &x_buf,
+        &y_buf_b,
+        &dims_buf,
+        &batch_buf,
+        grid,
+        tg,
     );
 
     // Run A once into y_buf_a, B once into y_buf_b
     run_64_standard(
-        &queue, &pipeline, &weight_packed, &weight_scales, &weight_biases,
-        &x_buf, &y_buf_a, &dims_buf, &batch_buf, grid, tg,
+        &queue,
+        &pipeline,
+        &weight_packed,
+        &weight_scales,
+        &weight_biases,
+        &x_buf,
+        &y_buf_a,
+        &dims_buf,
+        &batch_buf,
+        grid,
+        tg,
     );
     let resources = [
-        &weight_packed, &weight_scales, &weight_biases,
-        &x_buf, &y_buf_b, &dims_buf, &batch_buf,
+        &weight_packed,
+        &weight_scales,
+        &weight_biases,
+        &x_buf,
+        &y_buf_b,
+        &dims_buf,
+        &batch_buf,
     ];
     run_64_icb(&queue, &icb, &resources);
 
@@ -330,13 +360,19 @@ fn icb_qmv_fast_real_kernel_microbench() {
     for i in 0..(out * batch) {
         let a = unsafe { *y_a_ptr.add(i) };
         let b = unsafe { *y_b_ptr.add(i) };
-        if a != b { diffs += 1; }
+        if a != b {
+            diffs += 1;
+        }
     }
     eprintln!();
     eprintln!("=== ICB PoC #2 — real qmv_fast_bf16in_bf16out kernel ===");
     eprintln!("Shape: out={out} in={ins} batch={batch}, N_PER_CB={N_PER_CB}");
-    eprintln!("Bit-identical (A vs B output): {} / {} (diffs={})",
-        out * batch - diffs, out * batch, diffs);
+    eprintln!(
+        "Bit-identical (A vs B output): {} / {} (diffs={})",
+        out * batch - diffs,
+        out * batch,
+        diffs
+    );
 
     if diffs > 0 {
         panic!("ICB output diverged from standard — kernel correctness broken");
@@ -346,8 +382,17 @@ fn icb_qmv_fast_real_kernel_microbench() {
     let warmup = 16;
     for _ in 0..warmup {
         run_64_standard(
-            &queue, &pipeline, &weight_packed, &weight_scales, &weight_biases,
-            &x_buf, &y_buf_a, &dims_buf, &batch_buf, grid, tg,
+            &queue,
+            &pipeline,
+            &weight_packed,
+            &weight_scales,
+            &weight_biases,
+            &x_buf,
+            &y_buf_a,
+            &dims_buf,
+            &batch_buf,
+            grid,
+            tg,
         );
         run_64_icb(&queue, &icb, &resources);
     }
@@ -357,8 +402,17 @@ fn icb_qmv_fast_real_kernel_microbench() {
     let t0 = Instant::now();
     for _ in 0..iters {
         run_64_standard(
-            &queue, &pipeline, &weight_packed, &weight_scales, &weight_biases,
-            &x_buf, &y_buf_a, &dims_buf, &batch_buf, grid, tg,
+            &queue,
+            &pipeline,
+            &weight_packed,
+            &weight_scales,
+            &weight_biases,
+            &x_buf,
+            &y_buf_a,
+            &dims_buf,
+            &batch_buf,
+            grid,
+            tg,
         );
     }
     let mean_a_us = t0.elapsed().as_secs_f64() * 1.0e6 / iters as f64;
@@ -372,8 +426,17 @@ fn icb_qmv_fast_real_kernel_microbench() {
     let t2 = Instant::now();
     for _ in 0..iters {
         run_64_standard(
-            &queue, &pipeline, &weight_packed, &weight_scales, &weight_biases,
-            &x_buf, &y_buf_a, &dims_buf, &batch_buf, grid, tg,
+            &queue,
+            &pipeline,
+            &weight_packed,
+            &weight_scales,
+            &weight_biases,
+            &x_buf,
+            &y_buf_a,
+            &dims_buf,
+            &batch_buf,
+            grid,
+            tg,
         );
     }
     let mean_a2_us = t2.elapsed().as_secs_f64() * 1.0e6 / iters as f64;
@@ -389,7 +452,9 @@ fn icb_qmv_fast_real_kernel_microbench() {
     eprintln!("  Standard pass 2: {mean_a2_us:.2} µs/CB");
     eprintln!("  Standard mean:   {mean_a_combined:.2} µs/CB");
     eprintln!();
-    eprintln!("Per-dispatch CPU savings: {savings_us_per_op:+.2} µs/op ({savings_pct_total:+.1}% per CB)");
+    eprintln!(
+        "Per-dispatch CPU savings: {savings_us_per_op:+.2} µs/op ({savings_pct_total:+.1}% per CB)"
+    );
     eprintln!();
 
     // Project to 27B Dense decode (960 dispatches/token, 67 ms baseline).
@@ -405,11 +470,11 @@ fn icb_qmv_fast_real_kernel_microbench() {
     // Compare with PoC #1 trivial-kernel projection (~+2 µs/op = +1.92 ms).
     let poc1_us_per_op = 2.0;
     let real_vs_trivial_ratio = savings_us_per_op / poc1_us_per_op;
-    eprintln!(
-        "Real kernel vs PoC #1 trivial: {real_vs_trivial_ratio:.2}× ICB savings",
-    );
+    eprintln!("Real kernel vs PoC #1 trivial: {real_vs_trivial_ratio:.2}× ICB savings",);
     if real_vs_trivial_ratio < 1.0 {
-        eprintln!("  → Real kernel ICB savings are LOWER than trivial — set_bytes_directly was likely cheaper");
+        eprintln!(
+            "  → Real kernel ICB savings are LOWER than trivial — set_bytes_directly was likely cheaper"
+        );
     } else if real_vs_trivial_ratio < 2.0 {
         eprintln!("  → Real kernel ICB savings ~match trivial");
     } else {

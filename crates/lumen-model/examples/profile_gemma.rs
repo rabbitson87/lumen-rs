@@ -1,6 +1,6 @@
 //! Profile Gemma 4 E4B inference to find bottlenecks.
-use std::time::Instant;
 use lumen_model::gemma::GemmaModel;
+use std::time::Instant;
 
 fn main() {
     let model_id = std::env::var("MODEL_ID").unwrap_or("google/gemma-4-E4B-it".into());

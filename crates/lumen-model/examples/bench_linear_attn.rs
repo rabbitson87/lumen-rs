@@ -18,12 +18,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use candle_core::{Tensor, D};
+use candle_core::{D, Tensor};
 use lumen_metal::mxfp4_gpu::MxFp4Context;
 use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
 
-const PROMPT: &str =
-    "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
+const PROMPT: &str = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
 fn main() -> Result<()> {
     let mut decode_steps = 50;
@@ -44,17 +43,14 @@ fn main() -> Result<()> {
         }
     }
 
-    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
-        .context("LUMEN_QWEN35_SHARDS required")?;
+    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS").context("LUMEN_QWEN35_SHARDS required")?;
     let shard_dir = PathBuf::from(shard_dir);
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let native_flag = std::env::var("LUMEN_LINEAR_ATTN_NATIVE")
         .map(|v| v == "1")
         .unwrap_or(false);
-    eprintln!(
-        "[bench] model={model_id} steps={decode_steps} native_linear_attn={native_flag}"
-    );
+    eprintln!("[bench] model={model_id} steps={decode_steps} native_linear_attn={native_flag}");
 
     let gpu_ctx = std::sync::Arc::new(MxFp4Context::new()?);
     let load_start = Instant::now();
@@ -104,7 +100,9 @@ fn main() -> Result<()> {
     for step in 0..decode_steps {
         let t0 = Instant::now();
         let dec_input = Tensor::new(&[next_tok], &device)?.unsqueeze(0)?;
-        let dec_logits = backend.model_mut().forward_with_offset(&dec_input, offset)?;
+        let dec_logits = backend
+            .model_mut()
+            .forward_with_offset(&dec_input, offset)?;
         let dec_last = dec_logits
             .narrow(D::Minus2, 0, 1)?
             .flatten_all()?

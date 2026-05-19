@@ -19,10 +19,10 @@
 
 #![cfg(feature = "turboquant-gpu")]
 
-use lumen_metal::metal::CommandBufferExt;
 use candle_core::Device;
+use lumen_metal::metal::CommandBufferExt;
+use lumen_model::qwen3_5_moe_native::{NativeDType, shared_native_resources_for};
 use std::time::Instant;
-use lumen_model::qwen3_5_moe_native::{shared_native_resources_for, NativeDType};
 
 const HEAD_DIM: usize = 256;
 const HALF_D: usize = 32; // head_dim * partial_rotary_factor / 2 = 256*0.25/2 = 32
@@ -114,9 +114,7 @@ fn rope_dispatch_microbench() {
 
     eprintln!();
     eprintln!("=== Phase 19.A.4.2 RoPE dispatch microbench (production-pattern) ===");
-    eprintln!(
-        "  shape: Q=[1,1,{Q_HEADS},{HEAD_DIM}] K=[1,1,{K_HEADS},{HEAD_DIM}] half_d={HALF_D}"
-    );
+    eprintln!("  shape: Q=[1,1,{Q_HEADS},{HEAD_DIM}] K=[1,1,{K_HEADS},{HEAD_DIM}] half_d={HALF_D}");
     eprintln!("  {ITERS} dispatches per cmdbuf");
     eprintln!();
     eprintln!("  Q+K per-layer RoPE dispatch time         : {avg_qk_us:.2} µs");

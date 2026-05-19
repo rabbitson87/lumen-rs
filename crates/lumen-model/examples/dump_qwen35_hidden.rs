@@ -23,8 +23,7 @@ use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
 const PROMPT: &str = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
 fn main() -> Result<()> {
-    let dump_dir =
-        std::env::var("LUMEN_DUMP_HIDDEN").unwrap_or_else(|_| "/tmp/rust_hidden".into());
+    let dump_dir = std::env::var("LUMEN_DUMP_HIDDEN").unwrap_or_else(|_| "/tmp/rust_hidden".into());
     std::fs::create_dir_all(&dump_dir).with_context(|| format!("mkdir {dump_dir}"))?;
     // Ensure the forward code sees the env var set to this exact value.
     // Safe: single-threaded at this point and the value originates from this process.
@@ -34,8 +33,8 @@ fn main() -> Result<()> {
         .context("LUMEN_QWEN35_SHARDS must point at the model snapshot dir")?;
     let shard_dir = PathBuf::from(shard_dir);
 
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
 
     let gpu_ctx = std::sync::Arc::new(MxFp4Context::new().context("Metal context")?);
 
@@ -53,8 +52,15 @@ fn main() -> Result<()> {
     eprintln!("logits shape: {:?}", logits.dims());
 
     // Print top-5 argmax of the last token from the dumped logits for a quick sanity check.
-    let last = logits.i((.., ids.len() - 1, ..))?.flatten_all()?.to_vec1::<f32>()?;
-    let mut indexed: Vec<(u32, f32)> = last.iter().enumerate().map(|(i, &v)| (i as u32, v)).collect();
+    let last = logits
+        .i((.., ids.len() - 1, ..))?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut indexed: Vec<(u32, f32)> = last
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     println!("Rust top-5 last-token logits:");
     for (tok, score) in indexed.iter().take(5) {

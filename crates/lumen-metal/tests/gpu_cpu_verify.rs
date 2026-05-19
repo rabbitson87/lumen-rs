@@ -4,8 +4,8 @@
 //! then compares results to ensure bitwise/numerical equivalence.
 
 use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
-use rand::prelude::*;
 use rand::RngExt;
+use rand::prelude::*;
 use rand_distr::StandardNormal;
 
 use lumen_core::bitpack;

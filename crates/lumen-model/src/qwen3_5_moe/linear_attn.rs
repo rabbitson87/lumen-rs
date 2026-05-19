@@ -30,7 +30,7 @@
 //! Cross-referencing these against the shard header is the only safe way to lock the interface
 //! before writing the forward pass — naming conventions in Mamba2 variants shift frequently.
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor, D};
+use candle_core::{D, DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
 
 use super::config::TextConfig;
@@ -285,7 +285,9 @@ impl GatedDeltaNet {
             // Keep the buffer allocated; just zero it so the next prefill sees
             // a cold state without paying for re-allocation.
             if let Some(state) = self.native_ssm_state.as_mut() {
-                if let Ok(mut res) = crate::qwen3_5_moe_native::shared_native_resources().map(|m| m.lock()) {
+                if let Ok(mut res) =
+                    crate::qwen3_5_moe_native::shared_native_resources().map(|m| m.lock())
+                {
                     if let Ok(res) = res.as_mut() {
                         let _ = state.reset(&res.ctx);
                     }
@@ -325,7 +327,10 @@ impl GatedDeltaNet {
         self.ssm_state = snap.ssm_state.clone();
         #[cfg(feature = "turboquant-gpu")]
         {
-            match (snap.native_ssm_snapshot.as_ref(), self.native_ssm_state.as_mut()) {
+            match (
+                snap.native_ssm_snapshot.as_ref(),
+                self.native_ssm_state.as_mut(),
+            ) {
                 (Some(s), Some(state)) => state
                     .restore(s)
                     .map_err(|e| candle_core::Error::Msg(format!("restore ssm: {e}")))?,
@@ -370,7 +375,8 @@ impl GatedDeltaNet {
             #[cfg(feature = "turboquant-gpu")]
             native_ssm_state: self.native_ssm_state.take(),
         };
-        self.stashed_seq_states.insert(self.current_seq_id, old_entry);
+        self.stashed_seq_states
+            .insert(self.current_seq_id, old_entry);
         self.current_seq_id = seq_id;
         // Restore target seq's state (new seq starts with None).
         if let Some(entry) = self.stashed_seq_states.remove(&seq_id) {
@@ -394,12 +400,14 @@ impl GatedDeltaNet {
     /// `seq_id` is already registered or is the current active seq.
     pub fn init_seq(&mut self, seq_id: u64) {
         if seq_id != self.current_seq_id {
-            self.stashed_seq_states.entry(seq_id).or_insert_with(|| SsmStateEntry {
-                conv_state: None,
-                ssm_state: None,
-                #[cfg(feature = "turboquant-gpu")]
-                native_ssm_state: None,
-            });
+            self.stashed_seq_states
+                .entry(seq_id)
+                .or_insert_with(|| SsmStateEntry {
+                    conv_state: None,
+                    ssm_state: None,
+                    #[cfg(feature = "turboquant-gpu")]
+                    native_ssm_state: None,
+                });
         }
     }
 
@@ -500,7 +508,8 @@ impl GatedDeltaNet {
             .map(|v| v == "1")
             .unwrap_or(false);
         let mut marks: Vec<(&'static str, std::time::Instant)> = Vec::new();
-        let sync_mark = |marks: &mut Vec<(&'static str, std::time::Instant)>, label: &'static str| {
+        let sync_mark = |marks: &mut Vec<(&'static str, std::time::Instant)>,
+                         label: &'static str| {
             if la_timing {
                 let _ = device.synchronize();
                 marks.push((label, std::time::Instant::now()));
@@ -698,9 +707,7 @@ impl GatedDeltaNet {
         let total_len = conv_pad + seq_len;
         let keep_start = total_len - conv_pad;
         // Rebuild from conv_input (prev_conv_state ++ qkv_flat) and slice.
-        let new_conv_state = conv_input
-            .narrow(1, keep_start, conv_pad)?
-            .contiguous()?;
+        let new_conv_state = conv_input.narrow(1, keep_start, conv_pad)?.contiguous()?;
         self.conv_state = Some(new_conv_state);
         sync_mark(&mut marks, "conv1d");
 
@@ -745,9 +752,7 @@ impl GatedDeltaNet {
                 // bf16. The native fast paths return F32 (Dense out_proj or
                 // MXFP4 fused tail); cast once here. No-op when the chain is
                 // f32 or the flag is off.
-                if super::moe::bf16_residual_enabled()
-                    && bf16_in_path
-                    && out.dtype() != DType::BF16
+                if super::moe::bf16_residual_enabled() && bf16_in_path && out.dtype() != DType::BF16
                 {
                     return Ok(out.to_dtype(DType::BF16)?);
                 }
@@ -760,15 +765,24 @@ impl GatedDeltaNet {
         // ── 4. Split q / k / v, reshape to [B, S, H, D] ───────────────────
         let k_dim = d.k_dim();
         let v_dim = d.v_dim();
-        let q = conv_out
-            .narrow(D::Minus1, 0, k_dim)?
-            .reshape((batch, seq_len, d.num_k_heads, d.head_dim))?;
-        let k = conv_out
-            .narrow(D::Minus1, k_dim, k_dim)?
-            .reshape((batch, seq_len, d.num_k_heads, d.head_dim))?;
-        let v = conv_out
-            .narrow(D::Minus1, 2 * k_dim, v_dim)?
-            .reshape((batch, seq_len, d.num_v_heads, d.head_dim))?;
+        let q = conv_out.narrow(D::Minus1, 0, k_dim)?.reshape((
+            batch,
+            seq_len,
+            d.num_k_heads,
+            d.head_dim,
+        ))?;
+        let k = conv_out.narrow(D::Minus1, k_dim, k_dim)?.reshape((
+            batch,
+            seq_len,
+            d.num_k_heads,
+            d.head_dim,
+        ))?;
+        let v = conv_out.narrow(D::Minus1, 2 * k_dim, v_dim)?.reshape((
+            batch,
+            seq_len,
+            d.num_v_heads,
+            d.head_dim,
+        ))?;
 
         // ── 5. QK-norm (weightless RMS on last axis, eps=1e-6) with inv_scale ──
         //   MLX applies `q = (inv_scale**2) * rms_norm(q, None, 1e-6)` and
@@ -799,8 +813,7 @@ impl GatedDeltaNet {
         } else {
             self.dt_bias.to_dtype(dtype)?
         };
-        let a_plus_dt =
-            a_flat.broadcast_add(&dt_bias_chain.reshape((1, 1, d.num_v_heads))?)?; // [B, S, Hv]
+        let a_plus_dt = a_flat.broadcast_add(&dt_bias_chain.reshape((1, 1, d.num_v_heads))?)?; // [B, S, Hv]
         let softplus_a = softplus(&a_plus_dt)?;
         let a_log_f32 = self.a_log.to_dtype(DType::F32)?.exp()?; // [Hv]
         let g = softplus_a
@@ -893,13 +906,12 @@ impl GatedDeltaNet {
                 // bf16-in/bf16-out kernel.
                 let bf16_residual_active = super::moe::bf16_residual_enabled()
                     && out_flat.dtype() == candle_core::DType::BF16;
-                let out_flat = if !bf16_residual_active
-                    && out_flat.dtype() != candle_core::DType::F32
-                {
-                    out_flat.to_dtype(candle_core::DType::F32)?
-                } else {
-                    out_flat
-                };
+                let out_flat =
+                    if !bf16_residual_active && out_flat.dtype() != candle_core::DType::F32 {
+                        out_flat.to_dtype(candle_core::DType::F32)?
+                    } else {
+                        out_flat
+                    };
                 let out = if bf16_residual_active {
                     self.out_proj.forward_bf16_in_bf16_out(&out_flat)?
                 } else if super::moe::bf16_out_enabled() {
@@ -998,17 +1010,13 @@ impl GatedDeltaNet {
         // (same pattern as the kernel-path block above; head_dim ≈ 256 elems).
         let y_in = y.contiguous()?;
         let y_normed = if y_in.dtype() == self.norm_weight.dtype() {
-            candle_nn::ops::rms_norm(
-                &y_in,
-                &self.norm_weight,
-                self.runtime.rms_norm_eps as f32,
-            )?
+            candle_nn::ops::rms_norm(&y_in, &self.norm_weight, self.runtime.rms_norm_eps as f32)?
         } else {
             let w = self.norm_weight.to_dtype(y_in.dtype())?;
             candle_nn::ops::rms_norm(&y_in, &w, self.runtime.rms_norm_eps as f32)?
         };
-        let gated_f32 = (candle_nn::ops::silu(&z.to_dtype(DType::F32)?)?
-            * y_normed.to_dtype(DType::F32)?)?;
+        let gated_f32 =
+            (candle_nn::ops::silu(&z.to_dtype(DType::F32)?)? * y_normed.to_dtype(DType::F32)?)?;
         let gated = gated_f32.to_dtype(dtype)?;
         sync_mark(&mut marks, "rms_norm_gated");
 
@@ -1017,11 +1025,9 @@ impl GatedDeltaNet {
         // (`LUMEN_BF16_RESIDUAL=1`) lifts the cast and keeps the chain in
         // bf16 down through out_proj. No-op when ops-fallback ran f32 inputs
         // (legacy path).
-        let bf16_residual_active = super::moe::bf16_residual_enabled()
-            && out_flat.dtype() == candle_core::DType::BF16;
-        let out_flat = if !bf16_residual_active
-            && out_flat.dtype() != candle_core::DType::F32
-        {
+        let bf16_residual_active =
+            super::moe::bf16_residual_enabled() && out_flat.dtype() == candle_core::DType::BF16;
+        let out_flat = if !bf16_residual_active && out_flat.dtype() != candle_core::DType::F32 {
             out_flat.to_dtype(candle_core::DType::F32)?
         } else {
             out_flat
@@ -1071,8 +1077,9 @@ impl GatedDeltaNet {
         la_timing: bool,
     ) -> CandleResult<Option<Tensor>> {
         use crate::qwen3_5_moe_native::{
-            forward_post_conv_fused_with_cache, forward_post_conv_fused_with_cache_candle_queue,
-            from_candle_tensor, shared_native_resources_for, LinearAttnConfig, NativeSsmState,
+            LinearAttnConfig, NativeSsmState, forward_post_conv_fused_with_cache,
+            forward_post_conv_fused_with_cache_candle_queue, from_candle_tensor,
+            shared_native_resources_for,
         };
 
         // Sub-stage timing inside the native post-conv path. Each marker syncs
@@ -1251,7 +1258,9 @@ impl GatedDeltaNet {
         device: &Device,
         seq_len: usize,
     ) -> CandleResult<Option<Tensor>> {
-        use crate::qwen3_5_moe_native::{from_candle_tensor, shared_native_resources_for, to_candle_tensor};
+        use crate::qwen3_5_moe_native::{
+            from_candle_tensor, shared_native_resources_for, to_candle_tensor,
+        };
         let res_lock = match shared_native_resources_for(device) {
             Ok(m) => m,
             Err(_) => return Ok(None),
@@ -1281,19 +1290,17 @@ impl GatedDeltaNet {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
-        let y_native = match res
-            .ctx
-            .zeros(vec![1, seq_len, conv_dim], crate::qwen3_5_moe_native::NativeDType::F32)
-        {
+        let y_native = match res.ctx.zeros(
+            vec![1, seq_len, conv_dim],
+            crate::qwen3_5_moe_native::NativeDType::F32,
+        ) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
-        if let Err(e) = res.lib.depthwise_conv1d_silu(
-            &res.ctx,
-            &x_native,
-            &cached.conv1d_weight,
-            &y_native,
-        ) {
+        if let Err(e) =
+            res.lib
+                .depthwise_conv1d_silu(&res.ctx, &x_native, &cached.conv1d_weight, &y_native)
+        {
             eprintln!("depthwise_conv1d_silu failed, falling back: {e}");
             return Ok(None);
         }
@@ -1349,10 +1356,7 @@ fn repeat_heads(x: &Tensor, repeats: usize) -> CandleResult<Tensor> {
 /// after `sanitize` (see `qwen3_5.py::TextModel.sanitize`). Candle's `Conv1d` expects
 /// `[out_channels, in_channels/groups, kernel]` = `[channels, 1, kernel]`. We squeeze the
 /// trailing 1 and transpose. The result is a drop-in depth-wise conv with `groups=channels`.
-pub fn conv1d_from_mlx_weight(
-    weight: Tensor,
-    kernel: usize,
-) -> CandleResult<Conv1d> {
+pub fn conv1d_from_mlx_weight(weight: Tensor, kernel: usize) -> CandleResult<Conv1d> {
     let dims = weight.dims();
     if dims.len() != 3 || dims[1] != kernel || dims[2] != 1 {
         candle_core::bail!(
@@ -1467,7 +1471,13 @@ mod tests {
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(CONFIG_JSON).unwrap();
         cfg.text_config.linear_value_head_dim = 256;
         let err = LinearAttnDims::from_config(&cfg.text_config).unwrap_err();
-        assert!(matches!(err, DimsError::UnequalHeadDims { key: 128, value: 256 }));
+        assert!(matches!(
+            err,
+            DimsError::UnequalHeadDims {
+                key: 128,
+                value: 256
+            }
+        ));
     }
 
     /// Cross-link: the `LinearAttnPart` set expected by the weights classifier must align
@@ -1515,7 +1525,7 @@ mod tests {
 
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Conv1d, Linear};
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     fn tiny_dims() -> LinearAttnDims {
         // Dk = Dv = 4; Hk = 2; Hv = 4 → repeat_factor = 2.
@@ -1551,8 +1561,7 @@ mod tests {
         let conv = conv1d_from_mlx_weight(conv_w, d.conv_kernel).unwrap();
         let a_log = rnd(&[d.num_v_heads], &mut r, device);
         let dt_bias = rnd(&[d.num_v_heads], &mut r, device);
-        let norm_w =
-            Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
+        let norm_w = Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
         let out = Linear::new(rnd(&[d.hidden_size, d.v_dim()], &mut r, device), None);
         GatedDeltaNet::new(
             tiny_runtime(),
@@ -1619,7 +1628,10 @@ mod tests {
         let device = Device::Cpu;
         let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
         let eps = 1e-6f64;
-        let y = weightless_rms_norm(&x, eps).unwrap().to_vec2::<f32>().unwrap();
+        let y = weightless_rms_norm(&x, eps)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
         // mean_sq = (1 + 4 + 9 + 16) / 4 = 7.5; denom = sqrt(7.5 + 1e-6) ≈ 2.7386128
         let denom = (7.5f32 + 1e-6f32).sqrt();
         for (got, x) in y[0].iter().zip([1f32, 2.0, 3.0, 4.0].iter()) {
@@ -1650,12 +1662,8 @@ mod tests {
     fn repeat_heads_duplicates_consecutively() {
         let device = Device::Cpu;
         // [B=1, S=1, H=2, D=3] with rows 10..12 and 20..22
-        let xs = Tensor::from_vec(
-            vec![10f32, 11., 12., 20., 21., 22.],
-            (1, 1, 2, 3),
-            &device,
-        )
-        .unwrap();
+        let xs =
+            Tensor::from_vec(vec![10f32, 11., 12., 20., 21., 22.], (1, 1, 2, 3), &device).unwrap();
         let out = repeat_heads(&xs, 2).unwrap();
         assert_eq!(out.dims(), &[1, 1, 4, 3]);
         let flat = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1717,12 +1725,7 @@ mod tests {
     fn conv1d_from_mlx_weight_produces_depthwise_layout() {
         let device = Device::Cpu;
         // [channels=3, kernel=2, 1] — MLX sanitize layout.
-        let w = Tensor::from_vec(
-            vec![1f32, 2., 3., 4., 5., 6.],
-            (3, 2, 1),
-            &device,
-        )
-        .unwrap();
+        let w = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (3, 2, 1), &device).unwrap();
         let conv: Conv1d = conv1d_from_mlx_weight(w, 2).unwrap();
         let wr = conv.weight().dims().to_vec();
         assert_eq!(wr, vec![3, 1, 2], "depth-wise Candle layout");
@@ -1780,16 +1783,8 @@ mod tests {
         }
 
         assert_eq!(y_candle.dims(), y_native.dims());
-        let yc = y_candle
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let yn = y_native
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
+        let yc = y_candle.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let yn = y_native.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let dot: f64 = yc
             .iter()
             .zip(yn.iter())
@@ -1815,11 +1810,7 @@ mod tests {
         );
         // The native state must have been allocated and marked populated.
         assert!(net_native.native_ssm_state.is_some());
-        assert!(net_native
-            .native_ssm_state
-            .as_ref()
-            .unwrap()
-            .is_populated());
+        assert!(net_native.native_ssm_state.as_ref().unwrap().is_populated());
     }
 
     /// Decode-style: prefill a chunk, then run a single-token decode step.
@@ -2174,7 +2165,7 @@ mod tests {
         let device = Device::Cpu;
         let mut r = StdRng::seed_from_u64(0xDEAD_BEEF);
 
-        let x_pre  = rnd(&[1, 4, 8], &mut r, &device); // A prefill
+        let x_pre = rnd(&[1, 4, 8], &mut r, &device); // A prefill
         let x_dec1 = rnd(&[1, 1, 8], &mut r, &device); // A decode step 1
         let x_dec2 = rnd(&[1, 1, 8], &mut r, &device); // A decode step 2
 
@@ -2183,10 +2174,20 @@ mod tests {
             let mut net = build_tiny(0xABBA, &device);
             net.set_current_seq_id(1);
             let _ = net.forward(&x_pre, None).unwrap();
-            let d1 = net.forward(&x_dec1, None).unwrap()
-                .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let d2 = net.forward(&x_dec2, None).unwrap()
-                .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let d1 = net
+                .forward(&x_dec1, None)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let d2 = net
+                .forward(&x_dec2, None)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             (d1, d2)
         };
 
@@ -2205,19 +2206,38 @@ mod tests {
 
             // Resume seq A.
             net.set_current_seq_id(1);
-            let d1 = net.forward(&x_dec1, None).unwrap()
-                .flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let d2 = net.forward(&x_dec2, None).unwrap()
-                .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let d1 = net
+                .forward(&x_dec1, None)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let d2 = net
+                .forward(&x_dec2, None)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             (d1, d2)
         };
 
         let max_diff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
         let d1 = max_diff(&ref_d1, &test_d1);
         let d2 = max_diff(&ref_d2, &test_d2);
-        assert!(d1 < 1e-5, "A decode-1 corrupted after failed B admit: max|Δ|={d1}");
-        assert!(d2 < 1e-5, "A decode-2 corrupted after failed B admit: max|Δ|={d2}");
+        assert!(
+            d1 < 1e-5,
+            "A decode-1 corrupted after failed B admit: max|Δ|={d1}"
+        );
+        assert!(
+            d2 < 1e-5,
+            "A decode-2 corrupted after failed B admit: max|Δ|={d2}"
+        );
     }
 }

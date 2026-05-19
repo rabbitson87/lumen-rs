@@ -20,14 +20,17 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::RmsNorm;
 use lumen_metal::mxfp4::dequantize_f32;
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 use lumen_metal::mxfp4_linear::Mxfp4Linear;
 
 use lumen_model::qwen3_5_moe::proj::ProjLinear;
 use lumen_model::qwen3_5_moe::self_attn::{SelfAttention, SelfAttnDims, SelfAttnRuntime};
 
 fn synth_weight(out: usize, ins: usize, seed: u32) -> (Vec<u32>, Vec<u8>, Vec<f32>) {
-    assert!(ins.is_multiple_of(32), "MXFP4 requires in_features % 32 == 0");
+    assert!(
+        ins.is_multiple_of(32),
+        "MXFP4 requires in_features % 32 == 0"
+    );
     let n_groups = out * ins / 32;
     let n_words = out * ins / 8;
     let mut s = seed;
@@ -63,8 +66,7 @@ fn make_mxfp4_proj_from_host(
 ) -> (ProjLinear, Tensor) {
     let weight = Mxfp4Weight::from_host(&ctx.ctx, &packed, &scales, out, ins).unwrap();
     let proj = ProjLinear::Mxfp4(Mxfp4Linear::new(weight, None, Arc::clone(ctx)));
-    let dense_tensor =
-        Tensor::from_vec(dense, (out, ins), &Device::Cpu).unwrap();
+    let dense_tensor = Tensor::from_vec(dense, (out, ins), &Device::Cpu).unwrap();
     (proj, dense_tensor)
 }
 
@@ -132,7 +134,10 @@ fn mxfp4_self_attention_forward_runs_and_is_finite() {
     );
     // Output must depend on input (not collapse to all-zero through a bug in the proj chain).
     let max_abs = y_vec.iter().fold(0f32, |a, b| a.max(b.abs()));
-    assert!(max_abs > 1e-6, "output appears to be identically zero (max_abs = {max_abs})");
+    assert!(
+        max_abs > 1e-6,
+        "output appears to be identically zero (max_abs = {max_abs})"
+    );
 }
 
 #[test]
@@ -147,7 +152,9 @@ fn mxfp4_q_projection_matches_cpu_dense_matmul() {
     let (q_proj, q_dense) = make_mxfp4_proj(&ctx, out_features, in_features, 0x11);
 
     // Q projection: y = x @ W^T  (x shape [3, 32])
-    let x_vec: Vec<f32> = (0..3 * in_features).map(|i| (i as f32 * 0.013).sin()).collect();
+    let x_vec: Vec<f32> = (0..3 * in_features)
+        .map(|i| (i as f32 * 0.013).sin())
+        .collect();
     let x = Tensor::from_vec(x_vec.clone(), (3, in_features), &device).unwrap();
     let y_gpu = q_proj.forward(&x).unwrap();
 

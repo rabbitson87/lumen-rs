@@ -17,8 +17,8 @@ use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderComp
 use std::sync::Arc;
 
 use lumen_metal::metal;
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
 use lumen_metal::mtl_size;
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
@@ -47,12 +47,7 @@ fn synth_x(n: usize) -> Vec<f32> {
 }
 
 /// Direct v2 dispatch (matches the v1/v2 parity test helper).
-fn run_v2(
-    ctx: &MxFp4Context,
-    weight: &Mxfp4Weight,
-    x: &[f32],
-    batch: usize,
-) -> Vec<f32> {
+fn run_v2(ctx: &MxFp4Context, weight: &Mxfp4Weight, x: &[f32], batch: usize) -> Vec<f32> {
     let pso = ctx.matmul_f32_pipeline_v2();
     let x_buf = ctx.ctx.buffer_with_data(x);
     let y_buf = ctx.ctx.buffer_for::<f32>(batch * weight.out_features);
@@ -100,17 +95,13 @@ fn run_v2(
     cmd.commit();
     cmd.wait_until_completed();
 
-    ctx.ctx.read_buffer::<f32>(&y_buf, batch * weight.out_features)
+    ctx.ctx
+        .read_buffer::<f32>(&y_buf, batch * weight.out_features)
 }
 
 /// Direct v3 dispatch — different topology (256 threads/threadgroup,
 /// threadgroup memory holds staged x, grid = (ceil(out/8), batch)).
-fn run_v3(
-    ctx: &MxFp4Context,
-    weight: &Mxfp4Weight,
-    x: &[f32],
-    batch: usize,
-) -> Vec<f32> {
+fn run_v3(ctx: &MxFp4Context, weight: &Mxfp4Weight, x: &[f32], batch: usize) -> Vec<f32> {
     let pso = ctx.matmul_f32_pipeline_v3();
     let x_buf = ctx.ctx.buffer_with_data(x);
     let y_buf = ctx.ctx.buffer_for::<f32>(batch * weight.out_features);
@@ -160,7 +151,8 @@ fn run_v3(
     cmd.commit();
     cmd.wait_until_completed();
 
-    ctx.ctx.read_buffer::<f32>(&y_buf, batch * weight.out_features)
+    ctx.ctx
+        .read_buffer::<f32>(&y_buf, batch * weight.out_features)
 }
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
@@ -251,7 +243,7 @@ fn v2_v3_parity_non_multiple_of_8() {
         Err(_) => return,
     };
     let shapes = [
-        ("out=63", 63, 256, 1),  // 8 tg's, last has only 7 valid rows
+        ("out=63", 63, 256, 1),   // 8 tg's, last has only 7 valid rows
         ("out=129", 129, 512, 1), // 17 tg's, last has 1 valid row
         ("out=251", 251, 256, 1), // 32 tg's, last has 3 valid rows
     ];

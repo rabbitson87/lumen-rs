@@ -38,9 +38,8 @@ fn main() -> Result<()> {
 
     let model_id = std::env::var("MODEL_ID")
         .unwrap_or_else(|_| "/path/to/models/gemma-4-26b-a4b-mlx-4bit".into());
-    let drafter_dir = std::env::var("DRAFTER_DIR").unwrap_or_else(|_| {
-        "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into()
-    });
+    let drafter_dir = std::env::var("DRAFTER_DIR")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
     let max_tokens: usize = std::env::var("MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -133,9 +132,7 @@ fn main() -> Result<()> {
             break;
         }
     }
-    println!(
-        "\n  bit-identical prefix: {match_len}/{n_compare} tokens",
-    );
+    println!("\n  bit-identical prefix: {match_len}/{n_compare} tokens",);
     println!(
         "  OFF first 32: {:?}",
         &stats_off.generated_tokens[..stats_off.generated_tokens.len().min(32)]
@@ -166,9 +163,7 @@ fn main() -> Result<()> {
     } else {
         0.0
     };
-    println!(
-        "\n  mtp_steps={s:.0}, total_committed={total:.0}",
-    );
+    println!("\n  mtp_steps={s:.0}, total_committed={total:.0}",);
     println!(
         "  inferred mean n_accepted/step = {mean_n_accepted:.2} of n_draft={n_draft_env:.0} \
          (acceptance rate ≈ {accept_pct:.0}%)"

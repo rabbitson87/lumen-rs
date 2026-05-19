@@ -92,25 +92,18 @@ mod imp {
             queries, keys, values, scale, mask, None, /* sinks */
         );
         let t_after_call = Instant::now();
-        let final_result =
-            raw.context("mlx-rs fast::scaled_dot_product_attention FFI call failed");
+        let final_result = raw.context("mlx-rs fast::scaled_dot_product_attention FFI call failed");
         let t_end = Instant::now();
-        lumen_sdpa_timing::PRE_NS.fetch_add(
-            (t_after_pre - t_start).as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        lumen_sdpa_timing::PRE_NS
+            .fetch_add((t_after_pre - t_start).as_nanos() as u64, Ordering::Relaxed);
         lumen_sdpa_timing::CALL_NS.fetch_add(
             (t_after_call - t_after_pre).as_nanos() as u64,
             Ordering::Relaxed,
         );
-        lumen_sdpa_timing::POST_NS.fetch_add(
-            (t_end - t_after_call).as_nanos() as u64,
-            Ordering::Relaxed,
-        );
-        lumen_sdpa_timing::TOTAL_NS.fetch_add(
-            (t_end - t_start).as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        lumen_sdpa_timing::POST_NS
+            .fetch_add((t_end - t_after_call).as_nanos() as u64, Ordering::Relaxed);
+        lumen_sdpa_timing::TOTAL_NS
+            .fetch_add((t_end - t_start).as_nanos() as u64, Ordering::Relaxed);
         lumen_sdpa_timing::CALLS.fetch_add(1, Ordering::Relaxed);
         final_result
     }
@@ -190,7 +183,10 @@ mod imp {
         // (Vec<f32> + memset + Array::from_slice + as_dtype). Default OFF =
         // new GPU bool builder. Keep both paths until perf delta is confirmed
         // across all (ctx, model) shapes.
-        if std::env::var("LUMEN_LEGACY_MASK_BUILDER").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("LUMEN_LEGACY_MASK_BUILDER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             let total_keys = kv_actual;
             let total_cells = query_len * total_keys;
             let mut data = vec![f32::NEG_INFINITY; total_cells];
@@ -247,19 +243,24 @@ mod imp {
             &stream,
         )
         .context("build_causal_mask_abs: arange rinds failed")?;
-        let linds = linds.expand_dims_device(1, &stream)
+        let linds = linds
+            .expand_dims_device(1, &stream)
             .context("build_causal_mask_abs: expand linds -> [L_q,1] failed")?;
-        let rinds = rinds.expand_dims_device(0, &stream)
+        let rinds = rinds
+            .expand_dims_device(0, &stream)
             .context("build_causal_mask_abs: expand rinds -> [1,L_kv] failed")?;
-        let mut mask = linds.ge_device(&rinds, &stream)
+        let mut mask = linds
+            .ge_device(&rinds, &stream)
             .context("build_causal_mask_abs: linds >= rinds failed")?;
         if let Some(w) = window_size {
             let w_arr = Array::from_int(w as i32);
             let rinds_plus_w = mlx_rs::ops::add_device(&rinds, &w_arr, &stream)
                 .context("build_causal_mask_abs: rinds + window failed")?;
-            let window_mask = linds.lt_device(&rinds_plus_w, &stream)
+            let window_mask = linds
+                .lt_device(&rinds_plus_w, &stream)
                 .context("build_causal_mask_abs: linds < rinds+w failed")?;
-            mask = mask.logical_and_device(&window_mask, &stream)
+            mask = mask
+                .logical_and_device(&window_mask, &stream)
                 .context("build_causal_mask_abs: causal & window failed")?;
         }
         Ok(Some(mask))
@@ -267,10 +268,11 @@ mod imp {
 }
 
 #[cfg(feature = "mlx-native")]
-#[allow(unused_imports)] // Consumed by Phase 3b model assembly in runner_native.rs and Gemma 4 sliding attention.
-pub(crate) use imp::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
-#[cfg(feature = "mlx-native")]
 pub use imp::lumen_sdpa_timing;
+#[cfg(feature = "mlx-native")]
+#[allow(unused_imports)]
+// Consumed by Phase 3b model assembly in runner_native.rs and Gemma 4 sliding attention.
+pub(crate) use imp::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
 
 // SDPA bit-identical vs MLX reference.
 //

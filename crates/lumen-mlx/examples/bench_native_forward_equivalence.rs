@@ -83,8 +83,8 @@ struct PerPos {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let mut model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let mut n_list_raw = String::from("2,3,4,5,6,7,8,12,16,24,32");
     let mut prompt = DEFAULT_PROMPT.to_string();
 
@@ -127,7 +127,11 @@ fn main() -> Result<()> {
     println!("loaded in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     let prompt_ids = backend.encode(&prompt)?;
-    println!("prompt: {} chars → {} tokens", prompt.len(), prompt_ids.len());
+    println!(
+        "prompt: {} chars → {} tokens",
+        prompt.len(),
+        prompt_ids.len()
+    );
 
     // ── Reference: generate `n_max + 2` greedy tokens via S=1 path ──────────
     // This produces the deterministic block_input we compare on. The +2 gives
@@ -270,19 +274,13 @@ fn main() -> Result<()> {
         overall_safe
     );
     if !overall_safe {
-        println!(
-            "\n  WARNING: even where argmax matches in tested positions, max-abs"
-        );
+        println!("\n  WARNING: even where argmax matches in tested positions, max-abs");
         println!(
             "  divergence ≥ {:.1} indicates the verify path's cache state evolution",
             bar1_threshold
         );
-        println!(
-            "  differs from sequential decode — subsequent decode_steps WILL"
-        );
-        println!(
-            "  eventually flip argmax. See `dflash_root_cause_diagnostic.md`."
-        );
+        println!("  differs from sequential decode — subsequent decode_steps WILL");
+        println!("  eventually flip argmax. See `dflash_root_cause_diagnostic.md`.");
     }
 
     // Exit code: 0 if safe, 1 if any BAR fails (mirrors python verifier).

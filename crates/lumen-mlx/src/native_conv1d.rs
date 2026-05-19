@@ -25,15 +25,8 @@ mod imp {
         padding: i32,
         groups: i32,
     ) -> Result<Array> {
-        mlx_rs::ops::conv1d(
-            x,
-            weight,
-            stride,
-            padding,
-            /* dilation */ 1,
-            groups,
-        )
-        .context("mlx-rs ops::conv1d FFI call failed")
+        mlx_rs::ops::conv1d(x, weight, stride, padding, /* dilation */ 1, groups)
+            .context("mlx-rs ops::conv1d FFI call failed")
     }
 }
 
@@ -105,8 +98,7 @@ mod parity_tests {
         let weight_per_group = in_channels / groups_usize;
         let x_count = batch * length * in_channels;
         let weight_count = out_channels * kernel_size * weight_per_group;
-        let out_length =
-            (length + 2 * padding as usize - kernel_size) / stride as usize + 1;
+        let out_length = (length + 2 * padding as usize - kernel_size) / stride as usize + 1;
         let y_count = batch * out_length * out_channels;
 
         let mut cur = HEADER_LEN;
@@ -156,9 +148,8 @@ mod parity_tests {
 
         let out = conv1d(&x, &w, fx.stride, fx.padding, fx.groups)
             .expect("mlx-rs ops::conv1d FFI call must succeed");
-        let out_length = (fx.length + 2 * fx.padding as usize - fx.kernel_size)
-            / fx.stride as usize
-            + 1;
+        let out_length =
+            (fx.length + 2 * fx.padding as usize - fx.kernel_size) / fx.stride as usize + 1;
         assert_eq!(
             out.shape(),
             &[fx.batch as i32, out_length as i32, fx.out_channels as i32],
@@ -192,7 +183,8 @@ mod parity_tests {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "{name}: {mismatches}/{} elements diverged from MLX reference",
             observed.len()
         );

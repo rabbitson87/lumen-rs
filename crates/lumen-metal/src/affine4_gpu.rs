@@ -259,47 +259,69 @@ impl Affine4Context {
 
         let residual_func = library
             .get_function("affine4_matmul_f32_v3_residual", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_matmul_f32_v3_residual` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_matmul_f32_v3_residual` not found: {e}")
+            })?;
         let matmul_f32_v3_residual = ctx
             .device
             .new_compute_pipeline_state_with_function(&residual_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_matmul_f32_v3_residual` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_matmul_f32_v3_residual` failed: {e}")
+            })?;
 
         let bf16out_func = library
             .get_function("affine4_matmul_f32in_bf16out_v3", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_matmul_f32in_bf16out_v3` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_matmul_f32in_bf16out_v3` not found: {e}")
+            })?;
         let matmul_f32in_bf16out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&bf16out_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_matmul_f32in_bf16out_v3` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_matmul_f32in_bf16out_v3` failed: {e}")
+            })?;
 
         let bf16in_func = library
             .get_function("affine4_matmul_bf16in_f32out_v3", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_matmul_bf16in_f32out_v3` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_matmul_bf16in_f32out_v3` not found: {e}")
+            })?;
         let matmul_bf16in_f32out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&bf16in_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_matmul_bf16in_f32out_v3` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_matmul_bf16in_f32out_v3` failed: {e}")
+            })?;
 
         let gate_up_func = library
             .get_function("affine4_gate_up_silu_mul_f32_v3", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_gate_up_silu_mul_f32_v3` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_gate_up_silu_mul_f32_v3` not found: {e}")
+            })?;
         let gate_up_silu_mul_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&gate_up_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_gate_up_silu_mul_f32_v3` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_gate_up_silu_mul_f32_v3` failed: {e}")
+            })?;
 
         let gate_up_bf16out_func = library
             .get_function("affine4_gate_up_silu_mul_f32in_bf16out_v3", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_gate_up_silu_mul_f32in_bf16out_v3` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_gate_up_silu_mul_f32in_bf16out_v3` not found: {e}")
+            })?;
         let gate_up_silu_mul_bf16out_v3 = ctx
             .device
             .new_compute_pipeline_state_with_function(&gate_up_bf16out_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_gate_up_silu_mul_f32in_bf16out_v3` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_gate_up_silu_mul_f32in_bf16out_v3` failed: {e}")
+            })?;
 
         let rmsnorm_func = library
             .get_function("affine4_matmul_f32_v3_rmsnorm", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_matmul_f32_v3_rmsnorm` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_matmul_f32_v3_rmsnorm` not found: {e}")
+            })?;
         let matmul_f32_v3_rmsnorm = ctx
             .device
             .new_compute_pipeline_state_with_function(&rmsnorm_func)
@@ -323,11 +345,15 @@ impl Affine4Context {
 
         let reduce_res_func = library
             .get_function("affine4_reduce_chunks_f32_residual", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_reduce_chunks_f32_residual` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_reduce_chunks_f32_residual` not found: {e}")
+            })?;
         let reduce_chunks_f32_residual = ctx
             .device
             .new_compute_pipeline_state_with_function(&reduce_res_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_reduce_chunks_f32_residual` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_reduce_chunks_f32_residual` failed: {e}")
+            })?;
 
         let qmv_fast_func = library
             .get_function("affine4_qmv_fast", None)
@@ -355,23 +381,27 @@ impl Affine4Context {
 
         let qmv_fast_bf16_func = library
             .get_function("affine4_qmv_fast_bf16in_bf16out", None)
-            .map_err(|e| anyhow::anyhow!("kernel `affine4_qmv_fast_bf16in_bf16out` not found: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_qmv_fast_bf16in_bf16out` not found: {e}")
+            })?;
         let qmv_fast_bf16in_bf16out = ctx
             .device
             .new_compute_pipeline_state_with_function(&qmv_fast_bf16_func)
-            .map_err(|e| anyhow::anyhow!("pipeline `affine4_qmv_fast_bf16in_bf16out` failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_qmv_fast_bf16in_bf16out` failed: {e}")
+            })?;
 
         let qmv_fast_bf16_residual_func = library
             .get_function("affine4_qmv_fast_bf16in_bf16out_residual", None)
-            .map_err(|e| anyhow::anyhow!(
-                "kernel `affine4_qmv_fast_bf16in_bf16out_residual` not found: {e}"
-            ))?;
+            .map_err(|e| {
+                anyhow::anyhow!("kernel `affine4_qmv_fast_bf16in_bf16out_residual` not found: {e}")
+            })?;
         let qmv_fast_bf16in_bf16out_residual = ctx
             .device
             .new_compute_pipeline_state_with_function(&qmv_fast_bf16_residual_func)
-            .map_err(|e| anyhow::anyhow!(
-                "pipeline `affine4_qmv_fast_bf16in_bf16out_residual` failed: {e}"
-            ))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_qmv_fast_bf16in_bf16out_residual` failed: {e}")
+            })?;
 
         // ICB-supporting variants of the two bf16 fast paths
         // (qmv_fast_bf16in_bf16out + ..._residual). Built via the new
@@ -381,15 +411,17 @@ impl Affine4Context {
         let qmv_fast_bf16in_bf16out_icb = ctx
             .device
             .new_compute_pipeline_state_with_function_for_icb(&qmv_fast_bf16_func)
-            .map_err(|e| anyhow::anyhow!(
-                "pipeline `affine4_qmv_fast_bf16in_bf16out` (ICB) failed: {e}"
-            ))?;
+            .map_err(|e| {
+                anyhow::anyhow!("pipeline `affine4_qmv_fast_bf16in_bf16out` (ICB) failed: {e}")
+            })?;
         let qmv_fast_bf16in_bf16out_residual_icb = ctx
             .device
             .new_compute_pipeline_state_with_function_for_icb(&qmv_fast_bf16_residual_func)
-            .map_err(|e| anyhow::anyhow!(
-                "pipeline `affine4_qmv_fast_bf16in_bf16out_residual` (ICB) failed: {e}"
-            ))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "pipeline `affine4_qmv_fast_bf16in_bf16out_residual` (ICB) failed: {e}"
+                )
+            })?;
 
         Ok(Self {
             ctx,
@@ -523,7 +555,10 @@ impl Affine4Context {
         y_offset: u64,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
         encoder.set_buffer(1, Some(&weight.scales), weight.scales_offset as usize);
@@ -574,7 +609,10 @@ impl Affine4Context {
         y_offset: u64,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast_bf16in_bf16out);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
         encoder.set_buffer(1, Some(&weight.scales), weight.scales_offset as usize);
@@ -624,7 +662,10 @@ impl Affine4Context {
         y_offset: u64,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast_residual);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
         encoder.set_buffer(1, Some(&weight.scales), weight.scales_offset as usize);
@@ -678,7 +719,10 @@ impl Affine4Context {
         y_offset: u64,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast_bf16in_bf16out_residual);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
         encoder.set_buffer(1, Some(&weight.scales), weight.scales_offset as usize);
@@ -742,7 +786,10 @@ impl Affine4Context {
         batch_buf: &Buffer,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
 
         const NSG: usize = 2;
         const RPS: usize = 4;
@@ -793,7 +840,10 @@ impl Affine4Context {
         batch_buf: &Buffer,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
 
         const NSG: usize = 2;
         const RPS: usize = 4;
@@ -844,7 +894,10 @@ impl Affine4Context {
         rms_eps: f32,
         batch: usize,
     ) {
-        debug_assert!(Self::qmv_fast_supports(weight.in_features, weight.out_features));
+        debug_assert!(Self::qmv_fast_supports(
+            weight.in_features,
+            weight.out_features
+        ));
         encoder.set_compute_pipeline_state(&self.qmv_fast_rmsnorm);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
         encoder.set_buffer(1, Some(&weight.scales), weight.scales_offset as usize);
@@ -1098,21 +1151,29 @@ impl Affine4Context {
         if batch == 0 {
             return Ok(());
         }
-        let scratch_bytes =
-            Self::tiled_scratch_bytes(weight.out_features, batch, n_chunks) as u64;
+        let scratch_bytes = Self::tiled_scratch_bytes(weight.out_features, batch, n_chunks) as u64;
         let scratch = self.ctx.buffer_zeroed(scratch_bytes);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine4_matmul_tiled");
         self.encode_matmul_tiled_dispatch(
-            encoder.as_ref(), weight,
-            x_buf, x_offset,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
             &scratch,
-            y_buf, y_offset,
-            tile_in, n_chunks, batch,
+            y_buf,
+            y_offset,
+            tile_in,
+            n_chunks,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1286,8 +1347,16 @@ impl Affine4Context {
         encoder.set_threadgroup_memory_length(0, x_shared_bytes);
         encoder.set_threadgroup_memory_length(1, reduce_buf_bytes);
         let n_groups_x = weight.out_features.div_ceil(ROWS_PER_TG);
-        let grid = MTLSize { width: n_groups_x, height: batch, depth: 1 };
-        let tg = MTLSize { width: THREADS_PER_TG, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: n_groups_x,
+            height: batch,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(grid, tg);
     }
 
@@ -1309,17 +1378,26 @@ impl Affine4Context {
         if batch == 0 {
             return Ok(());
         }
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine4_matmul_rmsnorm");
         self.encode_matmul_rmsnorm_dispatch(
-            encoder.as_ref(), weight,
-            x_buf, x_offset,
-            rms_weight_buf, rms_weight_offset,
-            y_buf, y_offset,
-            rms_eps, batch,
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            rms_weight_buf,
+            rms_weight_offset,
+            y_buf,
+            y_offset,
+            rms_eps,
+            batch,
         );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1363,8 +1441,16 @@ impl Affine4Context {
         let tg_mem_bytes = weight.in_features * 4;
         encoder.set_threadgroup_memory_length(0, tg_mem_bytes);
         let n_groups_x = inter.div_ceil(ROWS_PER_TG);
-        let grid = MTLSize { width: n_groups_x, height: batch, depth: 1 };
-        let tg = MTLSize { width: THREADS_PER_TG, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: n_groups_x,
+            height: batch,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(grid, tg);
     }
 
@@ -1393,11 +1479,15 @@ impl Affine4Context {
         let x_buf = self.ctx.buffer_with_data(x);
         let y_buf = self.ctx.buffer_for::<f32>(batch * weight.out_features);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine4_matmul");
         self.encode_matmul_dispatch(encoder.as_ref(), weight, &x_buf, 0, &y_buf, 0, batch);
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self
             .ctx
@@ -1420,11 +1510,23 @@ impl Affine4Context {
         if batch == 0 {
             return Ok(());
         }
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine4_matmul");
-        self.encode_matmul_dispatch(encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch);
+        self.encode_matmul_dispatch(
+            encoder.as_ref(),
+            weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
+        );
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
         Ok(())
     }
 
@@ -1439,7 +1541,9 @@ impl Affine4Context {
         let x_buf = self.ctx.buffer_with_data(x);
         let y_buf = self.ctx.buffer_for::<f32>(weight.out_features);
 
-        let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+        let encoder = crate::metal::process_commands()
+            .command_encoder()
+            .expect("ce");
         encoder.set_label("lumen:affine4_matvec");
         encoder.set_compute_pipeline_state(&self.matvec_f32);
         encoder.set_buffer(0, Some(&weight.packed), weight.packed_offset as usize);
@@ -1471,7 +1575,9 @@ impl Affine4Context {
         };
         encoder.dispatch_threads(grid, tg);
         drop(encoder);
-        crate::metal::process_commands().flush_and_wait().expect("flush");
+        crate::metal::process_commands()
+            .flush_and_wait()
+            .expect("flush");
 
         Ok(self.ctx.read_buffer::<f32>(&y_buf, weight.out_features))
     }

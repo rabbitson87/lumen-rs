@@ -28,13 +28,13 @@
 #[cfg(feature = "mlx-native")]
 fn main() -> anyhow::Result<()> {
     use anyhow::{Context, anyhow};
-    use mlx_rs::ops;
     use lumen_mlx::MlxBackend;
+    use mlx_rs::ops;
 
     // ── CLI ──────────────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    let mut model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let mut model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let mut target_ids_raw = String::from("1,10,19,28,37");
     let mut prompt = String::from(
         "<|im_start|>user\nWrite a Python function for binary search.<|im_end|>\n<|im_start|>assistant\n",

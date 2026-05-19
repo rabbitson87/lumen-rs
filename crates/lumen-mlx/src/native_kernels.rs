@@ -26,9 +26,7 @@ mod imp {
 
     use crate::native_compile_cache::{CompiledMultiRefs, invoke_compiled_multi_refs};
 
-    fn sigmoid_mul_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn sigmoid_mul_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         let gate = &args[0];
         let other = &args[1];
         let sig = mlx_rs::ops::sigmoid(gate)?;
@@ -68,8 +66,7 @@ mod imp {
             &args,
         )
         .context("sigmoid_mul_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("sigmoid_mul_fused: empty output vec")
+        out.pop().context("sigmoid_mul_fused: empty output vec")
     }
 }
 

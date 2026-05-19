@@ -127,8 +127,7 @@ pub(crate) mod imp {
     /// Step counter used by `dump_hidden` to namespace decode-step blobs.
     /// 0 = prefill (default), 1..N = decode step. Set externally by the
     /// debug example via `set_forward_step` before each `forward_array` call.
-    static FORWARD_STEP: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static FORWARD_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     pub fn set_forward_step(step: usize) {
         FORWARD_STEP.store(step, std::sync::atomic::Ordering::Relaxed);
@@ -185,16 +184,15 @@ pub(crate) mod imp {
             .with_context(|| format!("dump_hidden: eval {name}"))?;
         let dims = casted.shape().to_vec();
         let data: &[f32] = casted.as_slice::<f32>();
-        let mut f = std::fs::File::create(&path)
-            .with_context(|| format!("dump_hidden: create {path}"))?;
+        let mut f =
+            std::fs::File::create(&path).with_context(|| format!("dump_hidden: create {path}"))?;
         f.write_all(b"TQHD")?;
         f.write_all(&(dims.len() as u32).to_le_bytes())?;
         for d in &dims {
             f.write_all(&(*d as u32).to_le_bytes())?;
         }
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         f.write_all(bytes)?;
         Ok(())
     }
@@ -351,9 +349,7 @@ pub(crate) mod imp {
     // shape from a dynamic start (`num_experts - top_k`). Keeping the slice
     // out trims the fuse to 4 ops, which still saves 3 FFI dispatches per
     // layer (×30 layers per decode step).
-    fn gemma4_routing_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn gemma4_routing_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         // args[0] = scores  (post-projection logits, [B, L, num_experts])
         // args[1] = indices ([B, L, top_k] — sliced from argpartition outside)
         // args[2] = per_expert_scale ([num_experts])
@@ -364,8 +360,7 @@ pub(crate) mod imp {
 
         let top_logits = scores.take_along_axis(indices, last_axis)?;
         let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert =
-            mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
+        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
         let weights = weights.multiply(&per_expert)?;
         Ok(vec![weights])
     }
@@ -418,15 +413,13 @@ pub(crate) mod imp {
         // matching Gemma 4 dense MLP's 8-bit affine quant). The lazy compile
         // path traces ops during first invocation; the stream is restamped at
         // trace time so we use the default-device variant here.
-        let qmm = |xi: &Array, w: &Array, s: &Array, b: &Array| -> std::result::Result<Array, Exception> {
+        let qmm = |xi: &Array,
+                   w: &Array,
+                   s: &Array,
+                   b: &Array|
+         -> std::result::Result<Array, Exception> {
             mlx_rs::ops::quantized_matmul(
-                xi,
-                w,
-                s,
-                b,
-                /* transpose */ true,
-                /* group_size */ 64,
-                /* bits */ 8,
+                xi, w, s, b, /* transpose */ true, /* group_size */ 64, /* bits */ 8,
             )
         };
 
@@ -448,7 +441,10 @@ pub(crate) mod imp {
         let scaled = coeff.multiply(&inner_add)?;
         let t = tanh(&scaled)?;
         let one_plus_tanh = one.add(&t)?;
-        let activated = half.multiply(&gate)?.multiply(&one_plus_tanh)?.multiply(&up)?;
+        let activated = half
+            .multiply(&gate)?
+            .multiply(&one_plus_tanh)?
+            .multiply(&up)?;
 
         let down = qmm(&activated, down_w, down_s, down_b)?;
         Ok(vec![down])
@@ -496,15 +492,13 @@ pub(crate) mod imp {
 
         let normed = mlx_rs::fast::rms_norm(x, pre_norm_w, 1e-6_f32)?;
 
-        let qmm = |xi: &Array, w: &Array, s: &Array, b: &Array| -> std::result::Result<Array, Exception> {
+        let qmm = |xi: &Array,
+                   w: &Array,
+                   s: &Array,
+                   b: &Array|
+         -> std::result::Result<Array, Exception> {
             mlx_rs::ops::quantized_matmul(
-                xi,
-                w,
-                s,
-                b,
-                /* transpose */ true,
-                /* group_size */ 64,
-                /* bits */ 8,
+                xi, w, s, b, /* transpose */ true, /* group_size */ 64, /* bits */ 8,
             )
         };
 
@@ -522,7 +516,10 @@ pub(crate) mod imp {
         let scaled = coeff.multiply(&inner_add)?;
         let t = tanh(&scaled)?;
         let one_plus_tanh = one.add(&t)?;
-        let activated = half.multiply(&gate)?.multiply(&one_plus_tanh)?.multiply(&up)?;
+        let activated = half
+            .multiply(&gate)?
+            .multiply(&one_plus_tanh)?
+            .multiply(&up)?;
 
         let down = qmm(&activated, down_w, down_s, down_b)?;
         let result = mlx_rs::fast::rms_norm(&down, post_norm_w, 1e-6_f32)?;
@@ -579,15 +576,16 @@ pub(crate) mod imp {
             .context("gemma4_pre_post_norm_dense_mlp_fused: missing output")
     }
 
-    fn gemma4_dense_mlp_fused(
-        x: &Array,
-        w: &ResolvedGemma4DenseMlpWeights,
-    ) -> Result<Array> {
+    fn gemma4_dense_mlp_fused(x: &Array, w: &ResolvedGemma4DenseMlpWeights) -> Result<Array> {
         // Dense MLP biases must be present for the compile path (10 args
         // assumed). Fall back to legacy if any bias is None.
         let gate_b = match w.gate_proj.biases.as_ref() {
             Some(b) => b,
-            None => return Err(anyhow!("gemma4_dense_mlp_fused: gate_proj.biases is None — falling back required")),
+            None => {
+                return Err(anyhow!(
+                    "gemma4_dense_mlp_fused: gate_proj.biases is None — falling back required"
+                ));
+            }
         };
         let up_b = match w.up_proj.biases.as_ref() {
             Some(b) => b,
@@ -665,9 +663,7 @@ pub(crate) mod imp {
     //
     // GeGLU formula inlined (gelu_approx(gate) * up) — can't nest the existing
     // gelu_mul compile slot inside another compile.
-    fn gemma4_experts_compiled_inner(
-        args: &[Array],
-    ) -> std::result::Result<Vec<Array>, Exception> {
+    fn gemma4_experts_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         use mlx_rs::ops::tanh;
         let x = &args[0];
         let idx = &args[1];
@@ -684,7 +680,11 @@ pub(crate) mod imp {
         // mlx-rs's macro-generated `gather_qmm` uses DEFAULT_MODE="affine",
         // matching Gemma 4 experts (4-bit affine). The stream is restamped at
         // trace time so we use the default-device variant.
-        let gqmm = |xi: &Array, w: &Array, s: &Array, b: &Array| -> std::result::Result<Array, Exception> {
+        let gqmm = |xi: &Array,
+                    w: &Array,
+                    s: &Array,
+                    b: &Array|
+         -> std::result::Result<Array, Exception> {
             mlx_rs::ops::gather_qmm(
                 xi,
                 w,
@@ -716,7 +716,10 @@ pub(crate) mod imp {
         let scaled = coeff.multiply(&inner_add)?;
         let t = tanh(&scaled)?;
         let one_plus_tanh = one.add(&t)?;
-        let activated = half.multiply(&gate)?.multiply(&one_plus_tanh)?.multiply(&up)?;
+        let activated = half
+            .multiply(&gate)?
+            .multiply(&one_plus_tanh)?
+            .multiply(&up)?;
 
         let down = gqmm(&activated, down_w, down_s, down_b)?;
         Ok(vec![down])
@@ -775,15 +778,18 @@ pub(crate) mod imp {
         let last_axis = (scores.ndim() as i32) - 1;
         let top_logits = scores.take_along_axis(indices, last_axis)?;
         let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert =
-            mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
+        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
         let weights = weights.multiply(&per_expert)?;
 
         // 2. expand_dims(x, [-2, -3]) → [B, L, 1, 1, hidden] for gather_qmm.
         let x_5d = mlx_rs::ops::expand_dims_axes(x, &[-2, -3])?;
 
         // 3. Experts: gate / up / GeGLU / down (mirrors gemma4_experts_compiled_inner).
-        let gqmm = |xi: &Array, w: &Array, s: &Array, b: &Array| -> std::result::Result<Array, Exception> {
+        let gqmm = |xi: &Array,
+                    w: &Array,
+                    s: &Array,
+                    b: &Array|
+         -> std::result::Result<Array, Exception> {
             mlx_rs::ops::gather_qmm(
                 xi,
                 w,
@@ -812,7 +818,10 @@ pub(crate) mod imp {
         let scaled = coeff.multiply(&inner_add)?;
         let t = tanh(&scaled)?;
         let one_plus_tanh = one.add(&t)?;
-        let activated = half.multiply(&gate)?.multiply(&one_plus_tanh)?.multiply(&up)?;
+        let activated = half
+            .multiply(&gate)?
+            .multiply(&one_plus_tanh)?
+            .multiply(&up)?;
 
         let down = gqmm(&activated, down_w, down_s, down_b)?;
 
@@ -883,27 +892,19 @@ pub(crate) mod imp {
         let last_axis = (scores.ndim() as i32) - 1;
         let top_logits = scores.take_along_axis(indices, last_axis)?;
         let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert =
-            mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
+        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
         let weights = weights.multiply(&per_expert)?;
 
         // 2. expand_dims for gather_qmm.
         let x_5d = mlx_rs::ops::expand_dims_axes(&h, &[-2, -3])?;
 
         // 3. Experts.
-        let gqmm = |xi: &Array, w: &Array, s: &Array, b: &Array| -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::gather_qmm(
-                xi,
-                w,
-                s,
-                b,
-                None,
-                Some(indices),
-                true,
-                64,
-                4,
-                false,
-            )
+        let gqmm = |xi: &Array,
+                    w: &Array,
+                    s: &Array,
+                    b: &Array|
+         -> std::result::Result<Array, Exception> {
+            mlx_rs::ops::gather_qmm(xi, w, s, b, None, Some(indices), true, 64, 4, false)
         };
 
         let gate = gqmm(&x_5d, gate_w, gate_s, gate_b)?;
@@ -920,7 +921,10 @@ pub(crate) mod imp {
         let scaled = coeff.multiply(&inner_add)?;
         let t = tanh(&scaled)?;
         let one_plus_tanh = one.add(&t)?;
-        let activated = half.multiply(&gate)?.multiply(&one_plus_tanh)?.multiply(&up)?;
+        let activated = half
+            .multiply(&gate)?
+            .multiply(&one_plus_tanh)?
+            .multiply(&up)?;
 
         let down = gqmm(&activated, down_w, down_s, down_b)?;
 
@@ -956,21 +960,15 @@ pub(crate) mod imp {
         post_norm_w: &Array,
         w: &ResolvedGemma4ExpertsWeights,
     ) -> Result<Array> {
-        let gate_b = w
-            .gate_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_pre_post_norm_routing_experts_fused: gate_proj.biases is None"))?;
-        let up_b = w
-            .up_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_pre_post_norm_routing_experts_fused: up_proj.biases is None"))?;
-        let down_b = w
-            .down_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_pre_post_norm_routing_experts_fused: down_proj.biases is None"))?;
+        let gate_b = w.gate_proj.biases.as_ref().ok_or_else(|| {
+            anyhow!("gemma4_pre_post_norm_routing_experts_fused: gate_proj.biases is None")
+        })?;
+        let up_b = w.up_proj.biases.as_ref().ok_or_else(|| {
+            anyhow!("gemma4_pre_post_norm_routing_experts_fused: up_proj.biases is None")
+        })?;
+        let down_b = w.down_proj.biases.as_ref().ok_or_else(|| {
+            anyhow!("gemma4_pre_post_norm_routing_experts_fused: down_proj.biases is None")
+        })?;
         let args = [
             scores,
             indices,
@@ -1056,7 +1054,9 @@ pub(crate) mod imp {
     // Args (3 arrays): [logits, softcap_inv, softcap]
     // Output: tanh(logits * softcap_inv) * softcap
 
-    fn gemma4_softcap_compiled_inner(args: &[Array]) -> Result<Vec<Array>, mlx_rs::error::Exception> {
+    fn gemma4_softcap_compiled_inner(
+        args: &[Array],
+    ) -> Result<Vec<Array>, mlx_rs::error::Exception> {
         let logits = &args[0];
         let softcap_inv = &args[1];
         let softcap = &args[2];
@@ -1076,11 +1076,7 @@ pub(crate) mod imp {
             .unwrap_or(true)
     }
 
-    fn gemma4_softcap_fused(
-        logits: &Array,
-        softcap_inv: &Array,
-        softcap: &Array,
-    ) -> Result<Array> {
+    fn gemma4_softcap_fused(logits: &Array, softcap_inv: &Array, softcap: &Array) -> Result<Array> {
         let args = [logits, softcap_inv, softcap];
         let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
             &GEMMA4_SOFTCAP_SLOT,
@@ -1412,12 +1408,10 @@ pub(crate) mod imp {
 
     impl NativeGemma4Config {
         pub fn load(path: &Path) -> Result<Self> {
-            let raw = std::fs::read_to_string(path).map_err(|err| {
-                anyhow!("config.json read failed at {}: {err}", path.display())
-            })?;
-            serde_json::from_str(&raw).map_err(|err| {
-                anyhow!("config.json parse failed at {}: {err}", path.display())
-            })
+            let raw = std::fs::read_to_string(path)
+                .map_err(|err| anyhow!("config.json read failed at {}: {err}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))
         }
 
         /// Returns whichever of `quantization` / `quantization_config` is
@@ -1541,9 +1535,7 @@ pub(crate) mod imp {
             // surface early.
             if self.enable_moe_block {
                 if self.num_experts == 0 {
-                    return Err(anyhow!(
-                        "enable_moe_block=true but num_experts=0"
-                    ));
+                    return Err(anyhow!("enable_moe_block=true but num_experts=0"));
                 }
                 if self.top_k_experts == 0 || self.top_k_experts > self.num_experts {
                     return Err(anyhow!(
@@ -1561,11 +1553,7 @@ pub(crate) mod imp {
             // sliding/full split sanity: every num_hidden_layers/sliding_window_pattern
             // positions should be a full attention layer (5 sliding + 1 full
             // for 26B-A4B's pattern=6).
-            let n_full = self
-                .layer_types
-                .iter()
-                .filter(|t| t.is_full())
-                .count();
+            let n_full = self.layer_types.iter().filter(|t| t.is_full()).count();
             let expected_full = self.num_hidden_layers / self.sliding_window_pattern;
             if n_full == 0 || n_full > self.num_hidden_layers {
                 return Err(anyhow!(
@@ -1594,8 +1582,7 @@ pub(crate) mod imp {
         pub fn n_kv_heads_for(&self, kind: NativeGemma4LayerType) -> usize {
             match kind {
                 NativeGemma4LayerType::FullAttention
-                    if self.attention_k_eq_v
-                        && self.num_global_key_value_heads.is_some() =>
+                    if self.attention_k_eq_v && self.num_global_key_value_heads.is_some() =>
                 {
                     self.num_global_key_value_heads.unwrap()
                 }
@@ -1614,9 +1601,7 @@ pub(crate) mod imp {
         pub fn rope_for(&self, kind: NativeGemma4LayerType) -> &NativeGemma4RopePerKind {
             match kind {
                 NativeGemma4LayerType::FullAttention => &self.rope_parameters.full_attention,
-                NativeGemma4LayerType::SlidingAttention => {
-                    &self.rope_parameters.sliding_attention
-                }
+                NativeGemma4LayerType::SlidingAttention => &self.rope_parameters.sliding_attention,
             }
         }
     }
@@ -1643,18 +1628,11 @@ pub(crate) mod imp {
             let mut shard_paths = std::fs::read_dir(dir)
                 .with_context(|| format!("read_dir({}) failed", dir.display()))?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .is_some_and(|ext| ext == "safetensors")
-                })
+                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "safetensors"))
                 .collect::<Vec<_>>();
             shard_paths.sort();
             if shard_paths.is_empty() {
-                return Err(anyhow!(
-                    "no *.safetensors found under {}",
-                    dir.display()
-                ));
+                return Err(anyhow!("no *.safetensors found under {}", dir.display()));
             }
             let mut tensors: HashMap<String, Array> = HashMap::new();
             for shard in shard_paths {
@@ -1715,10 +1693,7 @@ pub(crate) mod imp {
             // `.experts.switch_glu.down_proj`. Detect the un-rewritten form.
             let legacy_down = out
                 .keys()
-                .find(|k| {
-                    k.ends_with(".experts.down_proj.weight")
-                        && !k.contains(".switch_glu.")
-                })
+                .find(|k| k.ends_with(".experts.down_proj.weight") && !k.contains(".switch_glu."))
                 .cloned();
             if let Some(k) = legacy_down {
                 return Err(anyhow!(
@@ -1775,10 +1750,7 @@ pub(crate) mod imp {
         ///     alongside `.weight`; for the bring-up gate we only require
         ///     `.weight` so the loader works against both quantized and
         ///     unquantized shards.
-        pub fn validate_keys_against_config(
-            &self,
-            cfg: &NativeGemma4TextConfig,
-        ) -> Result<()> {
+        pub fn validate_keys_against_config(&self, cfg: &NativeGemma4TextConfig) -> Result<()> {
             let top_level = [
                 "language_model.model.embed_tokens.weight",
                 "language_model.model.norm.weight",
@@ -1809,8 +1781,7 @@ pub(crate) mod imp {
                     format!("{base}.mlp.down_proj.weight"),
                 ];
                 if !cfg.use_k_eq_v_for(*layer_kind) {
-                    required_keys
-                        .push(format!("{base}.self_attn.v_proj.weight"));
+                    required_keys.push(format!("{base}.self_attn.v_proj.weight"));
                 }
                 if cfg.enable_moe_block {
                     required_keys.extend([
@@ -1945,9 +1916,7 @@ pub(crate) mod imp {
             }
         }
 
-        pub fn as_sliding_quantized_mut(
-            &mut self,
-        ) -> Result<&mut NativeRotatingKvCacheQuantized> {
+        pub fn as_sliding_quantized_mut(&mut self) -> Result<&mut NativeRotatingKvCacheQuantized> {
             match self {
                 NativeGemma4LayerCache::SlidingQuantized(c) => Ok(c),
                 _ => Err(anyhow!(
@@ -2059,9 +2028,9 @@ pub(crate) mod imp {
                 .map(|kind| match kind {
                     NativeGemma4LayerType::FullAttention => {
                         if quant_kv {
-                            NativeGemma4LayerCache::FullQuantized(
-                                NativeKvCacheQuantized::new(64, 4),
-                            )
+                            NativeGemma4LayerCache::FullQuantized(NativeKvCacheQuantized::new(
+                                64, 4,
+                            ))
                         } else {
                             NativeGemma4LayerCache::Full(NativeKvCache::new())
                         }
@@ -2075,13 +2044,10 @@ pub(crate) mod imp {
                                     .ok()
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(4);
-                            let cache = NativeRotatingKvCacheTurboQuant::new(
-                                cfg.sliding_window, 0, bits,
-                            );
+                            let cache =
+                                NativeRotatingKvCacheTurboQuant::new(cfg.sliding_window, 0, bits);
                             let cache = if gemma4_quant_kv_sliding_turboquant_qjl_enabled() {
-                                let qjl_m = gemma4_quant_kv_sliding_turboquant_qjl_m(
-                                    cfg.head_dim,
-                                );
+                                let qjl_m = gemma4_quant_kv_sliding_turboquant_qjl_m(cfg.head_dim);
                                 cache.with_qjl(qjl_m)
                             } else {
                                 cache
@@ -2192,12 +2158,12 @@ pub(crate) mod imp {
                             c.max_size()
                         ));
                     }
-                    let k_buf = c.keys().ok_or_else(|| {
-                        anyhow!("layer_kv_bf16: sliding {layer_idx} no keys")
-                    })?;
-                    let v_buf = c.values().ok_or_else(|| {
-                        anyhow!("layer_kv_bf16: sliding {layer_idx} no values")
-                    })?;
+                    let k_buf = c
+                        .keys()
+                        .ok_or_else(|| anyhow!("layer_kv_bf16: sliding {layer_idx} no keys"))?;
+                    let v_buf = c
+                        .values()
+                        .ok_or_else(|| anyhow!("layer_kv_bf16: sliding {layer_idx} no values"))?;
                     let k = k_buf
                         .try_index((.., .., 0..off, ..))
                         .context("layer_kv_bf16: slice sliding K")?;
@@ -2345,19 +2311,16 @@ pub(crate) mod imp {
             return Ok(None);
         }
 
-        let slot: &'static std::thread::LocalKey<
-            std::cell::RefCell<Option<MaskCacheEntry>>,
-        > = match kind {
-            NativeGemma4LayerType::SlidingAttention => &MASK_CACHE_SLIDING,
-            NativeGemma4LayerType::FullAttention => &MASK_CACHE_FULL,
-        };
+        let slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<MaskCacheEntry>>> =
+            match kind {
+                NativeGemma4LayerType::SlidingAttention => &MASK_CACHE_SLIDING,
+                NativeGemma4LayerType::FullAttention => &MASK_CACHE_FULL,
+            };
 
         // Cache hit fast path: same shape parameters → reuse the prior mask.
         let hit = slot.with(|c| {
             c.borrow().as_ref().and_then(|e| {
-                if e.query_len == query_len
-                    && e.kv_offset == kv_offset
-                    && e.kv_actual == kv_actual
+                if e.query_len == query_len && e.kv_offset == kv_offset && e.kv_actual == kv_actual
                 {
                     Some(e.mask.clone())
                 } else {
@@ -2374,8 +2337,7 @@ pub(crate) mod imp {
             NativeGemma4LayerType::SlidingAttention => Some(cfg.sliding_window),
             NativeGemma4LayerType::FullAttention => None,
         };
-        let cache_first_held_pos =
-            (kv_offset + query_len).saturating_sub(kv_actual);
+        let cache_first_held_pos = (kv_offset + query_len).saturating_sub(kv_actual);
         let built = build_causal_mask_abs(
             kv_offset,
             query_len,
@@ -2410,9 +2372,9 @@ pub(crate) mod imp {
         cfg: &NativeGemma4Config,
         base: &str,
     ) -> Result<(i32, i32, &'static CStr)> {
-        let quant = cfg.effective_quantization().ok_or_else(|| {
-            anyhow!("quant_params_for({base}): no quantization block in config")
-        })?;
+        let quant = cfg
+            .effective_quantization()
+            .ok_or_else(|| anyhow!("quant_params_for({base}): no quantization block in config"))?;
         let base_key = base
             .trim_end_matches(".weight")
             .trim_end_matches(".scales")
@@ -2577,9 +2539,7 @@ pub(crate) mod imp {
         cfg: &NativeGemma4Config,
         layer_idx: usize,
     ) -> Result<ResolvedGemma4ExpertsWeights> {
-        let base = format!(
-            "language_model.model.layers.{layer_idx}.experts.switch_glu"
-        );
+        let base = format!("language_model.model.layers.{layer_idx}.experts.switch_glu");
         Ok(ResolvedGemma4ExpertsWeights {
             gate_proj: resolve_quant_linear(weights, cfg, &format!("{base}.gate_proj"))?,
             up_proj: resolve_quant_linear(weights, cfg, &format!("{base}.up_proj"))?,
@@ -2633,10 +2593,7 @@ pub(crate) mod imp {
             dense_mlp,
             router,
             experts,
-            input_layernorm: require_clone(
-                weights,
-                &format!("{base}.input_layernorm.weight"),
-            )?,
+            input_layernorm: require_clone(weights, &format!("{base}.input_layernorm.weight"))?,
             post_attention_layernorm: require_clone(
                 weights,
                 &format!("{base}.post_attention_layernorm.weight"),
@@ -2747,8 +2704,8 @@ pub(crate) mod imp {
         let w_t = mlx_rs::ops::transpose_axes(&w_3d, &[0, 2, 1])
             .context("bake_r_into_v_proj: transpose to [H_kv, hidden, head_dim]")?;
         // R is f32 by construction; we operate in f32 too.
-        let w_t_rot = mlx_rs::ops::matmul(&w_t, r_arr)
-            .context("bake_r_into_v_proj: matmul W_t @ R")?;
+        let w_t_rot =
+            mlx_rs::ops::matmul(&w_t, r_arr).context("bake_r_into_v_proj: matmul W_t @ R")?;
         let w_rot_3d = mlx_rs::ops::transpose_axes(&w_t_rot, &[0, 2, 1])
             .context("bake_r_into_v_proj: transpose back to [H_kv, head_dim, hidden]")?;
         let w_rot_f32 = mlx_rs::ops::reshape(&w_rot_3d, &[h_kv * head_dim, hidden])
@@ -2819,8 +2776,8 @@ pub(crate) mod imp {
         let w_3d = mlx_rs::ops::reshape(&w_dense, &[hidden, h, head_dim])
             .context("bake_r_into_o_proj: reshape to 3D")?;
         // head_dim is already the last axis — matmul contracts on it.
-        let w_rot_3d = mlx_rs::ops::matmul(&w_3d, r_arr)
-            .context("bake_r_into_o_proj: matmul W_o @ R")?;
+        let w_rot_3d =
+            mlx_rs::ops::matmul(&w_3d, r_arr).context("bake_r_into_o_proj: matmul W_o @ R")?;
         let w_rot_f32 = mlx_rs::ops::reshape(&w_rot_3d, &[hidden, h * head_dim])
             .context("bake_r_into_o_proj: reshape back to 2D")?;
         let w_rot_flat = w_rot_f32
@@ -2966,13 +2923,9 @@ pub(crate) mod imp {
             weights.sanitize()?;
             weights.validate_keys_against_config(&cfg.text_config)?;
 
-            let embed_tokens = resolve_quant_linear(
-                &weights,
-                &cfg,
-                "language_model.model.embed_tokens",
-            )?;
-            let final_norm =
-                require_clone(&weights, "language_model.model.norm.weight")?;
+            let embed_tokens =
+                resolve_quant_linear(&weights, &cfg, "language_model.model.embed_tokens")?;
+            let final_norm = require_clone(&weights, "language_model.model.norm.weight")?;
 
             let mut layers = cfg
                 .text_config
@@ -3032,9 +2985,7 @@ pub(crate) mod imp {
                     }
                     if bake_o {
                         let op_rot = bake_r_into_o_proj(&lw.attn.o_proj, &r_arr, h_q, head_dim)
-                            .with_context(|| {
-                                format!("load: bake R into o_proj (layer {idx})")
-                            })?;
+                            .with_context(|| format!("load: bake R into o_proj (layer {idx})"))?;
                         lw.attn.o_proj = op_rot;
                     }
                     baked += 1;
@@ -3170,10 +3121,7 @@ pub(crate) mod imp {
         /// pass under `set_mtp_capture_enabled(true)`. Returns `None` if no
         /// hidden was captured (capture disabled, or already consumed).
         pub fn take_captured_last_h(&self) -> Option<Array> {
-            self.mtp_capture_slot
-                .lock()
-                .ok()
-                .and_then(|mut s| s.take())
+            self.mtp_capture_slot.lock().ok().and_then(|mut s| s.take())
         }
 
         /// Index of the trunk's last full-attention layer (drafter's full
@@ -3263,9 +3211,9 @@ pub(crate) mod imp {
                 .forward_array_last_token(&step_a_input, cache)
                 .context("mtp_step: Step A trunk forward")?;
             self.set_mtp_capture_enabled(false);
-            let trunk_h_at_m = self.take_captured_last_h().ok_or_else(|| {
-                anyhow!("mtp_step: Step A failed to capture trunk last hidden")
-            })?;
+            let trunk_h_at_m = self
+                .take_captured_last_h()
+                .ok_or_else(|| anyhow!("mtp_step: Step A failed to capture trunk last hidden"))?;
             let next_token = self
                 .argmax_last_token(&logits_a)
                 .context("mtp_step: Step A argmax next_token")?;
@@ -3285,11 +3233,8 @@ pub(crate) mod imp {
                 let trunk_embed_raw = self
                     .embed_lookup_affine(&tok_arr)
                     .with_context(|| format!("mtp_step: Step B embed lookup k={k}"))?;
-                let trunk_embed = mlx_rs::ops::multiply(
-                    &trunk_embed_raw,
-                    &self.const_embed_scale,
-                )
-                .with_context(|| format!("mtp_step: Step B embed × scale k={k}"))?;
+                let trunk_embed = mlx_rs::ops::multiply(&trunk_embed_raw, &self.const_embed_scale)
+                    .with_context(|| format!("mtp_step: Step B embed × scale k={k}"))?;
                 let (k_full, v_full) = cache
                     .layer_kv_bf16(last_full_idx)
                     .with_context(|| format!("mtp_step: Step B KV(full) k={k}"))?;
@@ -3361,7 +3306,10 @@ pub(crate) mod imp {
             // runs aren't slowed by an std::env hit per step (cached via
             // OnceLock would be ideal; this is one-shot debugging so plain
             // env::var is fine).
-            if std::env::var("LUMEN_MTP_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("LUMEN_MTP_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 eprintln!(
                     "[mtp_step m_pre={m_pre}] next_token={next_token} drafts={drafts:?} preds={preds:?}"
                 );
@@ -3449,7 +3397,10 @@ pub(crate) mod imp {
             corpus.push(next_token);
             let drafts = find_lookup_draft(&corpus, n_lookup, n_draft);
 
-            if std::env::var("LUMEN_LOOKUP_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("LUMEN_LOOKUP_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 eprintln!(
                     "[lookup_step m_pre={m_pre}] next={next_token} drafts={drafts:?} \
                      (n_lookup={n_lookup}, n_draft={n_draft}, corpus_len={})",
@@ -3641,7 +3592,11 @@ pub(crate) mod imp {
             let time_substages = gemma4_any_breakdown_active();
 
             // (1+2+3) Q/K/V projections (3 qmatmul + 3 reshape).
-            let qkvo_start = if time_substages { Some(Instant::now()) } else { None };
+            let qkvo_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let q_raw = Self::qmatmul(&lw.attn.q_proj, x)?;
             let q = mlx_rs::ops::reshape(&q_raw, &[b, l, n_heads, head_dim])
                 .context("attn: reshape Q failed")?;
@@ -3670,7 +3625,11 @@ pub(crate) mod imp {
             // (+34 ms regression at PROMPT_LEN=4096). Removed 2026-05-14;
             // future fusion work must use the M4.8 mlx Primitive pattern,
             // not the bridge.
-            let norms_start = if time_substages { Some(Instant::now()) } else { None };
+            let norms_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
 
             let q_n = rms_norm(&q, &lw.attn.q_norm, eps).context("attn: q_norm")?;
             let k_n = rms_norm(&k_4d, &lw.attn.k_norm, eps).context("attn: k_norm")?;
@@ -3690,7 +3649,11 @@ pub(crate) mod imp {
             // documented `LUMEN_GEMMA4_ROPE_PRECOMPUTE_FREQS=1`
             // as WASH (no perf gain vs per-call arange+pow); precompute path
             // removed 2026-05-14.
-            let rope_start = if time_substages { Some(Instant::now()) } else { None };
+            let rope_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             // Full attention layers use mlx_lm's `ProportionalRoPE`: freqs are
             // computed against the FULL head_dim (denominator = head_dim, NOT
             // the partial rope_dim), with `(head_dim - rope_dim)/2` trailing
@@ -3739,7 +3702,11 @@ pub(crate) mod imp {
             // mlx::quantized_matmul + softmax + quantized_matmul. Bypasses
             // the bf16 dispatch tree below entirely and jumps straight to
             // the o_proj path with the resulting attn_out.
-            let cache_start = if time_substages { Some(Instant::now()) } else { None };
+            let cache_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             if let NativeGemma4LayerCache::FullQuantized(c) = cache {
                 let (kt, vt) = c.update_and_fetch(&k_rope, &v_t)?;
                 let gs = c.group_size();
@@ -3760,24 +3727,25 @@ pub(crate) mod imp {
                 let n_kv_i = n_kv;
                 let head_dim_i = head_dim;
                 let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) =
-                    if n_repeats > 1 {
-                        let q_reshaped = mlx_rs::ops::reshape(
-                            &q_rope,
-                            &[b_i, n_kv_i, n_repeats, l_i, head_dim_i],
-                        )
-                        .context("qkv_quant: reshape Q for GQA")?;
-                        let exp = |a: &Array| -> Result<Array> {
-                            mlx_rs::ops::expand_dims(a, -3)
-                                .context("qkv_quant: expand_dims(K/V, -3)")
-                        };
-                        let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                        let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                        (q_reshaped, kt2, vt2, true)
-                    } else {
-                        (q_rope.clone(), kt, vt, false)
+                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
+                {
+                    let q_reshaped =
+                        mlx_rs::ops::reshape(&q_rope, &[b_i, n_kv_i, n_repeats, l_i, head_dim_i])
+                            .context("qkv_quant: reshape Q for GQA")?;
+                    let exp = |a: &Array| -> Result<Array> {
+                        mlx_rs::ops::expand_dims(a, -3).context("qkv_quant: expand_dims(K/V, -3)")
                     };
-                let sdpa_start = if time_substages { Some(Instant::now()) } else { None };
+                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
+                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
+                    (q_reshaped, kt2, vt2, true)
+                } else {
+                    (q_rope.clone(), kt, vt, false)
+                };
+                let sdpa_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 // scores = Q @ K^T  (Q is bf16, K is quantized)
                 let scores = mlx_rs::ops::quantized_matmul(
                     &q_for_qmm,
@@ -3792,11 +3760,14 @@ pub(crate) mod imp {
                 // Apply causal mask if multi-token (prefill); decode L=1 needs no mask.
                 let scores_masked = if (l_i as usize) > 1 {
                     let mask = make_attention_mask_for_layer_chunked(
-                        kind, cfg, l_i as usize, kv_offset as usize, kv_actual_q,
+                        kind,
+                        cfg,
+                        l_i as usize,
+                        kv_offset as usize,
+                        kv_actual_q,
                     )?;
                     match mask {
-                        Some(m) => mlx_rs::ops::add(&scores, &m)
-                            .context("qkv_quant: add mask")?,
+                        Some(m) => mlx_rs::ops::add(&scores, &m).context("qkv_quant: add mask")?,
                         None => scores,
                     }
                 } else {
@@ -3832,12 +3803,15 @@ pub(crate) mod imp {
                 }
 
                 // Jump directly to o_proj path (skipping the bf16 dispatch tree).
-                let oproj_start = if time_substages { Some(Instant::now()) } else { None };
+                let oproj_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant: transpose output")?;
-                let attn_flat =
-                    mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
-                        .context("qkv_quant: reshape output flat")?;
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                    .context("qkv_quant: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -3885,24 +3859,28 @@ pub(crate) mod imp {
                 let n_kv_i = n_kv;
                 let head_dim_i = head_dim;
                 let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) =
-                    if n_repeats > 1 {
-                        let q_reshaped = mlx_rs::ops::reshape(
-                            &q_for_rotation,
-                            &[b_i, n_kv_i, n_repeats, l_i, head_dim_i],
-                        )
-                        .context("qkv_quant_sliding: reshape Q for GQA")?;
-                        let exp = |a: &Array| -> Result<Array> {
-                            mlx_rs::ops::expand_dims(a, -3)
-                                .context("qkv_quant_sliding: expand_dims(K/V, -3)")
-                        };
-                        let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                        let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                        (q_reshaped, kt2, vt2, true)
-                    } else {
-                        (q_for_rotation, kt, vt, false)
+                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
+                {
+                    let q_reshaped = mlx_rs::ops::reshape(
+                        &q_for_rotation,
+                        &[b_i, n_kv_i, n_repeats, l_i, head_dim_i],
+                    )
+                    .context("qkv_quant_sliding: reshape Q for GQA")?;
+                    let exp = |a: &Array| -> Result<Array> {
+                        mlx_rs::ops::expand_dims(a, -3)
+                            .context("qkv_quant_sliding: expand_dims(K/V, -3)")
                     };
-                let sdpa_start = if time_substages { Some(Instant::now()) } else { None };
+                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
+                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
+                    (q_reshaped, kt2, vt2, true)
+                } else {
+                    (q_for_rotation, kt, vt, false)
+                };
+                let sdpa_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 // scores = Q @ K^T  (Q is bf16, K is quantized)
                 let scores = mlx_rs::ops::quantized_matmul(
                     &q_for_qmm,
@@ -3920,11 +3898,16 @@ pub(crate) mod imp {
                 // output regardless of ring order — no mask needed.
                 let scores_masked = if (l_i as usize) > 1 {
                     let mask = make_attention_mask_for_layer_chunked(
-                        kind, cfg, l_i as usize, kv_offset as usize, kv_actual_q,
+                        kind,
+                        cfg,
+                        l_i as usize,
+                        kv_offset as usize,
+                        kv_actual_q,
                     )?;
                     match mask {
-                        Some(m) => mlx_rs::ops::add(&scores, &m)
-                            .context("qkv_quant_sliding: add mask")?,
+                        Some(m) => {
+                            mlx_rs::ops::add(&scores, &m).context("qkv_quant_sliding: add mask")?
+                        }
                         None => scores,
                     }
                 } else {
@@ -3956,12 +3939,15 @@ pub(crate) mod imp {
                 if let Some(t0) = sdpa_start {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let oproj_start = if time_substages { Some(Instant::now()) } else { None };
+                let oproj_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant_sliding: transpose output")?;
-                let attn_flat =
-                    mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
-                        .context("qkv_quant_sliding: reshape output flat")?;
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                    .context("qkv_quant_sliding: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4098,12 +4084,11 @@ pub(crate) mod imp {
                     };
                     if use_fused {
                         crate::turboquant::lloyd_max_quantize_stage1_fused(
-                            &v_for_encode, &centroids,
+                            &v_for_encode,
+                            &centroids,
                         )?
                     } else {
-                        crate::turboquant::lloyd_max_quantize_stage1(
-                            &v_for_encode, &centroids,
-                        )?
+                        crate::turboquant::lloyd_max_quantize_stage1(&v_for_encode, &centroids)?
                     }
                 };
 
@@ -4146,110 +4131,129 @@ pub(crate) mod imp {
                 let sv_inline_enabled = std::env::var("LUMEN_GEMMA4_TQ_SV_INLINE")
                     .map(|s| s == "1")
                     .unwrap_or(false);
-                let do_inline = qk_inline_enabled
-                    && (l as usize) == 1
-                    && qjl_m.is_none();
+                let do_inline = qk_inline_enabled && (l as usize) == 1 && qjl_m.is_none();
                 // Stage 3 (`turboquant_sv_inline`) requires Stage 2 active +
                 // V stays in rotated space (Wo bake absorbs the un-rotation).
                 // When `unrotate_v_dq=true` the runtime applies Rᵀ to V_dq
                 // before SDPA — the inline kernel can't do that, so fall back
                 // to materialized V on that path.
                 let do_sv_inline = do_inline && sv_inline_enabled && !unrotate_v_dq;
-                let (kv_actual_tq, k_dq_opt, v_dq_opt, kc_inline, ks_inline,
-                     vc_inline, vs_inline) = if let Some(m) = qjl_m {
-                    // Local Stage-1 K dequant for residual computation.
-                    let k_dq_local = crate::turboquant::lloyd_max_dequantize_scaled(
-                        &k_codes, &k_sigma, &centroids,
-                    )?;
-                    let qjl_proj = crate::turboquant::qjl_projection_matrix_f32(
-                        head_dim as usize, m, crate::turboquant::TURBOQUANT_SEED,
-                    )?;
-                    // Packed encode: signs stored as u32 [..., ceil(m/32)]
-                    // — 16× smaller than the bf16 ±1 [..., m] equivalent.
-                    let (k_signs_packed, k_rnorm) =
-                        crate::turboquant::qjl_encode_stage2_packed(
-                            &k_rot, &k_dq_local, &qjl_proj,
+                let (kv_actual_tq, k_dq_opt, v_dq_opt, kc_inline, ks_inline, vc_inline, vs_inline) =
+                    if let Some(m) = qjl_m {
+                        // Local Stage-1 K dequant for residual computation.
+                        let k_dq_local = crate::turboquant::lloyd_max_dequantize_scaled(
+                            &k_codes, &k_sigma, &centroids,
                         )?;
+                        let qjl_proj = crate::turboquant::qjl_projection_matrix_f32(
+                            head_dim as usize,
+                            m,
+                            crate::turboquant::TURBOQUANT_SEED,
+                        )?;
+                        // Packed encode: signs stored as u32 [..., ceil(m/32)]
+                        // — 16× smaller than the bf16 ±1 [..., m] equivalent.
+                        let (k_signs_packed, k_rnorm) =
+                            crate::turboquant::qjl_encode_stage2_packed(
+                                &k_rot,
+                                &k_dq_local,
+                                &qjl_proj,
+                            )?;
 
-                    let ((kc, ks, ksg, krn), (vc, vs)) = c.update_and_fetch_qjl(
-                        &k_codes, &k_sigma, &k_signs_packed, &k_rnorm,
-                        &v_codes, &v_sigma,
-                    )?;
-                    let kv_actual_tq = kc.shape()[2] as usize;
-                    if let Some(t0) = cache_start {
-                        bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
-                    }
-                    let k_dq = crate::turboquant::lloyd_max_dequantize_scaled(
-                        &kc, &ks, &centroids,
-                    )?;
-                    let v_dq = crate::turboquant::lloyd_max_dequantize_scaled(
-                        &vc, &vs, &centroids,
-                    )?;
-                    let k_eff = crate::turboquant::qjl_apply_correction_packed(
-                        &k_dq, &ksg, &krn, &qjl_proj, m,
-                    )?;
-                    // If V was rotated for encode, un-rotate V_dq back into
-                    // the original head_dim space: V ≈ V_rot · Rᵀ.
-                    // Skipped when R is baked into Wo (un-rotation absorbed
-                    // there).
-                    let v_dq = if unrotate_v_dq {
-                        let r_t = mlx_rs::ops::transpose_axes(&r_arr, &[1, 0])
-                            .context("tq_sliding: Rᵀ for V un-rotate")?;
-                        crate::turboquant::rotate_last_axis(&v_dq, &r_t)?
-                    } else {
-                        v_dq
-                    };
-                    (kv_actual_tq, Some(k_eff), Some(v_dq), None, None, None, None)
-                } else {
-                    let ((kc, ks), (vc, vs)) =
-                        c.update_and_fetch(&k_codes, &k_sigma, &v_codes, &v_sigma)?;
-                    let kv_actual_tq = kc.shape()[2] as usize;
-                    if let Some(t0) = cache_start {
-                        bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
-                    }
-                    // Materialize K_dq only when NOT taking the Stage-2 inline
-                    // path. When `do_inline` is true the custom kernel reads
-                    // K_codes (uint8) + K_sigma directly — skipping the 32 MB
-                    // bf16 K_dq round-trip is the whole point of Stage 2.
-                    let k_dq_opt = if do_inline {
-                        None
-                    } else {
-                        Some(crate::turboquant::lloyd_max_dequantize_scaled(
-                            &kc, &ks, &centroids,
-                        )?)
-                    };
-                    // Symmetric V-side skip: when Stage 3 (`turboquant_sv_inline`)
-                    // is active, V_dq never materializes — the kernel reads
-                    // V_codes + V_sigma inline. Requires bake_o=ON so V stays
-                    // in rotated space all the way through SDPA → o_proj.
-                    let v_dq_opt = if do_sv_inline {
-                        None
-                    } else {
-                        let v_dq = crate::turboquant::lloyd_max_dequantize_scaled(
-                            &vc, &vs, &centroids,
+                        let ((kc, ks, ksg, krn), (vc, vs)) = c.update_and_fetch_qjl(
+                            &k_codes,
+                            &k_sigma,
+                            &k_signs_packed,
+                            &k_rnorm,
+                            &v_codes,
+                            &v_sigma,
                         )?;
+                        let kv_actual_tq = kc.shape()[2] as usize;
+                        if let Some(t0) = cache_start {
+                            bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                        let k_dq =
+                            crate::turboquant::lloyd_max_dequantize_scaled(&kc, &ks, &centroids)?;
+                        let v_dq =
+                            crate::turboquant::lloyd_max_dequantize_scaled(&vc, &vs, &centroids)?;
+                        let k_eff = crate::turboquant::qjl_apply_correction_packed(
+                            &k_dq, &ksg, &krn, &qjl_proj, m,
+                        )?;
+                        // If V was rotated for encode, un-rotate V_dq back into
+                        // the original head_dim space: V ≈ V_rot · Rᵀ.
+                        // Skipped when R is baked into Wo (un-rotation absorbed
+                        // there).
                         let v_dq = if unrotate_v_dq {
                             let r_t = mlx_rs::ops::transpose_axes(&r_arr, &[1, 0])
-                                .context("tq_sliding: Rᵀ for V un-rotate (non-QJL)")?;
+                                .context("tq_sliding: Rᵀ for V un-rotate")?;
                             crate::turboquant::rotate_last_axis(&v_dq, &r_t)?
                         } else {
                             v_dq
                         };
-                        Some(v_dq)
-                    };
-                    let (kc_inline, ks_inline) = if do_inline {
-                        (Some(kc), Some(ks))
+                        (
+                            kv_actual_tq,
+                            Some(k_eff),
+                            Some(v_dq),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
                     } else {
-                        (None, None)
+                        let ((kc, ks), (vc, vs)) =
+                            c.update_and_fetch(&k_codes, &k_sigma, &v_codes, &v_sigma)?;
+                        let kv_actual_tq = kc.shape()[2] as usize;
+                        if let Some(t0) = cache_start {
+                            bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
+                        }
+                        // Materialize K_dq only when NOT taking the Stage-2 inline
+                        // path. When `do_inline` is true the custom kernel reads
+                        // K_codes (uint8) + K_sigma directly — skipping the 32 MB
+                        // bf16 K_dq round-trip is the whole point of Stage 2.
+                        let k_dq_opt = if do_inline {
+                            None
+                        } else {
+                            Some(crate::turboquant::lloyd_max_dequantize_scaled(
+                                &kc, &ks, &centroids,
+                            )?)
+                        };
+                        // Symmetric V-side skip: when Stage 3 (`turboquant_sv_inline`)
+                        // is active, V_dq never materializes — the kernel reads
+                        // V_codes + V_sigma inline. Requires bake_o=ON so V stays
+                        // in rotated space all the way through SDPA → o_proj.
+                        let v_dq_opt = if do_sv_inline {
+                            None
+                        } else {
+                            let v_dq = crate::turboquant::lloyd_max_dequantize_scaled(
+                                &vc, &vs, &centroids,
+                            )?;
+                            let v_dq = if unrotate_v_dq {
+                                let r_t = mlx_rs::ops::transpose_axes(&r_arr, &[1, 0])
+                                    .context("tq_sliding: Rᵀ for V un-rotate (non-QJL)")?;
+                                crate::turboquant::rotate_last_axis(&v_dq, &r_t)?
+                            } else {
+                                v_dq
+                            };
+                            Some(v_dq)
+                        };
+                        let (kc_inline, ks_inline) = if do_inline {
+                            (Some(kc), Some(ks))
+                        } else {
+                            (None, None)
+                        };
+                        let (vc_inline, vs_inline) = if do_sv_inline {
+                            (Some(vc), Some(vs))
+                        } else {
+                            (None, None)
+                        };
+                        (
+                            kv_actual_tq,
+                            k_dq_opt,
+                            v_dq_opt,
+                            kc_inline,
+                            ks_inline,
+                            vc_inline,
+                            vs_inline,
+                        )
                     };
-                    let (vc_inline, vs_inline) = if do_sv_inline {
-                        (Some(vc), Some(vs))
-                    } else {
-                        (None, None)
-                    };
-                    (kv_actual_tq, k_dq_opt, v_dq_opt, kc_inline, ks_inline,
-                     vc_inline, vs_inline)
-                };
 
                 // bf16 SDPA on (Q_rotated, K_dequant_rotated, V_dequant_orig).
                 // Score Q_rot · K_rot equals Q · K (orthogonal R), and V is in
@@ -4258,7 +4262,11 @@ pub(crate) mod imp {
                 // Stage-2 inline path (decode L=1, env gate, QJL off) replaces
                 // (K_dq materialize → fused mlx SDPA) with
                 //   (Q @ K_codes inline → softmax → GQA matmul with V_dq).
-                let sdpa_start = if time_substages { Some(Instant::now()) } else { None };
+                let sdpa_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let attn_out = if (l as usize) > 1 {
                     // Prefill: build causal+window mask for sliding kind.
                     let k_dq = k_dq_opt
@@ -4268,15 +4276,17 @@ pub(crate) mod imp {
                         .as_ref()
                         .expect("tq_sliding prefill requires materialized V_dq");
                     let mask = make_attention_mask_for_layer_chunked(
-                        kind, cfg, l as usize, kv_offset as usize, kv_actual_tq,
+                        kind,
+                        cfg,
+                        l as usize,
+                        kv_offset as usize,
+                        kv_actual_tq,
                     )?;
                     match mask {
                         Some(m) => sdpa_with_mask(&q_rot, k_dq, v_dq, 1.0, &m)?,
                         None => sdpa(&q_rot, k_dq, v_dq, 1.0, false)?,
                     }
-                } else if let (Some(kc), Some(ks)) =
-                    (kc_inline.as_ref(), ks_inline.as_ref())
-                {
+                } else if let (Some(kc), Some(ks)) = (kc_inline.as_ref(), ks_inline.as_ref()) {
                     // Stage-2 inline path: scores = Q · K_dq^T inline, then
                     // softmax + GQA matmul with V_dq. Skips the K_dq DRAM
                     // round-trip. Mask not needed at decode (the sliding
@@ -4286,41 +4296,29 @@ pub(crate) mod imp {
                     // custom kernel for the reference (dequant K_dq → mlx
                     // matmul). Isolates whether end-to-end garbage is due to
                     // the kernel or the post-kernel softmax+GQA-matmul wiring.
-                    let use_ref = std::env::var(
-                        "LUMEN_GEMMA4_TQ_QK_INLINE_REF",
-                    )
-                    .map(|s| s == "1")
-                    .unwrap_or(false);
+                    let use_ref = std::env::var("LUMEN_GEMMA4_TQ_QK_INLINE_REF")
+                        .map(|s| s == "1")
+                        .unwrap_or(false);
                     let scores = if use_ref {
                         let k_dq_dbg =
-                            crate::turboquant::lloyd_max_dequantize_scaled(
-                                kc, ks, &centroids,
-                            )?;
-                        let k_dq_t =
-                            mlx_rs::ops::transpose_axes(&k_dq_dbg, &[0, 1, 3, 2])?;
+                            crate::turboquant::lloyd_max_dequantize_scaled(kc, ks, &centroids)?;
+                        let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq_dbg, &[0, 1, 3, 2])?;
                         let group_d = n_heads / n_kv;
                         let kv_i = kc.shape()[2];
-                        let k_t_r = mlx_rs::ops::reshape(
-                            &k_dq_t,
-                            &[b, n_kv, 1, head_dim, kv_i],
-                        )?;
-                        let k_t_bcast = mlx_rs::ops::broadcast_to(
-                            &k_t_r,
-                            &[b, n_kv, group_d, head_dim, kv_i],
-                        )?;
-                        let k_t_full = mlx_rs::ops::reshape(
-                            &k_t_bcast,
-                            &[b, n_heads, head_dim, kv_i],
-                        )?;
+                        let k_t_r = mlx_rs::ops::reshape(&k_dq_t, &[b, n_kv, 1, head_dim, kv_i])?;
+                        let k_t_bcast =
+                            mlx_rs::ops::broadcast_to(&k_t_r, &[b, n_kv, group_d, head_dim, kv_i])?;
+                        let k_t_full =
+                            mlx_rs::ops::reshape(&k_t_bcast, &[b, n_heads, head_dim, kv_i])?;
                         mlx_rs::ops::matmul(&q_rot, &k_t_full)?
                     } else {
-                        crate::turboquant::turboquant_qk_inline(
-                            &q_rot, kc, ks, &centroids,
-                        )?
+                        crate::turboquant::turboquant_qk_inline(&q_rot, kc, ks, &centroids)?
                     };
                     let last_axis = (scores.ndim() as i32) - 1;
                     let attn_w = mlx_rs::ops::softmax_axis(
-                        &scores, last_axis, /* precise */ Some(true),
+                        &scores,
+                        last_axis,
+                        /* precise */ Some(true),
                     )
                     .context("tq_sliding inline: softmax over scores")?;
                     // Stage 3 inline: when V codes are plumbed
@@ -4332,12 +4330,8 @@ pub(crate) mod imp {
                     // Fallback: when Stage 3 is disabled or bake_o=OFF
                     // (V_dq needed in original head_dim space), do the
                     // GQA reshape matmul against materialized V_dq.
-                    if let (Some(vc), Some(vs)) =
-                        (vc_inline.as_ref(), vs_inline.as_ref())
-                    {
-                        crate::turboquant::turboquant_sv_inline(
-                            &attn_w, vc, vs, &centroids,
-                        )?
+                    if let (Some(vc), Some(vs)) = (vc_inline.as_ref(), vs_inline.as_ref()) {
+                        crate::turboquant::turboquant_sv_inline(&attn_w, vc, vs, &centroids)?
                     } else {
                         // GQA matmul: attn_w [B, H, 1, N] @ v_dq
                         // [B, H_kv, N, D]. Reshape to broadcast along the
@@ -4348,16 +4342,12 @@ pub(crate) mod imp {
                         let n_kv_local = n_kv;
                         let kv_actual_i = kv_actual_tq as i32;
                         let group = n_heads / n_kv_local;
-                        let attn_w_r = mlx_rs::ops::reshape(
-                            &attn_w,
-                            &[b, n_kv_local, group, 1, kv_actual_i],
-                        )
-                        .context("tq_sliding inline: reshape attn_w for GQA")?;
-                        let v_dq_r = mlx_rs::ops::reshape(
-                            v_dq,
-                            &[b, n_kv_local, 1, kv_actual_i, head_dim],
-                        )
-                        .context("tq_sliding inline: reshape v_dq for GQA")?;
+                        let attn_w_r =
+                            mlx_rs::ops::reshape(&attn_w, &[b, n_kv_local, group, 1, kv_actual_i])
+                                .context("tq_sliding inline: reshape attn_w for GQA")?;
+                        let v_dq_r =
+                            mlx_rs::ops::reshape(v_dq, &[b, n_kv_local, 1, kv_actual_i, head_dim])
+                                .context("tq_sliding inline: reshape v_dq for GQA")?;
                         let attn_out_r = mlx_rs::ops::matmul(&attn_w_r, &v_dq_r)
                             .context("tq_sliding inline: GQA matmul attn_w @ V")?;
                         mlx_rs::ops::reshape(&attn_out_r, &[b, n_heads, 1, head_dim])
@@ -4379,12 +4369,15 @@ pub(crate) mod imp {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
 
-                let oproj_start = if time_substages { Some(Instant::now()) } else { None };
+                let oproj_start = if time_substages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3])
                     .context("tq_sliding: transpose output")?;
-                let attn_flat =
-                    mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
-                        .context("tq_sliding: reshape output flat")?;
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
+                    .context("tq_sliding: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4394,15 +4387,15 @@ pub(crate) mod imp {
             let (k_full, v_full) = match cache {
                 NativeGemma4LayerCache::Sliding(c) => c.update_and_fetch(&k_rope, &v_t)?,
                 NativeGemma4LayerCache::Full(c) => c.update_and_fetch(&k_rope, &v_t)?,
-                NativeGemma4LayerCache::FullQuantized(_) => unreachable!(
-                    "FullQuantized handled in early return above"
-                ),
-                NativeGemma4LayerCache::SlidingQuantized(_) => unreachable!(
-                    "SlidingQuantized handled in early return above"
-                ),
-                NativeGemma4LayerCache::SlidingTurboquant(_) => unreachable!(
-                    "SlidingTurboquant handled in early return above"
-                ),
+                NativeGemma4LayerCache::FullQuantized(_) => {
+                    unreachable!("FullQuantized handled in early return above")
+                }
+                NativeGemma4LayerCache::SlidingQuantized(_) => {
+                    unreachable!("SlidingQuantized handled in early return above")
+                }
+                NativeGemma4LayerCache::SlidingTurboquant(_) => {
+                    unreachable!("SlidingTurboquant handled in early return above")
+                }
             };
             if let Some(t0) = cache_start {
                 bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4434,7 +4427,11 @@ pub(crate) mod imp {
                 v_full.eval().context("sdpa_pre_eval: v_full")?;
             }
 
-            let sdpa_start = if time_substages { Some(Instant::now()) } else { None };
+            let sdpa_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             // Mask builder is chunked-aware: derive kv_actual from the K
             // tensor returned by the cache so a rotated sliding-window
             // cache (chunked prefill chunk N≥2) gets a mask sized to its
@@ -4470,9 +4467,9 @@ pub(crate) mod imp {
             let dtype_bf16 = q_rope.dtype() == mlx_rs::Dtype::Bfloat16
                 && k_full.dtype() == mlx_rs::Dtype::Bfloat16
                 && v_full.dtype() == mlx_rs::Dtype::Bfloat16;
-            let prefill_kernel_enabled =
-                std::env::var("LUMEN_GEMMA4_PREFILL_KERNEL")
-                    .map(|v| v == "1").unwrap_or(false);
+            let prefill_kernel_enabled = std::env::var("LUMEN_GEMMA4_PREFILL_KERNEL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let prefill_kernel_eligible = prefill_kernel_enabled
                 && (l as usize) > 1
                 && dtype_bf16
@@ -4494,10 +4491,9 @@ pub(crate) mod imp {
             //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
             //   - dtype bf16
             // Env: LUMEN_GEMMA4_SDPA_WINDOWED=0 opts out.
-            let sdpa_windowed_enabled =
-                std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+            let sdpa_windowed_enabled = std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             // Chunked-prefill rotation support (2026-05-15 follow-up): the
             // steel kernel's window check `row_pos - col_pos >= W` is
             // computed in K-relative coordinates (both row_pos and col_pos
@@ -4528,7 +4524,11 @@ pub(crate) mod imp {
                 None
             } else {
                 make_attention_mask_for_layer_chunked(
-                    kind, cfg, l as usize, kv_offset as usize, kv_actual,
+                    kind,
+                    cfg,
+                    l as usize,
+                    kv_offset as usize,
+                    kv_actual,
                 )?
             };
             // Tight timer: bracket ONLY the sdpa() / sdpa_with_mask() call,
@@ -4536,7 +4536,11 @@ pub(crate) mod imp {
             // If this stays in the μs range while attn.sdpa reads ms, the
             // delta is in the outer bookkeeping (timer / cell access /
             // make_mask / drops).
-            let tight_start = if time_substages { Some(Instant::now()) } else { None };
+            let tight_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             // strided-cache-aware kernel LANDED 2026-05-14.
             // `NativeKvCache::update_and_fetch` returns a slice view over a
             // step-allocated buffer where axis-1 (head) stride = `capacity*D`
@@ -4569,9 +4573,7 @@ pub(crate) mod imp {
             // Multi-token input already wouldn't run it correctly, so the
             // guard is sound independent of MTP mode.
             let q_is_decode_shape = q_rope.shape().get(2).copied() == Some(1);
-            let mtp_active_now = self
-                .mtp_active
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let mtp_active_now = self.mtp_active.load(std::sync::atomic::Ordering::Relaxed);
             let use_custom_flash = !prefill_kernel_eligible
                 && !use_sdpa_windowed
                 && q_is_decode_shape
@@ -4606,9 +4608,7 @@ pub(crate) mod imp {
                 && kv_actual_now == (kv_offset as usize + l as usize);
             let attn_out = if prefill_kernel_eligible {
                 let window: u32 = match kind {
-                    NativeGemma4LayerType::SlidingAttention => {
-                        cfg.sliding_window as u32
-                    }
+                    NativeGemma4LayerType::SlidingAttention => cfg.sliding_window as u32,
                     NativeGemma4LayerType::FullAttention => 0,
                 };
                 let stream = mlx_rs::Stream::gpu();
@@ -4658,12 +4658,15 @@ pub(crate) mod imp {
 
             // (8) Reshape back to [B, L, n_heads * head_dim] and apply o_proj.
             // Bucketed under qkvo since o_proj is one of the 4 projections.
-            let oproj_start = if time_substages { Some(Instant::now()) } else { None };
+            let oproj_start = if time_substages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let attn_t = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3])
                 .context("attn: transpose output failed")?;
-            let attn_flat =
-                mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
-                    .context("attn: reshape output failed")?;
+            let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
+                .context("attn: reshape output failed")?;
             let out = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
             if let Some(t0) = oproj_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4691,8 +4694,7 @@ pub(crate) mod imp {
             } else {
                 let activated = mlx_rs::nn::gelu_approximate(gate)
                     .context("geglu_apply: gelu_approx failed")?;
-                mlx_rs::ops::multiply(&activated, up)
-                    .context("geglu_apply: gelu * up failed")
+                mlx_rs::ops::multiply(&activated, up).context("geglu_apply: gelu * up failed")
             }
         }
 
@@ -4705,10 +4707,7 @@ pub(crate) mod imp {
         /// three projections is missing biases (the compile slot's args layout
         /// requires 10 arrays — biases must be present). Gemma 4's affine
         /// quantization always emits biases, so case (b) is a defensive guard.
-        fn dense_mlp_forward(
-            x: &Array,
-            w: &ResolvedGemma4DenseMlpWeights,
-        ) -> Result<Array> {
+        fn dense_mlp_forward(x: &Array, w: &ResolvedGemma4DenseMlpWeights) -> Result<Array> {
             if gemma4_dense_mlp_fuse_enabled() {
                 if let Ok(out) = gemma4_dense_mlp_fused(x, w) {
                     return Ok(out);
@@ -4739,8 +4738,7 @@ pub(crate) mod imp {
             let top_k = cfg.top_k_experts as i32;
             let eps = cfg.rms_norm_eps;
 
-            let normed =
-                rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
+            let normed = rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
             let scores = Self::qmatmul(&w.proj, &normed)?;
             let last_axis = (scores.ndim() as i32) - 1;
             let num_experts = scores.shape()[last_axis as usize];
@@ -4788,8 +4786,7 @@ pub(crate) mod imp {
             //      Default ON via LUMEN_GEMMA4_FUSE_ROUTER. Fallback path
             //      below runs the same 3 ops separately for A/B parity.
             if gemma4_router_fuse_enabled() {
-                let weights =
-                    gemma4_routing_fused_tail(&scores, &indices, &w.per_expert_scale)?;
+                let weights = gemma4_routing_fused_tail(&scores, &indices, &w.per_expert_scale)?;
                 Ok((indices, weights))
             } else {
                 let top_logits = scores
@@ -4801,9 +4798,8 @@ pub(crate) mod imp {
                     /* precise */ Some(true),
                 )
                 .context("router: softmax over top-k failed")?;
-                let per_expert =
-                    mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, &indices, 0)
-                        .context("router: take_axis(per_expert_scale, indices) failed")?;
+                let per_expert = mlx_rs::ops::indexing::take_axis(&w.per_expert_scale, &indices, 0)
+                    .context("router: take_axis(per_expert_scale, indices) failed")?;
                 let weights = mlx_rs::ops::multiply(&weights, &per_expert)
                     .context("router: weights × per_expert_scale failed")?;
                 Ok((indices, weights))
@@ -4858,9 +4854,8 @@ pub(crate) mod imp {
                     .context("experts: order // K floor_divide failed")?;
                 let x_sorted = mlx_rs::ops::indexing::take_axis(&x_flat, &row_idx, 0)
                     .context("experts: take_axis(x_flat, order // K) failed")?;
-                let idx_sorted =
-                    mlx_rs::ops::indexing::take_axis(&inds_flat, &order, 0)
-                        .context("experts: take_axis(inds_flat, order) failed")?;
+                let idx_sorted = mlx_rs::ops::indexing::take_axis(&inds_flat, &order, 0)
+                    .context("experts: take_axis(inds_flat, order) failed")?;
                 (x_sorted, idx_sorted, Some(inv_order))
             } else {
                 (x_5d, indices.clone(), None)
@@ -4974,9 +4969,8 @@ pub(crate) mod imp {
 
             // Unsort + reshape to [B, L, K, 1, hidden], squeeze axis -2.
             let recombined = if let Some(inv_order) = inv_order_opt {
-                let reordered =
-                    mlx_rs::ops::indexing::take_axis(&down, &inv_order, 0)
-                        .context("experts: take_axis(down, inv_order) failed")?;
+                let reordered = mlx_rs::ops::indexing::take_axis(&down, &inv_order, 0)
+                    .context("experts: take_axis(down, inv_order) failed")?;
                 mlx_rs::ops::unflatten(&reordered, 0, &[b, l, k])
                     .context("experts: unflatten(0, [B,L,K]) failed")?
             } else {
@@ -5031,7 +5025,11 @@ pub(crate) mod imp {
             let residual: &Array = x;
             let h = rms_norm(x, &lw.input_layernorm, eps).context("layer: input_layernorm")?;
 
-            let attn_start = if time_stages { Some(Instant::now()) } else { None };
+            let attn_start = if time_stages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let h = self.layer_attention_forward(&h, layer_idx, cache)?;
             if let Some(t0) = attn_start {
                 if !skip_eval_barriers {
@@ -5043,9 +5041,7 @@ pub(crate) mod imp {
                 bump_gemma4_attn_ms(ms);
                 match lw.kind {
                     NativeGemma4LayerType::FullAttention => bump_gemma4_attn_full_ms(ms),
-                    NativeGemma4LayerType::SlidingAttention => {
-                        bump_gemma4_attn_sliding_ms(ms)
-                    }
+                    NativeGemma4LayerType::SlidingAttention => bump_gemma4_attn_sliding_ms(ms),
                 }
             }
 
@@ -5064,7 +5060,11 @@ pub(crate) mod imp {
             // Dense MLP path: pre_ff_norm → mlp → post_ff_1
             // Tier 2C (2026-05-16) — opt-in fuse path absorbs both norms
             // into the dense_mlp compile slot (3 launches → 1).
-            let dense_start = if time_stages { Some(Instant::now()) } else { None };
+            let dense_start = if time_stages {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let h1 = if gemma4_pre_post_norm_dense_mlp_fuse_enabled() {
                 match gemma4_pre_post_norm_dense_mlp_fused(
                     &h,
@@ -5110,18 +5110,28 @@ pub(crate) mod imp {
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
             {
-                let router_start = if time_stages { Some(Instant::now()) } else { None };
-                let (scores, indices) =
-                    self.router_compute_scores_indices(&h, &lw.router)?;
+                let router_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let (scores, indices) = self.router_compute_scores_indices(&h, &lw.router)?;
                 if let Some(t0) = router_start {
                     if !skip_eval_barriers {
-                        scores.eval().context("breakdown: eval after router (scores)")?;
-                        indices.eval().context("breakdown: eval after router (indices)")?;
+                        scores
+                            .eval()
+                            .context("breakdown: eval after router (scores)")?;
+                        indices
+                            .eval()
+                            .context("breakdown: eval after router (indices)")?;
                     }
                     bump_gemma4_router_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let experts_start =
-                    if time_stages { Some(Instant::now()) } else { None };
+                let experts_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let h2 = match gemma4_pre_post_norm_routing_experts_fused(
                     &scores,
                     &indices,
@@ -5159,9 +5169,12 @@ pub(crate) mod imp {
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
             {
-                let router_start = if time_stages { Some(Instant::now()) } else { None };
-                let (scores, indices) =
-                    self.router_compute_scores_indices(&h, &lw.router)?;
+                let router_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let (scores, indices) = self.router_compute_scores_indices(&h, &lw.router)?;
                 if let Some(t0) = router_start {
                     if !skip_eval_barriers {
                         scores
@@ -5175,8 +5188,11 @@ pub(crate) mod imp {
                 }
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
-                let experts_start =
-                    if time_stages { Some(Instant::now()) } else { None };
+                let experts_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let h2 = match gemma4_routing_experts_fused(
                     &scores,
                     &indices,
@@ -5204,19 +5220,31 @@ pub(crate) mod imp {
                 needs_post_norm_outside = true;
                 h2
             } else {
-                let router_start = if time_stages { Some(Instant::now()) } else { None };
+                let router_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let (indices, weights) = self.router_forward(&h, &lw.router)?;
                 if let Some(t0) = router_start {
                     if !skip_eval_barriers {
-                        indices.eval().context("breakdown: eval after router (indices)")?;
-                        weights.eval().context("breakdown: eval after router (weights)")?;
+                        indices
+                            .eval()
+                            .context("breakdown: eval after router (indices)")?;
+                        weights
+                            .eval()
+                            .context("breakdown: eval after router (weights)")?;
                     }
                     bump_gemma4_router_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
 
                 let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
                     .context("layer: pre_feedforward_layernorm_2")?;
-                let experts_start = if time_stages { Some(Instant::now()) } else { None };
+                let experts_start = if time_stages {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let h2 = self.experts_forward(&h2, &indices, &weights, &lw.experts)?;
                 if let Some(t0) = experts_start {
                     if !skip_eval_barriers {
@@ -5254,8 +5282,7 @@ pub(crate) mod imp {
                         let h = mlx_rs::ops::add(&h1, &h2).context("layer: h1 + h2")?;
                         let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
                             .context("layer: post_feedforward_layernorm")?;
-                        let h = mlx_rs::ops::add(residual, &h)
-                            .context("layer: +residual (ff)")?;
+                        let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (ff)")?;
                         mlx_rs::ops::multiply(&h, &lw.layer_scalar)
                             .context("layer: × layer_scalar")?
                     }
@@ -5265,8 +5292,7 @@ pub(crate) mod imp {
                 let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
                     .context("layer: post_feedforward_layernorm")?;
                 let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (ff)")?;
-                mlx_rs::ops::multiply(&h, &lw.layer_scalar)
-                    .context("layer: × layer_scalar")?
+                mlx_rs::ops::multiply(&h, &lw.layer_scalar).context("layer: × layer_scalar")?
             };
             Ok(h)
         }
@@ -5277,10 +5303,7 @@ pub(crate) mod imp {
         /// Gemma 4's affine `embed_tokens.biases`. We replicate the take_axis
         /// + dequantize_with_mode pattern with the optional biases plumbed
         /// through.
-        fn embed_lookup_affine(
-            &self,
-            token_ids: &Array,
-        ) -> Result<Array> {
+        fn embed_lookup_affine(&self, token_ids: &Array) -> Result<Array> {
             let embed = &self.embed_tokens;
             let selected_packed = embed
                 .weight
@@ -5321,11 +5344,9 @@ pub(crate) mod imp {
             // (`LUMEN_GEMMA4_FUSE_SOFTCAP=0`) falls back to the unfused
             // path; default ON.
             if gemma4_softcap_fuse_enabled() {
-                if let Ok(out) = gemma4_softcap_fused(
-                    logits,
-                    &self.const_softcap_inv,
-                    &self.const_softcap,
-                ) {
+                if let Ok(out) =
+                    gemma4_softcap_fused(logits, &self.const_softcap_inv, &self.const_softcap)
+                {
                     return Ok(out);
                 }
                 // Trace dispatch failed for some reason — fall through to
@@ -5334,8 +5355,7 @@ pub(crate) mod imp {
             let scaled = mlx_rs::ops::multiply(logits, &self.const_softcap_inv)
                 .context("softcap: logits × (1/cap) failed")?;
             let tanh = mlx_rs::ops::tanh(&scaled).context("softcap: tanh failed")?;
-            mlx_rs::ops::multiply(&tanh, &self.const_softcap)
-                .context("softcap: tanh × cap failed")
+            mlx_rs::ops::multiply(&tanh, &self.const_softcap).context("softcap: tanh × cap failed")
         }
 
         /// Full model forward: `[B, L]` token-id input → `[B, L, vocab]` logits.
@@ -5447,14 +5467,11 @@ pub(crate) mod imp {
             // (1) Token ids → quantized embedding rows (dequantized to bf16).
             // residual stream stays bf16 (legacy f32-cast
             // opt-out removed 2026-05-14).
-            let ids_flat = mlx_rs::ops::reshape(input_ids, &[l])
-                .context("forward: flatten input_ids")?;
+            let ids_flat =
+                mlx_rs::ops::reshape(input_ids, &[l]).context("forward: flatten input_ids")?;
             let embed_rows = self.embed_lookup_affine(&ids_flat)?; // [L, hidden] in bf16
-            let h = mlx_rs::ops::reshape(
-                &embed_rows,
-                &[1, l, cfg.hidden_size as i32],
-            )
-            .context("forward: reshape embed [B, L, H]")?;
+            let h = mlx_rs::ops::reshape(&embed_rows, &[1, l, cfg.hidden_size as i32])
+                .context("forward: reshape embed [B, L, H]")?;
 
             // (2) h *= sqrt(hidden_size) — Phase 1.5 P8: cached const_embed_scale.
             let h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
@@ -5489,8 +5506,8 @@ pub(crate) mod imp {
             }
 
             // (4) Final norm.
-            let h = rms_norm(&h, &self.final_norm, cfg.rms_norm_eps)
-                .context("forward: final_norm")?;
+            let h =
+                rms_norm(&h, &self.final_norm, cfg.rms_norm_eps).context("forward: final_norm")?;
             dump_hidden(&h, "final_norm")?;
 
             // MTP capture hook — when the drafter is active and the MTP
@@ -5582,12 +5599,9 @@ pub(crate) mod imp {
             // last_logits shape [B, 1, V] → argmax over axis -1, KEEPING the
             // squeezed axis so the result is [B, 1] = [1, 1], directly
             // feedable to forward_array.
-            let argmax = mlx_rs::ops::indexing::argmax_axis(
-                &last_logits,
-                -1,
-                /* keep_dims */ false,
-            )
-            .context("argmax_last_token_lazy: argmax_axis")?;
+            let argmax =
+                mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, /* keep_dims */ false)
+                    .context("argmax_last_token_lazy: argmax_axis")?;
             // Cast to Int32 for token-id semantics; result is lazy.
             argmax
                 .as_dtype(mlx_rs::Dtype::Int32)
@@ -5614,11 +5628,7 @@ pub(crate) mod imp {
         /// Returns prefill / decode wall-clock so callers can compute a
         /// decode tokens-per-second baseline (e.g. compare against
         /// `mlx_lm.server`'s warm baseline of ~37 tok/s on M4 Pro).
-        pub fn generate(
-            &self,
-            prompt_ids: &[u32],
-            cfg: &GenerateConfig,
-        ) -> Result<GenerateStats> {
+        pub fn generate(&self, prompt_ids: &[u32], cfg: &GenerateConfig) -> Result<GenerateStats> {
             self.generate_with_cache(prompt_ids, cfg, None)
         }
 
@@ -5681,8 +5691,7 @@ pub(crate) mod imp {
             let mut current = self
                 .argmax_last_token_lazy(&logits)
                 .context("generate: prefill argmax_lazy")?;
-            mlx_rs::transforms::async_eval([&current])
-                .context("generate: prefill async_eval")?;
+            mlx_rs::transforms::async_eval([&current]).context("generate: prefill async_eval")?;
             // mirror mlx-lm Python's `mx.eval(current)` after
             // `mx.async_eval` so prefill GPU work is attributed to prefill_ms,
             // NOT to decode step[0]. Without this block prefill_ms is just
@@ -5779,7 +5788,10 @@ pub(crate) mod imp {
             // Tuning:
             //   LUMEN_GEMMA4_LOOKUP_N (default 3) — prefix length
             //   LUMEN_GEMMA4_LOOKUP_K (default 10) — max draft length
-            if std::env::var("LUMEN_GEMMA4_LOOKUP_SPEC").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("LUMEN_GEMMA4_LOOKUP_SPEC")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 let n_lookup: usize = std::env::var("LUMEN_GEMMA4_LOOKUP_N")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -5938,29 +5950,47 @@ pub(crate) mod imp {
                 // Reshape current [1, 1] argmax to [1, 1] (already is) and
                 // feed into forward_array — graph builds without forcing
                 // `current` to evaluate.
-                let t_fwd_start = if per_step_latency { Some(Instant::now()) } else { None };
+                let t_fwd_start = if per_step_latency {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let next_logits = self
                     .forward_array_last_token(&current, &mut cache)
                     .context("generate: decode forward_array_last_token")?;
                 let next_lazy = self
                     .argmax_last_token_lazy(&next_logits)
                     .context("generate: decode argmax_lazy")?;
-                let fwd_ms = t_fwd_start.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+                let fwd_ms = t_fwd_start
+                    .map(|t| t.elapsed().as_secs_f64() * 1e3)
+                    .unwrap_or(0.0);
                 // Schedule async eval — GPU starts working on this while we
                 // sync-read `current` below.
-                let t_ae_start = if per_step_latency { Some(Instant::now()) } else { None };
+                let t_ae_start = if per_step_latency {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 mlx_rs::transforms::async_eval([&next_lazy])
                     .context("generate: decode async_eval")?;
-                let ae_ms = t_ae_start.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+                let ae_ms = t_ae_start
+                    .map(|t| t.elapsed().as_secs_f64() * 1e3)
+                    .unwrap_or(0.0);
 
                 // Now sync-read the *current* token (which the GPU should
                 // have already completed during the previous iteration's
                 // graph-build work).
-                let t_rd_start = if per_step_latency { Some(Instant::now()) } else { None };
+                let t_rd_start = if per_step_latency {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let token = self
                     .read_token_u32(&current)
                     .context("generate: read current token")?;
-                let rd_ms = t_rd_start.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+                let rd_ms = t_rd_start
+                    .map(|t| t.elapsed().as_secs_f64() * 1e3)
+                    .unwrap_or(0.0);
                 if per_step_latency {
                     fwd_per_step.push(fwd_ms);
                     ae_per_step.push(ae_ms);
@@ -5999,8 +6029,7 @@ pub(crate) mod imp {
                     {
                         mlx_rs::transforms::eval([&current, &next_lazy])
                             .context("generate: pre-stop eval drain")?;
-                        mlx_rs::metal::stop_capture()
-                            .context("generate: metal::stop_capture")?;
+                        mlx_rs::metal::stop_capture().context("generate: metal::stop_capture")?;
                         eprintln!(
                             "[metal-capture] stopped after {capture_steps_window} \
                              captured decode_steps; open .gputrace in Xcode"
@@ -6026,18 +6055,15 @@ pub(crate) mod imp {
             if capture_path.is_some() && capture_started && !capture_stopped {
                 mlx_rs::metal::stop_capture()
                     .context("generate: metal::stop_capture (end-of-loop)")?;
-                eprintln!(
-                    "[metal-capture] stopped at end-of-loop (decode_steps={decode_steps})"
-                );
+                eprintln!("[metal-capture] stopped at end-of-loop (decode_steps={decode_steps})");
             }
             let decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
 
             // per-step wall-clock + substage breakdown.
             if per_step_latency && !step_latencies_ms.is_empty() {
                 let n = step_latencies_ms.len();
-                let have_sub = fwd_per_step.len() == n
-                    && ae_per_step.len() == n
-                    && rd_per_step.len() == n;
+                let have_sub =
+                    fwd_per_step.len() == n && ae_per_step.len() == n && rd_per_step.len() == n;
                 eprintln!("[per-step-latency] {} steps:", n);
                 if have_sub {
                     eprintln!(
@@ -6059,7 +6085,9 @@ pub(crate) mod imp {
                 // Buckets: first 1, first 4, first 8, last quarter (steady).
                 let mean_first = |k: usize| -> f64 {
                     let k = k.min(n);
-                    if k == 0 { 0.0 } else {
+                    if k == 0 {
+                        0.0
+                    } else {
                         step_latencies_ms[..k].iter().sum::<f64>() / k as f64
                     }
                 };
@@ -6145,8 +6173,7 @@ pub(crate) mod imp {
     mod tests {
         use super::*;
 
-        const LMSTUDIO_CONFIG_PATH: &str =
-            "/path/to/models/gemma-4-26b-a4b-mlx-4bit/config.json";
+        const LMSTUDIO_CONFIG_PATH: &str = "/path/to/models/gemma-4-26b-a4b-mlx-4bit/config.json";
 
         fn minimal_config_json(layer_types: &str, with_quant: bool) -> String {
             let quant_block = if with_quant {
@@ -6216,9 +6243,11 @@ pub(crate) mod imp {
             let quant = cfg.effective_quantization().expect("quant present");
             assert_eq!(quant.bits, 4);
             assert_eq!(quant.mode, "affine");
-            assert!(quant.overrides.contains_key(
-                "language_model.model.layers.0.mlp.gate_proj"
-            ));
+            assert!(
+                quant
+                    .overrides
+                    .contains_key("language_model.model.layers.0.mlp.gate_proj")
+            );
         }
 
         #[test]
@@ -6276,9 +6305,15 @@ pub(crate) mod imp {
             );
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
             let tc = &cfg.text_config;
-            assert_eq!(tc.head_dim_for(NativeGemma4LayerType::SlidingAttention), 256);
+            assert_eq!(
+                tc.head_dim_for(NativeGemma4LayerType::SlidingAttention),
+                256
+            );
             assert_eq!(tc.head_dim_for(NativeGemma4LayerType::FullAttention), 512);
-            assert_eq!(tc.n_kv_heads_for(NativeGemma4LayerType::SlidingAttention), 8);
+            assert_eq!(
+                tc.n_kv_heads_for(NativeGemma4LayerType::SlidingAttention),
+                8
+            );
             assert_eq!(tc.n_kv_heads_for(NativeGemma4LayerType::FullAttention), 2);
             assert!(tc.use_k_eq_v_for(NativeGemma4LayerType::FullAttention));
             assert!(!tc.use_k_eq_v_for(NativeGemma4LayerType::SlidingAttention));
@@ -6287,16 +6322,15 @@ pub(crate) mod imp {
                 1_000_000.0
             );
             assert_eq!(
-                tc.rope_for(NativeGemma4LayerType::SlidingAttention).rope_theta,
+                tc.rope_for(NativeGemma4LayerType::SlidingAttention)
+                    .rope_theta,
                 10_000.0
             );
         }
 
         // ──────────────────── Gemma4PromptCache + mask routing ────────────────────
 
-        fn minimal_text_config_for_cache_tests(
-            sliding_window: usize,
-        ) -> NativeGemma4TextConfig {
+        fn minimal_text_config_for_cache_tests(sliding_window: usize) -> NativeGemma4TextConfig {
             let json = format!(
                 r#"{{
                     "model_type": "gemma4_text",
@@ -6402,8 +6436,7 @@ pub(crate) mod imp {
                 NativeGemma4LayerType::SlidingAttention,
                 NativeGemma4LayerType::FullAttention,
             ] {
-                let m = make_attention_mask_for_layer(kind, &cfg, 1, 5)
-                    .expect("mask routing");
+                let m = make_attention_mask_for_layer(kind, &cfg, 1, 5).expect("mask routing");
                 assert!(
                     m.is_none(),
                     "decode (query_len=1) must return None mask, got Some for kind={kind:?}"
@@ -6415,14 +6448,9 @@ pub(crate) mod imp {
         #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
         fn mask_routing_prefill_full_returns_causal() {
             let cfg = minimal_text_config_for_cache_tests(8);
-            let m = make_attention_mask_for_layer(
-                NativeGemma4LayerType::FullAttention,
-                &cfg,
-                4,
-                0,
-            )
-            .expect("mask routing")
-            .expect("non-empty mask for prefill");
+            let m = make_attention_mask_for_layer(NativeGemma4LayerType::FullAttention, &cfg, 4, 0)
+                .expect("mask routing")
+                .expect("non-empty mask for prefill");
             assert_eq!(m.shape(), &[4, 4]);
         }
 
@@ -6430,14 +6458,10 @@ pub(crate) mod imp {
         #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
         fn mask_routing_prefill_sliding_applies_window() {
             let cfg = minimal_text_config_for_cache_tests(2);
-            let m = make_attention_mask_for_layer(
-                NativeGemma4LayerType::SlidingAttention,
-                &cfg,
-                4,
-                0,
-            )
-            .expect("mask routing")
-            .expect("non-empty mask");
+            let m =
+                make_attention_mask_for_layer(NativeGemma4LayerType::SlidingAttention, &cfg, 4, 0)
+                    .expect("mask routing")
+                    .expect("non-empty mask");
             assert_eq!(m.shape(), &[4, 4]);
             m.eval().expect("eval");
             // Inspect last row: query at position 3 with window 2 attends to keys 2..=3 only.
@@ -6478,18 +6502,14 @@ pub(crate) mod imp {
         fn loads_lmstudio_4bit_weights_when_present() {
             let dir = Path::new("/path/to/models/gemma-4-26b-a4b-mlx-4bit");
             if !dir.exists() {
-                eprintln!(
-                    "skip: lmstudio gemma-4-26b-a4b-mlx-4bit not present on this host"
-                );
+                eprintln!("skip: lmstudio gemma-4-26b-a4b-mlx-4bit not present on this host");
                 return;
             }
-            let cfg = NativeGemma4Config::load(&dir.join("config.json"))
-                .expect("load config.json");
+            let cfg = NativeGemma4Config::load(&dir.join("config.json")).expect("load config.json");
             cfg.validate_gemma4_family()
                 .expect("validate lmstudio config");
 
-            let mut weights =
-                NativeGemma4Weights::load_dir(dir).expect("load_dir lmstudio shards");
+            let mut weights = NativeGemma4Weights::load_dir(dir).expect("load_dir lmstudio shards");
             weights.sanitize().expect("sanitize lmstudio weights");
 
             // After sanitize, no multimodal-only keys should remain.
@@ -6507,9 +6527,7 @@ pub(crate) mod imp {
 
             // Spot-check that full-attention layers indeed lack v_proj.
             for layer_idx in [5usize, 11, 17, 23, 29] {
-                let vp = format!(
-                    "language_model.model.layers.{layer_idx}.self_attn.v_proj.weight"
-                );
+                let vp = format!("language_model.model.layers.{layer_idx}.self_attn.v_proj.weight");
                 assert!(
                     weights.get(&vp).is_none(),
                     "full attention layer {layer_idx} unexpectedly has {vp}"
@@ -6517,9 +6535,7 @@ pub(crate) mod imp {
             }
             // Sliding-attention layers must carry v_proj.
             for layer_idx in [0usize, 14, 28] {
-                let vp = format!(
-                    "language_model.model.layers.{layer_idx}.self_attn.v_proj.weight"
-                );
+                let vp = format!("language_model.model.layers.{layer_idx}.self_attn.v_proj.weight");
                 assert!(
                     weights.get(&vp).is_some(),
                     "sliding attention layer {layer_idx} missing {vp}"
@@ -6537,11 +6553,9 @@ pub(crate) mod imp {
             );
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
             // attention q_proj has no override → default 4-bit.
-            let (gs, bits, _mode) = quant_params_for(
-                &cfg,
-                "language_model.model.layers.0.self_attn.q_proj",
-            )
-            .expect("lookup");
+            let (gs, bits, _mode) =
+                quant_params_for(&cfg, "language_model.model.layers.0.self_attn.q_proj")
+                    .expect("lookup");
             assert_eq!(gs, 64);
             assert_eq!(bits, 4);
         }
@@ -6554,11 +6568,9 @@ pub(crate) mod imp {
             );
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
             // mlp.gate_proj has 8-bit override in the synthetic fixture.
-            let (gs, bits, _mode) = quant_params_for(
-                &cfg,
-                "language_model.model.layers.0.mlp.gate_proj.weight",
-            )
-            .expect("lookup");
+            let (gs, bits, _mode) =
+                quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
+                    .expect("lookup");
             assert_eq!(gs, 64);
             assert_eq!(bits, 8);
         }
@@ -6586,9 +6598,7 @@ pub(crate) mod imp {
             let model = NativeGemma4Model::load(dir).expect("load model");
             let vocab = model.vocab_size() as i32;
             let span = std::cmp::max(200, vocab - 20) as u32;
-            let prompt: Vec<u32> = (0..4096u32)
-                .map(|i| 10 + (i * 7) % span)
-                .collect();
+            let prompt: Vec<u32> = (0..4096u32).map(|i| 10 + (i * 7) % span).collect();
 
             // (a) Single-pass forward.
             let mut cache_single = model.make_cache();
@@ -6637,7 +6647,9 @@ pub(crate) mod imp {
             for _ in 0..warmup_iters {
                 let mut c = model.make_cache();
                 for chunk in prompt.chunks(chunk_size) {
-                    let l = model.forward_last_token(chunk, &mut c).expect("warmup chunked");
+                    let l = model
+                        .forward_last_token(chunk, &mut c)
+                        .expect("warmup chunked");
                     l.eval().expect("warmup eval");
                 }
             }
@@ -6646,7 +6658,9 @@ pub(crate) mod imp {
                 let mut c = model.make_cache();
                 let t0 = Instant::now();
                 for chunk in prompt.chunks(chunk_size) {
-                    let l = model.forward_last_token(chunk, &mut c).expect("timed chunked");
+                    let l = model
+                        .forward_last_token(chunk, &mut c)
+                        .expect("timed chunked");
                     l.eval().expect("timed eval");
                 }
                 total_ms += t0.elapsed().as_secs_f64() * 1e3;
@@ -6655,7 +6669,11 @@ pub(crate) mod imp {
             let tps = prompt.len() as f64 / (mean_ms / 1e3);
             eprintln!(
                 "[chunked-smoke] {} trials, chunk_size={}, prompt_len={}, mean={:.0}ms ({:.1} tok/s)",
-                trials, chunk_size, prompt.len(), mean_ms, tps
+                trials,
+                chunk_size,
+                prompt.len(),
+                mean_ms,
+                tps
             );
         }
 
@@ -6691,9 +6709,7 @@ pub(crate) mod imp {
             assert!((next as i32) < vocab, "argmax in vocab");
 
             // Decode step: feed the predicted token.
-            let logits2 = model
-                .forward(&[next], &mut cache)
-                .expect("forward decode");
+            let logits2 = model.forward(&[next], &mut cache).expect("forward decode");
             assert_eq!(logits2.shape(), &[1, 1, vocab]);
             for idx in 0..model.num_layers() {
                 assert_eq!(
@@ -6745,9 +6761,7 @@ pub(crate) mod imp {
                 stop_on_eos: false,
             };
 
-            let stats = model
-                .generate(&prompt, &gen_cfg)
-                .expect("generate ok");
+            let stats = model.generate(&prompt, &gen_cfg).expect("generate ok");
 
             // Shape / correctness asserts.
             assert_eq!(stats.prompt_tokens, prompt.len());
@@ -6847,10 +6861,7 @@ pub(crate) mod imp {
 
             eprintln!(
                 "[breakdown] decode_steps={} total_decode={:.0}ms total/step={:.2}ms tok/s={:.1}",
-                stats.decode_steps,
-                stats.decode_ms,
-                total_step,
-                stats.decode_tok_per_sec
+                stats.decode_steps, stats.decode_ms, total_step, stats.decode_tok_per_sec
             );
             eprintln!(
                 "[breakdown]   attn   = {:6.2} ms/step ({:5.1}%)",
@@ -7156,9 +7167,7 @@ pub(crate) mod imp {
             // so we can inspect per-layer cached_len. (We can't re-use the
             // generate's cache — it's freed inside the call.)
             let mut cache = model.make_cache();
-            let logits = model
-                .forward(&prompt, &mut cache)
-                .expect("prefill forward");
+            let logits = model.forward(&prompt, &mut cache).expect("prefill forward");
             let _ = model.argmax_last_token(&logits).expect("argmax");
 
             // Layer 0 = sliding → after prefill, cached_len == prompt_len
@@ -7266,8 +7275,9 @@ pub(crate) mod imp {
             // Decode-step sanity: feed a 1-token follow-up to layer 0 and
             // make sure RotatingKvCache grows correctly.
             let n_decode = (b * 1 * hidden) as usize;
-            let data1: Vec<f32> =
-                (0..n_decode).map(|i| 0.001 * ((i % 13) as f32 - 6.0)).collect();
+            let data1: Vec<f32> = (0..n_decode)
+                .map(|i| 0.001 * ((i % 13) as f32 - 6.0))
+                .collect();
             let x1 = Array::from_slice(&data1, &[b, 1i32, hidden])
                 .as_dtype(mlx_rs::Dtype::Float32)
                 .expect("cast decode input");
@@ -7298,8 +7308,7 @@ pub(crate) mod imp {
             // Spot-check per-layer resolution.
             for (idx, layer) in model.layers().iter().enumerate() {
                 // q_norm head_dim matches layer kind.
-                let expected_head_dim =
-                    model.text_config().head_dim_for(layer.kind) as i32;
+                let expected_head_dim = model.text_config().head_dim_for(layer.kind) as i32;
                 assert_eq!(
                     layer.attn.q_norm.shape(),
                     &[expected_head_dim],
@@ -7333,8 +7342,7 @@ pub(crate) mod imp {
             let cache = model.make_cache();
             assert_eq!(cache.len(), 30);
             for (idx, layer_cache) in cache.layers().iter().enumerate() {
-                let expected_sliding =
-                    model.text_config().layer_types[idx].is_sliding();
+                let expected_sliding = model.text_config().layer_types[idx].is_sliding();
                 let is_sliding = matches!(layer_cache, NativeGemma4LayerCache::Sliding(_));
                 assert_eq!(is_sliding, expected_sliding, "layer {idx} cache kind");
             }
@@ -7384,10 +7392,13 @@ pub(crate) mod imp {
             assert_eq!(quant.mode, "affine");
             // Spot-check a handful of 8-bit override entries spanning the layer stack.
             for layer_idx in [0usize, 14, 29] {
-                for tensor in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "router.proj"] {
-                    let key = format!(
-                        "language_model.model.layers.{layer_idx}.{tensor}"
-                    );
+                for tensor in [
+                    "mlp.gate_proj",
+                    "mlp.up_proj",
+                    "mlp.down_proj",
+                    "router.proj",
+                ] {
+                    let key = format!("language_model.model.layers.{layer_idx}.{tensor}");
                     let ov = quant
                         .overrides
                         .get(&key)
@@ -7399,4 +7410,3 @@ pub(crate) mod imp {
         }
     }
 }
-

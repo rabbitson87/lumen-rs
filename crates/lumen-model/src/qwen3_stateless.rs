@@ -124,9 +124,15 @@ impl Attn {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q.reshape((b, l, self.n_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, l, self.n_kv, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((b, l, self.n_kv, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, l, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.n_kv, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.n_kv, self.head_dim))?
+            .transpose(1, 2)?;
 
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
@@ -248,7 +254,9 @@ impl StatelessQwen3 {
                 attn,
                 mlp,
                 ln1_w: vbi.pp("input_layernorm").get(cfg.hidden_size, "weight")?,
-                ln2_w: vbi.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")?,
+                ln2_w: vbi
+                    .pp("post_attention_layernorm")
+                    .get(cfg.hidden_size, "weight")?,
                 rms_eps: cfg.rms_norm_eps as f32,
             });
         }
@@ -277,22 +285,35 @@ impl StatelessQwen3 {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vbl = vb.pp("model.layers");
 
-        let take = |projections: &mut HashMap<String, Affine8Linear>, key: &str| -> Result<LinearKind> {
-            projections
-                .remove(key)
-                .map(LinearKind::Quant)
-                .ok_or_else(|| anyhow!("missing quant projection: {key}"))
-        };
+        let take =
+            |projections: &mut HashMap<String, Affine8Linear>, key: &str| -> Result<LinearKind> {
+                projections
+                    .remove(key)
+                    .map(LinearKind::Quant)
+                    .ok_or_else(|| anyhow!("missing quant projection: {key}"))
+            };
 
         for i in 0..cfg.num_hidden_layers {
             let vbi = vbl.pp(i);
             let attn_vb = vbi.pp("self_attn");
             let head_dim = cfg.head_dim;
             let attn = Attn {
-                q_proj: take(&mut projections, &format!("model.layers.{i}.self_attn.q_proj"))?,
-                k_proj: take(&mut projections, &format!("model.layers.{i}.self_attn.k_proj"))?,
-                v_proj: take(&mut projections, &format!("model.layers.{i}.self_attn.v_proj"))?,
-                o_proj: take(&mut projections, &format!("model.layers.{i}.self_attn.o_proj"))?,
+                q_proj: take(
+                    &mut projections,
+                    &format!("model.layers.{i}.self_attn.q_proj"),
+                )?,
+                k_proj: take(
+                    &mut projections,
+                    &format!("model.layers.{i}.self_attn.k_proj"),
+                )?,
+                v_proj: take(
+                    &mut projections,
+                    &format!("model.layers.{i}.self_attn.v_proj"),
+                )?,
+                o_proj: take(
+                    &mut projections,
+                    &format!("model.layers.{i}.self_attn.o_proj"),
+                )?,
                 q_norm_w: attn_vb.pp("q_norm").get(head_dim, "weight")?,
                 k_norm_w: attn_vb.pp("k_norm").get(head_dim, "weight")?,
                 rms_eps: cfg.rms_norm_eps as f32,
@@ -312,7 +333,9 @@ impl StatelessQwen3 {
                 attn,
                 mlp,
                 ln1_w: vbi.pp("input_layernorm").get(cfg.hidden_size, "weight")?,
-                ln2_w: vbi.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")?,
+                ln2_w: vbi
+                    .pp("post_attention_layernorm")
+                    .get(cfg.hidden_size, "weight")?,
                 rms_eps: cfg.rms_norm_eps as f32,
             });
         }
@@ -347,7 +370,11 @@ impl StatelessQwen3 {
     pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
         let mut h = candle_core::Module::forward(&self.embed, input)?;
-        let mask = if l > 1 { Some(self.causal_mask(l)?) } else { None };
+        let mask = if l > 1 {
+            Some(self.causal_mask(l)?)
+        } else {
+            None
+        };
         for layer in &self.layers {
             h = layer.forward(&h, mask.as_ref())?;
         }

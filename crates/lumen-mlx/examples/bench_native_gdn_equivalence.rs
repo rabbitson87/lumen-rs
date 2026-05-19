@@ -40,8 +40,8 @@
 #[cfg(feature = "mlx-native")]
 fn main() -> anyhow::Result<()> {
     use anyhow::Context;
-    use mlx_rs::{Array, ops};
     use lumen_mlx::native_ssm::gated_delta_step_kernel;
+    use mlx_rs::{Array, ops};
 
     // ── CLI ──────────────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();

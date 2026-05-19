@@ -58,11 +58,7 @@ fn main() -> Result<()> {
 }"#;
 
     // 3 queries — same system, different user team name.
-    let queries = vec![
-        "맨유 매칭해줘",
-        "바르샤 매칭해줘",
-        "리버풀 매칭해줘",
-    ];
+    let queries = vec!["맨유 매칭해줘", "바르샤 매칭해줘", "리버풀 매칭해줘"];
 
     let max_new_tokens = 200;
     let prefix_key = "moltis-sports-batch-001";
@@ -89,7 +85,11 @@ fn main() -> Result<()> {
         let visible = response.visible.as_str();
         // Cap preview at 200 *chars* (not bytes) to avoid splitting UTF-8.
         let preview: String = visible.chars().take(200).collect();
-        let suffix_marker = if visible.chars().count() > 200 { "…" } else { "" };
+        let suffix_marker = if visible.chars().count() > 200 {
+            "…"
+        } else {
+            ""
+        };
         let preview = format!("{preview}{suffix_marker}");
         println!(
             "Request {}: query={:?}  wall={:.0} ms",

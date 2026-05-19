@@ -33,21 +33,21 @@ pub use context::NativeContext;
 #[cfg(feature = "turboquant-gpu")]
 pub use forward::placeholder_forward;
 #[cfg(feature = "turboquant-gpu")]
-pub use kernels::{build_rope_tables, KernelLib};
+pub use kernels::{KernelLib, build_rope_tables};
 #[cfg(feature = "turboquant-gpu")]
 pub use kv_cache::NativeKvCache;
 #[cfg(feature = "turboquant-gpu")]
 pub use linear_attn::{
-    forward_linear_attn, forward_linear_attn_fused, forward_post_conv_fused,
+    LinearAttnConfig, forward_linear_attn, forward_linear_attn_fused, forward_post_conv_fused,
     forward_post_conv_fused_with_cache, forward_post_conv_fused_with_cache_candle_queue,
-    forward_ssm_loop, LinearAttnConfig,
+    forward_ssm_loop,
 };
 #[cfg(feature = "turboquant-gpu")]
 pub use linear_state::{NativeConvSnapshot, NativeConvState, NativeSsmSnapshot, NativeSsmState};
 #[cfg(feature = "turboquant-gpu")]
 pub use self_attn::{
-    forward_attn_block, forward_attn_block_full, forward_self_attn, forward_self_attn_full,
-    forward_self_attn_with_native_cache, AttnBlockConfig, SelfAttnConfig,
+    AttnBlockConfig, SelfAttnConfig, forward_attn_block, forward_attn_block_full,
+    forward_self_attn, forward_self_attn_full, forward_self_attn_with_native_cache,
 };
 #[cfg(feature = "turboquant-gpu")]
 pub use tensor::{NativeDType, NativeTensor};
@@ -129,4 +129,4 @@ mod shared {
 }
 
 #[cfg(feature = "turboquant-gpu")]
-pub use shared::{shared_native_resources, shared_native_resources_for, NativeResources};
+pub use shared::{NativeResources, shared_native_resources, shared_native_resources_for};

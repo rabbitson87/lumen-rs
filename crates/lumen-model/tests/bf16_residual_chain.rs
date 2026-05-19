@@ -42,10 +42,14 @@ fn metal_device() -> Option<Device> {
 
 fn random_f32(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
     let n: usize = shape.iter().product();
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = ((s >> 32) as u32) as f32 / u32::MAX as f32;
         data.push((bits - 0.5) * scale);
     }
@@ -151,9 +155,7 @@ fn b9_residual_stream_chain_matches_f32_reference() {
         .unwrap()
         .to_scalar::<f32>()
         .unwrap();
-    eprintln!(
-        "B.9 residual chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}"
-    );
+    eprintln!("B.9 residual chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}");
     assert!(cos > 0.998, "cosine sim {cos} must exceed 0.998");
     assert!(
         rel_l2 < 2e-2,
@@ -183,8 +185,7 @@ fn b9_layer_exit_f32_cast_recovers_reference() {
     let h_f32 = (&x_f32 + &r_f32).unwrap();
     let out_f32 = (&h_f32 + &mlp.forward(&h_f32).unwrap()).unwrap();
 
-    let h_bf16 = (&x_f32.to_dtype(DType::BF16).unwrap()
-        + &r_f32.to_dtype(DType::BF16).unwrap())
+    let h_bf16 = (&x_f32.to_dtype(DType::BF16).unwrap() + &r_f32.to_dtype(DType::BF16).unwrap())
         .unwrap()
         .contiguous()
         .unwrap();

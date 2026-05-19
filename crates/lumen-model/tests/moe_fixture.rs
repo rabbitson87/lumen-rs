@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, safetensors as cst};
 use candle_nn::Linear;
 use lumen_model::qwen3_5_moe::moe::{
     MoeDims, SharedExpert, SparseMoeBlock, SparseMoeRuntime, SwitchMlp,
@@ -154,8 +154,7 @@ fn sparse_moe_forward_matches_mlx_fixture_layer0() {
 
     // Assemble the sub-linears from dequantized weights.
     let gate = Linear::new(take_f32(&weights, "gate.weight"), None);
-    let shared_expert_gate =
-        Linear::new(take_f32(&weights, "shared_expert_gate.weight"), None);
+    let shared_expert_gate = Linear::new(take_f32(&weights, "shared_expert_gate.weight"), None);
     let se_gate = Linear::new(take_f32(&weights, "shared_expert.gate_proj.weight"), None);
     let se_up = Linear::new(take_f32(&weights, "shared_expert.up_proj.weight"), None);
     let se_down = Linear::new(take_f32(&weights, "shared_expert.down_proj.weight"), None);
@@ -175,8 +174,14 @@ fn sparse_moe_forward_matches_mlx_fixture_layer0() {
         shared_expert_gate.weight().dims(),
         shapes.shared_expert_gate.as_slice()
     );
-    assert_eq!(se_gate.weight().dims(), shapes.shared_expert_gate_proj.as_slice());
-    assert_eq!(se_up.weight().dims(), shapes.shared_expert_up_proj.as_slice());
+    assert_eq!(
+        se_gate.weight().dims(),
+        shapes.shared_expert_gate_proj.as_slice()
+    );
+    assert_eq!(
+        se_up.weight().dims(),
+        shapes.shared_expert_up_proj.as_slice()
+    );
     assert_eq!(
         se_down.weight().dims(),
         shapes.shared_expert_down_proj.as_slice()

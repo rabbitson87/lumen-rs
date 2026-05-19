@@ -33,7 +33,7 @@
 //! allocated so subsequent generations reuse them — this is how the cache
 //! stays cheap across many requests.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lumen_metal::metal::{BlitCommandEncoderRef, MTLBlitOption};
 
 use super::context::NativeContext;
@@ -64,14 +64,8 @@ impl NativeKvCache {
                 "NativeKvCache::new: all dims must be > 0 (got b={b}, kv={kv_heads}, d={head_dim}, max={max_seq_len})"
             ));
         }
-        let k_buf = ctx.zeros(
-            vec![b, kv_heads, max_seq_len, head_dim],
-            NativeDType::F32,
-        )?;
-        let v_buf = ctx.zeros(
-            vec![b, kv_heads, max_seq_len, head_dim],
-            NativeDType::F32,
-        )?;
+        let k_buf = ctx.zeros(vec![b, kv_heads, max_seq_len, head_dim], NativeDType::F32)?;
+        let v_buf = ctx.zeros(vec![b, kv_heads, max_seq_len, head_dim], NativeDType::F32)?;
         Ok(Self {
             k_buf,
             v_buf,
@@ -150,11 +144,7 @@ impl NativeKvCache {
 
     /// Validation-only helper. Mirrors the checks inside `encode_append`
     /// without touching `current_seq_len` or the encoder state.
-    fn validate_append(
-        &self,
-        k_new: &NativeTensor,
-        v_new: &NativeTensor,
-    ) -> Result<()> {
+    fn validate_append(&self, k_new: &NativeTensor, v_new: &NativeTensor) -> Result<()> {
         if k_new.rank() != 4 || v_new.rank() != 4 {
             return Err(anyhow!(
                 "NativeKvCache::append: K/V must be rank 4 BHLD, got K={:?} V={:?}",
@@ -338,8 +328,16 @@ mod tests {
                 let src_off = (b_idx * kv + h) * d;
                 let dst_off = ((b_idx * kv + h) * max + 0) * d;
                 for j in 0..d {
-                    assert_eq!(k_full[dst_off + j], k_data[src_off + j], "K mismatch h={h} j={j}");
-                    assert_eq!(v_full[dst_off + j], v_data[src_off + j], "V mismatch h={h} j={j}");
+                    assert_eq!(
+                        k_full[dst_off + j],
+                        k_data[src_off + j],
+                        "K mismatch h={h} j={j}"
+                    );
+                    assert_eq!(
+                        v_full[dst_off + j],
+                        v_data[src_off + j],
+                        "V mismatch h={h} j={j}"
+                    );
                 }
                 // Slot 1 must remain zero.
                 let zero_off = ((b_idx * kv + h) * max + 1) * d;
@@ -419,8 +417,12 @@ mod tests {
             Err(_) => return,
         };
         let mut cache = NativeKvCache::new(&ctx, 1, 1, 4, 4).unwrap();
-        let k = ctx.from_slice_f32(&vec![0.0; 1 * 1 * 5 * 4], vec![1, 1, 5, 4]).unwrap();
-        let v = ctx.from_slice_f32(&vec![0.0; 1 * 1 * 5 * 4], vec![1, 1, 5, 4]).unwrap();
+        let k = ctx
+            .from_slice_f32(&vec![0.0; 1 * 1 * 5 * 4], vec![1, 1, 5, 4])
+            .unwrap();
+        let v = ctx
+            .from_slice_f32(&vec![0.0; 1 * 1 * 5 * 4], vec![1, 1, 5, 4])
+            .unwrap();
         let r = cache.append(&ctx, &k, &v);
         assert!(r.is_err());
     }
@@ -433,8 +435,12 @@ mod tests {
         };
         let mut cache = NativeKvCache::new(&ctx, 1, 2, 4, 8).unwrap();
         // Wrong kv (3 instead of 2)
-        let k = ctx.from_slice_f32(&vec![0.0; 1 * 3 * 1 * 4], vec![1, 3, 1, 4]).unwrap();
-        let v = ctx.from_slice_f32(&vec![0.0; 1 * 3 * 1 * 4], vec![1, 3, 1, 4]).unwrap();
+        let k = ctx
+            .from_slice_f32(&vec![0.0; 1 * 3 * 1 * 4], vec![1, 3, 1, 4])
+            .unwrap();
+        let v = ctx
+            .from_slice_f32(&vec![0.0; 1 * 3 * 1 * 4], vec![1, 3, 1, 4])
+            .unwrap();
         let r = cache.append(&ctx, &k, &v);
         assert!(r.is_err());
     }
@@ -446,8 +452,12 @@ mod tests {
             Err(_) => return,
         };
         let mut cache = NativeKvCache::new(&ctx, 1, 1, 2, 4).unwrap();
-        let k = ctx.from_slice_f32(&vec![1.0; 1 * 1 * 2 * 2], vec![1, 1, 2, 2]).unwrap();
-        let v = ctx.from_slice_f32(&vec![2.0; 1 * 1 * 2 * 2], vec![1, 1, 2, 2]).unwrap();
+        let k = ctx
+            .from_slice_f32(&vec![1.0; 1 * 1 * 2 * 2], vec![1, 1, 2, 2])
+            .unwrap();
+        let v = ctx
+            .from_slice_f32(&vec![2.0; 1 * 1 * 2 * 2], vec![1, 1, 2, 2])
+            .unwrap();
         cache.append(&ctx, &k, &v).unwrap();
         assert_eq!(cache.current_seq_len(), 2);
         cache.reset();

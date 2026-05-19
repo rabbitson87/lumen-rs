@@ -17,12 +17,12 @@
 
 use candle_core::backend::BackendDevice as _;
 use candle_core::{DType, Device, Tensor};
-use std::sync::Arc;
-use std::time::Instant;
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 use lumen_metal::affine4_linear::Affine4Linear;
 use lumen_model::qwen3_5_moe::moe::DenseMlp;
 use lumen_model::qwen3_5_moe::proj::ProjLinear;
+use std::sync::Arc;
+use std::time::Instant;
 
 // Shape source: mlx-community/Qwen3.6-27B-4bit config.json text_config
 //   hidden_size = 5120, intermediate_size = 17408 (was 25600, fictional — anti-pattern #25)
@@ -34,26 +34,35 @@ const WARMUP: usize = 30;
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
     let mut s = seed;
-    (0..n).map(|_| { s = s.wrapping_mul(1103515245).wrapping_add(12345); s }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            s
+        })
+        .collect()
 }
 
 fn synth_scales_or_biases(out: usize, ins: usize, seed: u32, neg: bool) -> Vec<u16> {
     let n = out * ins / 64;
     let mut s = seed;
     let off = if neg { -0.005 } else { 0.01 };
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1103515245).wrapping_add(12345);
-        let f = ((s >> 8) & 0xff) as f32 / 256.0 * 0.01 + off;
-        (f.to_bits() >> 16) as u16
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            let f = ((s >> 8) & 0xff) as f32 / 256.0 * 0.01 + off;
+            (f.to_bits() >> 16) as u16
+        })
+        .collect()
 }
 
 fn synth_x(n: usize, seed: u32) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1103515245).wrapping_add(12345);
-        ((s >> 8) & 0xff) as f32 / 256.0 - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            ((s >> 8) & 0xff) as f32 / 256.0 - 0.5
+        })
+        .collect()
 }
 
 fn welchs_t(a: &[f64], b: &[f64]) -> f64 {
@@ -95,16 +104,26 @@ fn mlp_icb_production_path_microbench() {
     let gate_up_scales = synth_scales_or_biases(2 * INTER, HIDDEN, 0xCAFE_BABE, false);
     let gate_up_biases = synth_scales_or_biases(2 * INTER, HIDDEN, 0x1234_5678, true);
     let gate_up_w = Affine4Weight::from_host(
-        &ctx.ctx, &gate_up_packed, &gate_up_scales, &gate_up_biases,
-        2 * INTER, HIDDEN,
-    ).expect("gate_up weight");
+        &ctx.ctx,
+        &gate_up_packed,
+        &gate_up_scales,
+        &gate_up_biases,
+        2 * INTER,
+        HIDDEN,
+    )
+    .expect("gate_up weight");
     let down_packed = synth_packed(HIDDEN, INTER, 0xFADE_FADE);
     let down_scales = synth_scales_or_biases(HIDDEN, INTER, 0xBEEF_BEEF, false);
     let down_biases = synth_scales_or_biases(HIDDEN, INTER, 0xC0DE_C0DE, true);
     let down_w = Affine4Weight::from_host(
-        &ctx.ctx, &down_packed, &down_scales, &down_biases,
-        HIDDEN, INTER,
-    ).expect("down weight");
+        &ctx.ctx,
+        &down_packed,
+        &down_scales,
+        &down_biases,
+        HIDDEN,
+        INTER,
+    )
+    .expect("down weight");
 
     let gate_up_lin = Affine4Linear::new(gate_up_w, None, ctx.clone());
     let down_lin = Affine4Linear::new(down_w, None, ctx.clone());
@@ -117,59 +136,116 @@ fn mlp_icb_production_path_microbench() {
 
     // Inputs.
     let x_data = synth_x(HIDDEN, 0xAAAA_BBBB);
-    let x = Tensor::from_vec(x_data, &[1, 1, HIDDEN], &dev).unwrap()
-        .to_dtype(DType::BF16).unwrap()
-        .contiguous().unwrap();
+    let x = Tensor::from_vec(x_data, &[1, 1, HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
     let r_data = synth_x(HIDDEN, 0x9999_8888);
-    let residual = Tensor::from_vec(r_data, &[1, 1, HIDDEN], &dev).unwrap()
-        .to_dtype(DType::BF16).unwrap()
-        .contiguous().unwrap();
+    let residual = Tensor::from_vec(r_data, &[1, 1, HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
 
     // ── Bit-identity gate ────────────────────────────────────────────
-    unsafe { std::env::set_var("LUMEN_MLP_ICB", "0"); }
-    let y_off = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
-    unsafe { std::env::set_var("LUMEN_MLP_ICB", "1"); }
-    let y_on = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
+    unsafe {
+        std::env::set_var("LUMEN_MLP_ICB", "0");
+    }
+    let y_off = mlp
+        .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+        .unwrap();
+    unsafe {
+        std::env::set_var("LUMEN_MLP_ICB", "1");
+    }
+    let y_on = mlp
+        .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+        .unwrap();
 
-    let bits_off: Vec<u32> = y_off.flatten_all().unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap()
-        .iter().map(|f| f.to_bits()).collect();
-    let bits_on: Vec<u32> = y_on.flatten_all().unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap()
-        .iter().map(|f| f.to_bits()).collect();
-    let diffs = bits_off.iter().zip(bits_on.iter()).filter(|(a, b)| a != b).count();
+    let bits_off: Vec<u32> = y_off
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
+    let bits_on: Vec<u32> = y_on
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
+    let diffs = bits_off
+        .iter()
+        .zip(bits_on.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     eprintln!();
     eprintln!("=== Production path bit-identity (off ↔ on) ===");
     eprintln!("Compared:  {} elements", bits_off.len());
-    eprintln!("Diffs:     {diffs} {}", if diffs == 0 { "✓" } else { "✗ (drift)" });
+    eprintln!(
+        "Diffs:     {diffs} {}",
+        if diffs == 0 { "✓" } else { "✗ (drift)" }
+    );
 
     // ── Bench (interleaved) ──────────────────────────────────────────
-    unsafe { std::env::set_var("LUMEN_MLP_ICB", "0"); }
-    for _ in 0..WARMUP {
-        let _ = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
+    unsafe {
+        std::env::set_var("LUMEN_MLP_ICB", "0");
     }
-    if let Device::Metal(md) = &dev { let _ = md.synchronize(); }
-    unsafe { std::env::set_var("LUMEN_MLP_ICB", "1"); }
     for _ in 0..WARMUP {
-        let _ = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
+        let _ = mlp
+            .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+            .unwrap();
     }
-    if let Device::Metal(md) = &dev { let _ = md.synchronize(); }
+    if let Device::Metal(md) = &dev {
+        let _ = md.synchronize();
+    }
+    unsafe {
+        std::env::set_var("LUMEN_MLP_ICB", "1");
+    }
+    for _ in 0..WARMUP {
+        let _ = mlp
+            .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+            .unwrap();
+    }
+    if let Device::Metal(md) = &dev {
+        let _ = md.synchronize();
+    }
 
     let mut t_off: Vec<f64> = Vec::with_capacity(ITERS);
     let mut t_on: Vec<f64> = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
-        unsafe { std::env::set_var("LUMEN_MLP_ICB", "0"); }
+        unsafe {
+            std::env::set_var("LUMEN_MLP_ICB", "0");
+        }
         let t0 = Instant::now();
-        let y = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
-        if let Device::Metal(md) = y.device() { let _ = md.synchronize(); }
+        let y = mlp
+            .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+            .unwrap();
+        if let Device::Metal(md) = y.device() {
+            let _ = md.synchronize();
+        }
         t_off.push(t0.elapsed().as_secs_f64() * 1e6);
 
-        unsafe { std::env::set_var("LUMEN_MLP_ICB", "1"); }
+        unsafe {
+            std::env::set_var("LUMEN_MLP_ICB", "1");
+        }
         let t1 = Instant::now();
-        let y = mlp.forward_with_residual_bf16_in_bf16_out(&x, &residual).unwrap();
-        if let Device::Metal(md) = y.device() { let _ = md.synchronize(); }
+        let y = mlp
+            .forward_with_residual_bf16_in_bf16_out(&x, &residual)
+            .unwrap();
+        if let Device::Metal(md) = y.device() {
+            let _ = md.synchronize();
+        }
         t_on.push(t1.elapsed().as_secs_f64() * 1e6);
     }
 

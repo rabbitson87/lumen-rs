@@ -84,10 +84,14 @@ fn random_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
     // Deterministic linear-congruential filler — keeps the tests reproducible
     // without pulling in `rand`. Values in roughly [-0.5, 0.5].
     let n: usize = shape.iter().product();
-    let mut state = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut state = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = ((state >> 32) as u32) as f32 / u32::MAX as f32;
         data.push(bits - 0.5);
     }
@@ -130,11 +134,7 @@ fn parity_decode_h16_skv256() {
 
     assert_eq!(out_bf16.dtype(), DType::BF16, "output must be bf16");
 
-    let f32_v = out_f32
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
+    let f32_v = out_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let bf16_v = out_bf16
         .to_dtype(DType::F32)
         .unwrap()
@@ -151,11 +151,7 @@ fn parity_decode_h16_skv256() {
 
     // Also compare to CPU reference (looser tolerance — bf16 rounding stacks).
     let out_cpu = cpu_sdpa_reference_f32(&q, &k, &v, scale);
-    let cpu_v = out_cpu
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
+    let cpu_v = out_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let cos_cpu = cosine_similarity(&cpu_v, &bf16_v);
     eprintln!("decode_h16_skv256 vs cpu: cos={cos_cpu:.6}");
     assert!(cos_cpu > 0.999, "vs cpu cosine {cos_cpu} must exceed 0.999");
@@ -219,7 +215,11 @@ fn parity_with_mask_decode() {
         .map(|i| if i % 2 == 0 { 0.0 } else { -1e4 })
         .collect();
     let mask_f32 = Tensor::from_vec(mask_data, (sq, skv), &dev).unwrap();
-    let mask_bf16 = mask_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
+    let mask_bf16 = mask_f32
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
 
     set_disabled(false);
     let out_f32 = flash_attn_candle(&q, &k, &v, Some(&mask_f32), scale)
@@ -315,8 +315,14 @@ fn determinism_repeat_call_bit_identical() {
             }
         }
     }
-    eprintln!("determinism: {differing} differing bits over 9 × {n} = {} positions", 9 * n);
-    assert_eq!(differing, 0, "bf16 flash_attn must be bit-deterministic across calls");
+    eprintln!(
+        "determinism: {differing} differing bits over 9 × {n} = {} positions",
+        9 * n
+    );
+    assert_eq!(
+        differing, 0,
+        "bf16 flash_attn must be bit-deterministic across calls"
+    );
 }
 
 #[test]
@@ -342,5 +348,8 @@ fn dtype_mismatch_returns_none() {
 
     set_disabled(false);
     let result = flash_attn_candle(&q, &k_bf16, &v, None, scale);
-    assert!(result.is_none(), "mixed dtype must return None (caller falls back)");
+    assert!(
+        result.is_none(),
+        "mixed dtype must return None (caller falls back)"
+    );
 }

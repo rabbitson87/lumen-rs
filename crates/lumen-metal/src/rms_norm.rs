@@ -75,9 +75,7 @@ impl RmsNormBf16Out {
         }
         let dims = x.dims();
         if dims.len() < 2 {
-            return Err(candle_core::Error::Msg(
-                "RmsNormBf16Out: rank < 2".into(),
-            ));
+            return Err(candle_core::Error::Msg("RmsNormBf16Out: rank < 2".into()));
         }
         let hidden = *dims.last().unwrap();
         let m: usize = dims[..dims.len() - 1].iter().product();
@@ -204,7 +202,12 @@ impl RmsNormBf16InBf16Out {
             .device
             .new_compute_pipeline_state_with_function_for_icb(&func)
             .map_err(|e| anyhow::anyhow!("rms_norm: pipeline_icb: {e:?}"))?;
-        Ok(Self { pipeline, pipeline_icb, eps, ctx })
+        Ok(Self {
+            pipeline,
+            pipeline_icb,
+            eps,
+            ctx,
+        })
     }
 
     /// Allocate a `dims_buf` containing `[hidden, eps]` for use with
@@ -242,8 +245,16 @@ impl RmsNormBf16InBf16Out {
     ) {
         const THREADS_PER_TG: usize = 256;
         const SIMD_PARTIALS_BYTES: usize = 8 * std::mem::size_of::<f32>();
-        let grid = MTLSize { width: m, height: 1, depth: 1 };
-        let tg = MTLSize { width: THREADS_PER_TG, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: m,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
         icb.record_compute_full(
             slot,
             &self.pipeline_icb,
@@ -326,8 +337,16 @@ impl RmsNormBf16InBf16Out {
         encoder.set_threadgroup_memory_length(0, 8 * std::mem::size_of::<f32>());
 
         const THREADS_PER_TG: usize = 256;
-        let grid = MTLSize { width: m, height: 1, depth: 1 };
-        let tg = MTLSize { width: THREADS_PER_TG, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: m,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: THREADS_PER_TG,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(grid, tg);
         drop(encoder);
         Ok(y)

@@ -28,22 +28,22 @@ unsafe impl Send for SafePipeline {}
 unsafe impl Sync for SafePipeline {}
 
 static FA_PIPELINE: OnceLock<SafePipeline> = OnceLock::new();
-static FA_FAILED:   AtomicBool             = AtomicBool::new(false);
+static FA_FAILED: AtomicBool = AtomicBool::new(false);
 
 // bf16 I/O variant — Workstream C, MLX dtype policy alignment. Internal
 // accumulation stays f32 (correctness — bf16 mantissa too narrow for
 // 256+-element softmax denominators). Selected when all of Q/K/V/output/mask
 // are bf16; mixed dtype returns None so caller falls back to 3-dispatch SDPA.
 static FA_BF16_PIPELINE: OnceLock<SafePipeline> = OnceLock::new();
-static FA_BF16_FAILED:   AtomicBool             = AtomicBool::new(false);
+static FA_BF16_FAILED: AtomicBool = AtomicBool::new(false);
 
 static SDPAV_PIPELINE: OnceLock<SafePipeline> = OnceLock::new();
-static SDPAV_FAILED:   AtomicBool             = AtomicBool::new(false);
+static SDPAV_FAILED: AtomicBool = AtomicBool::new(false);
 
 // SDPA vector port — opt-in until validated. Reads LUMEN_USE_SDPA_VECTOR
 // once at first call; can be toggled at runtime via set_sdpa_vector_enabled.
-static SDPAV_ENABLED:      AtomicBool = AtomicBool::new(false);
-static SDPAV_ENABLED_INIT: Once       = Once::new();
+static SDPAV_ENABLED: AtomicBool = AtomicBool::new(false);
+static SDPAV_ENABLED_INIT: Once = Once::new();
 
 fn init_sdpav_enabled() {
     SDPAV_ENABLED_INIT.call_once(|| {
@@ -67,8 +67,8 @@ pub fn set_sdpa_vector_enabled(on: bool) {
 // ── Env-var gate ──────────────────────────────────────────────────────────────
 // AtomicBool so benchmarks and tests can override at runtime via set_disabled().
 // Reads LUMEN_DISABLE_FLASH_ATTN once at first call, then stays writable.
-static FA_DISABLED:      AtomicBool = AtomicBool::new(false);
-static FA_DISABLED_INIT: Once       = Once::new();
+static FA_DISABLED: AtomicBool = AtomicBool::new(false);
+static FA_DISABLED_INIT: Once = Once::new();
 
 fn init_disabled() {
     FA_DISABLED_INIT.call_once(|| {
@@ -247,14 +247,21 @@ fn metal_buf(t: &Tensor) -> Option<(&crate::metal::Buffer, usize)> {
 #[cfg(feature = "model-integration")]
 #[allow(clippy::too_many_arguments)]
 fn encode_flash_attn(
-    enc:      &crate::metal::ComputeCommandEncoderRef,
+    enc: &crate::metal::ComputeCommandEncoderRef,
     pipeline: &crate::metal::ComputePipelineState,
-    q_buf: &crate::metal::Buffer, q_off: usize,
-    k_buf: &crate::metal::Buffer, k_off: usize,
-    v_buf: &crate::metal::Buffer, v_off: usize,
-    o_buf: &crate::metal::Buffer, o_off: usize,
+    q_buf: &crate::metal::Buffer,
+    q_off: usize,
+    k_buf: &crate::metal::Buffer,
+    k_off: usize,
+    v_buf: &crate::metal::Buffer,
+    v_off: usize,
+    o_buf: &crate::metal::Buffer,
+    o_off: usize,
     mask_buf: Option<(&crate::metal::Buffer, usize)>,
-    b: u32, h: u32, sq: u32, skv: u32,
+    b: u32,
+    h: u32,
+    sq: u32,
+    skv: u32,
     scale: f32,
     group: u32,
 ) {
@@ -297,14 +304,21 @@ fn encode_flash_attn(
 #[cfg(feature = "model-integration")]
 #[allow(clippy::too_many_arguments)]
 fn encode_sdpa_vector(
-    enc:      &crate::metal::ComputeCommandEncoderRef,
+    enc: &crate::metal::ComputeCommandEncoderRef,
     pipeline: &crate::metal::ComputePipelineState,
-    q_buf: &crate::metal::Buffer, q_off: usize,
-    k_buf: &crate::metal::Buffer, k_off: usize,
-    v_buf: &crate::metal::Buffer, v_off: usize,
-    o_buf: &crate::metal::Buffer, o_off: usize,
+    q_buf: &crate::metal::Buffer,
+    q_off: usize,
+    k_buf: &crate::metal::Buffer,
+    k_off: usize,
+    v_buf: &crate::metal::Buffer,
+    v_off: usize,
+    o_buf: &crate::metal::Buffer,
+    o_off: usize,
     mask_buf: Option<(&crate::metal::Buffer, usize)>,
-    b: u32, h: u32, sq: u32, skv: u32,
+    b: u32,
+    h: u32,
+    sq: u32,
+    skv: u32,
     scale: f32,
     group: u32,
 ) {
@@ -370,13 +384,15 @@ fn encode_sdpa_vector(
 /// expand+contiguous materialization upstream.
 #[cfg(feature = "model-integration")]
 pub fn flash_attn_candle(
-    q:     &Tensor,
-    k:     &Tensor,
-    v:     &Tensor,
-    mask:  Option<&Tensor>,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
     scale: f32,
 ) -> Option<candle_core::Result<Tensor>> {
-    if is_disabled() { return None; }
+    if is_disabled() {
+        return None;
+    }
 
     // ── dtype gate ────────────────────────────────────────────────────────────
     // All inputs must share dtype. Production paths: F32 (legacy) and BF16
@@ -405,19 +421,36 @@ pub fn flash_attn_candle(
     let dims_q = q.dims();
     let dims_k = k.dims();
     let dims_v = v.dims();
-    if dims_q.len() != 4 || dims_k.len() != 4 || dims_v.len() != 4 { return None; }
-    let (b, h, sq, d)  = (dims_q[0] as u32, dims_q[1] as u32, dims_q[2] as u32, dims_q[3] as u32);
+    if dims_q.len() != 4 || dims_k.len() != 4 || dims_v.len() != 4 {
+        return None;
+    }
+    let (b, h, sq, d) = (
+        dims_q[0] as u32,
+        dims_q[1] as u32,
+        dims_q[2] as u32,
+        dims_q[3] as u32,
+    );
     let h_kv = dims_k[1] as u32;
-    let skv  = dims_k[2] as u32;
-    if d != 256 { return None; }   // kernel hardcoded for head_dim = 256
+    let skv = dims_k[2] as u32;
+    if d != 256 {
+        return None;
+    } // kernel hardcoded for head_dim = 256
 
     // GQA: K/V may be at full H (group=1) or compressed H_kv (group=H/H_kv).
     // Reject non-divisible / KV-not-matching shapes so the caller falls back.
-    if h_kv == 0 || h % h_kv != 0 { return None; }
+    if h_kv == 0 || h % h_kv != 0 {
+        return None;
+    }
     let group: u32 = h / h_kv;
-    if dims_v[1] as u32 != h_kv { return None; }
-    if dims_k[0] as u32 != b || dims_v[0] as u32 != b { return None; }
-    if dims_v[2] as u32 != skv || dims_k[3] as u32 != d || dims_v[3] as u32 != d { return None; }
+    if dims_v[1] as u32 != h_kv {
+        return None;
+    }
+    if dims_k[0] as u32 != b || dims_v[0] as u32 != b {
+        return None;
+    }
+    if dims_v[2] as u32 != skv || dims_k[3] as u32 != d || dims_v[3] as u32 != d {
+        return None;
+    }
 
     // ── Metal device check ────────────────────────────────────────────────────
     let device = q.device().clone();
@@ -428,11 +461,24 @@ pub fn flash_attn_candle(
 
     // ── Force contiguous (copies only when strided/sliced) ────────────────────
     let to_cont = |t: &Tensor| -> candle_core::Result<Tensor> {
-        if t.is_contiguous() { Ok(t.clone()) } else { t.contiguous() }
+        if t.is_contiguous() {
+            Ok(t.clone())
+        } else {
+            t.contiguous()
+        }
     };
-    let q_c = match to_cont(q) { Ok(t) => t, Err(e) => return Some(Err(e)) };
-    let k_c = match to_cont(k) { Ok(t) => t, Err(e) => return Some(Err(e)) };
-    let v_c = match to_cont(v) { Ok(t) => t, Err(e) => return Some(Err(e)) };
+    let q_c = match to_cont(q) {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    let k_c = match to_cont(k) {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    let v_c = match to_cont(v) {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
 
     // ── Extract Metal buffers ─────────────────────────────────────────────────
     let (q_buf, q_off) = metal_buf(&q_c)?;
@@ -453,12 +499,21 @@ pub fn flash_attn_candle(
     // ── Optional mask (must match Q/K/V dtype) ────────────────────────────────
     let mask_c: Option<Tensor> = if let Some(m) = mask {
         let dims_m = m.dims();
-        if dims_m.len() < 2 { return None; }
-        let m_sq  = dims_m[dims_m.len() - 2] as u32;
+        if dims_m.len() < 2 {
+            return None;
+        }
+        let m_sq = dims_m[dims_m.len() - 2] as u32;
         let m_skv = dims_m[dims_m.len() - 1] as u32;
-        if m_sq != sq || m_skv != skv { return None; }
-        if m.dtype() != qkv_dtype { return None; }
-        match to_cont(m) { Ok(t) => Some(t), Err(e) => return Some(Err(e)) }
+        if m_sq != sq || m_skv != skv {
+            return None;
+        }
+        if m.dtype() != qkv_dtype {
+            return None;
+        }
+        match to_cont(m) {
+            Ok(t) => Some(t),
+            Err(e) => return Some(Err(e)),
+        }
     } else {
         None
     };
@@ -471,19 +526,26 @@ pub fn flash_attn_candle(
         .map_err(|e| candle_core::Error::Msg(format!("flash_attn cmd_encoder: {e}")))
     {
         Ok(enc) => enc,
-        Err(e)  => return Some(Err(e)),
+        Err(e) => return Some(Err(e)),
     };
 
     if pipeline_is_sdpav {
         encode_sdpa_vector(
             encoder.as_ref(),
             pipeline,
-            q_buf, q_off,
-            k_buf, k_off,
-            v_buf, v_off,
-            o_buf, o_off,
+            q_buf,
+            q_off,
+            k_buf,
+            k_off,
+            v_buf,
+            v_off,
+            o_buf,
+            o_off,
             mask_arg,
-            b, h, sq, skv,
+            b,
+            h,
+            sq,
+            skv,
             scale,
             group,
         );
@@ -493,12 +555,19 @@ pub fn flash_attn_candle(
         encode_flash_attn(
             encoder.as_ref(),
             pipeline,
-            q_buf, q_off,
-            k_buf, k_off,
-            v_buf, v_off,
-            o_buf, o_off,
+            q_buf,
+            q_off,
+            k_buf,
+            k_off,
+            v_buf,
+            v_off,
+            o_buf,
+            o_off,
             mask_arg,
-            b, h, sq, skv,
+            b,
+            h,
+            sq,
+            skv,
             scale,
             group,
         );

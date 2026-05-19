@@ -13,7 +13,7 @@
 //! a no-op command. Subsequent phases register pipelines (mxfp4 v2, rmsnorm,
 //! etc.) and add fence helpers.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use lumen_metal::metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 
 use super::tensor::{NativeDType, NativeTensor};

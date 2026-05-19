@@ -342,27 +342,53 @@ fn run_setting(s: &Setting, iters: usize) {
     {
         // Run scores_v6 into a fresh buffer, then softmax_parallel in place.
         kernels::attention::qjl_project_query(
-            &ctx, &pipelines, &q_buf, &qjl_matrix_buf, &qjl_proj_buf,
-            s.dim as u32, s.qjl_m as u32,
-        ).unwrap();
+            &ctx,
+            &pipelines,
+            &q_buf,
+            &qjl_matrix_buf,
+            &qjl_proj_buf,
+            s.dim as u32,
+            s.qjl_m as u32,
+        )
+        .unwrap();
         kernels::attention::compressed_attention_scores_v6(
-            &ctx, &pipelines, &rq_buf, &qjl_proj_buf, &packed_buf, &scales_buf,
-            &cent_buf, &qjl_packed_buf, &res_norms_buf, &split_softmax_buf,
-            s.dim as u32, s.n_kv as u32, s.bits, n_packed as u32,
-            s.qjl_m as u32, n_qjl_packed as u32, n_levels,
-        ).unwrap();
-        kernels::attention::softmax_parallel(
-            &ctx, &pipelines, &split_softmax_buf, s.n_kv as u32,
-        ).unwrap();
+            &ctx,
+            &pipelines,
+            &rq_buf,
+            &qjl_proj_buf,
+            &packed_buf,
+            &scales_buf,
+            &cent_buf,
+            &qjl_packed_buf,
+            &res_norms_buf,
+            &split_softmax_buf,
+            s.dim as u32,
+            s.n_kv as u32,
+            s.bits,
+            n_packed as u32,
+            s.qjl_m as u32,
+            n_qjl_packed as u32,
+            n_levels,
+        )
+        .unwrap();
+        kernels::attention::softmax_parallel(&ctx, &pipelines, &split_softmax_buf, s.n_kv as u32)
+            .unwrap();
     }
     let gpu_split_softmax: Vec<f32> = ctx.read_buffer(&split_softmax_buf, s.n_kv);
 
     // CPU softmax of cpu_scores (reference)
     let cpu_max = cpu_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let cpu_exp_sum: f32 = cpu_scores.iter().map(|&x| (x - cpu_max).exp()).sum();
-    let cpu_softmax: Vec<f32> = cpu_scores.iter().map(|&x| (x - cpu_max).exp() / cpu_exp_sum).collect();
+    let cpu_softmax: Vec<f32> = cpu_scores
+        .iter()
+        .map(|&x| (x - cpu_max).exp() / cpu_exp_sum)
+        .collect();
     let cos_split_cpu_sm = cosine(&gpu_split_softmax, &cpu_softmax);
-    let max_diff_split = gpu_split_softmax.iter().zip(&cpu_softmax).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff_split = gpu_split_softmax
+        .iter()
+        .zip(&cpu_softmax)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     let split_sum: f32 = gpu_split_softmax.iter().sum();
 
     let gpu_old_scores: Vec<f32> = ctx.read_buffer(&scores_old_buf, s.n_kv);
@@ -426,11 +452,25 @@ fn run_setting(s: &Setting, iters: usize) {
     );
     println!(
         "  cos(*,true): cpu={:.6} v1={:.6} v2={:.6} v3={:.6} v4={:.6} v5={:.6} v6={:.6}",
-        cos_cpu_true, cos_gpu_old_true, cos_gpu_new_true, cos_gpu_v3_true, cos_gpu_v4_true, cos_gpu_v5_true, cos_gpu_v6_true
+        cos_cpu_true,
+        cos_gpu_old_true,
+        cos_gpu_new_true,
+        cos_gpu_v3_true,
+        cos_gpu_v4_true,
+        cos_gpu_v5_true,
+        cos_gpu_v6_true
     );
     println!(
         "  max|Δ| v1-v2={:.3e}  v2-v3={:.3e}  v3-v4={:.3e}  v3-v5={:.3e}  v3-v6={:.3e}    cos(v2,v3)={:.6}  cos(v3,v4)={:.6}  cos(v3,v5)={:.6}  cos(v3,v6)={:.6}",
-        max_abs_diff_old_new, max_abs_diff_v2_v3, max_abs_diff_v3_v4, max_abs_diff_v3_v5, max_abs_diff_v3_v6, cos_v2_v3, cos_v3_v4, cos_v3_v5, cos_v3_v6
+        max_abs_diff_old_new,
+        max_abs_diff_v2_v3,
+        max_abs_diff_v3_v4,
+        max_abs_diff_v3_v5,
+        max_abs_diff_v3_v6,
+        cos_v2_v3,
+        cos_v3_v4,
+        cos_v3_v5,
+        cos_v3_v6
     );
     println!(
         "  v1={:>7.1}μs v2={:>7.1}μs v3={:>7.1}μs v4={:>7.1}μs v5={:>7.1}μs v6={:>7.1}μs",
@@ -443,7 +483,15 @@ fn run_setting(s: &Setting, iters: usize) {
     );
     println!(
         "  speedup vs v1: v2={:.2}× v3={:.2}× v4={:.2}× v5={:.2}× v6={:.2}×    chain: v3/v2={:.2}× v4/v3={:.2}× v5/v3={:.2}× v6/v3={:.2}×",
-        speedup_v2, speedup_v3, speedup_v4, speedup_v5, speedup_v6, speedup_v3_over_v2, speedup_v4_over_v3, speedup_v5_over_v3, speedup_v6_over_v3,
+        speedup_v2,
+        speedup_v3,
+        speedup_v4,
+        speedup_v5,
+        speedup_v6,
+        speedup_v3_over_v2,
+        speedup_v4_over_v3,
+        speedup_v5_over_v3,
+        speedup_v6_over_v3,
     );
     println!(
         "  prod split (v6+softmax_parallel): cos(split,cpu_sm)={:.6}  max|Δ|={:.3e}  Σ={:.6} (must be ~1.0)",
@@ -455,8 +503,11 @@ fn run_setting(s: &Setting, iters: usize) {
 fn compressor_qjl_matrix(c: &TurboQuantCompressor) -> Vec<f32> {
     // Reproduce the QJLProjector held inside the compressor by re-creating with
     // the same seed offset. This avoids exposing private fields.
-    let qjl =
-        lumen_core::qjl::QJLProjector::new(c.config.head_dim, c.config.qjl_m, c.config.seed.wrapping_add(1));
+    let qjl = lumen_core::qjl::QJLProjector::new(
+        c.config.head_dim,
+        c.config.qjl_m,
+        c.config.seed.wrapping_add(1),
+    );
     qjl.proj_matrix
 }
 
@@ -464,17 +515,67 @@ fn main() {
     let iters = 50;
     let settings = [
         // realistic head_dim across modern LLMs (Qwen=128, Llama=128, GPT=64-256)
-        Setting { dim: 64,  qjl_m: 64,  n_kv: 1024,  bits: 3 },
-        Setting { dim: 128, qjl_m: 64,  n_kv: 1024,  bits: 3 },
-        Setting { dim: 128, qjl_m: 128, n_kv: 1024,  bits: 3 },
-        Setting { dim: 128, qjl_m: 64,  n_kv: 4096,  bits: 3 },
-        Setting { dim: 128, qjl_m: 64,  n_kv: 8192,  bits: 3 },
-        Setting { dim: 256, qjl_m: 128, n_kv: 4096,  bits: 3 },
-        Setting { dim: 256, qjl_m: 128, n_kv: 8192,  bits: 3 },
+        Setting {
+            dim: 64,
+            qjl_m: 64,
+            n_kv: 1024,
+            bits: 3,
+        },
+        Setting {
+            dim: 128,
+            qjl_m: 64,
+            n_kv: 1024,
+            bits: 3,
+        },
+        Setting {
+            dim: 128,
+            qjl_m: 128,
+            n_kv: 1024,
+            bits: 3,
+        },
+        Setting {
+            dim: 128,
+            qjl_m: 64,
+            n_kv: 4096,
+            bits: 3,
+        },
+        Setting {
+            dim: 128,
+            qjl_m: 64,
+            n_kv: 8192,
+            bits: 3,
+        },
+        Setting {
+            dim: 256,
+            qjl_m: 128,
+            n_kv: 4096,
+            bits: 3,
+        },
+        Setting {
+            dim: 256,
+            qjl_m: 128,
+            n_kv: 8192,
+            bits: 3,
+        },
         // larger cases — beyond dispatch floor, expose true compute-bound win
-        Setting { dim: 256, qjl_m: 128, n_kv: 16384, bits: 3 },
-        Setting { dim: 512, qjl_m: 256, n_kv: 8192,  bits: 3 },
-        Setting { dim: 512, qjl_m: 256, n_kv: 16384, bits: 3 },
+        Setting {
+            dim: 256,
+            qjl_m: 128,
+            n_kv: 16384,
+            bits: 3,
+        },
+        Setting {
+            dim: 512,
+            qjl_m: 256,
+            n_kv: 8192,
+            bits: 3,
+        },
+        Setting {
+            dim: 512,
+            qjl_m: 256,
+            n_kv: 16384,
+            bits: 3,
+        },
     ];
 
     println!("=== TurboQuant QJL precompute optimization microbench ===");

@@ -21,9 +21,8 @@ fn main() -> Result<()> {
 
     let model_id = std::env::var("MODEL_ID")
         .unwrap_or_else(|_| "/path/to/models/gemma-4-26b-a4b-mlx-4bit".into());
-    let drafter_dir = std::env::var("DRAFTER_DIR").unwrap_or_else(|_| {
-        "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into()
-    });
+    let drafter_dir = std::env::var("DRAFTER_DIR")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
     let n_draft: usize = std::env::var("N_DRAFT")
         .ok()
         .and_then(|s| s.parse().ok())

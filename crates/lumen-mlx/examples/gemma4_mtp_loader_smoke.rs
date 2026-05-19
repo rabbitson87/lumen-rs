@@ -14,13 +14,11 @@ use anyhow::{Context, Result};
 fn main() -> Result<()> {
     use lumen_mlx::gemma4::mtp::load_drafter;
 
-    let dir = std::env::var("DRAFTER_DIR").unwrap_or_else(|_| {
-        "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into()
-    });
+    let dir = std::env::var("DRAFTER_DIR")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
     eprintln!("[mtp-loader-smoke] loading {dir}");
 
-    let drafter = load_drafter(Path::new(&dir))
-        .context("load_drafter failed")?;
+    let drafter = load_drafter(Path::new(&dir)).context("load_drafter failed")?;
 
     let cfg = &drafter.config;
     let tc = &cfg.text_config;
@@ -45,9 +43,18 @@ fn main() -> Result<()> {
     println!("  num_kv_shared_layers = {}", tc.num_kv_shared_layers);
     println!("  tie_word_embeddings  = {}", cfg.tie_word_embeddings);
 
-    println!("\n  embed_tokens   shape = {:?}", drafter.embed_tokens.shape());
-    println!("  pre_projection shape = {:?}", drafter.pre_projection.shape());
-    println!("  post_projection shape = {:?}", drafter.post_projection.shape());
+    println!(
+        "\n  embed_tokens   shape = {:?}",
+        drafter.embed_tokens.shape()
+    );
+    println!(
+        "  pre_projection shape = {:?}",
+        drafter.pre_projection.shape()
+    );
+    println!(
+        "  post_projection shape = {:?}",
+        drafter.post_projection.shape()
+    );
     println!("  final_norm     shape = {:?}", drafter.final_norm.shape());
 
     for (i, lw) in drafter.layers.iter().enumerate() {

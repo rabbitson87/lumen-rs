@@ -165,8 +165,6 @@ fn probe_buffer_stability_with_dispatch() {
     if unique_in.len() <= ITERS / 20 + 1 && unique_out.len() <= ITERS / 20 + 1 {
         eprintln!("VERDICT: pool reuse stable → record-once architecture viable");
     } else {
-        eprintln!(
-            "VERDICT: pool reuse NOT stable → must re-record or allocate scratch buffers"
-        );
+        eprintln!("VERDICT: pool reuse NOT stable → must re-record or allocate scratch buffers");
     }
 }

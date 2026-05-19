@@ -73,8 +73,8 @@ fn int8_affine_dequant_matches_mlx_reference() {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
-    let got = debug_dequant_int8_affine(&packed, &scales, &biases, group_size)
-        .expect("Rust dequant");
+    let got =
+        debug_dequant_int8_affine(&packed, &scales, &biases, group_size).expect("Rust dequant");
     assert_eq!(got.len(), expected.len());
 
     // L2, max abs, cosine.
@@ -105,7 +105,9 @@ fn int8_affine_dequant_matches_mlx_reference() {
     for i in 0..8 {
         eprintln!(
             "  w[0,{i:>4}]: got={:>+9.6}  ref={:>+9.6}  Δ={:+.3e}",
-            got[i], expected[i], got[i] - expected[i]
+            got[i],
+            expected[i],
+            got[i] - expected[i]
         );
     }
     // Also check one sample from the middle and the end to rule out packing drift.
@@ -115,7 +117,9 @@ fn int8_affine_dequant_matches_mlx_reference() {
             if (got[idx] - expected[idx]).abs() > 1e-3 {
                 eprintln!(
                     "  MISMATCH w[{row},{col}]: got={:+.6}  ref={:+.6}  Δ={:+.3e}",
-                    got[idx], expected[idx], got[idx] - expected[idx]
+                    got[idx],
+                    expected[idx],
+                    got[idx] - expected[idx]
                 );
             }
         }

@@ -16,10 +16,10 @@
 #![cfg(feature = "model-integration")]
 
 use candle_core::{DType, Device, Tensor, backend::BackendDevice as _};
-use std::time::Instant;
 use lumen_metal::flash_attn::flash_attn_candle;
 use lumen_metal::rms_norm::RmsNormBf16InBf16Out;
 use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
+use std::time::Instant;
 
 const HIDDEN: usize = 5120;
 const INTER: usize = 17408;
@@ -145,12 +145,7 @@ fn stage25_non_matmul_breakdown() {
         let calls = N_TOTAL_LAYERS; // 1 per MLP block
         let ms_tok = us * calls as f64 / 1000.0;
         total_ms_tok += ms_tok;
-        rows.push((
-            format!("silu*mul fused (INTER={INTER})"),
-            us,
-            calls,
-            ms_tok,
-        ));
+        rows.push((format!("silu*mul fused (INTER={INTER})"), us, calls, ms_tok));
     }
 
     // ── 3. Flash-attn (full-attn shape: 24Q heads, 4KV heads, head_dim=256) ──
@@ -261,9 +256,7 @@ fn stage25_non_matmul_breakdown() {
     let attn_non_matmul_ms = stage1_attn_ms - stage2_attn_matmul_ms;
     eprintln!();
     eprintln!("=== Derived (Stage 1 - Stage 2) ===");
-    eprintln!(
-        "Stage 1 attn-block total (sync-mode ratio × 67ms): {stage1_attn_ms:.2} ms"
-    );
+    eprintln!("Stage 1 attn-block total (sync-mode ratio × 67ms): {stage1_attn_ms:.2} ms");
     eprintln!(
         "Stage 2 attn matmul (lin + ful in/out + qkv + o_proj): {stage2_attn_matmul_ms:.2} ms"
     );

@@ -164,11 +164,7 @@ fn run_setting(s: &E2ESetting, iters: usize) {
         .collect();
     let rotation_flat: Vec<f32> = compressor.rotation().matrix.clone();
     let qjl_matrix_flat: Vec<f32> = {
-        let qjl = lumen_core::qjl::QJLProjector::new(
-            s.dim,
-            qjl_m,
-            42u64.wrapping_add(1),
-        );
+        let qjl = lumen_core::qjl::QJLProjector::new(s.dim, qjl_m, 42u64.wrapping_add(1));
         qjl.proj_matrix
     };
     let rotated_query = compressor.rotation().apply(&query);
@@ -198,36 +194,88 @@ fn run_setting(s: &E2ESetting, iters: usize) {
     // Bench: full pipeline (timing)
     let bench_pipeline = || {
         kernels::attention::qjl_project_query(
-            &ctx, &pipelines, &q_buf, &qjl_matrix_buf, &qjl_proj_buf,
-            s.dim as u32, qjl_m as u32,
-        ).unwrap();
+            &ctx,
+            &pipelines,
+            &q_buf,
+            &qjl_matrix_buf,
+            &qjl_proj_buf,
+            s.dim as u32,
+            qjl_m as u32,
+        )
+        .unwrap();
         kernels::attention::compressed_attention_scores_v6(
-            &ctx, &pipelines, &rq_buf, &qjl_proj_buf, &k_packed_buf, &k_scales_buf,
-            &cent_buf, &k_qjl_buf, &k_resnorms_buf, &scores_buf,
-            s.dim as u32, s.n_kv as u32, s.bits, n_packed as u32,
-            qjl_m as u32, n_qjl_packed as u32, n_levels,
-        ).unwrap();
+            &ctx,
+            &pipelines,
+            &rq_buf,
+            &qjl_proj_buf,
+            &k_packed_buf,
+            &k_scales_buf,
+            &cent_buf,
+            &k_qjl_buf,
+            &k_resnorms_buf,
+            &scores_buf,
+            s.dim as u32,
+            s.n_kv as u32,
+            s.bits,
+            n_packed as u32,
+            qjl_m as u32,
+            n_qjl_packed as u32,
+            n_levels,
+        )
+        .unwrap();
         kernels::attention::softmax_parallel(&ctx, &pipelines, &scores_buf, s.n_kv as u32).unwrap();
         kernels::attention::compressed_value_gather_multi(
-            &ctx, &pipelines, &scores_buf, &v_packed_buf, &v_scales_buf,
-            &cent_buf, &rot_buf, &output_buf,
-            s.dim as u32, s.n_kv as u32, s.bits, n_packed as u32, n_levels, s.gqa_ratio,
-        ).unwrap();
+            &ctx,
+            &pipelines,
+            &scores_buf,
+            &v_packed_buf,
+            &v_scales_buf,
+            &cent_buf,
+            &rot_buf,
+            &output_buf,
+            s.dim as u32,
+            s.n_kv as u32,
+            s.bits,
+            n_packed as u32,
+            n_levels,
+            s.gqa_ratio,
+        )
+        .unwrap();
     };
     bench_pipeline(); // warmup
     let dur = time_median(iters, bench_pipeline);
 
     // Accuracy run: capture RAW scores BEFORE softmax (for primary accuracy metric)
     kernels::attention::qjl_project_query(
-        &ctx, &pipelines, &q_buf, &qjl_matrix_buf, &qjl_proj_buf,
-        s.dim as u32, qjl_m as u32,
-    ).unwrap();
+        &ctx,
+        &pipelines,
+        &q_buf,
+        &qjl_matrix_buf,
+        &qjl_proj_buf,
+        s.dim as u32,
+        qjl_m as u32,
+    )
+    .unwrap();
     kernels::attention::compressed_attention_scores_v6(
-        &ctx, &pipelines, &rq_buf, &qjl_proj_buf, &k_packed_buf, &k_scales_buf,
-        &cent_buf, &k_qjl_buf, &k_resnorms_buf, &scores_buf,
-        s.dim as u32, s.n_kv as u32, s.bits, n_packed as u32,
-        qjl_m as u32, n_qjl_packed as u32, n_levels,
-    ).unwrap();
+        &ctx,
+        &pipelines,
+        &rq_buf,
+        &qjl_proj_buf,
+        &k_packed_buf,
+        &k_scales_buf,
+        &cent_buf,
+        &k_qjl_buf,
+        &k_resnorms_buf,
+        &scores_buf,
+        s.dim as u32,
+        s.n_kv as u32,
+        s.bits,
+        n_packed as u32,
+        qjl_m as u32,
+        n_qjl_packed as u32,
+        n_levels,
+    )
+    .unwrap();
     let scores_tq_raw: Vec<f32> = ctx.read_buffer(&scores_buf, s.n_kv);
 
     // FP32 reference raw scores (no 1/sqrt(dim))
@@ -279,18 +327,32 @@ fn run_setting(s: &E2ESetting, iters: usize) {
     // "how well does TurboQuant reproduce attention weights".
     let cos_output_attn_only = cosine(&output_tq_host, &output_ref);
 
-    println!("[{}] dim={} n_kv={} gqa_ratio={} bits={}",
-             s.label, s.dim, s.n_kv, s.gqa_ratio, s.bits);
-    println!("  memory: FP16={:.2}MB  TurboQuant={:.2}MB  ratio={:.2}× compression",
-             fp16_bytes / 1e6, tq_bytes / 1e6, compress_ratio);
-    println!("  scores accuracy (raw inner products): cos={:.6}  max|Δ|={:.3e}",
-             cos_scores, max_diff_scores);
-    println!("  attention dist (with 1/√d scale):     cos(softmax)={:.6}  KL={:.4e}  top-1={}  top-5={}/5",
-             cos_softmax, kl_tq_ref, top1_match, top5_overlap);
-    println!("  attention output (FP32 V, isolates weights): cos={:.6}",
-             cos_output_attn_only);
-    println!("  speed: pipeline median = {:.1}μs / attention call",
-             dur.as_secs_f64() * 1e6);
+    println!(
+        "[{}] dim={} n_kv={} gqa_ratio={} bits={}",
+        s.label, s.dim, s.n_kv, s.gqa_ratio, s.bits
+    );
+    println!(
+        "  memory: FP16={:.2}MB  TurboQuant={:.2}MB  ratio={:.2}× compression",
+        fp16_bytes / 1e6,
+        tq_bytes / 1e6,
+        compress_ratio
+    );
+    println!(
+        "  scores accuracy (raw inner products): cos={:.6}  max|Δ|={:.3e}",
+        cos_scores, max_diff_scores
+    );
+    println!(
+        "  attention dist (with 1/√d scale):     cos(softmax)={:.6}  KL={:.4e}  top-1={}  top-5={}/5",
+        cos_softmax, kl_tq_ref, top1_match, top5_overlap
+    );
+    println!(
+        "  attention output (FP32 V, isolates weights): cos={:.6}",
+        cos_output_attn_only
+    );
+    println!(
+        "  speed: pipeline median = {:.1}μs / attention call",
+        dur.as_secs_f64() * 1e6
+    );
     println!();
 }
 
@@ -380,7 +442,10 @@ fn main() {
 
     println!("=== Phase 8 (a) — TurboQuant E2E benchmark ===");
     println!("Pipeline: qjl_project_query → scores_v6 → softmax_parallel → value_gather_multi");
-    println!("Each setting runs {} iterations; reporting median wall time.", iters);
+    println!(
+        "Each setting runs {} iterations; reporting median wall time.",
+        iters
+    );
     println!();
 
     for s in &settings {

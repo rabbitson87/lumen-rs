@@ -18,8 +18,8 @@ use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderComp
 use std::sync::Arc;
 
 use lumen_metal::metal;
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
 use lumen_metal::mtl_size;
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
@@ -59,9 +59,7 @@ fn run_dense(
     batch: usize,
 ) -> Vec<f32> {
     let x_buf = ctx.ctx.buffer_with_data(x);
-    let y_buf = ctx
-        .ctx
-        .buffer_for::<f32>(batch * weight.out_features);
+    let y_buf = ctx.ctx.buffer_for::<f32>(batch * weight.out_features);
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -106,7 +104,8 @@ fn run_dense(
     cmd.commit();
     cmd.wait_until_completed();
 
-    ctx.ctx.read_buffer::<f32>(&y_buf, batch * weight.out_features)
+    ctx.ctx
+        .read_buffer::<f32>(&y_buf, batch * weight.out_features)
 }
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {

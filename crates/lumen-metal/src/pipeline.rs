@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::metal::{ComputePipelineState, Device, Library};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 /// Compiled Metal shader library + cached compute pipelines.

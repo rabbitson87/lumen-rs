@@ -40,8 +40,8 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
 use lumen_mlx::gemma4::Gemma4Backend;
+use serde::Deserialize;
 
 const FIXTURE_PATH: &str = "tests/fixtures/gemma4_parity.json";
 const LMSTUDIO_DIR: &str = "/path/to/models/gemma-4-26b-a4b-mlx-4bit";
@@ -117,7 +117,10 @@ fn gemma4_parity_teacher_forced_argmax_match() {
     let Some(fixture) = load_fixture() else {
         return;
     };
-    assert!(!fixture.fixtures.is_empty(), "fixture set must be non-empty");
+    assert!(
+        !fixture.fixtures.is_empty(),
+        "fixture set must be non-empty"
+    );
     eprintln!(
         "[parity] fixtures={} max_new_tokens={} thinking={} eos_ids={:?}",
         fixture.fixtures.len(),
@@ -165,19 +168,13 @@ fn gemma4_parity_teacher_forced_argmax_match() {
         assert!(!ref_tokens.is_empty(), "case {idx}: empty reference");
         let mut tf_matched = if pred == ref_tokens[0] { 1 } else { 0 };
         let tf_total = ref_tokens.len();
-        let mut tf_first_div: Option<usize> = if pred == ref_tokens[0] {
-            None
-        } else {
-            Some(0)
-        };
+        let mut tf_first_div: Option<usize> = if pred == ref_tokens[0] { None } else { Some(0) };
 
         for k in 1..ref_tokens.len() {
             let logits = model
                 .forward(&[ref_tokens[k - 1]], &mut cache)
                 .expect("tf decode forward");
-            pred = model
-                .argmax_last_token(&logits)
-                .expect("tf decode argmax");
+            pred = model.argmax_last_token(&logits).expect("tf decode argmax");
             if pred == ref_tokens[k] {
                 tf_matched += 1;
             } else if tf_first_div.is_none() {
@@ -236,7 +233,13 @@ fn gemma4_parity_teacher_forced_argmax_match() {
         let free_pct = (r.free_prefix_match as f64 / r.free_total_ref as f64) * 100.0;
         eprintln!(
             "  case {}: TF {}/{} ({:.1}%) | free prefix {}/{} ({:.1}%)",
-            r.idx, r.tf_matched, r.tf_total, tf_pct, r.free_prefix_match, r.free_total_ref, free_pct
+            r.idx,
+            r.tf_matched,
+            r.tf_total,
+            tf_pct,
+            r.free_prefix_match,
+            r.free_total_ref,
+            free_pct
         );
     }
 

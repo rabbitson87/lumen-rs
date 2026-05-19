@@ -30,18 +30,10 @@ impl MatmulGraph2D {
         let b_shape = shape_from_dims(&[k, n]);
 
         let a = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&a_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&a_shape), MPSDataType::Float32, None)
         };
         let b = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&b_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&b_shape), MPSDataType::Float32, None)
         };
         let c = unsafe {
             graph.matrixMultiplicationWithPrimaryTensor_secondaryTensor_name(&a, &b, None)
@@ -51,14 +43,17 @@ impl MatmulGraph2D {
         let b_shaped = shaped_type(&b_shape, MPSDataType::Float32);
         let feeds = NSDictionary::from_slices(&[&*a, &*b], &[&*a_shaped, &*b_shaped]);
 
-        Self { graph, a, b, c, feeds }
+        Self {
+            graph,
+            a,
+            b,
+            c,
+            feeds,
+        }
     }
 }
 
-fn shaped_type(
-    shape: &NSArray<NSNumber>,
-    dtype: MPSDataType,
-) -> Retained<MPSGraphShapedType> {
+fn shaped_type(shape: &NSArray<NSNumber>, dtype: MPSDataType) -> Retained<MPSGraphShapedType> {
     use objc2::AllocAnyThread;
     let alloc = MPSGraphShapedType::alloc();
     unsafe { MPSGraphShapedType::initWithShape_dataType(alloc, Some(shape), dtype) }
@@ -94,18 +89,10 @@ impl RmsNormGraph {
         let w_shape = shape_from_dims(&[hidden]);
 
         let x = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&x_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&x_shape), MPSDataType::Float32, None)
         };
         let weight = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&w_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&w_shape), MPSDataType::Float32, None)
         };
 
         // axes = [1] → reduce along hidden (last dim of [m, hidden])
@@ -114,17 +101,13 @@ impl RmsNormGraph {
 
         let x_sq = unsafe { graph.squareWithTensor_name(&x, None) };
         let var = unsafe { graph.meanOfTensor_axes_name(&x_sq, &axes, None) };
-        let eps_t = unsafe {
-            graph.constantWithScalar_dataType(eps as f64, MPSDataType::Float32)
-        };
-        let var_eps = unsafe {
-            graph.additionWithPrimaryTensor_secondaryTensor_name(&var, &eps_t, None)
-        };
+        let eps_t = unsafe { graph.constantWithScalar_dataType(eps as f64, MPSDataType::Float32) };
+        let var_eps =
+            unsafe { graph.additionWithPrimaryTensor_secondaryTensor_name(&var, &eps_t, None) };
         let inv = unsafe { graph.reciprocalSquareRootWithTensor_name(&var_eps, None) };
         // x · inv  (broadcast inv [m,1] onto x [m,hidden])
-        let x_norm = unsafe {
-            graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x, &inv, None)
-        };
+        let x_norm =
+            unsafe { graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x, &inv, None) };
         // · weight  (broadcast weight [hidden] onto [m,hidden])
         let y = unsafe {
             graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x_norm, &weight, None)
@@ -134,7 +117,13 @@ impl RmsNormGraph {
         let w_shaped = shaped_type(&w_shape, MPSDataType::Float32);
         let feeds = NSDictionary::from_slices(&[&*x, &*weight], &[&*x_shaped, &*w_shaped]);
 
-        Self { graph, x, weight, y, feeds }
+        Self {
+            graph,
+            x,
+            weight,
+            y,
+            feeds,
+        }
     }
 }
 
@@ -161,18 +150,10 @@ impl RmsNormBf16OutGraph {
         let w_shape = shape_from_dims(&[hidden]);
 
         let x = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&x_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&x_shape), MPSDataType::Float32, None)
         };
         let weight = unsafe {
-            graph.placeholderWithShape_dataType_name(
-                Some(&w_shape),
-                MPSDataType::Float32,
-                None,
-            )
+            graph.placeholderWithShape_dataType_name(Some(&w_shape), MPSDataType::Float32, None)
         };
 
         let axes_arr: Vec<Retained<NSNumber>> = vec![NSNumber::new_i64(1)];
@@ -180,27 +161,27 @@ impl RmsNormBf16OutGraph {
 
         let x_sq = unsafe { graph.squareWithTensor_name(&x, None) };
         let var = unsafe { graph.meanOfTensor_axes_name(&x_sq, &axes, None) };
-        let eps_t = unsafe {
-            graph.constantWithScalar_dataType(eps as f64, MPSDataType::Float32)
-        };
-        let var_eps = unsafe {
-            graph.additionWithPrimaryTensor_secondaryTensor_name(&var, &eps_t, None)
-        };
+        let eps_t = unsafe { graph.constantWithScalar_dataType(eps as f64, MPSDataType::Float32) };
+        let var_eps =
+            unsafe { graph.additionWithPrimaryTensor_secondaryTensor_name(&var, &eps_t, None) };
         let inv = unsafe { graph.reciprocalSquareRootWithTensor_name(&var_eps, None) };
-        let x_norm = unsafe {
-            graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x, &inv, None)
-        };
+        let x_norm =
+            unsafe { graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x, &inv, None) };
         let y_f32 = unsafe {
             graph.multiplicationWithPrimaryTensor_secondaryTensor_name(&x_norm, &weight, None)
         };
-        let y = unsafe {
-            graph.castTensor_toType_name(&y_f32, MPSDataType::BFloat16, None)
-        };
+        let y = unsafe { graph.castTensor_toType_name(&y_f32, MPSDataType::BFloat16, None) };
 
         let x_shaped = shaped_type(&x_shape, MPSDataType::Float32);
         let w_shaped = shaped_type(&w_shape, MPSDataType::Float32);
         let feeds = NSDictionary::from_slices(&[&*x, &*weight], &[&*x_shaped, &*w_shaped]);
 
-        Self { graph, x, weight, y, feeds }
+        Self {
+            graph,
+            x,
+            weight,
+            y,
+            feeds,
+        }
     }
 }

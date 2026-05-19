@@ -38,7 +38,9 @@ fn multi_value_gather_matches_single_per_qhead() {
     let compressed = compressor.compress(&vectors, n_kv);
 
     // Synthetic softmax weights: random positive, normalized to sum=1
-    let raw: Vec<f32> = (0..n_kv).map(|_| rng.sample::<f32, _>(StandardNormal).abs() + 1e-3).collect();
+    let raw: Vec<f32> = (0..n_kv)
+        .map(|_| rng.sample::<f32, _>(StandardNormal).abs() + 1e-3)
+        .collect();
     let raw_sum: f32 = raw.iter().sum();
     let weights: Vec<f32> = raw.iter().map(|&w| w / raw_sum).collect();
 
@@ -166,7 +168,10 @@ fn multi_value_gather_matches_single_per_qhead() {
             .zip(sq)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert_eq!(max_intra, 0.0, "Q head {q} differs from Q head 0 within multi (must be identical fan-out)");
+        assert_eq!(
+            max_intra, 0.0,
+            "Q head {q} differs from Q head 0 within multi (must be identical fan-out)"
+        );
     }
 
     // ── C4 microbench: gqa_ratio × single dispatch vs single multi dispatch ──

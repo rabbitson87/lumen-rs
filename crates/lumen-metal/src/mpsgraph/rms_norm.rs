@@ -17,8 +17,8 @@ use objc2_metal_performance_shaders::MPSDataType;
 use objc2_metal_performance_shaders_graph::MPSGraphExecutable;
 
 use super::{
-    compile, encode_and_commit, shape_from_dims, tensor_data_from_buffer, MpsGraphContext,
-    RmsNormBf16OutGraph, RmsNormGraph,
+    MpsGraphContext, RmsNormBf16OutGraph, RmsNormGraph, compile, encode_and_commit,
+    shape_from_dims, tensor_data_from_buffer,
 };
 
 /// Cached compiled RmsNorm graph for a given `(m, hidden)` pair.
@@ -212,8 +212,7 @@ impl MpsRmsNormBf16Out {
         {
             let mut cache = self.cache.lock().unwrap();
             if !cache.contains_key(&key) {
-                let rn =
-                    RmsNormBf16OutGraph::build(self.ctx.new_graph(), m, hidden, self.eps);
+                let rn = RmsNormBf16OutGraph::build(self.ctx.new_graph(), m, hidden, self.eps);
                 let exe = compile(&rn.graph, self.ctx.device(), &rn.feeds, &[&*rn.y]);
                 cache.insert(key, CompiledRmsNorm { exe });
             }
@@ -259,9 +258,7 @@ impl MpsRmsNormBf16Out {
 }
 
 /// Extract the MTLBuffer + byte offset from a Candle Tensor with Metal storage.
-fn buffer_from_tensor(
-    t: &Tensor,
-) -> candle_core::Result<(&ProtocolObject<dyn MTLBuffer>, usize)> {
+fn buffer_from_tensor(t: &Tensor) -> candle_core::Result<(&ProtocolObject<dyn MTLBuffer>, usize)> {
     let (storage_guard, layout) = t.storage_and_layout();
     match &*storage_guard {
         Storage::Metal(ms) => {
@@ -271,8 +268,7 @@ fn buffer_from_tensor(
             let buf_ref: &ProtocolObject<dyn MTLBuffer> = candle_buf.as_ref();
             // Borrow lives as long as the storage_guard / Tensor.
             // The signature exposes a borrow tied to `t`, which is correct.
-            let buf_ref: &ProtocolObject<dyn MTLBuffer> =
-                unsafe { std::mem::transmute(buf_ref) };
+            let buf_ref: &ProtocolObject<dyn MTLBuffer> = unsafe { std::mem::transmute(buf_ref) };
             Ok((buf_ref, offset_bytes))
         }
         _ => Err(candle_core::Error::Msg(
@@ -294,9 +290,14 @@ mod tests {
         let device = Device::new_metal(0).expect("Metal device");
         let m = 2usize;
         let hidden = 4usize;
-        let x =
-            Tensor::from_vec((0..(m * hidden) as i32).map(|i| i as f32).collect::<Vec<_>>(),
-                (m, hidden), &device).unwrap();
+        let x = Tensor::from_vec(
+            (0..(m * hidden) as i32)
+                .map(|i| i as f32)
+                .collect::<Vec<_>>(),
+            (m, hidden),
+            &device,
+        )
+        .unwrap();
         let y = Tensor::zeros((m, hidden), candle_core::DType::F32, &device).unwrap();
 
         let (x_buf, _) = buffer_from_tensor(&x).unwrap();

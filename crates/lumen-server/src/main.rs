@@ -1,3 +1,4 @@
+mod catalog;
 mod embedding;
 mod engine;
 mod routes;
@@ -11,7 +12,10 @@ use engine::{EngineHandle, InferenceEngine};
 use types::ErrorResponse;
 
 const DEFAULT_MODEL: &str = "Qwen/Qwen2.5-0.5B";
-const DEFAULT_PORT: u16 = 8080;
+// 41110 picked because: (1) far from common services (8080 collides with web
+// dev servers, 11434 collides with Ollama), (2) phonetic "LU-MEN" via leetspeak
+// L=1, U=4(rotated), M=1, EN=10. Override with PORT= env var as before.
+const DEFAULT_PORT: u16 = 41110;
 
 /// Embedded mlx Metal kernel library. Populated by build.rs from
 /// `target/.../out/build/lib/mlx.metallib`. Under non-mlx-native builds
@@ -63,6 +67,24 @@ fn ensure_metallib_colocated() {
 
 #[tokio::main]
 async fn main() -> Result<(), SendableError> {
+    // ── Early-exit flags ───────────────────────────────────────────
+    // Handle before any heavy initialization (env loading, model loading,
+    // metallib unpack). These flags exist so external tooling (the lumen-app
+    // desktop control plane in particular) can introspect the binary without
+    // paying the startup cost.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--catalog") {
+        let cat = catalog::catalog();
+        let json = serde_json::to_string_pretty(&cat)
+            .map_err(|e| SendableError::from(format!("serialize catalog: {e}")))?;
+        println!("{json}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("lumen-server {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Auto-load .env from CWD or binary-adjacent directory so deployments
     // can drop config without exporting every var manually. Errors are
     // silently ignored (missing .env is normal — env vars still take
@@ -90,7 +112,9 @@ async fn main() -> Result<(), SendableError> {
     // Keep as a soft default: respect user override.
     if std::env::var_os("CANDLE_METAL_COMPUTE_PER_BUFFER").is_none() {
         // SAFETY: set before any threads are spawned.
-        unsafe { std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "10"); }
+        unsafe {
+            std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "10");
+        }
     }
 
     let model_id = std::env::var("MODEL_ID").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
@@ -135,12 +159,25 @@ async fn main() -> Result<(), SendableError> {
         let memory_gb = env_gb("LUMEN_MEMORY_LIMIT_GB", 32);
         let gb_to_bytes = |gb: usize| gb * 1024 * 1024 * 1024;
 
-        match lumen_mlx::metal_memory::set_wired_limit(gb_to_bytes(wired_gb)) {
+        // Byte-precision override for wired_limit — set by the desktop app to
+        // exactly match the active model's safetensors size. Takes precedence
+        // over the GB-rounded knob so 13.45 GB weights don't get evicted by a
+        // 13 GB ceiling.
+        let wired_bytes = std::env::var("LUMEN_WIRED_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| gb_to_bytes(wired_gb));
+
+        match lumen_mlx::metal_memory::set_wired_limit(wired_bytes) {
             Ok(prev) => eprintln!(
-                "[mlx-mem] wired_limit raised to {wired_gb} GB (prev {} GB)",
-                prev / (1024 * 1024 * 1024)
+                "[mlx-mem] wired_limit raised to {} MB (prev {} MB)",
+                wired_bytes / (1024 * 1024),
+                prev / (1024 * 1024),
             ),
-            Err(e) => eprintln!("[mlx-mem] WARN set_wired_limit={wired_gb} GB: {e}"),
+            Err(e) => eprintln!(
+                "[mlx-mem] WARN set_wired_limit={} MB: {e}",
+                wired_bytes / (1024 * 1024),
+            ),
         }
         match lumen_mlx::metal_memory::set_memory_limit(gb_to_bytes(memory_gb)) {
             Ok(prev) => eprintln!(
@@ -172,33 +209,30 @@ async fn main() -> Result<(), SendableError> {
     // 503 with an actionable message. The service runs on a dedicated
     // blocking thread because the underlying subprocess pipe is
     // synchronous (blocking_recv inside the loop).
-    let embedding_handle: Option<EmbeddingHandle> =
-        match std::env::var("EMBEDDING_MODEL_ID") {
-            Ok(model_id) if !model_id.is_empty() => {
-                eprintln!("Loading embedding model: {model_id}");
-                match EmbeddingService::load(&model_id) {
-                    Ok(service) => {
-                        let (etx, erx) = tokio::sync::mpsc::channel(64);
-                        std::thread::Builder::new()
-                            .name("embedding-service".into())
-                            .spawn(move || service.run(erx))
-                            .map_err(|e| {
-                                SendableError::from(format!(
-                                    "failed to spawn embedding thread: {e}"
-                                ))
-                            })?;
-                        Some(EmbeddingHandle::new(etx))
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[embedding] WARN failed to load {model_id}: {e:#} — /v1/embeddings will return 503"
-                        );
-                        None
-                    }
+    let embedding_handle: Option<EmbeddingHandle> = match std::env::var("EMBEDDING_MODEL_ID") {
+        Ok(model_id) if !model_id.is_empty() => {
+            eprintln!("Loading embedding model: {model_id}");
+            match EmbeddingService::load(&model_id) {
+                Ok(service) => {
+                    let (etx, erx) = tokio::sync::mpsc::channel(64);
+                    std::thread::Builder::new()
+                        .name("embedding-service".into())
+                        .spawn(move || service.run(erx))
+                        .map_err(|e| {
+                            SendableError::from(format!("failed to spawn embedding thread: {e}"))
+                        })?;
+                    Some(EmbeddingHandle::new(etx))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[embedding] WARN failed to load {model_id}: {e:#} — /v1/embeddings will return 503"
+                    );
+                    None
                 }
             }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
 
     let addr = format!("0.0.0.0:{port}");
     let mut server = Server::new(&addr).await?;
@@ -206,8 +240,13 @@ async fn main() -> Result<(), SendableError> {
     eprintln!("  POST   /v1/messages          (Anthropic Messages API)");
     eprintln!("  POST   /v1/chat/completions  (OpenAI)");
     eprintln!("  POST   /v1/completions       (OpenAI)");
-    eprintln!("  POST   /v1/embeddings        (OpenAI{})",
-        if embedding_handle.is_some() { "" } else { " — disabled, set EMBEDDING_MODEL_ID" }
+    eprintln!(
+        "  POST   /v1/embeddings        (OpenAI{})",
+        if embedding_handle.is_some() {
+            ""
+        } else {
+            " — disabled, set EMBEDDING_MODEL_ID"
+        }
     );
     eprintln!("  GET    /v1/models");
     eprintln!("  DELETE /v1/sessions/{{id}}     (drop MLX prompt cache)");

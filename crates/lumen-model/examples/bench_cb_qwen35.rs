@@ -60,8 +60,10 @@ fn log_lumen_env_state() {
     ];
     for var in DEFAULT_ON_OPT_OUTS {
         match std::env::var(var) {
-            Ok(v) => eprintln!("[cb-qwen35 env] {var}={v} (explicit; fusion {})",
-                if v == "1" { "DISABLED" } else { "active" }),
+            Ok(v) => eprintln!(
+                "[cb-qwen35 env] {var}={v} (explicit; fusion {})",
+                if v == "1" { "DISABLED" } else { "active" }
+            ),
             Err(_) => eprintln!("[cb-qwen35 env] {var}=(unset → fusion active)"),
         }
     }
@@ -81,7 +83,13 @@ fn argmax(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
-fn run_bench(backend: &mut Qwen35MoeBackend, n: usize, decode_steps: usize, warmup: usize, prompt_len: usize) -> Result<()> {
+fn run_bench(
+    backend: &mut Qwen35MoeBackend,
+    n: usize,
+    decode_steps: usize,
+    warmup: usize,
+    prompt_len: usize,
+) -> Result<()> {
     println!("\n--- N={n}, decode_steps={decode_steps}, prompt_len={prompt_len} ---");
 
     // Synthetic prompts: each sequence gets a distinct token stream.
@@ -171,8 +179,8 @@ fn run_bench(backend: &mut Qwen35MoeBackend, n: usize, decode_steps: usize, warm
 }
 
 fn main() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let shard_dir = PathBuf::from(
         std::env::var("LUMEN_QWEN35_SHARDS")
             .context("LUMEN_QWEN35_SHARDS must point to the shard directory")?,
@@ -214,7 +222,9 @@ fn main() -> Result<()> {
 
         // Print ratio summary.
         println!("\nNote: N={n} runs the same GPU compute N× sequentially per step.");
-        println!("Per-seq throughput degradation = CB scheduling overhead (queue drain, CPU sampling).");
+        println!(
+            "Per-seq throughput degradation = CB scheduling overhead (queue drain, CPU sampling)."
+        );
     }
 
     Ok(())

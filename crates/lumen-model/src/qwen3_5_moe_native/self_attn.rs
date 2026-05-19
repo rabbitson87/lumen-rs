@@ -11,15 +11,15 @@
 //!    optional `attn_output_gate` (q split + sigmoid * out). Bridges Candle
 //!    Tensor ↔ NativeTensor at the projection boundaries via [`super::bridge`].
 
+use anyhow::{Result, anyhow};
+use candle_core::{D, DType, Tensor};
 use lumen_metal::metal::CommandBufferExt;
-use anyhow::{anyhow, Result};
-use candle_core::{DType, Tensor, D};
 
 use crate::qwen3_5_moe::proj::ProjLinear;
 
 use super::bridge::{from_candle_tensor, from_candle_tensor_no_sync, to_candle_tensor};
 use super::context::NativeContext;
-use super::kernels::{build_rope_tables, KernelLib};
+use super::kernels::{KernelLib, build_rope_tables};
 use super::kv_cache::NativeKvCache;
 use super::tensor::{NativeDType, NativeTensor};
 
@@ -57,10 +57,7 @@ impl AttnBlockConfig {
             return Err(anyhow!("head_dim must be > 0"));
         }
         if self.rotary_dim % 2 != 0 {
-            return Err(anyhow!(
-                "rotary_dim ({}) must be even",
-                self.rotary_dim
-            ));
+            return Err(anyhow!("rotary_dim ({}) must be even", self.rotary_dim));
         }
         if self.rotary_dim > self.head_dim {
             return Err(anyhow!(
@@ -166,10 +163,7 @@ pub fn forward_attn_block_full(
         ));
     }
     if out.shape() != [b, l, h, d] {
-        return Err(anyhow!(
-            "out shape {:?} != [{b},{l},{h},{d}]",
-            out.shape()
-        ));
+        return Err(anyhow!("out shape {:?} != [{b},{l},{h},{d}]", out.shape()));
     }
     if k_bhld_out.shape() != [b, kv, l, d] || v_bhld_out.shape() != [b, kv, l, d] {
         return Err(anyhow!(
@@ -472,9 +466,7 @@ pub fn forward_self_attn_full(
     };
 
     // 7. Output projection.
-    let out = o_proj
-        .forward(&gated)
-        .map_err(|e| anyhow!("o_proj: {e}"))?;
+    let out = o_proj.forward(&gated).map_err(|e| anyhow!("o_proj: {e}"))?;
     Ok((out, k_bhld, v_bhld))
 }
 
@@ -646,10 +638,7 @@ pub fn forward_self_attn_with_native_cache(
         None
     };
     let out_y_n = if let Some(linear) = out_mxfp4 {
-        Some(ctx.zeros(
-            vec![b * l, linear.out_features()],
-            NativeDType::F32,
-        )?)
+        Some(ctx.zeros(vec![b * l, linear.out_features()], NativeDType::F32)?)
     } else {
         None
     };
@@ -757,16 +746,14 @@ pub fn forward_self_attn_with_native_cache(
     } else {
         attn_out
     };
-    o_proj
-        .forward(&gated)
-        .map_err(|e| anyhow!("o_proj: {e}"))
+    o_proj.forward(&gated).map_err(|e| anyhow!("o_proj: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device, Tensor, D};
-    use candle_nn::{rms_norm, rotary_emb, VarBuilder, VarMap};
+    use candle_core::{D, DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap, rms_norm, rotary_emb};
 
     /// Candle reference: same algorithm as `forward_attn_block`, expressed in
     /// Candle ops. Matches the post-projection forward portion of
@@ -793,8 +780,16 @@ mod tests {
         let manual_rms = |x: &Tensor, gamma: &Tensor| -> Tensor {
             let _ = rms_norm; // suppress unused
             let ms = x.sqr().unwrap().mean_keepdim(D::Minus1).unwrap();
-            let scale = (ms + cfg.rms_eps as f64).unwrap().sqrt().unwrap().recip().unwrap();
-            x.broadcast_mul(&scale).unwrap().broadcast_mul(gamma).unwrap()
+            let scale = (ms + cfg.rms_eps as f64)
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .recip()
+                .unwrap();
+            x.broadcast_mul(&scale)
+                .unwrap()
+                .broadcast_mul(gamma)
+                .unwrap()
         };
 
         let q_n = manual_rms(q_raw, gamma_q); // [B,L,H,D]
@@ -830,10 +825,19 @@ mod tests {
             if rotary_dim == head_dim {
                 rotary_emb::rope(&x.contiguous().unwrap(), &cos, &sin).unwrap()
             } else {
-                let rot = x.narrow(D::Minus1, 0, rotary_dim).unwrap().contiguous().unwrap();
-                let pass = x.narrow(D::Minus1, rotary_dim, head_dim - rotary_dim).unwrap();
+                let rot = x
+                    .narrow(D::Minus1, 0, rotary_dim)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+                let pass = x
+                    .narrow(D::Minus1, rotary_dim, head_dim - rotary_dim)
+                    .unwrap();
                 let rot = rotary_emb::rope(&rot, &cos, &sin).unwrap();
-                Tensor::cat(&[&rot, &pass], D::Minus1).unwrap().contiguous().unwrap()
+                Tensor::cat(&[&rot, &pass], D::Minus1)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
             }
         };
 
@@ -867,7 +871,9 @@ mod tests {
 
         // Causal attention (mask via lower-triangular, additive -inf above diagonal).
         let scale = (cfg.head_dim as f64).powf(-0.5);
-        let scores = (q_r.matmul(&k_x.transpose(D::Minus2, D::Minus1).unwrap()).unwrap()
+        let scores = (q_r
+            .matmul(&k_x.transpose(D::Minus2, D::Minus1).unwrap())
+            .unwrap()
             * scale)
             .unwrap();
         // Build mask [L, L]: 0 on/below diagonal, -INF above.
@@ -939,7 +945,11 @@ mod tests {
         let (q_raw, gate_flat) = if cfg.attn_output_gate {
             let q_section = qkv.narrow(last, 0, q_section_dim).unwrap();
             let q_split = q_section.reshape((b, l, h, 2 * d)).unwrap();
-            let q = q_split.narrow(D::Minus1, 0, d).unwrap().contiguous().unwrap();
+            let q = q_split
+                .narrow(D::Minus1, 0, d)
+                .unwrap()
+                .contiguous()
+                .unwrap();
             let g = q_split
                 .narrow(D::Minus1, d, d)
                 .unwrap()
@@ -969,7 +979,13 @@ mod tests {
 
         let block_cfg = cfg.block_config();
         let attn_out = candle_attn_block(
-            &q_raw, &k_raw, &v_raw, q_norm_gamma, k_norm_gamma, &block_cfg, pos_offset,
+            &q_raw,
+            &k_raw,
+            &v_raw,
+            q_norm_gamma,
+            k_norm_gamma,
+            &block_cfg,
+            pos_offset,
         );
         let attn_flat = attn_out.reshape((b, l, h * d)).unwrap();
         let _ = DType::F32; // ensure import use
@@ -1172,7 +1188,9 @@ mod tests {
             .map(|i| (i as f32) * 0.005 - 0.3)
             .collect();
         let gamma_q_v: Vec<f32> = (0..cfg.head_dim).map(|i| 1.0 + (i as f32) * 0.01).collect();
-        let gamma_k_v: Vec<f32> = (0..cfg.head_dim).map(|i| 0.95 + (i as f32) * 0.011).collect();
+        let gamma_k_v: Vec<f32> = (0..cfg.head_dim)
+            .map(|i| 0.95 + (i as f32) * 0.011)
+            .collect();
 
         // ─── Native ─────────────────────────────────────────────────────────
         let q_raw = ctx
@@ -1216,10 +1234,8 @@ mod tests {
             &device,
         )
         .unwrap();
-        let gamma_q_c =
-            Tensor::from_vec(gamma_q_v.clone(), (cfg.head_dim,), &device).unwrap();
-        let gamma_k_c =
-            Tensor::from_vec(gamma_k_v.clone(), (cfg.head_dim,), &device).unwrap();
+        let gamma_q_c = Tensor::from_vec(gamma_q_v.clone(), (cfg.head_dim,), &device).unwrap();
+        let gamma_k_c = Tensor::from_vec(gamma_k_v.clone(), (cfg.head_dim,), &device).unwrap();
 
         let cand_out = candle_attn_block(
             &q_raw_c, &k_raw_c, &v_raw_c, &gamma_q_c, &gamma_k_c, &cfg, pos_offset,
@@ -1282,13 +1298,17 @@ mod tests {
         let qkv_proj = dense_linear(qkv_out, hidden_dim, 0xE5, &device);
         let o_proj = dense_linear(hidden_dim, cfg.num_heads * cfg.head_dim, 0xF6, &device);
         let gamma_q = Tensor::from_vec(
-            (0..cfg.head_dim).map(|i| 1.0 + (i as f32) * 0.005).collect::<Vec<_>>(),
+            (0..cfg.head_dim)
+                .map(|i| 1.0 + (i as f32) * 0.005)
+                .collect::<Vec<_>>(),
             (cfg.head_dim,),
             &device,
         )
         .unwrap();
         let gamma_k = Tensor::from_vec(
-            (0..cfg.head_dim).map(|i| 0.97 + (i as f32) * 0.007).collect::<Vec<_>>(),
+            (0..cfg.head_dim)
+                .map(|i| 0.97 + (i as f32) * 0.007)
+                .collect::<Vec<_>>(),
             (cfg.head_dim,),
             &device,
         )
@@ -1301,9 +1321,7 @@ mod tests {
         .unwrap();
         assert_eq!(cache.current_seq_len(), l);
 
-        let exp_t = candle_self_attn(
-            &hidden, &qkv_proj, &gamma_q, &gamma_k, &o_proj, &cfg, 0,
-        );
+        let exp_t = candle_self_attn(&hidden, &qkv_proj, &gamma_q, &gamma_k, &o_proj, &cfg, 0);
         let got = got_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let expected = exp_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let cos = cosine(&got, &expected);
@@ -1348,12 +1366,8 @@ mod tests {
         let hidden_v: Vec<f32> = (0..b * total_l * hidden_dim)
             .map(|i| ((i as f32) * 0.017).sin() * 1.1)
             .collect();
-        let hidden_full = Tensor::from_vec(
-            hidden_v.clone(),
-            (b, total_l, hidden_dim),
-            &device,
-        )
-        .unwrap();
+        let hidden_full =
+            Tensor::from_vec(hidden_v.clone(), (b, total_l, hidden_dim), &device).unwrap();
 
         let q_section = cfg.q_section_dim();
         let kv_out = cfg.kv_out_dim();
@@ -1361,13 +1375,17 @@ mod tests {
         let qkv_proj = dense_linear(qkv_out, hidden_dim, 0x07, &device);
         let o_proj = dense_linear(hidden_dim, cfg.num_heads * cfg.head_dim, 0x18, &device);
         let gamma_q = Tensor::from_vec(
-            (0..cfg.head_dim).map(|i| 1.0 + (i as f32) * 0.003).collect::<Vec<_>>(),
+            (0..cfg.head_dim)
+                .map(|i| 1.0 + (i as f32) * 0.003)
+                .collect::<Vec<_>>(),
             (cfg.head_dim,),
             &device,
         )
         .unwrap();
         let gamma_k = Tensor::from_vec(
-            (0..cfg.head_dim).map(|i| 0.95 + (i as f32) * 0.004).collect::<Vec<_>>(),
+            (0..cfg.head_dim)
+                .map(|i| 0.95 + (i as f32) * 0.004)
+                .collect::<Vec<_>>(),
             (cfg.head_dim,),
             &device,
         )
@@ -1379,11 +1397,7 @@ mod tests {
         let mut step_outs: Vec<Vec<f32>> = Vec::with_capacity(total_l);
         for t in 0..total_l {
             // Slice [B, t..t+1, hidden] off the full hidden tensor.
-            let h_t = hidden_full
-                .narrow(1, t, 1)
-                .unwrap()
-                .contiguous()
-                .unwrap();
+            let h_t = hidden_full.narrow(1, t, 1).unwrap().contiguous().unwrap();
             let out_t = forward_self_attn_with_native_cache(
                 &h_t, &qkv_proj, &gamma_q, &gamma_k, &o_proj, &cfg, &ctx, &lib, &mut cache,
             )
@@ -1395,7 +1409,13 @@ mod tests {
 
         // Candle reference: full prefill of the same sequence.
         let exp_t = candle_self_attn(
-            &hidden_full, &qkv_proj, &gamma_q, &gamma_k, &o_proj, &cfg, 0,
+            &hidden_full,
+            &qkv_proj,
+            &gamma_q,
+            &gamma_k,
+            &o_proj,
+            &cfg,
+            0,
         );
         // exp_t has shape [B, total_l, hidden]; compare per-step.
         for t in 0..total_l {

@@ -38,11 +38,7 @@ fn candle_ref_step(
         .unwrap();
     let state = state.broadcast_mul(&decay).unwrap();
     let k_bc = k_t.unsqueeze(D::Minus2).unwrap();
-    let kv_mem = state
-        .broadcast_mul(&k_bc)
-        .unwrap()
-        .sum(D::Minus1)
-        .unwrap();
+    let kv_mem = state.broadcast_mul(&k_bc).unwrap().sum(D::Minus1).unwrap();
     let delta = (v_t - kv_mem)
         .unwrap()
         .broadcast_mul(&beta_t.unsqueeze(D::Minus1).unwrap())
@@ -52,11 +48,7 @@ fn candle_ref_step(
         .unwrap();
     let state = (state + outer).unwrap();
     let q_bc = q_t.unsqueeze(D::Minus2).unwrap();
-    let y_t = state
-        .broadcast_mul(&q_bc)
-        .unwrap()
-        .sum(D::Minus1)
-        .unwrap();
+    let y_t = state.broadcast_mul(&q_bc).unwrap().sum(D::Minus1).unwrap();
     (y_t, state)
 }
 
@@ -94,23 +86,23 @@ fn make_input(
     let v = Tensor::from_vec(make(b * hv * dv, 3.3, 0.5), (b, hv, dv), device).unwrap();
     // g should be in (0, 1] — use sigmoid-like values.
     let g = Tensor::from_vec(
-        (0..b * hv).map(|i| 0.5 + 0.4 * (i as f32 * 0.05).sin()).collect(),
+        (0..b * hv)
+            .map(|i| 0.5 + 0.4 * (i as f32 * 0.05).sin())
+            .collect(),
         (b, hv),
         device,
     )
     .unwrap();
     let beta = Tensor::from_vec(
-        (0..b * hv).map(|i| 0.5 + 0.3 * (i as f32 * 0.07).cos()).collect(),
+        (0..b * hv)
+            .map(|i| 0.5 + 0.3 * (i as f32 * 0.07).cos())
+            .collect(),
         (b, hv),
         device,
     )
     .unwrap();
-    let state = Tensor::from_vec(
-        make(b * hv * dv * dk, 5.5, 0.1),
-        (b, hv, dv, dk),
-        device,
-    )
-    .unwrap();
+    let state =
+        Tensor::from_vec(make(b * hv * dv * dk, 5.5, 0.1), (b, hv, dv, dk), device).unwrap();
     (q, k, v, g, beta, state)
 }
 
@@ -140,16 +132,15 @@ fn gated_delta_kernel_matches_candle_ops() {
 
     let cases = [
         // (B, Hk, Hv, Dk, Dv)
-        (1usize, 4, 8, 64, 64),       // small smoke
-        (1, 16, 48, 128, 128),         // Qwen3.6-27B Dense GDN shape
+        (1usize, 4, 8, 64, 64), // small smoke
+        (1, 16, 48, 128, 128),  // Qwen3.6-27B Dense GDN shape
     ];
 
     set_enabled(true);
 
     for &(b, hk, hv, dk, dv) in cases.iter() {
         let h_ratio = hv / hk;
-        let (q_hk, k_hk, v_hv, g, beta, state) =
-            make_input(&device, b, hk, hv, dk, dv);
+        let (q_hk, k_hk, v_hv, g, beta, state) = make_input(&device, b, hk, hv, dk, dv);
 
         // Candle reference: SSM expects q/k expanded to Hv heads.
         let q_hv = repeat_heads(&q_hk, h_ratio);
@@ -179,8 +170,14 @@ fn gated_delta_kernel_matches_candle_ops() {
              y_max_abs={y_diff:.3e}, state_max_abs={s_diff:.3e}"
         );
 
-        assert!(y_diff < 1e-3, "y mismatch: {y_diff:.3e} (B={b},Hv={hv},Dk={dk})");
-        assert!(s_diff < 1e-3, "state mismatch: {s_diff:.3e} (B={b},Hv={hv},Dk={dk})");
+        assert!(
+            y_diff < 1e-3,
+            "y mismatch: {y_diff:.3e} (B={b},Hv={hv},Dk={dk})"
+        );
+        assert!(
+            s_diff < 1e-3,
+            "state mismatch: {s_diff:.3e} (B={b},Hv={hv},Dk={dk})"
+        );
     }
 
     set_enabled(false);

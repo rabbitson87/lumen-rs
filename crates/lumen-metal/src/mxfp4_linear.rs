@@ -15,7 +15,7 @@ use candle_nn::{Linear, Module};
 
 use crate::metal::Buffer;
 
-use crate::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
+use crate::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 
 /// Extract the Metal buffer + byte offset backing a Candle tensor, transmuting between the
 /// two `metal` crate versions (Candle's vs ours — same underlying `objc::runtime::Object`,
@@ -227,9 +227,21 @@ pub fn tri_add_f32_candle_queue_into(
         }
     };
 
-    let a_c = if a.is_contiguous() { a.clone() } else { a.contiguous()? };
-    let b_c = if b.is_contiguous() { b.clone() } else { b.contiguous()? };
-    let c_c = if c.is_contiguous() { c.clone() } else { c.contiguous()? };
+    let a_c = if a.is_contiguous() {
+        a.clone()
+    } else {
+        a.contiguous()?
+    };
+    let b_c = if b.is_contiguous() {
+        b.clone()
+    } else {
+        b.contiguous()?
+    };
+    let c_c = if c.is_contiguous() {
+        c.clone()
+    } else {
+        c.contiguous()?
+    };
 
     let (a_buf, a_off) = metal_buffer_of(&a_c)
         .ok_or_else(|| candle_core::Error::Msg("tri_add_f32: no metal buffer for a".into()))?;
@@ -245,10 +257,14 @@ pub fn tri_add_f32_candle_queue_into(
         .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
     ctx.tri_add_f32_zero_copy_inline(
         encoder.as_ref(),
-        a_buf, a_off,
-        b_buf, b_off,
-        c_buf, c_off,
-        y_buf, y_off,
+        a_buf,
+        a_off,
+        b_buf,
+        b_off,
+        c_buf,
+        c_off,
+        y_buf,
+        y_off,
         n,
     )
     .map_err(|e| candle_core::Error::Msg(format!("tri_add_f32: {e}")))?;
@@ -310,10 +326,26 @@ pub fn scalar_mul_tri_add_f32_candle_queue_into(
         }
     };
 
-    let a_c = if a.is_contiguous() { a.clone() } else { a.contiguous()? };
-    let b_c = if b.is_contiguous() { b.clone() } else { b.contiguous()? };
-    let coef_c = if coef.is_contiguous() { coef.clone() } else { coef.contiguous()? };
-    let d_c = if d.is_contiguous() { d.clone() } else { d.contiguous()? };
+    let a_c = if a.is_contiguous() {
+        a.clone()
+    } else {
+        a.contiguous()?
+    };
+    let b_c = if b.is_contiguous() {
+        b.clone()
+    } else {
+        b.contiguous()?
+    };
+    let coef_c = if coef.is_contiguous() {
+        coef.clone()
+    } else {
+        coef.contiguous()?
+    };
+    let d_c = if d.is_contiguous() {
+        d.clone()
+    } else {
+        d.contiguous()?
+    };
 
     let (a_buf, a_off) = metal_buffer_of(&a_c).ok_or_else(|| {
         candle_core::Error::Msg("scalar_mul_tri_add_f32: no metal buffer for a".into())
@@ -336,12 +368,18 @@ pub fn scalar_mul_tri_add_f32_candle_queue_into(
         .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
     ctx.scalar_mul_tri_add_f32_zero_copy_inline(
         encoder.as_ref(),
-        a_buf, a_off,
-        b_buf, b_off,
-        coef_buf, coef_off,
-        d_buf, d_off,
-        y_buf, y_off,
-        bl, hidden,
+        a_buf,
+        a_off,
+        b_buf,
+        b_off,
+        coef_buf,
+        coef_off,
+        d_buf,
+        d_off,
+        y_buf,
+        y_off,
+        bl,
+        hidden,
     )
     .map_err(|e| candle_core::Error::Msg(format!("scalar_mul_tri_add_f32: {e}")))?;
     drop(encoder);
@@ -369,8 +407,13 @@ pub fn scalar_mul_tri_add_rmsnorm_f32_candle_queue_into(
     use candle_core::Device;
 
     for (name, t) in [
-        ("a", a), ("b", b), ("coef", coef), ("d", d),
-        ("rms_weight", rms_weight), ("out", out), ("attn_in", attn_in),
+        ("a", a),
+        ("b", b),
+        ("coef", coef),
+        ("d", d),
+        ("rms_weight", rms_weight),
+        ("out", out),
+        ("attn_in", attn_in),
     ] {
         if t.dtype() != DType::F32 {
             return Err(candle_core::Error::Msg(format!(
@@ -380,7 +423,13 @@ pub fn scalar_mul_tri_add_rmsnorm_f32_candle_queue_into(
         }
     }
     let n = bl * hidden;
-    for (name, t) in [("a", a), ("b", b), ("d", d), ("out", out), ("attn_in", attn_in)] {
+    for (name, t) in [
+        ("a", a),
+        ("b", b),
+        ("d", d),
+        ("out", out),
+        ("attn_in", attn_in),
+    ] {
         let m: usize = t.dims().iter().product();
         if m != n {
             return Err(candle_core::Error::Msg(format!(
@@ -414,10 +463,26 @@ pub fn scalar_mul_tri_add_rmsnorm_f32_candle_queue_into(
         }
     };
 
-    let a_c = if a.is_contiguous() { a.clone() } else { a.contiguous()? };
-    let b_c = if b.is_contiguous() { b.clone() } else { b.contiguous()? };
-    let coef_c = if coef.is_contiguous() { coef.clone() } else { coef.contiguous()? };
-    let d_c = if d.is_contiguous() { d.clone() } else { d.contiguous()? };
+    let a_c = if a.is_contiguous() {
+        a.clone()
+    } else {
+        a.contiguous()?
+    };
+    let b_c = if b.is_contiguous() {
+        b.clone()
+    } else {
+        b.contiguous()?
+    };
+    let coef_c = if coef.is_contiguous() {
+        coef.clone()
+    } else {
+        coef.contiguous()?
+    };
+    let d_c = if d.is_contiguous() {
+        d.clone()
+    } else {
+        d.contiguous()?
+    };
     let rms_w_c = if rms_weight.is_contiguous() {
         rms_weight.clone()
     } else {
@@ -455,14 +520,23 @@ pub fn scalar_mul_tri_add_rmsnorm_f32_candle_queue_into(
         .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
     ctx.scalar_mul_tri_add_rmsnorm_f32_zero_copy_inline(
         encoder.as_ref(),
-        a_buf, a_off,
-        b_buf, b_off,
-        coef_buf, coef_off,
-        d_buf, d_off,
-        rms_buf, rms_off,
-        out_buf, out_off,
-        attn_in_buf, attn_in_off,
-        bl, hidden, rms_eps,
+        a_buf,
+        a_off,
+        b_buf,
+        b_off,
+        coef_buf,
+        coef_off,
+        d_buf,
+        d_off,
+        rms_buf,
+        rms_off,
+        out_buf,
+        out_off,
+        attn_in_buf,
+        attn_in_off,
+        bl,
+        hidden,
+        rms_eps,
     )
     .map_err(|e| candle_core::Error::Msg(format!("scalar_mul_tri_add_rmsnorm_f32: {e}")))?;
     drop(encoder);
@@ -547,7 +621,13 @@ fn mxfp4_matmul_tensor(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_matmul_dispatch(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -647,7 +727,13 @@ fn mxfp4_matmul_tensor_bf16_out(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_matmul_dispatch_bf16_out(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -745,7 +831,13 @@ fn mxfp4_matmul_tensor_bf16_in(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_matmul_dispatch_bf16_in(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -761,7 +853,9 @@ fn mxfp4_matmul_tensor_bf16_in(
                     }
                 }
                 ctx.matmul_zero_copy_bf16_in(weight, x_buf, x_offset, y_buf, y_offset, batch)
-                    .map_err(|e| candle_core::Error::Msg(format!("mxfp4 zero-copy bf16-in: {e}")))?;
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("mxfp4 zero-copy bf16-in: {e}"))
+                    })?;
                 ZERO_COPY_HITS.fetch_add(1, Relaxed);
                 return Ok(y);
             }
@@ -838,7 +932,13 @@ fn mxfp4_matmul_small_out_tensor(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_matmul_small_out_dispatch(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -853,12 +953,10 @@ fn mxfp4_matmul_small_out_tensor(
                         metal_dev.wait_until_completed()?;
                     }
                 }
-                ctx.matmul_small_out_zero_copy(
-                    weight, x_buf, x_offset, y_buf, y_offset, batch,
-                )
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("mxfp4 small_out zero-copy: {e}"))
-                })?;
+                ctx.matmul_small_out_zero_copy(weight, x_buf, x_offset, y_buf, y_offset, batch)
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("mxfp4 small_out zero-copy: {e}"))
+                    })?;
                 ZERO_COPY_HITS.fetch_add(1, Relaxed);
                 return Ok(y);
             }
@@ -938,7 +1036,13 @@ fn mxfp4_gate_up_silu_mul_tensor(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_gate_up_silu_mul_dispatch(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -1023,7 +1127,13 @@ fn mxfp4_matmul_small_out_tensor_bf16_out(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_matmul_small_out_dispatch_bf16_out(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -1119,7 +1229,13 @@ fn mxfp4_gate_up_silu_mul_tensor_bf16_out(
                             candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         ctx.encode_gate_up_silu_mul_dispatch_bf16_out(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         ZERO_COPY_HITS.fetch_add(1, Relaxed);
@@ -1138,9 +1254,7 @@ fn mxfp4_gate_up_silu_mul_tensor_bf16_out(
                     weight, x_buf, x_offset, y_buf, y_offset, batch,
                 )
                 .map_err(|e| {
-                    candle_core::Error::Msg(format!(
-                        "mxfp4 gate_up_silu_mul zero-copy bf16: {e}"
-                    ))
+                    candle_core::Error::Msg(format!("mxfp4 gate_up_silu_mul zero-copy bf16: {e}"))
                 })?;
                 ZERO_COPY_HITS.fetch_add(1, Relaxed);
                 return Ok(y);
@@ -1191,8 +1305,8 @@ impl Mxfp4Linear {
     /// directly against the device buffers — no CPU roundtrip. Falls back to a staged
     /// flatten→host→kernel→host→tensor path for non-Metal inputs (unit tests).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = mxfp4_matmul_tensor(&self.ctx, &self.weight, x)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let y =
+            mxfp4_matmul_tensor(&self.ctx, &self.weight, x).map_err(|e| anyhow::anyhow!("{e}"))?;
         let y = match &self.bias {
             Some(b) => y.broadcast_add(b).map_err(|e| anyhow::anyhow!("{e}"))?,
             None => y,
@@ -1346,7 +1460,9 @@ impl Mxfp4Linear {
                 .map_err(|e| anyhow::anyhow!("{e}"))?
         };
         let rms_w_f32 = if rms_weight.dtype() == DType::F32 {
-            rms_weight.contiguous().map_err(|e| anyhow::anyhow!("{e}"))?
+            rms_weight
+                .contiguous()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
             rms_weight
                 .to_dtype(DType::F32)
@@ -1439,9 +1555,7 @@ impl Mxfp4Linear {
         drop(encoder);
 
         let y = match &self.bias {
-            Some(b) => y_out
-                .broadcast_add(b)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Some(b) => y_out.broadcast_add(b).map_err(|e| anyhow::anyhow!("{e}"))?,
             None => y_out,
         };
         Ok(y)
@@ -1550,9 +1664,7 @@ impl Mxfp4Linear {
         drop(encoder);
 
         let y = match &self.bias {
-            Some(b) => y_out
-                .broadcast_add(b)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Some(b) => y_out.broadcast_add(b).map_err(|e| anyhow::anyhow!("{e}"))?,
             None => y_out,
         };
         Ok(y)
@@ -1581,8 +1693,15 @@ impl Mxfp4Linear {
         y_offset: u64,
         batch: usize,
     ) {
-        self.ctx
-            .encode_matmul_dispatch(encoder, &self.weight, x_buf, x_offset, y_buf, y_offset, batch);
+        self.ctx.encode_matmul_dispatch(
+            encoder,
+            &self.weight,
+            x_buf,
+            x_offset,
+            y_buf,
+            y_offset,
+            batch,
+        );
     }
 
     /// Borrow the GPU-resident MXFP4 weight (for callers that want to
@@ -2024,9 +2143,8 @@ impl Mxfp4SwitchMlp {
         let (y_buf, y_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
             candle_core::Error::Msg("no metal buffer for moe_gate_up y_big".into())
         })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
 
         let indices: Vec<u32> = experts.iter().map(|&e| e as u32).collect();
         self.ctx
@@ -2047,7 +2165,9 @@ impl Mxfp4SwitchMlp {
         ZERO_COPY_HITS.fetch_add(k, Relaxed);
 
         let gate_big = y_big.narrow(1, 0, self.moe_inter)?.contiguous()?;
-        let up_big = y_big.narrow(1, self.moe_inter, self.moe_inter)?.contiguous()?;
+        let up_big = y_big
+            .narrow(1, self.moe_inter, self.moe_inter)?
+            .contiguous()?;
         Ok((gate_big, up_big))
     }
 
@@ -2056,16 +2176,14 @@ impl Mxfp4SwitchMlp {
     ///
     /// `hiddens_big` must be `[k*batch, moe_inter]` contiguous (typically the output of
     /// `silu(gate_big) * up_big`). Returns `[k*batch, hidden]`.
-    pub fn moe_down(
-        &self,
-        hiddens_big: &Tensor,
-        experts: &[usize],
-    ) -> candle_core::Result<Tensor> {
+    pub fn moe_down(&self, hiddens_big: &Tensor, experts: &[usize]) -> candle_core::Result<Tensor> {
         use candle_core::Device;
         use std::sync::atomic::Ordering::Relaxed;
 
         if experts.is_empty() {
-            return Err(candle_core::Error::Msg("moe_down: empty expert list".into()));
+            return Err(candle_core::Error::Msg(
+                "moe_down: empty expert list".into(),
+            ));
         }
         for e in experts {
             if *e >= self.num_experts {
@@ -2115,12 +2233,10 @@ impl Mxfp4SwitchMlp {
             md.wait_until_completed()?;
         }
 
-        let (y_buf, y_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for moe_down y_big".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(&y_big)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for moe_down y_big".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
 
         let indices: Vec<u32> = experts.iter().map(|&e| e as u32).collect();
         self.ctx
@@ -2207,12 +2323,10 @@ impl Mxfp4SwitchMlp {
                 "no metal buffer for moe_gate_up_with_indices_buffer y_big".into(),
             )
         })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         self.ctx
             .matmul_moe_zero_copy_with_indices_buffer(
@@ -2236,7 +2350,9 @@ impl Mxfp4SwitchMlp {
         ZERO_COPY_HITS.fetch_add(k, Relaxed);
 
         let gate_big = y_big.narrow(1, 0, self.moe_inter)?.contiguous()?;
-        let up_big = y_big.narrow(1, self.moe_inter, self.moe_inter)?.contiguous()?;
+        let up_big = y_big
+            .narrow(1, self.moe_inter, self.moe_inter)?
+            .contiguous()?;
         Ok((gate_big, up_big))
     }
 
@@ -2304,15 +2420,12 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_big".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(&y_big)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_big".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -2343,7 +2456,9 @@ impl Mxfp4SwitchMlp {
         ZERO_COPY_HITS.fetch_add(k, Relaxed);
 
         let gate_big = y_big.narrow(1, 0, self.moe_inter)?.contiguous()?;
-        let up_big = y_big.narrow(1, self.moe_inter, self.moe_inter)?.contiguous()?;
+        let up_big = y_big
+            .narrow(1, self.moe_inter, self.moe_inter)?
+            .contiguous()?;
         Ok((gate_big, up_big))
     }
 
@@ -2414,15 +2529,12 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_big".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(&y_big)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_big".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -2445,9 +2557,7 @@ impl Mxfp4SwitchMlp {
                 false,
             )
             .map_err(|e| {
-                candle_core::Error::Msg(format!(
-                    "moe_down_with_indices_buffer_candle_queue: {e}"
-                ))
+                candle_core::Error::Msg(format!("moe_down_with_indices_buffer_candle_queue: {e}"))
             })?;
         drop(encoder);
         ZERO_COPY_HITS.fetch_add(k, Relaxed);
@@ -2542,15 +2652,12 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -2674,15 +2781,12 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -2807,18 +2911,14 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (rms_buf, rms_offset) = metal_buffer_of(&rms_w_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for rms_weight".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (rms_buf, rms_offset) = metal_buffer_of(&rms_w_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for rms_weight".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -2936,24 +3036,31 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
             .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
         self.ctx
             .matmul_moe_gate_up_silu_mul_bf16out_zero_copy_with_indices_buffer_inline(
-                encoder.as_ref(), &self.gate_up_packed_all, &self.gate_up_scales_all,
-                inds_buf, inds_offset, k, x_buf, x_offset, y_buf, y_offset,
-                self.moe_inter, self.hidden, batch,
+                encoder.as_ref(),
+                &self.gate_up_packed_all,
+                &self.gate_up_scales_all,
+                inds_buf,
+                inds_offset,
+                k,
+                x_buf,
+                x_offset,
+                y_buf,
+                y_offset,
+                self.moe_inter,
+                self.hidden,
+                batch,
             )
             .map_err(|e| {
                 candle_core::Error::Msg(format!(
@@ -3022,7 +3129,9 @@ impl Mxfp4SwitchMlp {
         if y_dims.len() != 2 || y_dims[1] != self.hidden || y_dims[0] != k * batch {
             return Err(candle_core::Error::Msg(format!(
                 "moe_down_bf16in_with_indices_buffer_candle_queue_into: y_slice {:?} != [{}, {}]",
-                y_dims, k * batch, self.hidden
+                y_dims,
+                k * batch,
+                self.hidden
             )));
         }
         if y_slice.dtype() != DType::F32 {
@@ -3037,7 +3146,8 @@ impl Mxfp4SwitchMlp {
             Device::Metal(md) => md,
             _ => {
                 return Err(candle_core::Error::Msg(
-                    "moe_down_bf16in_with_indices_buffer_candle_queue_into: Metal device required".into(),
+                    "moe_down_bf16in_with_indices_buffer_candle_queue_into: Metal device required"
+                        .into(),
                 ));
             }
         };
@@ -3053,24 +3163,32 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
             .map_err(|e| candle_core::Error::Msg(format!("candle command_encoder: {e}")))?;
         self.ctx
             .matmul_moe_bf16in_zero_copy_with_indices_buffer_inline(
-                encoder.as_ref(), &self.down_packed_all, &self.down_scales_all,
-                inds_buf, inds_offset, k, x_buf, x_offset, y_buf, y_offset,
-                self.hidden, self.moe_inter, batch, false,
+                encoder.as_ref(),
+                &self.down_packed_all,
+                &self.down_scales_all,
+                inds_buf,
+                inds_offset,
+                k,
+                x_buf,
+                x_offset,
+                y_buf,
+                y_offset,
+                self.hidden,
+                self.moe_inter,
+                batch,
+                false,
             )
             .map_err(|e| {
                 candle_core::Error::Msg(format!(
@@ -3164,15 +3282,12 @@ impl Mxfp4SwitchMlp {
             weights.contiguous()?
         };
 
-        let (downs_buf, downs_off) = metal_buffer_of(&downs_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for downs".into())
-        })?;
-        let (weights_buf, weights_off) = metal_buffer_of(&weights_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for weights".into())
-        })?;
-        let (out_buf, out_off) = metal_buffer_of(out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for out".into())
-        })?;
+        let (downs_buf, downs_off) = metal_buffer_of(&downs_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for downs".into()))?;
+        let (weights_buf, weights_off) = metal_buffer_of(&weights_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for weights".into()))?;
+        let (out_buf, out_off) = metal_buffer_of(out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for out".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -3189,9 +3304,7 @@ impl Mxfp4SwitchMlp {
                 k,
                 hidden,
             )
-            .map_err(|e| {
-                candle_core::Error::Msg(format!("moe_wsum_candle_queue_into: {e}"))
-            })?;
+            .map_err(|e| candle_core::Error::Msg(format!("moe_wsum_candle_queue_into: {e}")))?;
         drop(encoder);
 
         Ok(())
@@ -3319,18 +3432,14 @@ impl Mxfp4SwitchMlp {
             weights.contiguous()?
         };
 
-        let (x_buf, x_offset) = metal_buffer_of(&x_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
-        let (weights_buf, weights_offset) = metal_buffer_of(&weights_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for weights".into())
-        })?;
-        let (out_buf, out_offset) = metal_buffer_of(out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for out".into())
-        })?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
+        let (weights_buf, weights_offset) = metal_buffer_of(&weights_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for weights".into()))?;
+        let (out_buf, out_offset) = metal_buffer_of(out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for out".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -3446,15 +3555,12 @@ impl Mxfp4SwitchMlp {
         } else {
             probs.contiguous()?
         };
-        let (probs_buf, probs_off) = metal_buffer_of(&probs_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for probs".into())
-        })?;
-        let (inds_buf, inds_off) = metal_buffer_of(inds_out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_out".into())
-        })?;
-        let (vals_buf, vals_off) = metal_buffer_of(vals_out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for vals_out".into())
-        })?;
+        let (probs_buf, probs_off) = metal_buffer_of(&probs_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for probs".into()))?;
+        let (inds_buf, inds_off) = metal_buffer_of(inds_out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_out".into()))?;
+        let (vals_buf, vals_off) = metal_buffer_of(vals_out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for vals_out".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -3473,9 +3579,7 @@ impl Mxfp4SwitchMlp {
                 k,
             )
             .map_err(|e| {
-                candle_core::Error::Msg(format!(
-                    "topk_partial_select_candle_queue_into: {e}"
-                ))
+                candle_core::Error::Msg(format!("topk_partial_select_candle_queue_into: {e}"))
             })?;
         drop(encoder);
         Ok(())
@@ -3554,7 +3658,8 @@ impl Mxfp4SwitchMlp {
             Device::Metal(md) => md,
             _ => {
                 return Err(candle_core::Error::Msg(
-                    "router_softmax_topk_renorm_f32_candle_queue_into: Metal device required".into(),
+                    "router_softmax_topk_renorm_f32_candle_queue_into: Metal device required"
+                        .into(),
                 ));
             }
         };
@@ -3564,15 +3669,12 @@ impl Mxfp4SwitchMlp {
         } else {
             logits.contiguous()?
         };
-        let (logits_buf, logits_off) = metal_buffer_of(&logits_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for logits".into())
-        })?;
-        let (inds_buf, inds_off) = metal_buffer_of(inds_out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_out".into())
-        })?;
-        let (vals_buf, vals_off) = metal_buffer_of(vals_out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for vals_out".into())
-        })?;
+        let (logits_buf, logits_off) = metal_buffer_of(&logits_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for logits".into()))?;
+        let (inds_buf, inds_off) = metal_buffer_of(inds_out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_out".into()))?;
+        let (vals_buf, vals_off) = metal_buffer_of(vals_out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for vals_out".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -3703,18 +3805,14 @@ impl Mxfp4SwitchMlp {
             weights.contiguous()?
         };
 
-        let (x_buf, x_offset) = metal_buffer_of(&x_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
-        let (weights_buf, weights_offset) = metal_buffer_of(&weights_c).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for weights".into())
-        })?;
-        let (out_buf, out_offset) = metal_buffer_of(out).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for out".into())
-        })?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
+        let (weights_buf, weights_offset) = metal_buffer_of(&weights_c)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for weights".into()))?;
+        let (out_buf, out_offset) = metal_buffer_of(out)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for out".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -3838,15 +3936,12 @@ impl Mxfp4SwitchMlp {
             inds_slice.contiguous()?
         };
 
-        let (y_buf, y_offset) = metal_buffer_of(y_slice).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_slice".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (y_buf, y_offset) = metal_buffer_of(y_slice)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_slice".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         let encoder = md
             .command_encoder()
@@ -4148,7 +4243,8 @@ impl Mxfp4SwitchMlp {
         if k == 0 || batch == 0 {
             return Ok(());
         }
-        if downs.dtype() != DType::F32 || weights.dtype() != DType::F32 || out.dtype() != DType::F32 {
+        if downs.dtype() != DType::F32 || weights.dtype() != DType::F32 || out.dtype() != DType::F32
+        {
             return Err(candle_core::Error::Msg(
                 "moe_wsum_multi_…: all tensors must be F32".into(),
             ));
@@ -4299,16 +4395,12 @@ impl Mxfp4SwitchMlp {
         }
 
         let (y_buf, y_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg(
-                "no metal buffer for moe_down_with_indices_buffer y_big".into(),
-            )
+            candle_core::Error::Msg("no metal buffer for moe_down_with_indices_buffer y_big".into())
         })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for hiddens_big".into())
-        })?;
-        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for inds_slice".into())
-        })?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for hiddens_big".into()))?;
+        let (inds_buf, inds_offset) = metal_buffer_of(&inds_contig)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for inds_slice".into()))?;
 
         self.ctx
             .matmul_moe_zero_copy_with_indices_buffer(
@@ -4326,9 +4418,7 @@ impl Mxfp4SwitchMlp {
                 batch,
                 false, // per-slot x band
             )
-            .map_err(|e| {
-                candle_core::Error::Msg(format!("moe_down_with_indices_buffer: {e}"))
-            })?;
+            .map_err(|e| candle_core::Error::Msg(format!("moe_down_with_indices_buffer: {e}")))?;
         ZERO_COPY_HITS.fetch_add(k, Relaxed);
 
         Ok(y_big)
@@ -4345,9 +4435,9 @@ impl Mxfp4SwitchMlp {
         x: &Tensor,
         experts: &[usize],
     ) -> candle_core::Result<(Tensor, Tensor)> {
+        use crate::mxfp4_gpu::Mxfp4Job;
         use candle_core::Device;
         use std::sync::atomic::Ordering::Relaxed;
-        use crate::mxfp4_gpu::Mxfp4Job;
 
         if experts.is_empty() {
             return Err(candle_core::Error::Msg(
@@ -4368,10 +4458,8 @@ impl Mxfp4SwitchMlp {
             // CPU fallback: do them separately and stack. Slow path used by unit tests.
             let x_refs = [x].repeat(experts.len());
             let refs: Vec<&Tensor> = x_refs.iter().copied().collect();
-            let gate_big =
-                self.expert_matmul_group_big_impl(&refs, experts, ExpertProj::Gate)?;
-            let up_big =
-                self.expert_matmul_group_big_impl(&refs, experts, ExpertProj::Up)?;
+            let gate_big = self.expert_matmul_group_big_impl(&refs, experts, ExpertProj::Gate)?;
+            let up_big = self.expert_matmul_group_big_impl(&refs, experts, ExpertProj::Up)?;
             return Ok((gate_big, up_big));
         }
 
@@ -4397,12 +4485,10 @@ impl Mxfp4SwitchMlp {
             md.wait_until_completed()?;
         }
 
-        let (y_base_buf, y_base_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for gate+up y_big".into())
-        })?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for x".into())
-        })?;
+        let (y_base_buf, y_base_offset) = metal_buffer_of(&y_big)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for gate+up y_big".into()))?;
+        let (x_buf, x_offset) = metal_buffer_of(&x_f32)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
         let slab_stride_bytes = (batch * combined_out * 4) as u64;
 
         // One job per expert using the combined gate_up weight (out = 2*moe_inter).
@@ -4428,7 +4514,9 @@ impl Mxfp4SwitchMlp {
         // elementwise ops (silu/mul) hit the fast packed-layout Metal kernel instead of the
         // generic strided one.
         let gate_big = y_big.narrow(1, 0, self.moe_inter)?.contiguous()?;
-        let up_big = y_big.narrow(1, self.moe_inter, self.moe_inter)?.contiguous()?;
+        let up_big = y_big
+            .narrow(1, self.moe_inter, self.moe_inter)?
+            .contiguous()?;
         Ok((gate_big, up_big))
     }
 
@@ -4463,9 +4551,9 @@ impl Mxfp4SwitchMlp {
         experts: &[usize],
         proj: ExpertProj,
     ) -> candle_core::Result<Tensor> {
+        use crate::mxfp4_gpu::Mxfp4Job;
         use candle_core::Device;
         use std::sync::atomic::Ordering::Relaxed;
-        use crate::mxfp4_gpu::Mxfp4Job;
 
         assert_eq!(inputs.len(), experts.len());
         if experts.is_empty() {
@@ -4559,17 +4647,15 @@ impl Mxfp4SwitchMlp {
 
         // Extract buffer pointers. `y_big` is contiguous, so job[i] writes to
         //     y_base_offset + i * (batch * out_features) * sizeof(f32)
-        let (y_base_buf, y_base_offset) = metal_buffer_of(&y_big).ok_or_else(|| {
-            candle_core::Error::Msg("no metal buffer for y_big".into())
-        })?;
+        let (y_base_buf, y_base_offset) = metal_buffer_of(&y_big)
+            .ok_or_else(|| candle_core::Error::Msg("no metal buffer for y_big".into()))?;
         let slab_stride_bytes = (batch * out_features * 4) as u64;
 
         let mut jobs: Vec<Mxfp4Job<'_>> = Vec::with_capacity(experts.len());
         let mut x_bufs: Vec<(&crate::metal::Buffer, u64)> = Vec::with_capacity(experts.len());
         for x in xs_f32.iter() {
-            let xb = metal_buffer_of(x).ok_or_else(|| {
-                candle_core::Error::Msg("no metal buffer for x".into())
-            })?;
+            let xb = metal_buffer_of(x)
+                .ok_or_else(|| candle_core::Error::Msg("no metal buffer for x".into()))?;
             x_bufs.push(xb);
         }
         for (i, &e) in experts.iter().enumerate() {
@@ -4604,11 +4690,18 @@ impl Mxfp4SwitchMlp {
         let strategy_raw = std::env::var("LUMEN_MOE_DISPATCH").unwrap_or_default();
         let strategy: &str = if !strategy_raw.is_empty() {
             strategy_raw.as_str()
-        } else if std::env::var("LUMEN_MOE_MULTI_ENCODER").map(|v| v == "1").unwrap_or(false)
-            || std::env::var("LUMEN_MOE_BATCH_SINGLE").map(|v| v == "0").unwrap_or(false)
+        } else if std::env::var("LUMEN_MOE_MULTI_ENCODER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var("LUMEN_MOE_BATCH_SINGLE")
+                .map(|v| v == "0")
+                .unwrap_or(false)
         {
             "multi_encoder"
-        } else if std::env::var("LUMEN_MOE_BATCH_SINGLE").map(|v| v == "1").unwrap_or(false) {
+        } else if std::env::var("LUMEN_MOE_BATCH_SINGLE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             "fanout"
         } else {
             "multi_cmdbuf"

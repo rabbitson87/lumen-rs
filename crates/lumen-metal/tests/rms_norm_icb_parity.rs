@@ -11,13 +11,13 @@
 
 #![cfg(feature = "model-integration")]
 
-use lumen_metal::metal::CommandBufferExt;
 use candle_core::{DType, Device, Tensor};
+use lumen_metal::metal::CommandBufferExt;
+use lumen_metal::metal::IndirectCommandBuffer;
+use lumen_metal::rms_norm::RmsNormBf16InBf16Out;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResourceUsage};
-use lumen_metal::metal::IndirectCommandBuffer;
-use lumen_metal::rms_norm::RmsNormBf16InBf16Out;
 
 const HIDDEN: usize = 5120;
 const EPS: f32 = 1e-6;
@@ -58,19 +58,28 @@ fn rms_norm_bf16in_bf16out_icb_matches_standard() {
     let x_data = synth_x(m * HIDDEN, 0xFADE_FADE, 1.0);
     let w_data = synth_x(HIDDEN, 0xCAFE_BABE, 0.5);
 
-    let x = Tensor::from_vec(x_data, &[m, HIDDEN], &dev).unwrap()
-        .to_dtype(DType::BF16).unwrap()
-        .contiguous().unwrap();
-    let w = Tensor::from_vec(w_data, &[HIDDEN], &dev).unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .contiguous().unwrap();
+    let x = Tensor::from_vec(x_data, &[m, HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let w = Tensor::from_vec(w_data, &[HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .contiguous()
+        .unwrap();
 
     // ── Standard path reference ────────────────────────────────────────
     let y_ref = rms.forward(&x, &w).unwrap();
     let ref_bits: Vec<u32> = y_ref
-        .flatten_all().unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
         .iter()
         .map(|f| f.to_bits())
         .collect();
@@ -105,7 +114,9 @@ fn rms_norm_bf16in_bf16out_icb_matches_standard() {
     let (w_buf, w_off) = extract(&w);
     let (y_buf, y_off) = extract(&y_icb_tensor);
 
-    rms.record_icb(&icb, 0, &x_buf, x_off, &w_buf, w_off, &y_buf, y_off, &dims_buf, m);
+    rms.record_icb(
+        &icb, 0, &x_buf, x_off, &w_buf, w_off, &y_buf, y_off, &dims_buf, m,
+    );
 
     // Drain any Candle pending command buffers so they don't race with our
     // ICB submission on the shared queue (Tensor::zeros enqueues an async
@@ -124,19 +135,34 @@ fn rms_norm_bf16in_bf16out_icb_matches_standard() {
 
     // Compare bits.
     let icb_bits: Vec<u32> = y_icb_tensor
-        .flatten_all().unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
         .iter()
         .map(|f| f.to_bits())
         .collect();
 
     assert_eq!(ref_bits.len(), icb_bits.len());
-    let diffs = ref_bits.iter().zip(icb_bits.iter()).filter(|(a, b)| a != b).count();
+    let diffs = ref_bits
+        .iter()
+        .zip(icb_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
 
     // Debug output — first 8 elements of each.
-    let ref_f: Vec<f32> = ref_bits.iter().take(8).map(|b| f32::from_bits(*b)).collect();
-    let icb_f: Vec<f32> = icb_bits.iter().take(8).map(|b| f32::from_bits(*b)).collect();
+    let ref_f: Vec<f32> = ref_bits
+        .iter()
+        .take(8)
+        .map(|b| f32::from_bits(*b))
+        .collect();
+    let icb_f: Vec<f32> = icb_bits
+        .iter()
+        .take(8)
+        .map(|b| f32::from_bits(*b))
+        .collect();
     eprintln!();
     eprintln!("=== Phase 17.D-1 — RmsNormBf16InBf16Out ICB parity ===");
     eprintln!("Hidden:   {HIDDEN}");

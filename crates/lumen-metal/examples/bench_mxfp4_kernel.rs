@@ -11,13 +11,13 @@
 //!
 //! Run: `cargo run --release --example bench_mxfp4_kernel -p lumen-metal`
 
-use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
 use anyhow::Result;
-use std::time::Instant;
 use lumen_metal::device::MetalContext;
 use lumen_metal::metal;
+use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
 use lumen_metal::mtl_size;
 use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
+use std::time::Instant;
 
 const PEAK_BW_GBS: f64 = 400.0; // M3 Max LPDDR5
 

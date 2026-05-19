@@ -127,11 +127,7 @@ mod imp {
         /// slot in place. Returns logical-length slices that can feed SDPA
         /// directly (an MLX Array clone is a refcount bump on the underlying
         /// buffer, not a deep copy).
-        pub fn update_and_fetch(
-            &mut self,
-            keys: &Array,
-            values: &Array,
-        ) -> Result<(Array, Array)> {
+        pub fn update_and_fetch(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
             if keys.ndim() != 4 {
                 return Err(anyhow!(
                     "NativeKvCache::update_and_fetch: expected 4D keys [B, n_kv_heads, S, head_dim], got {}D",
@@ -199,16 +195,10 @@ mod imp {
                 let n_steps = (KV_CACHE_STEP + s - 1) / KV_CACHE_STEP;
                 let new_block_len = (n_steps * KV_CACHE_STEP) as i32;
 
-                let new_k = mlx_rs::ops::zeros_dtype(
-                    &[b, h_k, new_block_len, d_k],
-                    keys.dtype(),
-                )
-                .context("NativeKvCache: zeros_dtype for k grow")?;
-                let new_v = mlx_rs::ops::zeros_dtype(
-                    &[b, h_v, new_block_len, d_v],
-                    values.dtype(),
-                )
-                .context("NativeKvCache: zeros_dtype for v grow")?;
+                let new_k = mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, d_k], keys.dtype())
+                    .context("NativeKvCache: zeros_dtype for k grow")?;
+                let new_v = mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, d_v], values.dtype())
+                    .context("NativeKvCache: zeros_dtype for v grow")?;
 
                 self.keys = Some(match self.keys.take() {
                     None => new_k,
@@ -242,15 +232,9 @@ mod imp {
             // the new graph node back to `self.keys`. The MLX backend reuses
             // the underlying buffer when safe.
             {
-                let k_buf = self
-                    .keys
-                    .as_mut()
-                    .expect("keys buffer present after grow");
+                let k_buf = self.keys.as_mut().expect("keys buffer present after grow");
                 k_buf
-                    .try_index_mut(
-                        (.., .., (prev as i32)..(new_total as i32), ..),
-                        keys,
-                    )
+                    .try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), keys)
                     .context("NativeKvCache: slice_update keys")?;
             }
             {
@@ -259,10 +243,7 @@ mod imp {
                     .as_mut()
                     .expect("values buffer present after grow");
                 v_buf
-                    .try_index_mut(
-                        (.., .., (prev as i32)..(new_total as i32), ..),
-                        values,
-                    )
+                    .try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), values)
                     .context("NativeKvCache: slice_update values")?;
             }
 
@@ -285,12 +266,7 @@ mod imp {
         /// (`native_snapshot::PromptCacheSnapshot::restore`) to rewind the cache
         /// to a captured state. Caller is responsible for invariants —
         /// `keys.is_some() == values.is_some()` and `keys.shape()[2] >= offset`.
-        pub fn set_state(
-            &mut self,
-            keys: Option<Array>,
-            values: Option<Array>,
-            offset: usize,
-        ) {
+        pub fn set_state(&mut self, keys: Option<Array>, values: Option<Array>, offset: usize) {
             self.keys = keys;
             self.values = values;
             self.offset = offset;
@@ -327,8 +303,7 @@ mod imp {
                 return Ok(());
             }
             if let (Some(k), Some(v)) = (self.keys.as_ref(), self.values.as_ref()) {
-                k.eval()
-                    .context("NativeKvCache::truncate_to: eval keys")?;
+                k.eval().context("NativeKvCache::truncate_to: eval keys")?;
                 v.eval()
                     .context("NativeKvCache::truncate_to: eval values")?;
             }
@@ -459,9 +434,10 @@ mod imp {
             }
 
             // STEP-PREALLOC path — grow buffers in KV_CACHE_STEP blocks.
-            let need_grow = self.keys.as_ref().map_or(true, |(kp, _, _)| {
-                new_total > kp.shape()[2] as usize
-            });
+            let need_grow = self
+                .keys
+                .as_ref()
+                .map_or(true, |(kp, _, _)| new_total > kp.shape()[2] as usize);
 
             if need_grow {
                 let b = keys.shape()[0];
@@ -477,18 +453,24 @@ mod imp {
                 let n_steps = (KV_CACHE_STEP + s - 1) / KV_CACHE_STEP;
                 let new_block_len = (n_steps * KV_CACHE_STEP) as i32;
 
-                let new_kp = mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, kp_last], k_p.dtype())
-                    .context("NativeKvCacheQuantized: zeros k_packed")?;
-                let new_ks = mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, ks_last], k_s.dtype())
-                    .context("NativeKvCacheQuantized: zeros k_scales")?;
-                let new_kb = mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, kb_last], k_b.dtype())
-                    .context("NativeKvCacheQuantized: zeros k_biases")?;
-                let new_vp = mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vp_last], v_p.dtype())
-                    .context("NativeKvCacheQuantized: zeros v_packed")?;
-                let new_vs = mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vs_last], v_s.dtype())
-                    .context("NativeKvCacheQuantized: zeros v_scales")?;
-                let new_vb = mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vb_last], v_b.dtype())
-                    .context("NativeKvCacheQuantized: zeros v_biases")?;
+                let new_kp =
+                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, kp_last], k_p.dtype())
+                        .context("NativeKvCacheQuantized: zeros k_packed")?;
+                let new_ks =
+                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, ks_last], k_s.dtype())
+                        .context("NativeKvCacheQuantized: zeros k_scales")?;
+                let new_kb =
+                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_block_len, kb_last], k_b.dtype())
+                        .context("NativeKvCacheQuantized: zeros k_biases")?;
+                let new_vp =
+                    mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vp_last], v_p.dtype())
+                        .context("NativeKvCacheQuantized: zeros v_packed")?;
+                let new_vs =
+                    mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vs_last], v_s.dtype())
+                        .context("NativeKvCacheQuantized: zeros v_scales")?;
+                let new_vb =
+                    mlx_rs::ops::zeros_dtype(&[b, h_v, new_block_len, vb_last], v_b.dtype())
+                        .context("NativeKvCacheQuantized: zeros v_biases")?;
 
                 self.keys = Some(match self.keys.take() {
                     None => (new_kp, new_ks, new_kb),
@@ -536,46 +518,22 @@ mod imp {
 
             // In-place slice update at [..., prev:new_total, :].
             {
-                let (kp, ks, kb) = self
-                    .keys
-                    .as_mut()
-                    .expect("keys present after grow");
-                kp.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &k_p,
-                )
-                .context("NativeKvCacheQuantized: slice_update k_packed")?;
-                ks.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &k_s,
-                )
-                .context("NativeKvCacheQuantized: slice_update k_scales")?;
-                kb.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &k_b,
-                )
-                .context("NativeKvCacheQuantized: slice_update k_biases")?;
+                let (kp, ks, kb) = self.keys.as_mut().expect("keys present after grow");
+                kp.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &k_p)
+                    .context("NativeKvCacheQuantized: slice_update k_packed")?;
+                ks.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &k_s)
+                    .context("NativeKvCacheQuantized: slice_update k_scales")?;
+                kb.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &k_b)
+                    .context("NativeKvCacheQuantized: slice_update k_biases")?;
             }
             {
-                let (vp, vs, vb) = self
-                    .values
-                    .as_mut()
-                    .expect("values present after grow");
-                vp.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &v_p,
-                )
-                .context("NativeKvCacheQuantized: slice_update v_packed")?;
-                vs.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &v_s,
-                )
-                .context("NativeKvCacheQuantized: slice_update v_scales")?;
-                vb.try_index_mut(
-                    (.., .., (prev as i32)..(new_total as i32), ..),
-                    &v_b,
-                )
-                .context("NativeKvCacheQuantized: slice_update v_biases")?;
+                let (vp, vs, vb) = self.values.as_mut().expect("values present after grow");
+                vp.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &v_p)
+                    .context("NativeKvCacheQuantized: slice_update v_packed")?;
+                vs.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &v_s)
+                    .context("NativeKvCacheQuantized: slice_update v_scales")?;
+                vb.try_index_mut((.., .., (prev as i32)..(new_total as i32), ..), &v_b)
+                    .context("NativeKvCacheQuantized: slice_update v_biases")?;
             }
 
             self.offset = new_total;
@@ -688,11 +646,7 @@ mod imp {
         /// hit the rotation cap yet), or a legacy concat path for prefill /
         /// rotation. The fast path eliminates the O(prev × head_dim) DRAM
         /// copy that was the root cause of the 2.2× gap vs mlx-lm.
-        pub fn update_and_fetch(
-            &mut self,
-            keys: &Array,
-            values: &Array,
-        ) -> Result<(Array, Array)> {
+        pub fn update_and_fetch(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
             if keys.ndim() != 4 {
                 return Err(anyhow!(
                     "NativeRotatingKvCache::update_and_fetch: expected 4D keys [B, n_kv_heads, S, head_dim], got {}D",
@@ -775,16 +729,12 @@ mod imp {
                             (trim_size + self.keep) as i32,
                             cached as i32,
                         )?;
-                        let combined_keys = mlx_rs::ops::concatenate_axis(
-                            &[&head_k, &tail_k, keys],
-                            2,
-                        )
-                        .context("NativeRotatingKvCache: concat keys after trim")?;
-                        let combined_values = mlx_rs::ops::concatenate_axis(
-                            &[&head_v, &tail_v, values],
-                            2,
-                        )
-                        .context("NativeRotatingKvCache: concat values after trim")?;
+                        let combined_keys =
+                            mlx_rs::ops::concatenate_axis(&[&head_k, &tail_k, keys], 2)
+                                .context("NativeRotatingKvCache: concat keys after trim")?;
+                        let combined_values =
+                            mlx_rs::ops::concatenate_axis(&[&head_v, &tail_v, values], 2)
+                                .context("NativeRotatingKvCache: concat values after trim")?;
                         (combined_keys, combined_values)
                     } else {
                         let combined_keys =
@@ -823,11 +773,7 @@ mod imp {
         /// no effect on the attention output for decode (q_len=1).
         ///
         /// Caller must guarantee: `s == 1`.
-        fn update_in_place(
-            &mut self,
-            keys: &Array,
-            values: &Array,
-        ) -> Result<(Array, Array)> {
+        fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
             let s = 1usize;
             let prev = self.offset;
 
@@ -847,18 +793,11 @@ mod imp {
                 let h_v = values.shape()[1];
                 let d_v = values.shape()[3];
 
-                let new_size =
-                    std::cmp::min(KV_CACHE_STEP, self.max_size - prev) as i32;
-                let new_k = mlx_rs::ops::zeros_dtype(
-                    &[b, h_k, new_size, d_k],
-                    keys.dtype(),
-                )
-                .context("NativeRotatingKvCache: zeros_dtype for k grow")?;
-                let new_v = mlx_rs::ops::zeros_dtype(
-                    &[b, h_v, new_size, d_v],
-                    values.dtype(),
-                )
-                .context("NativeRotatingKvCache: zeros_dtype for v grow")?;
+                let new_size = std::cmp::min(KV_CACHE_STEP, self.max_size - prev) as i32;
+                let new_k = mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, d_k], keys.dtype())
+                    .context("NativeRotatingKvCache: zeros_dtype for k grow")?;
+                let new_v = mlx_rs::ops::zeros_dtype(&[b, h_v, new_size, d_v], values.dtype())
+                    .context("NativeRotatingKvCache: zeros_dtype for v grow")?;
 
                 self.keys = Some(match self.keys.take() {
                     None => new_k,
@@ -883,22 +822,14 @@ mod imp {
                 let trimmed_keys = {
                     let k = self.keys.as_ref().unwrap();
                     let head_k = slice_axis2(k, 0, keep as i32)?;
-                    let tail_k = slice_axis2(
-                        k,
-                        (trim_size + keep) as i32,
-                        buf_size as i32,
-                    )?;
+                    let tail_k = slice_axis2(k, (trim_size + keep) as i32, buf_size as i32)?;
                     mlx_rs::ops::concatenate_axis(&[&head_k, &tail_k], 2)
                         .context("NativeRotatingKvCache: trim keys (one-time)")?
                 };
                 let trimmed_values = {
                     let v = self.values.as_ref().unwrap();
                     let head_v = slice_axis2(v, 0, keep as i32)?;
-                    let tail_v = slice_axis2(
-                        v,
-                        (trim_size + keep) as i32,
-                        buf_size as i32,
-                    )?;
+                    let tail_v = slice_axis2(v, (trim_size + keep) as i32, buf_size as i32)?;
                     mlx_rs::ops::concatenate_axis(&[&head_v, &tail_v], 2)
                         .context("NativeRotatingKvCache: trim values (one-time)")?
                 };
@@ -916,15 +847,9 @@ mod imp {
             let write_idx = self.idx;
             let new_idx = write_idx + s;
             {
-                let k_buf = self
-                    .keys
-                    .as_mut()
-                    .expect("keys buffer present after grow");
+                let k_buf = self.keys.as_mut().expect("keys buffer present after grow");
                 k_buf
-                    .try_index_mut(
-                        (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                        keys,
-                    )
+                    .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), keys)
                     .context("NativeRotatingKvCache: slice_update keys")?;
             }
             {
@@ -933,10 +858,7 @@ mod imp {
                     .as_mut()
                     .expect("values buffer present after grow");
                 v_buf
-                    .try_index_mut(
-                        (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                        values,
-                    )
+                    .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), values)
                     .context("NativeRotatingKvCache: slice_update values")?;
             }
 
@@ -950,10 +872,8 @@ mod imp {
                 let v = self.values.as_ref().unwrap().clone();
                 Ok((k, v))
             } else {
-                let k_view =
-                    slice_axis2(self.keys.as_ref().unwrap(), 0, self.offset as i32)?;
-                let v_view =
-                    slice_axis2(self.values.as_ref().unwrap(), 0, self.offset as i32)?;
+                let k_view = slice_axis2(self.keys.as_ref().unwrap(), 0, self.offset as i32)?;
+                let v_view = slice_axis2(self.values.as_ref().unwrap(), 0, self.offset as i32)?;
                 Ok((k_view, v_view))
             }
         }
@@ -1045,7 +965,10 @@ mod imp {
 
     impl NativeRotatingKvCacheQuantized {
         pub fn new(max_size: usize, keep: usize, group_size: i32, bits: i32) -> Self {
-            assert!(max_size > 0, "RotatingKvCacheQuantized: max_size must be > 0");
+            assert!(
+                max_size > 0,
+                "RotatingKvCacheQuantized: max_size must be > 0"
+            );
             assert!(
                 keep < max_size,
                 "RotatingKvCacheQuantized: keep={keep} must be < max_size={max_size}"
@@ -1341,46 +1264,22 @@ mod imp {
             let write_idx = self.idx;
             let new_idx = write_idx + s;
             {
-                let (kp, ks, kb) = self
-                    .keys
-                    .as_mut()
-                    .expect("keys present after grow");
-                kp.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &k_p,
-                )
-                .context("RotatingQuant: slice_update k_packed")?;
-                ks.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &k_s,
-                )
-                .context("RotatingQuant: slice_update k_scales")?;
-                kb.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &k_b,
-                )
-                .context("RotatingQuant: slice_update k_biases")?;
+                let (kp, ks, kb) = self.keys.as_mut().expect("keys present after grow");
+                kp.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &k_p)
+                    .context("RotatingQuant: slice_update k_packed")?;
+                ks.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &k_s)
+                    .context("RotatingQuant: slice_update k_scales")?;
+                kb.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &k_b)
+                    .context("RotatingQuant: slice_update k_biases")?;
             }
             {
-                let (vp, vs, vb) = self
-                    .values
-                    .as_mut()
-                    .expect("values present after grow");
-                vp.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &v_p,
-                )
-                .context("RotatingQuant: slice_update v_packed")?;
-                vs.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &v_s,
-                )
-                .context("RotatingQuant: slice_update v_scales")?;
-                vb.try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    &v_b,
-                )
-                .context("RotatingQuant: slice_update v_biases")?;
+                let (vp, vs, vb) = self.values.as_mut().expect("values present after grow");
+                vp.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &v_p)
+                    .context("RotatingQuant: slice_update v_packed")?;
+                vs.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &v_s)
+                    .context("RotatingQuant: slice_update v_scales")?;
+                vb.try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), &v_b)
+                    .context("RotatingQuant: slice_update v_biases")?;
             }
 
             self.idx = new_idx;
@@ -1447,8 +1346,8 @@ mod imp {
         values_sigma: Option<Array>,
         // QJL Stage-2 slots — only populated when `qjl_m.is_some()`. K-side
         // only; V uses Stage 1 alone (no per-row inner-product structure).
-        keys_signs: Option<Array>,           // [B, n_kv, S, m] bf16 ±1
-        keys_residual_norm: Option<Array>,   // [B, n_kv, S, 1] f32
+        keys_signs: Option<Array>,         // [B, n_kv, S, m] bf16 ±1
+        keys_residual_norm: Option<Array>, // [B, n_kv, S, 1] f32
         /// Total tokens ever pushed.
         offset: usize,
         max_size: usize,
@@ -1636,10 +1535,7 @@ mod imp {
             self.keys_sigma = Some(new_k_sigma.clone());
             self.values_codes = Some(new_v_codes.clone());
             self.values_sigma = Some(new_v_sigma.clone());
-            Ok((
-                (new_k_codes, new_k_sigma),
-                (new_v_codes, new_v_sigma),
-            ))
+            Ok(((new_k_codes, new_k_sigma), (new_v_codes, new_v_sigma)))
         }
 
         fn update_in_place_tq(
@@ -1766,34 +1662,22 @@ mod imp {
             self.keys_codes
                 .as_mut()
                 .expect("k_codes present after grow")
-                .try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    k_codes,
-                )
+                .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), k_codes)
                 .context("TurboQuant: slice_update k_codes")?;
             self.keys_sigma
                 .as_mut()
                 .expect("k_sigma present after grow")
-                .try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    k_sigma,
-                )
+                .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), k_sigma)
                 .context("TurboQuant: slice_update k_sigma")?;
             self.values_codes
                 .as_mut()
                 .expect("v_codes present after grow")
-                .try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    v_codes,
-                )
+                .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), v_codes)
                 .context("TurboQuant: slice_update v_codes")?;
             self.values_sigma
                 .as_mut()
                 .expect("v_sigma present after grow")
-                .try_index_mut(
-                    (.., .., (write_idx as i32)..(new_idx as i32), ..),
-                    v_sigma,
-                )
+                .try_index_mut((.., .., (write_idx as i32)..(new_idx as i32), ..), v_sigma)
                 .context("TurboQuant: slice_update v_sigma")?;
 
             self.idx = new_idx;
@@ -1844,7 +1728,9 @@ mod imp {
                 return Err(anyhow!(
                     "TurboQuant cache (qjl): expected 4D inputs, got \
                      K_codes={}D, V_codes={}D, K_signs={}D",
-                    k_codes.ndim(), v_codes.ndim(), k_signs.ndim()
+                    k_codes.ndim(),
+                    v_codes.ndim(),
+                    k_signs.ndim()
                 ));
             }
             let s = k_codes.shape()[2] as usize;
@@ -1852,89 +1738,90 @@ mod imp {
                 return Err(anyhow!(
                     "TurboQuant cache (qjl): seq-len mismatch — K_codes={}, \
                      V_codes={}, K_signs={}",
-                    s, v_codes.shape()[2], k_signs.shape()[2]
+                    s,
+                    v_codes.shape()[2],
+                    k_signs.shape()[2]
                 ));
             }
 
             if s == 1 && use_step_prealloc() {
-                return self.update_in_place_tq_qjl(
-                    k_codes, k_sigma, k_signs, k_rnorm, v_codes, v_sigma,
-                );
+                return self
+                    .update_in_place_tq_qjl(k_codes, k_sigma, k_signs, k_rnorm, v_codes, v_sigma);
             }
 
             // Legacy concat-with-trim path mirroring update_and_fetch but
             // operating on six buffers.
-            let (
-                new_k_codes, new_k_sigma,
-                new_k_signs, new_k_rnorm,
-                new_v_codes, new_v_sigma,
-            ) = match (
-                self.keys_codes.take(),
-                self.keys_sigma.take(),
-                self.keys_signs.take(),
-                self.keys_residual_norm.take(),
-                self.values_codes.take(),
-                self.values_sigma.take(),
-            ) {
-                (None, None, None, None, None, None) => (
-                    k_codes.clone(), k_sigma.clone(),
-                    k_signs.clone(), k_rnorm.clone(),
-                    v_codes.clone(), v_sigma.clone(),
-                ),
-                (Some(kc), Some(ks), Some(ksg), Some(krn), Some(vc), Some(vs)) => {
-                    let cached = kc.shape()[2] as usize;
-                    let trim_size = (cached + s).saturating_sub(self.max_size);
-                    let cached_i = cached as i32;
-                    let keep_i = self.keep as i32;
-                    let trim_keep = (trim_size + self.keep) as i32;
-                    if trim_size > 0 {
-                        let head_kc  = slice_axis2(&kc, 0, keep_i)?;
-                        let tail_kc  = slice_axis2(&kc, trim_keep, cached_i)?;
-                        let head_ks  = slice_axis2(&ks, 0, keep_i)?;
-                        let tail_ks  = slice_axis2(&ks, trim_keep, cached_i)?;
-                        let head_ksg = slice_axis2(&ksg, 0, keep_i)?;
-                        let tail_ksg = slice_axis2(&ksg, trim_keep, cached_i)?;
-                        let head_krn = slice_axis2(&krn, 0, keep_i)?;
-                        let tail_krn = slice_axis2(&krn, trim_keep, cached_i)?;
-                        let head_vc  = slice_axis2(&vc, 0, keep_i)?;
-                        let tail_vc  = slice_axis2(&vc, trim_keep, cached_i)?;
-                        let head_vs  = slice_axis2(&vs, 0, keep_i)?;
-                        let tail_vs  = slice_axis2(&vs, trim_keep, cached_i)?;
-                        (
-                            mlx_rs::ops::concatenate_axis(&[&head_kc, &tail_kc, k_codes], 2)
-                                .context("TurboQuant(qjl): concat k_codes after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_ks, &tail_ks, k_sigma], 2)
-                                .context("TurboQuant(qjl): concat k_sigma after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_ksg, &tail_ksg, k_signs], 2)
-                                .context("TurboQuant(qjl): concat k_signs after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_krn, &tail_krn, k_rnorm], 2)
-                                .context("TurboQuant(qjl): concat k_rnorm after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_vc, &tail_vc, v_codes], 2)
-                                .context("TurboQuant(qjl): concat v_codes after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_vs, &tail_vs, v_sigma], 2)
-                                .context("TurboQuant(qjl): concat v_sigma after trim")?,
-                        )
-                    } else {
-                        (
-                            mlx_rs::ops::concatenate_axis(&[&kc, k_codes], 2)
-                                .context("TurboQuant(qjl): concat k_codes (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&ks, k_sigma], 2)
-                                .context("TurboQuant(qjl): concat k_sigma (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&ksg, k_signs], 2)
-                                .context("TurboQuant(qjl): concat k_signs (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&krn, k_rnorm], 2)
-                                .context("TurboQuant(qjl): concat k_rnorm (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&vc, v_codes], 2)
-                                .context("TurboQuant(qjl): concat v_codes (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&vs, v_sigma], 2)
-                                .context("TurboQuant(qjl): concat v_sigma (no trim)")?,
-                        )
+            let (new_k_codes, new_k_sigma, new_k_signs, new_k_rnorm, new_v_codes, new_v_sigma) =
+                match (
+                    self.keys_codes.take(),
+                    self.keys_sigma.take(),
+                    self.keys_signs.take(),
+                    self.keys_residual_norm.take(),
+                    self.values_codes.take(),
+                    self.values_sigma.take(),
+                ) {
+                    (None, None, None, None, None, None) => (
+                        k_codes.clone(),
+                        k_sigma.clone(),
+                        k_signs.clone(),
+                        k_rnorm.clone(),
+                        v_codes.clone(),
+                        v_sigma.clone(),
+                    ),
+                    (Some(kc), Some(ks), Some(ksg), Some(krn), Some(vc), Some(vs)) => {
+                        let cached = kc.shape()[2] as usize;
+                        let trim_size = (cached + s).saturating_sub(self.max_size);
+                        let cached_i = cached as i32;
+                        let keep_i = self.keep as i32;
+                        let trim_keep = (trim_size + self.keep) as i32;
+                        if trim_size > 0 {
+                            let head_kc = slice_axis2(&kc, 0, keep_i)?;
+                            let tail_kc = slice_axis2(&kc, trim_keep, cached_i)?;
+                            let head_ks = slice_axis2(&ks, 0, keep_i)?;
+                            let tail_ks = slice_axis2(&ks, trim_keep, cached_i)?;
+                            let head_ksg = slice_axis2(&ksg, 0, keep_i)?;
+                            let tail_ksg = slice_axis2(&ksg, trim_keep, cached_i)?;
+                            let head_krn = slice_axis2(&krn, 0, keep_i)?;
+                            let tail_krn = slice_axis2(&krn, trim_keep, cached_i)?;
+                            let head_vc = slice_axis2(&vc, 0, keep_i)?;
+                            let tail_vc = slice_axis2(&vc, trim_keep, cached_i)?;
+                            let head_vs = slice_axis2(&vs, 0, keep_i)?;
+                            let tail_vs = slice_axis2(&vs, trim_keep, cached_i)?;
+                            (
+                                mlx_rs::ops::concatenate_axis(&[&head_kc, &tail_kc, k_codes], 2)
+                                    .context("TurboQuant(qjl): concat k_codes after trim")?,
+                                mlx_rs::ops::concatenate_axis(&[&head_ks, &tail_ks, k_sigma], 2)
+                                    .context("TurboQuant(qjl): concat k_sigma after trim")?,
+                                mlx_rs::ops::concatenate_axis(&[&head_ksg, &tail_ksg, k_signs], 2)
+                                    .context("TurboQuant(qjl): concat k_signs after trim")?,
+                                mlx_rs::ops::concatenate_axis(&[&head_krn, &tail_krn, k_rnorm], 2)
+                                    .context("TurboQuant(qjl): concat k_rnorm after trim")?,
+                                mlx_rs::ops::concatenate_axis(&[&head_vc, &tail_vc, v_codes], 2)
+                                    .context("TurboQuant(qjl): concat v_codes after trim")?,
+                                mlx_rs::ops::concatenate_axis(&[&head_vs, &tail_vs, v_sigma], 2)
+                                    .context("TurboQuant(qjl): concat v_sigma after trim")?,
+                            )
+                        } else {
+                            (
+                                mlx_rs::ops::concatenate_axis(&[&kc, k_codes], 2)
+                                    .context("TurboQuant(qjl): concat k_codes (no trim)")?,
+                                mlx_rs::ops::concatenate_axis(&[&ks, k_sigma], 2)
+                                    .context("TurboQuant(qjl): concat k_sigma (no trim)")?,
+                                mlx_rs::ops::concatenate_axis(&[&ksg, k_signs], 2)
+                                    .context("TurboQuant(qjl): concat k_signs (no trim)")?,
+                                mlx_rs::ops::concatenate_axis(&[&krn, k_rnorm], 2)
+                                    .context("TurboQuant(qjl): concat k_rnorm (no trim)")?,
+                                mlx_rs::ops::concatenate_axis(&[&vc, v_codes], 2)
+                                    .context("TurboQuant(qjl): concat v_codes (no trim)")?,
+                                mlx_rs::ops::concatenate_axis(&[&vs, v_sigma], 2)
+                                    .context("TurboQuant(qjl): concat v_sigma (no trim)")?,
+                            )
+                        }
                     }
-                }
-                _ => unreachable!(
-                    "TurboQuant cache (qjl): all six fields must move in lockstep"
-                ),
-            };
+                    _ => {
+                        unreachable!("TurboQuant cache (qjl): all six fields must move in lockstep")
+                    }
+                };
             self.offset += s;
             self.idx = new_k_codes.shape()[2] as usize;
             self.keys_codes = Some(new_k_codes.clone());
@@ -1979,24 +1866,18 @@ mod imp {
 
                 let new_size = std::cmp::min(KV_CACHE_STEP, self.max_size - prev) as i32;
 
-                let new_kc =
-                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, d_k], k_codes.dtype())
-                        .context("TurboQuant(qjl): zeros k_codes grow")?;
-                let new_ks =
-                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, 1], k_sigma.dtype())
-                        .context("TurboQuant(qjl): zeros k_sigma grow")?;
-                let new_ksg =
-                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, m_k], k_signs.dtype())
-                        .context("TurboQuant(qjl): zeros k_signs grow")?;
-                let new_krn =
-                    mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, 1], k_rnorm.dtype())
-                        .context("TurboQuant(qjl): zeros k_rnorm grow")?;
-                let new_vc =
-                    mlx_rs::ops::zeros_dtype(&[b, h_v, new_size, d_v], v_codes.dtype())
-                        .context("TurboQuant(qjl): zeros v_codes grow")?;
-                let new_vs =
-                    mlx_rs::ops::zeros_dtype(&[b, h_v, new_size, 1], v_sigma.dtype())
-                        .context("TurboQuant(qjl): zeros v_sigma grow")?;
+                let new_kc = mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, d_k], k_codes.dtype())
+                    .context("TurboQuant(qjl): zeros k_codes grow")?;
+                let new_ks = mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, 1], k_sigma.dtype())
+                    .context("TurboQuant(qjl): zeros k_sigma grow")?;
+                let new_ksg = mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, m_k], k_signs.dtype())
+                    .context("TurboQuant(qjl): zeros k_signs grow")?;
+                let new_krn = mlx_rs::ops::zeros_dtype(&[b, h_k, new_size, 1], k_rnorm.dtype())
+                    .context("TurboQuant(qjl): zeros k_rnorm grow")?;
+                let new_vc = mlx_rs::ops::zeros_dtype(&[b, h_v, new_size, d_v], v_codes.dtype())
+                    .context("TurboQuant(qjl): zeros v_codes grow")?;
+                let new_vs = mlx_rs::ops::zeros_dtype(&[b, h_v, new_size, 1], v_sigma.dtype())
+                    .context("TurboQuant(qjl): zeros v_sigma grow")?;
 
                 self.keys_codes = Some(match self.keys_codes.take() {
                     None => new_kc,
@@ -2039,48 +1920,72 @@ mod imp {
                 let trim_keep = (trim_size + self.keep) as i32;
                 let buf_i = buf_size as i32;
 
-                let kc  = self.keys_codes.take().unwrap();
-                let ks  = self.keys_sigma.take().unwrap();
+                let kc = self.keys_codes.take().unwrap();
+                let ks = self.keys_sigma.take().unwrap();
                 let ksg = self.keys_signs.take().unwrap();
                 let krn = self.keys_residual_norm.take().unwrap();
-                let vc  = self.values_codes.take().unwrap();
-                let vs  = self.values_sigma.take().unwrap();
+                let vc = self.values_codes.take().unwrap();
+                let vs = self.values_sigma.take().unwrap();
 
                 self.keys_codes = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&kc, 0, keep_i)?, &slice_axis2(&kc, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&kc, 0, keep_i)?,
+                            &slice_axis2(&kc, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim k_codes")?,
+                    )
+                    .context("TurboQuant(qjl): trim k_codes")?,
                 );
                 self.keys_sigma = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&ks, 0, keep_i)?, &slice_axis2(&ks, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&ks, 0, keep_i)?,
+                            &slice_axis2(&ks, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim k_sigma")?,
+                    )
+                    .context("TurboQuant(qjl): trim k_sigma")?,
                 );
                 self.keys_signs = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&ksg, 0, keep_i)?, &slice_axis2(&ksg, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&ksg, 0, keep_i)?,
+                            &slice_axis2(&ksg, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim k_signs")?,
+                    )
+                    .context("TurboQuant(qjl): trim k_signs")?,
                 );
                 self.keys_residual_norm = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&krn, 0, keep_i)?, &slice_axis2(&krn, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&krn, 0, keep_i)?,
+                            &slice_axis2(&krn, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim k_rnorm")?,
+                    )
+                    .context("TurboQuant(qjl): trim k_rnorm")?,
                 );
                 self.values_codes = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&vc, 0, keep_i)?, &slice_axis2(&vc, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&vc, 0, keep_i)?,
+                            &slice_axis2(&vc, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim v_codes")?,
+                    )
+                    .context("TurboQuant(qjl): trim v_codes")?,
                 );
                 self.values_sigma = Some(
                     mlx_rs::ops::concatenate_axis(
-                        &[&slice_axis2(&vs, 0, keep_i)?, &slice_axis2(&vs, trim_keep, buf_i)?],
+                        &[
+                            &slice_axis2(&vs, 0, keep_i)?,
+                            &slice_axis2(&vs, trim_keep, buf_i)?,
+                        ],
                         2,
-                    ).context("TurboQuant(qjl): trim v_sigma")?,
+                    )
+                    .context("TurboQuant(qjl): trim v_sigma")?,
                 );
                 self.idx = self.max_size;
             }
@@ -2096,27 +2001,33 @@ mod imp {
             let wi = write_idx as i32;
             let ni = new_idx as i32;
             self.keys_codes
-                .as_mut().expect("k_codes")
+                .as_mut()
+                .expect("k_codes")
                 .try_index_mut((.., .., wi..ni, ..), k_codes)
                 .context("TurboQuant(qjl): slice_update k_codes")?;
             self.keys_sigma
-                .as_mut().expect("k_sigma")
+                .as_mut()
+                .expect("k_sigma")
                 .try_index_mut((.., .., wi..ni, ..), k_sigma)
                 .context("TurboQuant(qjl): slice_update k_sigma")?;
             self.keys_signs
-                .as_mut().expect("k_signs")
+                .as_mut()
+                .expect("k_signs")
                 .try_index_mut((.., .., wi..ni, ..), k_signs)
                 .context("TurboQuant(qjl): slice_update k_signs")?;
             self.keys_residual_norm
-                .as_mut().expect("k_rnorm")
+                .as_mut()
+                .expect("k_rnorm")
                 .try_index_mut((.., .., wi..ni, ..), k_rnorm)
                 .context("TurboQuant(qjl): slice_update k_rnorm")?;
             self.values_codes
-                .as_mut().expect("v_codes")
+                .as_mut()
+                .expect("v_codes")
                 .try_index_mut((.., .., wi..ni, ..), v_codes)
                 .context("TurboQuant(qjl): slice_update v_codes")?;
             self.values_sigma
-                .as_mut().expect("v_sigma")
+                .as_mut()
+                .expect("v_sigma")
                 .try_index_mut((.., .., wi..ni, ..), v_sigma)
                 .context("TurboQuant(qjl): slice_update v_sigma")?;
 
@@ -2125,21 +2036,21 @@ mod imp {
 
             // ── 5. Return: full ring if wrapped; partial view otherwise.
             if self.offset >= self.max_size {
-                let kc  = self.keys_codes.as_ref().unwrap().clone();
-                let ks  = self.keys_sigma.as_ref().unwrap().clone();
+                let kc = self.keys_codes.as_ref().unwrap().clone();
+                let ks = self.keys_sigma.as_ref().unwrap().clone();
                 let ksg = self.keys_signs.as_ref().unwrap().clone();
                 let krn = self.keys_residual_norm.as_ref().unwrap().clone();
-                let vc  = self.values_codes.as_ref().unwrap().clone();
-                let vs  = self.values_sigma.as_ref().unwrap().clone();
+                let vc = self.values_codes.as_ref().unwrap().clone();
+                let vs = self.values_sigma.as_ref().unwrap().clone();
                 Ok(((kc, ks, ksg, krn), (vc, vs)))
             } else {
                 let off_i = self.offset as i32;
-                let kc  = slice_axis2(self.keys_codes.as_ref().unwrap(), 0, off_i)?;
-                let ks  = slice_axis2(self.keys_sigma.as_ref().unwrap(), 0, off_i)?;
+                let kc = slice_axis2(self.keys_codes.as_ref().unwrap(), 0, off_i)?;
+                let ks = slice_axis2(self.keys_sigma.as_ref().unwrap(), 0, off_i)?;
                 let ksg = slice_axis2(self.keys_signs.as_ref().unwrap(), 0, off_i)?;
                 let krn = slice_axis2(self.keys_residual_norm.as_ref().unwrap(), 0, off_i)?;
-                let vc  = slice_axis2(self.values_codes.as_ref().unwrap(), 0, off_i)?;
-                let vs  = slice_axis2(self.values_sigma.as_ref().unwrap(), 0, off_i)?;
+                let vc = slice_axis2(self.values_codes.as_ref().unwrap(), 0, off_i)?;
+                let vs = slice_axis2(self.values_sigma.as_ref().unwrap(), 0, off_i)?;
                 Ok(((kc, ks, ksg, krn), (vc, vs)))
             }
         }
@@ -2192,11 +2103,9 @@ mod imp {
 
         pub fn set(&mut self, idx: usize, value: Array) -> Result<()> {
             let len = self.cache.len();
-            *self
-                .cache
-                .get_mut(idx)
-                .ok_or_else(|| anyhow!("NativeArraysCache::set: idx {idx} out of range (len={len})"))? =
-                Some(value);
+            *self.cache.get_mut(idx).ok_or_else(|| {
+                anyhow!("NativeArraysCache::set: idx {idx} out of range (len={len})")
+            })? = Some(value);
             Ok(())
         }
 
@@ -2242,11 +2151,9 @@ mod imp {
         /// captured state may include empty slots.
         pub fn set_slot(&mut self, idx: usize, value: Option<Array>) -> Result<()> {
             let len = self.cache.len();
-            *self
-                .cache
-                .get_mut(idx)
-                .ok_or_else(|| anyhow!("NativeArraysCache::set_slot: idx {idx} out of range (len={len})"))? =
-                value;
+            *self.cache.get_mut(idx).ok_or_else(|| {
+                anyhow!("NativeArraysCache::set_slot: idx {idx} out of range (len={len})")
+            })? = value;
             Ok(())
         }
 
@@ -2756,11 +2663,7 @@ mod lifecycle_tests {
             .unwrap()
             .set(0, conv_state)
             .unwrap();
-        pc.layer_mut(0)
-            .unwrap()
-            .as_linear_mut()
-            .unwrap()
-            .advance(4);
+        pc.layer_mut(0).unwrap().as_linear_mut().unwrap().advance(4);
 
         assert_eq!(pc.full_attn_offset(), 4);
         assert_eq!(pc.layer(0).unwrap().offset(), 4);
@@ -2768,13 +2671,7 @@ mod lifecycle_tests {
         pc.clear();
         assert_eq!(pc.full_attn_offset(), 0);
         assert_eq!(pc.layer(0).unwrap().offset(), 0);
-        assert!(
-            pc.layer(0)
-                .unwrap()
-                .as_linear()
-                .unwrap()
-                .empty_slots()
-        );
+        assert!(pc.layer(0).unwrap().as_linear().unwrap().empty_slots());
         assert!(pc.layer(1).unwrap().as_full().unwrap().empty());
     }
 

@@ -12,15 +12,15 @@
 
 #[cfg(feature = "mlx-native")]
 fn main() -> anyhow::Result<()> {
-    use mlx_rs::{Array, Dtype};
     use lumen_mlx::native_metal_bridge::run_flash_attn_bf16;
+    use mlx_rs::{Array, Dtype};
 
     println!("=== Phase 1.8 M4.2: flash_attn_bf16 parity vs mlx::fast::sdpa ===");
 
     // Gemma 4: n_heads=32 (Q), n_kv=8 (K/V), head_dim=256, GQA group=4.
     let n_heads: usize = 32;
-    let n_kv:    usize = 8;
-    let d:       usize = 256;
+    let n_kv: usize = 8;
+    let d: usize = 256;
     let scale: f32 = 1.0 / (d as f32).sqrt();
 
     // Sweep KV lengths covering decode @ various offsets.
@@ -57,9 +57,8 @@ fn main() -> anyhow::Result<()> {
         // Reference: mlx::fast::scaled_dot_product_attention with no mask.
         // At Sq=1 decode every query attends to all KV (causal == no-mask).
         let ref_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k, &v, scale,
-            None,  // no mask
-            None,  // no sinks
+            &q, &k, &v, scale, None, // no mask
+            None, // no sinks
         )?;
         ref_out.eval()?;
 
@@ -102,16 +101,18 @@ fn main() -> anyhow::Result<()> {
         max_diff_overall = max_diff_overall.max(max_diff);
         min_cos_overall = min_cos_overall.min(min_cos);
 
-        let status = if max_diff <= 3.0e-2 && min_cos >= 0.9999 { "OK" } else { "FAIL" };
+        let status = if max_diff <= 3.0e-2 && min_cos >= 0.9999 {
+            "OK"
+        } else {
+            "FAIL"
+        };
         println!(
             "Sq=1 H={n_heads} H_kv={n_kv} D={d} Skv={skv:>4}: max|Δ|={max_diff:.3e} min_cos={min_cos:.6} {status}"
         );
     }
 
     println!();
-    println!(
-        "=== overall: max|Δ|={max_diff_overall:.3e} min_cos={min_cos_overall:.6} ==="
-    );
+    println!("=== overall: max|Δ|={max_diff_overall:.3e} min_cos={min_cos_overall:.6} ===");
     if max_diff_overall > 3.0e-2 || min_cos_overall < 0.9999 {
         eprintln!("PARITY FAIL");
         std::process::exit(1);
@@ -161,12 +162,14 @@ fn main() -> anyhow::Result<()> {
                 mask_f32[j] = f32::NEG_INFINITY;
             }
         }
-        let mask = Array::from_slice(&mask_f32, &[1, skv as i32])
-            .as_dtype(Dtype::Bfloat16)?;
+        let mask = Array::from_slice(&mask_f32, &[1, skv as i32]).as_dtype(Dtype::Bfloat16)?;
         mask.eval()?;
 
         let ref_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k, &v, scale,
+            &q,
+            &k,
+            &v,
+            scale,
             Some(mlx_rs::fast::ScaledDotProductAttentionMask::Array(&mask)),
             None,
         )?;
@@ -182,7 +185,11 @@ fn main() -> anyhow::Result<()> {
 
         let r: Vec<f32> = ref_f32.as_slice::<f32>().to_vec();
         let g: Vec<f32> = got_f32.as_slice::<f32>().to_vec();
-        let max_diff = r.iter().zip(&g).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+        let max_diff = r
+            .iter()
+            .zip(&g)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
         let mut min_cos = 1.0f32;
         for h in 0..n_heads {
             let a = &r[h * d..(h + 1) * d];
@@ -190,12 +197,20 @@ fn main() -> anyhow::Result<()> {
             let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
             let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
             let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let cos = if na > 0.0 && nb > 0.0 { (dot / (na * nb)).clamp(-1.0, 1.0) } else { 1.0 };
+            let cos = if na > 0.0 && nb > 0.0 {
+                (dot / (na * nb)).clamp(-1.0, 1.0)
+            } else {
+                1.0
+            };
             min_cos = min_cos.min(cos);
         }
         m43_max = m43_max.max(max_diff);
         m43_cos = m43_cos.min(min_cos);
-        let status = if max_diff <= 3.0e-2 && min_cos >= 0.9999 { "OK" } else { "FAIL" };
+        let status = if max_diff <= 3.0e-2 && min_cos >= 0.9999 {
+            "OK"
+        } else {
+            "FAIL"
+        };
         println!(
             "Sq=1 H={n_heads} D={d} Skv={skv:>4} window={window}: max|Δ|={max_diff:.3e} min_cos={min_cos:.6} {status}"
         );

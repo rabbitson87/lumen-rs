@@ -17,8 +17,8 @@ async fn main() -> Result<()> {
 }
 
 fn run_sync() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
     let prompt_len: usize = std::env::var("PROMPT_LEN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -40,10 +40,7 @@ fn run_sync() -> Result<()> {
     let t_prefill = Instant::now();
     let (mut last, mut pos) = b.prefill(1, &prompt)?;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "prefill: {} tokens in {prefill_ms:.0}ms",
-        prompt.len()
-    );
+    println!("prefill: {} tokens in {prefill_ms:.0}ms", prompt.len());
 
     for _ in 0..warmup {
         let (n, p) = b.decode_step(1, last, pos)?;

@@ -98,14 +98,8 @@ fn mxfp4_matmul_matches_mlx_reference() {
     assert_eq!(blob.bits, 4);
     assert_eq!(blob.x.len(), blob.in_features);
     assert_eq!(blob.expected_y.len(), blob.out_features);
-    assert_eq!(
-        blob.packed.len(),
-        blob.out_features * blob.in_features / 8
-    );
-    assert_eq!(
-        blob.scales.len(),
-        blob.out_features * blob.in_features / 32
-    );
+    assert_eq!(blob.packed.len(), blob.out_features * blob.in_features / 8);
+    assert_eq!(blob.scales.len(), blob.out_features * blob.in_features / 32);
 
     let ctx = MxFp4Context::new().expect("Metal ctx");
     let weight = Mxfp4Weight::from_host(
@@ -117,9 +111,7 @@ fn mxfp4_matmul_matches_mlx_reference() {
     )
     .expect("upload weight");
 
-    let got = ctx
-        .matmul_with_weight(&weight, &blob.x, 1)
-        .expect("matmul");
+    let got = ctx.matmul_with_weight(&weight, &blob.x, 1).expect("matmul");
     assert_eq!(got.len(), blob.out_features);
 
     // Compare: L2 relative error, max absolute error, cosine similarity.
@@ -142,31 +134,55 @@ fn mxfp4_matmul_matches_mlx_reference() {
     let cos = dot / (ng.sqrt() * nr.sqrt() + 1e-12);
 
     eprintln!("── MXFP4 Rust-vs-MLX parity ──────────────────────────────");
-    eprintln!("  shape:       out={} in={}", blob.out_features, blob.in_features);
+    eprintln!(
+        "  shape:       out={} in={}",
+        blob.out_features, blob.in_features
+    );
     eprintln!("  L2 rel err:  {l2_rel:.6e}");
     eprintln!("  max |err|:   {max_abs:.6e}");
     eprintln!("  cosine sim:  {cos:.6}");
-    eprintln!("  ref range:   [{:.4}, {:.4}]  std={:.4}",
-              blob.expected_y.iter().cloned().fold(f32::INFINITY, f32::min),
-              blob.expected_y.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-              {
-                  let mean = blob.expected_y.iter().sum::<f32>() / blob.expected_y.len() as f32;
-                  let v = blob.expected_y.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
-                      / blob.expected_y.len() as f32;
-                  v.sqrt()
-              });
-    eprintln!("  got range:   [{:.4}, {:.4}]",
-              got.iter().cloned().fold(f32::INFINITY, f32::min),
-              got.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    eprintln!(
+        "  ref range:   [{:.4}, {:.4}]  std={:.4}",
+        blob.expected_y
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min),
+        blob.expected_y
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max),
+        {
+            let mean = blob.expected_y.iter().sum::<f32>() / blob.expected_y.len() as f32;
+            let v = blob
+                .expected_y
+                .iter()
+                .map(|x| (x - mean).powi(2))
+                .sum::<f32>()
+                / blob.expected_y.len() as f32;
+            v.sqrt()
+        }
+    );
+    eprintln!(
+        "  got range:   [{:.4}, {:.4}]",
+        got.iter().cloned().fold(f32::INFINITY, f32::min),
+        got.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+    );
 
     // First 8 values side-by-side for eyeballing when things drift.
     for i in 0..8 {
-        eprintln!("  y[{i:>4}]: got={:>+10.5}  ref={:>+10.5}  Δ={:+.4e}",
-                  got[i], blob.expected_y[i], got[i] - blob.expected_y[i]);
+        eprintln!(
+            "  y[{i:>4}]: got={:>+10.5}  ref={:>+10.5}  Δ={:+.4e}",
+            got[i],
+            blob.expected_y[i],
+            got[i] - blob.expected_y[i]
+        );
     }
 
     // Tolerance: MXFP4 is exact dequant + fp32 accumulate, so the only source of drift
     // is fp32 FMA ordering. L2 rel ≤ 1e-4 is a comfortable pass; cos ≥ 1 - 1e-6.
     assert!(l2_rel < 1e-3, "MXFP4 matmul diverges from MLX reference");
-    assert!(cos > 0.9999, "cosine sim too low — kernel numerically wrong");
+    assert!(
+        cos > 0.9999,
+        "cosine sim too low — kernel numerically wrong"
+    );
 }

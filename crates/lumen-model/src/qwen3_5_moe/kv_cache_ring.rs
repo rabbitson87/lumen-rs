@@ -33,7 +33,12 @@ pub struct SlidingWindowKvCache {
 
 impl SlidingWindowKvCache {
     pub fn new(concat_dim: usize, window: usize) -> Self {
-        Self { concat_dim, window, key_buf: None, val_buf: None }
+        Self {
+            concat_dim,
+            window,
+            key_buf: None,
+            val_buf: None,
+        }
     }
 
     /// Number of tokens currently stored (≤ `window`).

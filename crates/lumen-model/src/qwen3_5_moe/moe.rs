@@ -27,19 +27,19 @@
 //! Ground truth shapes below were read from `model-00001-of-00004.safetensors` layer 0 on
 //! 2026-04-23.
 
-use candle_core::{Result as CandleResult, Tensor, D};
+use candle_core::{D, Result as CandleResult, Tensor};
 use candle_nn::Module;
 use std::sync::Mutex;
 
 #[cfg(feature = "turboquant-gpu")]
-use std::sync::Arc;
-#[cfg(feature = "turboquant-gpu")]
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 use lumen_metal::metal::{BatchedEncoderExt, Buffer, ComputeEncoderCompat, IndirectCommandBuffer};
 use lumen_metal::mxfp4_gpu::MxFp4Context;
-use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
 #[cfg(feature = "turboquant-gpu")]
 use lumen_metal::mxfp4_linear::{ExpertProj, Mxfp4SwitchMlp};
+use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
+#[cfg(feature = "turboquant-gpu")]
+use std::sync::Arc;
 
 use super::config::TextConfig;
 use super::proj::ProjLinear;
@@ -163,12 +163,12 @@ struct MlpIcbCache {
     /// Persistent intermediate buffers — pre-zeroed via synchronous
     /// `MetalContext::buffer_zeroed` to avoid the Candle `Tensor::zeros`
     /// async-fill race observed in 17.D-1c.
-    combined_buf: Buffer,           // [m, 2*inter] — gate_up output
-    hidden_buf: Buffer,             // [m, inter]   — silu*mul output
-    gate_up_dims_buf: Buffer,       // Affine4Dims for slot 0
-    down_dims_buf: Buffer,          // Affine4Dims for slot 2
-    silu_dims_buf: Buffer,          // SiluMulDims for slot 1
-    batch_buf: Buffer,              // u32 for slots 0+2
+    combined_buf: Buffer, // [m, 2*inter] — gate_up output
+    hidden_buf: Buffer,       // [m, inter]   — silu*mul output
+    gate_up_dims_buf: Buffer, // Affine4Dims for slot 0
+    down_dims_buf: Buffer,    // Affine4Dims for slot 2
+    silu_dims_buf: Buffer,    // SiluMulDims for slot 1
+    batch_buf: Buffer,        // u32 for slots 0+2
     /// Bound buffer addresses (gpuAddress) — fast-path validation.
     bound_x_id: usize,
     bound_x_off: u64,
@@ -195,11 +195,7 @@ struct Affine4Dims {
 }
 
 impl SharedExpert {
-    pub fn new(
-        gate_up_proj: ProjLinear,
-        down_proj: ProjLinear,
-        intermediate_size: usize,
-    ) -> Self {
+    pub fn new(gate_up_proj: ProjLinear, down_proj: ProjLinear, intermediate_size: usize) -> Self {
         Self {
             gate_up_proj,
             down_proj,
@@ -229,9 +225,10 @@ impl SharedExpert {
         residual: &Tensor,
     ) -> CandleResult<Tensor> {
         // gate_up matmul with in-kernel RmsNorm.
-        let gate_up_lin = self.gate_up_proj.as_affine4().expect(
-            "forward_post_attn_fused requires Affine4 gate_up_proj",
-        );
+        let gate_up_lin = self
+            .gate_up_proj
+            .as_affine4()
+            .expect("forward_post_attn_fused requires Affine4 gate_up_proj");
         let combined = gate_up_lin
             .forward_with_rmsnorm(x_raw, post_attn_ln_weight, rms_eps)
             .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
@@ -410,10 +407,7 @@ impl SharedExpert {
             let mlp_icb_on = std::env::var("LUMEN_MLP_ICB")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if mlp_icb_on
-                && self.gate_up_proj.is_affine4()
-                && self.down_proj.is_affine4()
-            {
+            if mlp_icb_on && self.gate_up_proj.is_affine4() && self.down_proj.is_affine4() {
                 if let Some(out) = self.try_forward_mlp_icb(x_bf16, residual_bf16)? {
                     return Ok(out);
                 }
@@ -524,12 +518,9 @@ impl SharedExpert {
         ctx: &Arc<MxFp4Context>,
     ) -> CandleResult<Tensor> {
         // Combined matmul on raw x with internal RmsNorm: [..., 2*inter].
-        let combined = self.gate_up_proj.forward_with_rmsnorm(
-            x_raw,
-            rms_weight,
-            rms_eps,
-            ctx,
-        )?;
+        let combined = self
+            .gate_up_proj
+            .forward_with_rmsnorm(x_raw, rms_weight, rms_eps, ctx)?;
         let last = combined.dims().len() - 1;
         let gate = combined
             .narrow(last, 0, self.intermediate_size)?
@@ -551,13 +542,14 @@ impl SharedExpert {
         mut marks: Option<&mut Vec<(&'static str, std::time::Instant)>>,
     ) -> CandleResult<Tensor> {
         let device = x.device().clone();
-        let push = |label: &'static str,
-                    marks: &mut Option<&mut Vec<(&'static str, std::time::Instant)>>| {
-            if let Some(m) = marks.as_deref_mut() {
-                let _ = device.synchronize();
-                m.push((label, std::time::Instant::now()));
-            }
-        };
+        let push =
+            |label: &'static str,
+             marks: &mut Option<&mut Vec<(&'static str, std::time::Instant)>>| {
+                if let Some(m) = marks.as_deref_mut() {
+                    let _ = device.synchronize();
+                    m.push((label, std::time::Instant::now()));
+                }
+            };
 
         // fused gate+up+silu*up kernel exists but is **opt-in only**.
         // Empirical 35B measurement (2026-04-26) shows fusion regressed decode
@@ -711,14 +703,18 @@ impl SharedExpert {
             .map_err(|e| candle_core::Error::Msg(format!("mlp_icb_cache lock: {e}")))?;
 
         if cache_guard.is_none() {
-            let icb = ctx.ctx.new_indirect_command_buffer(3, 8)
+            let icb = ctx
+                .ctx
+                .new_indirect_command_buffer(3, 8)
                 .map_err(|e| candle_core::Error::Msg(format!("ICB alloc: {e}")))?;
             let silu_kernel = SiluMulBf16InBf16Out::new()
                 .map_err(|e| candle_core::Error::Msg(format!("silu kernel init: {e}")))?;
 
             // Synchronous-zeroed persistent intermediates (no async fill — see
             // 17.D-1c lesson on Tensor::zeros race).
-            let combined_buf = ctx.ctx.buffer_zeroed((2 * self.intermediate_size * 2) as u64);
+            let combined_buf = ctx
+                .ctx
+                .buffer_zeroed((2 * self.intermediate_size * 2) as u64);
             let hidden_buf = ctx.ctx.buffer_zeroed((self.intermediate_size * 2) as u64);
 
             let gate_up_dims_buf = ctx.ctx.buffer_with_data(&[Affine4Dims {
@@ -763,32 +759,53 @@ impl SharedExpert {
         let r_id = buffer_gpu_id(&r_buf);
         let y_id = buffer_gpu_id(&y_buf);
         let needs_record = !cache.recorded
-            || cache.bound_x_id != x_id || cache.bound_x_off != x_off
-            || cache.bound_r_id != r_id || cache.bound_r_off != r_off
-            || cache.bound_y_id != y_id || cache.bound_y_off != y_off;
+            || cache.bound_x_id != x_id
+            || cache.bound_x_off != x_off
+            || cache.bound_r_id != r_id
+            || cache.bound_r_off != r_off
+            || cache.bound_y_id != y_id
+            || cache.bound_y_off != y_off;
 
         if needs_record {
             // Slot 0: gate_up_proj qmv_fast.
             ctx.record_qmv_fast_bf16in_bf16out_icb(
-                &cache.icb, 0, gate_up_w,
-                &x_buf, x_off,
-                &cache.combined_buf, 0,
-                &cache.gate_up_dims_buf, &cache.batch_buf, batch,
+                &cache.icb,
+                0,
+                gate_up_w,
+                &x_buf,
+                x_off,
+                &cache.combined_buf,
+                0,
+                &cache.gate_up_dims_buf,
+                &cache.batch_buf,
+                batch,
             );
             // Slot 1: silu*mul.
             cache.silu_kernel.record_icb(
-                &cache.icb, 1,
-                &cache.combined_buf, 0,
-                &cache.hidden_buf, 0,
-                &cache.silu_dims_buf, batch, self.intermediate_size,
+                &cache.icb,
+                1,
+                &cache.combined_buf,
+                0,
+                &cache.hidden_buf,
+                0,
+                &cache.silu_dims_buf,
+                batch,
+                self.intermediate_size,
             );
             // Slot 2: down_proj qmv_fast bf16-residual.
             ctx.record_qmv_fast_bf16in_bf16out_residual_icb(
-                &cache.icb, 2, down_w,
-                &cache.hidden_buf, 0,
-                &r_buf, r_off,
-                &y_buf, y_off,
-                &cache.down_dims_buf, &cache.batch_buf, batch,
+                &cache.icb,
+                2,
+                down_w,
+                &cache.hidden_buf,
+                0,
+                &r_buf,
+                r_off,
+                &y_buf,
+                y_off,
+                &cache.down_dims_buf,
+                &cache.batch_buf,
+                batch,
             );
             cache.bound_x_id = x_id;
             cache.bound_x_off = x_off;
@@ -811,12 +828,16 @@ impl SharedExpert {
         let (dp, ds, db) = down_w.buffers();
         encoder.use_buffers_for_icb(
             &[
-                gp, gs, gb,
+                gp,
+                gs,
+                gb,
                 &x_buf,
                 &cache.combined_buf,
                 &cache.silu_dims_buf,
                 &cache.hidden_buf,
-                dp, ds, db,
+                dp,
+                ds,
+                db,
                 &r_buf,
                 &y_buf,
                 &cache.gate_up_dims_buf,
@@ -883,11 +904,7 @@ pub struct DenseMlp {
 }
 
 impl DenseMlp {
-    pub fn new(
-        gate_up_proj: ProjLinear,
-        down_proj: ProjLinear,
-        intermediate_size: usize,
-    ) -> Self {
+    pub fn new(gate_up_proj: ProjLinear, down_proj: ProjLinear, intermediate_size: usize) -> Self {
         Self {
             inner: SharedExpert::new(gate_up_proj, down_proj, intermediate_size),
         }
@@ -973,9 +990,10 @@ impl DenseMlp {
         if !self.inner.forward_with_post_attn_fusion_supported() {
             return None;
         }
-        Some(self
-            .inner
-            .forward_post_attn_fused(x_raw, post_attn_ln_weight, rms_eps, residual))
+        Some(
+            self.inner
+                .forward_post_attn_fused(x_raw, post_attn_ln_weight, rms_eps, residual),
+        )
     }
 
     #[cfg(feature = "turboquant-gpu")]
@@ -1047,9 +1065,7 @@ impl MlpBlock {
     ) -> Option<CandleResult<Tensor>> {
         match self {
             MlpBlock::Moe(_) => None,
-            MlpBlock::Dense(dense) => {
-                Some(dense.forward_with_residual_bf16_in(x_bf16, residual))
-            }
+            MlpBlock::Dense(dense) => Some(dense.forward_with_residual_bf16_in(x_bf16, residual)),
         }
     }
 
@@ -1057,10 +1073,7 @@ impl MlpBlock {
     /// Dense arm; MoE returns `None` (its production rmsnorm-fused path is
     /// f32-only and the bf16 wiring lands in B.7+).
     #[cfg(feature = "turboquant-gpu")]
-    pub fn forward_bf16_in_bf16_out(
-        &self,
-        x_bf16: &Tensor,
-    ) -> Option<CandleResult<Tensor>> {
+    pub fn forward_bf16_in_bf16_out(&self, x_bf16: &Tensor) -> Option<CandleResult<Tensor>> {
         match self {
             MlpBlock::Moe(_) => None,
             MlpBlock::Dense(dense) => Some(dense.forward_bf16_in_bf16_out(x_bf16)),
@@ -1077,9 +1090,9 @@ impl MlpBlock {
     ) -> Option<CandleResult<Tensor>> {
         match self {
             MlpBlock::Moe(_) => None,
-            MlpBlock::Dense(dense) => Some(
-                dense.forward_with_residual_bf16_in_bf16_out(x_bf16, residual_bf16),
-            ),
+            MlpBlock::Dense(dense) => {
+                Some(dense.forward_with_residual_bf16_in_bf16_out(x_bf16, residual_bf16))
+            }
         }
     }
 
@@ -1216,7 +1229,11 @@ impl SwitchMlp {
         check_shape("switch_mlp.gate_proj", &gate_proj, &expected_gate)?;
         check_shape("switch_mlp.up_proj", &up_proj, &expected_gate)?;
         check_shape("switch_mlp.down_proj", &down_proj, &expected_down)?;
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 }
 
@@ -1395,13 +1412,15 @@ impl SparseMoeBlock {
         let device = x.device().clone();
         let mut marks: Vec<(&'static str, std::time::Instant)> = Vec::new();
         let mut sub_marks: Vec<(&'static str, std::time::Instant)> = Vec::new();
-        let sync_mark = |marks: &mut Vec<(&'static str, std::time::Instant)>, label: &'static str| {
+        let sync_mark = |marks: &mut Vec<(&'static str, std::time::Instant)>,
+                         label: &'static str| {
             if moe_timing {
                 let _ = device.synchronize();
                 marks.push((label, std::time::Instant::now()));
             }
         };
-        let sync_sub = |marks: &mut Vec<(&'static str, std::time::Instant)>, label: &'static str| {
+        let sync_sub = |marks: &mut Vec<(&'static str, std::time::Instant)>,
+                        label: &'static str| {
             if moe_sub_timing {
                 let _ = device.synchronize();
                 marks.push((label, std::time::Instant::now()));
@@ -1476,36 +1495,23 @@ impl SparseMoeBlock {
                         (inds.clone(), vals.clone())
                     }
                     _ => {
-                        let inds_out = Tensor::zeros(
-                            vec![bl, k],
-                            candle_core::DType::U32,
-                            logits.device(),
-                        )?;
-                        let vals_out = Tensor::zeros(
-                            vec![bl, k],
-                            candle_core::DType::F32,
-                            logits.device(),
-                        )?;
+                        let inds_out =
+                            Tensor::zeros(vec![bl, k], candle_core::DType::U32, logits.device())?;
+                        let vals_out =
+                            Tensor::zeros(vec![bl, k], candle_core::DType::F32, logits.device())?;
                         *guard = Some((bl, inds_out.clone(), vals_out.clone()));
                         (inds_out, vals_out)
                     }
                 }
             } else {
-                let inds_out = Tensor::zeros(
-                    vec![bl, k],
-                    candle_core::DType::U32,
-                    logits.device(),
-                )?;
-                let vals_out = Tensor::zeros(
-                    vec![bl, k],
-                    candle_core::DType::F32,
-                    logits.device(),
-                )?;
+                let inds_out =
+                    Tensor::zeros(vec![bl, k], candle_core::DType::U32, logits.device())?;
+                let vals_out =
+                    Tensor::zeros(vec![bl, k], candle_core::DType::F32, logits.device())?;
                 (inds_out, vals_out)
             };
-            mxfp4_ref.router_softmax_topk_renorm_f32_candle_queue_into(
-                &logits, &inds_out, &vals_out,
-            )?;
+            mxfp4_ref
+                .router_softmax_topk_renorm_f32_candle_queue_into(&logits, &inds_out, &vals_out)?;
             sync_sub(&mut sub_marks, "r_router_fused");
             sync_mark(&mut marks, "routing");
             (inds_out, vals_out) // already renormalized
@@ -1520,10 +1526,9 @@ impl SparseMoeBlock {
             // Default OFF; flip ON after 35B A/B (σ ≥ 2). Falls back to the
             // existing chain otherwise. Bit-exact equivalent to the chain (stable
             // descending sort + lowest-index tie-break).
-            let enable_routing_topk_fusion =
-                std::env::var("LUMEN_ENABLE_ROUTING_TOPK_FUSION")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+            let enable_routing_topk_fusion = std::env::var("LUMEN_ENABLE_ROUTING_TOPK_FUSION")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let probs_dims = probs.dims();
             let topk_fused_path = enable_routing_topk_fusion
                 && matches!(self.switch_mlp, SwitchMlpBackend::Mxfp4(_))
@@ -1565,21 +1570,13 @@ impl SparseMoeBlock {
                         }
                     }
                 } else {
-                    let inds_out = Tensor::zeros(
-                        vec![bl, k],
-                        candle_core::DType::U32,
-                        probs.device(),
-                    )?;
-                    let vals_out = Tensor::zeros(
-                        vec![bl, k],
-                        candle_core::DType::F32,
-                        probs.device(),
-                    )?;
+                    let inds_out =
+                        Tensor::zeros(vec![bl, k], candle_core::DType::U32, probs.device())?;
+                    let vals_out =
+                        Tensor::zeros(vec![bl, k], candle_core::DType::F32, probs.device())?;
                     (inds_out, vals_out)
                 };
-                mxfp4_ref.topk_partial_select_candle_queue_into(
-                    &probs, &inds_out, &vals_out,
-                )?;
+                mxfp4_ref.topk_partial_select_candle_queue_into(&probs, &inds_out, &vals_out)?;
                 sync_sub(&mut sub_marks, "r_topk_fused");
                 (inds_out, vals_out)
             } else {
@@ -1738,10 +1735,9 @@ impl SparseMoeBlock {
             // gate_up_pool. Only active on the candle-queue + GPU-inds + pool
             // + Lever-A fused path; falls back to F32 chain otherwise.
             // Default OFF; flip after 35B A/B (σ ≥ 2).
-            let enable_bf16_chain =
-                std::env::var("LUMEN_ENABLE_MOE_BF16_CHAIN")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+            let enable_bf16_chain = std::env::var("LUMEN_ENABLE_MOE_BF16_CHAIN")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let bf16_chain_active = enable_bf16_chain
                 && enable_moe_swiglu_fusion
                 && use_gpu_inds
@@ -1753,7 +1749,9 @@ impl SparseMoeBlock {
             } else {
                 candle_core::DType::F32
             };
-            let (gate_up_pool, down_pool) = if use_gpu_inds && enable_candle_queue && enable_y_pool
+            let (gate_up_pool, down_pool) = if use_gpu_inds
+                && enable_candle_queue
+                && enable_y_pool
                 && let SwitchMlpBackend::Mxfp4(mxfp4) = &self.switch_mlp
             {
                 let g_out = if enable_moe_swiglu_fusion {
@@ -1761,11 +1759,8 @@ impl SparseMoeBlock {
                 } else {
                     2 * mxfp4.moe_inter
                 };
-                let g_pool = Tensor::zeros(
-                    vec![bl * k, g_out],
-                    gate_up_pool_dtype,
-                    x_flat.device(),
-                )?;
+                let g_pool =
+                    Tensor::zeros(vec![bl * k, g_out], gate_up_pool_dtype, x_flat.device())?;
                 let d_pool = Tensor::zeros(
                     vec![bl * k, mxfp4.hidden],
                     candle_core::DType::F32,
@@ -1830,17 +1825,16 @@ impl SparseMoeBlock {
                                     &x_t, inds_t, k, &y_slice,
                                 )?;
                                 let moe_inter = mxfp4.moe_inter;
-                                let gate_big =
-                                    y_slice.narrow(1, 0, moe_inter)?.contiguous()?;
-                                let up_big = y_slice
-                                    .narrow(1, moe_inter, moe_inter)?
-                                    .contiguous()?;
+                                let gate_big = y_slice.narrow(1, 0, moe_inter)?.contiguous()?;
+                                let up_big =
+                                    y_slice.narrow(1, moe_inter, moe_inter)?.contiguous()?;
                                 Some((gate_big, up_big))
                             }
                         } else {
                             Some(
-                                mxfp4
-                                    .moe_gate_up_with_indices_buffer_candle_queue(&x_t, inds_t, k)?,
+                                mxfp4.moe_gate_up_with_indices_buffer_candle_queue(
+                                    &x_t, inds_t, k,
+                                )?,
                             )
                         }
                     } else {
@@ -1859,9 +1853,8 @@ impl SparseMoeBlock {
                 let hiddens_big = if let Some(h) = hiddens_big_fused {
                     h
                 } else {
-                    let (gate_big, up_big) = gate_up_pair.expect(
-                        "gate_up_pair is Some when fusion is OFF",
-                    );
+                    let (gate_big, up_big) =
+                        gate_up_pair.expect("gate_up_pair is Some when fusion is OFF");
                     let f32_h = (candle_nn::ops::silu(&gate_big)? * up_big)?;
                     if bf16_chain_active {
                         // Defensive: shouldn't actually hit this branch since
@@ -1910,7 +1903,9 @@ impl SparseMoeBlock {
                     && matches!(hiddens_big.device(), candle_core::Device::Metal(_));
 
                 let row = if lever_c_path {
-                    let inds_t = inds_slice.as_ref().expect("lever_c_path implies inds_slice");
+                    let inds_t = inds_slice
+                        .as_ref()
+                        .expect("lever_c_path implies inds_slice");
                     let hidden_dim = mxfp4.hidden;
                     let w_kx1 = if let Some(host) = scores_host.as_ref() {
                         let weights_vec: Vec<f32> = host[t * k..(t + 1) * k].to_vec();
@@ -1998,7 +1993,8 @@ impl SparseMoeBlock {
                         let moe_inter = hiddens_big.dims()[1];
                         let mut hidden_views: Vec<Tensor> = Vec::with_capacity(k);
                         for j in 0..k {
-                            hidden_views.push(hiddens_big.narrow(0, j, 1)?.reshape((1, moe_inter))?);
+                            hidden_views
+                                .push(hiddens_big.narrow(0, j, 1)?.reshape((1, moe_inter))?);
                         }
                         mxfp4.expert_matmul_group_multi_x_big(
                             &hidden_views,
@@ -2036,10 +2032,9 @@ impl SparseMoeBlock {
                     // Default ON, opt-out via `LUMEN_DISABLE_MOE_WSUM_FUSION=1`.
                     // Falls back to the Candle chain when off, or when downs_big
                     // is not Metal F32 (CPU fallback paths).
-                    let enable_wsum_fusion =
-                        std::env::var("LUMEN_DISABLE_MOE_WSUM_FUSION")
-                            .map(|v| v != "1")
-                            .unwrap_or(true);
+                    let enable_wsum_fusion = std::env::var("LUMEN_DISABLE_MOE_WSUM_FUSION")
+                        .map(|v| v != "1")
+                        .unwrap_or(true);
                     let row = if enable_wsum_fusion
                         && downs_big.dtype() == candle_core::DType::F32
                         && matches!(downs_big.device(), candle_core::Device::Metal(_))
@@ -2114,7 +2109,8 @@ impl SparseMoeBlock {
                             let hidden_out = (candle_nn::ops::silu(&gate_out)? * up_out)?;
                             let _ = device.synchronize();
                             let t3 = std::time::Instant::now();
-                            let down_out = mx.expert_matmul(&hidden_out, expert, ExpertProj::Down)?;
+                            let down_out =
+                                mx.expert_matmul(&hidden_out, expert, ExpertProj::Down)?;
                             let _ = device.synchronize();
                             let t4 = std::time::Instant::now();
                             let contrib = down_out.affine(w, 0.0)?;
@@ -2284,16 +2280,18 @@ impl SparseMoeBlock {
         // int8-affine-dequantized to dense Candle Linear at load time.
         let mxfp4 = match &self.switch_mlp {
             SwitchMlpBackend::Mxfp4(mx) => mx,
-            SwitchMlpBackend::Dense(_) => candle_core::bail!(
-                "forward_with_rmsnorm: requires Mxfp4 switch_mlp backend"
-            ),
+            SwitchMlpBackend::Dense(_) => {
+                candle_core::bail!("forward_with_rmsnorm: requires Mxfp4 switch_mlp backend")
+            }
         };
         let ctx = mxfp4.ctx();
 
         // ── Routing ────────────────────────────────────────────────────────
         // Routing gate is int8-affine → Dense; dispatch the dense f32 RmsNorm
         // kernel. Output: [BL, num_experts] f32.
-        let logits = self.gate.forward_with_rmsnorm(&h_flat, rms_weight, rms_eps, ctx)?;
+        let logits = self
+            .gate
+            .forward_with_rmsnorm(&h_flat, rms_weight, rms_eps, ctx)?;
         let probs = candle_nn::ops::softmax_last_dim(&logits)?;
 
         // Top-k via arg_sort + narrow + gather (Lever G fused topk path is
@@ -2338,24 +2336,12 @@ impl SparseMoeBlock {
 
             // Stage 1: routed gate_up + silu*up + RmsNorm — one dispatch.
             mxfp4.moe_gate_up_silu_mul_rmsnorm_multi_candle_queue_into(
-                &h_flat,
-                rms_weight,
-                rms_eps,
-                &inds_flat,
-                k,
-                bl,
-                &g_pool,
+                &h_flat, rms_weight, rms_eps, &inds_flat, k, bl, &g_pool,
             )?;
             let hiddens_big = g_pool.contiguous()?;
 
             // Stage 2: down — one dispatch.
-            mxfp4.moe_down_multi_candle_queue_into(
-                &hiddens_big,
-                &inds_flat,
-                k,
-                bl,
-                &d_pool,
-            )?;
+            mxfp4.moe_down_multi_candle_queue_into(&hiddens_big, &inds_flat, k, bl, &d_pool)?;
             let downs_big = d_pool.contiguous()?;
 
             // Stage 3: weighted sum — one dispatch, output [B, hidden].
@@ -2386,12 +2372,7 @@ impl SparseMoeBlock {
 
                 let g_slice = g_pool.narrow(0, t * k, k)?;
                 mxfp4.moe_gate_up_silu_mul_rmsnorm_with_indices_buffer_candle_queue_into(
-                    &h_t,
-                    rms_weight,
-                    rms_eps,
-                    &inds_t,
-                    k,
-                    &g_slice,
+                    &h_t, rms_weight, rms_eps, &inds_t, k, &g_slice,
                 )?;
                 let hiddens_big = g_slice.contiguous()?;
 
@@ -2445,16 +2426,10 @@ impl SparseMoeBlock {
             (Some(res), Some((next_rms_w, next_rms_eps))) => {
                 let res_flat = res.reshape((bl, hidden))?;
                 let coef_flat = shared_coef.reshape((bl,))?;
-                let out_flat = Tensor::zeros(
-                    vec![bl, hidden],
-                    candle_core::DType::F32,
-                    h_flat.device(),
-                )?;
-                let attn_in_flat = Tensor::zeros(
-                    vec![bl, hidden],
-                    candle_core::DType::F32,
-                    h_flat.device(),
-                )?;
+                let out_flat =
+                    Tensor::zeros(vec![bl, hidden], candle_core::DType::F32, h_flat.device())?;
+                let attn_in_flat =
+                    Tensor::zeros(vec![bl, hidden], candle_core::DType::F32, h_flat.device())?;
                 lumen_metal::mxfp4_linear::scalar_mul_tri_add_rmsnorm_f32_candle_queue_into(
                     ctx,
                     &y_routed,
@@ -2475,11 +2450,8 @@ impl SparseMoeBlock {
             (Some(res), None) => {
                 let res_flat = res.reshape((bl, hidden))?;
                 let coef_flat = shared_coef.reshape((bl,))?;
-                let out_flat = Tensor::zeros(
-                    vec![bl, hidden],
-                    candle_core::DType::F32,
-                    h_flat.device(),
-                )?;
+                let out_flat =
+                    Tensor::zeros(vec![bl, hidden], candle_core::DType::F32, h_flat.device())?;
                 lumen_metal::mxfp4_linear::scalar_mul_tri_add_f32_candle_queue_into(
                     ctx,
                     &y_routed,
@@ -2503,9 +2475,7 @@ impl SparseMoeBlock {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SparseMoeError {
-    #[error(
-        "weight `{name}` has shape {found:?}, expected {expected:?}"
-    )]
+    #[error("weight `{name}` has shape {found:?}, expected {expected:?}")]
     WeightShape {
         name: &'static str,
         expected: Vec<usize>,
@@ -2577,12 +2547,27 @@ mod tests {
         let canonical = canonical_mlx_shapes();
         assert_eq!(predicted.gate, canonical.gate);
         assert_eq!(predicted.shared_expert_gate, canonical.shared_expert_gate);
-        assert_eq!(predicted.shared_expert_gate_proj, canonical.shared_expert_gate_proj);
-        assert_eq!(predicted.shared_expert_up_proj, canonical.shared_expert_up_proj);
-        assert_eq!(predicted.shared_expert_down_proj, canonical.shared_expert_down_proj);
-        assert_eq!(predicted.switch_mlp_gate_proj, canonical.switch_mlp_gate_proj);
+        assert_eq!(
+            predicted.shared_expert_gate_proj,
+            canonical.shared_expert_gate_proj
+        );
+        assert_eq!(
+            predicted.shared_expert_up_proj,
+            canonical.shared_expert_up_proj
+        );
+        assert_eq!(
+            predicted.shared_expert_down_proj,
+            canonical.shared_expert_down_proj
+        );
+        assert_eq!(
+            predicted.switch_mlp_gate_proj,
+            canonical.switch_mlp_gate_proj
+        );
         assert_eq!(predicted.switch_mlp_up_proj, canonical.switch_mlp_up_proj);
-        assert_eq!(predicted.switch_mlp_down_proj, canonical.switch_mlp_down_proj);
+        assert_eq!(
+            predicted.switch_mlp_down_proj,
+            canonical.switch_mlp_down_proj
+        );
     }
 
     /// Sanity: switch_mlp is a single grouped tensor, NOT a per-expert split. The leading
@@ -2596,8 +2581,14 @@ mod tests {
         assert_eq!(s.switch_mlp_up_proj[0], d.num_experts);
         assert_eq!(s.switch_mlp_down_proj[0], d.num_experts);
         // Per-expert inner layout: gate/up produce [inter, hidden]; down reverses to [hidden, inter].
-        assert_eq!(&s.switch_mlp_gate_proj[1..], &[d.moe_intermediate_size, d.hidden_size]);
-        assert_eq!(&s.switch_mlp_down_proj[1..], &[d.hidden_size, d.moe_intermediate_size]);
+        assert_eq!(
+            &s.switch_mlp_gate_proj[1..],
+            &[d.moe_intermediate_size, d.hidden_size]
+        );
+        assert_eq!(
+            &s.switch_mlp_down_proj[1..],
+            &[d.hidden_size, d.moe_intermediate_size]
+        );
     }
 
     #[test]
@@ -2643,9 +2634,9 @@ mod tests {
                 // The MoE shape table doesn't carry Dense entries — this test only
                 // covers the MoE fixture, which never produces `MlpPart::Dense`. The
                 // unreachable arm exists solely to satisfy the exhaustiveness check.
-                MlpPart::Dense(_) => unreachable!(
-                    "MoE shape coverage test does not include Dense MLP parts"
-                ),
+                MlpPart::Dense(_) => {
+                    unreachable!("MoE shape coverage test does not include Dense MLP parts")
+                }
             };
         }
     }
@@ -2661,7 +2652,7 @@ mod tests {
 
     use candle_core::{Device, Tensor};
     use candle_nn::Linear;
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     /// Tiny dims so CPU tests stay well under a second.
     fn tiny_dims() -> MoeDims {
@@ -2737,7 +2728,13 @@ mod tests {
             d,
         )
         .unwrap();
-        SparseMoeBlock::new(rt, gate.into(), shared_expert_gate.into(), shared, switch.into())
+        SparseMoeBlock::new(
+            rt,
+            gate.into(),
+            shared_expert_gate.into(),
+            shared,
+            switch.into(),
+        )
     }
 
     fn is_finite(t: &Tensor) -> bool {
@@ -2890,8 +2887,14 @@ mod tests {
 
         // Independently recompute what the routed sum should be: for each of the top-2
         // selected experts, run the SwiGLU FFN and weight by normalized softmax probs.
-        let logits = block.gate.forward(&x.reshape((1, d.hidden_size)).unwrap()).unwrap();
-        let probs = candle_nn::ops::softmax_last_dim(&logits).unwrap().to_vec2::<f32>().unwrap();
+        let logits = block
+            .gate
+            .forward(&x.reshape((1, d.hidden_size)).unwrap())
+            .unwrap();
+        let probs = candle_nn::ops::softmax_last_dim(&logits)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
         let probs_row = &probs[0];
         // Find top-2 indices.
         let mut ranked: Vec<(usize, f32)> = probs_row.iter().cloned().enumerate().collect();
@@ -2904,8 +2907,16 @@ mod tests {
         let w2 = (p2 / sum_p) as f64;
 
         let x_t = x.reshape((1, d.hidden_size)).unwrap();
-        let contrib1 = block.expert_forward(&x_t, e1).unwrap().affine(w1, 0.0).unwrap();
-        let contrib2 = block.expert_forward(&x_t, e2).unwrap().affine(w2, 0.0).unwrap();
+        let contrib1 = block
+            .expert_forward(&x_t, e1)
+            .unwrap()
+            .affine(w1, 0.0)
+            .unwrap();
+        let contrib2 = block
+            .expert_forward(&x_t, e2)
+            .unwrap()
+            .affine(w2, 0.0)
+            .unwrap();
         let expected = (contrib1 + contrib2).unwrap();
         // shared_y ≈ 0 because sigmoid(shared_expert_gate(x)) ≈ 0; the rtol is set generously
         // because sigmoid(-1e9)·shared_out is a tiny but nonzero drift.
@@ -2961,10 +2972,18 @@ mod tests {
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
-        assert!(diff > 1e-6, "norm flag should influence output; got diff={diff}");
+        assert!(
+            diff > 1e-6,
+            "norm flag should influence output; got diff={diff}"
+        );
     }
 
-    fn build_tiny_dense(seed: u64, hidden: usize, intermediate: usize, device: &Device) -> DenseMlp {
+    fn build_tiny_dense(
+        seed: u64,
+        hidden: usize,
+        intermediate: usize,
+        device: &Device,
+    ) -> DenseMlp {
         let mut rng = StdRng::seed_from_u64(seed);
         // gate+up fused along axis 0 → [2 * intermediate, hidden] (matches loader output).
         let gate_up = Linear::new(
@@ -3013,7 +3032,10 @@ mod tests {
             .unwrap();
         // Threshold is well above the f32 noise floor (~1e-7) but tolerant of the
         // tiny weight scale `random_tensor` uses (`±0.1` range).
-        assert!(diff > 1e-6, "dense MLP outputs should differ across inputs; got {diff}");
+        assert!(
+            diff > 1e-6,
+            "dense MLP outputs should differ across inputs; got {diff}"
+        );
     }
 
     #[test]
@@ -3052,8 +3074,14 @@ mod tests {
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
-        assert!(dd < 1e-6, "MlpBlock::Dense should match DenseMlp::forward exactly; got {dd}");
-        assert!(dm < 1e-6, "MlpBlock::Moe should match SparseMoeBlock::forward exactly; got {dm}");
+        assert!(
+            dd < 1e-6,
+            "MlpBlock::Dense should match DenseMlp::forward exactly; got {dd}"
+        );
+        assert!(
+            dm < 1e-6,
+            "MlpBlock::Moe should match SparseMoeBlock::forward exactly; got {dm}"
+        );
     }
 
     #[test]

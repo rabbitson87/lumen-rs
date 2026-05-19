@@ -29,10 +29,14 @@ fn metal_device() -> Option<Device> {
 
 fn random_f32(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
     let n: usize = shape.iter().product();
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = ((s >> 32) as u32) as f32 / u32::MAX as f32;
         data.push((bits - 0.5) * 0.1); // small magnitude — keeps softmax stable
     }
@@ -133,10 +137,12 @@ fn bf16_chain_forward_matches_f32_within_tolerance() {
 
     // bf16 chain path (B.3): input bf16 → propagates bf16 through the chain →
     // cast to f32 at o_proj boundary → final output f32.
-    let y_b16 = attn_bf16
-        .forward(&x_bf16, 0, None)
-        .expect("bf16 forward");
-    assert_eq!(y_b16.dtype(), DType::F32, "self_attn must return f32 (residual contract)");
+    let y_b16 = attn_bf16.forward(&x_bf16, 0, None).expect("bf16 forward");
+    assert_eq!(
+        y_b16.dtype(),
+        DType::F32,
+        "self_attn must return f32 (residual contract)"
+    );
 
     assert_eq!(y_f32.dims(), y_b16.dims(), "shape parity");
 
@@ -151,9 +157,7 @@ fn bf16_chain_forward_matches_f32_within_tolerance() {
         .to_scalar::<f32>()
         .unwrap();
 
-    eprintln!(
-        "B.3 bf16 chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}"
-    );
+    eprintln!("B.3 bf16 chain parity: cos={cos:.6} rel_L2={rel_l2:.4e} max_abs={max_abs:.4e}");
 
     assert!(cos > 0.998, "cosine sim {cos} must exceed 0.998");
     assert!(

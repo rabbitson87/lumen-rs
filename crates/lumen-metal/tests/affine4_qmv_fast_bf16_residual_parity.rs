@@ -8,8 +8,8 @@
 //! bf16-quantize the f32 output. Cosine ≥ 0.9999 confirms the new kernel's
 //! reduction + residual add are bit-identical beyond the I/O bf16 boundaries.
 
-use lumen_metal::metal::CommandBufferExt;
 use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
+use lumen_metal::metal::CommandBufferExt;
 use lumen_metal::metal::{Buffer, MTLResourceOptions};
 
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
@@ -52,15 +52,21 @@ fn synth_x(n: usize, scale: f32, phase: f32) -> Vec<f32> {
 }
 
 fn f32_to_bf16_bits(xs: &[f32]) -> Vec<u16> {
-    xs.iter().map(|x| half::bf16::from_f32(*x).to_bits()).collect()
+    xs.iter()
+        .map(|x| half::bf16::from_f32(*x).to_bits())
+        .collect()
 }
 
 fn bf16_bits_to_f32(xs: &[u16]) -> Vec<f32> {
-    xs.iter().map(|b| half::bf16::from_bits(*b).to_f32()).collect()
+    xs.iter()
+        .map(|b| half::bf16::from_bits(*b).to_f32())
+        .collect()
 }
 
 fn round_trip_bf16(xs: &[f32]) -> Vec<f32> {
-    xs.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect()
+    xs.iter()
+        .map(|x| half::bf16::from_f32(*x).to_f32())
+        .collect()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -156,7 +162,14 @@ fn affine4_qmv_fast_bf16in_bf16out_residual_parity_dense_shapes() {
         let x_round_buf = ctx.ctx.buffer_with_data(&x_round);
         let r_round_buf = ctx.ctx.buffer_with_data(&res_round);
         let y_f32_ref_buf = ctx.ctx.buffer_for::<f32>(batch * out);
-        run_qmv_fast_residual_f32(&ctx, &weight, &x_round_buf, &r_round_buf, &y_f32_ref_buf, batch);
+        run_qmv_fast_residual_f32(
+            &ctx,
+            &weight,
+            &x_round_buf,
+            &r_round_buf,
+            &y_f32_ref_buf,
+            batch,
+        );
         let y_f32_ref = ctx.ctx.read_buffer::<f32>(&y_f32_ref_buf, batch * out);
         let y_ref_bf16_quantized: Vec<f32> = y_f32_ref
             .iter()
@@ -214,10 +227,8 @@ fn affine4_linear_forward_with_residual_bf16_in_bf16_out_tensor_parity() {
         Err(_) => return,
     };
 
-    let shapes: &[(&str, usize, usize, usize)] = &[
-        ("o_decode", 5120, 5120, 1),
-        ("down_decode", 5120, 22528, 1),
-    ];
+    let shapes: &[(&str, usize, usize, usize)] =
+        &[("o_decode", 5120, 5120, 1), ("down_decode", 5120, 22528, 1)];
 
     for &(name, out, ins, batch) in shapes {
         let packed = synth_packed(out, ins, 0xAAAA0000 ^ name.len() as u32);

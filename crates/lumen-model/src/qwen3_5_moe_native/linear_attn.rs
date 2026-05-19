@@ -18,10 +18,10 @@
 //! decoder traffic is `B == 1` (single-stream autoregressive), so we defer
 //! the generalization until a multi-batch use case appears.
 
-use lumen_metal::metal::CommandBufferExt;
-use anyhow::{anyhow, Result};
-use candle_core::{DType, Result as CandleResult, Tensor, D};
+use anyhow::{Result, anyhow};
+use candle_core::{D, DType, Result as CandleResult, Tensor};
 use candle_nn::Conv1d;
+use lumen_metal::metal::CommandBufferExt;
 
 use crate::qwen3_5_moe::proj::ProjLinear;
 
@@ -76,22 +76,14 @@ pub fn forward_ssm_loop(
     }
     let (b, s, hv, dk) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
     if b != 1 {
-        return Err(anyhow!(
-            "forward_ssm_loop currently requires B=1 (got {b})"
-        ));
+        return Err(anyhow!("forward_ssm_loop currently requires B=1 (got {b})"));
     }
     if k.shape() != [1, s, hv, dk] {
-        return Err(anyhow!(
-            "k shape {:?} != [1, {s}, {hv}, {dk}]",
-            k.shape()
-        ));
+        return Err(anyhow!("k shape {:?} != [1, {s}, {hv}, {dk}]", k.shape()));
     }
     let dv = v.shape()[3];
     if v.shape() != [1, s, hv, dv] {
-        return Err(anyhow!(
-            "v shape {:?} != [1, {s}, {hv}, {dv}]",
-            v.shape()
-        ));
+        return Err(anyhow!("v shape {:?} != [1, {s}, {hv}, {dv}]", v.shape()));
     }
     if beta.shape() != [1, s, hv] || g.shape() != [1, s, hv] {
         return Err(anyhow!(
@@ -101,10 +93,7 @@ pub fn forward_ssm_loop(
         ));
     }
     if y.shape() != [1, s, hv, dv] {
-        return Err(anyhow!(
-            "y shape {:?} != [1, {s}, {hv}, {dv}]",
-            y.shape()
-        ));
+        return Err(anyhow!("y shape {:?} != [1, {s}, {hv}, {dv}]", y.shape()));
     }
     if s == 0 || hv == 0 || dv == 0 || dk == 0 {
         return Ok(());
@@ -212,7 +201,9 @@ pub fn forward_linear_attn(
         ));
     }
     if batch != 1 {
-        return Err(anyhow!("forward_linear_attn currently requires B=1 (got {batch})"));
+        return Err(anyhow!(
+            "forward_linear_attn currently requires B=1 (got {batch})"
+        ));
     }
     let device = hidden.device().clone();
     let dtype = hidden.dtype();
@@ -253,8 +244,7 @@ pub fn forward_linear_attn(
     let conv_pad = cfg.conv_kernel - 1;
     let prev_conv_state =
         Tensor::zeros((batch, conv_pad, qkv_dim), dtype, &device).map_err(|e| anyhow!("{e}"))?;
-    let conv_input =
-        Tensor::cat(&[&prev_conv_state, &qkv_flat], 1).map_err(|e| anyhow!("{e}"))?;
+    let conv_input = Tensor::cat(&[&prev_conv_state, &qkv_flat], 1).map_err(|e| anyhow!("{e}"))?;
     let mut window_slices = Vec::with_capacity(cfg.conv_kernel);
     for k in 0..cfg.conv_kernel {
         window_slices.push(
@@ -399,9 +389,7 @@ pub fn forward_linear_attn(
     .map_err(|e| anyhow!("{e}"))?;
     let gated_f32 = (candle_nn::ops::silu(&z.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
         .map_err(|e| anyhow!("{e}"))?
-        * y_normed
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow!("{e}"))?)
+        * y_normed.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
     .map_err(|e| anyhow!("{e}"))?;
     let gated = gated_f32.to_dtype(dtype).map_err(|e| anyhow!("{e}"))?;
 
@@ -509,8 +497,7 @@ pub fn forward_linear_attn_fused(
     let conv_pad = cfg.conv_kernel - 1;
     let prev_conv_state =
         Tensor::zeros((batch, conv_pad, qkv_dim), dtype, &device).map_err(|e| anyhow!("{e}"))?;
-    let conv_input =
-        Tensor::cat(&[&prev_conv_state, &qkv_flat], 1).map_err(|e| anyhow!("{e}"))?;
+    let conv_input = Tensor::cat(&[&prev_conv_state, &qkv_flat], 1).map_err(|e| anyhow!("{e}"))?;
     let mut window_slices = Vec::with_capacity(cfg.conv_kernel);
     for k in 0..cfg.conv_kernel {
         window_slices.push(
@@ -589,8 +576,20 @@ pub fn forward_post_conv_fused(
     ssm_state: &mut NativeSsmState,
 ) -> Result<Tensor> {
     forward_post_conv_fused_with_cache(
-        conv_out, z_flat, b_flat, a_flat, a_log, dt_bias, norm_weight, out_proj, cfg, ctx, lib,
-        ssm_state, /* cached_dt_bias */ None, /* cached_exp_a_log */ None,
+        conv_out,
+        z_flat,
+        b_flat,
+        a_flat,
+        a_log,
+        dt_bias,
+        norm_weight,
+        out_proj,
+        cfg,
+        ctx,
+        lib,
+        ssm_state,
+        /* cached_dt_bias */ None,
+        /* cached_exp_a_log */ None,
     )
 }
 
@@ -887,20 +886,21 @@ fn run_post_conv_fused(
     // weight load. When the caller supplies pre-converted native copies, skip
     // the per-call BF16→F32 conversion and `exp` GPU dispatch. With 30
     // linear-attn layers per token, this drops 60+ small dispatches/token.
-    let (exp_a_log_owned, dt_bias_f32_owned) = if cached_exp_a_log.is_some() && cached_dt_bias.is_some() {
-        (None, None)
-    } else {
-        let e = a_log
-            .to_dtype(DType::F32)
-            .and_then(|t| t.exp())
-            .and_then(|t| t.contiguous())
-            .map_err(|e| anyhow!("{e}"))?;
-        let d = dt_bias
-            .to_dtype(DType::F32)
-            .and_then(|t| t.contiguous())
-            .map_err(|e| anyhow!("{e}"))?;
-        (Some(e), Some(d))
-    };
+    let (exp_a_log_owned, dt_bias_f32_owned) =
+        if cached_exp_a_log.is_some() && cached_dt_bias.is_some() {
+            (None, None)
+        } else {
+            let e = a_log
+                .to_dtype(DType::F32)
+                .and_then(|t| t.exp())
+                .and_then(|t| t.contiguous())
+                .map_err(|e| anyhow!("{e}"))?;
+            let d = dt_bias
+                .to_dtype(DType::F32)
+                .and_then(|t| t.contiguous())
+                .map_err(|e| anyhow!("{e}"))?;
+            (Some(e), Some(d))
+        };
 
     // Sync Candle's queue exactly once before adopting any of the dynamic buffers.
     // The remaining bridges reuse the same queue lineage, so a per-bridge
@@ -921,10 +921,8 @@ fn run_post_conv_fused(
     let dt_bias_in: &NativeTensor = if let Some(c) = cached_dt_bias {
         c
     } else {
-        dt_bias_owned_native = from_candle_tensor_no_sync(
-            ctx,
-            dt_bias_f32_owned.as_ref().expect("uncached dt_bias"),
-        )?;
+        dt_bias_owned_native =
+            from_candle_tensor_no_sync(ctx, dt_bias_f32_owned.as_ref().expect("uncached dt_bias"))?;
         // SAFETY: tied to function lifetime; not actually unsafe — just shadowing.
         // Borrow-checker dance: we need a `&NativeTensor` whose backing storage
         // outlives the kernel dispatch below. The owned version above does.
@@ -933,10 +931,8 @@ fn run_post_conv_fused(
     let exp_a_log_in: &NativeTensor = if let Some(c) = cached_exp_a_log {
         c
     } else {
-        exp_a_log_owned_native = from_candle_tensor_no_sync(
-            ctx,
-            exp_a_log_owned.as_ref().expect("uncached exp_a_log"),
-        )?;
+        exp_a_log_owned_native =
+            from_candle_tensor_no_sync(ctx, exp_a_log_owned.as_ref().expect("uncached exp_a_log"))?;
         &exp_a_log_owned_native
     };
 
@@ -1031,15 +1027,7 @@ fn run_post_conv_fused(
         .map(|v| v == "1")
         .unwrap_or(false);
     if fused_compute_g {
-        lib.encode_compute_g_full(
-            &enc,
-            &b_in,
-            &a_in,
-            dt_bias_in,
-            exp_a_log_in,
-            &beta,
-            &g,
-        )?;
+        lib.encode_compute_g_full(&enc, &b_in, &a_in, dt_bias_in, exp_a_log_in, &beta, &g)?;
     } else {
         lib.encode_sigmoid(&enc, &b_in, &beta)?;
         lib.encode_broadcast_add_per_head(&enc, &a_in, dt_bias_in, &a_plus_dt)?;
@@ -1086,19 +1074,12 @@ fn run_post_conv_fused(
         if bf16_in {
             let beta_b = beta_bf.as_ref().unwrap();
             let g_b = g_bf.as_ref().unwrap();
-            let beta_t = beta_b
-                .slice(beta_b.offset_bytes() + t * scalar_step_bf16, vec![batch, hv])?;
-            let g_t = g_b.slice(g_b.offset_bytes() + t * scalar_step_bf16, vec![batch, hv])?;
-            lib.encode_ssm_step_bf16(
-                &enc,
-                ssm_state.buf(),
-                &q_t,
-                &k_t,
-                &v_t,
-                &beta_t,
-                &g_t,
-                &y_t,
+            let beta_t = beta_b.slice(
+                beta_b.offset_bytes() + t * scalar_step_bf16,
+                vec![batch, hv],
             )?;
+            let g_t = g_b.slice(g_b.offset_bytes() + t * scalar_step_bf16, vec![batch, hv])?;
+            lib.encode_ssm_step_bf16(&enc, ssm_state.buf(), &q_t, &k_t, &v_t, &beta_t, &g_t, &y_t)?;
         } else {
             let beta_t = beta.slice(beta.offset_bytes() + t * scalar_step_f32, vec![batch, hv])?;
             let g_t = g.slice(g.offset_bytes() + t * scalar_step_f32, vec![batch, hv])?;
@@ -1194,9 +1175,7 @@ fn run_post_conv_fused(
     .map_err(|e| anyhow!("{e}"))?;
     let gated_f32 = (candle_nn::ops::silu(&z.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
         .map_err(|e| anyhow!("{e}"))?
-        * y_normed
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow!("{e}"))?)
+        * y_normed.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
     .map_err(|e| anyhow!("{e}"))?;
     let gated = gated_f32.to_dtype(dtype).map_err(|e| anyhow!("{e}"))?;
     let out_flat = gated
@@ -1249,7 +1228,7 @@ fn run_post_conv_fused_candle_queue(
         _ => {
             return Err(anyhow!(
                 "forward_post_conv_fused_candle_queue: Metal device required"
-            ))
+            ));
         }
     };
     let dtype = conv_out.dtype();
@@ -1355,19 +1334,15 @@ fn run_post_conv_fused_candle_queue(
     let dt_bias_in: &NativeTensor = if let Some(c) = cached_dt_bias {
         c
     } else {
-        dt_bias_owned_native = from_candle_tensor_no_sync(
-            ctx,
-            dt_bias_f32_owned.as_ref().expect("uncached dt_bias"),
-        )?;
+        dt_bias_owned_native =
+            from_candle_tensor_no_sync(ctx, dt_bias_f32_owned.as_ref().expect("uncached dt_bias"))?;
         &dt_bias_owned_native
     };
     let exp_a_log_in: &NativeTensor = if let Some(c) = cached_exp_a_log {
         c
     } else {
-        exp_a_log_owned_native = from_candle_tensor_no_sync(
-            ctx,
-            exp_a_log_owned.as_ref().expect("uncached exp_a_log"),
-        )?;
+        exp_a_log_owned_native =
+            from_candle_tensor_no_sync(ctx, exp_a_log_owned.as_ref().expect("uncached exp_a_log"))?;
         &exp_a_log_owned_native
     };
 
@@ -1444,12 +1419,24 @@ fn run_post_conv_fused_candle_queue(
     if bf16_in {
         lib.encode_rms_norm_weightless_bf16(encoder.as_ref(), &q_in, cfg.ssm_eps, &q_scaled)?;
         lib.encode_rms_norm_weightless_bf16(encoder.as_ref(), &k_in, cfg.ssm_eps, &k_scaled)?;
-        lib.encode_affine_scalar_bf16(encoder.as_ref(), &q_scaled, inv_scale * inv_scale, 0.0, &q_scaled)?;
+        lib.encode_affine_scalar_bf16(
+            encoder.as_ref(),
+            &q_scaled,
+            inv_scale * inv_scale,
+            0.0,
+            &q_scaled,
+        )?;
         lib.encode_affine_scalar_bf16(encoder.as_ref(), &k_scaled, inv_scale, 0.0, &k_scaled)?;
     } else {
         lib.encode_rms_norm_weightless(encoder.as_ref(), &q_in, cfg.ssm_eps, &q_scaled)?;
         lib.encode_rms_norm_weightless(encoder.as_ref(), &k_in, cfg.ssm_eps, &k_scaled)?;
-        lib.encode_affine_scalar(encoder.as_ref(), &q_scaled, inv_scale * inv_scale, 0.0, &q_scaled)?;
+        lib.encode_affine_scalar(
+            encoder.as_ref(),
+            &q_scaled,
+            inv_scale * inv_scale,
+            0.0,
+            &q_scaled,
+        )?;
         lib.encode_affine_scalar(encoder.as_ref(), &k_scaled, inv_scale, 0.0, &k_scaled)?;
     }
     lib.encode_sigmoid(encoder.as_ref(), &b_in, &beta)?;
@@ -1493,8 +1480,10 @@ fn run_post_conv_fused_candle_queue(
         if bf16_in {
             let beta_b = beta_bf.as_ref().unwrap();
             let g_b = g_bf.as_ref().unwrap();
-            let beta_t =
-                beta_b.slice(beta_b.offset_bytes() + t * scalar_step_bf16, vec![batch, hv])?;
+            let beta_t = beta_b.slice(
+                beta_b.offset_bytes() + t * scalar_step_bf16,
+                vec![batch, hv],
+            )?;
             let g_t = g_b.slice(g_b.offset_bytes() + t * scalar_step_bf16, vec![batch, hv])?;
             lib.encode_ssm_step_bf16(
                 encoder.as_ref(),
@@ -1621,9 +1610,7 @@ fn run_post_conv_fused_candle_queue(
     .map_err(|e| anyhow!("{e}"))?;
     let gated_f32 = (candle_nn::ops::silu(&z.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
         .map_err(|e| anyhow!("{e}"))?
-        * y_normed
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow!("{e}"))?)
+        * y_normed.to_dtype(DType::F32).map_err(|e| anyhow!("{e}"))?)
     .map_err(|e| anyhow!("{e}"))?;
     let gated = gated_f32.to_dtype(dtype).map_err(|e| anyhow!("{e}"))?;
     let out_flat = gated
@@ -1817,7 +1804,11 @@ mod tests {
 
         let combined = in_proj_combined.forward(hidden).unwrap();
         let last = combined.dims().len() - 1;
-        let qkv_flat = combined.narrow(last, 0, qkv_dim).unwrap().contiguous().unwrap();
+        let qkv_flat = combined
+            .narrow(last, 0, qkv_dim)
+            .unwrap()
+            .contiguous()
+            .unwrap();
         let z_flat = combined
             .narrow(last, qkv_dim, v_dim)
             .unwrap()
@@ -1960,7 +1951,9 @@ mod tests {
                 .unwrap()
                 .broadcast_mul(&beta_t.unsqueeze(D::Minus1).unwrap())
                 .unwrap();
-            let outer = k_bc.broadcast_mul(&delta.unsqueeze(D::Minus1).unwrap()).unwrap();
+            let outer = k_bc
+                .broadcast_mul(&delta.unsqueeze(D::Minus1).unwrap())
+                .unwrap();
             state = (state + outer).unwrap();
             let q_bc = q_t.unsqueeze(D::Minus2).unwrap();
             let y_t = state.broadcast_mul(&q_bc).unwrap().sum(D::Minus1).unwrap();
@@ -1969,12 +1962,9 @@ mod tests {
         let y = Tensor::stack(&y_steps, 1).unwrap().to_dtype(dtype).unwrap();
 
         let z = z_flat.reshape((batch, seq_len, hv, dh)).unwrap();
-        let y_normed = candle_nn::ops::rms_norm(
-            &y.contiguous().unwrap(),
-            norm_weight,
-            cfg.rms_norm_eps,
-        )
-        .unwrap();
+        let y_normed =
+            candle_nn::ops::rms_norm(&y.contiguous().unwrap(), norm_weight, cfg.rms_norm_eps)
+                .unwrap();
         let gated_f32 = (candle_nn::ops::silu(&z.to_dtype(DType::F32).unwrap()).unwrap()
             * y_normed.to_dtype(DType::F32).unwrap())
         .unwrap();
@@ -2016,7 +2006,8 @@ mod tests {
         let seq_len = 5;
 
         let hidden_v = lcg_vec(0xA1, batch * seq_len * cfg.hidden_size, 1.5);
-        let hidden = Tensor::from_vec(hidden_v, (batch, seq_len, cfg.hidden_size), &device).unwrap();
+        let hidden =
+            Tensor::from_vec(hidden_v, (batch, seq_len, cfg.hidden_size), &device).unwrap();
 
         let combined_out = cfg.qkv_dim() + cfg.v_dim() + 2 * cfg.num_v_heads;
         let in_proj = dense(combined_out, cfg.hidden_size, 0xB2, &device);
@@ -2038,9 +2029,7 @@ mod tests {
         let a_log = Tensor::from_vec(a_log_v, (cfg.num_v_heads,), &device).unwrap();
         let dt_bias_v = lcg_vec(0xE5, cfg.num_v_heads, 0.2);
         let dt_bias = Tensor::from_vec(dt_bias_v, (cfg.num_v_heads,), &device).unwrap();
-        let norm_w_v: Vec<f32> = (0..cfg.head_dim)
-            .map(|i| 1.0 + (i as f32) * 0.02)
-            .collect();
+        let norm_w_v: Vec<f32> = (0..cfg.head_dim).map(|i| 1.0 + (i as f32) * 0.02).collect();
         let norm_weight = Tensor::from_vec(norm_w_v, (cfg.head_dim,), &device).unwrap();
         let out_proj = dense(cfg.hidden_size, cfg.v_dim(), 0xF6, &device);
 
@@ -2111,7 +2100,8 @@ mod tests {
         let hidden = Tensor::zeros((2, 3, cfg.hidden_size), DType::F32, &device).unwrap();
         let combined_out = cfg.qkv_dim() + cfg.v_dim() + 2 * cfg.num_v_heads;
         let in_proj = dense(combined_out, cfg.hidden_size, 1, &device);
-        let conv_w = Tensor::zeros((cfg.qkv_dim(), 1, cfg.conv_kernel), DType::F32, &device).unwrap();
+        let conv_w =
+            Tensor::zeros((cfg.qkv_dim(), 1, cfg.conv_kernel), DType::F32, &device).unwrap();
         let conv_cfg = Conv1dConfig {
             padding: 0,
             stride: 1,
@@ -2219,8 +2209,12 @@ mod tests {
             cudnn_fwd_algo: None,
         };
         let conv1d = Conv1d::new(conv_w_t, None, conv_cfg);
-        let a_log = Tensor::from_vec(lcg_vec(0xD4, cfg.num_v_heads, 0.3), (cfg.num_v_heads,), device)
-            .unwrap();
+        let a_log = Tensor::from_vec(
+            lcg_vec(0xD4, cfg.num_v_heads, 0.3),
+            (cfg.num_v_heads,),
+            device,
+        )
+        .unwrap();
         let dt_bias = Tensor::from_vec(
             lcg_vec(0xE5, cfg.num_v_heads, 0.2),
             (cfg.num_v_heads,),
@@ -2366,10 +2360,8 @@ mod tests {
             &device,
         )
         .unwrap();
-        let a_log =
-            Tensor::from_vec(lcg_vec(0xE5, hv, 0.3), (hv,), &device).unwrap();
-        let dt_bias =
-            Tensor::from_vec(lcg_vec(0xF6, hv, 0.2), (hv,), &device).unwrap();
+        let a_log = Tensor::from_vec(lcg_vec(0xE5, hv, 0.3), (hv,), &device).unwrap();
+        let dt_bias = Tensor::from_vec(lcg_vec(0xF6, hv, 0.2), (hv,), &device).unwrap();
         let norm_w_v: Vec<f32> = (0..cfg.head_dim).map(|i| 1.0 + (i as f32) * 0.02).collect();
         let norm_weight = Tensor::from_vec(norm_w_v, (cfg.head_dim,), &device).unwrap();
         let out_proj = dense(cfg.hidden_size, v_dim, 0xA7, &device);
@@ -2416,7 +2408,11 @@ mod tests {
 
         assert_eq!(legacy.dims(), candle_queue.dims());
         let exp = legacy.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let got = candle_queue.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = candle_queue
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let cos = cosine(&got, &exp);
         let max_abs = got
             .iter()
@@ -2508,10 +2504,26 @@ mod tests {
         // bf16 copies of the chain-active tensors (conv_out / z / b / a). The
         // f32 → bf16 → f32 round-trip on the inputs models what production
         // sees when `LUMEN_BF16_RMSNORM=1` flips the chain.
-        let conv_out_bf = conv_out_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
-        let z_flat_bf = z_flat_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
-        let b_flat_bf = b_flat_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
-        let a_flat_bf = a_flat_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
+        let conv_out_bf = conv_out_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let z_flat_bf = z_flat_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let b_flat_bf = b_flat_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let a_flat_bf = a_flat_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .contiguous()
+            .unwrap();
 
         // Reference: f32 path (legacy queue).
         let mut state_ref =
@@ -2580,9 +2592,7 @@ mod tests {
             .map(|v| v.abs())
             .fold(0.0_f32, f32::max);
         let rel = max_abs / max_mag.max(1e-6);
-        eprintln!(
-            "B.6 bf16-in (legacy queue): cos={cos:.6} rel={rel:.4e} max_abs={max_abs:.4e}"
-        );
+        eprintln!("B.6 bf16-in (legacy queue): cos={cos:.6} rel={rel:.4e} max_abs={max_abs:.4e}");
         // bf16 rounding ≈ 1/256. The chain widens this through the SSM loop,
         // so allow ~5x headroom on relative L_inf — same envelope as B.4.
         assert!(
@@ -2653,17 +2663,13 @@ mod tests {
 
         // Build full sequence + projections.
         let hidden_v = lcg_vec(0x77AA, total_len * cfg.hidden_size, 1.2);
-        let hidden_full = Tensor::from_vec(hidden_v, (1, total_len, cfg.hidden_size), &device)
-            .unwrap();
+        let hidden_full =
+            Tensor::from_vec(hidden_v, (1, total_len, cfg.hidden_size), &device).unwrap();
         let combined_out = cfg.qkv_dim() + cfg.v_dim() + 2 * cfg.num_v_heads;
         let in_proj = dense(combined_out, cfg.hidden_size, 0x77BB, &device);
         let conv_w = lcg_vec(0x77CC, cfg.qkv_dim() * cfg.conv_kernel, 0.5);
-        let conv_w_t = Tensor::from_vec(
-            conv_w,
-            (cfg.qkv_dim(), 1, cfg.conv_kernel),
-            &device,
-        )
-        .unwrap();
+        let conv_w_t =
+            Tensor::from_vec(conv_w, (cfg.qkv_dim(), 1, cfg.conv_kernel), &device).unwrap();
         let conv_cfg = Conv1dConfig {
             padding: 0,
             stride: 1,

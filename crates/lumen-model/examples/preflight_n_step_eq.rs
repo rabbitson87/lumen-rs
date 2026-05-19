@@ -33,14 +33,13 @@ use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
 
 const MODEL_ID: &str = "mlx-community/Qwen3.6-27B-4bit";
 const REF_BLOCK_LEN: usize = 16;
-const PROMPT: &str = "Once upon a time, in a small village by the sea, there lived a curious cat. The cat";
+const PROMPT: &str =
+    "Once upon a time, in a small village by the sea, there lived a curious cat. The cat";
 
 fn build_backend() -> Result<Qwen35MoeBackend> {
     let shard_dir: PathBuf = std::env::var("LUMEN_QWEN35_SHARDS")
         .map(PathBuf::from)
-        .map_err(|_| {
-            anyhow::anyhow!("set LUMEN_QWEN35_SHARDS=<dir> to the 27B-4bit shards")
-        })?;
+        .map_err(|_| anyhow::anyhow!("set LUMEN_QWEN35_SHARDS=<dir> to the 27B-4bit shards"))?;
     let gpu_ctx = Arc::new(MxFp4Context::new()?);
     let affine4_ctx = Arc::new(Affine4Context::new()?);
     Qwen35MoeBackend::load_with_affine4(MODEL_ID, &shard_dir, gpu_ctx, affine4_ctx)
@@ -194,7 +193,14 @@ fn main() -> Result<()> {
         );
     }
 
-    eprintln!("\n[preflight] OVERALL: {}", if overall_pass { "PASS — R3 spec decode is feasible" } else { "FAIL — R3 spec decode dead on this stack" });
+    eprintln!(
+        "\n[preflight] OVERALL: {}",
+        if overall_pass {
+            "PASS — R3 spec decode is feasible"
+        } else {
+            "FAIL — R3 spec decode dead on this stack"
+        }
+    );
     if overall_pass {
         Ok(())
     } else {

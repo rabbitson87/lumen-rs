@@ -14,14 +14,14 @@
 
 #![cfg(feature = "model-integration")]
 
-use lumen_metal::metal::CommandBufferExt;
 use candle_core::backend::BackendDevice;
 use candle_core::{DType, Device, Tensor};
+use lumen_metal::metal::CommandBufferExt;
+use lumen_metal::metal::IndirectCommandBuffer;
+use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResourceUsage};
-use lumen_metal::metal::IndirectCommandBuffer;
-use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
 
 const INTER: usize = 5120;
 
@@ -44,8 +44,16 @@ fn candle_silu_mul_reference(combined: &Tensor, inter: usize) -> Tensor {
     //   combined_bf16 → f32 → narrow gate / up → silu*up → bf16
     let combined_f32 = combined.to_dtype(DType::F32).unwrap();
     let last = combined_f32.dims().len() - 1;
-    let gate = combined_f32.narrow(last, 0, inter).unwrap().contiguous().unwrap();
-    let up = combined_f32.narrow(last, inter, inter).unwrap().contiguous().unwrap();
+    let gate = combined_f32
+        .narrow(last, 0, inter)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let up = combined_f32
+        .narrow(last, inter, inter)
+        .unwrap()
+        .contiguous()
+        .unwrap();
     let h = (candle_nn::ops::silu(&gate).unwrap() * up).unwrap();
     h.to_dtype(DType::BF16).unwrap()
 }
@@ -79,10 +87,20 @@ fn silu_mul_standalone_matches_candle_reference() {
     let y_ref = candle_silu_mul_reference(&combined, INTER);
     let y_kernel = kernel.forward(&combined).unwrap();
 
-    let ref_v: Vec<f32> = y_ref.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap();
-    let kernel_v: Vec<f32> = y_kernel.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap();
+    let ref_v: Vec<f32> = y_ref
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let kernel_v: Vec<f32> = y_kernel
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
 
     assert_eq!(ref_v.len(), kernel_v.len());
     let mut max_abs: f32 = 0.0;
@@ -138,8 +156,16 @@ fn silu_mul_icb_matches_standalone() {
 
     // Standalone reference.
     let y_std = kernel.forward(&combined).unwrap();
-    let std_bits: Vec<u32> = y_std.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap().iter().map(|f| f.to_bits()).collect();
+    let std_bits: Vec<u32> = y_std
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
 
     // ICB path.
     let metal_dev = match combined.device() {
@@ -181,11 +207,23 @@ fn silu_mul_icb_matches_standalone() {
     cmd.commit();
     cmd.wait_until_completed();
 
-    let icb_bits: Vec<u32> = y_icb_tensor.flatten_all().unwrap().to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap().iter().map(|f| f.to_bits()).collect();
+    let icb_bits: Vec<u32> = y_icb_tensor
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
 
     assert_eq!(std_bits.len(), icb_bits.len());
-    let diffs = std_bits.iter().zip(icb_bits.iter()).filter(|(a, b)| a != b).count();
+    let diffs = std_bits
+        .iter()
+        .zip(icb_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
 
     eprintln!();
     eprintln!("=== silu_mul ICB vs standalone ===");

@@ -64,7 +64,9 @@ fn make_qmv_fast_pipeline(
         .newLibraryWithSource_options_error(&src, Some(&opts))
         .expect("affine4.metal compile");
     let name = objc2_foundation::NSString::from_str("affine4_qmv_fast_bf16in_bf16out");
-    let function = library.newFunctionWithName(&name).expect("kernel not found");
+    let function = library
+        .newFunctionWithName(&name)
+        .expect("kernel not found");
     let desc = MTLComputePipelineDescriptor::new();
     desc.setComputeFunction(Some(&function));
     desc.setSupportIndirectCommandBuffers(true);
@@ -203,7 +205,10 @@ fn run_64_icb(
     unsafe {
         enc.executeCommandsInBuffer_withRange(
             icb,
-            NSRange { location: 0, length: N_PER_CB },
+            NSRange {
+                location: 0,
+                length: N_PER_CB,
+            },
         );
     }
     enc.endEncoding();
@@ -318,7 +323,11 @@ fn icb_multi_weight_real_kernel_microbench() {
         height: out / 8,
         depth: 1,
     };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
 
     // ── Bit-identity check first ────────────────────────────────────────
     run_64_standard_cycle(
@@ -357,11 +366,15 @@ fn icb_multi_weight_real_kernel_microbench() {
         for i in 0..(out * batch) {
             let a = unsafe { *a_ptr.add(i) };
             let b = unsafe { *b_ptr.add(i) };
-            if a != b { diffs += 1; }
+            if a != b {
+                diffs += 1;
+            }
         }
         eprintln!(
             "  Layer {layer_idx}: bit-identical {} / {} (diffs={})",
-            out * batch - diffs, out * batch, diffs
+            out * batch - diffs,
+            out * batch,
+            diffs
         );
         total_diffs += diffs;
     }
@@ -425,9 +438,7 @@ fn icb_multi_weight_real_kernel_microbench() {
     let pct_throughput = 100.0 * (new_tps - 1000.0 / 67.0) / (1000.0 / 67.0);
     eprintln!("Projected 27B Dense decode (multi-weight basis):");
     eprintln!("  Baseline: 67.00 ms/token = 14.93 tok/s");
-    eprintln!(
-        "  Post-ICB: {new_ms:.2} ms/token = {new_tps:.2} tok/s ({pct_throughput:+.1}%)"
-    );
+    eprintln!("  Post-ICB: {new_ms:.2} ms/token = {new_tps:.2} tok/s ({pct_throughput:+.1}%)");
 
     // Compare with PoC #2 single-weight: should match closely (~10 µs/op)
     let poc2_us_per_op = 10.67;

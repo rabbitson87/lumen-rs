@@ -40,8 +40,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor, D};
-use candle_nn::{rotary_emb, Module, RmsNorm};
+use candle_core::{D, DType, Device, Result as CandleResult, Tensor};
+use candle_nn::{Module, RmsNorm, rotary_emb};
 
 use super::config::TextConfig;
 use super::kv_cache_ring::AttentionKvCache;
@@ -511,7 +511,9 @@ impl SelfAttention {
         x: &Tensor,
         pos_offset: usize,
         mask: Option<&Tensor>,
-        compressed_kv: &mut Option<Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>>,
+        compressed_kv: &mut Option<
+            Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>,
+        >,
     ) -> CandleResult<Tensor> {
         self.forward_with_tq_inner(x, None, None, pos_offset, mask, compressed_kv)
     }
@@ -528,7 +530,9 @@ impl SelfAttention {
         residual: &Tensor,
         pos_offset: usize,
         mask: Option<&Tensor>,
-        compressed_kv: &mut Option<Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>>,
+        compressed_kv: &mut Option<
+            Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>,
+        >,
     ) -> CandleResult<Tensor> {
         self.forward_with_tq_inner(x, None, Some(residual), pos_offset, mask, compressed_kv)
     }
@@ -551,7 +555,9 @@ impl SelfAttention {
         rms_eps: f32,
         pos_offset: usize,
         mask: Option<&Tensor>,
-        compressed_kv: &mut Option<Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>>,
+        compressed_kv: &mut Option<
+            Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>,
+        >,
     ) -> CandleResult<Tensor> {
         self.forward_with_tq_inner(
             x_raw,
@@ -589,7 +595,9 @@ impl SelfAttention {
         residual: Option<&Tensor>,
         pos_offset: usize,
         mask: Option<&Tensor>,
-        compressed_kv: &mut Option<Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>>,
+        compressed_kv: &mut Option<
+            Box<dyn candle_transformers::models::quantized_gemma4::CompressedKVBackend + Send>,
+        >,
     ) -> CandleResult<Tensor> {
         let (batch, seq_len, hidden) = x.dims3()?;
         if hidden != self.runtime.dims.hidden_size {
@@ -626,7 +634,11 @@ impl SelfAttention {
         // pipeline on real model weights and quantifies the per-layer ROI.
         // The native result is *not* substituted into the production output —
         // see `LUMEN_NATIVE_OUTPUT=1` below for that.
-        let past_kv_len_for_probe = self.kv_caches.get(&self.current_seq_id).map(|c| c.current_seq_len()).unwrap_or(0);
+        let past_kv_len_for_probe = self
+            .kv_caches
+            .get(&self.current_seq_id)
+            .map(|c| c.current_seq_len())
+            .unwrap_or(0);
         // Lever H Step 3: native parity probe expects pre-normalized x; skip
         // when the input-rmsnorm fusion is in effect (raw x).
         let native_probe = crate::qwen3_5_moe_native::native_forward_enabled()
@@ -719,9 +731,9 @@ impl SelfAttention {
                 }
             }
             #[cfg(not(feature = "turboquant-gpu"))]
-            Some(_) => candle_core::bail!(
-                "self_attn input-rmsnorm fusion requires turboquant-gpu feature"
-            ),
+            Some(_) => {
+                candle_core::bail!("self_attn input-rmsnorm fusion requires turboquant-gpu feature")
+            }
             None => {
                 if bf16_in_path {
                     // Workstream B Phase 3 (2026-05-08): bf16-in-bf16-out path.
@@ -738,9 +750,7 @@ impl SelfAttention {
                     }
                     #[cfg(not(feature = "turboquant-gpu"))]
                     {
-                        candle_core::bail!(
-                            "self_attn bf16-in path requires turboquant-gpu feature"
-                        )
+                        candle_core::bail!("self_attn bf16-in path requires turboquant-gpu feature")
                     }
                 } else if super::moe::bf16_out_enabled() {
                     let y_bf16 = self.qkv_proj.forward_bf16_out(x)?;
@@ -781,9 +791,8 @@ impl SelfAttention {
 
         // ── LUMEN_DISABLE_QKNORM_ROPE: L.0 cost-model bypass ────────────────
         static QNR_SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let skip_qknorm_rope = *QNR_SKIP.get_or_init(|| {
-            std::env::var("LUMEN_DISABLE_QKNORM_ROPE").as_deref() == Ok("1")
-        });
+        let skip_qknorm_rope = *QNR_SKIP
+            .get_or_init(|| std::env::var("LUMEN_DISABLE_QKNORM_ROPE").as_deref() == Ok("1"));
 
         // ── 2. QK-norm (per-head RMSNorm along head_dim) ───────────────────
         // Workstream B Phase 3: candle_nn::RmsNorm errors on dtype mismatch
@@ -809,8 +818,16 @@ impl SelfAttention {
                 candle_nn::ops::rms_norm(t, &w, self.k_norm.eps() as f32)
             }
         };
-        let queries = if skip_qknorm_rope { queries } else { q_norm_apply(&queries)? };
-        let keys = if skip_qknorm_rope { keys } else { k_norm_apply(&keys)? };
+        let queries = if skip_qknorm_rope {
+            queries
+        } else {
+            q_norm_apply(&queries)?
+        };
+        let keys = if skip_qknorm_rope {
+            keys
+        } else {
+            k_norm_apply(&keys)?
+        };
 
         // ── 3. Transpose to [B, H, L, D] layout for attention ──────────────
         let queries = queries.transpose(1, 2)?.contiguous()?;
@@ -831,13 +848,8 @@ impl SelfAttention {
         let (queries, keys) = if skip_qknorm_rope {
             (queries, keys)
         } else {
-            let (cos, sin) = self.cached_rope_table_or_build(
-                d.rotary_dim,
-                seq_len,
-                pos_offset,
-                dtype,
-                &device,
-            )?;
+            let (cos, sin) =
+                self.cached_rope_table_or_build(d.rotary_dim, seq_len, pos_offset, dtype, &device)?;
             let q = apply_partial_rope(&queries, &cos, &sin, d.rotary_dim)?;
             let k = apply_partial_rope(&keys, &cos, &sin, d.rotary_dim)?;
             (q, k)
@@ -858,7 +870,11 @@ impl SelfAttention {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2048)
         });
-        let past_kv_len = self.kv_caches.get(&self.current_seq_id).map(|c| c.current_seq_len()).unwrap_or(0);
+        let past_kv_len = self
+            .kv_caches
+            .get(&self.current_seq_id)
+            .map(|c| c.current_seq_len())
+            .unwrap_or(0);
         let cumulative_kv_after = past_kv_len + seq_len;
 
         // Push new tokens into the TurboQuant compressor (prefill-phase accumulation).
@@ -900,13 +916,9 @@ impl SelfAttention {
         if use_tq {
             let slot = self.tq_slot.unwrap();
             let ckv = compressed_kv.as_mut().unwrap();
-            if let Some(attn_out) = ckv.compressed_attention(
-                slot,
-                &queries,
-                d.num_heads,
-                d.num_kv_heads,
-                d.head_dim,
-            ) {
+            if let Some(attn_out) =
+                ckv.compressed_attention(slot, &queries, d.num_heads, d.num_kv_heads, d.head_dim)
+            {
                 // compressed_attention vs SDPA
                 // single-step cos. Activated by `LUMEN_TQ_DEBUG_COS=1`. Uses
                 // the full pre-GQA-repeat K/V from the vanilla KvCache (already
@@ -914,17 +926,27 @@ impl SelfAttention {
                 // bypasses TQ's compress/decompress for the reference. Computes
                 // per-Q-head cos + max|Δ| against ref SDPA output to localise
                 // exactly where TQ output diverges.
-                if std::env::var("LUMEN_TQ_DEBUG_COS").map(|v| v == "1").unwrap_or(false) {
+                if std::env::var("LUMEN_TQ_DEBUG_COS")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
                     let _ = device.synchronize();
                     let group = d.gqa_group_size();
                     let k_full = repeat_kv_heads(&keys, group)?;
                     let v_full = repeat_kv_heads(&values, group)?;
                     let scale = (d.head_dim as f64).powf(-0.5);
-                    let ref_scores = (queries.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+                    let ref_scores =
+                        (queries.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)? * scale)?;
                     let ref_out = candle_nn::ops::softmax_last_dim(&ref_scores)?.matmul(&v_full)?;
                     // Both [B=1, num_heads, S=1, head_dim].
-                    let tq_vals = attn_out.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    let ref_vals = ref_out.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let tq_vals = attn_out
+                        .to_dtype(candle_core::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let ref_vals = ref_out
+                        .to_dtype(candle_core::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
                     let hd = d.head_dim;
                     let nh = d.num_heads;
                     let mut overall_dot = 0.0f64;
@@ -937,38 +959,61 @@ impl SelfAttention {
                         let hi = lo + hd;
                         let a = &tq_vals[lo..hi];
                         let b = &ref_vals[lo..hi];
-                        let mut dot = 0.0f64; let mut na = 0.0f64; let mut nb = 0.0f64;
+                        let mut dot = 0.0f64;
+                        let mut na = 0.0f64;
+                        let mut nb = 0.0f64;
                         let mut md = 0.0f32;
                         for i in 0..hd {
                             let av = a[i] as f64;
                             let bv = b[i] as f64;
-                            dot += av * bv; na += av * av; nb += bv * bv;
+                            dot += av * bv;
+                            na += av * av;
+                            nb += bv * bv;
                             let dd = (a[i] - b[i]).abs();
-                            if dd > md { md = dd; }
+                            if dd > md {
+                                md = dd;
+                            }
                         }
-                        overall_dot += dot; overall_na += na; overall_nb += nb;
-                        if md > max_diff_overall { max_diff_overall = md; }
+                        overall_dot += dot;
+                        overall_na += na;
+                        overall_nb += nb;
+                        if md > max_diff_overall {
+                            max_diff_overall = md;
+                        }
                         let denom = (na.sqrt() * nb.sqrt()).max(1e-12);
                         head_cos.push((dot / denom) as f32);
                     }
-                    let overall_cos = overall_dot / (overall_na.sqrt() * overall_nb.sqrt()).max(1e-12);
+                    let overall_cos =
+                        overall_dot / (overall_na.sqrt() * overall_nb.sqrt()).max(1e-12);
                     let cos_min = head_cos.iter().cloned().fold(f32::INFINITY, f32::min);
                     let cos_max = head_cos.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let cos_mean = head_cos.iter().sum::<f32>() / nh as f32;
                     let n_kv = keys.dim(2)?;
                     let tq_max_abs = tq_vals.iter().cloned().map(f32::abs).fold(0.0f32, f32::max);
-                    let ref_max_abs = ref_vals.iter().cloned().map(f32::abs).fold(0.0f32, f32::max);
+                    let ref_max_abs = ref_vals
+                        .iter()
+                        .cloned()
+                        .map(f32::abs)
+                        .fold(0.0f32, f32::max);
                     let tq_nans = tq_vals.iter().filter(|v| !v.is_finite()).count();
                     eprintln!(
                         "[TQ-DEBUG] L{:02} n_kv={n_kv} cos_overall={:.4} cos_mean={:.4} cos_min={:.4} cos_max={:.4} max|Δ|={:.3e} tq_max|x|={:.3e} ref_max|x|={:.3e} tq_nan={tq_nans}",
-                        self.layer_idx, overall_cos, cos_mean, cos_min, cos_max, max_diff_overall, tq_max_abs, ref_max_abs
+                        self.layer_idx,
+                        overall_cos,
+                        cos_mean,
+                        cos_min,
+                        cos_max,
+                        max_diff_overall,
+                        tq_max_abs,
+                        ref_max_abs
                     );
                 }
                 // Collapse heads → flat hidden, apply gate/out-proj, return.
-                let flat = attn_out
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((batch, seq_len, d.num_heads * d.head_dim))?;
+                let flat = attn_out.transpose(1, 2)?.contiguous()?.reshape((
+                    batch,
+                    seq_len,
+                    d.num_heads * d.head_dim,
+                ))?;
                 let gated = if let Some(gate) = gate_flat {
                     (flat * candle_nn::ops::sigmoid(&gate)?)?
                 } else {
@@ -1013,7 +1058,10 @@ impl SelfAttention {
         let (keys, values) = if window_trim {
             if attn_sink == 0 {
                 let start = kv_len - attn_window;
-                (keys.narrow(2, start, attn_window)?, values.narrow(2, start, attn_window)?)
+                (
+                    keys.narrow(2, start, attn_window)?,
+                    values.narrow(2, start, attn_window)?,
+                )
             } else {
                 // sink (positions 0..sink) + recent (kv_len - (window - sink)..kv_len)
                 let recent = attn_window - attn_sink;
@@ -1048,7 +1096,11 @@ impl SelfAttention {
         } else {
             None
         };
-        let mask: Option<&Tensor> = if window_trim { mask_buf.as_ref().or(mask) } else { mask };
+        let mask: Option<&Tensor> = if window_trim {
+            mask_buf.as_ref().or(mask)
+        } else {
+            mask
+        };
 
         // ── 5. GQA broadcast + scaled dot-product attention ────────────────
         let group = d.gqa_group_size();
@@ -1066,7 +1118,11 @@ impl SelfAttention {
         #[cfg(feature = "turboquant-gpu")]
         let out = if gqa_inkernel {
             match lumen_metal::flash_attn::flash_attn_candle(
-                &queries, &keys, &values, mask, scale as f32,
+                &queries,
+                &keys,
+                &values,
+                mask,
+                scale as f32,
             ) {
                 Some(result) => result?,
                 None => {
@@ -1085,7 +1141,11 @@ impl SelfAttention {
             let keys = repeat_kv_heads(&keys, group)?;
             let values = repeat_kv_heads(&values, group)?;
             match lumen_metal::flash_attn::flash_attn_candle(
-                &queries, &keys, &values, mask, scale as f32,
+                &queries,
+                &keys,
+                &values,
+                mask,
+                scale as f32,
             ) {
                 Some(result) => result?,
                 None => {
@@ -1104,8 +1164,7 @@ impl SelfAttention {
             let _ = gqa_inkernel; // gate has no effect on the SDPA-only build.
             let keys = repeat_kv_heads(&keys, group)?;
             let values = repeat_kv_heads(&values, group)?;
-            let mut scores =
-                (queries.matmul(&keys.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+            let mut scores = (queries.matmul(&keys.transpose(D::Minus2, D::Minus1)?)? * scale)?;
             if let Some(m) = mask {
                 scores = scores.broadcast_add(m)?;
             }
@@ -1117,10 +1176,11 @@ impl SelfAttention {
         }
 
         // ── 6. Collapse heads, apply sigmoid gate, project out ─────────────
-        let out = out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, seq_len, d.num_heads * d.head_dim))?;
+        let out = out.transpose(1, 2)?.contiguous()?.reshape((
+            batch,
+            seq_len,
+            d.num_heads * d.head_dim,
+        ))?;
         let out = if let Some(gate) = gate_flat {
             (out * candle_nn::ops::sigmoid(&gate)?)?
         } else {
@@ -1325,7 +1385,10 @@ fn debug_stage_by_stage(
 
     let device = x.device();
     let d = sa.runtime.dims;
-    let (b, l, _) = match x.dims3() { Ok(t) => t, Err(_) => return };
+    let (b, l, _) = match x.dims3() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
 
     fn flat_f32(t: &Tensor) -> Vec<f32> {
         t.flatten_all()
@@ -1338,10 +1401,18 @@ fn debug_stage_by_stage(
         if a.len() != b.len() || a.is_empty() {
             return 0.0;
         }
-        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let dot: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum();
         let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-        if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
     }
 
     fn report(stage: &str, candle: &Tensor, native: &Tensor) {
@@ -1374,7 +1445,10 @@ fn debug_stage_by_stage(
     // Stage 1: qkv_proj output
     let qkv_candle = match sa.qkv_proj.forward(x) {
         Ok(t) => t,
-        Err(e) => { eprintln!("    [stage] qkv_proj failed: {e}"); return }
+        Err(e) => {
+            eprintln!("    [stage] qkv_proj failed: {e}");
+            return;
+        }
     };
     eprintln!(
         "    [stage] qkv_proj output: shape={:?} dtype={:?}",
@@ -1384,32 +1458,61 @@ fn debug_stage_by_stage(
 
     // Stage 2: q/k/v split (same logic in both paths — just verify).
     let last = qkv_candle.dims().len() - 1;
-    let q_section_dim = if cfg.attn_output_gate { 2 * d.num_heads * d.head_dim } else { d.num_heads * d.head_dim };
+    let q_section_dim = if cfg.attn_output_gate {
+        2 * d.num_heads * d.head_dim
+    } else {
+        d.num_heads * d.head_dim
+    };
     let kv_out = d.num_kv_heads * d.head_dim;
     let (q_raw_candle, gate_flat_candle) = if cfg.attn_output_gate {
         let q_section = qkv_candle.narrow(last, 0, q_section_dim).unwrap();
-        let q_split = q_section.reshape((b, l, d.num_heads, 2 * d.head_dim)).unwrap();
-        let q = q_split.narrow(D::Minus1, 0, d.head_dim).unwrap().contiguous().unwrap();
-        let g = q_split.narrow(D::Minus1, d.head_dim, d.head_dim).unwrap().contiguous().unwrap();
+        let q_split = q_section
+            .reshape((b, l, d.num_heads, 2 * d.head_dim))
+            .unwrap();
+        let q = q_split
+            .narrow(D::Minus1, 0, d.head_dim)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let g = q_split
+            .narrow(D::Minus1, d.head_dim, d.head_dim)
+            .unwrap()
+            .contiguous()
+            .unwrap();
         let g_flat = g.reshape((b, l, d.num_heads * d.head_dim)).unwrap();
         (q, Some(g_flat))
     } else {
-        let q = qkv_candle.narrow(last, 0, q_section_dim).unwrap()
-            .reshape((b, l, d.num_heads, d.head_dim)).unwrap()
-            .contiguous().unwrap();
+        let q = qkv_candle
+            .narrow(last, 0, q_section_dim)
+            .unwrap()
+            .reshape((b, l, d.num_heads, d.head_dim))
+            .unwrap()
+            .contiguous()
+            .unwrap();
         (q, None)
     };
-    let k_raw_candle = qkv_candle.narrow(last, q_section_dim, kv_out).unwrap()
-        .reshape((b, l, d.num_kv_heads, d.head_dim)).unwrap().contiguous().unwrap();
+    let k_raw_candle = qkv_candle
+        .narrow(last, q_section_dim, kv_out)
+        .unwrap()
+        .reshape((b, l, d.num_kv_heads, d.head_dim))
+        .unwrap()
+        .contiguous()
+        .unwrap();
 
     // Stage 3: q_norm output. We compute the candle reference manually (sqr → mean → rsqrt
     // → mul) instead of calling `sa.q_norm.forward` because that path was triggering an
     // intermittent SIGSEGV under the probe (likely a buffer-lifetime interaction between
     // Mxfp4Linear's transmuted Metal buffer and the secondary RmsNorm kernel dispatch).
     let q_normed_candle = {
-        let xf = match q_raw_candle.to_dtype(DType::F32).and_then(|t| t.contiguous()) {
+        let xf = match q_raw_candle
+            .to_dtype(DType::F32)
+            .and_then(|t| t.contiguous())
+        {
             Ok(t) => t,
-            Err(e) => { eprintln!("    [stage] candle q to f32 failed: {e}"); return }
+            Err(e) => {
+                eprintln!("    [stage] candle q to f32 failed: {e}");
+                return;
+            }
         };
         let res_seq = xf
             .sqr()
@@ -1421,7 +1524,10 @@ fn debug_stage_by_stage(
             .and_then(|t| t.broadcast_mul(sa.q_norm.weight()));
         match res_seq {
             Ok(t) => t,
-            Err(e) => { eprintln!("    [stage] candle manual rmsnorm failed: {e}"); return }
+            Err(e) => {
+                eprintln!("    [stage] candle manual rmsnorm failed: {e}");
+                return;
+            }
         }
     };
 
@@ -1432,14 +1538,25 @@ fn debug_stage_by_stage(
         .and_then(|t| t.contiguous());
     let q_2d = match q_2d {
         Ok(t) => t,
-        Err(e) => { eprintln!("    [stage] q_2d reshape failed: {e}"); return }
+        Err(e) => {
+            eprintln!("    [stage] q_2d reshape failed: {e}");
+            return;
+        }
     };
     let gamma_q_candle = sa.q_norm.weight();
     let q_2d_native = match from_candle_tensor(&res.ctx, &q_2d) {
-        Ok(t) => t, Err(e) => { eprintln!("    [stage] bridge q failed: {e}"); return }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("    [stage] bridge q failed: {e}");
+            return;
+        }
     };
     let gamma_q_native = match from_candle_tensor(&res.ctx, gamma_q_candle) {
-        Ok(t) => t, Err(e) => { eprintln!("    [stage] bridge gamma failed: {e}"); return }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("    [stage] bridge gamma failed: {e}");
+            return;
+        }
     };
     // Verify native sees non-zero input.
     let q_2d_v = q_2d_native.to_vec_f32().unwrap_or_default();
@@ -1456,7 +1573,11 @@ fn debug_stage_by_stage(
         &gamma_v_n[..gamma_v_n.len().min(4)],
     );
     let q_normed_n_2d = match res.ctx.zeros(vec![rows_qk, d.head_dim], NativeDType::F32) {
-        Ok(t) => t, Err(e) => { eprintln!("    [stage] alloc failed: {e}"); return }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("    [stage] alloc failed: {e}");
+            return;
+        }
     };
     if let Err(e) = res.lib.rms_norm(
         &res.ctx,
@@ -1465,14 +1586,21 @@ fn debug_stage_by_stage(
         cfg.rms_eps,
         &q_normed_n_2d,
     ) {
-        eprintln!("    [stage] native rms_norm failed: {e}"); return;
+        eprintln!("    [stage] native rms_norm failed: {e}");
+        return;
     }
     let q_normed_native = match to_candle_tensor(&q_normed_n_2d, device) {
         Ok(t) => match t.reshape(q_raw_candle.dims()) {
             Ok(t) => t,
-            Err(e) => { eprintln!("    [stage] reshape failed: {e}"); return }
+            Err(e) => {
+                eprintln!("    [stage] reshape failed: {e}");
+                return;
+            }
         },
-        Err(e) => { eprintln!("    [stage] back-bridge failed: {e}"); return }
+        Err(e) => {
+            eprintln!("    [stage] back-bridge failed: {e}");
+            return;
+        }
     };
     report("q_norm", &q_normed_candle, &q_normed_native);
 
@@ -1551,7 +1679,10 @@ fn run_native_self_attn_substitute(
     let (out, k_bhld, v_bhld) = match result {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("    [native-out] self_attn[layer={}] failed: {e}", sa.layer_idx);
+            eprintln!(
+                "    [native-out] self_attn[layer={}] failed: {e}",
+                sa.layer_idx
+            );
             return None;
         }
     };
@@ -1583,11 +1714,7 @@ fn run_native_self_attn_substitute(
 }
 
 #[cfg(not(feature = "turboquant-gpu"))]
-fn run_native_self_attn_substitute(
-    _: &mut SelfAttention,
-    _: &Tensor,
-    _: usize,
-) -> Option<Tensor> {
+fn run_native_self_attn_substitute(_: &mut SelfAttention, _: &Tensor, _: usize) -> Option<Tensor> {
     None
 }
 
@@ -1693,14 +1820,16 @@ fn run_native_self_attn_substitute_with_cache(
 }
 
 #[cfg(not(feature = "turboquant-gpu"))]
-fn run_native_self_attn_substitute_with_cache(
-    _: &mut SelfAttention,
-    _: &Tensor,
-) -> Option<Tensor> {
+fn run_native_self_attn_substitute_with_cache(_: &mut SelfAttention, _: &Tensor) -> Option<Tensor> {
     None
 }
 
-fn report_native_parity(layer_idx: usize, candle_out: &Tensor, native_out: &Tensor, native_ms: f64) {
+fn report_native_parity(
+    layer_idx: usize,
+    candle_out: &Tensor,
+    native_out: &Tensor,
+    native_ms: f64,
+) {
     if candle_out.dims() != native_out.dims() {
         eprintln!(
             "    [native] self_attn[layer={layer_idx}] shape mismatch: candle={:?} native={:?}",
@@ -1709,14 +1838,22 @@ fn report_native_parity(layer_idx: usize, candle_out: &Tensor, native_out: &Tens
         );
         return;
     }
-    let candle_v = match candle_out.flatten_all().and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.to_vec1::<f32>()) {
+    let candle_v = match candle_out
+        .flatten_all()
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
         Ok(v) => v,
         Err(e) => {
             eprintln!("    [native] self_attn[layer={layer_idx}] candle vec failed: {e}");
             return;
         }
     };
-    let native_v = match native_out.flatten_all().and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.to_vec1::<f32>()) {
+    let native_v = match native_out
+        .flatten_all()
+        .and_then(|t| t.to_dtype(DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+    {
         Ok(v) => v,
         Err(e) => {
             eprintln!("    [native] self_attn[layer={layer_idx}] native vec failed: {e}");
@@ -1728,9 +1865,21 @@ fn report_native_parity(layer_idx: usize, candle_out: &Tensor, native_out: &Tens
         .zip(native_v.iter())
         .map(|(a, b)| (*a as f64) * (*b as f64))
         .sum();
-    let na: f64 = candle_v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = native_v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
-    let cos = if na > 0.0 && nb > 0.0 { dot / (na * nb) } else { 0.0 };
+    let na: f64 = candle_v
+        .iter()
+        .map(|x| (*x as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let nb: f64 = native_v
+        .iter()
+        .map(|x| (*x as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na * nb)
+    } else {
+        0.0
+    };
     let max_abs = candle_v
         .iter()
         .zip(native_v.iter())
@@ -1823,7 +1972,9 @@ fn build_rope_table(
     let positions = Tensor::from_vec(positions, (seq_len,), device)?;
 
     // angles: [L, half]
-    let angles = positions.unsqueeze(1)?.broadcast_mul(&inv_freqs.unsqueeze(0)?)?;
+    let angles = positions
+        .unsqueeze(1)?
+        .broadcast_mul(&inv_freqs.unsqueeze(0)?)?;
     let cos = angles.cos()?.to_dtype(dtype)?;
     let sin = angles.sin()?.to_dtype(dtype)?;
     Ok((cos, sin))
@@ -1961,7 +2112,10 @@ mod tests {
         let err = SelfAttnDims::from_config(&t).unwrap_err();
         assert!(matches!(
             err,
-            SelfAttnDimsError::GqaGroupIndivisible { n_heads: 16, n_kv: 3 }
+            SelfAttnDimsError::GqaGroupIndivisible {
+                n_heads: 16,
+                n_kv: 3
+            }
         ));
     }
 
@@ -2010,7 +2164,7 @@ mod tests {
 
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, RmsNorm};
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     /// Use a tiny config so tests stay fast on CPU. Shape invariants are the goal.
     fn tiny_dims(attn_output_gate: bool) -> SelfAttnDims {
@@ -2051,10 +2205,8 @@ mod tests {
             random_tensor(&[d.hidden_size, d.attn_value_dim()], &mut rng, device),
             None,
         );
-        let q_norm_w =
-            Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
-        let k_norm_w =
-            Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
+        let q_norm_w = Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
+        let k_norm_w = Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
         SelfAttention::new(
             runtime,
             qkv.into(),
@@ -2065,11 +2217,7 @@ mod tests {
     }
 
     fn is_finite(t: &Tensor) -> bool {
-        let flat = t
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
+        let flat = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         flat.iter().all(|v| v.is_finite())
     }
 
@@ -2109,15 +2257,8 @@ mod tests {
         let theta = 10_000f32;
         let seq_len = 3;
         let offset = 5;
-        let (cos, sin) = build_rope_table(
-            rotary_dim,
-            seq_len,
-            offset,
-            theta,
-            &device,
-            DType::F32,
-        )
-        .unwrap();
+        let (cos, sin) =
+            build_rope_table(rotary_dim, seq_len, offset, theta, &device, DType::F32).unwrap();
         assert_eq!(cos.dims(), &[seq_len, rotary_dim / 2]);
         let cos_v = cos.to_vec2::<f32>().unwrap();
         let sin_v = sin.to_vec2::<f32>().unwrap();
@@ -2227,7 +2368,10 @@ mod tests {
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
-        assert!(diff > 1e-2, "offset 5 should noticeably rotate cos table; got {diff}");
+        assert!(
+            diff > 1e-2,
+            "offset 5 should noticeably rotate cos table; got {diff}"
+        );
     }
 
     #[test]
@@ -2236,15 +2380,8 @@ mod tests {
         // bit-identical. A silent contiguity bug here would wreck attention without NaNs.
         let device = Device::Cpu;
         let dims = tiny_dims(true); // head_dim=8, rotary_dim=4
-        let (cos, sin) = build_rope_table(
-            dims.rotary_dim,
-            3,
-            0,
-            10_000.0,
-            &device,
-            DType::F32,
-        )
-        .unwrap();
+        let (cos, sin) =
+            build_rope_table(dims.rotary_dim, 3, 0, 10_000.0, &device, DType::F32).unwrap();
         // Shape [B=1, H=1, L=3, D=8]
         let x_data: Vec<f32> = (0..(1 * 1 * 3 * 8)).map(|i| i as f32 / 10.0).collect();
         let x = Tensor::from_vec(x_data, (1, 1, 3, 8), &device).unwrap();

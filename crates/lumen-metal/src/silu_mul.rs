@@ -79,12 +79,18 @@ impl SiluMulBf16InBf16Out {
             .device
             .new_compute_pipeline_state_with_function_for_icb(&func)
             .map_err(|e| anyhow::anyhow!("silu_mul: pipeline_icb: {e:?}"))?;
-        Ok(Self { pipeline, pipeline_icb, ctx })
+        Ok(Self {
+            pipeline,
+            pipeline_icb,
+            ctx,
+        })
     }
 
     /// Pre-allocate the small `[inter]` constant buffer for ICB use.
     pub fn make_dims_buf(&self, inter: usize) -> Buffer {
-        self.ctx.buffer_with_data(&[SiluMulDims { inter: inter as u32 }])
+        self.ctx.buffer_with_data(&[SiluMulDims {
+            inter: inter as u32,
+        }])
     }
 
     /// Standalone (non-ICB) forward path. Allocates a fresh output Tensor.
@@ -118,8 +124,7 @@ impl SiluMulBf16InBf16Out {
 
         let n_out: usize = out_shape.iter().product();
         let zeros: Vec<half::bf16> = vec![half::bf16::ZERO; n_out];
-        let y = Tensor::from_vec(zeros, out_shape.as_slice(), combined.device())?
-            .contiguous()?;
+        let y = Tensor::from_vec(zeros, out_shape.as_slice(), combined.device())?.contiguous()?;
 
         let metal_dev = match combined.device() {
             Device::Metal(d) => d,
@@ -140,7 +145,9 @@ impl SiluMulBf16InBf16Out {
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(c_buf), c_off as usize);
         encoder.set_buffer(1, Some(y_buf), y_off as usize);
-        let dims_struct = SiluMulDims { inter: inter as u32 };
+        let dims_struct = SiluMulDims {
+            inter: inter as u32,
+        };
         encoder.set_bytes_directly(
             2,
             std::mem::size_of::<SiluMulDims>(),
@@ -155,9 +162,17 @@ impl SiluMulBf16InBf16Out {
             height: m,
             depth: 1,
         };
-        let tg = MTLSize { width: THREADS_X, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: THREADS_X,
+            height: 1,
+            depth: 1,
+        };
         encoder.dispatch_thread_groups(
-            MTLSize { width: grid.width / THREADS_X, height: grid.height, depth: 1 },
+            MTLSize {
+                width: grid.width / THREADS_X,
+                height: grid.height,
+                depth: 1,
+            },
             tg,
         );
         drop(encoder);
@@ -183,7 +198,11 @@ impl SiluMulBf16InBf16Out {
             height: m,
             depth: 1,
         };
-        let tg = MTLSize { width: THREADS_X, height: 1, depth: 1 };
+        let tg = MTLSize {
+            width: THREADS_X,
+            height: 1,
+            depth: 1,
+        };
         icb.record_compute(
             slot,
             &self.pipeline_icb,

@@ -78,7 +78,9 @@ fn make_pipeline(
             .expect("newLibraryWithSource failed")
     };
     let name = objc2_foundation::NSString::from_str("noop_7bufs");
-    let function = library.newFunctionWithName(&name).expect("function not found");
+    let function = library
+        .newFunctionWithName(&name)
+        .expect("function not found");
 
     // Pipeline must support ICB recording. Plain
     // `newComputePipelineStateWithFunction_error` produces a pipeline that
@@ -107,7 +109,10 @@ fn drain_queue(queue: &ProtocolObject<dyn MTLCommandQueue>) {
     unsafe { cb.waitUntilCompleted() };
 }
 
-fn alloc_buf(device: &ProtocolObject<dyn MTLDevice>, n_u32: usize) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+fn alloc_buf(
+    device: &ProtocolObject<dyn MTLDevice>,
+    n_u32: usize,
+) -> Retained<ProtocolObject<dyn MTLBuffer>> {
     let bytes = (n_u32 * 4) as usize;
     device
         .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
@@ -127,7 +132,9 @@ fn run_standard_n(
     wait: bool,
 ) {
     let cb = queue.commandBuffer().expect("commandBuffer nil");
-    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder nil");
+    let enc = cb
+        .computeCommandEncoder()
+        .expect("computeCommandEncoder nil");
     for _ in 0..n {
         enc.setComputePipelineState(pipeline);
         for (i, buf) in buffers.iter().enumerate() {
@@ -156,10 +163,10 @@ fn run_icb_n(
     wait: bool,
 ) {
     let cb = queue.commandBuffer().expect("commandBuffer nil");
-    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder nil");
-    let usage = MTLResourceUsage(
-        MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0,
-    );
+    let enc = cb
+        .computeCommandEncoder()
+        .expect("computeCommandEncoder nil");
+    let usage = MTLResourceUsage(MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0);
     for buf in buffers {
         let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
         enc.useResource_usage(res, usage);
@@ -167,7 +174,10 @@ fn run_icb_n(
     unsafe {
         enc.executeCommandsInBuffer_withRange(
             icb,
-            NSRange { location: 0, length: n },
+            NSRange {
+                location: 0,
+                length: n,
+            },
         );
     }
     enc.endEncoding();
@@ -234,8 +244,16 @@ fn icb_vs_standard_per_iter_cost() {
     // memory traffic compared to the encoding overhead we're measuring.
     let buffers: Vec<_> = (0..7).map(|_| alloc_buf(&device, 4096)).collect();
 
-    let grid = MTLSize { width: 1, height: 1, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
 
     // Sweep N (dispatches per CB): 1 (1 dispatch per CB), 10 (lumen-rs's
     // CANDLE_METAL_COMPUTE_PER_BUFFER), 64 (Apple A/B baseline), 128.
@@ -245,9 +263,18 @@ fn icb_vs_standard_per_iter_cost() {
     let iters = 200usize;
 
     eprintln!();
-    eprintln!("=== ICB vs Standard encoding ({} iters/config, 7 buffers/op, wait per CB) ===", iters);
-    eprintln!("{:>6} | {:>10} | {:>10} | {:>10} | {:>10}", "N/CB", "STD µs", "ICB µs", "Δ µs/op", "Δ %/op");
-    eprintln!("{:->6}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->10}", "", "", "", "", "");
+    eprintln!(
+        "=== ICB vs Standard encoding ({} iters/config, 7 buffers/op, wait per CB) ===",
+        iters
+    );
+    eprintln!(
+        "{:>6} | {:>10} | {:>10} | {:>10} | {:>10}",
+        "N/CB", "STD µs", "ICB µs", "Δ µs/op", "Δ %/op"
+    );
+    eprintln!(
+        "{:->6}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->10}",
+        "", "", "", "", ""
+    );
 
     let mut results: Vec<(usize, f64, f64, f64)> = Vec::new();
     for &n in &n_sweep {

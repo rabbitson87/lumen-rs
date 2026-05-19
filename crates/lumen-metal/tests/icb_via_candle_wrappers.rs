@@ -15,9 +15,9 @@
 use lumen_metal::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
 use std::time::Instant;
 
-use objc2_metal::{MTLBuffer, MTLResourceUsage, MTLSize};
 use lumen_metal::device::MetalContext;
 use lumen_metal::metal::{Buffer, IndirectCommandBuffer};
+use objc2_metal::{MTLBuffer, MTLResourceUsage, MTLSize};
 
 const SHADER_SRC: &str = include_str!("../src/shaders/affine4.metal");
 const N_PER_CB: usize = 64;
@@ -32,7 +32,12 @@ struct Affine4Dims {
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
     let mut s = seed;
-    (0..n).map(|_| { s = s.wrapping_mul(1103515245).wrapping_add(12345); s }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            s
+        })
+        .collect()
 }
 
 fn synth_scales_or_biases(out: usize, ins: usize, seed: u32, neg: bool) -> Vec<u16> {
@@ -101,13 +106,24 @@ fn icb_wrapper_pipeline_record_replay_parity() {
     let y_buf_a = ctx.buffer_zeroed((batch * out * 2) as u64);
     let y_buf_b = ctx.buffer_zeroed((batch * out * 2) as u64);
 
-    let dims = Affine4Dims { out_features: out as u32, in_features: ins as u32 };
+    let dims = Affine4Dims {
+        out_features: out as u32,
+        in_features: ins as u32,
+    };
     let dims_buf = ctx.buffer_with_data(&[dims]);
     let batch_u32 = batch as u32;
     let batch_buf = ctx.buffer_with_data(&[batch_u32]);
 
-    let grid = MTLSize { width: batch, height: out / 8, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: batch,
+        height: out / 8,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
 
     // ── ICB record via Candle wrapper ──────────────────────────────────
     use objc2::rc::Retained;
@@ -123,8 +139,7 @@ fn icb_wrapper_pipeline_record_replay_parity() {
         Retained::from(dev_ref)
     };
 
-    let icb = IndirectCommandBuffer::new(&raw_device, N_PER_CB, 7)
-        .expect("ICB allocation failed");
+    let icb = IndirectCommandBuffer::new(&raw_device, N_PER_CB, 7).expect("ICB allocation failed");
 
     // Record 64 identical commands (same buffers, different layers analogue
     // would supply distinct buffers per command).
@@ -166,8 +181,7 @@ fn icb_wrapper_pipeline_record_replay_parity() {
         cmd.wait_until_completed();
     };
 
-    let usage =
-        MTLResourceUsage(MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0);
+    let usage = MTLResourceUsage(MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0);
     let run_icb = || {
         let cmd = lumen_metal::metal::new_command_buffer(&ctx.queue);
         let enc = cmd.auto_compute_encoder();
@@ -200,8 +214,12 @@ fn icb_wrapper_pipeline_record_replay_parity() {
     }
     eprintln!();
     eprintln!("=== Phase 17.B foundation — Candle wrapper ICB test ===");
-    eprintln!("Bit-identical (A vs B): {} / {} (diffs={})",
-        out * batch - diffs, out * batch, diffs);
+    eprintln!(
+        "Bit-identical (A vs B): {} / {} (diffs={})",
+        out * batch - diffs,
+        out * batch,
+        diffs
+    );
     if diffs > 0 {
         panic!("Candle wrapper ICB output diverged from standard");
     }

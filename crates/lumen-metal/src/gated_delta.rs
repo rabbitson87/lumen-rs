@@ -31,14 +31,14 @@ unsafe impl Send for SafePipeline {}
 unsafe impl Sync for SafePipeline {}
 
 static GDN_PIPELINE: OnceLock<SafePipeline> = OnceLock::new();
-static GDN_FAILED:   AtomicBool             = AtomicBool::new(false);
+static GDN_FAILED: AtomicBool = AtomicBool::new(false);
 
 static GDN_BF16_PIPELINE: OnceLock<SafePipeline> = OnceLock::new();
-static GDN_BF16_FAILED:   AtomicBool             = AtomicBool::new(false);
+static GDN_BF16_FAILED: AtomicBool = AtomicBool::new(false);
 
 // Default OFF until A/B validated — opt-in via `LUMEN_USE_GDN_KERNEL=1`.
-static GDN_ENABLED:      AtomicBool = AtomicBool::new(false);
-static GDN_ENABLED_INIT: Once       = Once::new();
+static GDN_ENABLED: AtomicBool = AtomicBool::new(false);
+static GDN_ENABLED_INIT: Once = Once::new();
 
 fn init_enabled() {
     GDN_ENABLED_INIT.call_once(|| {
@@ -163,11 +163,11 @@ fn metal_buf(t: &Tensor) -> Option<(&crate::metal::Buffer, usize)> {
 #[cfg(feature = "model-integration")]
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_step_candle(
-    q:        &Tensor,
-    k:        &Tensor,
-    v:        &Tensor,
-    g:        &Tensor,
-    beta:     &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
     state_in: &Tensor,
 ) -> Option<candle_core::Result<(Tensor, Tensor)>> {
     if !is_enabled() {
@@ -201,13 +201,19 @@ pub fn gated_delta_step_candle(
     // Shape extraction
     let qd = q.dims();
     let vd = v.dims();
-    if qd.len() != 4 || vd.len() != 4 { return None; }
+    if qd.len() != 4 || vd.len() != 4 {
+        return None;
+    }
     let (b, t, hk, dk) = (qd[0], qd[1], qd[2], qd[3]);
-    let (hv, dv)       = (vd[2], vd[3]);
+    let (hv, dv) = (vd[2], vd[3]);
 
     // Preconditions
-    if dk % 32 != 0 { return None; }
-    if hv == 0 || hk == 0 || hv % hk != 0 { return None; }
+    if dk % 32 != 0 {
+        return None;
+    }
+    if hv == 0 || hk == 0 || hv % hk != 0 {
+        return None;
+    }
     let dk_state = state_in.dims();
     if dk_state.len() != 4
         || dk_state[0] != b
@@ -217,15 +223,23 @@ pub fn gated_delta_step_candle(
     {
         return None;
     }
-    if k.dims() != qd { return None; }
+    if k.dims() != qd {
+        return None;
+    }
     let gd = g.dims();
-    if gd.len() != 3 || gd[0] != b || gd[1] != t || gd[2] != hv { return None; }
+    if gd.len() != 3 || gd[0] != b || gd[1] != t || gd[2] != hv {
+        return None;
+    }
     let bd = beta.dims();
-    if bd != gd { return None; }
+    if bd != gd {
+        return None;
+    }
 
     // Device check
     let dev = q.device();
-    if !matches!(dev, Device::Metal(_)) { return None; }
+    if !matches!(dev, Device::Metal(_)) {
+        return None;
+    }
 
     // Allocate outputs. `y` matches input dtype (bf16 in bf16 path); state stays f32.
     let y = match Tensor::zeros(&[b, t, hv, dv], in_dtype, dev) {
@@ -237,14 +251,14 @@ pub fn gated_delta_step_candle(
         Err(e) => return Some(Err(e)),
     };
 
-    let (q_buf,   q_off)   = metal_buf(q)?;
-    let (k_buf,   k_off)   = metal_buf(k)?;
-    let (v_buf,   v_off)   = metal_buf(v)?;
-    let (g_buf,   g_off)   = metal_buf(g)?;
-    let (beta_buf,beta_off)= metal_buf(beta)?;
-    let (si_buf,  si_off)  = metal_buf(state_in)?;
-    let (y_buf,   y_off)   = metal_buf(&y)?;
-    let (so_buf,  so_off)  = metal_buf(&state_out)?;
+    let (q_buf, q_off) = metal_buf(q)?;
+    let (k_buf, k_off) = metal_buf(k)?;
+    let (v_buf, v_off) = metal_buf(v)?;
+    let (g_buf, g_off) = metal_buf(g)?;
+    let (beta_buf, beta_off) = metal_buf(beta)?;
+    let (si_buf, si_off) = metal_buf(state_in)?;
+    let (y_buf, y_off) = metal_buf(&y)?;
+    let (so_buf, so_off) = metal_buf(&state_out)?;
 
     let metal_dev = match dev {
         Device::Metal(md) => md,
@@ -255,25 +269,25 @@ pub fn gated_delta_step_candle(
         .map_err(|e| candle_core::Error::Msg(format!("gated_delta cmd_encoder: {e}")))
     {
         Ok(enc) => enc,
-        Err(e)  => return Some(Err(e)),
+        Err(e) => return Some(Err(e)),
     };
     encoder.set_compute_pipeline_state(pipeline);
 
-    encoder.set_buffer(0, Some(q_buf),   q_off);
-    encoder.set_buffer(1, Some(k_buf),   k_off);
-    encoder.set_buffer(2, Some(v_buf),   v_off);
-    encoder.set_buffer(3, Some(g_buf),   g_off);
-    encoder.set_buffer(4, Some(beta_buf),beta_off);
-    encoder.set_buffer(5, Some(si_buf),  si_off);
-    encoder.set_buffer(6, Some(y_buf),   y_off);
-    encoder.set_buffer(7, Some(so_buf),  so_off);
+    encoder.set_buffer(0, Some(q_buf), q_off);
+    encoder.set_buffer(1, Some(k_buf), k_off);
+    encoder.set_buffer(2, Some(v_buf), v_off);
+    encoder.set_buffer(3, Some(g_buf), g_off);
+    encoder.set_buffer(4, Some(beta_buf), beta_off);
+    encoder.set_buffer(5, Some(si_buf), si_off);
+    encoder.set_buffer(6, Some(y_buf), y_off);
+    encoder.set_buffer(7, Some(so_buf), so_off);
 
     let set_u32 = |idx: usize, v: u32| {
         let bytes = v.to_ne_bytes();
         encoder.set_bytes_directly(idx, 4, bytes.as_ptr() as *const _);
     };
-    set_u32(8,  t  as u32);
-    set_u32(9,  dk as u32);
+    set_u32(8, t as u32);
+    set_u32(9, dk as u32);
     set_u32(10, dv as u32);
     set_u32(11, hk as u32);
     set_u32(12, hv as u32);

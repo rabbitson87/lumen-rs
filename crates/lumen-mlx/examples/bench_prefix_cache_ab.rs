@@ -93,7 +93,10 @@ fn main() -> Result<()> {
 
     println!("--- Track A1.2 prefix-cache A/B ---");
     println!("model = {model_id}");
-    println!("LUMEN_MLX_PREFIX_CACHE = {}", if pc_enabled { "1" } else { "0 (DISABLED)" });
+    println!(
+        "LUMEN_MLX_PREFIX_CACHE = {}",
+        if pc_enabled { "1" } else { "0 (DISABLED)" }
+    );
 
     let mut backend = MlxBackend::load(&model_id)?;
 
@@ -126,7 +129,10 @@ fn main() -> Result<()> {
         results.push(r);
     }
 
-    println!("\n{:<5} {:<12} {:>10} {:>10} {:>5} | {}", "i", "label", "ttft(ms)", "total(ms)", "n", "user");
+    println!(
+        "\n{:<5} {:<12} {:>10} {:>10} {:>5} | {}",
+        "i", "label", "ttft(ms)", "total(ms)", "n", "user"
+    );
     println!("{}", "-".repeat(90));
     for (i, r) in results.iter().enumerate() {
         println!(
@@ -143,10 +149,7 @@ fn main() -> Result<()> {
                 post.iter().map(|r| r.ttft_ms).sum::<f64>() / post.len() as f64;
             let cold_ttft = cold.ttft_ms;
             let savings_pct = 100.0 * (cold_ttft - avg_post_ttft) / cold_ttft.max(1e-9);
-            println!(
-                "\nCold seed TTFT:        {:.0}ms",
-                cold_ttft
-            );
+            println!("\nCold seed TTFT:        {:.0}ms", cold_ttft);
             println!(
                 "Avg subsequent TTFT:   {:.0}ms ({} runs)",
                 avg_post_ttft,

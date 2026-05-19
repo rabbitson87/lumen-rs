@@ -65,11 +65,7 @@ fn find_metallib(target_dir: &PathBuf) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-fn walk(
-    dir: &PathBuf,
-    best: &mut Option<(std::time::SystemTime, PathBuf)>,
-    depth_budget: usize,
-) {
+fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, depth_budget: usize) {
     if depth_budget == 0 {
         return;
     }
@@ -86,9 +82,7 @@ fn walk(
                     let candidate = (mtime, path.clone());
                     match best {
                         None => *best = Some(candidate),
-                        Some((cur_mtime, _)) if *cur_mtime < mtime => {
-                            *best = Some(candidate)
-                        }
+                        Some((cur_mtime, _)) if *cur_mtime < mtime => *best = Some(candidate),
                         _ => {}
                     }
                 }

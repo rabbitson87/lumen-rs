@@ -22,9 +22,7 @@ pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use serde_json::Value as JsonValue;
 
-    use crate::gemma4_chat::imp::{
-        Gemma4ChatTemplate, TOK_CHANNEL_CLOSE, TOK_CHANNEL_OPEN,
-    };
+    use crate::gemma4_chat::imp::{Gemma4ChatTemplate, TOK_CHANNEL_CLOSE, TOK_CHANNEL_OPEN};
 
     // Tool-call delimiters from `tokenizer.json` added_tokens:
     //   <|tool_call> = 48,  <tool_call|> = 49
@@ -156,7 +154,9 @@ pub(crate) mod imp {
         let mut i = 0usize;
         while i < bytes.len() {
             // Find next "call:"
-            let Some(call_pos) = find_substr(text, "call:", i) else { break };
+            let Some(call_pos) = find_substr(text, "call:", i) else {
+                break;
+            };
             // Read identifier [\w-]+
             let name_start = call_pos + "call:".len();
             let mut name_end = name_start;
@@ -358,10 +358,8 @@ pub(crate) mod imp {
 
         #[test]
         fn arg_parser_multiple_fields_mixed_types() {
-            let v = gemma4_args_to_json(
-                r#"{city:<|"|>Paris<|"|>,unit:<|"|>celsius<|"|>,days:7}"#,
-            )
-            .expect("parse");
+            let v = gemma4_args_to_json(r#"{city:<|"|>Paris<|"|>,unit:<|"|>celsius<|"|>,days:7}"#)
+                .expect("parse");
             assert_eq!(v["city"], "Paris");
             assert_eq!(v["unit"], "celsius");
             assert_eq!(v["days"], 7);
@@ -369,10 +367,8 @@ pub(crate) mod imp {
 
         #[test]
         fn arg_parser_nested_object() {
-            let v = gemma4_args_to_json(
-                r#"{location:{lat:35.6,lng:139.7,name:<|"|>Tokyo<|"|>}}"#,
-            )
-            .expect("parse");
+            let v = gemma4_args_to_json(r#"{location:{lat:35.6,lng:139.7,name:<|"|>Tokyo<|"|>}}"#)
+                .expect("parse");
             assert_eq!(v["location"]["lat"], 35.6);
             assert_eq!(v["location"]["lng"], 139.7);
             assert_eq!(v["location"]["name"], "Tokyo");
@@ -380,10 +376,7 @@ pub(crate) mod imp {
 
         #[test]
         fn arg_parser_array_of_strings() {
-            let v = gemma4_args_to_json(
-                r#"{tags:[<|"|>red<|"|>,<|"|>blue<|"|>]}"#,
-            )
-            .expect("parse");
+            let v = gemma4_args_to_json(r#"{tags:[<|"|>red<|"|>,<|"|>blue<|"|>]}"#).expect("parse");
             assert!(v["tags"].is_array());
             assert_eq!(v["tags"][0], "red");
             assert_eq!(v["tags"][1], "blue");
@@ -400,10 +393,7 @@ pub(crate) mod imp {
         #[test]
         fn arg_parser_unterminated_string_errors() {
             let err = gemma4_args_to_json(r#"{q:<|"|>broken}"#).unwrap_err();
-            assert!(
-                format!("{err}").contains("unterminated"),
-                "got: {err}"
-            );
+            assert!(format!("{err}").contains("unterminated"), "got: {err}");
         }
 
         #[test]

@@ -333,9 +333,7 @@ pub struct QuantParams<'a> {
 /// Errors from cross-field validation.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error(
-        "layer_types length ({layer_types_len}) != num_hidden_layers ({num_hidden_layers})"
-    )]
+    #[error("layer_types length ({layer_types_len}) != num_hidden_layers ({num_hidden_layers})")]
     LayerTypesLengthMismatch {
         num_hidden_layers: usize,
         layer_types_len: usize,
@@ -348,9 +346,10 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
-    const FIXTURE_JSON: &str = include_str!(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qwen3_5_moe_config.json")
-    );
+    const FIXTURE_JSON: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/qwen3_5_moe_config.json"
+    ));
 
     #[test]
     fn parses_real_mlx_config() {
@@ -359,7 +358,10 @@ mod tests {
         cfg.validate().expect("cross-field invariants should hold");
 
         assert_eq!(cfg.model_type, "qwen3_5_moe");
-        assert_eq!(cfg.architectures, vec!["Qwen3_5MoeForConditionalGeneration"]);
+        assert_eq!(
+            cfg.architectures,
+            vec!["Qwen3_5MoeForConditionalGeneration"]
+        );
         assert!(!cfg.tie_word_embeddings);
         assert_eq!(cfg.eos_token_id, vec![248046, 248044]);
         assert_eq!(cfg.image_token_id, 248056);
@@ -381,7 +383,10 @@ mod tests {
         assert_eq!(t.num_experts_per_tok, 8);
         assert_eq!(t.moe_intermediate_size, 512);
         assert_eq!(t.shared_expert_intermediate_size, 512);
-        assert!(t.attn_output_gate, "Qwen3-Next gated output should be enabled");
+        assert!(
+            t.attn_output_gate,
+            "Qwen3-Next gated output should be enabled"
+        );
         assert_eq!(t.linear_conv_kernel_dim, 4);
         assert_eq!(t.linear_num_key_heads, 16);
         assert_eq!(t.linear_num_value_heads, 32);
@@ -536,7 +541,10 @@ mod tests {
         let cfg: Qwen3_5MoeConfig = serde_json::from_str(FIXTURE_JSON).unwrap();
         assert_eq!(cfg.text_config.mlp_kind(), MlpKind::Moe);
         assert_eq!(cfg.text_config.num_experts, 256);
-        assert_eq!(cfg.text_config.intermediate_size, 0, "MoE config has no top-level intermediate_size");
+        assert_eq!(
+            cfg.text_config.intermediate_size, 0,
+            "MoE config has no top-level intermediate_size"
+        );
     }
 
     #[test]
@@ -604,7 +612,10 @@ mod tests {
         assert_eq!(q.mode, "affine");
         assert_eq!(q.bits, 4);
         assert_eq!(q.group_size, 64);
-        assert!(q.overrides.is_empty(), "27B has no per-weight quant overrides");
+        assert!(
+            q.overrides.is_empty(),
+            "27B has no per-weight quant overrides"
+        );
     }
 
     #[test]
@@ -647,15 +658,18 @@ mod tests {
                 "out_hidden_size": 2560, "initializer_range": 0.02
             }
         }"#;
-        let mut cfg: Qwen3_5MoeConfig =
-            serde_json::from_str(json).expect("4B bf16 config should parse without quantization block");
+        let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(json)
+            .expect("4B bf16 config should parse without quantization block");
         cfg.validate().expect("cross-field invariants for 4B bf16");
         // After validate(), top-level partial_rotary_factor is canonicalised from
         // rope_parameters when the upstream checkpoint omits the duplicate (4B case).
         assert_eq!(cfg.text_config.partial_rotary_factor, 0.25);
         assert_eq!(cfg.text_config.mlp_kind(), MlpKind::Dense);
         assert_eq!(cfg.text_config.dense_intermediate_size(), 9216);
-        assert!(cfg.text_config.tie_word_embeddings, "4B uses tied embedding");
+        assert!(
+            cfg.text_config.tie_word_embeddings,
+            "4B uses tied embedding"
+        );
         assert!(
             cfg.quantization_config.is_none(),
             "4B bf16 has no quantization_config block"

@@ -17,7 +17,7 @@
 //! Both states reset to zeros at construction and on `reset()`. The Metal
 //! buffer is retained across resets so subsequent generations reuse it.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use super::context::NativeContext;
 use super::tensor::{NativeDType, NativeTensor};
@@ -177,12 +177,7 @@ pub struct NativeConvState {
 }
 
 impl NativeConvState {
-    pub fn new(
-        ctx: &NativeContext,
-        b: usize,
-        conv_kernel: usize,
-        qkv_dim: usize,
-    ) -> Result<Self> {
+    pub fn new(ctx: &NativeContext, b: usize, conv_kernel: usize, qkv_dim: usize) -> Result<Self> {
         if b == 0 || conv_kernel < 2 || qkv_dim == 0 {
             return Err(anyhow!(
                 "NativeConvState::new: invalid dims (b={b}, kernel={conv_kernel}, qkv_dim={qkv_dim})"

@@ -17,18 +17,18 @@
 
 #![cfg(feature = "model-integration")]
 
-use lumen_metal::metal::CommandBufferExt;
 use candle_core::backend::BackendDevice;
 use candle_core::{DType, Device, Tensor};
+use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
+use lumen_metal::affine4_linear::Affine4Linear;
+use lumen_metal::metal::CommandBufferExt;
+use lumen_metal::metal::{Buffer, IndirectCommandBuffer};
+use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResourceUsage};
 use std::sync::Arc;
 use std::time::Instant;
-use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
-use lumen_metal::affine4_linear::Affine4Linear;
-use lumen_metal::metal::{Buffer, IndirectCommandBuffer};
-use lumen_metal::silu_mul::SiluMulBf16InBf16Out;
 
 const HIDDEN: usize = 5120;
 // Shape source: mlx-community/Qwen3.6-27B-4bit config.json text_config.intermediate_size
@@ -40,26 +40,35 @@ const WARMUP: usize = 30;
 fn synth_packed(out: usize, ins: usize, seed: u32) -> Vec<u32> {
     let n = out * ins / 8;
     let mut s = seed;
-    (0..n).map(|_| { s = s.wrapping_mul(1103515245).wrapping_add(12345); s }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            s
+        })
+        .collect()
 }
 
 fn synth_scales_or_biases(out: usize, ins: usize, seed: u32, neg: bool) -> Vec<u16> {
     let n = out * ins / 64;
     let mut s = seed;
     let off = if neg { -0.005 } else { 0.01 };
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1103515245).wrapping_add(12345);
-        let f = ((s >> 8) & 0xff) as f32 / 256.0 * 0.01 + off;
-        (f.to_bits() >> 16) as u16
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            let f = ((s >> 8) & 0xff) as f32 / 256.0 * 0.01 + off;
+            (f.to_bits() >> 16) as u16
+        })
+        .collect()
 }
 
 fn synth_x(n: usize, seed: u32) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1103515245).wrapping_add(12345);
-        ((s >> 8) & 0xff) as f32 / 256.0 - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            ((s >> 8) & 0xff) as f32 / 256.0 - 0.5
+        })
+        .collect()
 }
 
 fn welchs_t(a: &[f64], b: &[f64]) -> f64 {
@@ -110,30 +119,46 @@ fn mlp_block_icb_poc_n3() {
     let gate_up_scales = synth_scales_or_biases(2 * INTER, HIDDEN, 0xCAFE_BABE, false);
     let gate_up_biases = synth_scales_or_biases(2 * INTER, HIDDEN, 0x1234_5678, true);
     let gate_up_w = Affine4Weight::from_host(
-        &ctx.ctx, &gate_up_packed, &gate_up_scales, &gate_up_biases,
-        2 * INTER, HIDDEN,
-    ).expect("gate_up weight");
+        &ctx.ctx,
+        &gate_up_packed,
+        &gate_up_scales,
+        &gate_up_biases,
+        2 * INTER,
+        HIDDEN,
+    )
+    .expect("gate_up weight");
 
     let down_packed = synth_packed(HIDDEN, INTER, 0xFADE_FADE);
     let down_scales = synth_scales_or_biases(HIDDEN, INTER, 0xBEEF_BEEF, false);
     let down_biases = synth_scales_or_biases(HIDDEN, INTER, 0xC0DE_C0DE, true);
     let down_w = Affine4Weight::from_host(
-        &ctx.ctx, &down_packed, &down_scales, &down_biases,
-        HIDDEN, INTER,
-    ).expect("down weight");
+        &ctx.ctx,
+        &down_packed,
+        &down_scales,
+        &down_biases,
+        HIDDEN,
+        INTER,
+    )
+    .expect("down weight");
 
     let gate_up_lin = Affine4Linear::new(gate_up_w, None, ctx.clone());
     let down_lin = Affine4Linear::new(down_w, None, ctx.clone());
 
     // Inputs.
     let x_data = synth_x(HIDDEN, 0xAAAA_BBBB);
-    let x = Tensor::from_vec(x_data, &[1, 1, HIDDEN], &dev).unwrap()
-        .to_dtype(DType::BF16).unwrap()
-        .contiguous().unwrap();
+    let x = Tensor::from_vec(x_data, &[1, 1, HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
     let residual_data = synth_x(HIDDEN, 0x9999_8888);
-    let residual = Tensor::from_vec(residual_data, &[1, 1, HIDDEN], &dev).unwrap()
-        .to_dtype(DType::BF16).unwrap()
-        .contiguous().unwrap();
+    let residual = Tensor::from_vec(residual_data, &[1, 1, HIDDEN], &dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .contiguous()
+        .unwrap();
 
     // ── Standard path closure (5-dispatch silu*mul chain) ─────────────
     // Mirrors `DenseMlp::forward_with_residual_bf16_in_bf16_out`.
@@ -141,10 +166,20 @@ fn mlp_block_icb_poc_n3() {
         let combined = gate_up_lin.forward_bf16_in_bf16_out(&x).unwrap();
         let combined_f32 = combined.to_dtype(DType::F32).unwrap();
         let last = combined_f32.dims().len() - 1;
-        let gate = combined_f32.narrow(last, 0, INTER).unwrap().contiguous().unwrap();
-        let up = combined_f32.narrow(last, INTER, INTER).unwrap().contiguous().unwrap();
+        let gate = combined_f32
+            .narrow(last, 0, INTER)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let up = combined_f32
+            .narrow(last, INTER, INTER)
+            .unwrap()
+            .contiguous()
+            .unwrap();
         let hidden_f32 = (candle_nn::ops::silu(&gate).unwrap() * up).unwrap();
-        down_lin.forward_with_residual_bf16_in_bf16_out(&hidden_f32, &residual).unwrap()
+        down_lin
+            .forward_with_residual_bf16_in_bf16_out(&hidden_f32, &residual)
+            .unwrap()
     };
 
     // ── Fused-chain closure (no ICB, only the dispatch-count reduction) ─
@@ -154,7 +189,9 @@ fn mlp_block_icb_poc_n3() {
     let run_fused_no_icb = || -> Tensor {
         let combined = gate_up_lin.forward_bf16_in_bf16_out(&x).unwrap();
         let hidden = silu_kernel.forward(&combined).unwrap();
-        down_lin.forward_with_residual_bf16_in_bf16_out(&hidden, &residual).unwrap()
+        down_lin
+            .forward_with_residual_bf16_in_bf16_out(&hidden, &residual)
+            .unwrap()
     };
 
     // ── ICB path setup ────────────────────────────────────────────────
@@ -176,7 +213,10 @@ fn mlp_block_icb_poc_n3() {
     // Constant buffers for each slot.
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct Affine4Dims { out_features: u32, in_features: u32 }
+    struct Affine4Dims {
+        out_features: u32,
+        in_features: u32,
+    }
     let gate_up_dims = ctx.ctx.buffer_with_data(&[Affine4Dims {
         out_features: (2 * INTER) as u32,
         in_features: HIDDEN as u32,
@@ -207,22 +247,43 @@ fn mlp_block_icb_poc_n3() {
 
     // Slot 0: gate_up_proj qmv_fast
     ctx.record_qmv_fast_bf16in_bf16out_icb(
-        &icb, 0, gate_up_lin.weight(),
-        &x_buf, x_off,
-        &combined_buf, 0,
-        &gate_up_dims, &batch_buf, 1,
+        &icb,
+        0,
+        gate_up_lin.weight(),
+        &x_buf,
+        x_off,
+        &combined_buf,
+        0,
+        &gate_up_dims,
+        &batch_buf,
+        1,
     );
     // Slot 1: silu*mul
     silu_kernel.record_icb(
-        &icb, 1, &combined_buf, 0, &hidden_buf, 0, &silu_dims, 1, INTER,
+        &icb,
+        1,
+        &combined_buf,
+        0,
+        &hidden_buf,
+        0,
+        &silu_dims,
+        1,
+        INTER,
     );
     // Slot 2: down_proj qmv_fast bf16-residual
     ctx.record_qmv_fast_bf16in_bf16out_residual_icb(
-        &icb, 2, down_lin.weight(),
-        &hidden_buf, 0,
-        &r_buf, r_off,
-        &y_buf, 0,
-        &down_dims, &batch_buf, 1,
+        &icb,
+        2,
+        down_lin.weight(),
+        &hidden_buf,
+        0,
+        &r_buf,
+        r_off,
+        &y_buf,
+        0,
+        &down_dims,
+        &batch_buf,
+        1,
     );
 
     // ICB run closure (committed via Candle's queue + drain protocol).
@@ -236,24 +297,28 @@ fn mlp_block_icb_poc_n3() {
     // calls are serialized via the encoder's built-in hazard tracking.
     let run_icb = || {
         let _ = metal_dev.synchronize();
-        let cmd = lumen_metal::metal::new_command_buffer(
-            &metal_dev.command_queue().unwrap()
-        );
+        let cmd = lumen_metal::metal::new_command_buffer(&metal_dev.command_queue().unwrap());
         let enc = cmd.auto_compute_encoder();
         let usage = MTLResourceUsage(MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0);
         let (gp, gs, gb) = gate_up_lin.weight().buffers();
         let (dp, ds, db) = down_lin.weight().buffers();
         enc.use_buffers_for_icb(
             &[
-                gp, gs, gb,                     // gate_up weights
-                &x_buf,                          // gate_up input
-                &combined_buf,                   // gate_up output / silu*mul input
-                &silu_dims,                      // silu*mul dims
-                &hidden_buf,                     // silu*mul output / down input
-                dp, ds, db,                     // down weights
-                &r_buf,                          // down residual
-                &y_buf,                          // down output
-                &gate_up_dims, &down_dims, &batch_buf,
+                gp,
+                gs,
+                gb,            // gate_up weights
+                &x_buf,        // gate_up input
+                &combined_buf, // gate_up output / silu*mul input
+                &silu_dims,    // silu*mul dims
+                &hidden_buf,   // silu*mul output / down input
+                dp,
+                ds,
+                db,     // down weights
+                &r_buf, // down residual
+                &y_buf, // down output
+                &gate_up_dims,
+                &down_dims,
+                &batch_buf,
             ],
             usage,
         );
@@ -274,10 +339,16 @@ fn mlp_block_icb_poc_n3() {
     let y_ref = run_standard();
     run_icb();
 
-    let ref_bits: Vec<u32> = y_ref.flatten_all().unwrap()
-        .to_dtype(DType::F32).unwrap()
-        .to_vec1::<f32>().unwrap()
-        .iter().map(|f| f.to_bits()).collect();
+    let ref_bits: Vec<u32> = y_ref
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|f| f.to_bits())
+        .collect();
     // Read y_buf back via raw pointer.
     let y_ptr = y_buf.contents() as *const u16;
     let mut icb_bits: Vec<u32> = Vec::with_capacity(HIDDEN);
@@ -287,7 +358,11 @@ fn mlp_block_icb_poc_n3() {
         icb_bits.push(f32_bits);
     }
 
-    let diffs = ref_bits.iter().zip(icb_bits.iter()).filter(|(a, b)| a != b).count();
+    let diffs = ref_bits
+        .iter()
+        .zip(icb_bits.iter())
+        .filter(|(a, b)| a != b)
+        .count();
     eprintln!();
     eprintln!("=== bit-identity gate (standard chain vs 3-cmd ICB) ===");
     eprintln!("Compared:  {HIDDEN} elements");
@@ -300,12 +375,24 @@ fn mlp_block_icb_poc_n3() {
     }
 
     // ── Bench (3-way A/B/C interleaved) ───────────────────────────────
-    for _ in 0..WARMUP { run_standard(); }
-    if let Device::Metal(md) = &dev { let _ = md.synchronize(); }
-    for _ in 0..WARMUP { run_icb(); }
-    if let Device::Metal(md) = &dev { let _ = md.synchronize(); }
-    for _ in 0..WARMUP { run_fused_no_icb(); }
-    if let Device::Metal(md) = &dev { let _ = md.synchronize(); }
+    for _ in 0..WARMUP {
+        run_standard();
+    }
+    if let Device::Metal(md) = &dev {
+        let _ = md.synchronize();
+    }
+    for _ in 0..WARMUP {
+        run_icb();
+    }
+    if let Device::Metal(md) = &dev {
+        let _ = md.synchronize();
+    }
+    for _ in 0..WARMUP {
+        run_fused_no_icb();
+    }
+    if let Device::Metal(md) = &dev {
+        let _ = md.synchronize();
+    }
 
     let mut t_std: Vec<f64> = Vec::with_capacity(ITERS);
     let mut t_fused: Vec<f64> = Vec::with_capacity(ITERS);
@@ -313,12 +400,16 @@ fn mlp_block_icb_poc_n3() {
     for _ in 0..ITERS {
         let t0 = Instant::now();
         let y = run_standard();
-        if let Device::Metal(md) = y.device() { let _ = md.synchronize(); }
+        if let Device::Metal(md) = y.device() {
+            let _ = md.synchronize();
+        }
         t_std.push(t0.elapsed().as_secs_f64() * 1e6);
 
         let t1 = Instant::now();
         let y = run_fused_no_icb();
-        if let Device::Metal(md) = y.device() { let _ = md.synchronize(); }
+        if let Device::Metal(md) = y.device() {
+            let _ = md.synchronize();
+        }
         t_fused.push(t1.elapsed().as_secs_f64() * 1e6);
 
         let t2 = Instant::now();

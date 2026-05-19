@@ -26,8 +26,7 @@ impl MpsGraphContext {
     /// transmute helper) — see the Phase 3 wiring plan.
     pub fn new() -> Result<Self, MpsGraphError> {
         let mtl_device = MTLCreateSystemDefaultDevice().ok_or(MpsGraphError::NoDevice)?;
-        let device =
-            unsafe { MPSGraphDevice::deviceWithMTLDevice(mtl_device.as_ref()) };
+        let device = unsafe { MPSGraphDevice::deviceWithMTLDevice(mtl_device.as_ref()) };
         Ok(Self { device, mtl_device })
     }
 
@@ -57,7 +56,7 @@ pub enum MpsGraphError {
 mod tests {
     use super::*;
     use crate::mpsgraph::{
-        compile, run_sync, shape_from_dims, tensor_data_from_buffer, MatmulGraph2D, RmsNormGraph,
+        MatmulGraph2D, RmsNormGraph, compile, run_sync, shape_from_dims, tensor_data_from_buffer,
     };
     use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
     use objc2_metal_performance_shaders::MPSDataType;

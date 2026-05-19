@@ -17,8 +17,8 @@
 
 use candle_core::backend::BackendDevice;
 use candle_core::{DType, Device, Tensor};
-use std::time::Instant;
 use lumen_metal::flash_attn::{flash_attn_candle, set_disabled};
+use std::time::Instant;
 
 fn metal_device() -> Option<Device> {
     Device::new_metal(0).ok()
@@ -26,7 +26,9 @@ fn metal_device() -> Option<Device> {
 
 fn random_tensor(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
     let n: usize = shape.iter().product();
-    let mut state = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut state = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
         state = state
@@ -46,11 +48,7 @@ fn welchs_t(a: &[f64], b: &[f64]) -> f64 {
     let va = a.iter().map(|x| (x - ma).powi(2)).sum::<f64>() / (na - 1.0);
     let vb = b.iter().map(|x| (x - mb).powi(2)).sum::<f64>() / (nb - 1.0);
     let se = (va / na + vb / nb).sqrt();
-    if se == 0.0 {
-        0.0
-    } else {
-        (ma - mb) / se
-    }
+    if se == 0.0 { 0.0 } else { (ma - mb) / se }
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -76,8 +74,12 @@ fn bench_shape(label: &str, h: usize, h_kv: usize, sq: usize, skv: usize, iters:
 
     // Warm-up — compile pipelines, prime caches.
     for _ in 0..20 {
-        let _ = flash_attn_candle(&q_f32, &k_f32, &v_f32, None, scale).unwrap().unwrap();
-        let _ = flash_attn_candle(&q_b16, &k_b16, &v_b16, None, scale).unwrap().unwrap();
+        let _ = flash_attn_candle(&q_f32, &k_f32, &v_f32, None, scale)
+            .unwrap()
+            .unwrap();
+        let _ = flash_attn_candle(&q_b16, &k_b16, &v_b16, None, scale)
+            .unwrap()
+            .unwrap();
     }
     if let Device::Metal(md) = &dev {
         let _ = md.synchronize();

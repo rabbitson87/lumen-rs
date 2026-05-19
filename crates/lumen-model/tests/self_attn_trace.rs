@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_core::{safetensors as cst, Device, Tensor, D};
-use candle_nn::{ops, rotary_emb, Linear, Module, RmsNorm};
+use candle_core::{D, Device, Tensor, safetensors as cst};
+use candle_nn::{Linear, Module, RmsNorm, ops, rotary_emb};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -79,7 +79,9 @@ fn apply_partial_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, rotary_dim: usize)
         .unwrap()
         .contiguous()
         .unwrap();
-    let pass = x.narrow(D::Minus1, rotary_dim, head_dim - rotary_dim).unwrap();
+    let pass = x
+        .narrow(D::Minus1, rotary_dim, head_dim - rotary_dim)
+        .unwrap();
     let rot = rotary_emb::rope(&rot, cos, sin).unwrap();
     Tensor::cat(&[&rot, &pass], D::Minus1).unwrap()
 }
@@ -142,12 +144,23 @@ fn trace_layer3_step_by_step() {
     // Step 1: q_raw
     let q_raw_rust = q_proj.forward(&x).unwrap().squeeze(0).unwrap();
     let q_raw_ref = take(&trace, "q_raw");
-    println!("[1] q_raw      rel_L2 = {:.3e}", rel_l2(&q_raw_rust, &q_raw_ref));
+    println!(
+        "[1] q_raw      rel_L2 = {:.3e}",
+        rel_l2(&q_raw_rust, &q_raw_ref)
+    );
 
     // Step 2: split into queries + gate (before norm)
     let q_full = q_raw_rust.reshape((seq_len, h, 2 * hd)).unwrap();
-    let q_before_norm_rust = q_full.narrow(D::Minus1, 0, hd).unwrap().contiguous().unwrap();
-    let gate_pre_rust = q_full.narrow(D::Minus1, hd, hd).unwrap().contiguous().unwrap();
+    let q_before_norm_rust = q_full
+        .narrow(D::Minus1, 0, hd)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let gate_pre_rust = q_full
+        .narrow(D::Minus1, hd, hd)
+        .unwrap()
+        .contiguous()
+        .unwrap();
     let q_before_ref = take(&trace, "q_before_norm");
     let gate_pre_ref = take(&trace, "gate_pre");
     println!(
@@ -225,12 +238,15 @@ fn trace_layer3_step_by_step() {
 
     // Step 5: SDPA
     let v_raw = v_proj.forward(&x).unwrap().squeeze(0).unwrap();
-    let v_t = v_raw.reshape((seq_len, kv, hd)).unwrap().transpose(0, 1).unwrap().contiguous().unwrap(); // [KV, L, HD]
+    let v_t = v_raw
+        .reshape((seq_len, kv, hd))
+        .unwrap()
+        .transpose(0, 1)
+        .unwrap()
+        .contiguous()
+        .unwrap(); // [KV, L, HD]
     let v_ref = take(&trace, "v_transposed");
-    println!(
-        "[6] v_transposed rel_L2 = {:.3e}",
-        rel_l2(&v_t, &v_ref)
-    );
+    println!("[6] v_transposed rel_L2 = {:.3e}", rel_l2(&v_t, &v_ref));
 
     let q4 = q_after_rope_rust.unsqueeze(0).unwrap(); // [1, H, L, HD]
     let k4 = k_after_rope_rust.unsqueeze(0).unwrap();
@@ -240,8 +256,11 @@ fn trace_layer3_step_by_step() {
     let v4 = repeat_kv(&v4, group);
 
     let scale = (hd as f64).powf(-0.5);
-    let scores =
-        (q4.matmul(&k4.transpose(D::Minus2, D::Minus1).unwrap()).unwrap() * scale).unwrap();
+    let scores = (q4
+        .matmul(&k4.transpose(D::Minus2, D::Minus1).unwrap())
+        .unwrap()
+        * scale)
+        .unwrap();
     let mask = causal_mask(seq_len, &device);
     let scores = scores.broadcast_add(&mask).unwrap();
     let attn = ops::softmax_last_dim(&scores).unwrap();
@@ -266,18 +285,23 @@ fn trace_layer3_step_by_step() {
     let gate_flat = gate_pre_rust.reshape((seq_len, h * hd)).unwrap();
     let gated = (sdpa_flat * ops::sigmoid(&gate_flat).unwrap()).unwrap();
     let gated_ref = take(&trace, "gated");
-    println!("[9] gated        rel_L2 = {:.3e}", rel_l2(&gated, &gated_ref));
+    println!(
+        "[9] gated        rel_L2 = {:.3e}",
+        rel_l2(&gated, &gated_ref)
+    );
 
-    let y_final = o_proj.forward(&gated.unsqueeze(0).unwrap()).unwrap().squeeze(0).unwrap();
+    let y_final = o_proj
+        .forward(&gated.unsqueeze(0).unwrap())
+        .unwrap()
+        .squeeze(0)
+        .unwrap();
     let y_ref = take(&trace, "y_final");
     println!("[10] y_final     rel_L2 = {:.3e}", rel_l2(&y_final, &y_ref));
 
     // Step 11: now run the actual SelfAttention::forward and verify it matches the same y_ref.
     // If this diverges from the inline reconstruction above, the bug is inside the library
     // wrapper (ordering, contiguity, etc.), not in the intermediate maths.
-    use lumen_model::qwen3_5_moe::self_attn::{
-        SelfAttention, SelfAttnDims, SelfAttnRuntime,
-    };
+    use lumen_model::qwen3_5_moe::self_attn::{SelfAttention, SelfAttnDims, SelfAttnRuntime};
     let dims = SelfAttnDims {
         hidden_size: 2048,
         num_heads: h,

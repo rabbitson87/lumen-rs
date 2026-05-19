@@ -32,10 +32,14 @@ fn metal_device() -> Option<Device> {
 
 fn random_f32(shape: &[usize], seed: u64, scale: f32, dev: &Device) -> Tensor {
     let n: usize = shape.iter().product();
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = ((s >> 32) as u32) as f32 / u32::MAX as f32;
         data.push((bits - 0.5) * scale);
     }
@@ -105,7 +109,11 @@ fn dense_mlp_forward_bf16_in_matches_f32_within_tolerance() {
     let y_f32 = mlp.forward(&x_f32).expect("f32 forward");
     let y_b16 = mlp.forward_bf16_in(&x_bf16).expect("bf16-in forward");
 
-    assert_eq!(y_b16.dtype(), DType::F32, "MLP output stays f32 (residual contract)");
+    assert_eq!(
+        y_b16.dtype(),
+        DType::F32,
+        "MLP output stays f32 (residual contract)"
+    );
     assert_eq!(y_f32.dims(), y_b16.dims(), "shape parity");
 
     let cos = cosine_sim(&y_f32, &y_b16);
@@ -148,7 +156,9 @@ fn dense_mlp_forward_with_residual_bf16_in_matches_f32_within_tolerance() {
     let residual = random_f32(&[1, 4, hidden], 9, 0.1, &dev);
     let x_bf16 = x_f32.to_dtype(DType::BF16).unwrap().contiguous().unwrap();
 
-    let y_f32 = mlp.forward_with_residual(&x_f32, &residual).expect("f32 fwd+res");
+    let y_f32 = mlp
+        .forward_with_residual(&x_f32, &residual)
+        .expect("f32 fwd+res");
     let y_b16 = mlp
         .forward_with_residual_bf16_in(&x_bf16, &residual)
         .expect("bf16-in fwd+res");
@@ -234,8 +244,7 @@ fn dense_mlp_forward_bf16_in_bf16_out_matches_f32_within_tolerance() {
 
     let cos = cosine_sim(&y_f32, &y_bf16);
     let rel_l2 = relative_l2(&y_bf16, &y_f32);
-    let max_abs = (&y_f32.to_dtype(DType::F32).unwrap()
-        - &y_bf16.to_dtype(DType::F32).unwrap())
+    let max_abs = (&y_f32.to_dtype(DType::F32).unwrap() - &y_bf16.to_dtype(DType::F32).unwrap())
         .unwrap()
         .abs()
         .unwrap()
@@ -366,7 +375,10 @@ fn mlp_block_dispatch_bf16_in_bf16_out_surface() {
         .unwrap();
 
     let y = mlp.forward_bf16_in_bf16_out(&x_bf16);
-    assert!(y.is_some(), "Dense arm must accept bf16-in-bf16-out dispatch");
+    assert!(
+        y.is_some(),
+        "Dense arm must accept bf16-in-bf16-out dispatch"
+    );
     assert_eq!(y.unwrap().unwrap().dtype(), DType::BF16);
 
     let residual_bf16 = random_f32(&[1, 1, hidden], 2, 0.1, &dev)
@@ -375,7 +387,10 @@ fn mlp_block_dispatch_bf16_in_bf16_out_surface() {
         .contiguous()
         .unwrap();
     let y_res = mlp.forward_with_residual_bf16_in_bf16_out(&x_bf16, &residual_bf16);
-    assert!(y_res.is_some(), "Dense arm must accept residual bf16-in-bf16-out");
+    assert!(
+        y_res.is_some(),
+        "Dense arm must accept residual bf16-in-bf16-out"
+    );
     assert_eq!(y_res.unwrap().unwrap().dtype(), DType::BF16);
 
     // Dense ProjLinear (test build) is not Affine4 → no native fast path.

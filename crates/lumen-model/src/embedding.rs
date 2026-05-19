@@ -60,8 +60,13 @@ fn is_layer_projection(key: &str) -> bool {
     }
     matches!(
         key.rsplit('.').next(),
-        Some("q_proj") | Some("k_proj") | Some("v_proj") | Some("o_proj")
-            | Some("gate_proj") | Some("up_proj") | Some("down_proj")
+        Some("q_proj")
+            | Some("k_proj")
+            | Some("v_proj")
+            | Some("o_proj")
+            | Some("gate_proj")
+            | Some("up_proj")
+            | Some("down_proj")
     )
 }
 
@@ -128,8 +133,12 @@ impl EmbeddingModel {
             }
         };
 
-        let tokenizer = tokenizers::Tokenizer::from_file(&files.tokenizer_path)
-            .map_err(|e| anyhow!("tokenizer from_file({}): {e}", files.tokenizer_path.display()))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&files.tokenizer_path).map_err(|e| {
+            anyhow!(
+                "tokenizer from_file({}): {e}",
+                files.tokenizer_path.display()
+            )
+        })?;
 
         eprintln!(
             "[embedding] loaded model_id={model_id_or_path} dim={dim} dtype={dtype:?} device={device:?} in {:.1}s",
@@ -340,8 +349,7 @@ struct ResolvedFiles {
 }
 
 fn resolve_model_files(model_id_or_path: &str) -> Result<ResolvedFiles> {
-    let looks_local =
-        model_id_or_path.starts_with('/') || model_id_or_path.starts_with("./");
+    let looks_local = model_id_or_path.starts_with('/') || model_id_or_path.starts_with("./");
     if looks_local {
         let root = PathBuf::from(model_id_or_path);
         let config_path = root.join("config.json");
@@ -401,10 +409,7 @@ fn resolve_model_files(model_id_or_path: &str) -> Result<ResolvedFiles> {
         safetensors_names.sort();
         let mut safetensors_paths = Vec::new();
         for name in &safetensors_names {
-            safetensors_paths.push(
-                repo.get(name)
-                    .with_context(|| format!("download {name}"))?,
-            );
+            safetensors_paths.push(repo.get(name).with_context(|| format!("download {name}"))?);
         }
         Ok(ResolvedFiles {
             config_path,
@@ -503,9 +508,7 @@ fn load_quant_kernel(
     //   - everything else (embed_tokens) → CPU dequant → bf16 Tensor
     let weight_keys: Vec<String> = all
         .keys()
-        .filter(|k| {
-            k.ends_with(".weight") && all.contains_key(&k.replace(".weight", ".scales"))
-        })
+        .filter(|k| k.ends_with(".weight") && all.contains_key(&k.replace(".weight", ".scales")))
         .cloned()
         .collect();
 
@@ -695,8 +698,7 @@ fn load_weight_map(
         let weight_keys: Vec<String> = all
             .keys()
             .filter(|k| {
-                k.ends_with(".weight")
-                    && all.contains_key(&k.replace(".weight", ".scales"))
+                k.ends_with(".weight") && all.contains_key(&k.replace(".weight", ".scales"))
             })
             .cloned()
             .collect();
@@ -867,8 +869,7 @@ fn dequant_mlx_8bit_to_buf(
         ));
     }
 
-    let mut out_bf16: Vec<half::bf16> =
-        vec![half::bf16::ZERO; out_features * in_features];
+    let mut out_bf16: Vec<half::bf16> = vec![half::bf16::ZERO; out_features * in_features];
 
     // Parallel over output rows. Each row's work touches disjoint output
     // bytes + disjoint slices of w_raw / s_raw / b_raw, so no contention.
@@ -880,22 +881,16 @@ fn dequant_mlx_8bit_to_buf(
             let w_off = o * packs_per_row;
             for p in 0..packs_per_row {
                 let bi = (w_off + p) * 4;
-                let pack = u32::from_le_bytes([
-                    w_raw[bi],
-                    w_raw[bi + 1],
-                    w_raw[bi + 2],
-                    w_raw[bi + 3],
-                ]);
+                let pack =
+                    u32::from_le_bytes([w_raw[bi], w_raw[bi + 1], w_raw[bi + 2], w_raw[bi + 3]]);
                 let base_i = p * 4;
                 for byte_idx in 0..4 {
                     let i = base_i + byte_idx;
                     let q = ((pack >> (8 * byte_idx)) & 0xFF) as f32;
                     let g = i / group_size;
                     let sbi = (s_off + g) * 2;
-                    let scale =
-                        half::f16::from_le_bytes([s_raw[sbi], s_raw[sbi + 1]]).to_f32();
-                    let bias =
-                        half::f16::from_le_bytes([b_raw[sbi], b_raw[sbi + 1]]).to_f32();
+                    let scale = half::f16::from_le_bytes([s_raw[sbi], s_raw[sbi + 1]]).to_f32();
+                    let bias = half::f16::from_le_bytes([b_raw[sbi], b_raw[sbi + 1]]).to_f32();
                     row_out[i] = half::bf16::from_f32(q * scale + bias);
                 }
             }

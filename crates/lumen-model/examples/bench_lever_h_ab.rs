@@ -150,7 +150,10 @@ fn run_subrun(
         println!(
             "BENCH run={label} p={p_idx} n_gen={n_gen} total_ms={total_ms:.2} decode_mean_ms={pooled_mean:.3} decode_tok_per_s={:.2} tokens={}",
             1000.0 / pooled_mean.max(1e-9),
-            out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+            out.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
 
         token_seqs.push(out);
@@ -161,7 +164,13 @@ fn run_subrun(
     let var = step_ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n.max(1.0);
     let sd = var.sqrt();
     let tps = 1000.0 / mean;
-    println!("SUBRUN run={label} n={} mean_ms={:.3} sd_ms={:.3} tok_per_s={:.2}", step_ms.len(), mean, sd, tps);
+    println!(
+        "SUBRUN run={label} n={} mean_ms={:.3} sd_ms={:.3} tok_per_s={:.2}",
+        step_ms.len(),
+        mean,
+        sd,
+        tps
+    );
 
     Ok((step_ms, token_seqs))
 }
@@ -346,11 +355,10 @@ fn cooldown(secs: u64) {
 }
 
 fn main() -> Result<()> {
-    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
-        .context("LUMEN_QWEN35_SHARDS required")?;
+    let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS").context("LUMEN_QWEN35_SHARDS required")?;
     let shard_dir = PathBuf::from(shard_dir);
-    let model_id = std::env::var("MODEL_ID")
-        .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
+    let model_id =
+        std::env::var("MODEL_ID").unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".into());
 
     // Anti-pattern #36 mitigation: log perf-gate env state. Lever H A/B
     // toggles flash_attn directly; surface the surrounding state so the
@@ -371,11 +379,15 @@ fn main() -> Result<()> {
         }
     }
 
-    let quick = std::env::var("KH_BENCH_QUICK").map(|v| v == "1").unwrap_or(false);
+    let quick = std::env::var("KH_BENCH_QUICK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     // dflash (2026-05-02): when set, replaces PROMPTS with a single ~12 K-char
     // long prompt (~2390 tokens) so flash_attn / SDPA benches measure the
     // long-Skv regime where N×N matrix avoidance has theoretical ROI.
-    let long_mode = std::env::var("KH_BENCH_LONG").map(|v| v == "1").unwrap_or(false);
+    let long_mode = std::env::var("KH_BENCH_LONG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let n_prompts: usize = if long_mode {
         1
     } else {
@@ -408,7 +420,10 @@ fn main() -> Result<()> {
         active_prompts_owned
     } else {
         if n_prompts > PROMPTS.len() {
-            anyhow::bail!("KH_BENCH_PROMPTS {n_prompts} > PROMPTS.len() {}", PROMPTS.len());
+            anyhow::bail!(
+                "KH_BENCH_PROMPTS {n_prompts} > PROMPTS.len() {}",
+                PROMPTS.len()
+            );
         }
         PROMPTS.iter().take(n_prompts).copied().collect()
     };
@@ -498,14 +513,23 @@ fn main() -> Result<()> {
     println!();
     println!("======================================================================");
     let bench_target = std::env::var("KH_BENCH_TARGET").unwrap_or_else(|_| "post".into());
-    println!("A/B [{bench_target}] Welch's t pooled n={} per variant", pool_kh0.len());
+    println!(
+        "A/B [{bench_target}] Welch's t pooled n={} per variant",
+        pool_kh0.len()
+    );
     println!("  KH=0 mean: {:.3} ms ({:.2} tok/s)", mean0, 1000.0 / mean0);
     println!("  KH=1 mean: {:.3} ms ({:.2} tok/s)", mean1, 1000.0 / mean1);
     println!("  Δ (KH=1 - KH=0): {delta_ms:+.3} ms ({pct:+.2}%) se={se:.3}");
-    println!("  Welch's σ: {t:+.2}  ({})",
-        if t.abs() >= 5.0 { "STRONG SIGNAL" }
-        else if t.abs() >= 2.0 { "MILD SIGNAL" }
-        else { "WASH (noise)" });
+    println!(
+        "  Welch's σ: {t:+.2}  ({})",
+        if t.abs() >= 5.0 {
+            "STRONG SIGNAL"
+        } else if t.abs() >= 2.0 {
+            "MILD SIGNAL"
+        } else {
+            "WASH (noise)"
+        }
+    );
     println!("======================================================================");
 
     // ── Bit-identical token check across runs ─────────────────────────────
@@ -513,13 +537,19 @@ fn main() -> Result<()> {
     let mut id_match_kh1 = 0usize;
     let mut cross_match = 0usize;
     for p in 0..run1_kh0_tok.len().min(run2_kh0_tok.len()) {
-        if run1_kh0_tok[p] == run2_kh0_tok[p] { id_match_kh0 += 1; }
+        if run1_kh0_tok[p] == run2_kh0_tok[p] {
+            id_match_kh0 += 1;
+        }
     }
     for p in 0..run1_kh1_tok.len().min(run2_kh1_tok.len()) {
-        if run1_kh1_tok[p] == run2_kh1_tok[p] { id_match_kh1 += 1; }
+        if run1_kh1_tok[p] == run2_kh1_tok[p] {
+            id_match_kh1 += 1;
+        }
     }
     for p in 0..run1_kh0_tok.len().min(run1_kh1_tok.len()) {
-        if run1_kh0_tok[p] == run1_kh1_tok[p] { cross_match += 1; }
+        if run1_kh0_tok[p] == run1_kh1_tok[p] {
+            cross_match += 1;
+        }
     }
     let total = run1_kh0_tok.len();
     println!("Bit-identical:");
@@ -532,7 +562,11 @@ fn main() -> Result<()> {
             if run1_kh0_tok[p] != run1_kh1_tok[p] {
                 let kh0 = &run1_kh0_tok[p];
                 let kh1 = &run1_kh1_tok[p];
-                let div_idx = kh0.iter().zip(kh1.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                let div_idx = kh0
+                    .iter()
+                    .zip(kh1.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
                 println!(
                     "  first divergence: prompt {p} at token {div_idx}: KH=0={} KH=1={}",
                     kh0[div_idx], kh1[div_idx]

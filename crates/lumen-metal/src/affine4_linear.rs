@@ -17,13 +17,15 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResourceUsage};
 
-use crate::affine4_gpu::{pick_tile_for_in, Affine4Context, Affine4Weight};
+use crate::affine4_gpu::{Affine4Context, Affine4Weight, pick_tile_for_in};
 use crate::metal::{
     BatchedEncoderExt, Buffer, CommandBufferExt, ComputeEncoderCompat, IndirectCommandBuffer,
 };
 
 fn icb_enabled() -> bool {
-    std::env::var("LUMEN_ICB").map(|v| v == "1").unwrap_or(false)
+    std::env::var("LUMEN_ICB")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 #[repr(C)]
@@ -186,10 +188,7 @@ fn affine4_matmul_tensor(
                 // dot product (`s*Σ(nib*x') + b*Σ(x)`) closes most of the gap
                 // to MLX reference (10.10 → ~13-15 tok/s expected on 27B Dense).
                 let qmv_fast_ok = qmv_fast_enabled()
-                    && Affine4Context::qmv_fast_supports(
-                        weight.in_features,
-                        weight.out_features,
-                    );
+                    && Affine4Context::qmv_fast_supports(weight.in_features, weight.out_features);
 
                 // R4: when qmv_fast doesn't apply but in_features exceeds the
                 // v3 single-shot TG memory budget, use the v3-tiled path.
@@ -215,15 +214,16 @@ fn affine4_matmul_tensor(
                     if proj_candle_queue {
                         if let Device::Metal(metal_dev) = x.device() {
                             let encoder = metal_dev.command_encoder().map_err(|e| {
-                                candle_core::Error::Msg(format!(
-                                    "candle command_encoder: {e}"
-                                ))
+                                candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                             })?;
                             encoder.set_label("lumen:affine4_qmv_fast");
                             ctx.encode_qmv_fast_dispatch(
-                                encoder.as_ref(), weight,
-                                x_buf, x_offset,
-                                y_buf, y_offset,
+                                encoder.as_ref(),
+                                weight,
+                                x_buf,
+                                x_offset,
+                                y_buf,
+                                y_offset,
                                 batch,
                             );
                             drop(encoder);
@@ -234,41 +234,49 @@ fn affine4_matmul_tensor(
                     if let Device::Metal(metal_dev) = x.device() {
                         metal_dev.wait_until_completed()?;
                     }
-                    let encoder = crate::metal::process_commands().command_encoder().expect("ce");
+                    let encoder = crate::metal::process_commands()
+                        .command_encoder()
+                        .expect("ce");
                     encoder.set_label("lumen:affine4_qmv_fast");
                     ctx.encode_qmv_fast_dispatch(
-                        encoder.as_ref(), weight,
-                        x_buf, x_offset,
-                        y_buf, y_offset,
+                        encoder.as_ref(),
+                        weight,
+                        x_buf,
+                        x_offset,
+                        y_buf,
+                        y_offset,
                         batch,
                     );
                     drop(encoder);
-                    crate::metal::process_commands().flush_and_wait().expect("flush");
+                    crate::metal::process_commands()
+                        .flush_and_wait()
+                        .expect("flush");
                     return Ok(y);
                 }
 
                 if let Some((tile_in, n_chunks)) = tile_info {
-                    let scratch_bytes = Affine4Context::tiled_scratch_bytes(
-                        weight.out_features,
-                        batch,
-                        n_chunks,
-                    ) as u64;
+                    let scratch_bytes =
+                        Affine4Context::tiled_scratch_bytes(weight.out_features, batch, n_chunks)
+                            as u64;
                     let scratch = ctx.ctx.buffer_zeroed(scratch_bytes);
 
                     if proj_candle_queue {
                         if let Device::Metal(metal_dev) = x.device() {
                             let encoder = metal_dev.command_encoder().map_err(|e| {
-                                candle_core::Error::Msg(format!(
-                                    "candle command_encoder: {e}"
-                                ))
+                                candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                             })?;
                             encoder.set_label("lumen:affine4_matmul_tiled");
                             ctx.encode_matmul_tiled_dispatch(
-                                encoder.as_ref(), weight,
-                                x_buf, x_offset,
+                                encoder.as_ref(),
+                                weight,
+                                x_buf,
+                                x_offset,
                                 &scratch,
-                                y_buf, y_offset,
-                                tile_in, n_chunks, batch,
+                                y_buf,
+                                y_offset,
+                                tile_in,
+                                n_chunks,
+                                batch,
                             );
                             drop(encoder);
                             return Ok(y);
@@ -278,8 +286,7 @@ fn affine4_matmul_tensor(
                         metal_dev.wait_until_completed()?;
                     }
                     ctx.matmul_tiled_zero_copy(
-                        weight, x_buf, x_offset, y_buf, y_offset,
-                        tile_in, n_chunks, batch,
+                        weight, x_buf, x_offset, y_buf, y_offset, tile_in, n_chunks, batch,
                     )
                     .map_err(|e| candle_core::Error::Msg(format!("affine4 tiled: {e}")))?;
                     return Ok(y);
@@ -288,13 +295,17 @@ fn affine4_matmul_tensor(
                 if proj_candle_queue {
                     if let Device::Metal(metal_dev) = x.device() {
                         let encoder = metal_dev.command_encoder().map_err(|e| {
-                            candle_core::Error::Msg(format!(
-                                "candle command_encoder: {e}"
-                            ))
+                            candle_core::Error::Msg(format!("candle command_encoder: {e}"))
                         })?;
                         encoder.set_label("lumen:affine4_matmul");
                         ctx.encode_matmul_dispatch(
-                            encoder.as_ref(), weight, x_buf, x_offset, y_buf, y_offset, batch,
+                            encoder.as_ref(),
+                            weight,
+                            x_buf,
+                            x_offset,
+                            y_buf,
+                            y_offset,
+                            batch,
                         );
                         drop(encoder);
                         return Ok(y);
@@ -377,10 +388,7 @@ impl Affine4Linear {
         batch: usize,
     ) {
         let qmv_fast_ok = qmv_fast_enabled()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if qmv_fast_ok {
             self.ctx.encode_qmv_fast_dispatch(
                 encoder,
@@ -423,14 +431,12 @@ impl Affine4Linear {
     ///   - `in ≤ 8192`: v3-residual single-shot kernel
     ///   - `in > 8192` with clean tile: v3-tiled + residual-reduce (R4 + residual fusion)
     ///   - else: manual matmul + broadcast_add
-    pub fn forward_with_residual_f32(
-        &self,
-        x: &Tensor,
-        residual: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn forward_with_residual_f32(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
         if !x.device().is_metal() {
             let y = self.forward(x)?;
-            return y.broadcast_add(residual).map_err(|e| anyhow::anyhow!("{e}"));
+            return y
+                .broadcast_add(residual)
+                .map_err(|e| anyhow::anyhow!("{e}"));
         }
         let dims = x.dims();
         let last = dims[dims.len() - 1];
@@ -449,15 +455,19 @@ impl Affine4Linear {
         let residual_f32 = if residual.dtype() == DType::F32 {
             residual.contiguous().map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
-            residual.to_dtype(DType::F32)
+            residual
+                .to_dtype(DType::F32)
                 .and_then(|t| t.contiguous())
                 .map_err(|e| anyhow::anyhow!("{e}"))?
         };
         let y = Tensor::zeros(out_shape.clone(), DType::F32, x.device())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
-        let (r_buf, r_offset) = metal_buffer_of(&residual_f32).ok_or_else(|| anyhow::anyhow!("residual not Metal"))?;
-        let (y_buf, y_offset) = metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
+        let (x_buf, x_offset) =
+            metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
+        let (r_buf, r_offset) =
+            metal_buffer_of(&residual_f32).ok_or_else(|| anyhow::anyhow!("residual not Metal"))?;
+        let (y_buf, y_offset) =
+            metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
 
         // R4 + residual fusion: when in > 8192 but a clean tile exists, use
         // tiled matmul + residual-reduction (saves one downstream broadcast_add
@@ -472,21 +482,24 @@ impl Affine4Linear {
         };
 
         let qmv_fast_ok = qmv_fast_enabled()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
 
         if qmv_fast_ok {
             // P3: MLX-pattern qmv_fast + residual fused.
             if let Device::Metal(metal_dev) = x.device() {
-                let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let encoder = metal_dev
+                    .command_encoder()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 encoder.set_label("lumen:affine4_qmv_fast_residual");
                 self.ctx.encode_qmv_fast_residual_dispatch(
-                    encoder.as_ref(), &self.weight,
-                    x_buf, x_offset,
-                    r_buf, r_offset,
-                    y_buf, y_offset,
+                    encoder.as_ref(),
+                    &self.weight,
+                    x_buf,
+                    x_offset,
+                    r_buf,
+                    r_offset,
+                    y_buf,
+                    y_offset,
                     batch,
                 );
                 drop(encoder);
@@ -494,41 +507,55 @@ impl Affine4Linear {
         } else if self.weight.in_features <= crate::affine4_gpu::AFFINE4_V3_MAX_IN_FEATURES {
             // v3 single-shot fused-residual kernel.
             if let Device::Metal(metal_dev) = x.device() {
-                let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let encoder = metal_dev
+                    .command_encoder()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 encoder.set_label("lumen:affine4_matmul_residual");
                 self.ctx.encode_matmul_residual_dispatch(
-                    encoder.as_ref(), &self.weight,
-                    x_buf, x_offset,
-                    r_buf, r_offset,
-                    y_buf, y_offset,
+                    encoder.as_ref(),
+                    &self.weight,
+                    x_buf,
+                    x_offset,
+                    r_buf,
+                    r_offset,
+                    y_buf,
+                    y_offset,
                     batch,
                 );
                 drop(encoder);
             }
         } else if let Some((tile_in, n_chunks)) = tile_info {
-            let scratch_bytes = Affine4Context::tiled_scratch_bytes(
-                self.weight.out_features,
-                batch,
-                n_chunks,
-            ) as u64;
+            let scratch_bytes =
+                Affine4Context::tiled_scratch_bytes(self.weight.out_features, batch, n_chunks)
+                    as u64;
             let scratch = self.ctx.ctx.buffer_zeroed(scratch_bytes);
             if let Device::Metal(metal_dev) = x.device() {
-                let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let encoder = metal_dev
+                    .command_encoder()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 encoder.set_label("lumen:affine4_matmul_tiled_residual");
                 self.ctx.encode_matmul_tiled_residual_dispatch(
-                    encoder.as_ref(), &self.weight,
-                    x_buf, x_offset,
+                    encoder.as_ref(),
+                    &self.weight,
+                    x_buf,
+                    x_offset,
                     &scratch,
-                    r_buf, r_offset,
-                    y_buf, y_offset,
-                    tile_in, n_chunks, batch,
+                    r_buf,
+                    r_offset,
+                    y_buf,
+                    y_offset,
+                    tile_in,
+                    n_chunks,
+                    batch,
                 );
                 drop(encoder);
             }
         } else {
             // Last-resort fallback: 2-step path.
             let y = self.forward(x)?;
-            return y.broadcast_add(residual).map_err(|e| anyhow::anyhow!("{e}"));
+            return y
+                .broadcast_add(residual)
+                .map_err(|e| anyhow::anyhow!("{e}"));
         }
         Ok(y)
     }
@@ -544,10 +571,7 @@ impl Affine4Linear {
     pub fn forward_bf16_out(&self, x: &Tensor) -> Result<Tensor> {
         let qmv_fast_ok = qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         // bf16-in fast-path: dispatch direct through bf16-in/bf16-out qmv_fast
         // (Workstream A), no f32 widen detour.
         if qmv_fast_ok && x.dtype() == DType::BF16 {
@@ -587,21 +611,34 @@ impl Affine4Linear {
         };
         let y = Tensor::zeros(out_shape.clone(), DType::BF16, x.device())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
-        let (y_buf, y_offset) = metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
+        let (x_buf, x_offset) =
+            metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
+        let (y_buf, y_offset) =
+            metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
 
         if let Device::Metal(metal_dev) = x.device() {
-            let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let encoder = metal_dev
+                .command_encoder()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             encoder.set_label("lumen:affine4_matmul_bf16out");
             self.ctx.encode_matmul_bf16out_dispatch(
-                encoder.as_ref(), &self.weight, x_buf, x_offset, y_buf, y_offset, batch,
+                encoder.as_ref(),
+                &self.weight,
+                x_buf,
+                x_offset,
+                y_buf,
+                y_offset,
+                batch,
             );
             drop(encoder);
         }
         let y = match &self.bias {
             Some(b) => {
-                let b_bf16 = b.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("{e}"))?;
-                y.broadcast_add(&b_bf16).map_err(|e| anyhow::anyhow!("{e}"))?
+                let b_bf16 = b
+                    .to_dtype(DType::BF16)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                y.broadcast_add(&b_bf16)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             }
             None => y,
         };
@@ -621,10 +658,7 @@ impl Affine4Linear {
     pub fn forward_bf16_in_bf16_out(&self, x: &Tensor) -> Result<Tensor> {
         let qmv_fast_ok = qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if !qmv_fast_ok {
             // Fallback: bf16-in path produces f32, then narrow to bf16. Loses
             // output-side BW saving for these shapes; vocab%8≠0 and other
@@ -673,7 +707,9 @@ impl Affine4Linear {
         }
         let y = match &self.bias {
             Some(b) => {
-                let b_bf16 = b.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let b_bf16 = b
+                    .to_dtype(DType::BF16)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 y.broadcast_add(&b_bf16)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
             }
@@ -701,15 +737,14 @@ impl Affine4Linear {
     ) -> Result<Tensor> {
         let qmv_fast_ok = qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if !qmv_fast_ok {
             // Fallback: matmul bf16-in/bf16-out + separate broadcast_add(bf16).
             // Same path as before introducing the fused kernel.
             let y_bf16 = self.forward_bf16_in_bf16_out(x)?;
-            return y_bf16.broadcast_add(residual).map_err(|e| anyhow::anyhow!("{e}"));
+            return y_bf16
+                .broadcast_add(residual)
+                .map_err(|e| anyhow::anyhow!("{e}"));
         }
 
         let dims = x.dims();
@@ -788,10 +823,7 @@ impl Affine4Linear {
         if x.dtype() == DType::BF16
             && qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            )
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features)
         {
             // qmv_fast bf16-in/bf16-out → cast back to f32 to preserve
             // caller contract. Single cast cost ≪ v3 vs qmv_fast gap.
@@ -825,14 +857,24 @@ impl Affine4Linear {
         };
         let y = Tensor::zeros(out_shape.clone(), DType::F32, x.device())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_bf16).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
-        let (y_buf, y_offset) = metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
+        let (x_buf, x_offset) =
+            metal_buffer_of(&x_bf16).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
+        let (y_buf, y_offset) =
+            metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
 
         if let Device::Metal(metal_dev) = x.device() {
-            let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let encoder = metal_dev
+                .command_encoder()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             encoder.set_label("lumen:affine4_matmul_bf16in");
             self.ctx.encode_matmul_bf16in_dispatch(
-                encoder.as_ref(), &self.weight, x_buf, x_offset, y_buf, y_offset, batch,
+                encoder.as_ref(),
+                &self.weight,
+                x_buf,
+                x_offset,
+                y_buf,
+                y_offset,
+                batch,
             );
             drop(encoder);
         }
@@ -886,7 +928,9 @@ impl Affine4Linear {
                 .map_err(|e| anyhow::anyhow!("{e}"))?
         };
         let rms_f32 = if rms_weight.dtype() == DType::F32 {
-            rms_weight.contiguous().map_err(|e| anyhow::anyhow!("{e}"))?
+            rms_weight
+                .contiguous()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
         } else {
             rms_weight
                 .to_dtype(DType::F32)
@@ -907,10 +951,7 @@ impl Affine4Linear {
         // inv_rms reduction, then qmv_fast inner loop with x folded by
         // `inv_rms * rms_weight`. 64 threads/TG, no big TG memory cache.
         let qmv_fast_rms_ok = qmv_fast_enabled()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if qmv_fast_rms_ok {
             if let Device::Metal(metal_dev) = x_raw.device() {
                 let encoder = metal_dev
@@ -948,15 +989,21 @@ impl Affine4Linear {
             .unwrap_or(true);
         if own_queue {
             if let Device::Metal(metal_dev) = x_raw.device() {
-                metal_dev.wait_until_completed().map_err(|e| anyhow::anyhow!("{e}"))?;
+                metal_dev
+                    .wait_until_completed()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             self.ctx
                 .matmul_rmsnorm_zero_copy(
                     &self.weight,
-                    x_buf, x_offset,
-                    rms_buf, rms_offset,
-                    y_buf, y_offset,
-                    rms_eps, batch,
+                    x_buf,
+                    x_offset,
+                    rms_buf,
+                    rms_offset,
+                    y_buf,
+                    y_offset,
+                    rms_eps,
+                    batch,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         } else if let Device::Metal(metal_dev) = x_raw.device() {
@@ -1006,11 +1053,13 @@ impl Affine4Linear {
             // Fallback: standard matmul + manual split + silu*mul.
             let combined = self.forward(x)?;
             let last = combined.dims().len() - 1;
-            let gate = combined.narrow(last, 0, inter)
+            let gate = combined
+                .narrow(last, 0, inter)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .contiguous()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let up = combined.narrow(last, inter, inter)
+            let up = combined
+                .narrow(last, inter, inter)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .contiguous()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1037,14 +1086,25 @@ impl Affine4Linear {
         let y_dtype = if bf16_out { DType::BF16 } else { DType::F32 };
         let y = Tensor::zeros(out_shape.clone(), y_dtype, x.device())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (x_buf, x_offset) = metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
-        let (y_buf, y_offset) = metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
+        let (x_buf, x_offset) =
+            metal_buffer_of(&x_f32).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
+        let (y_buf, y_offset) =
+            metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
 
         if let Device::Metal(metal_dev) = x.device() {
-            let encoder = metal_dev.command_encoder().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let encoder = metal_dev
+                .command_encoder()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             encoder.set_label("lumen:affine4_gate_up_silu_mul");
             self.ctx.encode_gate_up_silu_mul_dispatch(
-                encoder.as_ref(), &self.weight, x_buf, x_offset, y_buf, y_offset, batch, bf16_out,
+                encoder.as_ref(),
+                &self.weight,
+                x_buf,
+                x_offset,
+                y_buf,
+                y_offset,
+                batch,
+                bf16_out,
             );
             drop(encoder);
         }
@@ -1064,10 +1124,7 @@ impl Affine4Linear {
         }
         let qmv_fast_ok = qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if !qmv_fast_ok {
             return self.forward_bf16_in_bf16_out(x);
         }
@@ -1183,10 +1240,7 @@ impl Affine4Linear {
         }
         let qmv_fast_ok = qmv_fast_enabled()
             && x.device().is_metal()
-            && Affine4Context::qmv_fast_supports(
-                self.weight.in_features,
-                self.weight.out_features,
-            );
+            && Affine4Context::qmv_fast_supports(self.weight.in_features, self.weight.out_features);
         if !qmv_fast_ok {
             return self.forward_with_residual_bf16_in_bf16_out(x, residual);
         }
@@ -1215,8 +1269,8 @@ impl Affine4Linear {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (x_buf, x_offset) =
             metal_buffer_of(&x_bf16).ok_or_else(|| anyhow::anyhow!("x not Metal"))?;
-        let (r_buf, r_offset) = metal_buffer_of(&residual_bf16)
-            .ok_or_else(|| anyhow::anyhow!("residual not Metal"))?;
+        let (r_buf, r_offset) =
+            metal_buffer_of(&residual_bf16).ok_or_else(|| anyhow::anyhow!("residual not Metal"))?;
         let (y_buf, y_offset) =
             metal_buffer_of(&y).ok_or_else(|| anyhow::anyhow!("y not Metal"))?;
 
@@ -1284,7 +1338,16 @@ impl Affine4Linear {
         let (wp, ws, wb) = self.weight.buffers();
         // single FFI call for all 8 buffers (was 8 separate).
         encoder.use_buffers_for_icb(
-            &[wp, ws, wb, x_buf, r_buf, y_buf, &cache.dims_buf, &cache.batch_buf],
+            &[
+                wp,
+                ws,
+                wb,
+                x_buf,
+                r_buf,
+                y_buf,
+                &cache.dims_buf,
+                &cache.batch_buf,
+            ],
             usage,
         );
         encoder.execute_commands_in_buffer(&cache.icb_residual, 1);

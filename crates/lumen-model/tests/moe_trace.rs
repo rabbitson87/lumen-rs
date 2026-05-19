@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_core::{safetensors as cst, DType, Device, Tensor, D};
+use candle_core::{D, DType, Device, Tensor, safetensors as cst};
 use candle_nn::{Linear, Module};
 use lumen_model::qwen3_5_moe::moe::{
     MoeDims, SharedExpert, SparseMoeBlock, SparseMoeRuntime, SwitchMlp,
@@ -33,8 +33,23 @@ fn take_u32(map: &HashMap<String, Tensor>, name: &str) -> Tensor {
 
 fn rel_l2(a: &Tensor, b: &Tensor) -> f32 {
     let d = (a - b).unwrap();
-    let n = d.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt();
-    let de = b.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap().sqrt().max(1e-12);
+    let n = d
+        .sqr()
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt();
+    let de = b
+        .sqr()
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap()
+        .sqrt()
+        .max(1e-12);
     n / de
 }
 
@@ -123,7 +138,11 @@ fn sparse_moe_trace_matches_mlx_layer0() {
 
     // 3. Top-k indices: check whether the *sets* agree (ordering may differ).
     let our_sorted = our_probs.arg_sort_last_dim(false).unwrap();
-    let our_inds = our_sorted.narrow(D::Minus1, 0, rt.top_k).unwrap().contiguous().unwrap();
+    let our_inds = our_sorted
+        .narrow(D::Minus1, 0, rt.top_k)
+        .unwrap()
+        .contiguous()
+        .unwrap();
     let ref_inds = take_u32(&trace, "top_k_inds");
     let our_inds_v = our_inds.flatten_all().unwrap().to_vec1::<u32>().unwrap();
     let ref_inds_v = ref_inds.flatten_all().unwrap().to_vec1::<u32>().unwrap();
@@ -137,10 +156,14 @@ fn sparse_moe_trace_matches_mlx_layer0() {
     let mut mismatched_sets = 0;
     let mut near_tie_gaps: Vec<f32> = vec![];
     for t in 0..seq {
-        let ours: std::collections::BTreeSet<u32> =
-            our_inds_v[t * rt.top_k..(t + 1) * rt.top_k].iter().copied().collect();
-        let refs: std::collections::BTreeSet<u32> =
-            ref_inds_v[t * rt.top_k..(t + 1) * rt.top_k].iter().copied().collect();
+        let ours: std::collections::BTreeSet<u32> = our_inds_v[t * rt.top_k..(t + 1) * rt.top_k]
+            .iter()
+            .copied()
+            .collect();
+        let refs: std::collections::BTreeSet<u32> = ref_inds_v[t * rt.top_k..(t + 1) * rt.top_k]
+            .iter()
+            .copied()
+            .collect();
         if ours != refs {
             mismatched_sets += 1;
             let only_ours: Vec<u32> = ours.difference(&refs).copied().collect();
@@ -181,19 +204,31 @@ fn sparse_moe_trace_matches_mlx_layer0() {
     let denom = our_scores.sum_keepdim(D::Minus1).unwrap();
     let our_scores_norm = our_scores.broadcast_div(&denom).unwrap();
     let ref_scores = take_f32(&trace, "top_k_scores");
-    let our_scores_v = our_scores_norm.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let our_scores_v = our_scores_norm
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     let ref_scores_v = ref_scores.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let mut max_shared_score_diff = 0f32;
     for t in 0..seq {
         let ours: HashMap<u32, f32> = our_inds_v[t * rt.top_k..(t + 1) * rt.top_k]
             .iter()
             .copied()
-            .zip(our_scores_v[t * rt.top_k..(t + 1) * rt.top_k].iter().copied())
+            .zip(
+                our_scores_v[t * rt.top_k..(t + 1) * rt.top_k]
+                    .iter()
+                    .copied(),
+            )
             .collect();
         let refs: HashMap<u32, f32> = ref_inds_v[t * rt.top_k..(t + 1) * rt.top_k]
             .iter()
             .copied()
-            .zip(ref_scores_v[t * rt.top_k..(t + 1) * rt.top_k].iter().copied())
+            .zip(
+                ref_scores_v[t * rt.top_k..(t + 1) * rt.top_k]
+                    .iter()
+                    .copied(),
+            )
             .collect();
         for (e, o) in &ours {
             if let Some(r) = refs.get(e) {

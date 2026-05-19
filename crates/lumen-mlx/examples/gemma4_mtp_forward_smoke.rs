@@ -20,9 +20,8 @@ fn main() -> Result<()> {
     use mlx_rs::Array;
     use mlx_rs::Dtype;
 
-    let dir = std::env::var("DRAFTER_DIR").unwrap_or_else(|_| {
-        "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into()
-    });
+    let dir = std::env::var("DRAFTER_DIR")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
     eprintln!("[mtp-fwd-smoke] loading drafter from {dir}");
     let drafter = load_drafter(Path::new(&dir)).context("load_drafter")?;
 
@@ -40,8 +39,12 @@ fn main() -> Result<()> {
 
     let mk_random = |shape: &[i32]| -> Array {
         let n: usize = shape.iter().map(|d| *d as usize).product();
-        let vals: Vec<f32> = (0..n).map(|i| 0.01_f32 * ((i % 100) as f32 - 50.0)).collect();
-        Array::from_slice(&vals, shape).as_dtype(Dtype::Bfloat16).unwrap()
+        let vals: Vec<f32> = (0..n)
+            .map(|i| 0.01_f32 * ((i % 100) as f32 - 50.0))
+            .collect();
+        Array::from_slice(&vals, shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
     };
 
     let trunk_embed = mk_random(&[1, 1, backbone]); // [1, 1, 2816]
@@ -51,7 +54,9 @@ fn main() -> Result<()> {
     let k_sliding = mk_random(&[1, n_kv_sliding, t_sliding, head_dim_sliding]); // [1, 8, T, 256]
     let v_sliding = mk_random(&[1, n_kv_sliding, t_sliding, head_dim_sliding]);
 
-    eprintln!("[mtp-fwd-smoke] running draft_step (position={position}, t_full={t_full}, t_sliding={t_sliding})");
+    eprintln!(
+        "[mtp-fwd-smoke] running draft_step (position={position}, t_full={t_full}, t_sliding={t_sliding})"
+    );
     let h_trunk = drafter
         .draft_step(
             &trunk_embed,
@@ -78,7 +83,9 @@ fn main() -> Result<()> {
 
     // Force eval and sniff finiteness via a few elementwise loads.
     h_trunk.eval().context("eval draft_step output")?;
-    let casted = h_trunk.as_dtype(Dtype::Float32).context("cast to f32 for sniff")?;
+    let casted = h_trunk
+        .as_dtype(Dtype::Float32)
+        .context("cast to f32 for sniff")?;
     let flat = mlx_rs::ops::reshape(&casted, &[backbone]).context("reshape flat")?;
     flat.eval().context("eval flat")?;
     let vals: Vec<f32> = flat.as_slice::<f32>().to_vec();

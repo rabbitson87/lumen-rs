@@ -52,9 +52,8 @@ mod imp {
         }
 
         pub fn set_grid(&self, g1: i32, g2: i32, g3: i32) -> Result<()> {
-            let status = unsafe {
-                mlx_sys::mlx_fast_metal_kernel_config_set_grid(self.inner, g1, g2, g3)
-            };
+            let status =
+                unsafe { mlx_sys::mlx_fast_metal_kernel_config_set_grid(self.inner, g1, g2, g3) };
             if status != 0 {
                 return Err(anyhow!(
                     "mlx_fast_metal_kernel_config_set_grid returned {status}"
@@ -76,8 +75,8 @@ mod imp {
         }
 
         pub fn add_template_arg_dtype(&self, name: &str, dtype: Dtype) -> Result<()> {
-            let cname = CString::new(name)
-                .map_err(|_| anyhow!("template arg name contains nul byte"))?;
+            let cname =
+                CString::new(name).map_err(|_| anyhow!("template arg name contains nul byte"))?;
             let status = unsafe {
                 mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
                     self.inner,
@@ -94,8 +93,8 @@ mod imp {
         }
 
         pub fn add_template_arg_int(&self, name: &str, value: i32) -> Result<()> {
-            let cname = CString::new(name)
-                .map_err(|_| anyhow!("template arg name contains nul byte"))?;
+            let cname =
+                CString::new(name).map_err(|_| anyhow!("template arg name contains nul byte"))?;
             let status = unsafe {
                 mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
                     self.inner,
@@ -113,8 +112,8 @@ mod imp {
 
         #[allow(dead_code)]
         pub fn add_template_arg_bool(&self, name: &str, value: bool) -> Result<()> {
-            let cname = CString::new(name)
-                .map_err(|_| anyhow!("template arg name contains nul byte"))?;
+            let cname =
+                CString::new(name).map_err(|_| anyhow!("template arg name contains nul byte"))?;
             let status = unsafe {
                 mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
                     self.inner,
@@ -157,8 +156,7 @@ mod imp {
             ensure_row_contiguous: bool,
             atomic_outputs: bool,
         ) -> Result<Self> {
-            let cname =
-                CString::new(name).map_err(|_| anyhow!("kernel name contains nul byte"))?;
+            let cname = CString::new(name).map_err(|_| anyhow!("kernel name contains nul byte"))?;
             let csource =
                 CString::new(source).map_err(|_| anyhow!("kernel source contains nul byte"))?;
             // Empty header — we don't use additional code injection.
@@ -181,9 +179,8 @@ mod imp {
             for name in input_names {
                 let cs = CString::new(*name)
                     .map_err(|_| anyhow!("input name contains nul byte: {name}"))?;
-                let status = unsafe {
-                    mlx_sys::mlx_vector_string_append_value(inputs_guard.0, cs.as_ptr())
-                };
+                let status =
+                    unsafe { mlx_sys::mlx_vector_string_append_value(inputs_guard.0, cs.as_ptr()) };
                 name_storage.push(cs);
                 if status != 0 {
                     return Err(anyhow!(
@@ -250,9 +247,8 @@ mod imp {
             let input_vec = unsafe { mlx_sys::mlx_vector_array_new() };
             let input_guard = VecArrayGuard(input_vec);
             for arr in inputs {
-                let status = unsafe {
-                    mlx_sys::mlx_vector_array_append_value(input_guard.0, arr.as_ptr())
-                };
+                let status =
+                    unsafe { mlx_sys::mlx_vector_array_append_value(input_guard.0, arr.as_ptr()) };
                 if status != 0 {
                     return Err(anyhow!(
                         "mlx_vector_array_append_value (input) returned {status}"
@@ -294,17 +290,13 @@ mod imp {
             let mut outputs = Vec::with_capacity(num_outputs);
             for i in 0..num_outputs {
                 let mut raw: mlx_sys::mlx_array = unsafe { mlx_sys::mlx_array_new() };
-                let s = unsafe {
-                    mlx_sys::mlx_vector_array_get(&mut raw, outputs_raw, i)
-                };
+                let s = unsafe { mlx_sys::mlx_vector_array_get(&mut raw, outputs_raw, i) };
                 if s != 0 {
                     unsafe {
                         let _ = mlx_sys::mlx_array_free(raw);
                         let _ = mlx_sys::mlx_vector_array_free(outputs_raw);
                     }
-                    return Err(anyhow!(
-                        "mlx_vector_array_get(output {i}) returned {s}"
-                    ));
+                    return Err(anyhow!("mlx_vector_array_get(output {i}) returned {s}"));
                 }
                 outputs.push(unsafe { Array::from_ptr(raw) });
             }

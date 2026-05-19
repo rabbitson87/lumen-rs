@@ -6,7 +6,7 @@
 
 use half::bf16;
 use lumen_metal::affine8_gpu::{
-    cpu_reference_matmul_bf16, AFFINE8_GROUP_SIZE, Affine8Context, Affine8Weight,
+    AFFINE8_GROUP_SIZE, Affine8Context, Affine8Weight, cpu_reference_matmul_bf16,
 };
 
 fn make_ctx_or_skip() -> Option<Affine8Context> {
@@ -21,7 +21,9 @@ fn make_ctx_or_skip() -> Option<Affine8Context> {
 
 #[test]
 fn affine8_matmul_bf16_identity_ones() {
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 64;
     let out = 2;
     let batch = 1;
@@ -43,7 +45,9 @@ fn affine8_matmul_bf16_identity_ones() {
     let x_bf16: Vec<u16> = vec![bf16::from_f32(1.0).to_bits(); batch * in_f];
 
     let weight = Affine8Weight::from_host(&ctx.ctx, &packed, &scales, &biases, out, in_f).unwrap();
-    let gpu = ctx.matmul_bf16_with_weight(&weight, &x_bf16, batch).unwrap();
+    let gpu = ctx
+        .matmul_bf16_with_weight(&weight, &x_bf16, batch)
+        .unwrap();
     let cpu = cpu_reference_matmul_bf16(&packed, &scales, &biases, &x_bf16, out, in_f, batch);
 
     for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
@@ -58,7 +62,9 @@ fn affine8_matmul_bf16_identity_ones() {
 
 #[test]
 fn affine8_matmul_bf16_random() {
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 128;
     let out = 8;
     let batch = 3;
@@ -92,7 +98,9 @@ fn affine8_matmul_bf16_random() {
         .collect();
 
     let weight = Affine8Weight::from_host(&ctx.ctx, &packed, &scales, &biases, out, in_f).unwrap();
-    let gpu = ctx.matmul_bf16_with_weight(&weight, &x_bf16, batch).unwrap();
+    let gpu = ctx
+        .matmul_bf16_with_weight(&weight, &x_bf16, batch)
+        .unwrap();
     let cpu = cpu_reference_matmul_bf16(&packed, &scales, &biases, &x_bf16, out, in_f, batch);
 
     let mut max_err = 0f32;
@@ -115,7 +123,9 @@ fn affine8_linear_candle_tensor_batches() {
     use lumen_metal::affine8_linear::Affine8Linear;
     use std::sync::Arc;
 
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 128;
     let out = 32;
     let batch = 4;
@@ -182,7 +192,9 @@ fn affine8_linear_candle_tensor_batches() {
 /// Regression guard against an accidentally-broken batch index in the kernel.
 #[test]
 fn affine8_matmul_bf16_distinguishes_batches() {
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 64;
     let out = 4;
     let batch = 2;
@@ -206,7 +218,9 @@ fn affine8_matmul_bf16_distinguishes_batches() {
     }
 
     let weight = Affine8Weight::from_host(&ctx.ctx, &packed, &scales, &biases, out, in_f).unwrap();
-    let gpu = ctx.matmul_bf16_with_weight(&weight, &x_bf16, batch).unwrap();
+    let gpu = ctx
+        .matmul_bf16_with_weight(&weight, &x_bf16, batch)
+        .unwrap();
 
     for o in 0..out {
         let y0 = bf16::from_bits(gpu[o]).to_f32();
@@ -226,7 +240,9 @@ fn affine8_linear_candle_3d_input() {
     use lumen_metal::affine8_linear::Affine8Linear;
     use std::sync::Arc;
 
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 1024;
     let out = 2048;
     let b = 3;
@@ -303,7 +319,9 @@ fn affine8_linear_candle_q_proj_shape() {
     use lumen_metal::affine8_linear::Affine8Linear;
     use std::sync::Arc;
 
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 1024;
     let out = 2048;
     let batch = 21; // b * max_len = 3 * 7 (smoke shape)
@@ -362,10 +380,7 @@ fn affine8_linear_candle_q_proj_shape() {
                 max_err = rel;
             }
         }
-        assert!(
-            max_err < 0.1,
-            "row {r}: max_rel_err {max_err:.4} > 10%"
-        );
+        assert!(max_err < 0.1, "row {r}: max_rel_err {max_err:.4} > 10%");
     }
 }
 
@@ -373,7 +388,9 @@ fn affine8_linear_candle_q_proj_shape() {
 fn affine8_matmul_bf16_qwen3_embedding_shape() {
     // Sanity-check a shape that matches one of Qwen3-Embedding's actual
     // projections (k_proj in: 1024 → out: 1024 with GQA num_kv_heads=8 × head_dim=128).
-    let Some(ctx) = make_ctx_or_skip() else { return };
+    let Some(ctx) = make_ctx_or_skip() else {
+        return;
+    };
     let in_f = 1024;
     let out = 1024;
     let batch = 4;
@@ -407,7 +424,9 @@ fn affine8_matmul_bf16_qwen3_embedding_shape() {
         .collect();
 
     let weight = Affine8Weight::from_host(&ctx.ctx, &packed, &scales, &biases, out, in_f).unwrap();
-    let gpu = ctx.matmul_bf16_with_weight(&weight, &x_bf16, batch).unwrap();
+    let gpu = ctx
+        .matmul_bf16_with_weight(&weight, &x_bf16, batch)
+        .unwrap();
     let cpu = cpu_reference_matmul_bf16(&packed, &scales, &biases, &x_bf16, out, in_f, batch);
 
     let mut max_err = 0f32;

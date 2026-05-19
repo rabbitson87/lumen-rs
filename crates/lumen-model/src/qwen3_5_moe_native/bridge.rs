@@ -9,7 +9,7 @@
 //! is the slow path used only by tests; the production forward keeps every
 //! activation on Metal.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Storage, Tensor};
 
 use lumen_metal::metal::Buffer;

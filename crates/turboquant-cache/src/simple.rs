@@ -151,9 +151,9 @@ impl KVCache for SimpleCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_core::config::TurboQuantConfig;
     use rand::prelude::*;
     use rand_distr::StandardNormal;
-    use lumen_core::config::TurboQuantConfig;
 
     #[test]
     fn store_and_attend() {

@@ -948,7 +948,11 @@ mod imp {
                 model: None,
                 seqs: HashMap::new(),
                 timing_log: if any_timing { Some(Vec::new()) } else { None },
-                fine_timing_log: if timing_enabled { Some(Vec::new()) } else { None },
+                fine_timing_log: if timing_enabled {
+                    Some(Vec::new())
+                } else {
+                    None
+                },
                 snapshots: HashMap::new(),
                 next_snapshot_id: 1,
             })
@@ -970,9 +974,8 @@ mod imp {
 
         pub(crate) fn load(&mut self, model_id: &str) -> Result<LoadInfo> {
             let resolved = resolve_model_dir(model_id)?;
-            let model = NativeQwen3_5MoeModel::load(&resolved).with_context(|| {
-                format!("native mlx-rs runner: load `{}`", resolved.display())
-            })?;
+            let model = NativeQwen3_5MoeModel::load(&resolved)
+                .with_context(|| format!("native mlx-rs runner: load `{}`", resolved.display()))?;
             let info = LoadInfo {
                 eos_tokens: model.eos_tokens().to_vec(),
                 vocab_size: model.vocab_size(),
@@ -1042,14 +1045,11 @@ mod imp {
                 );
                 eprintln!(
                     "[native-prefill]   moe_sub: routing={:.2} switch_glu={:.2} shared_expert={:.2}",
-                    fine.moe_routing_ms,
-                    fine.moe_switch_glu_ms,
-                    fine.moe_shared_expert_ms,
+                    fine.moe_routing_ms, fine.moe_switch_glu_ms, fine.moe_shared_expert_ms,
                 );
             }
             let position = tokens.len();
-            self.seqs
-                .insert(seq_id, NativeSeqState { cache, position });
+            self.seqs.insert(seq_id, NativeSeqState { cache, position });
             Ok((next_tok, position))
         }
 
@@ -1107,17 +1107,17 @@ mod imp {
             // Python reference path.
             let (logits, captured) = model
                 .forward_with_capture(
-                    tokens, &mut cache, /* last_only */ false, capture_layer_ids,
+                    tokens,
+                    &mut cache,
+                    /* last_only */ false,
+                    capture_layer_ids,
                 )
                 .with_context(|| {
-                    format!(
-                        "native mlx-rs runner: prefill_with_capture forward (seq_id={seq_id})"
-                    )
+                    format!("native mlx-rs runner: prefill_with_capture forward (seq_id={seq_id})")
                 })?;
             let next_tok = model.argmax_last_token(&logits)?;
             let position = tokens.len();
-            self.seqs
-                .insert(seq_id, NativeSeqState { cache, position });
+            self.seqs.insert(seq_id, NativeSeqState { cache, position });
             Ok((next_tok, position, captured))
         }
 
@@ -1326,7 +1326,9 @@ mod imp {
             })?;
             let logits = model
                 .forward_with_opts(tokens, &mut state.cache, /* last_only */ true)
-                .with_context(|| format!("native mlx-rs runner: extend forward (seq_id={seq_id})"))?;
+                .with_context(|| {
+                    format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
+                })?;
             let next_tok = model.argmax_last_token(&logits)?;
             state.position += tokens.len();
             Ok((next_tok, state.position))
@@ -1351,11 +1353,9 @@ mod imp {
                 anyhow!("native mlx-rs runner: forward_probe on unknown seq_id {seq_id}")
             })?;
 
-            let logits = model
-                .forward(tokens, &mut state.cache)
-                .with_context(|| {
-                    format!("native mlx-rs runner: forward_probe forward (seq_id={seq_id})")
-                })?;
+            let logits = model.forward(tokens, &mut state.cache).with_context(|| {
+                format!("native mlx-rs runner: forward_probe forward (seq_id={seq_id})")
+            })?;
             if logits.ndim() != 3 {
                 return Err(anyhow!(
                     "native mlx-rs runner: forward_probe expected [B, K, V] logits, got ndim={}",
@@ -1371,12 +1371,11 @@ mod imp {
                 .context("native mlx-rs runner: forward_probe take_axis(B=0) failed")?;
 
             // Per-row argmax over the vocab axis → [K] u32.
-            let argmaxes =
-                mlx_rs::ops::indexing::argmax_axis(&kv, -1, /* keep_dims */ false)
-                    .context("native mlx-rs runner: forward_probe argmax_axis failed")?;
+            let argmaxes = mlx_rs::ops::indexing::argmax_axis(&kv, -1, /* keep_dims */ false)
+                .context("native mlx-rs runner: forward_probe argmax_axis failed")?;
             // Per-row max(|logit|) over the vocab axis → [K] f32.
-            let abs_kv = mlx_rs::ops::abs(&kv)
-                .context("native mlx-rs runner: forward_probe abs failed")?;
+            let abs_kv =
+                mlx_rs::ops::abs(&kv).context("native mlx-rs runner: forward_probe abs failed")?;
             let max_abs = mlx_rs::ops::max_axis(&abs_kv, -1, /* keep_dims */ false)
                 .context("native mlx-rs runner: forward_probe max_axis failed")?;
 
@@ -1409,34 +1408,27 @@ mod imp {
             let seq = self.seqs.get(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: snapshot_state — unknown seq_id {seq_id}")
             })?;
-            let snap = PromptCacheSnapshot::capture_shallow(&seq.cache, seq.position).context(
-                "native mlx-rs runner: snapshot_state — capture_shallow failed",
-            )?;
+            let snap = PromptCacheSnapshot::capture_shallow(&seq.cache, seq.position)
+                .context("native mlx-rs runner: snapshot_state — capture_shallow failed")?;
             let sid = self.next_snapshot_id;
-            self.next_snapshot_id = self.next_snapshot_id.checked_add(1).ok_or_else(|| {
-                anyhow!("native mlx-rs runner: snapshot_id counter exhausted")
-            })?;
+            self.next_snapshot_id = self
+                .next_snapshot_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("native mlx-rs runner: snapshot_id counter exhausted"))?;
             self.snapshots.insert(sid, snap);
             Ok(sid)
         }
 
-        pub(crate) fn restore_state(
-            &mut self,
-            seq_id: u64,
-            snapshot_id: u64,
-        ) -> Result<usize> {
+        pub(crate) fn restore_state(&mut self, seq_id: u64, snapshot_id: u64) -> Result<usize> {
             // Mirror PyO3 `restore_state`: snapshot is consumed (1-shot).
             let snap = self.snapshots.remove(&snapshot_id).ok_or_else(|| {
-                anyhow!(
-                    "native mlx-rs runner: restore_state — unknown snapshot_id {snapshot_id}"
-                )
+                anyhow!("native mlx-rs runner: restore_state — unknown snapshot_id {snapshot_id}")
             })?;
             let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: restore_state — unknown seq_id {seq_id}")
             })?;
-            snap.restore_into(&mut seq.cache).context(
-                "native mlx-rs runner: restore_state — restore_into failed",
-            )?;
+            snap.restore_into(&mut seq.cache)
+                .context("native mlx-rs runner: restore_state — restore_into failed")?;
             seq.position = snap.position();
             Ok(snap.position())
         }
@@ -1451,14 +1443,14 @@ mod imp {
             let seq = self.seqs.get(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: snapshot_state_deep — unknown seq_id {seq_id}")
             })?;
-            let snap = PromptCacheSnapshot::capture_deep(&seq.cache, seq.position).context(
-                "native mlx-rs runner: snapshot_state_deep — capture_deep failed",
-            )?;
+            let snap = PromptCacheSnapshot::capture_deep(&seq.cache, seq.position)
+                .context("native mlx-rs runner: snapshot_state_deep — capture_deep failed")?;
             let position = snap.position();
             let sid = self.next_snapshot_id;
-            self.next_snapshot_id = self.next_snapshot_id.checked_add(1).ok_or_else(|| {
-                anyhow!("native mlx-rs runner: snapshot_id counter exhausted")
-            })?;
+            self.next_snapshot_id = self
+                .next_snapshot_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("native mlx-rs runner: snapshot_id counter exhausted"))?;
             self.snapshots.insert(sid, snap);
             Ok((sid, position))
         }
@@ -1486,9 +1478,8 @@ mod imp {
             // they were all built from the same model. If no seqs exist yet,
             // fall back to constructing from the model's layer types.
             let mut fresh = self.require_model()?.make_cache();
-            snap.install_into_fresh(&mut fresh).context(
-                "native mlx-rs runner: fork_from_snapshot — install_into_fresh failed",
-            )?;
+            snap.install_into_fresh(&mut fresh)
+                .context("native mlx-rs runner: fork_from_snapshot — install_into_fresh failed")?;
             let position = snap.position();
             self.seqs.insert(
                 dst_seq_id,
@@ -1621,8 +1612,7 @@ mod imp {
 
         #[test]
         fn native_model_config_accepts_checked_in_qwen3_5_moe_fixture() -> Result<()> {
-            let fixture =
-                include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+            let fixture = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
             let config: NativeModelConfig = serde_json::from_str(fixture)?;
             let text = config.validate_qwen3_5_moe_contract()?;
 
