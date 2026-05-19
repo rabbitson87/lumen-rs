@@ -161,6 +161,10 @@ pub(crate) mod imp {
                 stop_on_eos: true,
             };
             let stats = self.model.generate(input_ids, &cfg)?;
+            eprintln!(
+                "[gemma4] completion done: {} tokens in {:.0}ms ({:.1} tok/s)",
+                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            );
             Ok(stats.generated_tokens)
         }
 
@@ -181,6 +185,10 @@ pub(crate) mod imp {
                 stop_on_eos: true,
             };
             let stats = self.model.generate(&prompt, &cfg)?;
+            eprintln!(
+                "[gemma4] chat done: {} tokens in {:.0}ms ({:.1} tok/s)",
+                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            );
 
             let mut parser = ResponseParser::new(&self.chat);
             for token in &stats.generated_tokens {
@@ -270,6 +278,10 @@ pub(crate) mod imp {
                 .model
                 .generate_with_cache(suffix, &cfg, Some(&mut cache))
                 .context("chat_with_prefix_cache: generate_with_cache")?;
+            eprintln!(
+                "[gemma4] chat done: {} tokens in {:.0}ms ({:.1} tok/s)",
+                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            );
 
             // ── Snapshot post-prompt state as the new master ──
             // After generate, `cache.offset()` is well past `prompt.len()`
@@ -560,6 +572,7 @@ pub(crate) mod imp {
                 let mut capture_stopped = false;
 
                 let mut count = 0usize;
+                let t_decode = std::time::Instant::now();
                 loop {
                     if count + 1 == max_new_tokens {
                         // Last token: read sync, emit, done.
@@ -679,6 +692,15 @@ pub(crate) mod imp {
                     }
                     current = next_lazy;
                 }
+                let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+                let tok_per_sec = if decode_ms > 0.0 && count > 0 {
+                    count as f64 / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[gemma4] chat done: {count} tokens in {decode_ms:.0}ms ({tok_per_sec:.1} tok/s)"
+                );
 
                 // Defensive: ensure capture is stopped even if loop ends early
                 // (e.g. EOS before capture_steps reached).

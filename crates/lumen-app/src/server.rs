@@ -125,11 +125,20 @@ pub struct ServerMetricsSnapshot {
     pub requests_per_min: Option<u32>,
 }
 
-/// Extract a `tok/s` reading from a single log line, if present. Handles both
-/// log conventions: `(<N> tok/s)` from done events and
-/// `steady_rate_recv=<N>tok/s` from the SSE stream-timing line. Returns the
-/// first match — both formats are unique enough that the simple substring
-/// scan won't false-positive on incidental occurrences in unrelated logs.
+/// Extract a `tok/s` reading from a single log line, if present.
+///
+/// Recognized formats — see `docs/backend-metrics-convention.md` for the
+/// rationale and the rules any new backend must follow:
+///
+/// 1. `... done: <N> tokens in <T>ms (<R> tok/s)` — decode-finalization
+///    emission. The `done:` keyword distinguishes this from prefill /
+///    per-step / EOS-mid-decode logs that also carry a `tok/s` reading
+///    but are not the canonical end-of-request rate.
+/// 2. `steady_rate_recv=<R>tok/s` — SSE stream-timing line (opt-in via
+///    `LUMEN_STREAM_TIMING=1`).
+///
+/// Returns `None` for any other shape so prefill / per-step / aggregate
+/// lines don't pollute the EMA.
 fn parse_tok_per_sec(line: &str) -> Option<f64> {
     if let Some(rest) = line.split("steady_rate_recv=").nth(1) {
         // "23.45tok/s last_write..." — take up to "tok/s"
@@ -138,8 +147,13 @@ fn parse_tok_per_sec(line: &str) -> Option<f64> {
             return Some(v);
         }
     }
+    // Require "done:" before the rate so we only sample the final
+    // end-of-decode emission, not prefill / per-step diagnostics that
+    // also format their rate as "(N.N tok/s)".
+    if !line.contains("done:") {
+        return None;
+    }
     if let Some(idx) = line.find(" tok/s)") {
-        // Walk backwards from the closing paren collecting the number.
         let prefix = &line[..idx];
         let num: String = prefix
             .chars()
@@ -185,6 +199,30 @@ mod parse_tests {
     fn rejects_unrelated_lines() {
         assert!(parse_tok_per_sec("Loading model: foo").is_none());
         assert!(parse_tok_per_sec("Error: tok/s computed wrong").is_none());
+    }
+
+    #[test]
+    fn rejects_prefill_line() {
+        // Prefill lines look almost identical to done lines but represent
+        // prompt-processing throughput, not decode rate — must be ignored.
+        let line = "[mlx] seq 7 prefill: 4096 tokens in 1500ms (2730.7 tok/s) -> tok=42";
+        assert!(parse_tok_per_sec(line).is_none());
+    }
+
+    #[test]
+    fn rejects_eos_mid_decode() {
+        // The mid-decode EOS log carries an instantaneous rate but isn't
+        // the canonical end-of-request signal — the trailing "done:" line
+        // is what we want to sample.
+        let line = "[mlx] seq 7 EOS at step 42 (28.3 tok/s)";
+        assert!(parse_tok_per_sec(line).is_none());
+    }
+
+    #[test]
+    fn parses_gemma4_done() {
+        // gemma4_backend emits this format from chat / completion paths.
+        let line = "[gemma4] chat done: 42 tokens in 1530ms (27.5 tok/s)";
+        assert!((parse_tok_per_sec(line).unwrap() - 27.5).abs() < 1e-6);
     }
 }
 
