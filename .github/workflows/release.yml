@@ -20,6 +20,14 @@ on:
   # release named `vTEST-<sha>`). Useful when iterating on this workflow.
   workflow_dispatch:
 
+# tauri-action creates a draft GitHub Release + uploads bundle artifacts,
+# which requires write access to repo contents. Without this block the
+# default token is read-only on repos with restrictive Actions settings,
+# and the release-creation step fails with
+# "Resource not accessible by integration".
+permissions:
+  contents: write
+
 jobs:
   build:
     name: build ${{ matrix.target }}
