@@ -68,7 +68,15 @@ fn main() -> Result<()> {
     let mut backend = MlxBackend::load(&model_id)?;
     println!("loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
+    // Phase 1 microbench drives the low-level `prefill / forward_probe /
+    // snapshot_state_deep / restore_state / remove_seq` API which lives on
+    // the family-specific backend. Escape hatch via `as_qwen35_mut()` per
+    // the doc on that method ("examples + benchmarks that drive the
+    // low-level API use this").
     let prompt_ids = backend.encode(DEFAULT_PROMPT)?;
+    let backend = backend
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("S-scaling gate requires the Qwen3.5 family backend"))?;
     println!(
         "prompt: {} chars -> {} tokens",
         DEFAULT_PROMPT.len(),

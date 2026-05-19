@@ -614,7 +614,306 @@ fn format_system_prefix(message: &(String, String)) -> String {
     s
 }
 
-pub struct MlxBackend {
+/// Unified mlx-native backend. Wraps either the Qwen3.5/3.6 family or the
+/// Gemma 4 family — both run on the same mlx-rs FFI + Metal kernels +
+/// shared `native_*` infrastructure (cache, attention, RoPE, RMSNorm). The
+/// only difference is the model-assembly module on top, which has its own
+/// config schema + tokenizer + chat template per family.
+///
+/// Adding a new family:
+/// 1. Drop a `<family>_moe.rs` (or equivalent) next to `qwen3_5_moe.rs`
+///    using the shared `native_*` primitives
+/// 2. Add a variant to this enum + `MlxBackendKind`
+/// 3. Wire arch detection in `MlxBackend::load`
+pub enum MlxBackend {
+    /// Qwen 2.5 / 3.5 / 3.6 (dense + MoE). Loaded via `NativeMlxRunner`
+    /// (or the legacy pyo3 / subprocess runners for fallback).
+    Qwen35Family(MlxQwen35Backend),
+    /// Gemma 4 26B-A4B MoE (3-bit / 4-bit MLX shards).
+    #[cfg(feature = "mlx-native")]
+    Gemma4(crate::gemma4::Gemma4Backend),
+}
+
+impl MlxBackend {
+    /// Load a model, picking the correct family path from `model_id` (a
+    /// local directory or an HF Hub repo id). Family detection is
+    /// substring-based; explicit override via `LUMEN_MLX_FAMILY=gemma4|qwen`
+    /// is accepted as an escape hatch.
+    pub fn load(model_id: &str) -> Result<Self> {
+        let family = detect_mlx_family(model_id);
+        match family {
+            #[cfg(feature = "mlx-native")]
+            MlxFamily::Gemma4 => {
+                use std::path::PathBuf;
+                let dir = if std::path::Path::new(model_id).is_dir() {
+                    PathBuf::from(model_id)
+                } else if let Ok(d) = std::env::var("LUMEN_GEMMA4_DIR") {
+                    PathBuf::from(d)
+                } else {
+                    return Err(anyhow!(
+                        "Gemma 4 native MLX requires either MODEL_ID pointing at an \
+                         existing local directory or LUMEN_GEMMA4_DIR=<dir>"
+                    ));
+                };
+                let inner = crate::gemma4::Gemma4Backend::from_dir(model_id, &dir)?;
+                Ok(Self::Gemma4(inner))
+            }
+            MlxFamily::Qwen35 => {
+                let inner = MlxQwen35Backend::load(model_id)?;
+                Ok(Self::Qwen35Family(inner))
+            }
+        }
+    }
+
+    /// Escape hatch: return a mutable reference to the inner Qwen3.5
+    /// backend if this is one. Examples + benchmarks that drive the
+    /// low-level `prefill` / `decode_step` / `snapshot_state` API directly
+    /// use this; production code paths in the engine should go through the
+    /// unified `chat` / `chat_streaming` / `generate` methods instead.
+    pub fn as_qwen35_mut(&mut self) -> Option<&mut MlxQwen35Backend> {
+        match self {
+            Self::Qwen35Family(m) => Some(m),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(_) => None,
+        }
+    }
+
+    /// Same as [`as_qwen35_mut`] but borrows immutably.
+    pub fn as_qwen35(&self) -> Option<&MlxQwen35Backend> {
+        match self {
+            Self::Qwen35Family(m) => Some(m),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(_) => None,
+        }
+    }
+
+    /// Public discriminant for callers that need to branch on family
+    /// (typically only the engine layer, e.g. for picking session vs
+    /// prefix-cache semantics).
+    pub fn kind(&self) -> MlxBackendKind {
+        match self {
+            Self::Qwen35Family(_) => MlxBackendKind::Qwen35Family,
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(_) => MlxBackendKind::Gemma4,
+        }
+    }
+
+    pub fn model_id(&self) -> &str {
+        match self {
+            Self::Qwen35Family(m) => m.model_id(),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.model_id(),
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::Qwen35Family(m) => m.encode(text),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.encode(text),
+        }
+    }
+
+    pub fn decode(&self, tokens: &[u32]) -> Result<String> {
+        match self {
+            Self::Qwen35Family(m) => m.decode(tokens),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.decode(tokens),
+        }
+    }
+
+    pub fn build_chat_input(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Qwen35Family(m) => m.build_chat_input(messages, thinking),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.build_chat_input(messages, thinking),
+        }
+    }
+
+    pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
+        match self {
+            Self::Qwen35Family(m) => m.drop_prefix_cache(key),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.drop_prefix_cache(key),
+        }
+    }
+
+    pub fn clear_prefix_cache(&mut self) -> usize {
+        match self {
+            Self::Qwen35Family(m) => m.clear_prefix_cache(),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.clear_prefix_cache(),
+        }
+    }
+
+    /// Drop a Qwen3.5 session entry. No-op on Gemma 4 (different session
+    /// model — Gemma 4 uses prefix caches keyed by session id rather than
+    /// per-seq KV state).
+    pub fn drop_session(&mut self, session_id: &str) -> bool {
+        match self {
+            Self::Qwen35Family(m) => m.drop_session(session_id),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(_) => false,
+        }
+    }
+
+    /// Unified chat — handles family-specific call shapes internally.
+    pub fn chat(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        temperature: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+    ) -> Result<String> {
+        match self {
+            Self::Qwen35Family(m) => {
+                if let Some(sid) = session_id {
+                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})
+                } else {
+                    let seq_id = m.alloc_seq_id();
+                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})
+                }
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let resp = if let Some(sid) = session_id {
+                    m.chat_with_prefix_cache(messages, max_new_tokens, temperature, thinking, sid)?
+                } else {
+                    m.chat(messages, max_new_tokens, temperature, thinking)?
+                };
+                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
+                    Ok(resp.reasoning)
+                } else {
+                    Ok(resp.visible)
+                }
+            }
+        }
+    }
+
+    /// Unified streaming chat — same shape as `chat` but with a token callback.
+    pub fn chat_streaming<F>(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        temperature: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        match self {
+            Self::Qwen35Family(m) => {
+                if let Some(sid) = session_id {
+                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)
+                } else {
+                    let seq_id = m.alloc_seq_id();
+                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, on_token)
+                }
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = (temperature, session_id);
+                let resp = m.chat_streaming(messages, max_new_tokens, thinking, |chunk| {
+                    on_token(chunk);
+                    Ok(())
+                })?;
+                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
+                    Ok(resp.reasoning)
+                } else {
+                    Ok(resp.visible)
+                }
+            }
+        }
+    }
+
+    /// Unified completion (`/v1/completions`) — greedy raw token generation.
+    pub fn generate(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        session_id: Option<&str>,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Qwen35Family(m) => {
+                let _ = (temperature, top_p);
+                if let Some(sid) = session_id {
+                    return m.completion_session(input_ids, max_new_tokens, sid);
+                }
+                let seq_id = m.alloc_seq_id();
+                let (mut last, mut pos) = m.prefill(seq_id, input_ids)?;
+                let mut out: Vec<u32> = vec![last];
+                let eos = m.eos_tokens().to_vec();
+                if !eos.contains(&last) {
+                    for _ in 1..max_new_tokens {
+                        let (n, p) = m.decode_step(seq_id, last, pos)?;
+                        last = n;
+                        pos = p;
+                        out.push(n);
+                        if eos.contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                m.remove_seq(seq_id).ok();
+                Ok(out)
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                m.generate(input_ids, max_new_tokens, temperature, top_p)
+            }
+        }
+    }
+}
+
+/// Family discriminant — exposed for engine-layer logging / metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxBackendKind {
+    Qwen35Family,
+    #[cfg(feature = "mlx-native")]
+    Gemma4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlxFamily {
+    Qwen35,
+    #[cfg(feature = "mlx-native")]
+    Gemma4,
+}
+
+fn detect_mlx_family(model_id: &str) -> MlxFamily {
+    // Manual override takes priority — useful when the heuristics misfire
+    // for a custom repo name.
+    if let Ok(v) = std::env::var("LUMEN_MLX_FAMILY") {
+        match v.trim().to_lowercase().as_str() {
+            #[cfg(feature = "mlx-native")]
+            "gemma4" | "gemma" | "gemma-4" => return MlxFamily::Gemma4,
+            "qwen" | "qwen35" | "qwen3_5" | "qwen3.6" => return MlxFamily::Qwen35,
+            _ => {}
+        }
+    }
+    let lower = model_id.to_lowercase();
+    #[cfg(feature = "mlx-native")]
+    if lower.contains("gemma-4")
+        || lower.contains("gemma4-")
+        || lower.contains("gemma_4")
+        || lower.contains("gemma4_")
+    {
+        return MlxFamily::Gemma4;
+    }
+    MlxFamily::Qwen35
+}
+
+pub struct MlxQwen35Backend {
     runner: RunnerImpl,
     pub model_id: String,
     pub eos_tokens: Vec<u32>,
@@ -630,7 +929,7 @@ pub struct MlxBackend {
     prefix_cache_max: Option<usize>,
 }
 
-impl MlxBackend {
+impl MlxQwen35Backend {
     /// Load the model. Default path is PyO3 in-process. `LUMEN_MLX_BACKEND`
     /// selects the runner (`pyo3`, `subprocess`, or `native`); legacy
     /// `LUMEN_MLX_SUBPROCESS=1` still switches to the subprocess JSON-RPC
@@ -2096,7 +2395,13 @@ mod tests {
     #[test]
     #[ignore = "spawns Python + downloads/loads ~19GB model"]
     fn smoke_load_prefill_decode() {
-        let mut b = MlxBackend::load("mlx-community/Qwen3.6-35B-A3B-mxfp4").unwrap();
+        let backend = MlxBackend::load("mlx-community/Qwen3.6-35B-A3B-mxfp4").unwrap();
+        // Unwrap to the Qwen35 inner for the low-level prefill / decode_step
+        // round-trip (the unified MlxBackend façade only exposes the
+        // high-level `chat` / `generate` methods).
+        let MlxBackend::Qwen35Family(mut b) = backend else {
+            panic!("expected Qwen35Family for this smoke test");
+        };
         let (first, pos) = b.prefill(1, &[12, 34, 56]).unwrap();
         assert!(pos == 3);
         let (_second, pos2) = b.decode_step(1, first, pos).unwrap();
