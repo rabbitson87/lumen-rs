@@ -300,6 +300,34 @@ cd ~/Documents/GitHub/lumen-rs
 
 ---
 
+## 11. Backend metrics convention
+
+The Tauri desktop app's METRICS card (tok/s, ms/step, requests/min) is
+fed by parsing `lumen-server`'s **stderr** — not by an in-process metric
+channel. A new model backend must emit one line at decode end:
+
+```
+[<backend>] <kind> done: <N> tokens in <T_ms>ms (<R> tok/s)
+```
+
+Required substrings: `done:` + ` tok/s)`. Use `eprintln!` (not
+`tracing::info!` / `println!`). Emit **once per request**, never per
+token or per step.
+
+Missing the line → METRICS card stays blank for that model. This was
+the actual bug for Gemma 4 (fixed by adding 4 emission sites in
+[`crates/lumen-mlx/src/gemma4_backend.rs`](../crates/lumen-mlx/src/gemma4_backend.rs)).
+
+Parser tests live in `parse_tests` mod in
+[`crates/lumen-app/src/server.rs`](../crates/lumen-app/src/server.rs).
+Add a positive case for any new backend you wire up; run with
+`cargo test -p lumen-app --lib parse_tests`.
+
+Full rules + anti-examples + end-to-end flow:
+[`docs/backend-metrics-convention.md`](backend-metrics-convention.md).
+
+---
+
 ## Update policy for this document
 
 Treat this file as a living maintainer guide. When you (the maintainer
