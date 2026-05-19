@@ -65,7 +65,9 @@ If a config-schema change landed, also bump `CURRENT_SCHEMA_VERSION` in
 cd crates/lumen-app
 
 # Build the lumen-server binary for the target triple.
-TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin for Intel Macs
+# Apple Silicon only — MLX (mlx-sys) refuses to build on x86_64, so there
+# is no Intel Mac target.
+TARGET=aarch64-apple-darwin
 cargo build -p lumen-server --release --target "$TARGET"
 
 # Tauri's sidecar feature requires the binary at a specific name.
@@ -97,10 +99,6 @@ GitHub Releases pattern (referenced by `tauri.conf.json::plugins.updater.endpoin
     "darwin-aarch64": {
       "signature": "<contents of Lumen.app.tar.gz.sig>",
       "url": "https://github.com/hsng95/lumen-rs/releases/download/v0.2.0/Lumen_0.2.0_aarch64.app.tar.gz"
-    },
-    "darwin-x86_64": {
-      "signature": "<contents of x86_64 sig>",
-      "url": "https://github.com/hsng95/lumen-rs/releases/download/v0.2.0/Lumen_0.2.0_x86_64.app.tar.gz"
     }
   }
 }
@@ -138,7 +136,9 @@ jobs:
   build:
     strategy:
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        # Apple Silicon only — MLX upstream CMakeLists.txt errors out
+        # on x86_64. An Intel matrix entry can't succeed with mlx-native.
+        target: [aarch64-apple-darwin]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -170,7 +170,7 @@ jobs:
 
 `tauri-action` handles signing the `.app.tar.gz`, uploading both bundle + sig to
 the GitHub Release, and writing the `latest.json` manifest in the format the
-updater expects. After both matrix jobs complete, publish the draft release —
+updater expects. After the job completes, publish the draft release —
 that flips the visibility for `releases/latest/download/latest.json`, which is
 the URL baked into `tauri.conf.json`.
 

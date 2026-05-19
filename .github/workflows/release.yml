@@ -1,12 +1,13 @@
 name: Release
 
-# Triggered by pushing a tag matching `v*` (e.g. `v0.2.0`). Builds both
-# aarch64-apple-darwin and x86_64-apple-darwin matrix entries, signs the
-# `.app.tar.gz` updater bundle with the Ed25519 key stored in the
-# `TAURI_SIGNING_PRIVATE_KEY` secret, and uploads the artifacts (plus a
-# `latest.json` manifest) to a draft GitHub Release. Flip the release from
-# draft to published once both matrix jobs finish to expose the new
-# version to the in-app updater.
+# Triggered by pushing a tag matching `v*` (e.g. `v0.2.0`). Builds the
+# aarch64-apple-darwin bundle (MLX is Apple-Silicon-only — mlx-sys's
+# CMakeLists.txt refuses x86_64 outright, so an Intel matrix entry can't
+# succeed), signs the `.app.tar.gz` updater bundle with the Ed25519 key
+# stored in the `TAURI_SIGNING_PRIVATE_KEY` secret, and uploads the
+# artifacts (plus a `latest.json` manifest) to a draft GitHub Release.
+# Flip the release from draft to published once the job finishes to
+# expose the new version to the in-app updater.
 #
 # Maintainer setup (one-time): see crates/lumen-app/docs/release.md for
 # how to generate the signing keypair + register the secrets on the repo.
@@ -26,9 +27,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Apple Silicon only. MLX upstream CMakeLists.txt errors out on
+        # x86_64 ("Building for x86_64 on macOS is not supported") so an
+        # Intel matrix entry is fundamentally not possible with the
+        # mlx-native feature.
         target:
           - aarch64-apple-darwin
-          - x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4

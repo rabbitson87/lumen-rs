@@ -91,8 +91,9 @@ reads, and self-updates from GitHub Releases.
 ### Install from a release
 
 1. Open the [latest GitHub Release](https://github.com/hsng95/lumen-rs/releases/latest).
-2. Download the `.dmg` matching your CPU (`aarch64` for Apple Silicon,
-   `x86_64` for Intel Macs).
+2. Download the `aarch64` `.dmg`. **Apple Silicon only** — MLX is
+   ARM64-native and refuses to build on x86_64, so there is no Intel
+   Mac bundle.
 3. Drag `Lumen.app` to `/Applications` and launch it. The first run
    prompts macOS to verify the developer signature — accept it once.
 4. On the **Models & Server** tab, pick a recommended model from the
