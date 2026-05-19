@@ -109,6 +109,7 @@ mod native_runtime;
 mod native_snapshot;
 pub mod native_ssm;
 mod qwen3_5_moe;
+mod qwen3_5_mtp;
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
 mod runner_pyo3;
