@@ -80,6 +80,9 @@ fn main() -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let mut backend = MlxBackend::load(&model_id)?;
     println!("loaded in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    let backend = backend
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("bench requires Qwen35-family backend"))?;
 
     let prompt_ids = backend.encode(&prompt)?;
     let prompt_len = prompt_ids.len();

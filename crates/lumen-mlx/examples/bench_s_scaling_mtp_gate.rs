@@ -110,7 +110,10 @@ fn main() -> Result<()> {
         "{:>3}  {:>10}  {:>10}  {:>10}  {:>10}",
         "S", "min_ms", "med_ms", "max_ms", "med/S"
     );
-    println!("{:->3}  {:->10}  {:->10}  {:->10}  {:->10}", "", "", "", "", "");
+    println!(
+        "{:->3}  {:->10}  {:->10}  {:->10}  {:->10}",
+        "", "", "", "", ""
+    );
 
     let mut s1_median: Option<f64> = None;
     let mut s2_median: Option<f64> = None;
@@ -155,9 +158,7 @@ fn main() -> Result<()> {
     match (s1_median, s2_median) {
         (Some(t1), Some(t2)) => {
             let ratio = t2 / t1;
-            println!(
-                "T(S=1) = {t1:.2} ms, T(S=2) = {t2:.2} ms, ratio = {ratio:.2}x"
-            );
+            println!("T(S=1) = {t1:.2} ms, T(S=2) = {t2:.2} ms, ratio = {ratio:.2}x");
             if ratio < 1.8 {
                 println!("VERDICT: PASS (ratio < 1.8) -- proceed with mlx-native MTP port");
             } else if ratio >= 2.5 {

@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[mtp-fwd-smoke] running draft_step (position={position}, t_full={t_full}, t_sliding={t_sliding})"
     );
-    let h_trunk = drafter
+    let (h_trunk, _logits) = drafter
         .draft_step(
             &trunk_embed,
             &last_hidden,

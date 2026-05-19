@@ -28,10 +28,7 @@ fn main() -> Result<()> {
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--runs" {
-            runs = args
-                .get(i + 1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(runs);
+            runs = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(runs);
             i += 2;
         } else {
             i += 1;
@@ -39,7 +36,9 @@ fn main() -> Result<()> {
     }
 
     println!("--- Phase 2 Step B synthetic-weight microbench ---");
-    println!("shapes  = Qwen3.6-35B-A3B-mxfp4 (hidden=2048, heads=16/2, head_dim=256, intermediate=4304)");
+    println!(
+        "shapes  = Qwen3.6-35B-A3B-mxfp4 (hidden=2048, heads=16/2, head_dim=256, intermediate=4304)"
+    );
     println!("quant   = MXFP4 (group_size=32, bits=4)");
     println!("runs    = {runs} per T (drop first as warmup)");
 
@@ -95,16 +94,12 @@ fn main() -> Result<()> {
 
         println!("step_B (T=1 measured)     = {step_b:.2} ms");
         println!();
-        println!(
-            "K=2  cycle = 14.4 + 2*{step_b:.2} + 19.2 + 3.0 = {cycle_k2:.2} ms"
-        );
+        println!("K=2  cycle = 14.4 + 2*{step_b:.2} + 19.2 + 3.0 = {cycle_k2:.2} ms");
         println!(
             "K=2  break-even emit = cycle/14.4 = {break_even_k2:.2}  (max emit 3 -> margin {k2_margin:+.2})"
         );
         println!();
-        println!(
-            "K=3  cycle = 14.4 + 3*{step_b:.2} + 22.55 + 3.0 = {cycle_k3:.2} ms"
-        );
+        println!("K=3  cycle = 14.4 + 3*{step_b:.2} + 22.55 + 3.0 = {cycle_k3:.2} ms");
         println!(
             "K=3  break-even emit = cycle/14.4 = {break_even_k3:.2}  (max emit 4 -> margin {k3_margin:+.2})"
         );
@@ -129,7 +124,9 @@ fn main() -> Result<()> {
         } else if k3_margin >= 0.5 {
             println!("VERDICT: K=3 favoured (margin {k3_margin:+.2} >= 0.5)");
         } else if k2_margin > 0.0 || k3_margin > 0.0 {
-            println!("VERDICT: MARGINAL (best margin > 0 but < 0.5 — needs high accept rate to win)");
+            println!(
+                "VERDICT: MARGINAL (best margin > 0 but < 0.5 — needs high accept rate to win)"
+            );
         } else {
             println!("VERDICT: NET LOSS at every K (step_B too high; cycle won't close)");
         }

@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use lumen_mlx::MlxBackend;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -34,6 +34,9 @@ fn run_sync() -> Result<()> {
 
     // Load on the main tokio task (synchronously — same as the engine does).
     let mut b = MlxBackend::load(&model_id)?;
+    let b = b
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("bench requires Qwen35-family backend"))?;
 
     let prompt: Vec<u32> = (0..prompt_len).map(|i| 10 + (i as u32 * 7) % 200).collect();
 

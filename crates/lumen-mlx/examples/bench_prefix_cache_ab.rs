@@ -26,8 +26,8 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
-use lumen_mlx::MlxBackend;
+use anyhow::{Result, anyhow};
+use lumen_mlx::{MlxBackend, MlxQwen35Backend};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant. Follow these instructions \
     carefully. The user will ask questions and you should answer concisely. Always \
@@ -56,7 +56,7 @@ struct RunResult {
     n_tokens: usize,
 }
 
-fn run_one(backend: &mut MlxBackend, label: &str, user: &str) -> Result<RunResult> {
+fn run_one(backend: &mut MlxQwen35Backend, label: &str, user: &str) -> Result<RunResult> {
     let msgs = build_msgs(user);
     let max_new = 32;
     let seq_id = backend.alloc_seq_id();
@@ -99,6 +99,9 @@ fn main() -> Result<()> {
     );
 
     let mut backend = MlxBackend::load(&model_id)?;
+    let backend = backend
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("bench requires Qwen35-family backend"))?;
 
     // Warmup uses a *different* system prompt so it doesn't pre-populate the
     // cache key for the measured runs.
@@ -121,7 +124,7 @@ fn main() -> Result<()> {
     let mut results: Vec<RunResult> = Vec::new();
     for (i, q) in queries.iter().enumerate() {
         let label = if i == 0 { "cold(seed)" } else { "hit?" };
-        let r = run_one(&mut backend, label, q)?;
+        let r = run_one(&mut *backend, label, q)?;
         eprintln!(
             "[run {i}] label={} user={q:?} ttft={:.0}ms total={:.0}ms n={}",
             r.label, r.ttft_ms, r.total_ms, r.n_tokens

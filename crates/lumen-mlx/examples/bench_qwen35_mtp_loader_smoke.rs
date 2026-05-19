@@ -27,7 +27,10 @@
 //!       --example bench_qwen35_mtp_loader_smoke -- --model 35b
 
 use anyhow::{Result, anyhow};
-use lumen_mlx::{MtpLoadQuant, Qwen35MtpDims, load_block_from_hf, smoke_forward_with_synth_trunk};
+use lumen_mlx::{
+    MtpLoadQuant, MtpMlpConfig, MtpMoeConfig, Qwen35MtpDims, load_block_from_hf,
+    smoke_forward_with_synth_trunk,
+};
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -57,8 +60,8 @@ fn main() -> Result<()> {
         return Err(anyhow!("{hf_dir} is not a directory"));
     }
 
-    // Dims sourced from each repo's config.json text_config block.
-    let (dims, intermediate_size, label) = match model.as_str() {
+    // Dims + MLP config sourced from each repo's config.json text_config block.
+    let (dims, mlp_cfg, label) = match model.as_str() {
         "27b" => {
             let d = Qwen35MtpDims {
                 // Qwen3.6-27B Dense
@@ -71,7 +74,13 @@ fn main() -> Result<()> {
                 rms_norm_eps: 1e-6,
                 attn_output_gate: true,
             };
-            (d, 17_408usize, "Qwen3.6-27B")
+            (
+                d,
+                MtpMlpConfig::Dense {
+                    intermediate_size: 17_408,
+                },
+                "Qwen3.6-27B (Dense)",
+            )
         }
         "35b" => {
             let d = Qwen35MtpDims {
@@ -85,7 +94,14 @@ fn main() -> Result<()> {
                 rms_norm_eps: 1e-6,
                 attn_output_gate: true,
             };
-            (d, 4304usize, "Qwen3.6-35B-A3B")
+            let moe = MtpMoeConfig {
+                num_experts: 256,
+                num_experts_per_tok: 8,
+                moe_intermediate_size: 512,
+                shared_expert_intermediate_size: 512,
+                norm_topk_prob: true,
+            };
+            (d, MtpMlpConfig::Moe(moe), "Qwen3.6-35B-A3B (MoE)")
         }
         other => {
             return Err(anyhow!("--model must be `27b` or `35b`, got `{other}`"));
@@ -103,15 +119,31 @@ fn main() -> Result<()> {
         dims.rope_dim,
         dims.attn_output_gate,
     );
-    println!("intermediate_size = {intermediate_size}");
+    match &mlp_cfg {
+        MtpMlpConfig::Dense { intermediate_size } => {
+            println!("mlp   = Dense intermediate_size={intermediate_size}");
+        }
+        MtpMlpConfig::Moe(m) => {
+            println!(
+                "mlp   = MoE E={} top_k={} moe_intermediate={} shared_intermediate={} norm_topk={}",
+                m.num_experts,
+                m.num_experts_per_tok,
+                m.moe_intermediate_size,
+                m.shared_expert_intermediate_size,
+                m.norm_topk_prob,
+            );
+        }
+    }
 
-    // AFFINE 4-bit group_size=64 — matches Phase 2 S1.5 synth bench.
+    // AFFINE 4-bit group_size=64 — matches Phase 2 S1.5 synth bench. For MoE
+    // the eh_proj/attn/lm_head paths use this; the MoE experts internally
+    // pin MXFP4 group 32 to match the trunk's middle layers.
     let quant = MtpLoadQuant::Affine4 { group_size: 64 };
 
     let t_load = Instant::now();
-    let block = load_block_from_hf(&hf_path, dims, intermediate_size, quant)?;
+    let block = load_block_from_hf(&hf_path, dims, mlp_cfg, quant)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
-    println!("loaded MTP block in {load_ms:.1} ms (quant=AFFINE4 gs=64)");
+    println!("loaded MTP block in {load_ms:.1} ms (attn/eh_proj=AFFINE4 gs=64)");
 
     println!();
     println!("forward smoke (synthetic trunk lm_head, T=1, vocab=248320):");
@@ -119,7 +151,9 @@ fn main() -> Result<()> {
     let t_fwd = Instant::now();
     let (argmax_tok, max_logit) = smoke_forward_with_synth_trunk(&block, vocab_size)?;
     let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
-    println!("  forward({load_ms:.0}+{fwd_ms:.1} ms total) -> argmax={argmax_tok} max_logit={max_logit:.4}");
+    println!(
+        "  forward({load_ms:.0}+{fwd_ms:.1} ms total) -> argmax={argmax_tok} max_logit={max_logit:.4}"
+    );
 
     if !max_logit.is_finite() {
         return Err(anyhow!(
@@ -127,14 +161,12 @@ fn main() -> Result<()> {
         ));
     }
     if argmax_tok >= vocab_size as u32 {
-        return Err(anyhow!(
-            "FAIL: argmax {argmax_tok} >= vocab {vocab_size}"
-        ));
+        return Err(anyhow!("FAIL: argmax {argmax_tok} >= vocab {vocab_size}"));
     }
 
     println!();
     println!("VERDICT: PASS");
-    println!("  - all 15 mtp.* tensors located + quantized + validated");
+    println!("  - all mtp.* tensors located + quantized + validated");
     println!("  - block.forward dispatch graph runs without error");
     println!("  - logits are finite, argmax within vocab range");
     println!();

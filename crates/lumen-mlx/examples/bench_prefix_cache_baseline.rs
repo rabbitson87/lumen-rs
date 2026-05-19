@@ -31,7 +31,7 @@
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use lumen_mlx::MlxBackend;
+use lumen_mlx::{MlxBackend, MlxQwen35Backend};
 
 /// Synthesizes a long, deterministic prompt by repeating a sentence. Returns
 /// approximately `target_tokens` tokens worth of text (slightly more in
@@ -77,7 +77,7 @@ impl Stats {
     }
 }
 
-fn run_one(backend: &mut MlxBackend, p_tokens: usize, s_tokens: usize) -> Result<Stats> {
+fn run_one(backend: &mut MlxQwen35Backend, p_tokens: usize, s_tokens: usize) -> Result<Stats> {
     let prefix_text = synth_prompt(p_tokens);
     let suffix_text = synth_prompt(s_tokens);
 
@@ -150,6 +150,9 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let mut backend = MlxBackend::load(&model_id)?;
     println!("loaded in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    let backend = backend
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("bench requires Qwen35-family backend"))?;
 
     // Warmup: small prefill to settle MPS cache + kernel JIT.
     let warm = backend.encode("warm up the engine please")?;
@@ -177,7 +180,7 @@ fn main() -> Result<()> {
     for &(p, s) in &combos {
         let mut runs: Vec<Stats> = Vec::with_capacity(runs_per);
         for _ in 0..runs_per {
-            match run_one(&mut backend, p, s) {
+            match run_one(&mut *backend, p, s) {
                 Ok(st) => runs.push(st),
                 Err(e) => {
                     eprintln!("[error] P={p} S={s}: {e}");

@@ -19,7 +19,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use lumen_mlx::MlxBackend;
 
 fn parse_args() -> (String, String, usize) {
@@ -70,7 +70,10 @@ fn run_one(
     let messages = vec![("user".to_string(), user_prompt.to_string())];
 
     let mut be = backend.lock().unwrap();
-    let seq_id = be.alloc_seq_id();
+    let qwen = be
+        .as_qwen35_mut()
+        .ok_or_else(|| anyhow!("bench requires Qwen35-family backend"))?;
+    let seq_id = qwen.alloc_seq_id();
     let t_total = Instant::now();
     // Inner per-call prefill time is logged by the backend itself; we
     // approximate decode-only time by subtracting the eprintln-traced prefill
@@ -81,7 +84,7 @@ fn run_one(
     // (total - prefill_ms_observed). For this bench we use the "cheap" trick:
     // run twice (warmup + measure) so prefill is amortized; report total tok/s.
     drop(t_prefill);
-    let text = be.chat_streaming(&messages, max_tokens, false, seq_id, |_| {})?;
+    let text = qwen.chat_streaming(&messages, max_tokens, false, seq_id, |_| {})?;
     let total_elapsed = t_total.elapsed().as_secs_f64();
     drop(be);
 
