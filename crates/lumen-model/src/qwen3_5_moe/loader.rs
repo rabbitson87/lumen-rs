@@ -42,19 +42,18 @@ use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 #[cfg(feature = "turboquant-gpu")]
 use lumen_metal::affine4_linear::Affine4Linear;
 #[cfg(feature = "turboquant-gpu")]
-use lumen_metal::mxfp4_gpu::{Mxfp4Weight, MxFp4Context};
+use lumen_metal::mxfp4_gpu::{MxFp4Context, Mxfp4Weight};
 #[cfg(feature = "turboquant-gpu")]
 use lumen_metal::mxfp4_linear::{Mxfp4Linear, Mxfp4SwitchMlp};
 
 use super::config::{LayerType, MlpKind, Qwen3_5MoeConfig};
 use super::layer::{AttentionBlock, DecoderLayer};
-use super::linear_attn::{conv1d_from_mlx_weight, GatedDeltaNet, GatedDeltaNetRuntime};
+use super::linear_attn::{GatedDeltaNet, GatedDeltaNetRuntime, conv1d_from_mlx_weight};
 use super::model::Qwen3_5MoeTextModel;
 use super::moe::{
     DenseMlp, MlpBlock, MoeDims, SharedExpert, SparseMoeBlock, SparseMoeRuntime, SwitchMlp,
     SwitchMlpBackend,
 };
-use super::mtp::MtpBlock;
 use super::proj::ProjLinear;
 use super::self_attn::{SelfAttention, SelfAttnDims, SelfAttnRuntime};
 use super::weights::{Classification, StorageKind, WeightIndex};
@@ -519,9 +518,7 @@ impl ShardSet {
             self.load_rms_norm(&format!("{prefix}.post_attention_layernorm"), device)?;
 
         let attention = match self.config.text_config.layer_types[layer_idx] {
-            LayerType::FullAttention => {
-                AttentionBlock::Full(self.load_self_attn(&prefix, device)?)
-            }
+            LayerType::FullAttention => AttentionBlock::Full(self.load_self_attn(&prefix, device)?),
             LayerType::LinearAttention => {
                 AttentionBlock::Linear(self.load_linear_attn(&prefix, device)?)
             }
@@ -564,229 +561,6 @@ impl ShardSet {
         Ok(Qwen3_5MoeTextModel::new(embed, layers, final_norm, lm_head))
     }
 
-    /// Load the MTP head from the HuggingFace original Qwen3.5/3.6 checkpoint.
-    ///
-    /// Returns `Ok(None)` when `LUMEN_QWEN35_HF_ORIGINAL` is unset — that signals the
-    /// caller to fall back to non-speculative decoding rather than treat absence as an
-    /// error. Any other failure (env var set but the index/shards are malformed, missing
-    /// tensors, shape mismatch) is a hard error.
-    ///
-    /// This path **bypasses [`Classification`]** entirely: the trunk classifier was built
-    /// against the MLX-converted checkpoint (renamed prefixes, quantized) and doesn't know
-    /// the HF original's `mtp.*` namespace. We parse the HF `model.safetensors.index.json`
-    /// to find which shards hold each `mtp.*` tensor (typically 2 of 15), mmap only those,
-    /// widen bf16 → f32 per tensor, and assemble the block. The trunk loading pipeline
-    /// is untouched.
-    ///
-    /// Tensor name mapping (HF original ↔ our internal):
-    ///
-    /// ```text
-    ///   mtp.fc.weight                                  → eh_proj  [2*hidden → hidden]
-    ///   mtp.pre_fc_norm_embedding.weight               → enorm
-    ///   mtp.pre_fc_norm_hidden.weight                  → hnorm
-    ///   mtp.norm.weight                                → shared_head_norm
-    ///   mtp.layers.0.input_layernorm.weight            → input_layernorm
-    ///   mtp.layers.0.post_attention_layernorm.weight   → post_attention_layernorm
-    ///   mtp.layers.0.self_attn.{q,k,v}_proj.weight     → fused along axis 0 → qkv proj
-    ///   mtp.layers.0.self_attn.o_proj.weight           → o_proj
-    ///   mtp.layers.0.self_attn.{q,k}_norm.weight       → q_norm / k_norm
-    ///   mtp.layers.0.mlp.{gate,up}_proj.weight         → fused along axis 0 → gate_up
-    ///   mtp.layers.0.mlp.down_proj.weight              → down_proj
-    /// ```
-    ///
-    /// The fusion along axis 0 mirrors what [`Self::load_self_attn`] / [`Self::load_dense_mlp`]
-    /// do for trunk layers — it lets `SelfAttention::forward` and `DenseMlp::forward` run
-    /// one matmul instead of three / two.
-    pub fn load_mtp_block(&self, device: &Device) -> Result<Option<MtpBlock>, LoadError> {
-        // Read `mtp.*` directly from the HuggingFace original multi-shard checkpoint at the
-        // path given by `LUMEN_QWEN35_HF_ORIGINAL`. Pure-Rust load — no Python step, no
-        // intermediate sidecar file.
-        if let Some(hf_dir) = hf_original_dir_from_env() {
-            return self.load_mtp_from_hf_native(&hf_dir, device).map(Some);
-        }
-        Ok(None)
-    }
-
-    /// Read `mtp.*` directly from the HuggingFace original multi-shard checkpoint. We parse
-    /// the index JSON's `weight_map` only (HF's `metadata.total_size` ships as float in
-    /// some snapshots, which doesn't fit a u64 — we don't need that field anyway), mmap only
-    /// the shards that actually contain `mtp.*` tensors (2 of 15 for Qwen3.6-27B), and
-    /// look up each weight by name.
-    fn load_mtp_from_hf_native(
-        &self,
-        hf_dir: &Path,
-        device: &Device,
-    ) -> Result<MtpBlock, LoadError> {
-        let idx_path = hf_dir.join("model.safetensors.index.json");
-        let idx_bytes = std::fs::read(&idx_path).map_err(|e| LoadError::Io {
-            path: idx_path.clone(),
-            source: e,
-        })?;
-        // Lax parse: only `weight_map` is required. Skip `metadata` entirely so a
-        // float `total_size` doesn't reject the whole index.
-        #[derive(serde::Deserialize)]
-        struct HfIndexLax {
-            weight_map: BTreeMap<String, String>,
-        }
-        let lax: HfIndexLax = serde_json::from_slice(&idx_bytes)
-            .map_err(|e| LoadError::Classify(format!("HF index parse: {e}")))?;
-
-        // Collect the `mtp.*` tensor → shard mapping and the unique shard set.
-        let mut tensor_to_shard: BTreeMap<String, String> = BTreeMap::new();
-        let mut shard_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (name, shard) in &lax.weight_map {
-            if name.starts_with("mtp.") {
-                tensor_to_shard.insert(name.clone(), shard.clone());
-                shard_set.insert(shard.clone());
-            }
-        }
-        if tensor_to_shard.is_empty() {
-            return Err(LoadError::Classify(format!(
-                "no `mtp.*` tensors in HF index at {}",
-                idx_path.display()
-            )));
-        }
-
-        // mmap each shard once. Each Mmap stays alive in `mmaps` for the whole function;
-        // the SafeTensors views inside `st_by_shard` borrow from it.
-        let mut mmaps: Vec<(String, memmap2::Mmap)> = Vec::with_capacity(shard_set.len());
-        for shard in &shard_set {
-            let p = hf_dir.join(shard);
-            let file = std::fs::File::open(&p).map_err(|e| LoadError::Io {
-                path: p.clone(),
-                source: e,
-            })?;
-            // SAFETY: read-only mmap of an immutable on-disk shard.
-            let m = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| LoadError::Io {
-                path: p.clone(),
-                source: e,
-            })?;
-            mmaps.push((shard.clone(), m));
-        }
-        let mut st_by_shard: BTreeMap<&str, SafeTensors<'_>> = BTreeMap::new();
-        for (name, mmap) in &mmaps {
-            let st = SafeTensors::deserialize(&mmap[..]).map_err(LoadError::Safetensors)?;
-            st_by_shard.insert(name.as_str(), st);
-        }
-
-        let read_plain = |name: &str, expected_shape: &[usize]| -> Result<Tensor, LoadError> {
-            let shard = tensor_to_shard.get(name).ok_or_else(|| {
-                LoadError::Classify(format!("tensor `{name}` missing from HF index"))
-            })?;
-            let st = st_by_shard.get(shard.as_str()).ok_or_else(|| {
-                LoadError::Classify(format!("shard `{shard}` not mmapped (HF native path)"))
-            })?;
-            let view = st.tensor(name).map_err(LoadError::Safetensors)?;
-            let shape = view.shape().to_vec();
-            check_shape(name, &shape, expected_shape)?;
-            let data = plain_to_f32(&view)?;
-            Tensor::from_vec(data, shape, device).map_err(LoadError::Candle)
-        };
-        self.build_mtp_block_with(read_plain, device)
-    }
-
-    /// Core builder: given any `(name, expected_shape) → Tensor` reader, assemble an
-    /// `MtpBlock`. Shared by the sidecar and HF-native loading paths. All tensor name
-    /// references and dimension wiring live in one place.
-    fn build_mtp_block_with<F>(
-        &self,
-        mut read_plain: F,
-        _device: &Device,
-    ) -> Result<MtpBlock, LoadError>
-    where
-        F: FnMut(&str, &[usize]) -> Result<Tensor, LoadError>,
-    {
-        let eps = self.config.text_config.rms_norm_eps as f64;
-        // Qwen3.6-27B uses Gemma-style `y = x * (1 + weight) / rms(x)` RMSNorm.
-        // The MXFP4 trunk export bakes `+1` into stored weights so that a
-        // standard `y = x * weight / rms(x)` Candle forward reproduces the
-        // intended scaling (verified: MX trunk norm mean=1.96, HF trunk norm
-        // mean=0.96, diff exactly +1.0). The HF original's `mtp.*` norms are
-        // stored RAW (no `+1` baked in), so we MUST add 1 here before passing
-        // to Candle's RmsNorm. Without this, MTP's logits collapse to noise
-        // (top-K logit ~7 vs trunk's ~30) and drafts have 0% acceptance.
-        let device_for_norm = _device.clone();
-        macro_rules! read_rmsnorm {
-            ($name:expr, $dim:expr) => {{
-                let w_raw = read_plain($name, &[$dim])?;
-                // Add 1.0 elementwise to match Gemma-style (1 + weight) semantics.
-                let one = Tensor::ones((($dim,)), w_raw.dtype(), &device_for_norm)
-                    .map_err(LoadError::Candle)?;
-                let w = (&w_raw + &one).map_err(LoadError::Candle)?;
-                RmsNorm::new(w, eps)
-            }};
-        }
-
-        // Dimensions sourced from text_config — the MTP block reuses trunk shapes
-        // (Qwen3.6-27B: hidden=5120, q_out_dim=12288 with attn_output_gate, kv_out_dim=1024,
-        // head_dim=256, intermediate_size=17408). On-disk shapes are still cross-checked
-        // by `read_plain`.
-        let sa_runtime = SelfAttnRuntime::from_text_config(&self.config.text_config)
-            .map_err(|e| LoadError::Config(format!("{e}")))?;
-        let sa_dims: SelfAttnDims = sa_runtime.dims;
-        let hidden = sa_dims.hidden_size;
-        let q_out = sa_dims.q_out_dim();
-        let kv_out = sa_dims.kv_out_dim();
-        let v_dim = sa_dims.attn_value_dim();
-        let head_dim = sa_dims.head_dim;
-        let intermediate = self.config.text_config.dense_intermediate_size();
-
-        // ── MTP-specific projections / norms ────────────────────────────────
-        let eh_proj_t = read_plain("mtp.fc.weight", &[hidden, 2 * hidden])?;
-        let eh_proj: ProjLinear = Linear::new(eh_proj_t, None).into();
-        let enorm = read_rmsnorm!("mtp.pre_fc_norm_embedding.weight", hidden);
-        let hnorm = read_rmsnorm!("mtp.pre_fc_norm_hidden.weight", hidden);
-        let shared_head_norm = Some(read_rmsnorm!("mtp.norm.weight", hidden));
-
-        // ── Standard decoder block: pre/post norms ──────────────────────────
-        let input_layernorm = read_rmsnorm!("mtp.layers.0.input_layernorm.weight", hidden);
-        let post_attention_layernorm =
-            read_rmsnorm!("mtp.layers.0.post_attention_layernorm.weight", hidden);
-
-        // ── Self-attention: fuse q/k/v along axis 0 ─────────────────────────
-        let q_proj = read_plain("mtp.layers.0.self_attn.q_proj.weight", &[q_out, hidden])?;
-        let k_proj = read_plain("mtp.layers.0.self_attn.k_proj.weight", &[kv_out, hidden])?;
-        let v_proj = read_plain("mtp.layers.0.self_attn.v_proj.weight", &[kv_out, hidden])?;
-        let qkv_fused = Tensor::cat(&[&q_proj, &k_proj, &v_proj], 0).map_err(LoadError::Candle)?;
-        let qkv_linear: ProjLinear = Linear::new(qkv_fused, None).into();
-
-        let o_proj_t = read_plain("mtp.layers.0.self_attn.o_proj.weight", &[hidden, v_dim])?;
-        let o_proj: ProjLinear = Linear::new(o_proj_t, None).into();
-
-        let q_norm = read_rmsnorm!("mtp.layers.0.self_attn.q_norm.weight", head_dim);
-        let k_norm = read_rmsnorm!("mtp.layers.0.self_attn.k_norm.weight", head_dim);
-
-        let attention = SelfAttention::new(sa_runtime, qkv_linear, o_proj, q_norm, k_norm);
-
-        // ── Dense SwiGLU MLP: fuse gate/up along axis 0 ─────────────────────
-        let gate_proj =
-            read_plain("mtp.layers.0.mlp.gate_proj.weight", &[intermediate, hidden])?;
-        let up_proj = read_plain("mtp.layers.0.mlp.up_proj.weight", &[intermediate, hidden])?;
-        let gate_up_fused =
-            Tensor::cat(&[&gate_proj, &up_proj], 0).map_err(LoadError::Candle)?;
-        let gate_up_linear: ProjLinear = Linear::new(gate_up_fused, None).into();
-        let down_proj_t =
-            read_plain("mtp.layers.0.mlp.down_proj.weight", &[hidden, intermediate])?;
-        let down_proj: ProjLinear = Linear::new(down_proj_t, None).into();
-        let mlp = MlpBlock::Dense(DenseMlp::new(gate_up_linear, down_proj, intermediate));
-
-        // Qwen3.6-27B publishes `mtp.norm.weight` but no dedicated `mtp.shared_head_head`
-        // (the lm_head is shared with the trunk via `mtp_use_dedicated_embeddings=false`).
-        let shared_head_head: Option<ProjLinear> = None;
-
-        Ok(MtpBlock::new(
-            eh_proj,
-            enorm,
-            hnorm,
-            input_layernorm,
-            attention,
-            post_attention_layernorm,
-            mlp,
-            shared_head_norm,
-            shared_head_head,
-        ))
-    }
-
     // ── Per-sub-block helpers ──────────────────────────────────────────────
 
     fn load_rms_norm(&self, prefix: &str, device: &Device) -> Result<RmsNorm, LoadError> {
@@ -797,13 +571,14 @@ impl ShardSet {
             });
         }
         let w = Tensor::from_vec(data, shape, device).map_err(LoadError::Candle)?;
-        Ok(RmsNorm::new(
-            w,
-            self.config.text_config.rms_norm_eps as f64,
-        ))
+        Ok(RmsNorm::new(w, self.config.text_config.rms_norm_eps as f64))
     }
 
-    fn load_self_attn(&self, layer_prefix: &str, device: &Device) -> Result<SelfAttention, LoadError> {
+    fn load_self_attn(
+        &self,
+        layer_prefix: &str,
+        device: &Device,
+    ) -> Result<SelfAttention, LoadError> {
         let runtime = SelfAttnRuntime::from_text_config(&self.config.text_config)
             .map_err(|e| LoadError::Config(format!("{e}")))?;
         let dims = runtime.dims;
@@ -880,8 +655,11 @@ impl ShardSet {
         check_shape("linear_attn.norm", &norm_shape, &[d.head_dim])?;
         let norm_w = Tensor::from_vec(norm_data, norm_shape, device).map_err(LoadError::Candle)?;
 
-        let out =
-            self.load_proj(&format!("{la}.out_proj"), &[d.hidden_size, d.v_dim()], device)?;
+        let out = self.load_proj(
+            &format!("{la}.out_proj"),
+            &[d.hidden_size, d.v_dim()],
+            device,
+        )?;
 
         Ok(GatedDeltaNet::new(
             runtime,
@@ -926,11 +704,7 @@ impl ShardSet {
             hidden,
             device,
         )?;
-        let down = self.load_proj(
-            &format!("{mlp}.down_proj"),
-            &[hidden, intermediate],
-            device,
-        )?;
+        let down = self.load_proj(&format!("{mlp}.down_proj"), &[hidden, intermediate], device)?;
         Ok(DenseMlp::new(gate_up, down, intermediate))
     }
 
@@ -941,7 +715,11 @@ impl ShardSet {
         // `gate` and `shared_expert_gate` are int8-affine → always dense (load_proj routes them
         // through the dequant path). The shared-expert projections are MXFP4 → GPU path when
         // a GPU context is installed.
-        let gate = self.load_proj(&format!("{mlp}.gate"), &[d.num_experts, d.hidden_size], device)?;
+        let gate = self.load_proj(
+            &format!("{mlp}.gate"),
+            &[d.num_experts, d.hidden_size],
+            device,
+        )?;
         let shared_gate = self.load_proj(
             &format!("{mlp}.shared_expert_gate"),
             &[1, d.hidden_size],
@@ -966,7 +744,11 @@ impl ShardSet {
             device,
         )?;
         let shared = SharedExpert::new(gate_up, down, d.shared_expert_intermediate_size);
-        let switch = self.load_switch_mlp_backend(&mlp, MoeDims::from_config(&self.config.text_config), device)?;
+        let switch = self.load_switch_mlp_backend(
+            &mlp,
+            MoeDims::from_config(&self.config.text_config),
+            device,
+        )?;
         Ok(SparseMoeBlock::new(
             runtime,
             gate,
@@ -1184,10 +966,7 @@ impl ShardSet {
                 )
                 .map_err(|e| {
                     let names: Vec<&str> = parts.iter().map(|(p, _)| *p).collect();
-                    LoadError::Config(format!(
-                        "mxfp4 fused upload `{}`: {e}",
-                        names.join(" + ")
-                    ))
+                    LoadError::Config(format!("mxfp4 fused upload `{}`: {e}", names.join(" + ")))
                 })?;
                 return Ok(ProjLinear::Mxfp4(Mxfp4Linear::new(
                     weight,
@@ -1204,7 +983,11 @@ impl ShardSet {
         #[cfg(feature = "turboquant-gpu")]
         if let Some(ctx) = self.affine4_ctx.as_ref() {
             let all_affine4 = parts.iter().all(|(p, _)| {
-                if self.storage_kind(p).map(|k| k == StorageKind::Int8Affine).unwrap_or(false) {
+                if self
+                    .storage_kind(p)
+                    .map(|k| k == StorageKind::Int8Affine)
+                    .unwrap_or(false)
+                {
                     self.config
                         .quantization_config
                         .as_ref()
@@ -1235,10 +1018,7 @@ impl ShardSet {
                 )
                 .map_err(|e| {
                     let names: Vec<&str> = parts.iter().map(|(p, _)| *p).collect();
-                    LoadError::Config(format!(
-                        "affine4 fused upload `{}`: {e}",
-                        names.join(" + ")
-                    ))
+                    LoadError::Config(format!("affine4 fused upload `{}`: {e}", names.join(" + ")))
                 })?;
                 return Ok(ProjLinear::from(Affine4Linear::new(
                     weight,
@@ -1318,19 +1098,31 @@ impl ShardSet {
                 check_shape(
                     &gate_prefix,
                     &gshape,
-                    &[dims.num_experts, dims.moe_intermediate_size, dims.hidden_size],
+                    &[
+                        dims.num_experts,
+                        dims.moe_intermediate_size,
+                        dims.hidden_size,
+                    ],
                 )?;
                 let (up, us, ushape) = self.mxfp4_raw(&up_prefix)?;
                 check_shape(
                     &up_prefix,
                     &ushape,
-                    &[dims.num_experts, dims.moe_intermediate_size, dims.hidden_size],
+                    &[
+                        dims.num_experts,
+                        dims.moe_intermediate_size,
+                        dims.hidden_size,
+                    ],
                 )?;
                 let (dp, ds, dshape) = self.mxfp4_raw(&down_prefix)?;
                 check_shape(
                     &down_prefix,
                     &dshape,
-                    &[dims.num_experts, dims.hidden_size, dims.moe_intermediate_size],
+                    &[
+                        dims.num_experts,
+                        dims.hidden_size,
+                        dims.moe_intermediate_size,
+                    ],
                 )?;
                 let backend = Mxfp4SwitchMlp::from_host(
                     Arc::clone(ctx),
@@ -1353,17 +1145,29 @@ impl ShardSet {
         let sw = SwitchMlp::new(
             self.load_3d(
                 &gate_prefix,
-                &[dims.num_experts, dims.moe_intermediate_size, dims.hidden_size],
+                &[
+                    dims.num_experts,
+                    dims.moe_intermediate_size,
+                    dims.hidden_size,
+                ],
                 device,
             )?,
             self.load_3d(
                 &up_prefix,
-                &[dims.num_experts, dims.moe_intermediate_size, dims.hidden_size],
+                &[
+                    dims.num_experts,
+                    dims.moe_intermediate_size,
+                    dims.hidden_size,
+                ],
                 device,
             )?,
             self.load_3d(
                 &down_prefix,
-                &[dims.num_experts, dims.hidden_size, dims.moe_intermediate_size],
+                &[
+                    dims.num_experts,
+                    dims.hidden_size,
+                    dims.moe_intermediate_size,
+                ],
                 device,
             )?,
             dims,
@@ -1438,17 +1242,6 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-/// Resolve the HuggingFace original Qwen3.5/3.6 snapshot directory from environment.
-///
-/// Reads `LUMEN_QWEN35_HF_ORIGINAL`. Returns `None` when unset or pointing at a non-directory.
-/// The path is expected to be the snapshot dir holding `model.safetensors.index.json` plus
-/// the multi-shard safetensors files (`model-NNNNN-of-NNNNN.safetensors`).
-fn hf_original_dir_from_env() -> Option<PathBuf> {
-    let v = std::env::var_os("LUMEN_QWEN35_HF_ORIGINAL")?;
-    let p = PathBuf::from(v);
-    if p.is_dir() { Some(p) } else { None }
 }
 
 fn check_shape(name: &str, got: &[usize], want: &[usize]) -> Result<(), LoadError> {
@@ -1539,7 +1332,11 @@ mod tests {
         assert_eq!(e8m0_to_f32(127), 1.0);
         assert_eq!(e8m0_to_f32(128), 2.0);
         assert_eq!(e8m0_to_f32(126), 0.5);
-        assert_eq!(e8m0_to_f32(0xFF), 0.0, "NaN encoding → 0.0 per loader policy");
+        assert_eq!(
+            e8m0_to_f32(0xFF),
+            0.0,
+            "NaN encoding → 0.0 per loader policy"
+        );
     }
 
     #[test]
@@ -1704,15 +1501,18 @@ mod tests {
             return;
         };
         let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
+        let cfg_str =
+            std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
         cfg.validate().unwrap();
 
         let shards = ShardSet::open(&dir, cfg).expect("open shard set");
         let device = Device::Cpu;
         let layer = shards.load_layer(0, &device).expect("load layer 0");
-        assert!(layer.is_linear(), "layer 0 is linear_attn in the 3:1 pattern");
+        assert!(
+            layer.is_linear(),
+            "layer 0 is linear_attn in the 3:1 pattern"
+        );
     }
 
     /// Env-gated: same as `real_shards_layer0_loads_when_available` but exercises
@@ -1727,8 +1527,8 @@ mod tests {
             return;
         };
         let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
+        let cfg_str =
+            std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
         cfg.validate().unwrap();
 
@@ -1740,96 +1540,11 @@ mod tests {
         );
         let shards = ShardSet::open(&dir, cfg).expect("open shard set");
         let device = Device::Cpu;
-        let layer = shards.load_layer(3, &device).expect("load layer 3 (full_attn)");
+        let layer = shards
+            .load_layer(3, &device)
+            .expect("load layer 3 (full_attn)");
         assert!(!layer.is_linear(), "layer 3 must report full_attention");
     }
-
-    /// Env-gated: smoke test for the MTP HF-native loader path. Confirms a tiny forward
-    /// runs end-to-end on real weights.
-    ///
-    /// Requires:
-    ///   * `LUMEN_QWEN35_SHARDS` → MLX 4-bit snapshot (trunk dims/config)
-    ///   * `LUMEN_QWEN35_HF_ORIGINAL` → HF original snapshot directory containing
-    ///     `model.safetensors.index.json` + the multi-shard `mtp.*` tensors.
-    #[test]
-    fn real_27b_mtp_hf_native_loads_when_available() {
-        use crate::qwen3_5_moe::mtp::MtpBlock;
-        use candle_nn::Module;
-
-        let Ok(dir) = std::env::var("LUMEN_QWEN35_SHARDS") else {
-            eprintln!("skipping MTP HF-native smoke (set LUMEN_QWEN35_SHARDS)");
-            return;
-        };
-        if std::env::var("LUMEN_QWEN35_HF_ORIGINAL").is_err() {
-            eprintln!("skipping MTP HF-native smoke (set LUMEN_QWEN35_HF_ORIGINAL)");
-            return;
-        }
-        let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
-        let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
-        cfg.validate().unwrap();
-        if cfg.text_config.mtp_num_hidden_layers == 0 {
-            eprintln!("skipping MTP HF-native smoke (config.mtp_num_hidden_layers == 0)");
-            return;
-        }
-        if !matches!(cfg.text_config.mlp_kind(), MlpKind::Dense) {
-            eprintln!("skipping MTP HF-native smoke (MoE MTP not exercised by this test)");
-            return;
-        }
-
-        let hidden = cfg.text_config.hidden_size;
-        let vocab = cfg.text_config.vocab_size;
-        let shards = ShardSet::open(&dir, cfg).expect("open shard set");
-        let device = Device::Cpu;
-        let Some(mut mtp) = shards
-            .load_mtp_block(&device)
-            .expect("load_mtp_block must succeed when HF original env is set")
-        else {
-            panic!("LUMEN_QWEN35_HF_ORIGINAL set but load_mtp_block returned None — \
-                    the path probably doesn't resolve to a snapshot dir");
-        };
-
-        // Synthetic single-step input — finiteness + shape contract gate.
-        let zeros = Tensor::zeros(&[1, 1, hidden], candle_core::DType::F32, &device).unwrap();
-        let fb_norm = RmsNorm::new(
-            Tensor::ones(&[hidden], candle_core::DType::F32, &device).unwrap(),
-            1e-6,
-        );
-        let fb_lm_head: ProjLinear = Linear::new(
-            Tensor::zeros(&[vocab, hidden], candle_core::DType::F32, &device).unwrap(),
-            None,
-        )
-        .into();
-
-        mtp.enable_kv_cache(8);
-        mtp.init_seq_kv_cache(0);
-        mtp.set_current_seq_id(0);
-        let (logits, h_pre_out) = mtp
-            .forward(&zeros, &zeros, &fb_norm, &fb_lm_head, 0, None)
-            .expect("MtpBlock::forward on real weights must succeed");
-        assert_eq!(logits.dims(), &[1, 1, vocab]);
-        assert_eq!(h_pre_out.dims(), &[1, 1, hidden]);
-        let finite_logits = logits
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-            .into_iter()
-            .all(|v| v.is_finite());
-        let finite_h = h_pre_out
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-            .into_iter()
-            .all(|v| v.is_finite());
-        assert!(finite_logits, "real-weight MTP logits must be finite");
-        assert!(finite_h, "real-weight MTP new_h_pre must be finite");
-        // Touch the module so candle_nn::Module import isn't dead.
-        let _ = Module::forward(&fb_norm, &zeros).unwrap();
-    }
-
 
     /// Env-gated: when real shards are available AND a Metal GPU is present, load layer 0
     /// via the GPU-resident MXFP4 path and confirm it succeeds without the 76 GB f32 blow-up.
@@ -1846,14 +1561,13 @@ mod tests {
             return;
         };
         let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
+        let cfg_str =
+            std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
         cfg.validate().unwrap();
 
         let ctx = Arc::new(gpu_ctx);
-        let shards =
-            ShardSet::open_with_gpu(&dir, cfg, Arc::clone(&ctx)).expect("open with GPU");
+        let shards = ShardSet::open_with_gpu(&dir, cfg, Arc::clone(&ctx)).expect("open with GPU");
         let device = Device::Cpu;
         let layer = shards.load_layer(0, &device).expect("load layer 0 on GPU");
         assert!(layer.is_linear(), "layer 0 is linear_attn");
@@ -1874,9 +1588,7 @@ mod tests {
         use lumen_metal::affine4_gpu::Affine4Context;
 
         let Ok(dir) = std::env::var("LUMEN_QWEN35_SHARDS") else {
-            eprintln!(
-                "skipping full-model affine4 GPU smoke (set LUMEN_QWEN35_SHARDS to enable)"
-            );
+            eprintln!("skipping full-model affine4 GPU smoke (set LUMEN_QWEN35_SHARDS to enable)");
             return;
         };
         let Ok(mxfp4_ctx) = MxFp4Context::new() else {
@@ -1888,8 +1600,8 @@ mod tests {
             return;
         };
         let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
+        let cfg_str =
+            std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
         cfg.validate().unwrap();
         let n_layers = cfg.text_config.num_hidden_layers;
@@ -1897,12 +1609,14 @@ mod tests {
         let has_affine4 = cfg
             .quantization_config
             .as_ref()
-            .map(|q| q.for_weight("language_model.model.layers.0.self_attn.q_proj").bits == 4)
+            .map(|q| {
+                q.for_weight("language_model.model.layers.0.self_attn.q_proj")
+                    .bits
+                    == 4
+            })
             .unwrap_or(false);
         if !has_affine4 {
-            eprintln!(
-                "skipping full-model affine4 smoke: checkpoint not 4-bit affine"
-            );
+            eprintln!("skipping full-model affine4 smoke: checkpoint not 4-bit affine");
             return;
         }
 
@@ -1934,9 +1648,7 @@ mod tests {
         use lumen_metal::affine4_gpu::Affine4Context;
 
         let Ok(dir) = std::env::var("LUMEN_QWEN35_SHARDS") else {
-            eprintln!(
-                "skipping affine4 GPU real-shard test (set LUMEN_QWEN35_SHARDS to enable)"
-            );
+            eprintln!("skipping affine4 GPU real-shard test (set LUMEN_QWEN35_SHARDS to enable)");
             return;
         };
         let Ok(mxfp4_ctx) = MxFp4Context::new() else {
@@ -1948,8 +1660,8 @@ mod tests {
             return;
         };
         let cfg_path = PathBuf::from(&dir).join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
+        let cfg_str =
+            std::fs::read_to_string(&cfg_path).unwrap_or_else(|e| panic!("read {cfg_path:?}: {e}"));
         let mut cfg: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str).unwrap();
         cfg.validate().unwrap();
 

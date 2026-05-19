@@ -31,15 +31,30 @@ enum BackendMode {
 }
 
 /// Resolve the adaptive routing mode from env. Precedence:
-///   1. `LUMEN_MODE=mlx|candle|auto`   — explicit selection
-///   2. `USE_MLX=1`                       — legacy alias for `LUMEN_MODE=mlx`
-///   3. default                           — Candle (safest for unknown workload)
+///   1. `LUMEN_MODE=mlx|candle|auto`  — explicit selection
+///   2. `USE_MLX=1`                     — legacy alias for `LUMEN_MODE=mlx`
+///   3. default                         — Mlx when the `mlx-native` feature is
+///                                        compiled in (mlx-rs gather_qmm path
+///                                        is +57% tok/s vs Candle at short
+///                                        prompts and 33× vs Candle at
+///                                        PROMPT_LEN=2048); otherwise Candle.
 ///
-/// `auto` resolves to Candle. We prefer Candle as the unknown-workload default
-/// because (a) MLX 60-72 tok/s win is single-tenant only and (b) Candle's CB
-/// safely degrades to single-tenant 47.6 tok/s without OOM risk.
+/// `auto` follows the same rule as the unset case.
 fn resolve_backend_mode() -> BackendMode {
     resolve_backend_mode_from(|name| std::env::var(name).ok())
+}
+
+/// Default backend when no env is set. mlx-native build → Mlx, otherwise Candle.
+#[inline]
+fn default_backend_mode() -> BackendMode {
+    #[cfg(feature = "mlx-native")]
+    {
+        BackendMode::Mlx
+    }
+    #[cfg(not(feature = "mlx-native"))]
+    {
+        BackendMode::Candle
+    }
 }
 
 /// Pure-function variant for unit testing — env access is injected so tests
@@ -51,20 +66,21 @@ where
     if let Some(raw) = get("LUMEN_MODE") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "mlx" => return BackendMode::Mlx,
-            "candle" | "auto" => return BackendMode::Candle,
+            "candle" => return BackendMode::Candle,
+            "auto" => return default_backend_mode(),
             other => {
                 eprintln!(
-                    "warn: LUMEN_MODE={other:?} unrecognized; falling back to candle. \
+                    "warn: LUMEN_MODE={other:?} unrecognized; falling back to default. \
                      Valid: mlx | candle | auto."
                 );
-                return BackendMode::Candle;
+                return default_backend_mode();
             }
         }
     }
     if matches!(get("USE_MLX").as_deref(), Some("1")) {
         return BackendMode::Mlx;
     }
-    BackendMode::Candle
+    default_backend_mode()
 }
 
 /// Model backend — supports multiple architectures.
@@ -288,13 +304,7 @@ impl ModelBackend {
                 // Without `session_id`, fall back to the stateless `chat()`
                 // path so single-shot requests stay zero-overhead.
                 let resp = if let Some(sid) = session_id {
-                    m.chat_with_prefix_cache(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        thinking,
-                        sid,
-                    )?
+                    m.chat_with_prefix_cache(messages, max_new_tokens, temperature, thinking, sid)?
                 } else {
                     m.chat(messages, max_new_tokens, temperature, thinking)?
                 };
@@ -399,7 +409,9 @@ fn detect_architecture(model_id: &str) -> &'static str {
     let lower = model_id.to_lowercase();
     if is_qwen3_5_dense(&lower) {
         "qwen3_5_dense"
-    } else if lower.contains("qwen3.6") || lower.contains("qwen3_5") || lower.contains("qwen3-next")
+    } else if lower.contains("qwen3.6")
+        || lower.contains("qwen3_5")
+        || lower.contains("qwen3-next")
         || lower.contains("a3b-mxfp4")
     {
         "qwen3_5_moe"
@@ -562,18 +574,20 @@ impl InferenceEngine {
         // common `MlpBlock` enum that `DecoderLayer.forward` dispatches on.
         #[cfg(feature = "qwen3_5_moe")]
         if arch == "qwen3_5_moe" || arch == "qwen3_5_dense" {
-            use std::path::PathBuf;
-            use std::sync::Arc;
             use lumen_metal::affine4_gpu::Affine4Context;
             use lumen_metal::mxfp4_gpu::MxFp4Context;
             use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
+            use std::path::PathBuf;
+            use std::sync::Arc;
 
             let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
                 .map(PathBuf::from)
-                .map_err(|_| anyhow::anyhow!(
-                    "{arch} requires LUMEN_QWEN35_SHARDS=<dir> pointing to the \
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "{arch} requires LUMEN_QWEN35_SHARDS=<dir> pointing to the \
                      shard directory (config.json + model.safetensors.index.json + shards)"
-                ))?;
+                    )
+                })?;
             let gpu_ctx = Arc::new(MxFp4Context::new()?);
             let mut backend = if arch == "qwen3_5_dense" {
                 // 27B dense ships uniform 4-bit affine quantization → also wire up
@@ -584,32 +598,6 @@ impl InferenceEngine {
                 Qwen35MoeBackend::load(model_id, &shard_dir, gpu_ctx)?
             };
 
-            // Optional MTP speculative-draft head (llama.cpp PR #22673 port).
-            // Active only when:
-            //   1. `LUMEN_SPEC` env contains "mtp" (case-insensitive), AND
-            //   2. `LUMEN_QWEN35_HF_ORIGINAL` env points at the HF original snapshot
-            //      directory (which carries the `mtp.*` weights), AND
-            //   3. the model arch is Qwen3.5/3.6 (config carries an MTP head).
-            // Any one missing → backend stays in non-MTP mode silently (the
-            // existing decode path still works fine).
-            let spec_kind = std::env::var("LUMEN_SPEC")
-                .ok()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            if spec_kind.contains("mtp") {
-                match backend.try_enable_mtp(&shard_dir) {
-                    Ok(true) => eprintln!("  MTP speculative draft enabled (LUMEN_SPEC=mtp)"),
-                    Ok(false) => eprintln!(
-                        "  MTP requested via LUMEN_SPEC=mtp but no `mtp.*` weights resolved \
-                         — continuing without speculation. Set LUMEN_QWEN35_HF_ORIGINAL to \
-                         the HuggingFace original snapshot dir (e.g. \
-                         ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/<hash>/)",
-                    ),
-                    Err(e) => eprintln!(
-                        "  MTP enable failed: {e:#} — continuing without speculation"
-                    ),
-                }
-            }
             return Ok(Self {
                 backend: ModelBackend::Qwen35Moe(backend),
                 model_id: model_id.to_string(),
@@ -1290,7 +1278,6 @@ impl InferenceEngine {
         use candle_core::{DType, Tensor};
         use std::collections::HashMap;
 
-
         let max_batch: usize = std::env::var("PAGED_MAX_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1758,8 +1745,13 @@ impl InferenceEngine {
                             req.thinking,
                             token_tx.clone(),
                         ) {
-                            Ok(seq) => { active.insert(next_seq_id, seq); next_seq_id += 1; }
-                            Err(e) => { let _ = token_tx.try_send(StreamEvent::Error(e.to_string())); }
+                            Ok(seq) => {
+                                active.insert(next_seq_id, seq);
+                                next_seq_id += 1;
+                            }
+                            Err(e) => {
+                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                            }
                         }
                     }
                     Ok(EngineRequest::StreamingAnthropicMessages { req, token_tx }) => {
@@ -1774,20 +1766,39 @@ impl InferenceEngine {
                                     .join("\n"),
                             };
                             if !system_text.is_empty() {
-                                messages.push(ChatMessage { role: "system".into(), content: system_text });
+                                messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: system_text,
+                                });
                             }
                         }
                         for msg in &req.messages {
-                            messages.push(ChatMessage { role: msg.role.clone(), content: msg.content.as_text() });
+                            messages.push(ChatMessage {
+                                role: msg.role.clone(),
+                                content: msg.content.as_text(),
+                            });
                         }
                         match self.start_streaming_seq_qwen35(
-                            next_seq_id, &messages, req.max_tokens, req.temperature, 0.9, req.thinking, token_tx.clone(),
+                            next_seq_id,
+                            &messages,
+                            req.max_tokens,
+                            req.temperature,
+                            0.9,
+                            req.thinking,
+                            token_tx.clone(),
                         ) {
-                            Ok(seq) => { active.insert(next_seq_id, seq); next_seq_id += 1; }
-                            Err(e) => { let _ = token_tx.try_send(StreamEvent::Error(e.to_string())); }
+                            Ok(seq) => {
+                                active.insert(next_seq_id, seq);
+                                next_seq_id += 1;
+                            }
+                            Err(e) => {
+                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                            }
                         }
                     }
-                    Ok(other) => { self.dispatch_request_sequential(other); }
+                    Ok(other) => {
+                        self.dispatch_request_sequential(other);
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                 }
@@ -1796,14 +1807,30 @@ impl InferenceEngine {
             if active.is_empty() {
                 match rx.recv().await {
                     Some(req) => {
-                        if matches!(req, EngineRequest::StreamingChatCompletion { .. } | EngineRequest::StreamingAnthropicMessages { .. }) {
+                        if matches!(
+                            req,
+                            EngineRequest::StreamingChatCompletion { .. }
+                                | EngineRequest::StreamingAnthropicMessages { .. }
+                        ) {
                             match req {
                                 EngineRequest::StreamingChatCompletion { req, token_tx } => {
                                     match self.start_streaming_seq_qwen35(
-                                        next_seq_id, &req.messages, req.max_tokens, req.temperature, req.top_p, req.thinking, token_tx.clone(),
+                                        next_seq_id,
+                                        &req.messages,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        req.top_p,
+                                        req.thinking,
+                                        token_tx.clone(),
                                     ) {
-                                        Ok(seq) => { active.insert(next_seq_id, seq); next_seq_id += 1; }
-                                        Err(e) => { let _ = token_tx.try_send(StreamEvent::Error(e.to_string())); }
+                                        Ok(seq) => {
+                                            active.insert(next_seq_id, seq);
+                                            next_seq_id += 1;
+                                        }
+                                        Err(e) => {
+                                            let _ = token_tx
+                                                .try_send(StreamEvent::Error(e.to_string()));
+                                        }
                                     }
                                 }
                                 EngineRequest::StreamingAnthropicMessages { req, token_tx } => {
@@ -1811,18 +1838,42 @@ impl InferenceEngine {
                                     if let Some(ref system) = req.system {
                                         let system_text = match system {
                                             AnthropicSystem::Text(s) => s.clone(),
-                                            AnthropicSystem::Blocks(blocks) => blocks.iter().filter_map(|b| b.text.clone()).collect::<Vec<_>>().join("\n"),
+                                            AnthropicSystem::Blocks(blocks) => blocks
+                                                .iter()
+                                                .filter_map(|b| b.text.clone())
+                                                .collect::<Vec<_>>()
+                                                .join("\n"),
                                         };
                                         if !system_text.is_empty() {
-                                            messages.push(ChatMessage { role: "system".into(), content: system_text });
+                                            messages.push(ChatMessage {
+                                                role: "system".into(),
+                                                content: system_text,
+                                            });
                                         }
                                     }
-                                    for msg in &req.messages { messages.push(ChatMessage { role: msg.role.clone(), content: msg.content.as_text() }); }
+                                    for msg in &req.messages {
+                                        messages.push(ChatMessage {
+                                            role: msg.role.clone(),
+                                            content: msg.content.as_text(),
+                                        });
+                                    }
                                     match self.start_streaming_seq_qwen35(
-                                        next_seq_id, &messages, req.max_tokens, req.temperature, 0.9, req.thinking, token_tx.clone(),
+                                        next_seq_id,
+                                        &messages,
+                                        req.max_tokens,
+                                        req.temperature,
+                                        0.9,
+                                        req.thinking,
+                                        token_tx.clone(),
                                     ) {
-                                        Ok(seq) => { active.insert(next_seq_id, seq); next_seq_id += 1; }
-                                        Err(e) => { let _ = token_tx.try_send(StreamEvent::Error(e.to_string())); }
+                                        Ok(seq) => {
+                                            active.insert(next_seq_id, seq);
+                                            next_seq_id += 1;
+                                        }
+                                        Err(e) => {
+                                            let _ = token_tx
+                                                .try_send(StreamEvent::Error(e.to_string()));
+                                        }
                                     }
                                 }
                                 _ => unreachable!(),
@@ -1844,107 +1895,16 @@ impl InferenceEngine {
             let q = match &mut self.backend {
                 #[cfg(feature = "turboquant-gpu")]
                 ModelBackend::Qwen35Moe(q) => q,
-                _ => { eprintln!("[qwen35 batched] non-Qwen35 backend unreachable"); return; }
+                _ => {
+                    eprintln!("[qwen35 batched] non-Qwen35 backend unreachable");
+                    return;
+                }
             };
 
             let t_step = std::time::Instant::now();
-            let breakdown = std::env::var("LUMEN_HTTP_BREAKDOWN").map(|v| v == "1").unwrap_or(false);
-
-            // ── MTP fast path: single-seq + greedy + MTP enabled ─────────────
-            // Multi-seq batching and non-greedy sampling stay on the existing
-            // decode_step_batch path (no semantic change). The MTP step emits
-            // 1 + n_accepted tokens in one engine step, so we update seq state
-            // and continue without touching the normal sampling/emit code below.
-            let mtp_eligible = ids.len() == 1
-                && q.has_mtp()
-                && {
-                    let s = &active[&ids[0]];
-                    s.temperature == 0.0 && (s.repeat_penalty - 1.0).abs() < 1e-9
-                };
-            if std::env::var("LUMEN_SPEC_DEBUG").is_ok() {
-                let s = active.get(&ids[0]);
-                eprintln!(
-                    "[mtp_debug] ids.len={} has_mtp={} temp={:?} rp={:?} → eligible={}",
-                    ids.len(),
-                    q.has_mtp(),
-                    s.map(|s| s.temperature),
-                    s.map(|s| s.repeat_penalty),
-                    mtp_eligible,
-                );
-            }
-            if mtp_eligible {
-                let id = ids[0];
-                let n_max: usize = std::env::var("LUMEN_SPEC_DRAFT_N_MAX")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(3);
-                match q.mtp_step(id, last_tokens[0], positions[0], n_max) {
-                    Ok((committed, n_drafted, n_accepted)) => {
-                        let seq = active.get_mut(&id).unwrap();
-                        // Commit each token: append, advance position, stream, check EOS.
-                        let mut hit_terminator = false;
-                        for tok in &committed {
-                            seq.generated.push(*tok);
-                            seq.last_token = *tok;
-                            seq.position += 1;
-                            // Stream decode + emit (text delta).
-                            let q2 = match &self.backend {
-                                #[cfg(feature = "turboquant-gpu")]
-                                ModelBackend::Qwen35Moe(qq) => qq,
-                                _ => unreachable!(),
-                            };
-                            if let Ok(text) = q2.decode(&seq.generated) {
-                                if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
-                                    let delta = text[seq.prev_text.len()..].to_string();
-                                    if !delta.is_empty() {
-                                        let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-                                        seq.prev_text = text;
-                                    }
-                                }
-                            }
-                            if seq.eos_tokens.contains(tok) || seq.generated.len() >= seq.max_new {
-                                hit_terminator = true;
-                                break;
-                            }
-                        }
-                        let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-                        eprintln!(
-                            "[qwen35 batched] mtp_step seq {id}: drafted={n_drafted} accepted={n_accepted} \
-                             emitted={} latency={:.1}ms ({:.1} tok/s)",
-                            committed.len(),
-                            step_ms,
-                            committed.len() as f64 / (step_ms / 1000.0),
-                        );
-                        if hit_terminator {
-                            let decode_ms = seq.decode_start.elapsed().as_secs_f64() * 1000.0;
-                            let n_gen = seq.generated.len();
-                            eprintln!(
-                                "[qwen35 batched] seq {id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
-                                n_gen as f64 / (decode_ms / 1000.0),
-                            );
-                            let _ = seq.token_tx.try_send(StreamEvent::Done {
-                                prompt_tokens: seq.prompt_tokens,
-                                completion_tokens: n_gen as u32,
-                            });
-                            active.remove(&id);
-                            if let ModelBackend::Qwen35Moe(q) = &mut self.backend {
-                                q.remove_sequence(id);
-                            }
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[qwen35 batched] mtp_step seq {id} failed: {e:#} \
-                             — falling through to decode_step_batch for this iteration"
-                        );
-                        // Fall through to the existing single-seq path. The
-                        // failure may have left MTP state inconsistent; future
-                        // iterations may continue to fail and the dispatch
-                        // will keep falling through — acceptable degrade.
-                    }
-                }
-            }
+            let breakdown = std::env::var("LUMEN_HTTP_BREAKDOWN")
+                .map(|v| v == "1")
+                .unwrap_or(false);
 
             // Both N=1 and N≥2 go through decode_step_batch → [B, vocab] for CPU sampling.
             // N=1 keeps the single-seq KV path (no SSM pollution); N≥2 is sequential-per-seq.
@@ -1958,7 +1918,11 @@ impl InferenceEngine {
                     continue;
                 }
             };
-            let t_decode = if breakdown { Some(std::time::Instant::now()) } else { None };
+            let t_decode = if breakdown {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Greedy fast path: when ALL seqs in this step are temperature==0 +
             // repeat_penalty==1.0 (no penalty), do GPU argmax over `[B, vocab]`
@@ -1972,7 +1936,11 @@ impl InferenceEngine {
             // For mixed/non-greedy seqs we still need full logits on CPU.
             // For all-greedy: skip the full transfer entirely.
             let (flat, argmax_idx): (Vec<f32>, Option<Vec<u32>>) = if all_greedy {
-                let am = match logits.argmax(candle_core::D::Minus1).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<u32>()) {
+                let am = match logits
+                    .argmax(candle_core::D::Minus1)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<u32>())
+                {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[qwen35 batched] argmax err: {e}");
@@ -1986,7 +1954,11 @@ impl InferenceEngine {
                 }
                 (Vec::new(), Some(am))
             } else {
-                let v = match logits.to_dtype(DType::F32).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1()) {
+                let v = match logits
+                    .to_dtype(DType::F32)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1())
+                {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[qwen35 batched] logits cpu err: {e}");
@@ -1995,7 +1967,11 @@ impl InferenceEngine {
                 };
                 (v, None)
             };
-            let t_xfer = if breakdown { Some(std::time::Instant::now()) } else { None };
+            let t_xfer = if breakdown {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let vocab = if all_greedy {
                 logits.dims().last().copied().unwrap_or(0)
             } else if flat.is_empty() || ids.is_empty() {
@@ -2012,13 +1988,21 @@ impl InferenceEngine {
             for (row, &id) in ids.iter().enumerate() {
                 let seq = active.get_mut(&id).unwrap();
                 let _ = vocab; // suppress unused warning when all_greedy path skips slicing
-                let ts0 = if breakdown { Some(std::time::Instant::now()) } else { None };
+                let ts0 = if breakdown {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let next_tok = if let Some(ref am) = argmax_idx {
                     am[row]
                 } else {
                     let row_slice = &flat[row * vocab..(row + 1) * vocab];
                     match lumen_model::sampling::sample_token_cpu(
-                        row_slice, seq.temperature, seq.top_p, seq.repeat_penalty, &seq.generated,
+                        row_slice,
+                        seq.temperature,
+                        seq.top_p,
+                        seq.repeat_penalty,
+                        &seq.generated,
                     ) {
                         Ok(t) => t,
                         Err(e) => {
@@ -2027,7 +2011,11 @@ impl InferenceEngine {
                         }
                     }
                 };
-                let ts1 = if breakdown { Some(std::time::Instant::now()) } else { None };
+                let ts1 = if breakdown {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 seq.generated.push(next_tok);
                 seq.last_token = next_tok;
                 seq.position += 1;
@@ -2041,7 +2029,11 @@ impl InferenceEngine {
                     if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
                         let delta = text[seq.prev_text.len()..].to_string();
                         if !delta.is_empty() {
-                            let ts2 = if breakdown { Some(std::time::Instant::now()) } else { None };
+                            let ts2 = if breakdown {
+                                Some(std::time::Instant::now())
+                            } else {
+                                None
+                            };
                             let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
                             seq.prev_text = text;
                             if let (Some(a), Some(b)) = (ts1, ts2) {
@@ -2072,15 +2064,27 @@ impl InferenceEngine {
             let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
             if breakdown {
                 let decode_ms = t_decode.unwrap().duration_since(t_step).as_secs_f64() * 1000.0;
-                let xfer_ms = t_xfer.unwrap().duration_since(t_decode.unwrap()).as_secs_f64() * 1000.0;
+                let xfer_ms = t_xfer
+                    .unwrap()
+                    .duration_since(t_decode.unwrap())
+                    .as_secs_f64()
+                    * 1000.0;
                 eprintln!(
                     "[qwen35 batched] step: N={} total={:.1}ms (decode={:.1} xfer={:.1} sample={:.1} decode_text={:.1} send={:.1})",
-                    ids.len(), step_ms, decode_ms, xfer_ms, sample_ms, decode_text_ms, send_ms,
+                    ids.len(),
+                    step_ms,
+                    decode_ms,
+                    xfer_ms,
+                    sample_ms,
+                    decode_text_ms,
+                    send_ms,
                 );
             } else {
                 eprintln!(
                     "[qwen35 batched] step: N={} latency={:.1}ms agg={:.1} tok/s",
-                    ids.len(), step_ms, ids.len() as f64 / (step_ms / 1000.0),
+                    ids.len(),
+                    step_ms,
+                    ids.len() as f64 / (step_ms / 1000.0),
                 );
             }
             for id in to_remove {
@@ -2139,14 +2143,6 @@ impl InferenceEngine {
             if let Err(e) = result {
                 q.remove_sequence(seq_id);
                 return Err(anyhow::anyhow!("prefill seq {seq_id}: {e}"));
-            }
-        }
-        // MTP: mirror the prefill into the MTP block's KV (no-op when MTP disabled).
-        // Must run BEFORE any other forward call clears the trunk's captured
-        // h_pre_norm. `mirror_prefill_into_mtp` consumes it via `take_h_pre_norm`.
-        if q.has_mtp() && !prefix.is_empty() {
-            if let Err(e) = q.mirror_prefill_into_mtp(seq_id, prefix) {
-                eprintln!("[qwen35 batched] seq {seq_id} MTP prefill mirror failed: {e:#}");
             }
         }
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -2257,18 +2253,25 @@ impl InferenceEngine {
 
 #[cfg(test)]
 mod backend_mode_tests {
-    use super::{resolve_backend_mode_from, BackendMode};
+    use super::{BackendMode, resolve_backend_mode_from};
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |name: &str| map.get(name).cloned()
     }
 
+    #[cfg(feature = "mlx-native")]
+    const DEFAULT: BackendMode = BackendMode::Mlx;
+    #[cfg(not(feature = "mlx-native"))]
+    const DEFAULT: BackendMode = BackendMode::Candle;
+
     #[test]
-    fn default_is_candle() {
-        assert_eq!(resolve_backend_mode_from(env(&[])), BackendMode::Candle);
+    fn default_matches_compiled_feature() {
+        assert_eq!(resolve_backend_mode_from(env(&[])), DEFAULT);
     }
 
     #[test]
@@ -2288,10 +2291,10 @@ mod backend_mode_tests {
     }
 
     #[test]
-    fn auto_resolves_to_candle() {
+    fn auto_resolves_to_default() {
         assert_eq!(
             resolve_backend_mode_from(env(&[("LUMEN_MODE", "auto")])),
-            BackendMode::Candle
+            DEFAULT
         );
     }
 
@@ -2308,10 +2311,10 @@ mod backend_mode_tests {
     }
 
     #[test]
-    fn invalid_value_falls_back_to_candle() {
+    fn invalid_value_falls_back_to_default() {
         assert_eq!(
             resolve_backend_mode_from(env(&[("LUMEN_MODE", "gpt-5")])),
-            BackendMode::Candle
+            DEFAULT
         );
     }
 
@@ -2324,26 +2327,20 @@ mod backend_mode_tests {
     }
 
     #[test]
-    fn legacy_use_mlx_other_values_ignored() {
+    fn legacy_use_mlx_other_values_fall_through_to_default() {
         // Only USE_MLX=1 historically meant "on". Other values fall through.
         assert_eq!(
             resolve_backend_mode_from(env(&[("USE_MLX", "true")])),
-            BackendMode::Candle
+            DEFAULT
         );
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("USE_MLX", "0")])),
-            BackendMode::Candle
-        );
+        assert_eq!(resolve_backend_mode_from(env(&[("USE_MLX", "0")])), DEFAULT);
     }
 
     #[test]
     fn lumen_mode_takes_precedence_over_use_mlx() {
         // Explicit candle overrides legacy USE_MLX=1.
         assert_eq!(
-            resolve_backend_mode_from(env(&[
-                ("LUMEN_MODE", "candle"),
-                ("USE_MLX", "1"),
-            ])),
+            resolve_backend_mode_from(env(&[("LUMEN_MODE", "candle"), ("USE_MLX", "1"),])),
             BackendMode::Candle
         );
         // And the inverse — LUMEN_MODE=mlx without USE_MLX.
@@ -2364,10 +2361,7 @@ mod arch_detection_tests {
             detect_architecture("mlx-community/Qwen3.6-35B-A3B-mxfp4"),
             "qwen3_5_moe"
         );
-        assert_eq!(
-            detect_architecture("Qwen/Qwen3.6-35B-A3B"),
-            "qwen3_5_moe"
-        );
+        assert_eq!(detect_architecture("Qwen/Qwen3.6-35B-A3B"), "qwen3_5_moe");
         assert_eq!(
             detect_architecture("Qwen/Qwen3-Next-80B-A3B"),
             "qwen3_5_moe"
@@ -2420,10 +2414,7 @@ mod arch_detection_tests {
         );
         assert_eq!(detect_architecture("google/gemma-2b"), "gemma4");
         assert_eq!(detect_architecture("google/gemma-2-9b-it"), "gemma4");
-        assert_eq!(
-            detect_architecture("Qwen/Qwen2.5-1.5B-Instruct"),
-            "qwen2"
-        );
+        assert_eq!(detect_architecture("Qwen/Qwen2.5-1.5B-Instruct"), "qwen2");
         assert_eq!(
             detect_architecture("meta-llama/Llama-3-8B-Instruct"),
             "qwen2"

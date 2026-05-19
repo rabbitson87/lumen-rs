@@ -16,8 +16,6 @@ pub mod linear_attn;
 pub mod loader;
 pub mod model;
 pub mod moe;
-pub mod mtp;
-pub mod mtp_drafter;
 #[cfg(feature = "mpsgraph")]
 pub(crate) mod mpsgraph_norm;
 pub mod proj;

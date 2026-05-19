@@ -61,9 +61,8 @@ fn dump_tensor_f32(t: &Tensor, path: &str) -> CandleResult<()> {
         f.write_all(&(*d as u32).to_le_bytes())
             .map_err(|e| candle_core::Error::Msg(format!("write dim: {e}")))?;
     }
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
     f.write_all(bytes)
         .map_err(|e| candle_core::Error::Msg(format!("write data: {e}")))?;
     Ok(())
@@ -81,16 +80,6 @@ pub struct Qwen3_5MoeTextModel {
     /// layers. Populated by `enable_turboquant`; consumed inside each
     /// `SelfAttention::forward_with_tq` via the `tq_slot` assigned by the loader.
     compressed_kv: CompressedKvHandle,
-    /// When true, every `forward_*` stashes the residual stream just before `final_norm`
-    /// into `last_h_pre_norm`. Consumed by the MTP speculative draft path
-    /// (llama.cpp PR #22673 `llama_get_embeddings_pre_norm_ith`). Off by default — when
-    /// off the capture cost is one boolean branch per forward call.
-    capture_h_pre_norm: bool,
-    /// Most recent pre-final-norm residual produced by any `forward_*` call. Shape
-    /// depends on the entry point: `[B, S, hidden]` for `forward_with_offset`,
-    /// `[N, 1, hidden]` for the batched-decode paths. Caller slices per-seq.
-    /// Cleared by [`Self::take_h_pre_norm`].
-    last_h_pre_norm: Option<Tensor>,
 }
 
 impl Qwen3_5MoeTextModel {
@@ -106,8 +95,6 @@ impl Qwen3_5MoeTextModel {
             final_norm,
             lm_head,
             compressed_kv: None,
-            capture_h_pre_norm: false,
-            last_h_pre_norm: None,
         }
     }
 
@@ -117,50 +104,6 @@ impl Qwen3_5MoeTextModel {
 
     pub fn layers(&self) -> &[DecoderLayer] {
         &self.layers
-    }
-
-    /// Toggle pre-final-norm hidden-state capture for the MTP draft path. When `on`,
-    /// every subsequent `forward_*` call writes the residual stream immediately
-    /// before `final_norm.forward(...)` into `last_h_pre_norm`. Off by default.
-    /// Turning it off clears any pending capture.
-    pub fn set_capture_h_pre_norm(&mut self, on: bool) {
-        self.capture_h_pre_norm = on;
-        if !on {
-            self.last_h_pre_norm = None;
-        }
-    }
-
-    pub fn capture_h_pre_norm_enabled(&self) -> bool {
-        self.capture_h_pre_norm
-    }
-
-    /// Borrow the most recently captured pre-norm hidden tensor.
-    pub fn peek_h_pre_norm(&self) -> Option<&Tensor> {
-        self.last_h_pre_norm.as_ref()
-    }
-
-    /// Consume the most recently captured pre-norm hidden tensor. The MTP draft loop
-    /// calls this after each trunk decode / verify batch.
-    pub fn take_h_pre_norm(&mut self) -> Option<Tensor> {
-        self.last_h_pre_norm.take()
-    }
-
-    /// Borrow the trunk's final norm. Used by `MtpBlock` to fall back to the
-    /// shared head norm when the checkpoint omits `mtp.norm`.
-    pub fn final_norm(&self) -> &RmsNorm {
-        &self.final_norm
-    }
-
-    /// Borrow the trunk's lm_head. Used by `MtpBlock` to share the LM head when
-    /// `mtp_use_dedicated_embeddings=false` (the common case for Qwen3.5/3.6).
-    pub fn lm_head(&self) -> &ProjLinear {
-        &self.lm_head
-    }
-
-    /// Borrow the trunk's token embedding. Used by `MtpBlock` to embed the
-    /// next-token id `x_{p+1}` before pairing it with `h_p`.
-    pub fn embed_tokens(&self) -> &Embedding {
-        &self.embed_tokens
     }
 
     /// Prefill forward. `input_ids: [B, S]` (token IDs). Returns logits `[B, S, vocab]`.
@@ -194,8 +137,6 @@ impl Qwen3_5MoeTextModel {
             final_norm,
             lm_head,
             compressed_kv,
-            capture_h_pre_norm,
-            last_h_pre_norm,
         } = self;
         // Optional layer-wise hidden-state dump. Set `LUMEN_DUMP_HIDDEN=/path/to/dir`
         // before running a prefill and every intermediate [B, S, hidden] / [B, S, vocab]
@@ -210,7 +151,11 @@ impl Qwen3_5MoeTextModel {
             .map(|v| v == "1")
             .unwrap_or(false);
         let device = input_ids.device().clone();
-        let t_start = if breakdown { Some(std::time::Instant::now()) } else { None };
+        let t_start = if breakdown {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut h = embed_tokens.forward(input_ids)?;
         if let Some(d) = &dump_dir {
             dump_tensor_f32(&h, &format!("{d}/embed.bin"))?;
@@ -312,11 +257,6 @@ impl Qwen3_5MoeTextModel {
         } else {
             h
         };
-        // MTP hook: stash the pre-final-norm residual. Cheap (Arc bump on Metal /
-        // ref-clone on Candle CPU) and only fires when explicitly enabled.
-        if *capture_h_pre_norm {
-            *last_h_pre_norm = Some(h.clone());
-        }
         let h = {
             #[cfg(feature = "mpsgraph")]
             {
@@ -436,14 +376,13 @@ impl Qwen3_5MoeTextModel {
         seq_ids: &[u64],
         positions: &[usize],
     ) -> CandleResult<Tensor> {
-
         let device = self.embed_tokens.embeddings().device().clone();
         let mut rows: Vec<Tensor> = Vec::with_capacity(seq_ids.len());
         for (i, &seq_id) in seq_ids.iter().enumerate() {
             self.set_current_seq_id(seq_id);
             let tok = Tensor::new(&[last_tokens[i]], &device)?.unsqueeze(0)?; // [1, 1]
-            let logits = self.forward_with_offset(&tok, positions[i])?;       // [1, 1, vocab]
-            rows.push(logits.squeeze(0)?.squeeze(0)?);                         // [vocab]
+            let logits = self.forward_with_offset(&tok, positions[i])?; // [1, 1, vocab]
+            rows.push(logits.squeeze(0)?.squeeze(0)?); // [vocab]
         }
         Tensor::stack(&rows, 0) // [B, vocab]
     }
@@ -468,8 +407,6 @@ impl Qwen3_5MoeTextModel {
             final_norm,
             lm_head,
             compressed_kv,
-            capture_h_pre_norm,
-            last_h_pre_norm,
         } = self;
 
         let device = embed_tokens.embeddings().device().clone();
@@ -502,11 +439,6 @@ impl Qwen3_5MoeTextModel {
 
         // Final norm + lm_head: batched once across all seqs
         let h_stacked = Tensor::cat(&hs, 0)?; // [N, 1, hidden]
-        // MTP hook: stash the pre-final-norm batched residual. Caller slices per-seq
-        // along axis 0 (each row corresponds to seq_ids[i]).
-        if *capture_h_pre_norm {
-            *last_h_pre_norm = Some(h_stacked.clone());
-        }
         let h_normed = {
             #[cfg(feature = "mpsgraph")]
             {
@@ -550,8 +482,6 @@ impl Qwen3_5MoeTextModel {
             final_norm,
             lm_head,
             compressed_kv,
-            capture_h_pre_norm,
-            last_h_pre_norm,
         } = self;
 
         let device = embed_tokens.embeddings().device().clone();
@@ -585,13 +515,8 @@ impl Qwen3_5MoeTextModel {
             let mut post_attn: Vec<Tensor> = Vec::with_capacity(n);
             for (i, &seq_id) in seq_ids.iter().enumerate() {
                 layer.set_current_seq_id(seq_id);
-                let h_out = layer.forward_attn_part(
-                    &hs[i],
-                    positions[i],
-                    None,
-                    None,
-                    compressed_kv,
-                )?;
+                let h_out =
+                    layer.forward_attn_part(&hs[i], positions[i], None, None, compressed_kv)?;
                 post_attn.push(h_out);
             }
             let tc = mark(breakdown, &device);
@@ -615,10 +540,6 @@ impl Qwen3_5MoeTextModel {
 
         // Batched final norm + lm_head (one dispatch for all B seqs)
         let h_stacked = Tensor::cat(&hs, 0)?; // [n, 1, hidden]
-        // MTP hook: stash the pre-final-norm batched residual.
-        if *capture_h_pre_norm {
-            *last_h_pre_norm = Some(h_stacked.clone());
-        }
         let h_normed = {
             #[cfg(feature = "mpsgraph")]
             {
@@ -639,7 +560,11 @@ impl Qwen3_5MoeTextModel {
             let _ = device.synchronize();
             let t_end = std::time::Instant::now();
             let embed_ms = t_embed.unwrap().duration_since(t0.unwrap()).as_secs_f64() * 1000.0;
-            let layers_ms = t_layers.unwrap().duration_since(t_embed.unwrap()).as_secs_f64() * 1000.0;
+            let layers_ms = t_layers
+                .unwrap()
+                .duration_since(t_embed.unwrap())
+                .as_secs_f64()
+                * 1000.0;
             let head_ms = t_end.duration_since(t_layers.unwrap()).as_secs_f64() * 1000.0;
             eprintln!(
                 "    v2-bd: embed={embed_ms:.1} layers={layers_ms:.1} \
@@ -708,7 +633,7 @@ mod tests {
     use crate::qwen3_5_moe::config::{LayerType, Qwen3_5MoeConfig};
     use crate::qwen3_5_moe::layer::{AttentionBlock, DecoderLayer};
     use crate::qwen3_5_moe::linear_attn::{
-        conv1d_from_mlx_weight, GatedDeltaNet, GatedDeltaNetRuntime, LinearAttnDims,
+        GatedDeltaNet, GatedDeltaNetRuntime, LinearAttnDims, conv1d_from_mlx_weight,
     };
     use crate::qwen3_5_moe::moe::{
         MoeDims, SharedExpert, SparseMoeBlock, SparseMoeRuntime, SwitchMlp,
@@ -717,7 +642,7 @@ mod tests {
 
     use candle_core::{Device, Tensor};
     use candle_nn::{Embedding, Linear, RmsNorm};
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     const CONFIG_JSON: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -746,10 +671,7 @@ mod tests {
         // Option M2: pre-fused [q_out + 2*kv_out, hidden] qkv weight.
         let combined_out = d.q_out_dim() + 2 * d.kv_out_dim();
         let qkv = Linear::new(rnd(&[combined_out, d.hidden_size], rng, device), None);
-        let o = Linear::new(
-            rnd(&[d.hidden_size, d.attn_value_dim()], rng, device),
-            None,
-        );
+        let o = Linear::new(rnd(&[d.hidden_size, d.attn_value_dim()], rng, device), None);
         let ones = Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
         SelfAttention::new(
             SelfAttnRuntime {
@@ -779,8 +701,7 @@ mod tests {
         let conv = conv1d_from_mlx_weight(conv_w, d.conv_kernel).unwrap();
         let a_log = rnd(&[d.num_v_heads], rng, device);
         let dt_bias = rnd(&[d.num_v_heads], rng, device);
-        let norm_w =
-            Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
+        let norm_w = Tensor::from_vec(vec![1f32; d.head_dim], (d.head_dim,), device).unwrap();
         let out = Linear::new(rnd(&[d.hidden_size, d.v_dim()], rng, device), None);
         GatedDeltaNet::new(
             GatedDeltaNetRuntime {
@@ -879,9 +800,7 @@ mod tests {
                 LayerType::LinearAttention => {
                     AttentionBlock::Linear(tiny_linear_attn(&mut r, device))
                 }
-                LayerType::FullAttention => {
-                    AttentionBlock::Full(tiny_self_attn(&mut r, device))
-                }
+                LayerType::FullAttention => AttentionBlock::Full(tiny_self_attn(&mut r, device)),
             };
             layers.push(DecoderLayer::new(
                 tiny_norm(device),
@@ -916,77 +835,6 @@ mod tests {
         let logits = model.forward(&input_ids).unwrap();
         assert_eq!(logits.dims(), &[1, 3, VOCAB]);
         assert!(is_finite(&logits), "forty-layer forward should be finite");
-    }
-
-    /// MTP pre-norm hidden state capture.
-    ///
-    /// Verifies the contract relied on by `MtpDrafter::process_after_trunk` (llama.cpp
-    /// PR #22673): calling `set_capture_h_pre_norm(true)` followed by a forward pass
-    /// must produce a hidden tensor `h` such that `lm_head(final_norm(h))` is
-    /// bit-identical to the model's returned logits. Without this guarantee the
-    /// MTP draft path cannot reconstruct the trunk's prediction distribution.
-    #[test]
-    fn capture_h_pre_norm_round_trips_logits() {
-        let device = Device::Cpu;
-        let mut model = build_tiny_model(&device);
-
-        // Toggle on, forward, take.
-        assert!(!model.capture_h_pre_norm_enabled());
-        model.set_capture_h_pre_norm(true);
-        assert!(model.capture_h_pre_norm_enabled());
-        assert!(model.peek_h_pre_norm().is_none(), "no forward yet");
-
-        let input_ids = Tensor::from_vec(vec![1u32, 7, 19, 3], (1, 4), &device).unwrap();
-        let logits_ref = model.forward(&input_ids).unwrap();
-        assert_eq!(logits_ref.dims(), &[1, 4, VOCAB]);
-
-        let h_pre = model
-            .take_h_pre_norm()
-            .expect("capture should have populated last_h_pre_norm");
-        // Tensor consumed.
-        assert!(model.peek_h_pre_norm().is_none());
-        assert_eq!(h_pre.dims(), &[1, 4, HIDDEN]);
-
-        // Reproduce trunk's `final_norm → lm_head` from the captured pre-norm hidden.
-        let h_normed = model.final_norm().forward(&h_pre).unwrap();
-        let logits_redo = model.lm_head().forward(&h_normed).unwrap();
-        assert_eq!(logits_redo.dims(), logits_ref.dims());
-
-        // Bit-equality: same f32 inputs, same op order ⇒ same bits.
-        let a = logits_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = logits_redo.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(a.len(), b.len());
-        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(
-                x.to_bits(),
-                y.to_bits(),
-                "logits diverge at index {i}: ref={x} redo={y}",
-            );
-        }
-    }
-
-    /// Capture must be a no-op when the flag is off — no allocation, no stash.
-    #[test]
-    fn capture_h_pre_norm_off_by_default_and_clears_on_disable() {
-        let device = Device::Cpu;
-        let mut model = build_tiny_model(&device);
-        let input_ids = Tensor::from_vec(vec![2u32, 4], (1, 2), &device).unwrap();
-        let _ = model.forward(&input_ids).unwrap();
-        assert!(
-            model.peek_h_pre_norm().is_none(),
-            "capture must stay None while disabled",
-        );
-
-        model.set_capture_h_pre_norm(true);
-        let _ = model.forward(&input_ids).unwrap();
-        assert!(model.peek_h_pre_norm().is_some());
-
-        // Disabling clears any pending stash.
-        model.set_capture_h_pre_norm(false);
-        assert!(
-            model.peek_h_pre_norm().is_none(),
-            "disable must clear last_h_pre_norm",
-        );
     }
 
     #[test]
@@ -1134,7 +982,12 @@ mod tests {
         let logits = model.forward(&input_ids).unwrap();
         let embed_only = model
             .lm_head
-            .forward(&model.final_norm.forward(&model.embed_tokens.forward(&input_ids).unwrap()).unwrap())
+            .forward(
+                &model
+                    .final_norm
+                    .forward(&model.embed_tokens.forward(&input_ids).unwrap())
+                    .unwrap(),
+            )
             .unwrap();
         let diff = (&logits - &embed_only)
             .unwrap()

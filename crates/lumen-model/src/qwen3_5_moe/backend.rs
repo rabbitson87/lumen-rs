@@ -20,12 +20,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Storage, Tensor, D};
-use tokenizers::Tokenizer;
-use lumen_metal::metal::{Buffer, CommandQueue, Device as MtlDevice};
+use candle_core::{D, DType, Device, Storage, Tensor};
 use lumen_metal::affine4_gpu::Affine4Context;
+use lumen_metal::metal::{Buffer, CommandQueue, Device as MtlDevice};
 use lumen_metal::mxfp4_gpu::MxFp4Context;
 use lumen_metal::sampling::SamplingKernels;
+use tokenizers::Tokenizer;
 
 use crate::sampling::sample_token_cpu_full_owned;
 
@@ -104,7 +104,6 @@ impl GpuSampler {
 use super::config::Qwen3_5MoeConfig;
 use super::loader::ShardSet;
 use super::model::Qwen3_5MoeTextModel;
-use super::mtp_drafter::MtpDrafter;
 
 /// Lookahead-decode summary captured from the most recent `generate_with_opts`
 /// call. Populated only when `LUMEN_LOOKAHEAD_DECODE=1` was active for that
@@ -141,11 +140,6 @@ pub struct Qwen35MoeBackend {
     /// Lookahead-decode summary from the most recent `generate_with_opts` call,
     /// or `None` if lookahead was disabled. Reset every call.
     last_lookahead_stats: Option<LookaheadStats>,
-    /// MTP speculative drafter (llama.cpp PR #22673 port). `Some` after
-    /// [`Self::try_enable_mtp`] succeeds — drives draft-then-verify decode for
-    /// greedy generations. `None` for non-Qwen3.6 models or when
-    /// `LUMEN_QWEN35_HF_ORIGINAL` isn't set to a snapshot carrying `mtp.*`.
-    mtp: Option<MtpDrafter>,
 }
 
 impl Qwen35MoeBackend {
@@ -229,9 +223,7 @@ impl Qwen35MoeBackend {
             .unwrap_or(8192);
         model.enable_kv_cache(max_seq);
         let n_full_attn = model.assign_tq_slots();
-        eprintln!(
-            "  KV cache enabled (max_seq={max_seq}), {n_full_attn} full-attn slots",
-        );
+        eprintln!("  KV cache enabled (max_seq={max_seq}), {n_full_attn} full-attn slots",);
 
         // TurboQuant compressed-KV backend, **default-OFF** for qwen3_5_moe.
         //
@@ -322,73 +314,7 @@ impl Qwen35MoeBackend {
             sampler,
             last_decode_step_ms: Vec::new(),
             last_lookahead_stats: None,
-            mtp: None,
         })
-    }
-
-    /// Try to enable MTP speculative decoding by loading the `mtp.*` head from the HF
-    /// original snapshot at `LUMEN_QWEN35_HF_ORIGINAL`. Returns `Ok(false)` when the env
-    /// var is unset or the config has no MTP head — callers should treat that as
-    /// "not enabled" rather than an error. `Ok(true)` on success (drafter constructed,
-    /// trunk `capture_h_pre_norm` enabled). Hard error if the env var resolves to a
-    /// malformed checkpoint.
-    ///
-    /// `shard_dir` is still required because we re-open the trunk shard set to inherit
-    /// its config + classification; the MTP weights themselves come from the HF
-    /// original path, not from this directory.
-    ///
-    /// Idempotent — calling twice with the same shard_dir is a no-op on the
-    /// second call.
-    pub fn try_enable_mtp(&mut self, shard_dir: &Path) -> Result<bool> {
-        use crate::qwen3_5_moe::mtp_drafter::MtpDrafter;
-        if self.mtp.is_some() {
-            return Ok(true);
-        }
-
-        // Re-open a ShardSet purely to access the sidecar. The mmaps are cheap
-        // (kernel page cache), classification re-runs on the index (~ms range).
-        // The trunk model is already loaded — we just need MTP weights.
-        let cfg_path = shard_dir.join("config.json");
-        let cfg_str = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("reading {} for MTP enable", cfg_path.display()))?;
-        let mut config: Qwen3_5MoeConfig = serde_json::from_str(&cfg_str)?;
-        config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        // Guard: MTP only makes sense when the config declares an MTP head AND
-        // the MLP variant is one MtpBlock supports (Dense for Qwen3.6-27B).
-        if config.text_config.mtp_num_hidden_layers == 0 {
-            return Ok(false);
-        }
-
-        let shards = ShardSet::open(shard_dir, config)
-            .context("open shard set for MTP HF-native load")?;
-        let Some(block) = shards.load_mtp_block(&self.device)? else {
-            return Ok(false);
-        };
-
-        let n_embd = self.model.embed_tokens().embeddings().dims()[1];
-        self.mtp = Some(MtpDrafter::new(block, n_embd));
-        // Trunk must emit pre-norm hidden so process_after_trunk / verify can
-        // mirror the trajectory into MTP's KV.
-        self.model.set_capture_h_pre_norm(true);
-        Ok(true)
-    }
-
-    /// Read-only access to the MTP drafter (if enabled).
-    pub fn mtp_drafter(&self) -> Option<&crate::qwen3_5_moe::mtp_drafter::MtpDrafter> {
-        self.mtp.as_ref()
-    }
-
-    /// Mutable access to the MTP drafter (for the engine's draft / verify loop).
-    pub fn mtp_drafter_mut(
-        &mut self,
-    ) -> Option<&mut crate::qwen3_5_moe::mtp_drafter::MtpDrafter> {
-        self.mtp.as_mut()
-    }
-
-    /// Whether MTP speculative decoding is currently enabled on this backend.
-    pub fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
     }
 
     pub fn model_id(&self) -> &str {
@@ -426,7 +352,11 @@ impl Qwen35MoeBackend {
 
     /// Build tokenized prompt from a sequence of `(role, content)` message pairs.
     /// Mirrors `GemmaGgufModel::build_chat_input` so the engine can dispatch uniformly.
-    pub fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>> {
+    pub fn build_chat_input(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+    ) -> Result<Vec<u32>> {
         let prompt = format_qwen3_chat(messages, thinking);
         self.encode(&prompt)
     }
@@ -435,304 +365,13 @@ impl Qwen35MoeBackend {
 
     /// Allocate KV cache slots for a new streaming sequence.
     /// Call before the first prefill. Must NOT call `reset_cache()` after this.
-    /// If MTP is enabled (see [`Self::try_enable_mtp`]) the MTP block's KV
-    /// cache for `seq_id` is initialised in lockstep — required so the very
-    /// first `mtp_step` call has a populated cache to advance.
     pub fn init_sequence(&mut self, seq_id: u64) {
         self.model.init_sequence(seq_id);
-        if let Some(mtp) = self.mtp.as_mut() {
-            // Match the trunk's max_seq_len. We resolve it the same way the
-            // load path does — single source of truth for the cache capacity.
-            let max_seq: usize = std::env::var("LUMEN_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8192);
-            mtp.init_sequence(seq_id, max_seq, &self.device);
-        }
     }
 
-    /// Free KV cache memory for a completed sequence (both trunk + MTP).
+    /// Free KV cache memory for a completed sequence.
     pub fn remove_sequence(&mut self, seq_id: u64) {
         self.model.remove_sequence(seq_id);
-        if let Some(mtp) = self.mtp.as_mut() {
-            mtp.remove_sequence(seq_id);
-        }
-    }
-
-    /// Mirror a completed trunk prefill into the MTP block's KV cache.
-    ///
-    /// Must be called exactly once per sequence, **after** the trunk's prefill
-    /// `forward_with_offset` returns and **before** the first `mtp_step`. The
-    /// trunk's `last_h_pre_norm` must still hold the prefill hidden trajectory
-    /// (i.e. no other forward calls between prefill and this).
-    ///
-    /// `prefill_tokens` are the token IDs fed to the trunk during prefill
-    /// (typically `prompt[..len-1]`). On exit MTP's KV is at position
-    /// `prefill_tokens.len()` — same as the trunk's — and the drafter's
-    /// `pending_h` is seeded with the final prefill hidden.
-    ///
-    /// No-op when MTP is not enabled.
-    pub fn mirror_prefill_into_mtp(
-        &mut self,
-        seq_id: u64,
-        prefill_tokens: &[u32],
-    ) -> Result<()> {
-        let Self { model, mtp, .. } = self;
-        let Some(drafter) = mtp.as_mut() else {
-            return Ok(()); // MTP not enabled — silently skip.
-        };
-        if prefill_tokens.is_empty() {
-            return Ok(());
-        }
-        let h_pre = model
-            .take_h_pre_norm()
-            .ok_or_else(|| anyhow::anyhow!("mirror_prefill_into_mtp: trunk had no h_pre_norm — \
-                ensure prefill ran with capture_h_pre_norm enabled"))?;
-        drafter
-            .process_after_trunk(
-                seq_id,
-                prefill_tokens,
-                &h_pre,
-                model.embed_tokens(),
-                model.final_norm(),
-                model.lm_head(),
-            )
-            .map_err(|e| anyhow::anyhow!("mirror_prefill_into_mtp: {e}"))?;
-        Ok(())
-    }
-
-    /// One MTP-accelerated decode step: draft `n_max` tokens, verify against
-    /// the trunk, accept the longest greedy-matching prefix, and return the
-    /// committed tokens.
-    ///
-    /// Returns `(committed, n_drafted, n_accepted)`:
-    /// * `committed` — `[trunk_sample, accepted_drafts...]`, length `1 + n_accepted`.
-    /// * `n_drafted` — always equals `n_max` on the happy path (used for stats).
-    /// * `n_accepted` — ∈ `0..=n_max`.
-    ///
-    /// Errors propagate from any inner forward / sampler / drafter call. On
-    /// error the backend's KV may be in a partial state — the caller should
-    /// drop the sequence rather than retry.
-    ///
-    /// Requires:
-    /// - MTP enabled ([`Self::has_mtp`] is true)
-    /// - Sequence initialised via [`Self::init_sequence`] (+ optional
-    ///   [`Self::mirror_prefill_into_mtp`] for the first step)
-    /// - Trunk `capture_h_pre_norm` enabled (auto-on after `try_enable_mtp`)
-    ///
-    /// Greedy-only — caller must NOT invoke this when temperature > 0 or
-    /// any sampling penalty is active. Verification uses argmax matching
-    /// which presupposes the trunk would have sampled the same token.
-    pub fn mtp_step(
-        &mut self,
-        seq_id: u64,
-        last_token: u32,
-        position: usize,
-        n_max: usize,
-    ) -> Result<(Vec<u32>, usize, usize)> {
-        use candle_core::D;
-
-        if n_max == 0 {
-            // Degenerate: just do a regular single-token decode and return it.
-            let next = self.decode_step_single(seq_id, last_token, position)?;
-            return Ok((vec![next], 0, 0));
-        }
-
-        // ── Step A: trunk decode 1 token at `position`, capture h_pre ────────
-        self.model.set_current_seq_id(seq_id);
-        let input = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?; // [1, 1]
-        let logits = self
-            .model
-            .forward_with_offset(&input, position)
-            .map_err(|e| anyhow::anyhow!("mtp_step trunk decode: {e}"))?; // [1, 1, vocab]
-        let next_tok = logits
-            .squeeze(0)?
-            .squeeze(0)?
-            .argmax(D::Minus1)?
-            .to_scalar::<u32>()?;
-        if std::env::var("LUMEN_DECODE_TRACE").is_ok() {
-            eprintln!(
-                "[mtp_stepA_trace] pos={position} last_tok={last_token} next_tok={next_tok}"
-            );
-        }
-        // Trunk top-5 at this position — for comparison against MTP block top-5.
-        if std::env::var("LUMEN_MTP_BLOCK_TRACE").is_ok() {
-            let row = logits.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
-            let v: Vec<f32> = row.to_vec1()?;
-            let mut idx: Vec<usize> = (0..v.len()).collect();
-            idx.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap_or(std::cmp::Ordering::Equal));
-            let top5: Vec<(usize, f32)> = idx.iter().take(5).map(|&i| (i, v[i])).collect();
-            eprintln!("[trunk_top5_stepA] pos={position}: {top5:?}");
-        }
-        let h_pre_decode = self.model.take_h_pre_norm().ok_or_else(|| {
-            anyhow::anyhow!("mtp_step: trunk forward produced no h_pre_norm (capture flag off?)")
-        })?; // [1, 1, hidden]
-
-        // ── Step B: mirror the decode step into MTP KV + draft n_max tokens ──
-        // Split borrow: mtp drafter is &mut, trunk model components are &.
-        let Self { model, mtp, .. } = self;
-        let drafter = mtp
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("mtp_step called without MTP enabled"))?;
-        drafter
-            .process_after_trunk(
-                seq_id,
-                &[last_token],
-                &h_pre_decode,
-                model.embed_tokens(),
-                model.final_norm(),
-                model.lm_head(),
-            )
-            .map_err(|e| anyhow::anyhow!("mtp_step process_after_trunk: {e}"))?;
-        let drafts = drafter
-            .draft(
-                seq_id,
-                next_tok,
-                n_max,
-                model.embed_tokens(),
-                model.final_norm(),
-                model.lm_head(),
-            )
-            .map_err(|e| anyhow::anyhow!("mtp_step draft: {e}"))?;
-        let n_drafted = drafts.len();
-        // NLL drops the `drafter` (&mut Mtp) + `model` (&Embedding/&RmsNorm/
-        // &ProjLinear) borrows here as their last use was above. We can now
-        // mut-borrow `self.model` for the verify forward.
-
-        // ── Step C: trunk verify on [next_tok, ...drafts] at position+1 ──────
-        // Snapshot before verify so we can rebuild trunk KV if any draft is
-        // rejected (Mamba SSM state isn't simply truncatable — must re-evolve).
-        let snapshot = self
-            .model
-            .snapshot_state()
-            .map_err(|e| anyhow::anyhow!("mtp_step snapshot: {e}"))?;
-
-        let mut verify_seq = Vec::with_capacity(1 + n_drafted);
-        verify_seq.push(next_tok);
-        verify_seq.extend_from_slice(&drafts);
-        let verify_input = Tensor::new(verify_seq.as_slice(), &self.device)?.unsqueeze(0)?; // [1, 1+N]
-        let verify_logits = self
-            .model
-            .forward_with_offset(&verify_input, position + 1)
-            .map_err(|e| anyhow::anyhow!("mtp_step verify forward: {e}"))?; // [1, 1+N, vocab]
-        let verify_h_pre = self.model.take_h_pre_norm().ok_or_else(|| {
-            anyhow::anyhow!("mtp_step: trunk verify produced no h_pre_norm")
-        })?; // [1, 1+N, hidden]
-
-        // ── Step D: greedy match → n_accepted ────────────────────────────────
-        // Target argmax per verify row: index i predicts the (committed +i+1)-th token.
-        // verify_logits[0, i, :] argmax should equal drafts[i] to accept draft #i.
-        let target_argmax = verify_logits
-            .argmax(D::Minus1)
-            .map_err(|e| anyhow::anyhow!("mtp_step verify argmax: {e}"))?
-            .squeeze(0)
-            .map_err(|e| anyhow::anyhow!("mtp_step squeeze: {e}"))?
-            .to_vec1::<u32>()
-            .map_err(|e| anyhow::anyhow!("mtp_step to_vec1: {e}"))?; // length 1+N
-        let n_accepted = target_argmax
-            .iter()
-            .take(n_drafted)
-            .zip(drafts.iter())
-            .take_while(|(t, d)| **t == **d)
-            .count();
-
-        if std::env::var("LUMEN_MTP_TRACE").is_ok() {
-            eprintln!(
-                "[mtp_trace] pos={position} next_tok={next_tok} drafts={drafts:?} \
-                 target_argmax={target_argmax:?} n_accepted={n_accepted}",
-            );
-        }
-
-        // ── Step E: rebuild trunk KV to position + 1 + n_accepted ────────────
-        // Contract: after mtp_step, trunk KV holds positions [0, position+n_accepted]
-        // (size = position+1+n_accepted). The LAST committed token
-        // (committed[n_accepted] = drafts[n_accepted-1] for n_acc≥1, or
-        // next_tok for n_acc=0) is intentionally NOT written here — the next
-        // mtp_step's Step A will consume it via `forward([last_token])` at
-        // offset position+1+n_accepted, which matches the engine's
-        // `seq.position += committed_len` increment.
-        //
-        // **Why skip the last write**: Mamba SSM layers in the hybrid
-        // architecture advance their recurrent state on every input. If
-        // rebuild writes 1+n_accepted tokens AND the next Step A re-consumes
-        // the last one at the same offset, the SSM evolves twice for that
-        // token → trunk argmax diverges (manifests as MTP-on vs MTP-off
-        // greedy output differing). GQA attention is idempotent on
-        // overwrite, but SSM is not — so we MUST write exactly n_accepted
-        // tokens here, leaving one for Step A.
-        //
-        // Always restore + rebuild — even for n_accepted == n_drafted —
-        // because the verify forward wrote 1+n_drafted tokens, one too
-        // many under the new contract.
-        self.model
-            .restore_state(&snapshot)
-            .map_err(|e| anyhow::anyhow!("mtp_step restore_state: {e}"))?;
-        if n_accepted > 0 {
-            // Write [next_tok, drafts[0..n_accepted-1]] (length n_accepted)
-            // at offset position+1. The last committed token
-            // drafts[n_accepted-1] is reserved for the next Step A.
-            let kept = &verify_seq[..n_accepted];
-            let kept_input = Tensor::new(kept, &self.device)?.unsqueeze(0)?;
-            let _ = self
-                .model
-                .forward_with_offset(&kept_input, position + 1)
-                .map_err(|e| anyhow::anyhow!("mtp_step rebuild forward: {e}"))?;
-            let _ = self.model.take_h_pre_norm();
-        }
-        // n_accepted == 0: nothing to rebuild — restore already left trunk KV
-        // at state-after-Step-A. Next Step A will write `next_tok` at
-        // offset position+1.
-        let _ = &verify_h_pre; // sliced below in the accept-side mirror
-
-        // ── Step F: mirror the COMMITTED suffix into MTP, then accept ────────
-        // The committed sequence is `[next_tok, drafts[..n_accepted]]` of
-        // length `1 + n_accepted`. We need MTP KV to reflect those positions.
-        // Currently MTP KV (after step B's process + step's draft) sits at
-        // position + 1 + n_drafted with rejected-tail entries. `accept`
-        // truncates it to position + 1 + n_accepted via the drafter's own
-        // bookkeeping.
-        //
-        // We also need MTP to ingest the verify-batch's h_pre for the
-        // committed suffix so its `pending_h` after this step reflects the
-        // trunk's last committed hidden — not MTP's own draft hidden.
-        let committed_len = 1 + n_accepted;
-        let n_committed_after = position + 1 + committed_len; // total trunk pos including this step
-        let Self { model, mtp, .. } = self;
-        let drafter = mtp
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("mtp_step: MTP vanished mid-step"))?;
-        // First: rewind MTP KV + reset pending_h from verify_h (drafter knows
-        // verify_h from its OWN process_after_trunk call earlier — wait, that
-        // one only ingested the single decode-step hidden. We need to also
-        // ingest the verify suffix.)
-        //
-        // Simpler model: re-mirror the committed suffix from scratch.
-        //   1. mtp.accept(seq, n_accepted=0, n_committed_after=position+1) → rewind to position+1 and reset pending_h
-        //   2. process_after_trunk(seq, &[next_tok, ...drafts[..n_accepted]], verify_h_pre_committed_slice)
-        // Net: MTP KV ends at position+1+committed_len = n_committed_after, pending_h = verify_h's last committed row.
-        drafter
-            .accept(seq_id, 0, position + 1)
-            .map_err(|e| anyhow::anyhow!("mtp_step pre-mirror accept: {e}"))?;
-        if committed_len > 0 {
-            // Slice verify_h_pre to the committed rows: [1, committed_len, hidden].
-            let h_committed = verify_h_pre
-                .narrow(1, 0, committed_len)
-                .map_err(|e| anyhow::anyhow!("mtp_step h slice: {e}"))?;
-            let committed_tokens = &verify_seq[..committed_len];
-            drafter
-                .process_after_trunk(
-                    seq_id,
-                    committed_tokens,
-                    &h_committed,
-                    model.embed_tokens(),
-                    model.final_norm(),
-                    model.lm_head(),
-                )
-                .map_err(|e| anyhow::anyhow!("mtp_step suffix mirror: {e}"))?;
-        }
-        let _ = n_committed_after;
-
-        Ok((verify_seq[..committed_len].to_vec(), n_drafted, n_accepted))
     }
 
     /// Prefill under `seq_id` and return `(first_generated_token, position)`.
@@ -745,7 +384,9 @@ impl Qwen35MoeBackend {
         }
         self.model.set_current_seq_id(seq_id);
         let prompt = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
-        let logits_all = self.model.forward_with_offset(&prompt, 0)
+        let logits_all = self
+            .model
+            .forward_with_offset(&prompt, 0)
             .map_err(|e| anyhow::anyhow!("prefill_sequence forward: {e}"))?; // [1, S, vocab]
         let last_logits = logits_all
             .narrow(D::Minus2, input_ids.len() - 1, 1)
@@ -790,16 +431,18 @@ impl Qwen35MoeBackend {
         use candle_core::D;
         self.model.set_current_seq_id(seq_id);
         let input = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward_with_offset(&input, position)
+        let logits = self
+            .model
+            .forward_with_offset(&input, position)
             .map_err(|e| anyhow::anyhow!("decode_step_single: {e}"))?; // [1, 1, vocab]
-        let next = logits.squeeze(0)?.squeeze(0)?
+        let next = logits
+            .squeeze(0)?
+            .squeeze(0)?
             .argmax(D::Minus1)?
             .to_scalar::<u32>()
             .map_err(|e| anyhow::anyhow!("decode_step_single argmax: {e}"))?;
         if std::env::var("LUMEN_DECODE_TRACE").is_ok() {
-            eprintln!(
-                "[decode_single_trace] pos={position} last_tok={last_token} next_tok={next}"
-            );
+            eprintln!("[decode_single_trace] pos={position} last_tok={last_token} next_tok={next}");
         }
         Ok(next)
     }
@@ -818,8 +461,12 @@ impl Qwen35MoeBackend {
         last_tokens: &[u32],
         positions: &[usize],
     ) -> Result<Tensor> {
-        let use_v2 = std::env::var("BATCHED_MOE").map(|v| v == "1").unwrap_or(false);
-        let use_phase0 = std::env::var("CB_PHASE0").map(|v| v == "1").unwrap_or(false);
+        let use_v2 = std::env::var("BATCHED_MOE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let use_phase0 = std::env::var("CB_PHASE0")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if use_v2 {
             self.model
                 .forward_batch_decode_seqs_v2(last_tokens, seq_ids, positions)
@@ -1078,7 +725,9 @@ impl Qwen35MoeBackend {
             // grows over the trajectory; G>0 paths consume those entries via
             // `LookaheadProposer::propose`.
             let lookahead_proposal = if lookahead_enabled {
-                lookahead_proposer.as_ref().and_then(|p| p.propose(&history))
+                lookahead_proposer
+                    .as_ref()
+                    .and_then(|p| p.propose(&history))
             } else {
                 None
             };
@@ -1104,8 +753,7 @@ impl Qwen35MoeBackend {
                 for g in &proposal.guesses {
                     verify_in.extend_from_slice(g);
                 }
-                let v_tensor =
-                    Tensor::new(verify_in.as_slice(), &self.device)?.unsqueeze(0)?;
+                let v_tensor = Tensor::new(verify_in.as_slice(), &self.device)?.unsqueeze(0)?;
                 let logits = self.model.forward_with_offset(&v_tensor, offset)?;
                 let argmax = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?;
                 debug_assert_eq!(argmax.len(), verify_in.len());
@@ -1155,8 +803,7 @@ impl Qwen35MoeBackend {
                     let mut fixup_in: Vec<u32> = Vec::with_capacity(replay_len);
                     fixup_in.push(next);
                     fixup_in.extend_from_slice(&proposal.jacobi[..jacobi_accept]);
-                    let f_tensor =
-                        Tensor::new(fixup_in.as_slice(), &self.device)?.unsqueeze(0)?;
+                    let f_tensor = Tensor::new(fixup_in.as_slice(), &self.device)?.unsqueeze(0)?;
                     let _ = self.model.forward_with_offset(&f_tensor, offset)?;
                 }
 
@@ -1175,8 +822,7 @@ impl Qwen35MoeBackend {
                 self.last_decode_step_ms.push(step_ms);
                 let kind = if jacobi_accept == w { "FULL" } else { "PART" };
                 let baseline_ms_per_tok: f64 = 175.0;
-                let real_gain =
-                    (committed_count as f64 * baseline_ms_per_tok) / step_ms.max(1.0);
+                let real_gain = (committed_count as f64 * baseline_ms_per_tok) / step_ms.max(1.0);
                 eprintln!(
                     "  decode lookahead[{kind}] step ~{step}: W={w} G={g_count} \
                      jacobi_acc={jacobi_accept} committed={committed_count} \
@@ -1220,16 +866,10 @@ impl Qwen35MoeBackend {
                 let logits = self.model.forward_with_offset(&v_tensor, offset)?; // [1, K+1, vocab]
 
                 // Per-position argmax → [1, K+1] u32 tensor → flatten to vec.
-                let argmax = logits
-                    .argmax(D::Minus1)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?;
+                let argmax = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?;
                 debug_assert_eq!(argmax.len(), verify_in.len());
 
-                let j = crate::spec_decode::greedy_accept_count(
-                    &argmax[..draft.len()],
-                    &draft,
-                );
+                let j = crate::spec_decode::greedy_accept_count(&argmax[..draft.len()], &draft);
                 spec_accepted_total += j;
                 let new_next: u32;
                 if j == draft.len() {
@@ -1254,8 +894,7 @@ impl Qwen35MoeBackend {
                     let mut fixup_in: Vec<u32> = Vec::with_capacity(j + 1);
                     fixup_in.push(next);
                     fixup_in.extend_from_slice(&draft[..j]);
-                    let f_tensor =
-                        Tensor::new(fixup_in.as_slice(), &self.device)?.unsqueeze(0)?;
+                    let f_tensor = Tensor::new(fixup_in.as_slice(), &self.device)?.unsqueeze(0)?;
                     let _ = self.model.forward_with_offset(&f_tensor, offset)?;
                     for i in 0..j {
                         history.push(draft[i]);
@@ -1340,7 +979,11 @@ impl Qwen35MoeBackend {
             let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
             self.last_decode_step_ms.push(step_ms);
             if let (Some(f), Some(s)) = (fwd_ms, samp_ms) {
-                let path = if greedy_fast { "gpu_argmax" } else { "cpu_full" };
+                let path = if greedy_fast {
+                    "gpu_argmax"
+                } else {
+                    "cpu_full"
+                };
                 eprintln!(
                     "    decode-split step {step}: fwd={f:.1} sample[{path}]={s:.1} \
                      other={:.1} (vocab={})",
@@ -1507,8 +1150,8 @@ impl Qwen35MoeBackend {
                 let (idx_data, mul_data) = aggregate_penalty_multipliers(
                     history,
                     repeat_penalty,
-                    4,    // ngram window
-                    5.0,  // ngram penalty multiplier
+                    4,   // ngram window
+                    5.0, // ngram penalty multiplier
                     n,
                 );
 
@@ -1601,8 +1244,7 @@ impl Qwen35MoeBackend {
                         .unwrap_or(0);
                     nanos ^ (std::process::id() as u32)
                 });
-                let counter =
-                    SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let counter = SAMPLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let seed_lo: u32 =
                     (counter as u32) ^ ((counter >> 32) as u32) ^ seed_hi.rotate_left(13);
 
@@ -1628,14 +1270,7 @@ impl Qwen35MoeBackend {
         let last_vec = tensor_to_vec_f32(last)?;
         // pass owned Vec<f32> through to skip the internal
         // 248K-elem clone the borrow-API variant pays.
-        sample_token_cpu_full_owned(
-            last_vec,
-            temperature,
-            top_p,
-            top_k,
-            repeat_penalty,
-            history,
-        )
+        sample_token_cpu_full_owned(last_vec, temperature, top_p, top_k, repeat_penalty, history)
     }
 
     /// Apply the Qwen3 chat template + generate a response. `thinking=true` leaves the
@@ -1649,10 +1284,19 @@ impl Qwen35MoeBackend {
         thinking: bool,
     ) -> Result<String> {
         let prompt = format_qwen3_chat(messages, thinking);
-        eprintln!("chat prompt ({} chars, thinking={thinking}): {prompt:?}", prompt.len());
+        eprintln!(
+            "chat prompt ({} chars, thinking={thinking}): {prompt:?}",
+            prompt.len()
+        );
         let ids = self.encode(&prompt)?;
-        eprintln!("chat encoded {} tokens: {:?}", ids.len(), &ids[..ids.len().min(20)]);
-        let greedy = std::env::var("LUMEN_GREEDY").map(|v| v == "1").unwrap_or(false);
+        eprintln!(
+            "chat encoded {} tokens: {:?}",
+            ids.len(),
+            &ids[..ids.len().min(20)]
+        );
+        let greedy = std::env::var("LUMEN_GREEDY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let (eff_temp, top_k, rep_pen) = if greedy {
             (0.0_f32, 0_usize, 1.0_f32)
         } else {
@@ -1681,7 +1325,10 @@ impl Qwen35MoeBackend {
         F: FnMut(&str),
     {
         let prompt = format_qwen3_chat(messages, thinking);
-        eprintln!("chat_streaming prompt ({} chars, thinking={thinking})", prompt.len());
+        eprintln!(
+            "chat_streaming prompt ({} chars, thinking={thinking})",
+            prompt.len()
+        );
         let ids = self.encode(&prompt)?;
         eprintln!("chat_streaming encoded {} tokens", ids.len());
 
@@ -1689,7 +1336,9 @@ impl Qwen35MoeBackend {
             anyhow::bail!("empty input_ids");
         }
 
-        let greedy = std::env::var("LUMEN_GREEDY").map(|v| v == "1").unwrap_or(false);
+        let greedy = std::env::var("LUMEN_GREEDY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let (eff_temp, top_k, rep_pen) = if greedy {
             (0.0_f32, 0_usize, 1.0_f32)
         } else {
@@ -1740,8 +1389,15 @@ impl Qwen35MoeBackend {
 
             let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward_with_offset(&input, offset)?; // [1, 1, vocab]
-            next =
-                self.sample_last_token(&logits, greedy_fast, eff_temp, 0.95, top_k, rep_pen, &history)?;
+            next = self.sample_last_token(
+                &logits,
+                greedy_fast,
+                eff_temp,
+                0.95,
+                top_k,
+                rep_pen,
+                &history,
+            )?;
             history.push(next);
             generated.push(next);
 
