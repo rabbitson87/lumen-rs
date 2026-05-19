@@ -51,6 +51,141 @@ struct Inner {
     port: u16,
     model_id: Option<String>,
     last_error: Option<String>,
+    metrics: MetricsAccumulator,
+}
+
+/// Live decode metrics aggregated from server stderr. We extract numbers from
+/// the structured log lines lumen-server already emits (no extra HTTP endpoint
+/// needed — keeps the engine side flag-clean). Two patterns are parsed:
+///
+///   1. `[stream-timing] sse: ... steady_rate_recv=23.45tok/s ...`
+///      — emitted once per `/v1/chat/completions` request (chat.rs)
+///   2. `seq N done: M tokens in T ms (X.Y tok/s)`
+///      — emitted by the MlxQwen35Backend + Candle batched paths
+///
+/// Both signals feed an EMA-smoothed `tok_per_sec` + derived
+/// `ms_per_step = 1000 / tok_per_sec`. `request_times` keeps a sliding
+/// 60-second window of decode-finish timestamps for the requests/min
+/// counter.
+#[derive(Debug, Default)]
+struct MetricsAccumulator {
+    tok_per_sec_ema: Option<f64>,
+    ms_per_step_ema: Option<f64>,
+    request_times: std::collections::VecDeque<Instant>,
+}
+
+impl MetricsAccumulator {
+    /// EMA smoothing factor — higher = more responsive, lower = more stable.
+    const EMA_ALPHA: f64 = 0.3;
+
+    fn observe(&mut self, line: &str) {
+        if let Some(tps) = parse_tok_per_sec(line) {
+            // Reject obviously bogus values (parser collision).
+            if (0.1..=1000.0).contains(&tps) {
+                let next = match self.tok_per_sec_ema {
+                    Some(prev) => Self::EMA_ALPHA * tps + (1.0 - Self::EMA_ALPHA) * prev,
+                    None => tps,
+                };
+                self.tok_per_sec_ema = Some(next);
+                self.ms_per_step_ema = Some(1000.0 / next);
+
+                // Each tok/s emission ≈ one finished decode request. Stamp it.
+                let now = Instant::now();
+                self.request_times.push_back(now);
+                self.evict_old(now);
+            }
+        }
+    }
+
+    fn evict_old(&mut self, now: Instant) {
+        let cutoff = Duration::from_secs(60);
+        while let Some(&front) = self.request_times.front() {
+            if now.duration_since(front) > cutoff {
+                self.request_times.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn snapshot(&mut self) -> ServerMetricsSnapshot {
+        self.evict_old(Instant::now());
+        ServerMetricsSnapshot {
+            tokens_per_sec: self.tok_per_sec_ema,
+            ms_per_step: self.ms_per_step_ema,
+            requests_per_min: Some(self.request_times.len() as u32),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServerMetricsSnapshot {
+    pub tokens_per_sec: Option<f64>,
+    pub ms_per_step: Option<f64>,
+    pub requests_per_min: Option<u32>,
+}
+
+/// Extract a `tok/s` reading from a single log line, if present. Handles both
+/// log conventions: `(<N> tok/s)` from done events and
+/// `steady_rate_recv=<N>tok/s` from the SSE stream-timing line. Returns the
+/// first match — both formats are unique enough that the simple substring
+/// scan won't false-positive on incidental occurrences in unrelated logs.
+fn parse_tok_per_sec(line: &str) -> Option<f64> {
+    if let Some(rest) = line.split("steady_rate_recv=").nth(1) {
+        // "23.45tok/s last_write..." — take up to "tok/s"
+        let num = rest.split("tok/s").next()?;
+        if let Ok(v) = num.trim().parse::<f64>() {
+            return Some(v);
+        }
+    }
+    if let Some(idx) = line.find(" tok/s)") {
+        // Walk backwards from the closing paren collecting the number.
+        let prefix = &line[..idx];
+        let num: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(v) = num.parse::<f64>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_tok_per_sec;
+
+    #[test]
+    fn parses_stream_timing_sse() {
+        let line = "[stream-timing] sse: n_deltas=42 first->last_recv=2150.4ms skip2->last_recv=1843.5ms steady_rate_recv=22.78tok/s last_write->DONE_flush=0.4ms";
+        assert!((parse_tok_per_sec(line).unwrap() - 22.78).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_mlx_done() {
+        let line = "[mlx] seq 7 done: 128 tokens in 2143ms (59.7 tok/s)";
+        assert!((parse_tok_per_sec(line).unwrap() - 59.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_batched_engine_step() {
+        let line = "[batched engine] step: N=4 latency=42.1ms aggregate=15.3 tok/s";
+        // No closing paren — current parser only matches "(... tok/s)" form
+        // and "steady_rate_recv=...". The aggregate-tok/s log is informational
+        // and we don't pull from it. Confirm we don't false-positive.
+        assert!(parse_tok_per_sec(line).is_none());
+    }
+
+    #[test]
+    fn rejects_unrelated_lines() {
+        assert!(parse_tok_per_sec("Loading model: foo").is_none());
+        assert!(parse_tok_per_sec("Error: tok/s computed wrong").is_none());
+    }
 }
 
 impl ServerSupervisor {
@@ -65,8 +200,16 @@ impl ServerSupervisor {
                 port: 8080,
                 model_id: None,
                 last_error: None,
+                metrics: MetricsAccumulator::default(),
             }),
         })
+    }
+
+    /// Live decode metrics aggregated from server stderr. Returns `None`-filled
+    /// fields until the first chat request finishes; thereafter EMA-smoothed.
+    pub async fn metrics(&self) -> ServerMetricsSnapshot {
+        let mut g = self.inner.lock().await;
+        g.metrics.snapshot()
     }
 
     pub async fn status(&self) -> ServerStatus {
@@ -125,14 +268,18 @@ impl ServerSupervisor {
             g.last_error = None;
         }
 
-        // Stream stdout/stderr → frontend.
+        // Stream stdout/stderr → frontend. stderr is also tee'd into the
+        // metrics accumulator since that's where the engine emits its
+        // structured timing lines.
         if let Some(stdout) = stdout {
             let app2 = app.clone();
-            tokio::spawn(async move { pipe_to_event(app2, stdout, "stdout").await });
+            let sup2 = Arc::clone(self);
+            tokio::spawn(async move { pipe_to_event(app2, sup2, stdout, "stdout").await });
         }
         if let Some(stderr) = stderr {
             let app2 = app.clone();
-            tokio::spawn(async move { pipe_to_event(app2, stderr, "stderr").await });
+            let sup2 = Arc::clone(self);
+            tokio::spawn(async move { pipe_to_event(app2, sup2, stderr, "stderr").await });
         }
 
         // Probe `/v1/models` to flip state → Running once the HTTP listener
@@ -242,9 +389,21 @@ impl ServerSupervisor {
     }
 }
 
-async fn pipe_to_event<R: tokio::io::AsyncRead + Unpin>(app: AppHandle, reader: R, stream: &str) {
+async fn pipe_to_event<R: tokio::io::AsyncRead + Unpin>(
+    app: AppHandle,
+    sup: Arc<ServerSupervisor>,
+    reader: R,
+    stream: &str,
+) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // Feed metrics first — we only need a shallow scan, and skipping it on
+        // shutdown isn't worth special-casing. Stderr-only because the timing
+        // lines only come from there in lumen-server.
+        if stream == "stderr" {
+            let mut g = sup.inner.lock().await;
+            g.metrics.observe(&line);
+        }
         let _ = app.emit(
             EVENT_LOG,
             LogLine {

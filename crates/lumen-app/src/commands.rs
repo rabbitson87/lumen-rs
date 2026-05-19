@@ -293,15 +293,18 @@ pub struct ServerMetrics {
     pub requests_per_min: Option<u32>,
 }
 
-/// Placeholder until lumen-server exposes a `/v1/metrics` endpoint. The
-/// frontend can still render the METRICS card with `None` fields.
+/// Live decode metrics — EMA-smoothed tok/s + ms-per-step + requests-per-min
+/// aggregated from lumen-server stderr by `ServerSupervisor`. Values stay
+/// `None` until the first chat request finishes. `kv_cache_mb` is reserved
+/// for a future `/v1/stats` endpoint and is always `None` for now.
 #[tauri::command]
-pub async fn server_metrics(_state: State<'_, AppState>) -> CmdResult<ServerMetrics> {
+pub async fn server_metrics(state: State<'_, AppState>) -> CmdResult<ServerMetrics> {
+    let snap = state.supervisor.metrics().await;
     Ok(ServerMetrics {
-        tokens_per_sec: None,
-        ms_per_step: None,
+        tokens_per_sec: snap.tokens_per_sec,
+        ms_per_step: snap.ms_per_step,
         kv_cache_mb: None,
-        requests_per_min: None,
+        requests_per_min: snap.requests_per_min,
     })
 }
 
