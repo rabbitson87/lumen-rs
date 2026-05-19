@@ -98,7 +98,7 @@ GitHub Releases pattern (referenced by `tauri.conf.json::plugins.updater.endpoin
   "platforms": {
     "darwin-aarch64": {
       "signature": "<contents of Lumen.app.tar.gz.sig>",
-      "url": "https://github.com/hsng95/lumen-rs/releases/download/v0.2.0/Lumen_0.2.0_aarch64.app.tar.gz"
+      "url": "https://github.com/rabbitson87/lumen-rs/releases/download/v0.2.0/Lumen_0.2.0_aarch64.app.tar.gz"
     }
   }
 }

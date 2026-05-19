@@ -30,6 +30,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
     "icon": [],
     "category": "DeveloperTool",
     "shortDescription": "Local LLM control plane",
@@ -47,7 +48,7 @@
       "active": true,
       "dialog": false,
       "endpoints": [
-        "https://github.com/hsng95/lumen-rs/releases/latest/download/latest.json"
+        "https://github.com/rabbitson87/lumen-rs/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJEOEIyRUFEQzVBODE1N0UKUldSK0ZhakZyUzZMdmFpdGdWSDlBQkhiaHZHYVJnaXpoUnFlNzFWalZKSEtSZFpFdnBhV29ZbEkK"
     }

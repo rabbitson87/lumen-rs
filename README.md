@@ -90,7 +90,7 @@ reads, and self-updates from GitHub Releases.
 
 ### Install from a release
 
-1. Open the [latest GitHub Release](https://github.com/hsng95/lumen-rs/releases/latest).
+1. Open the [latest GitHub Release](https://github.com/rabbitson87/lumen-rs/releases/latest).
 2. Download the `aarch64` `.dmg`. **Apple Silicon only** — MLX is
    ARM64-native and refuses to build on x86_64, so there is no Intel
    Mac bundle.
