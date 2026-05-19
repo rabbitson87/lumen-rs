@@ -124,20 +124,20 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         notes: "MoE flagship. 35B params, ~3B active per token. Best speed/quality on M3 Max.",
     },
     RecommendedModel {
-        id: "mlx-community/gemma-4-26b-a4b-mlx-4bit",
+        id: "mlx-community/gemma-4-26b-a4b-4bit",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (4-bit)",
+        label: "Gemma 4 — 26B A4B (4-bit, LM Studio community)",
         approx_size_gb: 14,
         min_ram_gb: 20,
-        notes: "Gemma 4 26B MoE, ~4B active per token. 4-bit quant — balanced quality.",
+        notes: "Gemma 4 26B MoE, ~4B active per token. 4-bit quant — balanced quality. Community build by LM Studio.",
     },
     RecommendedModel {
-        id: "mlx-community/gemma-4-26b-a4b-mlx-3bit",
+        id: "hsng95/gemma-4-26b-a4b-mlx-3bit",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (3-bit)",
+        label: "Gemma 4 — 26B A4B (3-bit, hsng95)",
         approx_size_gb: 11,
-        min_ram_gb: 16,
-        notes: "Same Gemma 4 26B but 3-bit — fits comfortably in 16 GB Mac mini / MacBook Air.",
+        min_ram_gb: 14,
+        notes: "3-bit affine MLX quant. ~11 GB on disk, fits 24 GB Mac mini comfortably. ~29 tok/s decode on M4 Pro.",
     },
 ];
 

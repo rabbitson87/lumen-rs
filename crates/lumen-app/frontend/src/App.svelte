@@ -53,7 +53,7 @@
   let downloads = $state<Map<string, DownloadProgress>>(new Map());
   let statusMessage = $state<string | null>(null);
   let typedEnvKeys = $state<Set<string>>(new Set());
-  let catalog = $state<Catalog>({ families: [], recommended: [] });
+  let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
   let systemInfo = $state<SystemInfo | null>(null);
   let selectedRecommend = $state<string>("");
 
@@ -177,10 +177,22 @@
     });
     unlistenDownload = await onDownload((p) => {
       const next = new Map(downloads);
-      next.set(`${p.repo_id}/${p.file}`, p);
+      const key = `${p.repo_id}/${p.file}`;
+      next.set(key, p);
       downloads = next;
       if (p.done) {
         api.listModels().then((m) => (models = m));
+        // Auto-clear completed lines after 3s so the progress panel
+        // doesn't crowd up during back-to-back downloads. Re-check
+        // `done` before removing so an in-flight resume doesn't drop
+        // a now-active entry under the same key.
+        setTimeout(() => {
+          const cur = new Map(downloads);
+          if (cur.get(key)?.done) {
+            cur.delete(key);
+            downloads = cur;
+          }
+        }, 3000);
       }
     });
 

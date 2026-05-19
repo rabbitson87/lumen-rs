@@ -3147,7 +3147,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
- "hf-hub",
  "libc",
  "nix",
  "reqwest 0.12.28",
