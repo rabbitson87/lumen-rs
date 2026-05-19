@@ -14,7 +14,7 @@
 //!
 //! See `phase18a_affine3_design.md` for risk analysis + roadmap.
 
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use anyhow::{Result, anyhow, ensure};
 
 use crate::device::MetalContext;

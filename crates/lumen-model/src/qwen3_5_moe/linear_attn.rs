@@ -1078,8 +1078,7 @@ impl GatedDeltaNet {
     ) -> CandleResult<Option<Tensor>> {
         use crate::qwen3_5_moe_native::{
             LinearAttnConfig, NativeSsmState, forward_post_conv_fused_with_cache,
-            forward_post_conv_fused_with_cache_candle_queue, from_candle_tensor,
-            shared_native_resources_for,
+            forward_post_conv_fused_with_cache_candle_queue, shared_native_resources_for,
         };
 
         // Sub-stage timing inside the native post-conv path. Each marker syncs

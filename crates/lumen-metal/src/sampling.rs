@@ -7,7 +7,7 @@
 //! Future expansion: top-k partial sort, top-p cumulative mask, multinomial.
 //! All as additions to [`SamplingKernels`].
 
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use crate::metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize, NSUInteger};
 use anyhow::{Result, anyhow};
 
@@ -73,7 +73,7 @@ impl SamplingKernels {
     #[allow(clippy::too_many_arguments)]
     pub fn apply_token_penalties_f32_into(
         &self,
-        queue: &crate::metal::CommandQueueRef,
+        _queue: &crate::metal::CommandQueueRef,
         logits_buf: &Buffer,
         logits_offset: u64,
         idx_buf: &Buffer,
@@ -158,7 +158,7 @@ impl SamplingKernels {
     #[allow(clippy::too_many_arguments)]
     pub fn apply_token_penalties_f32(
         &self,
-        queue: &crate::metal::CommandQueueRef,
+        _queue: &crate::metal::CommandQueueRef,
         device: &Device,
         logits_buf: &Buffer,
         logits_offset: u64,
@@ -241,7 +241,7 @@ impl SamplingKernels {
     #[allow(clippy::too_many_arguments)]
     pub fn apply_penalties_then_argmax(
         &self,
-        queue: &crate::metal::CommandQueueRef,
+        _queue: &crate::metal::CommandQueueRef,
         logits_buf: &Buffer,
         logits_offset: u64,
         n_logits: u32,
@@ -374,7 +374,7 @@ impl SamplingKernels {
     #[allow(clippy::too_many_arguments)]
     pub fn argmax_f32(
         &self,
-        queue: &crate::metal::CommandQueueRef,
+        _queue: &crate::metal::CommandQueueRef,
         x_buf: &Buffer,
         x_offset: u64,
         n: u32,
@@ -443,7 +443,7 @@ impl SamplingKernels {
     #[allow(clippy::too_many_arguments)]
     pub fn topk_topp_gumbel_argmax_f32_into(
         &self,
-        queue: &crate::metal::CommandQueueRef,
+        _queue: &crate::metal::CommandQueueRef,
         logits_buf: &Buffer,
         logits_off: u64,
         n_logits: u32,

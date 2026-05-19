@@ -33,7 +33,7 @@ pub mod rms_norm;
 pub mod sampling;
 pub mod silu_mul;
 
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use anyhow::Result;
 use lumen_core::config::TurboQuantConfig;
 use lumen_core::lloyd_max::LloydMaxCodebook;
@@ -66,6 +66,9 @@ pub struct GpuCompressor {
     scratch_tmp_rn: crate::metal::Buffer,  // [max_heads] f32
     scratch_tmp_qjl: crate::metal::Buffer, // [max_heads * n_qjl_packed] u64
     scratch_scores: crate::metal::Buffer,  // [max_seq] f32
+    /// Reserved for upcoming attention-scoring kernel output. Pre-allocated
+    /// alongside the other `scratch_*` buffers; no read path yet.
+    #[allow(dead_code)]
     scratch_output: crate::metal::Buffer,  // [max_heads * dim] f32
     scratch_qjl_proj: crate::metal::Buffer, // [qjl_m] f32 — precomputed per attention call
 }
@@ -403,7 +406,7 @@ mod candle_integration {
 
             // Layout: [1, n_kv_head, seq_len, head_dim] contiguous
             // Head h data starts at base + h * seq_len * dim * 4 bytes
-            let head_stride_bytes = (seq_len * dim * 4) as u64;
+            let _head_stride_bytes = (seq_len * dim * 4) as u64;
 
             // Batch compress: all KV heads in 2 calls (K + V) instead of 8 (per-head)
             // Layout [1, n_kv_head, seq_len, dim] is contiguous → n_vecs = n_kv_head * seq_len
@@ -993,7 +996,7 @@ mod candle_integration {
             v: &Tensor,
             n_kv_head: usize,
             seq_len: usize,
-            dim: usize,
+            _dim: usize,
         ) -> bool {
             for h in 0..n_kv_head {
                 let kh = k

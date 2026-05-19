@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::device::MetalContext;
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use crate::pipeline::ShaderPipelines;
 
 /// Dispatch the 4 compression kernels to compress KV vectors on GPU.

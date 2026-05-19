@@ -1758,7 +1758,7 @@ impl ProjLinear {
                 let last = combined.dims().len() - 1;
                 let gate = combined.narrow(last, 0, inter)?.contiguous()?;
                 let up = combined.narrow(last, inter, inter)?.contiguous()?;
-                (candle_nn::ops::silu(&gate)? * up)
+                candle_nn::ops::silu(&gate)? * up
             }
             Self::Mxfp4(l) => l
                 .forward_gate_up_silu_mul(x)

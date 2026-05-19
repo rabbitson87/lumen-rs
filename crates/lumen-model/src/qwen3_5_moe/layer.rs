@@ -29,7 +29,7 @@ pub type CompressedKvHandle = Option<Box<dyn CompressedKVBackend + Send>>;
 
 use super::config::LayerType;
 use super::linear_attn::GatedDeltaNet;
-use super::moe::{MlpBlock, SparseMoeBlock};
+use super::moe::MlpBlock;
 use super::self_attn::SelfAttention;
 
 /// Lever B L.3 (2026-04-28): `LUMEN_BF16_RMSNORM=1` enables a bf16 chain

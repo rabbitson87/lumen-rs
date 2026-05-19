@@ -363,12 +363,12 @@ pub struct CompileOptionsBuilder {
 
 impl CompileOptionsBuilder {
     pub fn new() -> Self {
-        let inner = unsafe { objc2_metal::MTLCompileOptions::new() };
+        let inner = objc2_metal::MTLCompileOptions::new();
         Self { inner }
     }
 
     pub fn set_language_version(&self, version: MTLLanguageVersion) {
-        unsafe { self.inner.setLanguageVersion(version) }
+        self.inner.setLanguageVersion(version)
     }
 
     pub fn set_fast_math_enabled(&self, enabled: bool) {
@@ -376,9 +376,7 @@ impl CompileOptionsBuilder {
         // `setFastMathEnabled` (deprecated). Use the deprecated setter
         // for parity with our metal v0.31 call sites.
         #[allow(deprecated)]
-        unsafe {
-            self.inner.setFastMathEnabled(enabled)
-        }
+        self.inner.setFastMathEnabled(enabled)
     }
 }
 

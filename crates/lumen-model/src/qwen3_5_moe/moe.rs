@@ -28,12 +28,11 @@
 //! 2026-04-23.
 
 use candle_core::{D, Result as CandleResult, Tensor};
-use candle_nn::Module;
 use std::sync::Mutex;
 
 #[cfg(feature = "turboquant-gpu")]
-use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
-use lumen_metal::metal::{BatchedEncoderExt, Buffer, ComputeEncoderCompat, IndirectCommandBuffer};
+use lumen_metal::affine4_gpu::Affine4Context;
+use lumen_metal::metal::{BatchedEncoderExt, Buffer, IndirectCommandBuffer};
 use lumen_metal::mxfp4_gpu::MxFp4Context;
 #[cfg(feature = "turboquant-gpu")]
 use lumen_metal::mxfp4_linear::{ExpertProj, Mxfp4SwitchMlp};

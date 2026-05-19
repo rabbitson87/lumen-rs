@@ -66,8 +66,13 @@ pub struct PagedKVBackend {
     next_auto_id: u64,
 
     /// Pre-allocated padded block-table buffer (re-uploaded per current seq).
+    /// Reserved for the PagedAttention scheduler path (Phase 3); not wired
+    /// into the current single-seq dispatch yet.
+    #[allow(dead_code)]
     block_table_buf: Buffer,
     /// Pre-allocated context_lens buffer (1 element for single active seq).
+    /// Same Phase-3 scaffolding as `block_table_buf`.
+    #[allow(dead_code)]
     context_lens_buf: Buffer,
     /// Max blocks per sequence (GPU block_table stride).
     max_num_blocks: u32,

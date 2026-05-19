@@ -9,7 +9,7 @@
 //! invocations.
 
 #[cfg(feature = "model-integration")]
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use anyhow::Result;
 #[cfg(feature = "model-integration")]
 use candle_core::{DType, Device, Storage, Tensor};

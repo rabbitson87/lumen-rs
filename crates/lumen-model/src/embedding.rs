@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -620,15 +620,6 @@ fn bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
             bytes[4 * i + 2],
             bytes[4 * i + 3],
         ]));
-    }
-    v
-}
-
-fn bytes_to_u16_vec(bytes: &[u8]) -> Vec<u16> {
-    let n = bytes.len() / 2;
-    let mut v = Vec::with_capacity(n);
-    for i in 0..n {
-        v.push(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]));
     }
     v
 }

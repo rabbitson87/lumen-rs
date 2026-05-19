@@ -9,7 +9,7 @@
 //!   - `Mxfp4Weight` — long-lived GPU-resident weight matrix; reuse for all forward
 //!     passes. `matmul_with_weight` supports batch > 1 by dispatching matvec per row.
 
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use crate::metal::{Buffer, ComputePipelineState, Library, MTLSize};
 use anyhow::Result;
 
@@ -310,6 +310,7 @@ pub struct MxFp4Context {
     /// of MoE v3, fused
     /// gate+up+silu*up v3, and small-out v1. Same compute as the f32
     /// pipelines; only the final store narrows.
+    #[allow(dead_code)]
     matmul_moe_f32in_bf16out_v3: ComputePipelineState,
     gate_up_silu_mul_f32in_bf16out_v3: ComputePipelineState,
     matmul_small_out_f32in_bf16out_v1: ComputePipelineState,
@@ -328,7 +329,7 @@ pub struct MxFp4Context {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KernelVersion {
+pub(crate) enum KernelVersion {
     V1,
     V2,
     V3,

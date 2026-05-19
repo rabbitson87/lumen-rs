@@ -9,7 +9,7 @@
 //! back to the standard 3-dispatch SDPA.
 
 #[cfg(feature = "model-integration")]
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::ComputeEncoderCompat;
 use candle_core::{DType, Device, Storage, Tensor};
 
 use std::sync::{

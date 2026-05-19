@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::device::MetalContext;
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use crate::pipeline::ShaderPipelines;
 
 /// Compute attention scores from compressed key cache on GPU.
@@ -10,7 +10,7 @@ use crate::pipeline::ShaderPipelines;
 ///
 /// Returns scores in `scores_out` buffer [n_kv] f32.
 pub fn compressed_attention_scores(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     // Query (pre-rotated and original)
     rotated_query: &crate::metal::Buffer, // [dim] f32
@@ -77,7 +77,7 @@ pub fn compressed_attention_scores(
 ///
 /// Returns the weighted sum in `output` buffer [dim] f32.
 pub fn compressed_value_gather(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     // Attention weights (post-softmax)
     weights: &crate::metal::Buffer, // [n_kv] f32
@@ -133,7 +133,7 @@ pub fn compressed_value_gather(
 /// Output is reused by `compressed_attention_scores_v2` for every kv_idx, eliminating
 /// the O(qjl_m * dim * n_kv) redundancy of the legacy kernel.
 pub fn qjl_project_query(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     query: &crate::metal::Buffer,        // [dim] f32
     qjl_matrix: &crate::metal::Buffer,   // [qjl_m x dim] f32
@@ -171,7 +171,7 @@ pub fn qjl_project_query(
 /// Caller MUST first dispatch `qjl_project_query` to populate `qjl_proj`.
 /// Eliminates per-kv_idx recomputation of qjl_matrix . query.
 pub fn compressed_attention_scores_v2(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     rotated_query: &crate::metal::Buffer, // [dim] f32
     qjl_proj: &crate::metal::Buffer,      // [qjl_m] f32, precomputed
@@ -227,7 +227,7 @@ pub fn compressed_attention_scores_v2(
 /// V3: same input/output contract as v2 but Stage 1 inner loop is float4-vectorized.
 /// Requires `dim % 4 == 0` (caller asserts).
 pub fn compressed_attention_scores_v3(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     rotated_query: &crate::metal::Buffer,
     qjl_proj: &crate::metal::Buffer,
@@ -285,7 +285,7 @@ pub fn compressed_attention_scores_v3(
 /// V4: V3 + centroids cached in threadgroup memory.
 /// Single-threadgroup dispatch (one threadgroup, n_kv threads).
 pub fn compressed_attention_scores_v4(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     rotated_query: &crate::metal::Buffer,
     qjl_proj: &crate::metal::Buffer,
@@ -347,7 +347,7 @@ pub fn compressed_attention_scores_v4(
 /// V5: V4 + fp16 Stage 1 (half precision FMA, f32 accumulation, threadgroup-cached half centroids).
 /// Multi-threadgroup dispatch (correctly handles n_kv > max_threadgroup).
 pub fn compressed_attention_scores_v5(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     rotated_query: &crate::metal::Buffer,
     qjl_proj: &crate::metal::Buffer,
@@ -406,7 +406,7 @@ pub fn compressed_attention_scores_v5(
 /// V6: SIMD-group cooperative reduction over dim. 1 simd-group (32 threads) per kv_idx.
 /// Each lane processes dim/32 chunks; simd_sum reduces. 8 kv_idx per TG (256 threads).
 pub fn compressed_attention_scores_v6(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     rotated_query: &crate::metal::Buffer,
     qjl_proj: &crate::metal::Buffer,
@@ -468,7 +468,7 @@ pub fn compressed_attention_scores_v6(
 /// to the FIRST Q head's output slot; the kernel writes to `output_base[q*dim + d]`
 /// for q in [0, gqa_ratio).
 pub fn compressed_value_gather_multi(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     weights: &crate::metal::Buffer,
     packed_codes: &crate::metal::Buffer,
@@ -519,7 +519,7 @@ pub fn compressed_value_gather_multi(
 /// Correctly handles arbitrary n via threadgroup-strided iteration.
 /// Threadgroup size must be a power of 2 (caller enforces).
 pub fn softmax_parallel(
-    ctx: &MetalContext,
+    _ctx: &MetalContext,
     pipelines: &ShaderPipelines,
     scores: &crate::metal::Buffer, // [n] f32 in/out
     n: u32,

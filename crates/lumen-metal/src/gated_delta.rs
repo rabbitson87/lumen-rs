@@ -16,7 +16,7 @@
 //!   y      = state · q  // simdgroup-reduced dot over Dk
 
 #[cfg(feature = "model-integration")]
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use candle_core::{Device, Storage, Tensor};
 
 use std::sync::{

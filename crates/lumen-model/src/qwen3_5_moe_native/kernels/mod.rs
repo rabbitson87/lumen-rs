@@ -6,8 +6,8 @@
 
 use anyhow::{Result, anyhow};
 use lumen_metal::metal::{
-    BatchedEncoderExt, CommandBufferExt, CompileOptions, ComputeCommandEncoderRef,
-    ComputeEncoderCompat, ComputePipelineState, Library, MTLLanguageVersion, MTLSize,
+    BatchedEncoderExt, CommandBufferExt, ComputeCommandEncoderRef, ComputeEncoderCompat,
+    ComputePipelineState, Library, MTLLanguageVersion, MTLSize,
 };
 
 use super::context::NativeContext;

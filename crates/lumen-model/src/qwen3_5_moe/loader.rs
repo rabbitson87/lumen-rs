@@ -55,7 +55,7 @@ use super::moe::{
     SwitchMlpBackend,
 };
 use super::proj::ProjLinear;
-use super::self_attn::{SelfAttention, SelfAttnDims, SelfAttnRuntime};
+use super::self_attn::{SelfAttention, SelfAttnRuntime};
 use super::weights::{Classification, StorageKind, WeightIndex};
 
 // ─────────────────────────────────────────────────────────────────────────────

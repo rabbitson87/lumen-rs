@@ -13,7 +13,7 @@
 //! Owns its own Metal library + pipeline states. The kernel source is
 //! [`shaders/affine4.metal`].
 
-use crate::metal::{BatchedEncoderExt, CommandBufferExt, ComputeEncoderCompat};
+use crate::metal::{BatchedEncoderExt, ComputeEncoderCompat};
 use anyhow::Result;
 
 use crate::device::MetalContext;

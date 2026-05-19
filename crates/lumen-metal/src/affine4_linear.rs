@@ -18,9 +18,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLResourceUsage};
 
 use crate::affine4_gpu::{Affine4Context, Affine4Weight, pick_tile_for_in};
-use crate::metal::{
-    BatchedEncoderExt, Buffer, CommandBufferExt, ComputeEncoderCompat, IndirectCommandBuffer,
-};
+use crate::metal::{BatchedEncoderExt, Buffer, IndirectCommandBuffer};
 
 fn icb_enabled() -> bool {
     std::env::var("LUMEN_ICB")

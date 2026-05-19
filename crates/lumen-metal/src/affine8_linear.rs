@@ -15,7 +15,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Storage, Tensor};
 
 use crate::affine8_gpu::{Affine8Context, Affine8Weight};
-use crate::metal::{Buffer, CommandBufferExt};
+use crate::metal::Buffer;
 
 /// Extract the Metal buffer + byte offset backing a Candle tensor. Returns
 /// `None` when the tensor is not Metal-resident. Same pattern as in
