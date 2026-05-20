@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import {
     api,
     onLog,
@@ -51,7 +52,10 @@
 
   type TopTab = "main" | "tuning" | "api" | "debug";
   let activeTab = $state<TopTab>("main");
-  let downloads = $state<Map<string, DownloadProgress>>(new Map());
+  // SvelteMap (not plain Map) so `.set()`/`.delete()` mutations trigger UI
+  // updates without manual reassignment — fixes the case where completed
+  // download lines wouldn't disappear after the 3s auto-dismiss timer.
+  let downloads = new SvelteMap<string, DownloadProgress>();
   let statusMessage = $state<string | null>(null);
   let typedEnvKeys = $state<Set<string>>(new Set());
   let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
@@ -219,24 +223,20 @@
       status = s;
     });
     unlistenDownload = await onDownload((p) => {
-      const next = new Map(downloads);
       const key = `${p.repo_id}/${p.file}`;
-      next.set(key, p);
-      downloads = next;
+      downloads.set(key, p);
       if (p.done) {
         api.listModels().then((m) => {
           models = m;
           refreshOutdated();
         });
         // Auto-clear completed lines after 3s so the progress panel
-        // doesn't crowd up during back-to-back downloads. Re-check
-        // `done` before removing so an in-flight resume doesn't drop
-        // a now-active entry under the same key.
+        // doesn't crowd up during back-to-back downloads. Re-check `done`
+        // first so an in-flight resume on the same key (rare but possible
+        // with retry logic) doesn't drop a now-active entry.
         setTimeout(() => {
-          const cur = new Map(downloads);
-          if (cur.get(key)?.done) {
-            cur.delete(key);
-            downloads = cur;
+          if (downloads.get(key)?.done) {
+            downloads.delete(key);
           }
         }, 3000);
       }
