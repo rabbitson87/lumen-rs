@@ -25,6 +25,56 @@
   import ApiTabs from "./lib/ApiTabs.svelte";
   import { bytes, duration } from "./lib/format";
 
+  // Tooltip action: portals tooltip into <body> on hover so it escapes any
+  // ancestor overflow / stacking-context clipping (cards near the window edge
+  // were truncating absolute-positioned tooltips). Reads `data-tooltip` from
+  // the bound element, clamps position into the viewport with an 8 px margin,
+  // and flips below the trigger if there's no room above.
+  function tooltip(node: HTMLElement) {
+    let tip: HTMLElement | null = null;
+
+    function show() {
+      const text = node.getAttribute("data-tooltip");
+      if (!text) return;
+      tip = document.createElement("div");
+      tip.className = "tooltip-portal";
+      tip.textContent = text;
+      document.body.appendChild(tip);
+
+      const margin = 8;
+      const rect = node.getBoundingClientRect();
+      const tipRect = tip.getBoundingClientRect();
+
+      let top = rect.top - tipRect.height - 8;
+      if (top < margin) top = rect.bottom + 8;
+
+      let left = rect.left + rect.width / 2 - tipRect.width / 2;
+      const maxLeft = window.innerWidth - tipRect.width - margin;
+      left = Math.max(margin, Math.min(maxLeft, left));
+
+      tip.style.top = `${top}px`;
+      tip.style.left = `${left}px`;
+    }
+
+    function hide() {
+      tip?.remove();
+      tip = null;
+    }
+
+    node.addEventListener("mouseenter", show);
+    node.addEventListener("mouseleave", hide);
+    node.addEventListener("blur", hide);
+
+    return {
+      destroy() {
+        hide();
+        node.removeEventListener("mouseenter", show);
+        node.removeEventListener("mouseleave", hide);
+        node.removeEventListener("blur", hide);
+      },
+    };
+  }
+
   // ── Reactive state ────────────────────────────────────────────────
   let config = $state<PersistentConfig | null>(null);
   let models = $state<ModelEntry[]>([]);
@@ -120,6 +170,41 @@
   function kvEstimateGb(ctxMax: number): number {
     return Math.max(0, ctxMax / 8192);
   }
+
+  // KV compression ratio under the current TurboQuant config.
+  // Stage-1 ratio at head_dim=256 (Gemma 4 sliding):
+  //   4-bit: ~4.0x, 3-bit: ~5.3x, 2-bit: ~8.0x
+  // QJL Stage-2 at default m=1024 adds ~128 B/vector, which dilutes Stage-1
+  // ratio roughly: total = bf16/(stage1_bytes + qjl_bytes).
+  let turboquantKvRatio = $derived.by(() => {
+    if (!config?.quant.turboquant_enabled) return 1.0;
+    const bits = config.quant.bits;
+    // bf16 = 16 bits/scalar; head_dim=256 → 4096 bits/vector
+    const stage1Bits = bits * 256;
+    const qjlBits = config.quant.turboquant_qjl_enabled ? config.quant.qjl_m : 0;
+    const totalBits = stage1Bits + qjlBits;
+    return totalBits > 0 ? 4096 / totalBits : 1.0;
+  });
+
+  let turboquantStateLabel = $derived.by(() => {
+    if (!config?.quant.turboquant_enabled) return "OFF (bf16 KV)";
+    const stage = `${config.quant.bits}-bit`;
+    const qjl = config.quant.turboquant_qjl_enabled ? " + QJL" : "";
+    return `${stage}${qjl}`;
+  });
+
+  // Realistic max-context budget. Assumes ~2 GB free for KV after model +
+  // overhead on the host Mac, scaled by the TurboQuant compression ratio.
+  // Returns rounded K-tokens (e.g. 32 for 32 768 tokens).
+  let realisticMaxCtxK = $derived.by(() => {
+    if (!systemInfo || !activeModel) return null;
+    const modelGb = activeModel.size_bytes / 1024 ** 3;
+    const overheadGb = 3; // server + tokenizer + activations
+    const freeForKv = Math.max(0.5, systemInfo.ram_gb - modelGb - overheadGb);
+    const bf16TokensPerGb = 8192; // baseline: ~1 GB / 8K tokens at bf16
+    const realisticTokens = freeForKv * bf16TokensPerGb * turboquantKvRatio;
+    return Math.round(realisticTokens / 1024);
+  });
   // Precise float used for display (3 decimal places); the persisted
   // `memory_limit_gb` ServerConfig field is still usize so we ceil() at save.
   let recommendedMemoryGbExact = $derived.by(() => {
@@ -496,7 +581,14 @@
     <h2>QUANT <span class="dim">(TurboQuant KV cache)</span></h2>
     {#if config}
       <div class="kv">
-        <span class="dim">TurboQuant</span>
+        <span class="dim">
+          TurboQuant
+          <span
+            class="help"
+            use:tooltip
+            data-tooltip="Master switch for KV-cache quantization (Lloyd-Max + Haar rotation, Stage 1). ON saves ~4–8× KV memory at small accuracy cost. OFF keeps KV in bf16 — recommended only if you see quality issues at long context."
+          >?</span>
+        </span>
         <label class="toggle">
           <input
             type="checkbox"
@@ -511,7 +603,14 @@
         </label>
       </div>
       <div class="kv">
-        <span class="dim">QJL residual (Stage 2)</span>
+        <span class="dim">
+          QJL residual (Stage 2)
+          <span
+            class="help"
+            use:tooltip
+            data-tooltip="Stage-2 unbiased 1-bit correction for the Stage-1 residual: projects (original − reconstructed) into m-dim Gaussian space and packs only the sign. Recovers ~2–3% Top-5 / +0.003 cosine at small extra cost (~m/8 bytes per K/V vector; ~25 MB for Gemma 4 sliding window at m=1024). Requires Stage 1 ON."
+          >?</span>
+        </span>
         <label class="toggle">
           <input
             type="checkbox"
@@ -527,7 +626,14 @@
         </label>
       </div>
       <div class="kv">
-        <span class="dim">Bits</span>
+        <span class="dim">
+          Bits
+          <span
+            class="help"
+            use:tooltip
+            data-tooltip="Lloyd-Max bits per KV channel. 4: highest quality, ~4× smaller than FP16. 3: balanced — recommended default. 2: max compression (~8× smaller), small quality drop. Applies to the sliding-window KV on Gemma 4."
+          >?</span>
+        </span>
         <div class="seg">
           {#each [2, 3, 4] as b}
             <button
@@ -585,8 +691,29 @@
 
   <!-- CONTEXT -->
   <section class="card span-6">
-    <h2>CONTEXT</h2>
+    <h2>CONTEXT <span class="dim">(driven by QUANT state)</span></h2>
     {#if config}
+      <div class="ctx-banner" class:ctx-banner-warn={!config.quant.turboquant_enabled}>
+        <div>
+          <span class="dim">TurboQuant:</span>
+          <b>{turboquantStateLabel}</b>
+          {#if config.quant.turboquant_enabled}
+            <span class="dim">· KV cache ~{turboquantKvRatio.toFixed(1)}× smaller than bf16</span>
+          {:else}
+            <span class="dim">· baseline KV memory (no compression)</span>
+          {/if}
+        </div>
+        {#if realisticMaxCtxK != null}
+          <div class="dim">
+            Recommended max on this Mac ({systemInfo?.ram_gb} GB):
+            <b>~{realisticMaxCtxK}K tokens</b>
+            {#if !config.quant.turboquant_enabled}
+              <span class="warn">— turn TurboQuant ON to handle longer contexts safely</span>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
       <div class="kv">
         <span class="dim">Max</span>
         <input
@@ -599,8 +726,17 @@
       </div>
       <div class="ctx-hint dim">
         Max sequence length (tokens). Caps the model's <code>max_position_embeddings</code>
-        when host RAM can't hold the model's native limit (Gemma 4 claims 128K
-        but a 16 GB Mac realistically handles ~16K). Env: <code>LUMEN_MAX_CTX</code>.
+        when host RAM can't hold the model's native limit (Gemma 4 claims 128K).
+        {#if config.quant.turboquant_enabled}
+          Current TurboQuant <b>{turboquantStateLabel}</b> gives ~{turboquantKvRatio.toFixed(1)}× KV compression
+          {#if realisticMaxCtxK != null}
+            — realistic on this Mac: <b>~{realisticMaxCtxK}K</b>.
+          {:else}.{/if}
+        {:else}
+          <span class="warn">TurboQuant OFF</span> — KV stays bf16, so practical limit on this Mac
+          {#if realisticMaxCtxK != null}is <b>~{realisticMaxCtxK}K</b>{:else}is much lower than the model's native max{/if}.
+        {/if}
+        Env: <code>LUMEN_MAX_CTX</code>.
       </div>
 
       <div class="kv">
@@ -617,7 +753,11 @@
         Sliding-window attention size. Some layers (Gemma 4: 25 of 30) only attend
         to the last N tokens instead of the full sequence → bounded KV memory for
         long contexts. <b>0</b> = use the model's built-in default; <b>N&gt;0</b> overrides it
-        (smaller = less KV, weaker long-range recall). Env: <code>LUMEN_SLIDING_WINDOW</code>.
+        (smaller = less KV, weaker long-range recall).
+        {#if config.quant.turboquant_enabled}
+          Stacks with TurboQuant — sliding bounds <i>which</i> tokens are kept, TurboQuant compresses <i>how</i> they're stored.
+        {/if}
+        Env: <code>LUMEN_SLIDING_WINDOW</code>.
       </div>
 
       <div class="kv">
@@ -633,8 +773,9 @@
       <div class="ctx-hint dim">
         Prompt-processing chunk cap. Server rejects prompts longer than this with
         a "prompt too large" error. Larger = accepts long prompts but more peak
-        memory during prefill (attention QK<sup>T</sup> = chunk × KV). Env:
-        <code>LUMEN_PREFILL_CHUNK</code>.
+        memory during prefill (attention QK<sup>T</sup> = chunk × KV
+        {#if config.quant.turboquant_enabled}, shrunk ~{turboquantKvRatio.toFixed(1)}× by TurboQuant{/if}).
+        Env: <code>LUMEN_PREFILL_CHUNK</code>.
       </div>
     {/if}
   </section>
@@ -1008,6 +1149,8 @@
         {config}
         {status}
         {catalog}
+        {models}
+        {systemInfo}
         onEmbeddingChange={(v) => {
           if (!config) return;
           config.server.embedding_model_id = v;
@@ -1017,6 +1160,13 @@
           if (!config) return;
           config.server.api_key = v;
           saveServer();
+        }}
+        onDownloadEmbedding={async (id) => {
+          try {
+            await api.downloadModel(id, null);
+          } catch (e) {
+            statusMessage = `Embedding download failed: ${e}`;
+          }
         }}
       />
     {/if}
@@ -1341,6 +1491,47 @@
     white-space: nowrap;
   }
 
+  .help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    margin-left: 4px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1;
+    cursor: help;
+    user-select: none;
+    transition: color 120ms, border-color 120ms;
+  }
+  .help:hover {
+    color: var(--text);
+    border-color: var(--text);
+  }
+
+  /* Tooltip portal: appended to <body> by the `tooltip` action so it
+     escapes ancestor overflow / stacking clipping. Must be :global() since
+     the element lives outside this component's scoped CSS. */
+  :global(.tooltip-portal) {
+    position: fixed;
+    max-width: 280px;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.45;
+    text-align: left;
+    white-space: normal;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    pointer-events: none;
+    z-index: 10000;
+  }
+
   .seg {
     display: flex;
     gap: 4px;
@@ -1348,6 +1539,29 @@
   .seg button {
     padding: 4px 10px;
     min-width: 36px;
+  }
+
+  .ctx-banner {
+    margin: -4px 0 12px;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ctx-banner-warn {
+    border-left-color: var(--warn);
+  }
+  .ctx-banner b {
+    color: var(--text);
+  }
+  .ctx-banner .warn {
+    color: var(--warn);
   }
 
   .ctx-hint {

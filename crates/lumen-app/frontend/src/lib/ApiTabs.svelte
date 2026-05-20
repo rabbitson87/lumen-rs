@@ -1,15 +1,63 @@
 <script lang="ts">
-  import type { PersistentConfig, ServerStatus, Catalog } from "./api";
+  import type {
+    PersistentConfig,
+    ServerStatus,
+    Catalog,
+    ModelEntry,
+    SystemInfo,
+  } from "./api";
 
   interface Props {
     config: PersistentConfig;
     status: ServerStatus;
     catalog: Catalog;
+    models: ModelEntry[];
+    systemInfo: SystemInfo | null;
     onEmbeddingChange: (value: string | null) => void;
     onApiKeyChange: (value: string | null) => void;
+    onDownloadEmbedding: (repoId: string) => void;
   }
-  let { config, status, catalog, onEmbeddingChange, onApiKeyChange }: Props =
-    $props();
+  let {
+    config,
+    status,
+    catalog,
+    models,
+    systemInfo,
+    onEmbeddingChange,
+    onApiKeyChange,
+    onDownloadEmbedding,
+  }: Props = $props();
+
+  // Embeddings already downloaded locally — selectable in the dropdown.
+  // Matches `catalog.embeddings` against `models` (which is the unified
+  // list of every model dir on disk, chat or embedding).
+  let downloadedEmbeddings = $derived.by(() => {
+    const have = new Set(models.map((m) => m.id));
+    return catalog.embeddings.filter((e) => have.has(e.id));
+  });
+
+  // Catalog entries not yet on disk — listed in the "Download embedding"
+  // picker. Sorted with the ones that fit this Mac's RAM first.
+  let availableEmbeddings = $derived.by(() => {
+    const have = new Set(models.map((m) => m.id));
+    const ram = systemInfo?.ram_gb ?? Infinity;
+    return catalog.embeddings
+      .filter((e) => !have.has(e.id))
+      .slice()
+      .sort((a, b) => {
+        const aOk = a.min_ram_gb <= ram ? 0 : 1;
+        const bOk = b.min_ram_gb <= ram ? 0 : 1;
+        if (aOk !== bOk) return aOk - bOk;
+        return a.min_ram_gb - b.min_ram_gb;
+      });
+  });
+
+  let selectedEmbDl = $state<string>("");
+  function triggerEmbeddingDownload() {
+    if (!selectedEmbDl) return;
+    onDownloadEmbedding(selectedEmbDl);
+    selectedEmbDl = "";
+  }
 
   type Style = "openai" | "claude";
   let activeStyle = $state<Style>("openai");
@@ -126,23 +174,41 @@
           }}
         >
           <option value="">(none — /v1/embeddings disabled)</option>
-          {#each catalog.embeddings as emb}
+          {#each downloadedEmbeddings as emb}
             <option value={emb.id}>
-              {emb.label} · {emb.approx_size_gb}GB · ≥{emb.min_ram_gb}GB RAM
+              {emb.label} · {emb.approx_size_gb}GB
             </option>
           {/each}
-          {#if config.server.embedding_model_id && !catalog.embeddings.find((e) => e.id === config.server.embedding_model_id)}
+          {#if config.server.embedding_model_id && !downloadedEmbeddings.find((e) => e.id === config.server.embedding_model_id)}
             <option value={config.server.embedding_model_id}>
               {config.server.embedding_model_id} (custom)
             </option>
           {/if}
         </select>
       </div>
-      {#if config.server.embedding_model_id}
-        {@const emb = catalog.embeddings.find((e) => e.id === config.server.embedding_model_id)}
-        {#if emb}
-          <div class="dl-hint dim">{emb.notes}</div>
-        {/if}
+      {#if downloadedEmbeddings.length === 0}
+        <div class="dl-hint dim warn">
+          No embedding models downloaded yet — pick one below to download first.
+        </div>
+      {/if}
+      {#if availableEmbeddings.length > 0}
+        <div class="kv">
+          <span class="dim">Download embedding</span>
+          <div class="emb-dl-row">
+            <select bind:value={selectedEmbDl}>
+              <option value="" disabled>— pick to download —</option>
+              {#each availableEmbeddings as emb}
+                {@const fits = !systemInfo || emb.min_ram_gb <= systemInfo.ram_gb}
+                <option value={emb.id}>
+                  {fits ? "" : "⚠ "}{emb.label} · {emb.approx_size_gb}GB · ≥{emb.min_ram_gb}GB RAM
+                </option>
+              {/each}
+            </select>
+            <button onclick={triggerEmbeddingDownload} disabled={!selectedEmbDl}>
+              Download
+            </button>
+          </div>
+        </div>
       {/if}
       <div class="endpoints">
         <div class="ep-h dim">Endpoints</div>
@@ -335,5 +401,16 @@
     margin-left: 130px;
     font-size: 11px;
     line-height: 1.5;
+  }
+  .dl-hint.warn {
+    color: var(--warn);
+  }
+  .emb-dl-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .emb-dl-row select {
+    flex: 1;
   }
 </style>
