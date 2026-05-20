@@ -120,16 +120,34 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
     },
 ];
 
-/// Recommended embedding models. Currently a small curated list — selected
-/// in the OpenAI tab of the desktop app's API card, sets `EMBEDDING_MODEL_ID`
-/// at subprocess spawn. When empty the `/v1/embeddings` endpoint returns 503.
-pub const EMBEDDINGS: &[RecommendedEmbedding] = &[RecommendedEmbedding {
-    id: "mlx-community/Qwen3-Embedding-0.6B-8bit",
-    label: "Qwen 3 Embedding — 0.6B (8-bit)",
-    approx_size_gb: 1,
-    min_ram_gb: 4,
-    notes: "Small, fast embedding model. Good default for retrieval / semantic search.",
-}];
+/// Recommended embedding models. Curated list of Qwen3-Embedding family —
+/// shown in the API card of the desktop app; user downloads explicitly,
+/// then selects from the downloaded set. Selection writes `EMBEDDING_MODEL_ID`
+/// into the spawned server's env; when unset the `/v1/embeddings` endpoint
+/// returns 503.
+pub const EMBEDDINGS: &[RecommendedEmbedding] = &[
+    RecommendedEmbedding {
+        id: "mlx-community/Qwen3-Embedding-0.6B-8bit",
+        label: "Qwen 3 Embedding — 0.6B (8-bit)",
+        approx_size_gb: 1,
+        min_ram_gb: 4,
+        notes: "Small, fast embedding model. Good default for retrieval / semantic search.",
+    },
+    RecommendedEmbedding {
+        id: "mlx-community/Qwen3-Embedding-4B-8bit",
+        label: "Qwen 3 Embedding — 4B (8-bit)",
+        approx_size_gb: 5,
+        min_ram_gb: 12,
+        notes: "Mid-size. Noticeably better recall on long passages and multilingual queries; slower per request than 0.6B.",
+    },
+    RecommendedEmbedding {
+        id: "mlx-community/Qwen3-Embedding-8B-8bit",
+        label: "Qwen 3 Embedding — 8B (8-bit)",
+        approx_size_gb: 9,
+        min_ram_gb: 20,
+        notes: "Top-of-family accuracy. Use when retrieval quality matters more than per-request latency.",
+    },
+];
 
 /// Detect which family a repo id / local dir name belongs to. Mirrors the
 /// detection logic in `engine::detect_architecture` but maps to the catalog
