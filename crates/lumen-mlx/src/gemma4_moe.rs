@@ -5747,6 +5747,70 @@ pub(crate) mod imp {
                 None
             };
 
+            // ── Sampled decode path (temperature / top-p / repeat-penalty) ──
+            //
+            // Routes here only when `cfg.sampling` is `Some` AND the
+            // config is non-greedy (temperature > 0 OR repeat_penalty != 1).
+            // The greedy fast path (with async pipelining + MTP + lookup
+            // spec) stays bit-identical when this branch is not taken.
+            //
+            // The prefill argmax `current` is already lazy from above; we
+            // discard it and re-sample the prefill logits with the same
+            // sampler so the very first decoded token also respects
+            // temperature / top-p.
+            if cfg.sampling.as_ref().map(|s| !s.is_greedy()).unwrap_or(false) {
+                use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
+                let sampling = cfg.sampling.as_ref().unwrap();
+                // Discard the lazy prefill argmax; we'll sample from
+                // `logits` (the [1, 1, V] prefill output already in scope)
+                // directly. No extra prefill pass.
+                let _ = current;
+                let mut rng = Xorshift64::new(sampling.seed);
+                let decode_start = Instant::now();
+
+                let first_tok =
+                    sample_next_token(&logits, &generated, sampling, &mut rng)
+                        .context("generate(sampled): sample prefill token")?;
+                generated.push(first_tok);
+                let mut hit_eos_s = cfg.stop_on_eos && eos.contains(&first_tok);
+
+                let mut current_u32 = first_tok;
+                let mut decode_steps_s: usize = 0;
+                while generated.len() < cfg.max_new_tokens && !hit_eos_s {
+                    let input = Array::from_slice(&[current_u32 as i32], &[1, 1])
+                        .as_dtype(mlx_rs::Dtype::Int32)
+                        .context("generate(sampled): build input array")?;
+                    let step_logits = self
+                        .forward_array_last_token(&input, &mut cache)
+                        .context("generate(sampled): decode forward")?;
+                    let next_tok =
+                        sample_next_token(&step_logits, &generated, sampling, &mut rng)
+                            .context("generate(sampled): sample step")?;
+                    generated.push(next_tok);
+                    decode_steps_s += 1;
+                    if cfg.stop_on_eos && eos.contains(&next_tok) {
+                        hit_eos_s = true;
+                    }
+                    current_u32 = next_tok;
+                }
+                let decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+                let decode_tok_per_sec = if decode_ms > 0.0 && decode_steps_s > 0 {
+                    decode_steps_s as f64 * 1e3 / decode_ms
+                } else {
+                    0.0
+                };
+                return Ok(GenerateStats {
+                    prompt_tokens: prompt_ids.len(),
+                    generated_tokens: generated,
+                    prefill_ms,
+                    prefill_breakdown,
+                    decode_ms,
+                    decode_steps: decode_steps_s,
+                    decode_tok_per_sec,
+                    stopped_on_eos: hit_eos_s,
+                });
+            }
+
             // ── MTP decode path (opt-in: LUMEN_GEMMA4_MTP=1 + try_enable_mtp()) ──
             //
             // Routes through `mtp_step()` (Step A→E speculative decoding).
@@ -6164,6 +6228,12 @@ pub(crate) mod imp {
         pub max_new_tokens: usize,
         /// If true, stop as soon as any of `eos_tokens()` is produced.
         pub stop_on_eos: bool,
+        /// Optional sampling config. `None` (or any config whose
+        /// `is_greedy()` returns true) takes the existing GPU-pipelined
+        /// argmax path — bit-identical to pre-sampling behavior. Anything
+        /// else routes through the CPU sampler in `gemma4_sampling`
+        /// (temperature / top-p / repeat-penalty).
+        pub sampling: Option<crate::gemma4_sampling::imp::SamplingConfig>,
     }
 
     impl Default for GenerateConfig {
@@ -6171,6 +6241,7 @@ pub(crate) mod imp {
             Self {
                 max_new_tokens: 32,
                 stop_on_eos: true,
+                sampling: None,
             }
         }
     }
@@ -6777,6 +6848,7 @@ pub(crate) mod imp {
             let warmup_cfg = GenerateConfig {
                 max_new_tokens: 4,
                 stop_on_eos: false,
+                sampling: None,
             };
             let _ = model
                 .generate(&prompt, &warmup_cfg)
@@ -6788,6 +6860,7 @@ pub(crate) mod imp {
                 // 31-step decode loop regardless of which token the model
                 // happens to argmax first.
                 stop_on_eos: false,
+                sampling: None,
             };
 
             let stats = model.generate(&prompt, &gen_cfg).expect("generate ok");
@@ -6862,6 +6935,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 4,
                         stop_on_eos: false,
+                        sampling: None,
                     },
                 )
                 .expect("warmup");
@@ -6874,6 +6948,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens: 32,
                 stop_on_eos: false,
+                sampling: None,
             };
             let stats = model.generate(&prompt, &cfg).expect("generate");
             let decode_steps = stats.decode_steps as f64;
@@ -6967,6 +7042,7 @@ pub(crate) mod imp {
             let gen_cfg = GenerateConfig {
                 max_new_tokens: 8,
                 stop_on_eos: true,
+                sampling: None,
             };
             let stats = model
                 .generate(&prompt_ids, &gen_cfg)
@@ -7038,6 +7114,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 4,
                         stop_on_eos: false,
+                        sampling: None,
                     },
                 )
                 .expect("warmup");
@@ -7049,6 +7126,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 64,
                         stop_on_eos: true,
+                        sampling: None,
                     },
                 )
                 .expect("positive generate");
@@ -7082,6 +7160,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 24,
                         stop_on_eos: false,
+                        sampling: None,
                     },
                 )
                 .expect("negative generate");
@@ -7168,6 +7247,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 2,
                         stop_on_eos: false,
+                        sampling: None,
                     },
                 )
                 .expect("warmup");
@@ -7179,6 +7259,7 @@ pub(crate) mod imp {
                     &GenerateConfig {
                         max_new_tokens: 4,
                         stop_on_eos: false,
+                        sampling: None,
                     },
                 )
                 .expect("long-context generate");

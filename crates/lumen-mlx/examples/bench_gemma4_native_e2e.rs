@@ -78,6 +78,7 @@ fn main() -> Result<()> {
     let warm_cfg = GenerateConfig {
         max_new_tokens: warmup.max(1),
         stop_on_eos: false,
+        sampling: None,
     };
     // hide `LUMEN_METAL_CAPTURE` from the warmup generate so
     // the .gputrace bundle only contains the timed run. We re-set after.
@@ -146,6 +147,7 @@ fn main() -> Result<()> {
     let cfg = GenerateConfig {
         max_new_tokens: steps,
         stop_on_eos: false,
+        sampling: None,
     };
     // Marker line for external profilers (e.g. capture_metal_systrace.sh) to
     // sync attach with the start of the timed decode window.

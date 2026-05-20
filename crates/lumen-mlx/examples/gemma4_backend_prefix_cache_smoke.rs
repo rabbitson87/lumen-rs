@@ -76,6 +76,7 @@ fn main() -> Result<()> {
                 &messages,
                 max_new_tokens,
                 /* temperature */ 0.0,
+                /* top_p */ 1.0,
                 /* thinking */ false,
                 prefix_key,
             )

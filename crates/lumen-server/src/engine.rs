@@ -215,18 +215,31 @@ impl ModelBackend {
         messages: &[(String, String)],
         max_new_tokens: usize,
         temperature: f32,
+        top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
     ) -> Result<String> {
         match self {
-            Self::Qwen(m) => m.chat(messages, max_new_tokens, temperature),
-            Self::Gemma(m) => m.chat(messages, max_new_tokens, temperature),
+            Self::Qwen(m) => {
+                let _ = top_p;
+                m.chat(messages, max_new_tokens, temperature)
+            }
+            Self::Gemma(m) => {
+                let _ = top_p;
+                m.chat(messages, max_new_tokens, temperature)
+            }
             Self::GemmaGguf(m) => {
+                let _ = top_p;
                 m.chat_with_options(messages, max_new_tokens, temperature, thinking)
             }
             #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => m.chat(messages, max_new_tokens, temperature, thinking),
-            Self::Mlx(m) => m.chat(messages, max_new_tokens, temperature, thinking, session_id),
+            Self::Qwen35Moe(m) => {
+                let _ = top_p;
+                m.chat(messages, max_new_tokens, temperature, thinking)
+            }
+            Self::Mlx(m) => {
+                m.chat(messages, max_new_tokens, temperature, top_p, thinking, session_id)
+            }
         }
     }
 
@@ -235,6 +248,7 @@ impl ModelBackend {
         messages: &[(String, String)],
         max_new_tokens: usize,
         temperature: f32,
+        top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
         on_token: F,
@@ -244,16 +258,19 @@ impl ModelBackend {
     {
         match self {
             Self::GemmaGguf(m) => {
+                let _ = top_p;
                 m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)
             }
             // Fallback: generate all, send as one chunk
             Self::Qwen(m) => {
+                let _ = top_p;
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
                 Ok(text)
             }
             Self::Gemma(m) => {
+                let _ = top_p;
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
@@ -261,11 +278,18 @@ impl ModelBackend {
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
+                let _ = top_p;
                 m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)
             }
-            Self::Mlx(m) => {
-                m.chat_streaming(messages, max_new_tokens, temperature, thinking, session_id, on_token)
-            }
+            Self::Mlx(m) => m.chat_streaming(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                thinking,
+                session_id,
+                on_token,
+            ),
         }
     }
 }
@@ -537,7 +561,7 @@ impl InferenceEngine {
 
         // Single short pass — just compiles Metal shaders + stabilizes GPU
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 3, 0.0, false, None)?;
+        let _ = self.backend.chat(&messages, 3, 0.0, 1.0, false, None)?;
         eprintln!(
             "  pass 1 done ({:.0}ms)",
             t.elapsed().as_secs_f64() * 1000.0
@@ -545,7 +569,7 @@ impl InferenceEngine {
 
         // One more decode step to ensure pipeline is warm
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 2, 0.0, false, None)?;
+        let _ = self.backend.chat(&messages, 2, 0.0, 1.0, false, None)?;
 
         eprintln!(
             "  warmup complete in {:.0}ms",
@@ -584,6 +608,7 @@ impl InferenceEngine {
             &messages,
             req.max_tokens,
             req.temperature,
+            req.top_p,
             req.thinking,
             req.session_id.as_deref(),
         )?;
@@ -675,6 +700,7 @@ impl InferenceEngine {
             &messages,
             req.max_tokens,
             req.temperature,
+            req.top_p,
             req.thinking,
             req.session_id.as_deref(),
         )?;
@@ -757,6 +783,7 @@ impl InferenceEngine {
             &messages,
             req.max_tokens,
             req.temperature,
+            req.top_p,
             req.thinking,
             req.session_id.as_deref(),
             |text| {
@@ -813,6 +840,7 @@ impl InferenceEngine {
             &messages,
             req.max_tokens,
             req.temperature,
+            req.top_p,
             req.thinking,
             req.session_id.as_deref(),
             |text| {

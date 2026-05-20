@@ -39,6 +39,7 @@ mod gemma4_chat;
 mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;
+mod gemma4_sampling;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).
@@ -829,16 +830,21 @@ impl MlxBackend {
     }
 
     /// Unified chat — handles family-specific call shapes internally.
+    /// `top_p` is used by the Gemma 4 path's sampler; Qwen35Family ignores
+    /// it (its sampling is configured server-side via REPEAT_PENALTY env
+    /// and request-level temperature).
     pub fn chat(
         &mut self,
         messages: &[(String, String)],
         max_new_tokens: usize,
         temperature: f32,
+        top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
     ) -> Result<String> {
         match self {
             Self::Qwen35Family(m) => {
+                let _ = top_p;
                 if let Some(sid) = session_id {
                     m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})
                 } else {
@@ -849,9 +855,16 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let resp = if let Some(sid) = session_id {
-                    m.chat_with_prefix_cache(messages, max_new_tokens, temperature, thinking, sid)?
+                    m.chat_with_prefix_cache(
+                        messages,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        sid,
+                    )?
                 } else {
-                    m.chat(messages, max_new_tokens, temperature, thinking)?
+                    m.chat(messages, max_new_tokens, temperature, top_p, thinking)?
                 };
                 if resp.visible.is_empty() && !resp.reasoning.is_empty() {
                     Ok(resp.reasoning)
@@ -868,6 +881,7 @@ impl MlxBackend {
         messages: &[(String, String)],
         max_new_tokens: usize,
         temperature: f32,
+        top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
         mut on_token: F,
@@ -877,6 +891,7 @@ impl MlxBackend {
     {
         match self {
             Self::Qwen35Family(m) => {
+                let _ = top_p;
                 if let Some(sid) = session_id {
                     m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)
                 } else {
@@ -886,11 +901,18 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                let _ = (temperature, session_id);
-                let resp = m.chat_streaming(messages, max_new_tokens, thinking, |chunk| {
-                    on_token(chunk);
-                    Ok(())
-                })?;
+                let _ = session_id;
+                let resp = m.chat_streaming(
+                    messages,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    thinking,
+                    |chunk| {
+                        on_token(chunk);
+                        Ok(())
+                    },
+                )?;
                 if resp.visible.is_empty() && !resp.reasoning.is_empty() {
                     Ok(resp.reasoning)
                 } else {

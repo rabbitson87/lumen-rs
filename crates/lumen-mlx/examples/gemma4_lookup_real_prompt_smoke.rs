@@ -104,6 +104,7 @@ fn main() -> Result<()> {
     let cfg = GenerateConfig {
         max_new_tokens: max_tokens,
         stop_on_eos,
+        sampling: None,
     };
 
     // ── OFF: standard decode ──

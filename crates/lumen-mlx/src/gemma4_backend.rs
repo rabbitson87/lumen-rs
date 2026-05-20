@@ -29,6 +29,47 @@ pub(crate) mod imp {
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
     use crate::gemma4_moe::imp::{GenerateConfig, NativeGemma4Model, NativeGemma4PromptCache};
     use crate::gemma4_response::imp::{ParsedResponse, ResponseParser};
+    use crate::gemma4_sampling::imp::SamplingConfig;
+
+    /// Builds a `SamplingConfig` from request-supplied `temperature`/`top_p`
+    /// plus operator-supplied env (`REPEAT_PENALTY`, `LUMEN_REPEAT_LAST_N`,
+    /// `LUMEN_SAMPLE_SEED`). Returns `None` when the result is greedy
+    /// (temperature ≤ 0 AND repeat_penalty == 1) so the decode loop can
+    /// take the existing fast path.
+    ///
+    /// Defaults reflect the OpenAI request defaults (`0.7` / `0.9`) when
+    /// the request didn't set them; `REPEAT_PENALTY=1.0` (no penalty)
+    /// preserves existing behavior. Operators flip `REPEAT_PENALTY` to
+    /// ~1.1 in the app's SERVER card to suppress degenerate loops on
+    /// aggressively quantized models (3-bit MXFP4 etc.).
+    fn build_sampling_config(temperature: f32, top_p: f32) -> Option<SamplingConfig> {
+        let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f32| *v > 0.0)
+            .unwrap_or(1.0);
+        let repeat_penalty_last_n: usize = std::env::var("LUMEN_REPEAT_LAST_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let seed: u64 = std::env::var("LUMEN_SAMPLE_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E3779B97F4A7C15)
+            });
+        let cfg = SamplingConfig {
+            temperature,
+            top_p,
+            repeat_penalty,
+            repeat_penalty_last_n,
+            seed,
+        };
+        if cfg.is_greedy() { None } else { Some(cfg) }
+    }
 
     /// Prefix-cache entry: snapshot of a prompt-prefilled cache that can be
     /// cloned + truncated to serve subsequent requests sharing a common
@@ -146,19 +187,20 @@ pub(crate) mod imp {
             )
         }
 
-        /// `/v1/completions` path: raw greedy generation from token ids.
-        /// `temperature` / `top_p` are accepted but ignored at this phase —
-        /// W5 (sampling) lands them.
+        /// `/v1/completions` path. When `temperature > 0` (or
+        /// `REPEAT_PENALTY` env is set), routes through CPU sampling;
+        /// otherwise the existing GPU-pipelined greedy path runs.
         pub fn generate(
             &mut self,
             input_ids: &[u32],
             max_new_tokens: usize,
-            _temperature: f32,
-            _top_p: f32,
+            temperature: f32,
+            top_p: f32,
         ) -> Result<Vec<u32>> {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
+                sampling: build_sampling_config(temperature, top_p),
             };
             let stats = self.model.generate(input_ids, &cfg)?;
             eprintln!(
@@ -176,13 +218,15 @@ pub(crate) mod imp {
             &mut self,
             messages: &[(String, String)],
             max_new_tokens: usize,
-            _temperature: f32,
+            temperature: f32,
+            top_p: f32,
             thinking: bool,
         ) -> Result<ParsedResponse> {
             let prompt = self.build_chat_input(messages, thinking)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
+                sampling: build_sampling_config(temperature, top_p),
             };
             let stats = self.model.generate(&prompt, &cfg)?;
             eprintln!(
@@ -221,7 +265,8 @@ pub(crate) mod imp {
             &mut self,
             messages: &[(String, String)],
             max_new_tokens: usize,
-            _temperature: f32,
+            temperature: f32,
+            top_p: f32,
             thinking: bool,
             prefix_cache_key: &str,
         ) -> Result<ParsedResponse> {
@@ -273,6 +318,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
+                sampling: build_sampling_config(temperature, top_p),
             };
             let stats = self
                 .model
@@ -345,6 +391,8 @@ pub(crate) mod imp {
             &mut self,
             messages: &[(String, String)],
             max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
             thinking: bool,
             mut on_token: impl FnMut(&str) -> Result<()>,
         ) -> Result<ParsedResponse> {
@@ -487,6 +535,78 @@ pub(crate) mod imp {
 
                 let mut parser = ResponseParser::new(&self.chat);
                 let eos = self.model.eos_tokens().to_vec();
+
+                // ── Sampled decode branch ──
+                //
+                // When request triggers non-greedy sampling
+                // (temperature > 0 OR REPEAT_PENALTY env != 1), use a
+                // simple per-step loop that pulls last-position logits
+                // to CPU, applies penalty + temperature + top-p, and
+                // multinomial-samples the next token. No async
+                // pipelining; the CPU sampling cost is ~1-2 ms / step
+                // at vocab 262144 vs ~30 ms GPU step time, so the net
+                // impact is < 5%. The greedy path below stays bit-
+                // identical when sampling is disabled.
+                let sampling_cfg = build_sampling_config(temperature, top_p);
+                if let Some(sampling) = sampling_cfg {
+                    use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
+                    let mut rng = Xorshift64::new(sampling.seed);
+                    let mut all_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
+                    let t_decode = std::time::Instant::now();
+
+                    let first_tok = sample_next_token(&logits, &all_tokens, &sampling, &mut rng)
+                        .context("chat_streaming(sampled): sample prefill token")?;
+                    all_tokens.push(first_tok);
+                    parser.push(first_tok)?;
+                    let chunk = self.chat.decode(&[first_tok], true)?;
+                    if !chunk.is_empty() {
+                        on_token(&chunk)?;
+                    }
+
+                    if !eos.contains(&first_tok) {
+                        let mut current_u32 = first_tok;
+                        while all_tokens.len() < max_new_tokens {
+                            let input = mlx_rs::Array::from_slice(
+                                &[current_u32 as i32],
+                                &[1, 1],
+                            )
+                            .as_dtype(mlx_rs::Dtype::Int32)
+                            .context("chat_streaming(sampled): build input array")?;
+                            let step_logits = self
+                                .model
+                                .forward_array_last_token(&input, &mut cache)
+                                .context("chat_streaming(sampled): decode forward")?;
+                            let next_tok = sample_next_token(
+                                &step_logits,
+                                &all_tokens,
+                                &sampling,
+                                &mut rng,
+                            )
+                            .context("chat_streaming(sampled): sample step")?;
+                            all_tokens.push(next_tok);
+                            parser.push(next_tok)?;
+                            let decoded = self.chat.decode(&[next_tok], true)?;
+                            if !decoded.is_empty() {
+                                on_token(&decoded)?;
+                            }
+                            if eos.contains(&next_tok) {
+                                break;
+                            }
+                            current_u32 = next_tok;
+                        }
+                    }
+                    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+                    let count = all_tokens.len();
+                    let tok_per_sec = if decode_ms > 0.0 && count > 0 {
+                        count as f64 / (decode_ms / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[gemma4] chat done: {count} tokens in {decode_ms:.0}ms ({tok_per_sec:.1} tok/s)"
+                    );
+                    return parser.finalize();
+                }
 
                 // env-gated op-counter instrumentation.
                 // When `LUMEN_GEMMA4_COUNT_OPS=1`, resets mlx-rs `OP_COUNTER`

@@ -212,6 +212,8 @@ pub struct AnthropicRequest {
     pub system: Option<AnthropicSystem>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]

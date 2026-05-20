@@ -60,6 +60,7 @@ fn main() -> Result<()> {
     let cfg = GenerateConfig {
         max_new_tokens: max_tokens,
         stop_on_eos: false,
+        sampling: None,
     };
 
     // Baseline (MTP-off). Run once as warmup, then time the second pass so the
