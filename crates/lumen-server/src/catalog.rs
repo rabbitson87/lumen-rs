@@ -64,12 +64,9 @@ pub struct Catalog {
 }
 
 pub const FAMILIES: &[FamilyInfo] = &[
-    FamilyInfo {
-        family: ModelFamily::Qwen25,
-        label: "Qwen 2.5",
-        backend: "candle",
-        notes: "Dense transformer family. Solid baseline; smallest sizes available.",
-    },
+    // Qwen 2.5 omitted: mlx-native runner doesn't parse Qwen 2.5's flat
+    // config.json shape (expects `text_config` nesting). Re-add when the
+    // native loader gains a Qwen 2.5 path.
     FamilyInfo {
         family: ModelFamily::Qwen35Dense,
         label: "Qwen 3.5/3.6 Dense",
@@ -91,30 +88,12 @@ pub const FAMILIES: &[FamilyInfo] = &[
 ];
 
 pub const RECOMMENDED: &[RecommendedModel] = &[
-    RecommendedModel {
-        id: "Qwen/Qwen2.5-0.5B",
-        family: ModelFamily::Qwen25,
-        label: "Qwen 2.5 — 0.5B (base)",
-        approx_size_gb: 1,
-        min_ram_gb: 4,
-        notes: "Smallest model — useful for smoke tests + low-RAM machines.",
-    },
-    RecommendedModel {
-        id: "Qwen/Qwen2.5-1.5B-Instruct",
-        family: ModelFamily::Qwen25,
-        label: "Qwen 2.5 — 1.5B Instruct",
-        approx_size_gb: 3,
-        min_ram_gb: 8,
-        notes: "Good quality-to-size ratio. Chat-tuned.",
-    },
-    RecommendedModel {
-        id: "Qwen/Qwen2.5-3B-Instruct",
-        family: ModelFamily::Qwen25,
-        label: "Qwen 2.5 — 3B Instruct",
-        approx_size_gb: 6,
-        min_ram_gb: 12,
-        notes: "Strong general-purpose baseline.",
-    },
+    // Qwen 2.5 entries are intentionally excluded from the recommended catalog:
+    // the mlx-native runner (now the default backend) expects a nested
+    // `text_config` object in `config.json` which only Gemma 4 and other
+    // multimodal models ship.  Qwen 2.5's flat config fails parsing at load
+    // time, so surfacing them as "recommended" misleads users into a broken
+    // download.  Re-add once the native runner gains a Qwen 2.5 config path.
     RecommendedModel {
         id: "mlx-community/Qwen3.6-35B-A3B-mxfp4",
         family: ModelFamily::Qwen35Moe,
