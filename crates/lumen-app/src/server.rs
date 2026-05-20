@@ -280,6 +280,13 @@ impl ServerSupervisor {
         let bin = resolve_binary(cfg.server_binary_path.as_deref())
             .context("resolve lumen-server binary path")?;
 
+        // If a previous app exit (or force-quit / crash) left an orphaned
+        // lumen-server holding the configured port, reclaim it before
+        // spawning the new one — otherwise bind() fails with EADDRINUSE.
+        // Only kills processes whose argv0 name contains "lumen-server" to
+        // avoid wiping unrelated services on the same port.
+        reclaim_port_if_lumen_server(&cfg.server.host, cfg.server.port);
+
         let mut cmd = Command::new(&bin);
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -382,6 +389,41 @@ impl ServerSupervisor {
         });
 
         Ok(self.status().await)
+    }
+
+    /// Synchronous best-effort kill for app-exit cleanup. Tauri's
+    /// `RunEvent::ExitRequested` fires on the event-loop thread and may
+    /// `std::process::exit()` before any tokio runtime drop, so we can't
+    /// rely on `kill_on_drop` or the async `stop()` path — both need a live
+    /// runtime. Instead grab the PID via `try_lock` and send signals
+    /// directly via `nix::kill`. SIGTERM → 3 s grace → SIGKILL fallback.
+    /// Returns silently if no server is running or the lock is contended
+    /// (treat both as "nothing to clean up").
+    pub fn shutdown_blocking(&self) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let pid = match self.inner.try_lock() {
+            Ok(g) => g.pid,
+            Err(_) => return,
+        };
+        let Some(pid) = pid else { return };
+        let pid_t = Pid::from_raw(pid as i32);
+
+        if kill(pid_t, Signal::SIGTERM).is_err() {
+            return;
+        }
+
+        // Poll for exit every 100 ms up to 3 s. `kill(pid, 0)` returns Err
+        // (ESRCH) once the process is reaped — that's our exit signal.
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            if kill(pid_t, None).is_err() {
+                return;
+            }
+        }
+
+        let _ = kill(pid_t, Signal::SIGKILL);
     }
 
     pub async fn stop(&self, app: AppHandle) -> Result<ServerStatus> {
@@ -683,6 +725,77 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
 /// "binary located?" check uses the exact same resolution order as start().
 pub fn resolve_binary_public(explicit: Option<&Path>) -> Result<PathBuf> {
     resolve_binary(explicit)
+}
+
+/// If `host:port` is occupied by a process whose argv0 name contains
+/// `lumen-server`, send it SIGTERM (then SIGKILL after a short grace) so
+/// `start()` can bind cleanly. No-op when:
+/// - nothing is listening on the port
+/// - the listener is some other process (we leave it alone; the spawn will
+///   fail loudly and surface as a port-collision error to the user)
+///
+/// macOS-only — uses `lsof` (always present on macOS) + `ps`. On other
+/// platforms this would need a different probe; Lumen ships Apple Silicon
+/// only so the cross-platform fork can wait.
+fn reclaim_port_if_lumen_server(host: &str, port: u16) {
+    use std::process::Command as StdCommand;
+
+    let lsof_target = if host == "0.0.0.0" || host.is_empty() {
+        format!("-iTCP:{}", port)
+    } else {
+        format!("-iTCP@{}:{}", host, port)
+    };
+    let out = match StdCommand::new("lsof")
+        .args(["-nP", &lsof_target, "-sTCP:LISTEN", "-t"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let pids: Vec<i32> = stdout
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    for pid in pids {
+        // Confirm it's actually a lumen-server before killing.
+        let ps_out = StdCommand::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output();
+        let is_lumen = match ps_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .rsplit('/')
+                .next()
+                .map(|name| name.contains("lumen-server"))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !is_lumen {
+            continue;
+        }
+
+        let pid_t = Pid::from_raw(pid);
+        let _ = kill(pid_t, Signal::SIGTERM);
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if kill(pid_t, None).is_err() {
+                break;
+            }
+        }
+        if kill(pid_t, None).is_ok() {
+            let _ = kill(pid_t, Signal::SIGKILL);
+            // brief settle so the kernel reclaims the socket before bind()
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 /// Resolution order:

@@ -15,6 +15,7 @@
     type Catalog,
     type RecommendedModel,
     type SystemInfo,
+    type MemoryUsage,
     type CorsMode,
   } from "./lib/api";
   import EnvOverrides from "./lib/EnvOverrides.svelte";
@@ -55,6 +56,7 @@
   let typedEnvKeys = $state<Set<string>>(new Set());
   let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
   let systemInfo = $state<SystemInfo | null>(null);
+  let memoryUsage = $state<MemoryUsage | null>(null);
   let selectedRecommend = $state<string>("");
 
   let visibleModels = $derived(models.filter((m) => m.supported));
@@ -169,6 +171,12 @@
       console.error("doctor run failed:", e);
     }
 
+    // Heal any stale memory caps left over from a previous session that
+    // pre-dates the auto-tune feature (e.g. system-default 16/2/20 saved
+    // before an active model existed). No-op if caps already match the
+    // tuned recommendation or no model is active.
+    await syncTunedMemoryCaps();
+
     unlistenLog = await onLog((l) => {
       logs = [...logs.slice(-499), l];
     });
@@ -196,10 +204,19 @@
       }
     });
 
+    try {
+      memoryUsage = await api.getMemoryUsage();
+    } catch (e) {
+      console.error("get_memory_usage failed:", e);
+    }
+
     pollHandle = setInterval(async () => {
       if (status.state === "running") {
         metrics = await api.serverMetrics();
       }
+      try {
+        memoryUsage = await api.getMemoryUsage();
+      } catch {}
     }, 2000);
   });
 
@@ -227,6 +244,32 @@
   async function setActive(id: string) {
     if (!config) return;
     config = await api.setActiveModel(id);
+    // Without this, switching models leaves the previous model's caps in
+    // place (e.g. 16 GB wired saved for a 16 GB model is wildly oversized
+    // for an 11 GB one). Re-tune to track the new model + current ctx.
+    await syncTunedMemoryCaps();
+  }
+
+  /// Sync the persisted Metal memory caps to the tuned recommendation
+  /// derived from the active model + current context. No-op when no active
+  /// model is set (system defaults stay in place) or values already match.
+  /// `wired_limit_gb = null` so the backend emits byte-exact
+  /// `LUMEN_WIRED_LIMIT_BYTES` from `active_model.size_bytes` instead of a
+  /// GB-rounded ceiling that could truncate a 14.45 GB model to 14 GB.
+  async function syncTunedMemoryCaps() {
+    if (!config || !activeModel) return;
+    if (recommendedMemoryGb == null || recommendedCacheGb == null) return;
+    const needsUpdate =
+      config.server.wired_limit_gb !== null ||
+      config.server.cache_limit_gb !== recommendedCacheGb ||
+      config.server.memory_limit_gb !== recommendedMemoryGb ||
+      config.server.disable_wired_limit;
+    if (!needsUpdate) return;
+    config.server.wired_limit_gb = null;
+    config.server.cache_limit_gb = recommendedCacheGb;
+    config.server.memory_limit_gb = recommendedMemoryGb;
+    config.server.disable_wired_limit = false;
+    config = await api.updateServerConfig(config.server);
   }
 
   async function saveServer() {
@@ -244,6 +287,9 @@
   async function saveContext() {
     if (!config) return;
     config = await api.updateContextConfig(config.context);
+    // ctx affects KV-cache headroom in the tuned memory recommendation
+    // (~1 GB per 8K tokens). Re-sync so saved caps follow.
+    await syncTunedMemoryCaps();
   }
 
   async function resetMemoryCaps() {
@@ -307,6 +353,22 @@
   </div>
   <div class="actions">
     {#if statusMessage}<span class="dim">{statusMessage}</span>{/if}
+    {#if memoryUsage}
+      {@const usedGb = memoryUsage.used_bytes / 1024 ** 3}
+      {@const totalGb = memoryUsage.total_bytes / 1024 ** 3}
+      {@const pct = (usedGb / totalGb) * 100}
+      <span
+        class="mem-indicator mono"
+        class:warn={pct >= 80 && pct < 92}
+        class:hot={pct >= 92}
+        title="System memory: {usedGb.toFixed(1)} / {totalGb.toFixed(0)} GB ({pct.toFixed(0)}%) — wired + active + compressor"
+      >
+        <span class="mem-bar">
+          <span class="mem-bar-fill" style="width: {Math.min(100, pct).toFixed(1)}%"></span>
+        </span>
+        {usedGb.toFixed(1)}/{totalGb.toFixed(0)} GB
+      </span>
+    {/if}
     <button
       class="health"
       class:healthy={doctorReport?.overall === "healthy"}
@@ -1052,6 +1114,46 @@
     color: var(--text-dim);
     font-size: 11px;
     margin-left: 2px;
+  }
+
+  .mem-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+  }
+  .mem-indicator.warn {
+    color: var(--warn);
+    border-color: var(--warn);
+  }
+  .mem-indicator.hot {
+    color: var(--err);
+    border-color: var(--err);
+  }
+  .mem-bar {
+    display: inline-block;
+    width: 48px;
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .mem-bar-fill {
+    display: block;
+    height: 100%;
+    background: var(--text-dim);
+    transition: width 0.4s ease-out;
+  }
+  .mem-indicator.warn .mem-bar-fill {
+    background: var(--warn);
+  }
+  .mem-indicator.hot .mem-bar-fill {
+    background: var(--err);
   }
 
   .grid {

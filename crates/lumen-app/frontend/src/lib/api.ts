@@ -119,6 +119,11 @@ export interface SystemInfo {
   recommended: MemoryDefaults;
 }
 
+export interface MemoryUsage {
+  used_bytes: number;
+  total_bytes: number;
+}
+
 export type LifecycleState = "stopped" | "starting" | "running" | "stopping" | "crashed";
 
 export interface ServerStatus {
@@ -218,6 +223,7 @@ export const api = {
   openConfigDir: () => invoke<string>("open_config_dir"),
 
   getSystemInfo: () => invoke<SystemInfo>("get_system_info"),
+  getMemoryUsage: () => invoke<MemoryUsage | null>("get_memory_usage"),
   resetMemoryCaps: () => invoke<PersistentConfig>("reset_memory_caps"),
 
   doctorRun: () => invoke<DoctorReport>("doctor_run"),

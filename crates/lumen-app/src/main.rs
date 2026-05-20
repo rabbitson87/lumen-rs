@@ -49,6 +49,7 @@ fn main() {
             commands::server_metrics,
             commands::open_config_dir,
             commands::get_system_info,
+            commands::get_memory_usage,
             commands::reset_memory_caps,
             commands::doctor_run,
             commands::doctor_fix,
@@ -56,6 +57,16 @@ fn main() {
             updater::install_update,
             updater::current_version,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Lumen");
+        .build(tauri::generate_context!())
+        .expect("error while building Lumen")
+        .run(|app_handle, event| {
+            // Tauri may std::process::exit() after this returns, which skips
+            // tokio runtime drop and therefore skips Child::kill_on_drop on
+            // the sidecar. Send SIGTERM → SIGKILL synchronously here so the
+            // server's port + RAM are reclaimed before the app process dies.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let state: tauri::State<AppState> = app_handle.state();
+                state.supervisor.shutdown_blocking();
+            }
+        });
 }

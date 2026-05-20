@@ -11,7 +11,7 @@ use crate::doctor::{self, DoctorReport};
 use crate::models::{self, DownloadProgress, ModelEntry};
 use crate::server::{self, ServerStatus, TYPED_ENV_KEYS};
 use crate::state::AppState;
-use crate::sysinfo::{self, SystemInfo};
+use crate::sysinfo::{self, MemoryUsage, SystemInfo};
 
 /// Wrap anyhow::Error → String so Tauri can serialize it for the frontend.
 type CmdResult<T> = Result<T, String>;
@@ -102,6 +102,14 @@ pub async fn open_config_dir() -> CmdResult<String> {
 #[tauri::command]
 pub async fn get_system_info() -> CmdResult<SystemInfo> {
     Ok(sysinfo::probe())
+}
+
+/// Live system memory snapshot for the topbar monitor. Returns `None` only
+/// if the `vm_stat` probe fails — the UI hides the indicator in that case
+/// rather than rendering nonsense.
+#[tauri::command]
+pub async fn get_memory_usage() -> CmdResult<Option<MemoryUsage>> {
+    Ok(sysinfo::current_memory_usage())
 }
 
 /// Reset the Metal memory caps in `ServerConfig` to RAM-aware defaults
