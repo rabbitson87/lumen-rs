@@ -51,3 +51,12 @@ worker-hang-investigation.html
 #    individually below. ──
 scripts/*
 !scripts/fetch_fixtures.py
+# Quantization reproducibility — release notes reference these as the
+# pipeline used to build the imatrix-driven Gemma 4 3-bit on the Hub.
+!scripts/quant/
+!scripts/quant/imatrix_corpus.py
+!scripts/quant/imatrix_capture_gemma4.py
+!scripts/quant/imatrix_mixed_quant.py
+!scripts/quant/test_long_context_imatrix3.py
+!scripts/quant/smoke_compare_quants.py
+!scripts/quant/quantize_gemma4_safe_3bit.py
