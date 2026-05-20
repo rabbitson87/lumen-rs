@@ -1,17 +1,45 @@
+@import "tailwindcss";
+
+/* Map the existing CSS-var design tokens into Tailwind 4's theme so utility
+   classes are generated automatically:
+     bg-bg / bg-panel / bg-panel-2          (backgrounds)
+     text-text / text-text-dim / text-...   (foregrounds)
+     border-border / border-accent / ...    (borders)
+     font-mono / font-sans
+   New components can use these utilities directly; the legacy `var(--bg)`
+   references in component <style> blocks keep working unchanged. */
+@theme {
+  --color-bg: #0e1014;
+  --color-panel: #161922;
+  --color-panel-2: #1d2230;
+  --color-border: #2a2f3d;
+  --color-text: #e6e7ea;
+  --color-text-dim: #8a8f9c;
+  --color-accent: #7fb3ff;
+  --color-ok: #5bd6a3;
+  --color-warn: #f0b65c;
+  --color-err: #ff7a7a;
+  --font-mono: ui-monospace, SF Mono, "JetBrains Mono", Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", sans-serif;
+}
+
 :root {
   color-scheme: dark;
-  --bg: #0e1014;
-  --panel: #161922;
-  --panel-2: #1d2230;
-  --border: #2a2f3d;
-  --text: #e6e7ea;
-  --text-dim: #8a8f9c;
-  --accent: #7fb3ff;
-  --ok: #5bd6a3;
-  --warn: #f0b65c;
-  --err: #ff7a7a;
-  --mono: ui-monospace, SF Mono, "JetBrains Mono", Menlo, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", sans-serif;
+  /* Legacy aliases — keep so existing `var(--bg)` references in component
+     <style> blocks resolve. New components should prefer Tailwind utilities
+     (`bg-bg`, `text-text-dim`, `border-border`, etc.) instead. */
+  --bg: var(--color-bg);
+  --panel: var(--color-panel);
+  --panel-2: var(--color-panel-2);
+  --border: var(--color-border);
+  --text: var(--color-text);
+  --text-dim: var(--color-text-dim);
+  --accent: var(--color-accent);
+  --ok: var(--color-ok);
+  --warn: var(--color-warn);
+  --err: var(--color-err);
+  --mono: var(--font-mono);
+  --sans: var(--font-sans);
 }
 
 * {
