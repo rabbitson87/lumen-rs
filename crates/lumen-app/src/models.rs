@@ -26,6 +26,43 @@ pub struct ModelEntry {
     /// means unsupported / unknown.
     #[serde(default)]
     pub label: Option<String>,
+    /// HF Hub commit SHA recorded when this snapshot was downloaded. `None`
+    /// for legacy installs from before v0.1.3 (no SHA was tracked at the time)
+    /// and for local-only models without an HF id. Used by `check_model_updates`
+    /// to detect when the Hub-side repo has been re-uploaded (same id, new
+    /// weights — e.g. `hsng95/gemma-4-26b-a4b-mlx-3bit` after the imatrix
+    /// rebuild). Persisted in a small `.lumen_hub_sha` text file inside the
+    /// model directory.
+    #[serde(default)]
+    pub local_sha: Option<String>,
+}
+
+/// File where we persist the HF Hub commit SHA at download time. Sits next
+/// to `config.json` etc. — small (~40 bytes), purely informational, ignored
+/// by every other consumer of the model directory.
+pub const SHA_MARKER_FILE: &str = ".lumen_hub_sha";
+
+/// Write the SHA marker. Called by `download()` after all files transfer.
+/// Best-effort: a failure here is logged but doesn't abort the install,
+/// because the model files are already on disk and usable — we just can't
+/// detect future Hub updates.
+pub fn write_sha_marker(model_dir: &Path, sha: &str) {
+    let marker = model_dir.join(SHA_MARKER_FILE);
+    if let Err(e) = std::fs::write(&marker, sha.trim()) {
+        eprintln!(
+            "lumen-app: could not write {}: {e} (model still usable, just won't detect future updates)",
+            marker.display()
+        );
+    }
+}
+
+/// Read the SHA marker if present. Trims whitespace so future formats can
+/// add trailing newlines / metadata lines without breaking older readers.
+fn read_sha_marker(model_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(model_dir.join(SHA_MARKER_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Scan `models_dir` and return one entry per model-bearing subdirectory.
@@ -104,6 +141,7 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
             .map(|m| m.len())
             .sum();
         let rec = catalog.find_recommended(&id);
+        let local_sha = read_sha_marker(&scan_dir);
         out.push(ModelEntry {
             id,
             path,
@@ -111,6 +149,7 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
             ready: config_present && weight_present,
             supported: rec.is_some(),
             label: rec.map(|r| r.label.clone()),
+            local_sha,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -144,6 +183,52 @@ fn resolve_hf_snapshot(hf_dir: &Path) -> Option<PathBuf> {
 pub fn local_path_for(models_dir: &Path, repo_id: &str) -> PathBuf {
     let flat = repo_id.replacen('/', "--", 1);
     models_dir.join(flat)
+}
+
+/// Latest commit SHA for the `main` branch of an HF Hub repo. Used to detect
+/// "same repo id, new weights" the way `hsng95/gemma-4-26b-a4b-mlx-3bit` was
+/// rebuilt in v0.1.3 — the old broken-3bit and the new imatrix mixed-precision
+/// build live at the same id, so byte-for-byte comparison would require
+/// re-downloading.  The Hub commit SHA is the single 40-char string that
+/// changes on every weight rebuild and is cheap to query (one HTTPS call).
+///
+/// API: `GET https://huggingface.co/api/models/<repo_id>` → JSON with `sha`.
+/// Falls back to `None` on any error (offline, repo gone, etc.) — the caller
+/// treats unknown remote SHA as "can't determine update status, allow use".
+pub async fn fetch_hub_sha(
+    client: &reqwest::Client,
+    repo_id: &str,
+) -> Result<String> {
+    let url = format!("https://huggingface.co/api/models/{repo_id}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("HF API for {repo_id}: HTTP {status}"));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("parse HF API json for {repo_id}"))?;
+    body.get("sha")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("HF API for {repo_id} missing sha field"))
+}
+
+/// Result of an update check for a single model. `needs_update` is true iff
+/// both the local SHA and the remote SHA are known AND they differ.  When
+/// either is unknown (legacy install / offline) we report `needs_update: false`
+/// — silent, don't block the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    pub repo_id: String,
+    pub local_sha: Option<String>,
+    pub remote_sha: Option<String>,
+    pub needs_update: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,6 +417,19 @@ pub async fn download(
                 done: true,
             })
             .await;
+    }
+
+    // Stamp the HF Hub commit SHA so future revision checks can detect when
+    // the same repo id has been re-uploaded with different weights.  Best-
+    // effort — `fetch_hub_sha` failure (offline finish, transient 5xx) just
+    // skips the marker; the model is still usable, the user just won't see
+    // an Update notification if the repo changes later.
+    match fetch_hub_sha(&client, repo_id).await {
+        Ok(sha) => write_sha_marker(&target, &sha),
+        Err(e) => eprintln!(
+            "lumen-app: could not fetch HF Hub SHA for {repo_id} post-download: {e} \
+             (download succeeded; future update detection disabled for this install)"
+        ),
     }
 
     Ok(target)

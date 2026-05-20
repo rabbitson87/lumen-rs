@@ -73,6 +73,20 @@ export interface ModelEntry {
   ready: boolean;
   supported: boolean;
   label: string | null;
+  /** HF Hub commit SHA recorded at download time. `null` for legacy installs
+   * (pre-v0.1.3) and for local-only models. Used together with `UpdateStatus`
+   * to detect "same id, new weights" rebuilds. */
+  local_sha: string | null;
+}
+
+/** Result of an HF Hub revision check for one installed model. `needs_update`
+ * is true iff both `local_sha` and `remote_sha` are known and differ.
+ * Drives the "Update available" badge + Start-button gating in App.svelte. */
+export interface UpdateStatus {
+  repo_id: string;
+  local_sha: string | null;
+  remote_sha: string | null;
+  needs_update: boolean;
 }
 
 export type ModelFamily = "qwen25" | "qwen35-dense" | "qwen35-moe" | "gemma4";
@@ -212,6 +226,11 @@ export const api = {
   setActiveModel: (model_id: string) =>
     invoke<PersistentConfig>("set_active_model", { modelId: model_id }),
   deleteModel: (model_id: string) => invoke<void>("delete_model", { modelId: model_id }),
+  /** Query HF Hub for the current commit SHA of each provided repo id and
+   * compare against the locally-recorded SHA. Side-effect: backend updates
+   * its outdated-set so `startServer` will refuse to launch a stale model. */
+  checkModelUpdates: (repo_ids: string[]) =>
+    invoke<UpdateStatus[]>("check_model_updates", { repoIds: repo_ids }),
   downloadModel: (repo_id: string, files: string[] | null = null) =>
     invoke<void>("download_model", { repoId: repo_id, files }),
 

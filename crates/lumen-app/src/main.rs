@@ -43,6 +43,7 @@ fn main() {
             commands::add_local_model,
             commands::delete_model,
             commands::download_model,
+            commands::check_model_updates,
             commands::start_server,
             commands::stop_server,
             commands::server_status,

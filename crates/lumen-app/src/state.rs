@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,6 +19,13 @@ pub struct AppState {
     /// refreshable via the `refresh_catalog` Tauri command. Defaults to an
     /// empty catalog if the binary can't be located yet — UI handles that.
     pub catalog: Mutex<Catalog>,
+    /// Repo ids whose local SHA differs from the HF Hub `main` SHA. Populated
+    /// by the `check_model_updates` command (and refreshed on demand from the
+    /// frontend). `start_server` consults this set and refuses to launch the
+    /// engine when the active model is in it — forcing the user through the
+    /// "Update" flow so the engine never loads stale weights against the new
+    /// tokenizer / config / catalog label.
+    pub outdated_models: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -33,6 +41,7 @@ impl AppState {
             config: Mutex::new(cfg),
             supervisor: ServerSupervisor::new(),
             catalog: Mutex::new(catalog),
+            outdated_models: Mutex::new(HashSet::new()),
         })
     }
 }

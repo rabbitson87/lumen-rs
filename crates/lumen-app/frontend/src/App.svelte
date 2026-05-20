@@ -59,7 +59,39 @@
   let memoryUsage = $state<MemoryUsage | null>(null);
   let selectedRecommend = $state<string>("");
 
+  // Set of repo ids whose local SHA differs from HF Hub `main` — driven by
+  // `api.checkModelUpdates(...)` after every model-list refresh. Drives the
+  // "Update available" badge + Start-button gating.  Cleared/repopulated on
+  // every refresh; never persisted to disk (backend owns the cache).
+  let outdatedModels = $state<Set<string>>(new Set());
+
   let visibleModels = $derived(models.filter((m) => m.supported));
+
+  let activeOutdated = $derived(
+    config?.active_model != null && outdatedModels.has(config.active_model)
+  );
+
+  /// Refresh the outdated-set against HF Hub. Best-effort: any network failure
+  /// just leaves the previous state in place (we never auto-flag-as-outdated
+  /// on a transient offline check, otherwise users would be blocked from
+  /// starting the server on flaky wifi). Called from `onMount`, after every
+  /// `setActive`, and after each download completes.
+  async function refreshOutdated() {
+    if (models.length === 0) {
+      outdatedModels = new Set();
+      return;
+    }
+    try {
+      const statuses = await api.checkModelUpdates(models.map((m) => m.id));
+      const next = new Set<string>();
+      for (const s of statuses) {
+        if (s.needs_update) next.add(s.repo_id);
+      }
+      outdatedModels = next;
+    } catch (e) {
+      console.warn("check_model_updates failed:", e);
+    }
+  }
 
   // Active model + derived hints (bits, recommended memory caps).
   let activeModel = $derived.by(() => {
@@ -144,6 +176,9 @@
   onMount(async () => {
     config = await api.getConfig();
     models = await api.listModels();
+    // Background revision check — fire-and-forget so app boot isn't blocked
+    // on HF Hub round-trip. Result drives the "Update available" UI state.
+    refreshOutdated();
     status = await api.serverStatus();
     metrics = await api.serverMetrics();
     typedEnvKeys = new Set(await api.typedEnvKeys());
@@ -189,7 +224,10 @@
       next.set(key, p);
       downloads = next;
       if (p.done) {
-        api.listModels().then((m) => (models = m));
+        api.listModels().then((m) => {
+          models = m;
+          refreshOutdated();
+        });
         // Auto-clear completed lines after 3s so the progress panel
         // doesn't crowd up during back-to-back downloads. Re-check
         // `done` before removing so an in-flight resume doesn't drop
@@ -331,6 +369,26 @@
     if (!confirm(`Delete ${id}? Weights will be removed from disk.`)) return;
     await api.deleteModel(id);
     models = await api.listModels();
+    refreshOutdated();
+  }
+
+  /// "Update" button handler for an out-of-date installed model.  Deletes
+  /// the local directory + triggers a fresh download against the current
+  /// Hub `main` SHA.  Re-uses the existing download path so the user sees
+  /// the same progress UI; SHA marker is rewritten at the end.
+  async function updateOutdated(id: string) {
+    if (!confirm(
+      `Update ${id}? Old weights will be removed and the latest version downloaded.`
+    )) return;
+    try {
+      await api.deleteModel(id);
+      models = await api.listModels();
+      await api.downloadModel(id, null);
+      // listModels + refreshOutdated happen on download completion (see the
+      // onDownload listener above) — no explicit refresh needed here.
+    } catch (e) {
+      statusMessage = `Update failed: ${e}`;
+    }
   }
 </script>
 
@@ -395,7 +453,11 @@
     <button
       class={status.state === "running" || status.state === "starting" ? "danger" : "primary"}
       onclick={toggleServer}
-      disabled={status.state === "starting" || status.state === "stopping"}
+      disabled={status.state === "starting" || status.state === "stopping" ||
+        (status.state !== "running" && activeOutdated)}
+      title={activeOutdated && status.state !== "running"
+        ? "Active model has a newer version on Hub. Update it first (MODELS card → Update)."
+        : ""}
     >
       {status.state === "running" || status.state === "starting" ? "Stop" : "Start"}
     </button>
@@ -551,26 +613,38 @@
     <h2>MODELS</h2>
     <div class="models">
       {#each visibleModels as m}
+        {@const needsUpdate = outdatedModels.has(m.id)}
         <div
           class="model-row"
           class:dimmed={!m.supported}
           class:row-active={config?.active_model === m.id}
+          class:row-outdated={needsUpdate}
         >
           <span class="mono mark">{config?.active_model === m.id ? "✓" : ""}</span>
           <div class="model-cell">
             <div class="model-id mono">{m.id}</div>
-            {#if m.label}
+            {#if needsUpdate}
+              <div class="model-label warn">⚠ Newer weights available on Hub — update required before use</div>
+            {:else if m.label}
               <div class="model-label dim">{m.label}</div>
             {:else if !m.supported}
               <div class="model-label warn">not in supported catalog</div>
             {/if}
           </div>
           <span class="dim mono model-size">{bytes(m.size_bytes)}</span>
-          <button
-            onclick={() => setActive(m.id)}
-            disabled={config?.active_model === m.id || !m.supported}
-            title={!m.supported ? "Not in the server-side supported catalog" : ""}
-          >Use</button>
+          {#if needsUpdate}
+            <button
+              class="primary"
+              onclick={() => updateOutdated(m.id)}
+              title="Re-download with the latest Hub weights"
+            >Update</button>
+          {:else}
+            <button
+              onclick={() => setActive(m.id)}
+              disabled={config?.active_model === m.id || !m.supported}
+              title={!m.supported ? "Not in the server-side supported catalog" : ""}
+            >Use</button>
+          {/if}
           <button class="danger" onclick={() => removeModel(m.id)}>Delete</button>
         </div>
       {/each}
@@ -1396,6 +1470,15 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent) inset;
     background: rgba(127, 179, 255, 0.06);
+  }
+  .model-row.row-outdated {
+    border-color: var(--warn);
+    background: rgba(255, 184, 108, 0.08);
+  }
+  .model-row.row-outdated.row-active {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 1px var(--warn) inset;
+    background: rgba(255, 184, 108, 0.14);
   }
   .mark {
     color: var(--ok);

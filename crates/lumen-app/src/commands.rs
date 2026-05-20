@@ -230,7 +230,85 @@ pub async fn download_model(
     });
     let res = models::download(&dir, &repo_id, files, tx).await;
     let _ = pump.await;
+    // Successful (re-)download clears the outdated flag — the SHA marker we
+    // just wrote inside the download is the new ground truth.
+    if res.is_ok() {
+        state.outdated_models.lock().await.remove(&repo_id);
+    }
     res.map(|_| ()).map_err(err)
+}
+
+/// Check each provided installed model against its HF Hub `main` commit SHA.
+/// Returns a status entry per model.  Side-effect: updates
+/// `AppState.outdated_models` so `start_server` can refuse to launch with a
+/// stale active model.
+///
+/// Behaviour:
+/// - `local_sha` known + `remote_sha` known + differ → `needs_update = true`
+/// - `local_sha` missing (legacy install) OR `remote_sha` fetch failed
+///   (offline / repo gone) → `needs_update = false` (don't block the user)
+///
+/// Network: one parallel HTTPS call per repo, ~50 ms each on a warm connection,
+/// so checking a dozen installed models takes well under a second.
+#[tauri::command]
+pub async fn check_model_updates(
+    state: State<'_, AppState>,
+    repo_ids: Vec<String>,
+) -> CmdResult<Vec<models::UpdateStatus>> {
+    let g = state.config.lock().await;
+    let dir = g.models_dir.clone();
+    drop(g);
+
+    let cat = state.catalog.lock().await;
+    let entries = models::scan_local(&dir, &cat).map_err(err)?;
+    drop(cat);
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut results = Vec::with_capacity(repo_ids.len());
+    let mut new_outdated = std::collections::HashSet::new();
+    for repo_id in &repo_ids {
+        // Only HF-style ids (`org/repo`) can be checked against the Hub.
+        // Local-only model names are skipped silently.
+        let is_hf_id = repo_id.contains('/');
+        let local_sha = entries
+            .iter()
+            .find(|m| &m.id == repo_id)
+            .and_then(|m| m.local_sha.clone());
+
+        let remote_sha = if is_hf_id {
+            match models::fetch_hub_sha(&client, repo_id).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("lumen-app: hub SHA fetch for {repo_id} failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let needs_update = matches!(
+            (local_sha.as_deref(), remote_sha.as_deref()),
+            (Some(l), Some(r)) if l != r
+        );
+        if needs_update {
+            new_outdated.insert(repo_id.clone());
+        }
+        results.push(models::UpdateStatus {
+            repo_id: repo_id.clone(),
+            local_sha,
+            remote_sha,
+            needs_update,
+        });
+    }
+
+    *state.outdated_models.lock().await = new_outdated;
+    Ok(results)
 }
 
 // ── Server lifecycle ───────────────────────────────────────────────────
@@ -246,6 +324,18 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     let models_dir = g.models_dir.clone();
     let sup = state.supervisor.clone();
     drop(g);
+
+    // Hard-gate the launch when the most-recent revision check flagged the
+    // active model as out of date.  The frontend already greys out the Start
+    // button in that state — this is the belt-and-suspenders guard for direct
+    // RPC bypass (CLI testing, future plugin, etc.) so the engine never loads
+    // weights against a tokenizer/config that has since been re-uploaded.
+    if state.outdated_models.lock().await.contains(&active_id) {
+        return Err(format!(
+            "active model `{active_id}` is out of date — open the MODELS card \
+             and click Update first, then start the server"
+        ));
+    }
 
     // Resolve the on-disk path of the active model. Flat-layout dirs use the
     // dir name (e.g. `gemma-4-26b-a4b-mlx-3bit`) which won't match the HF Hub
