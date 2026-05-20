@@ -54,106 +54,54 @@
       resetFromProp();
     }
   });
+
+  // Inline `<code>` styling — formerly `.env-help code { ... }`. Lifting the
+  // utility chain to a const so the markup stays readable when the same
+  // pattern repeats across multiple help strings.
+  const inlineCode = "font-mono bg-panel-2 px-1 rounded-[3px]";
 </script>
 
-<div class="env-body">
-  <div class="env-help dim">
-    Raw env-var overrides passed to the <code>lumen-server</code> subprocess. Useful for
-    one-off knobs not surfaced in the UI (e.g. <code>LUMEN_GEMMA4_FUSE_EXPERTS</code>,
-    <code>LUMEN_AFFINE4_FORCE_CPU</code>). Keys that shadow a typed UI field are highlighted.
+<div class="px-4 pt-2 pb-3 text-xs">
+  <div class="dim mb-2 text-[11px] leading-normal">
+    Raw env-var overrides passed to the <code class={inlineCode}>lumen-server</code> subprocess. Useful for
+    one-off knobs not surfaced in the UI (e.g. <code class={inlineCode}>LUMEN_GEMMA4_FUSE_EXPERTS</code>,
+    <code class={inlineCode}>LUMEN_AFFINE4_FORCE_CPU</code>). Keys that shadow a typed UI field are highlighted.
   </div>
-  <div class="env-rows">
+  <div class="flex flex-col gap-1 mb-2">
     {#each rows as r, i}
       {@const shadowed = typedKeys.has(r.key.trim())}
-      <div class="env-row" class:shadowed>
+      <div class="grid grid-cols-[280px_1fr_28px] gap-1.5 items-center">
         <input
-          class="env-key mono"
+          class={`mono uppercase ${shadowed ? "border-warn!" : ""}`}
           type="text"
           placeholder="LUMEN_..."
           bind:value={r.key}
         />
-        <input class="env-val mono" type="text" placeholder="value" bind:value={r.value} />
-        <button class="env-del" onclick={() => remove(i)} title="Remove">×</button>
+        <input class="mono" type="text" placeholder="value" bind:value={r.value} />
+        <button
+          class="min-w-0 px-2 py-0.5 bg-transparent text-text-dim hover:bg-panel-2 hover:text-err"
+          onclick={() => remove(i)}
+          title="Remove"
+        >×</button>
       </div>
       {#if shadowed}
-        <div class="env-warn">⚠ shadows the UI field for <code class="mono">{r.key.trim()}</code></div>
+        <div class="text-[11px] text-warn pl-1">
+          ⚠ shadows the UI field for <code class="mono">{r.key.trim()}</code>
+        </div>
       {/if}
     {/each}
     {#if rows.length === 0}
       <div class="dim">No overrides set.</div>
     {/if}
   </div>
-  <div class="env-actions">
+  <div class="flex items-center gap-2">
     <button onclick={add}>+ Add</button>
     <button class="primary" disabled={!dirty} onclick={commit}>Save</button>
     {#if dirty}
       <button onclick={resetFromProp}>Revert</button>
     {/if}
-    <span class="dim env-hint">
+    <span class="dim ml-auto text-[11px]">
       Changes apply on next server start.
     </span>
   </div>
 </div>
-
-<style>
-  .env-body {
-    padding: 8px 16px 12px;
-    font-size: 12px;
-  }
-  .env-help {
-    margin-bottom: 8px;
-    font-size: 11px;
-    line-height: 1.5;
-  }
-  .env-help code {
-    font-family: var(--mono);
-    background: var(--panel-2);
-    padding: 0 4px;
-    border-radius: 3px;
-  }
-  .env-rows {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-bottom: 8px;
-  }
-  .env-row {
-    display: grid;
-    grid-template-columns: 280px 1fr 28px;
-    gap: 6px;
-    align-items: center;
-  }
-  .env-row.shadowed .env-key {
-    border-color: var(--warn);
-  }
-  .env-key {
-    text-transform: uppercase;
-  }
-  .env-del {
-    padding: 2px 8px;
-    min-width: 0;
-    background: transparent;
-    color: var(--text-dim);
-  }
-  .env-del:hover {
-    background: var(--panel-2);
-    color: var(--err);
-  }
-  .env-warn {
-    font-size: 11px;
-    color: var(--warn);
-    padding-left: 4px;
-  }
-  .env-warn code {
-    font-family: var(--mono);
-  }
-  .env-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .env-hint {
-    margin-left: auto;
-    font-size: 11px;
-  }
-</style>

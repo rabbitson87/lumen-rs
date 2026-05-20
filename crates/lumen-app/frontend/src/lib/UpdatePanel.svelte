@@ -76,15 +76,15 @@
   }
 </script>
 
-<div class="upd-body">
-  <div class="upd-header">
+<div class="px-4 pt-3 pb-4 text-xs">
+  <div class="flex items-start justify-between gap-4 mb-2.5">
     <div>
-      <div class="upd-version mono">
+      <div class="mono text-sm font-medium">
         Lumen <span class="dim">v</span>{info?.current_version ?? "?"}
       </div>
       {#if info?.available && info.latest_version}
-        <div class="upd-latest">
-          <span class="ok">v{info.latest_version}</span>
+        <div class="mt-0.5">
+          <span class="text-ok font-medium">v{info.latest_version}</span>
           <span class="dim">available</span>
           {#if info.published_at}
             <span class="dim mono">· {info.published_at}</span>
@@ -94,7 +94,7 @@
         <div class="dim">You're on the latest version.</div>
       {/if}
     </div>
-    <div class="upd-actions">
+    <div class="flex gap-2">
       <button onclick={check} disabled={checking || installing}>
         {checking ? "Checking…" : "Check for updates"}
       </button>
@@ -107,20 +107,20 @@
   </div>
 
   {#if error}
-    <div class="upd-error mono">{error}</div>
+    <div class="mono text-err px-2.5 py-1.5 bg-err/10 rounded mb-2">{error}</div>
   {/if}
 
   {#if progress}
-    <div class="upd-progress">
-      <div class="upd-bar">
+    <div class="my-2">
+      <div class="w-full h-1.5 bg-panel-2 rounded-[3px] overflow-hidden">
         <div
-          class="upd-fill"
+          class="h-full bg-accent transition-[width] duration-200 ease-out"
           style="width: {progress.total_bytes
             ? (progress.downloaded_bytes / progress.total_bytes) * 100
             : 50}%"
         ></div>
       </div>
-      <div class="dim mono upd-pct">
+      <div class="dim mono mt-1 text-[11px]">
         {bytes(progress.downloaded_bytes)}
         {#if progress.total_bytes} / {bytes(progress.total_bytes)}{/if}
         {progress.done ? "— applying…" : ""}
@@ -129,85 +129,9 @@
   {/if}
 
   {#if info?.available && info.release_notes}
-    <div class="upd-notes">
-      <div class="upd-notes-h dim">Release notes</div>
-      <pre class="mono">{info.release_notes}</pre>
+    <div class="mt-3 border-t border-border pt-2">
+      <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1.5">Release notes</div>
+      <pre class="mono m-0 whitespace-pre-wrap wrap-break-word text-[11px] leading-normal text-text max-h-50 overflow-y-auto">{info.release_notes}</pre>
     </div>
   {/if}
 </div>
-
-<style>
-  .upd-body {
-    padding: 12px 16px 16px;
-    font-size: 12px;
-  }
-  .upd-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 10px;
-  }
-  .upd-version {
-    font-size: 14px;
-    font-weight: 500;
-  }
-  .upd-latest {
-    margin-top: 2px;
-  }
-  .ok {
-    color: var(--ok);
-    font-weight: 500;
-  }
-  .upd-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .upd-error {
-    color: var(--err);
-    padding: 6px 10px;
-    background: rgba(255, 122, 122, 0.08);
-    border-radius: 4px;
-    margin-bottom: 8px;
-  }
-  .upd-progress {
-    margin: 8px 0;
-  }
-  .upd-bar {
-    width: 100%;
-    height: 6px;
-    background: var(--panel-2);
-    border-radius: 3px;
-    overflow: hidden;
-  }
-  .upd-fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width 200ms ease;
-  }
-  .upd-pct {
-    margin-top: 4px;
-    font-size: 11px;
-  }
-  .upd-notes {
-    margin-top: 12px;
-    border-top: 1px solid var(--border);
-    padding-top: 8px;
-  }
-  .upd-notes-h {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-bottom: 6px;
-  }
-  .upd-notes pre {
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-size: 11px;
-    line-height: 1.5;
-    color: var(--text);
-    max-height: 200px;
-    overflow-y: auto;
-  }
-</style>

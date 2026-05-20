@@ -125,34 +125,49 @@
       copyHint = "copy failed: " + e;
     }
   }
+
+  // Tab button classes — Tailwind doesn't have a clean `hover:not(.active)`,
+  // so we toggle the whole set via Svelte. Keeps the original behavior:
+  // active → accent fill, inactive → dim text that brightens on hover.
+  const tabBase = "bg-transparent border-0 px-3.5 py-1 text-xs rounded";
+  const tabActive = "bg-accent text-bg font-medium";
+  const tabIdle = "text-text-dim hover:text-text";
 </script>
 
-<div class="api-card-h">
-  <h2 class="api-h">API</h2>
-  <div class="tabs">
-    <button class="tab" class:active={activeStyle === "openai"} onclick={() => (activeStyle = "openai")}>
+<div class="flex items-center gap-4 mb-3">
+  <h2 class="m-0 text-xs font-semibold tracking-[0.08em] text-text-dim uppercase">API</h2>
+  <div class="flex gap-0.5 bg-panel-2 border border-border rounded-md p-0.5">
+    <button
+      class={`${tabBase} ${activeStyle === "openai" ? tabActive : tabIdle}`}
+      onclick={() => (activeStyle = "openai")}
+    >
       OpenAI-style
     </button>
-    <button class="tab" class:active={activeStyle === "claude"} onclick={() => (activeStyle = "claude")}>
+    <button
+      class={`${tabBase} ${activeStyle === "claude" ? tabActive : tabIdle}`}
+      onclick={() => (activeStyle = "claude")}
+    >
       Claude-style
     </button>
   </div>
   {#if status.state !== "running"}
-    <span class="dim status-note">server is <span class="warn">{status.state}</span> — values shown are what clients will use once you Start</span>
+    <span class="dim text-[11px] ml-auto">
+      server is <span class="text-warn">{status.state}</span> — values shown are what clients will use once you Start
+    </span>
   {/if}
 </div>
 
-<div class="api-body">
+<div class="grid grid-cols-2 gap-6">
   {#if activeStyle === "openai"}
-    <div class="api-col">
-      <div class="kv">
+    <div class="flex flex-col gap-1.5 min-w-0">
+      <div class="flex flex-col gap-1">
         <span class="dim">Base URL</span>
-        <div class="copyable">
-          <code class="url mono">{openaiBase}</code>
+        <div class="flex items-center gap-2">
+          <code class="mono flex-1 px-2.5 py-[7px] bg-bg border border-border rounded text-accent overflow-x-auto whitespace-nowrap">{openaiBase}</code>
           <button onclick={() => copy(openaiBase)}>Copy</button>
         </div>
       </div>
-      <div class="kv">
+      <div class="flex flex-col gap-1">
         <span class="dim">API key</span>
         <input
           type="password"
@@ -164,7 +179,7 @@
           }}
         />
       </div>
-      <div class="kv">
+      <div class="flex flex-col gap-1">
         <span class="dim">Embedding model</span>
         <select
           value={config.server.embedding_model_id ?? ""}
@@ -187,15 +202,15 @@
         </select>
       </div>
       {#if downloadedEmbeddings.length === 0}
-        <div class="dl-hint dim warn">
+        <div class="mt-0.5 text-[11px] leading-normal text-warn">
           No embedding models downloaded yet — pick one below to download first.
         </div>
       {/if}
       {#if availableEmbeddings.length > 0}
-        <div class="kv">
+        <div class="flex flex-col gap-1">
           <span class="dim">Download embedding</span>
-          <div class="emb-dl-row">
-            <select bind:value={selectedEmbDl}>
+          <div class="flex items-center gap-1.5">
+            <select class="flex-1" bind:value={selectedEmbDl}>
               <option value="" disabled>— pick to download —</option>
               {#each availableEmbeddings as emb}
                 {@const fits = !systemInfo || emb.min_ram_gb <= systemInfo.ram_gb}
@@ -210,31 +225,33 @@
           </div>
         </div>
       {/if}
-      <div class="endpoints">
-        <div class="ep-h dim">Endpoints</div>
-        <div class="ep mono">POST /chat/completions</div>
-        <div class="ep mono">POST /completions</div>
-        <div class="ep mono">POST /embeddings <span class="dim">(requires Embedding model)</span></div>
-        <div class="ep mono">GET  /models</div>
+      <div class="mt-2 pt-2.5 border-t border-border">
+        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">Endpoints</div>
+        <div class="mono text-xs py-0.5 text-text-dim">POST /chat/completions</div>
+        <div class="mono text-xs py-0.5 text-text-dim">POST /completions</div>
+        <div class="mono text-xs py-0.5 text-text-dim">
+          POST /embeddings <span class="dim">(requires Embedding model)</span>
+        </div>
+        <div class="mono text-xs py-0.5 text-text-dim">GET  /models</div>
       </div>
     </div>
-    <div class="api-col">
-      <div class="curl-h">
+    <div class="flex flex-col gap-1.5 min-w-0">
+      <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.06em] mb-1">
         <span class="dim">curl example</span>
         <button onclick={() => copy(openaiCurl)}>Copy</button>
       </div>
-      <pre class="curl mono">{openaiCurl}</pre>
+      <pre class="mono m-0 px-3 py-2.5 bg-bg border border-border rounded-md text-[11px] leading-[1.55] text-text overflow-x-auto whitespace-pre">{openaiCurl}</pre>
     </div>
   {:else}
-    <div class="api-col">
-      <div class="kv">
+    <div class="flex flex-col gap-1.5 min-w-0">
+      <div class="flex flex-col gap-1">
         <span class="dim">Base URL</span>
-        <div class="copyable">
-          <code class="url mono">{claudeBase}</code>
+        <div class="flex items-center gap-2">
+          <code class="mono flex-1 px-2.5 py-[7px] bg-bg border border-border rounded text-accent overflow-x-auto whitespace-nowrap">{claudeBase}</code>
           <button onclick={() => copy(claudeBase)}>Copy</button>
         </div>
       </div>
-      <div class="kv">
+      <div class="flex flex-col gap-1">
         <span class="dim">API key</span>
         <input
           type="password"
@@ -246,171 +263,25 @@
           }}
         />
       </div>
-      <div class="kv">
+      <div class="flex flex-col gap-1">
         <span class="dim">anthropic-version</span>
-        <code class="mono inline-code">2023-06-01</code>
+        <code class="mono inline-block px-2 py-1 bg-bg border border-border rounded">2023-06-01</code>
       </div>
-      <div class="endpoints">
-        <div class="ep-h dim">Endpoints</div>
-        <div class="ep mono">POST /v1/messages</div>
+      <div class="mt-2 pt-2.5 border-t border-border">
+        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">Endpoints</div>
+        <div class="mono text-xs py-0.5 text-text-dim">POST /v1/messages</div>
       </div>
     </div>
-    <div class="api-col">
-      <div class="curl-h">
+    <div class="flex flex-col gap-1.5 min-w-0">
+      <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.06em] mb-1">
         <span class="dim">curl example</span>
         <button onclick={() => copy(claudeCurl)}>Copy</button>
       </div>
-      <pre class="curl mono">{claudeCurl}</pre>
+      <pre class="mono m-0 px-3 py-2.5 bg-bg border border-border rounded-md text-[11px] leading-[1.55] text-text overflow-x-auto whitespace-pre">{claudeCurl}</pre>
     </div>
   {/if}
 </div>
 
 {#if copyHint}
-  <div class="copy-hint dim">{copyHint}</div>
+  <div class="dim mt-1.5 text-[11px] text-right">{copyHint}</div>
 {/if}
-
-<style>
-  .api-card-h {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    margin-bottom: 12px;
-  }
-  .api-h {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    color: var(--text-dim);
-    text-transform: uppercase;
-  }
-  .tabs {
-    display: flex;
-    gap: 2px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 2px;
-  }
-  .tab {
-    background: transparent;
-    border: none;
-    padding: 4px 14px;
-    font-size: 12px;
-    border-radius: 4px;
-    color: var(--text-dim);
-  }
-  .tab.active {
-    background: var(--accent);
-    color: var(--bg);
-    font-weight: 500;
-  }
-  .tab:hover:not(.active) {
-    color: var(--text);
-    background: transparent;
-  }
-  .status-note {
-    font-size: 11px;
-    margin-left: auto;
-  }
-  .warn {
-    color: var(--warn);
-  }
-
-  .api-body {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 24px;
-  }
-  .api-col {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .copyable {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .url {
-    flex: 1;
-    padding: 7px 10px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--accent);
-    overflow-x: auto;
-    white-space: nowrap;
-  }
-
-  .endpoints {
-    margin-top: 8px;
-    padding-top: 10px;
-    border-top: 1px solid var(--border);
-  }
-  .ep-h {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-bottom: 4px;
-  }
-  .ep {
-    font-size: 12px;
-    padding: 2px 0;
-    color: var(--text-dim);
-  }
-
-  .curl-h {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-bottom: 4px;
-  }
-  .curl {
-    margin: 0;
-    padding: 10px 12px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 11px;
-    line-height: 1.55;
-    color: var(--text);
-    overflow-x: auto;
-    white-space: pre;
-  }
-  .inline-code {
-    padding: 4px 8px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    display: inline-block;
-  }
-
-  .copy-hint {
-    margin-top: 6px;
-    font-size: 11px;
-    text-align: right;
-  }
-  .dl-hint {
-    margin-top: 2px;
-    margin-left: 130px;
-    font-size: 11px;
-    line-height: 1.5;
-  }
-  .dl-hint.warn {
-    color: var(--warn);
-  }
-  .emb-dl-row {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-  .emb-dl-row select {
-    flex: 1;
-  }
-</style>
