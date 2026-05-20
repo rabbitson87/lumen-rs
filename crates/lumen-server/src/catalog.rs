@@ -134,10 +134,10 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
     RecommendedModel {
         id: "hsng95/gemma-4-26b-a4b-mlx-3bit",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (3-bit, hsng95)",
-        approx_size_gb: 11,
-        min_ram_gb: 14,
-        notes: "3-bit affine MLX quant. ~11 GB on disk, fits 24 GB Mac mini comfortably. ~29 tok/s decode on M4 Pro.",
+        label: "Gemma 4 — 26B A4B (imatrix mixed 4/3-bit, hsng95)",
+        approx_size_gb: 13,
+        min_ram_gb: 16,
+        notes: "Mixed 4/3-bit AFFINE driven by activation imatrix calibration on a multilingual corpus. 12.5 GB on disk, 4.14 bpw. Fixes the long-context token corruption that pure 3-bit had at 11K Korean prompts; quality close to the 4-bit build but 2.4 GB smaller.",
     },
 ];
 
