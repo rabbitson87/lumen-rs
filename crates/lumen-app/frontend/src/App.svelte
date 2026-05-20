@@ -475,12 +475,37 @@
       statusMessage = `Update failed: ${e}`;
     }
   }
+
+  // ── Shared utility-class chains (Tailwind 4) ─────────────────────
+  // Declared as plain string consts because Svelte's `{@const}` can only
+  // live at the top of `{#if}`/`{#each}`/etc. — not at the top of `<main>`.
+  // Hoisting here keeps the template DRY while letting the same chain be
+  // reused across cards in different conditional branches.
+  const cardBase = "bg-panel border border-border rounded-[10px] px-5 py-4.5 min-h-0";
+  const cardH2 = "m-0 mb-3.5 text-xs font-semibold tracking-[0.08em] text-text-dim uppercase";
+  const kvRow = "grid grid-cols-[120px_1fr] items-center gap-2.5 py-1.5";
+  const helpIcon = "inline-flex items-center justify-center w-3.5 h-3.5 ml-1 rounded-full border border-border text-text-dim text-[10px] leading-none cursor-help select-none transition-[color,border-color] duration-120 hover:text-text hover:border-text";
+  const toggleLabel = "flex items-center gap-2 cursor-pointer";
+  const tabBase = "bg-transparent border-0 border-b-2 px-4 py-2 text-[13px] rounded-none transition-[color,border-color] duration-120";
+  const tabActive = "text-text border-b-accent font-medium";
+  const tabIdle = "text-text-dim border-b-transparent hover:text-text";
+  const ctxHint = "dim -mt-0.5 mb-2 ml-32.5 text-[11px] leading-[1.55]";
+  const inlineCode = "px-1 bg-bg border border-border rounded-[3px] text-[10.5px]";
+  const cardSection = "mt-4 mb-1.5 text-[11px] font-semibold tracking-[0.06em] text-text-dim uppercase border-t border-border pt-2.5";
+  const sectionGrid = "grid grid-cols-3 gap-x-6 gap-y-0";
+  const colSpanFull = "col-span-full";
+  const ramTunedHint = "dim text-[10px] font-normal normal-case tracking-normal ml-2";
+  const resetMemBtn = "ml-2 px-2 py-0.5 text-[10px] font-normal normal-case tracking-normal";
+  const debugHint = "dim col-span-full -mt-0.5 mb-1.5 ml-32.5 text-[11px] leading-[1.55]";
+  const panelScroll = "max-h-[40vh] overflow-y-auto bg-panel";
+  const footerTabBase = "text-left border-0 bg-transparent px-3.5 py-1 text-xs rounded-none border-b-2 border-b-transparent hover:bg-panel-2";
+  const footerTabActive = "bg-panel-2 border-b-accent";
 </script>
 
 <!-- ── Top bar ──────────────────────────────────────────────────── -->
-<header class="topbar">
-  <div class="brand">● Lumen</div>
-  <div class="status">
+<header class="flex items-center gap-4 px-4 py-2.5 bg-panel border-b border-border shrink-0 sticky top-0 z-10">
+  <div class="font-semibold text-sm text-accent">● Lumen</div>
+  <div class="flex items-center gap-1.5">
     <span class="dot {status.state}"></span>
     <span class="mono">{status.state}</span>
     {#if status.state === "running"}
@@ -491,32 +516,38 @@
       {/if}
     {/if}
     {#if status.last_error}
-      <span class="err" title={status.last_error}>· error</span>
+      <span class="text-err" title={status.last_error}>· error</span>
     {/if}
   </div>
-  <div class="actions">
+  <div class="ml-auto flex items-center gap-2.5">
     {#if statusMessage}<span class="dim">{statusMessage}</span>{/if}
     {#if memoryUsage}
       {@const usedGb = memoryUsage.used_bytes / 1024 ** 3}
       {@const totalGb = memoryUsage.total_bytes / 1024 ** 3}
       {@const pct = (usedGb / totalGb) * 100}
+      {@const memHot = pct >= 92}
+      {@const memWarn = pct >= 80 && pct < 92}
       <span
-        class="mem-indicator mono"
-        class:warn={pct >= 80 && pct < 92}
-        class:hot={pct >= 92}
+        class={`mono inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 border rounded-md bg-panel ${
+          memHot ? "text-err border-err" :
+          memWarn ? "text-warn border-warn" :
+          "text-text-dim border-border"
+        }`}
         title="System memory: {usedGb.toFixed(1)} / {totalGb.toFixed(0)} GB ({pct.toFixed(0)}%) — wired + active + compressor"
       >
-        <span class="mem-bar">
-          <span class="mem-bar-fill" style="width: {Math.min(100, pct).toFixed(1)}%"></span>
+        <span class="inline-block w-12 h-1.5 bg-border rounded-[3px] overflow-hidden">
+          <span
+            class={`block h-full transition-[width] duration-400 ease-out ${
+              memHot ? "bg-err" : memWarn ? "bg-warn" : "bg-text-dim"
+            }`}
+            style="width: {Math.min(100, pct).toFixed(1)}%"
+          ></span>
         </span>
         {usedGb.toFixed(1)}/{totalGb.toFixed(0)} GB
       </span>
     {/if}
     <button
-      class="health"
-      class:healthy={doctorReport?.overall === "healthy"}
-      class:degraded={doctorReport?.overall === "degraded"}
-      class:blocked={doctorReport?.overall === "blocked"}
+      class="inline-flex items-center gap-1.5 text-xs"
       onclick={() => {
         doctorOpen = !doctorOpen;
         if (doctorOpen) {
@@ -526,10 +557,15 @@
       }}
       title={doctorReport ? `${doctorCounts.pass} pass · ${doctorCounts.warn} warn · ${doctorCounts.fail} fail` : "Run preflight checks"}
     >
-      <span class="health-dot"></span>
+      <span class={`w-2 h-2 rounded-full ${
+        doctorReport?.overall === "healthy" ? "bg-ok shadow-[0_0_6px_var(--color-ok)]" :
+        doctorReport?.overall === "degraded" ? "bg-warn" :
+        doctorReport?.overall === "blocked" ? "bg-err shadow-[0_0_6px_var(--color-err)]" :
+        "bg-text-dim"
+      }`}></span>
       Doctor
       {#if doctorReport && (doctorCounts.warn > 0 || doctorCounts.fail > 0)}
-        <span class="health-badge mono">
+        <span class="text-text-dim text-[11px] ml-0.5 mono">
           {#if doctorCounts.fail > 0}{doctorCounts.fail}✗{/if}
           {#if doctorCounts.warn > 0}{doctorCounts.warn}!{/if}
         </span>
@@ -550,47 +586,44 @@
 </header>
 
 <!-- ── Tab bar (top-level grouping) ─────────────────────────────── -->
-<nav class="tab-bar">
+<nav class="flex gap-1 px-4 py-1.5 bg-bg border-b border-border sticky top-13.25 z-9">
   <button
-    class="top-tab"
-    class:active={activeTab === "main"}
+    class={`${tabBase} ${activeTab === "main" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "main")}
   >Models &amp; Server</button>
   <button
-    class="top-tab"
-    class:active={activeTab === "tuning"}
+    class={`${tabBase} ${activeTab === "tuning" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "tuning")}
   >Tuning</button>
   <button
-    class="top-tab"
-    class:active={activeTab === "api"}
+    class={`${tabBase} ${activeTab === "api" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "api")}
   >API</button>
   <button
-    class="top-tab"
-    class:active={activeTab === "debug"}
+    class={`${tabBase} ${activeTab === "debug" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "debug")}
   >Debug</button>
 </nav>
 
 <!-- ── Card grid ───────────────────────────────────────────────── -->
-<main class="grid" class:tuning-mode={activeTab === "tuning"}>
+<main class={`grid gap-4 p-4.5 ${activeTab === "tuning" ? "grid-cols-6" : "grid-cols-3"}`}>
   {#if activeTab === "tuning"}
   <!-- QUANT -->
-  <section class="card span-3">
-    <h2>QUANT <span class="dim">(TurboQuant KV cache)</span></h2>
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>QUANT <span class="dim">(TurboQuant KV cache)</span></h2>
     {#if config}
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">
           TurboQuant
           <span
-            class="help"
+            class={helpIcon}
             use:tooltip
             data-tooltip="Master switch for KV-cache quantization (Lloyd-Max + Haar rotation, Stage 1). ON saves ~4–8× KV memory at small accuracy cost. OFF keeps KV in bf16 — recommended only if you see quality issues at long context."
           >?</span>
         </span>
-        <label class="toggle">
+        <label class={toggleLabel}>
           <input
+            class="w-3.5 h-3.5 m-0 accent-accent"
             type="checkbox"
             checked={config.quant.turboquant_enabled}
             onchange={(e) => {
@@ -602,17 +635,18 @@
           <span>{config.quant.turboquant_enabled ? "ON" : "OFF"}</span>
         </label>
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">
           QJL residual (Stage 2)
           <span
-            class="help"
+            class={helpIcon}
             use:tooltip
             data-tooltip="Stage-2 unbiased 1-bit correction for the Stage-1 residual: projects (original − reconstructed) into m-dim Gaussian space and packs only the sign. Recovers ~2–3% Top-5 / +0.003 cosine at small extra cost (~m/8 bytes per K/V vector; ~25 MB for Gemma 4 sliding window at m=1024). Requires Stage 1 ON."
           >?</span>
         </span>
-        <label class="toggle">
+        <label class={toggleLabel}>
           <input
+            class="w-3.5 h-3.5 m-0 accent-accent"
             type="checkbox"
             checked={config.quant.turboquant_qjl_enabled}
             disabled={!config.quant.turboquant_enabled}
@@ -625,19 +659,19 @@
           <span>{config.quant.turboquant_qjl_enabled ? "ON" : "OFF"}</span>
         </label>
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">
           Bits
           <span
-            class="help"
+            class={helpIcon}
             use:tooltip
             data-tooltip="Lloyd-Max bits per KV channel. 4: highest quality, ~4× smaller than FP16. 3: balanced — recommended default. 2: max compression (~8× smaller), small quality drop. Applies to the sliding-window KV on Gemma 4."
           >?</span>
         </span>
-        <div class="seg">
+        <div class="flex gap-1">
           {#each [2, 3, 4] as b}
             <button
-              class={config.quant.bits === b ? "primary" : ""}
+              class={`px-2.5 py-1 min-w-9 ${config.quant.bits === b ? "primary" : ""}`}
               disabled={!config.quant.turboquant_enabled}
               onclick={() => {
                 if (!config) return;
@@ -648,20 +682,20 @@
           {/each}
         </div>
       </div>
-      <div class="quant-tradeoff dim">
+      <div class="dim flex flex-col gap-0.5 mt-1 ml-32.5 text-[11px] leading-normal">
         {#if !config.quant.turboquant_enabled}
-          <span class="qt-row warn">TurboQuant OFF — KV cache stays bf16 (~5 GB at 11K Korean context on Gemma 4)</span>
+          <span class="text-warn">TurboQuant OFF — KV cache stays bf16 (~5 GB at 11K Korean context on Gemma 4)</span>
         {:else if config.quant.bits === 2}
-          <span class="qt-row"><b>2-bit</b> · ~8× smaller vs FP16 · cosine <b>0.9851</b> · Top-5 <b>89%</b></span>
-          <span class="qt-row qt-delta">vs 4-bit baseline: <b class="ok">−50% KV memory</b> · cosine <b class="warn">−1.3%</b></span>
+          <span><b class="text-text">2-bit</b> · ~8× smaller vs FP16 · cosine <b class="text-text">0.9851</b> · Top-5 <b class="text-text">89%</b></span>
+          <span class="text-text-dim">vs 4-bit baseline: <b class="text-ok">−50% KV memory</b> · cosine <b class="text-warn">−1.3%</b></span>
         {:else if config.quant.bits === 3}
-          <span class="qt-row"><b>3-bit</b> · ~5× smaller vs FP16 · cosine <b>0.9945</b> · Top-5 <b>94%</b></span>
-          <span class="qt-row qt-delta">vs 4-bit baseline: <b class="ok">−25% KV memory</b> · cosine <b>−0.4%</b></span>
+          <span><b class="text-text">3-bit</b> · ~5× smaller vs FP16 · cosine <b class="text-text">0.9945</b> · Top-5 <b class="text-text">94%</b></span>
+          <span class="text-text-dim">vs 4-bit baseline: <b class="text-ok">−25% KV memory</b> · cosine <b class="text-text">−0.4%</b></span>
         {:else if config.quant.bits === 4}
-          <span class="qt-row"><b>4-bit</b> · ~4× smaller vs FP16 · cosine <b>0.9983</b> · Top-5 <b>96%</b></span>
-          <span class="qt-row qt-delta">baseline (highest quality)</span>
+          <span><b class="text-text">4-bit</b> · ~4× smaller vs FP16 · cosine <b class="text-text">0.9983</b> · Top-5 <b class="text-text">96%</b></span>
+          <span class="text-text-dim">baseline (highest quality)</span>
         {/if}
-        <span class="qt-row qt-delta">
+        <span class="text-text-dim">
           QJL m + seed (TurboQuant internals) → Debug tab
         </span>
       </div>
@@ -669,34 +703,36 @@
   </section>
 
   <!-- METRICS -->
-  <section class="card span-3">
-    <h2>METRICS</h2>
-    <div class="kv">
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>METRICS</h2>
+    <div class={kvRow}>
       <span class="dim">tokens/sec</span>
       <span class="mono">{metrics.tokens_per_sec?.toFixed(1) ?? "—"}</span>
     </div>
-    <div class="kv">
+    <div class={kvRow}>
       <span class="dim">ms / step</span>
       <span class="mono">{metrics.ms_per_step?.toFixed(2) ?? "—"}</span>
     </div>
-    <div class="kv">
+    <div class={kvRow}>
       <span class="dim">KV cache</span>
       <span class="mono">{metrics.kv_cache_mb != null ? `${metrics.kv_cache_mb} MB` : "—"}</span>
     </div>
-    <div class="kv">
+    <div class={kvRow}>
       <span class="dim">req/min</span>
       <span class="mono">{metrics.requests_per_min ?? "—"}</span>
     </div>
   </section>
 
   <!-- CONTEXT -->
-  <section class="card span-6">
-    <h2>CONTEXT <span class="dim">(driven by QUANT state)</span></h2>
+  <section class="{cardBase} col-span-6">
+    <h2 class={cardH2}>CONTEXT <span class="dim">(driven by QUANT state)</span></h2>
     {#if config}
-      <div class="ctx-banner" class:ctx-banner-warn={!config.quant.turboquant_enabled}>
+      <div class={`-mt-1 mb-3 px-2.5 py-2 bg-panel-2 border border-border border-l-[3px] rounded text-xs leading-[1.55] flex flex-col gap-0.5 ${
+        config.quant.turboquant_enabled ? "border-l-accent" : "border-l-warn"
+      }`}>
         <div>
           <span class="dim">TurboQuant:</span>
-          <b>{turboquantStateLabel}</b>
+          <b class="text-text">{turboquantStateLabel}</b>
           {#if config.quant.turboquant_enabled}
             <span class="dim">· KV cache ~{turboquantKvRatio.toFixed(1)}× smaller than bf16</span>
           {:else}
@@ -706,15 +742,15 @@
         {#if realisticMaxCtxK != null}
           <div class="dim">
             Recommended max on this Mac ({systemInfo?.ram_gb} GB):
-            <b>~{realisticMaxCtxK}K tokens</b>
+            <b class="text-text">~{realisticMaxCtxK}K tokens</b>
             {#if !config.quant.turboquant_enabled}
-              <span class="warn">— turn TurboQuant ON to handle longer contexts safely</span>
+              <span class="text-warn">— turn TurboQuant ON to handle longer contexts safely</span>
             {/if}
           </div>
         {/if}
       </div>
 
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Max</span>
         <input
           type="number"
@@ -724,22 +760,22 @@
           onchange={saveContext}
         />
       </div>
-      <div class="ctx-hint dim">
-        Max sequence length (tokens). Caps the model's <code>max_position_embeddings</code>
+      <div class={ctxHint}>
+        Max sequence length (tokens). Caps the model's <code class={inlineCode}>max_position_embeddings</code>
         when host RAM can't hold the model's native limit (Gemma 4 claims 128K).
         {#if config.quant.turboquant_enabled}
-          Current TurboQuant <b>{turboquantStateLabel}</b> gives ~{turboquantKvRatio.toFixed(1)}× KV compression
+          Current TurboQuant <b class="text-text">{turboquantStateLabel}</b> gives ~{turboquantKvRatio.toFixed(1)}× KV compression
           {#if realisticMaxCtxK != null}
-            — realistic on this Mac: <b>~{realisticMaxCtxK}K</b>.
+            — realistic on this Mac: <b class="text-text">~{realisticMaxCtxK}K</b>.
           {:else}.{/if}
         {:else}
-          <span class="warn">TurboQuant OFF</span> — KV stays bf16, so practical limit on this Mac
-          {#if realisticMaxCtxK != null}is <b>~{realisticMaxCtxK}K</b>{:else}is much lower than the model's native max{/if}.
+          <span class="text-warn">TurboQuant OFF</span> — KV stays bf16, so practical limit on this Mac
+          {#if realisticMaxCtxK != null}is <b class="text-text">~{realisticMaxCtxK}K</b>{:else}is much lower than the model's native max{/if}.
         {/if}
-        Env: <code>LUMEN_MAX_CTX</code>.
+        Env: <code class={inlineCode}>LUMEN_MAX_CTX</code>.
       </div>
 
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Sliding</span>
         <input
           type="number"
@@ -749,18 +785,18 @@
           onchange={saveContext}
         />
       </div>
-      <div class="ctx-hint dim">
+      <div class={ctxHint}>
         Sliding-window attention size. Some layers (Gemma 4: 25 of 30) only attend
         to the last N tokens instead of the full sequence → bounded KV memory for
-        long contexts. <b>0</b> = use the model's built-in default; <b>N&gt;0</b> overrides it
+        long contexts. <b class="text-text">0</b> = use the model's built-in default; <b class="text-text">N&gt;0</b> overrides it
         (smaller = less KV, weaker long-range recall).
         {#if config.quant.turboquant_enabled}
           Stacks with TurboQuant — sliding bounds <i>which</i> tokens are kept, TurboQuant compresses <i>how</i> they're stored.
         {/if}
-        Env: <code>LUMEN_SLIDING_WINDOW</code>.
+        Env: <code class={inlineCode}>LUMEN_SLIDING_WINDOW</code>.
       </div>
 
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Prefill</span>
         <input
           type="number"
@@ -770,12 +806,12 @@
           onchange={saveContext}
         />
       </div>
-      <div class="ctx-hint dim">
+      <div class={ctxHint}>
         Prompt-processing chunk cap. Server rejects prompts longer than this with
         a "prompt too large" error. Larger = accepts long prompts but more peak
         memory during prefill (attention QK<sup>T</sup> = chunk × KV
         {#if config.quant.turboquant_enabled}, shrunk ~{turboquantKvRatio.toFixed(1)}× by TurboQuant{/if}).
-        Env: <code>LUMEN_PREFILL_CHUNK</code>.
+        Env: <code class={inlineCode}>LUMEN_PREFILL_CHUNK</code>.
       </div>
     {/if}
   </section>
@@ -784,29 +820,34 @@
 
   {#if activeTab === "main"}
   <!-- MODELS -->
-  <section class="card span-3">
-    <h2>MODELS</h2>
-    <div class="models">
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>MODELS</h2>
+    <div class="grid grid-cols-2 gap-x-3 gap-y-1.5 mb-3.5">
       {#each visibleModels as m}
         {@const needsUpdate = outdatedModels.has(m.id)}
+        {@const isActive = config?.active_model === m.id}
         <div
-          class="model-row"
-          class:dimmed={!m.supported}
-          class:row-active={config?.active_model === m.id}
-          class:row-outdated={needsUpdate}
+          class={`grid grid-cols-[18px_minmax(0,1fr)_90px_auto_auto] items-center gap-3 px-2.5 py-2 rounded-md bg-panel-2 border hover:border-border ${
+            !m.supported ? "opacity-55" : ""
+          } ${
+            needsUpdate && isActive ? "border-warn shadow-[0_0_0_1px_var(--color-warn)_inset] bg-warn/15" :
+            needsUpdate ? "border-warn bg-warn/10" :
+            isActive ? "border-accent shadow-[0_0_0_1px_var(--color-accent)_inset] bg-accent/[0.06]" :
+            "border-transparent"
+          }`}
         >
-          <span class="mono mark">{config?.active_model === m.id ? "✓" : ""}</span>
-          <div class="model-cell">
-            <div class="model-id mono">{m.id}</div>
+          <span class="mono text-ok font-bold">{isActive ? "✓" : ""}</span>
+          <div class="min-w-0 flex flex-col gap-0.5">
+            <div class="mono overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">{m.id}</div>
             {#if needsUpdate}
-              <div class="model-label warn">⚠ Newer weights available on Hub — update required before use</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">⚠ Newer weights available on Hub — update required before use</div>
             {:else if m.label}
-              <div class="model-label dim">{m.label}</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-text-dim">{m.label}</div>
             {:else if !m.supported}
-              <div class="model-label warn">not in supported catalog</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">not in supported catalog</div>
             {/if}
           </div>
-          <span class="dim mono model-size">{bytes(m.size_bytes)}</span>
+          <span class="mono text-text-dim text-right text-xs">{bytes(m.size_bytes)}</span>
           {#if needsUpdate}
             <button
               class="primary"
@@ -816,7 +857,7 @@
           {:else}
             <button
               onclick={() => setActive(m.id)}
-              disabled={config?.active_model === m.id || !m.supported}
+              disabled={isActive || !m.supported}
               title={!m.supported ? "Not in the server-side supported catalog" : ""}
             >Use</button>
           {/if}
@@ -824,17 +865,17 @@
         </div>
       {/each}
       {#if visibleModels.length === 0 && models.length > 0}
-        <p class="dim models-empty">No supported models on disk. Download one from the curated list below.</p>
+        <p class="dim col-span-full m-0">No supported models on disk. Download one from the curated list below.</p>
       {:else if models.length === 0}
-        <p class="dim models-empty">No local models. Download one from the curated list below.</p>
+        <p class="dim col-span-full m-0">No local models. Download one from the curated list below.</p>
       {/if}
     </div>
     {#if systemInfo}
-      <div class="dim ram-hint mono">
-        This Mac: <b>{systemInfo.ram_gb} GB RAM</b> ({systemInfo.arch}) — models over this size are marked.
+      <div class="dim mono text-[11px] mb-1.5">
+        This Mac: <b class="text-text">{systemInfo.ram_gb} GB RAM</b> ({systemInfo.arch}) — models over this size are marked.
       </div>
     {/if}
-    <div class="dl-row">
+    <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2.5">
       <select bind:value={selectedRecommend}>
         <option value="" disabled>— pick a recommended model —</option>
         {#each availableRecommended as r}
@@ -856,14 +897,14 @@
     {#if selectedRecommend}
       {@const r = catalog.recommended.find((x) => x.id === selectedRecommend)}
       {#if r}
-        <div class="dl-hint dim">{r.notes}</div>
+        <div class="dim mt-1.5 text-[11px] leading-normal">{r.notes}</div>
       {/if}
     {/if}
     {#if downloads.size > 0}
-      <div class="downloads">
+      <div class="mt-2 flex flex-col gap-0.5">
         {#each [...downloads.entries()] as [key, p]}
-          <div class="dl-line mono">
-            <span class={p.done ? "ok" : "dim"}>{p.done ? "✓" : "…"}</span>
+          <div class="mono grid grid-cols-[16px_1fr_80px] text-xs gap-1.5">
+            <span class={p.done ? "text-ok" : "text-text-dim"}>{p.done ? "✓" : "…"}</span>
             <span>{key}</span>
             <span class="dim">{bytes(p.downloaded_bytes)}</span>
           </div>
@@ -873,11 +914,11 @@
   </section>
 
   <!-- SERVER -->
-  <section class="card span-3">
-    <h2>SERVER</h2>
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>SERVER</h2>
     {#if config}
-      <div class="srv-grid">
-      <div class="kv">
+      <div class={sectionGrid}>
+      <div class={kvRow}>
         <span class="dim">CORS</span>
         <select
           value={config.server.cors}
@@ -896,7 +937,7 @@
           <option value="all">all / 0.0.0.0 (risky)</option>
         </select>
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Host</span>
         <input
           type="text"
@@ -905,62 +946,63 @@
           title={config.server.cors === "off" ? "Pin to a specific IP" : "Auto-set by CORS scope"}
         />
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Port</span>
         <input type="number" min="1" max="65535" bind:value={config.server.port} />
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">API key</span>
-        <span class="dim hint-inline">→ set in the API card</span>
+        <span class="dim text-[11px] italic">→ set in the API card</span>
       </div>
 
-      <h3 class="card-section">
+      <h3 class="{cardSection} {colSpanFull}">
         Metal memory <span class="dim">(mlx-native)</span>
         {#if activeModel && recommendedMemoryGbExact != null && recommendedWiredGb != null && recommendedCacheGb != null}
-          <span class="ram-tuned-hint dim">
-            · tuned for <b>{activeModel.id.split("/").pop()}</b>
+          <span class={ramTunedHint}>
+            · tuned for <b class="text-text">{activeModel.id.split("/").pop()}</b>
             + ctx {config.context.max}
             ({recommendedWiredGb.toFixed(3)}/{recommendedCacheGb.toFixed(3)}/{recommendedMemoryGbExact.toFixed(3)} GB)
           </span>
-          <button class="reset-mem" onclick={resetMemoryCaps}>Reset</button>
+          <button class={resetMemBtn} onclick={resetMemoryCaps}>Reset</button>
         {:else if systemInfo}
-          <span class="ram-tuned-hint dim">
+          <span class={ramTunedHint}>
             · system default for {systemInfo.ram_gb} GB
             ({systemInfo.recommended.wired_limit_gb.toFixed(3)}/{systemInfo.recommended.cache_limit_gb.toFixed(3)}/{systemInfo.recommended.memory_limit_gb.toFixed(3)} GB)
           </span>
-          <button class="reset-mem" onclick={resetMemoryCaps}>Reset</button>
+          <button class={resetMemBtn} onclick={resetMemoryCaps}>Reset</button>
         {/if}
       </h3>
-      <details class="mem-explainer">
-        <summary class="dim">What do these mean?</summary>
-        <div class="mem-explainer-body dim">
+      <details class="mem-explainer {colSpanFull} my-0.5 mb-1.5 text-xs">
+        <summary class="dim cursor-pointer list-none py-1">What do these mean?</summary>
+        <div class="dim py-1.5 pb-1 leading-relaxed">
           Apple Silicon shares one pool of RAM between CPU and GPU. These three caps
           tell MLX how much of that pool it may use:
-          <ul>
-            <li>
-              <b>Wired GB</b> — RAM that stays pinned for the GPU and can never be
+          <ul class="mt-1.5 pl-4.5 list-disc">
+            <li class="mb-1">
+              <b class="text-text">Wired GB</b> — RAM that stays pinned for the GPU and can never be
               paged out. Auto-set to the <i>exact</i> safetensors byte size of the
-              active model (via <code>LUMEN_WIRED_LIMIT_BYTES</code>), so a
+              active model (via <code class={inlineCode}>LUMEN_WIRED_LIMIT_BYTES</code>), so a
               14.45 GB model isn't truncated to a 14 GB ceiling. Override the
               input if you want extra headroom for KV cache.
             </li>
-            <li>
-              <b>Cache GB</b> — MLX's transient buffer reuse pool (activations,
+            <li class="mb-1">
+              <b class="text-text">Cache GB</b> — MLX's transient buffer reuse pool (activations,
               scratch). A small fixed budget (2 GB) is enough; scaling it with
               system RAM just reserves memory you'd rather give back to the OS.
             </li>
-            <li>
-              <b>Memory GB</b> — Soft total ceiling for Metal allocations.
+            <li class="mb-1">
+              <b class="text-text">Memory GB</b> — Soft total ceiling for Metal allocations.
               Hitting it triggers cache eviction before the hard wired limit.
               Set to model size + 2 GB + KV cache budget (≈ ctx ÷ 8K).
             </li>
           </ul>
         </div>
       </details>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Wired GB</span>
-        <div class="wired-row">
+        <div class="flex items-center gap-2">
           <input
+            class="flex-1"
             type="number"
             placeholder={recommendedWiredLabel ?? String(systemInfo?.recommended.wired_limit_gb ?? 28)}
             value={config.server.wired_limit_gb ?? ""}
@@ -971,13 +1013,13 @@
             }}
           />
           {#if activeModel && config.server.wired_limit_gb == null}
-            <span class="dim mono wired-hint" title="LUMEN_WIRED_LIMIT_BYTES — exact safetensors size">
+            <span class="dim mono text-[11px] whitespace-nowrap" title="LUMEN_WIRED_LIMIT_BYTES — exact safetensors size">
               = {Math.round(activeModel.size_bytes / 1024 ** 2).toLocaleString()} MB
             </span>
           {/if}
         </div>
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Cache GB</span>
         <input
           type="number"
@@ -990,7 +1032,7 @@
           }}
         />
       </div>
-      <div class="kv">
+      <div class={kvRow}>
         <span class="dim">Memory GB</span>
         <input
           type="number"
@@ -1004,7 +1046,7 @@
         />
       </div>
       </div>
-      <div class="actions-row">
+      <div class="mt-2.5 flex justify-end">
         <button class="primary" onclick={saveServer}>Save</button>
       </div>
     {/if}
@@ -1014,26 +1056,26 @@
 
   {#if activeTab === "debug"}
   <!-- DEBUG / power-user knobs (A/B testing, loader overrides) -->
-  <section class="card span-3">
-    <h2>DEBUG <span class="dim">(A/B + loader overrides)</span></h2>
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>DEBUG <span class="dim">(A/B + loader overrides)</span></h2>
     {#if config}
-      <p class="dim debug-intro">
+      <p class="dim m-0 mb-3 px-3 py-2 bg-panel-2 rounded-[5px] text-xs leading-normal">
         These knobs are for benchmarking + troubleshooting. Leave everything blank/off
         for normal use — the values that actually matter (model, memory caps, backend)
         live in the Models &amp; Server tab.
       </p>
-      <div class="adv-grid">
-        <h3 class="card-section">Memory bypass</h3>
-        <div class="kv">
+      <div class={sectionGrid}>
+        <h3 class="{cardSection} {colSpanFull}">Memory bypass</h3>
+        <div class={kvRow}>
           <span class="dim">Bypass all caps</span>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={config.server.disable_wired_limit} />
+          <label class={toggleLabel}>
+            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.disable_wired_limit} />
             <span class="dim">skip wired+cache+memory; let MLX/macOS manage</span>
           </label>
         </div>
 
-        <h3 class="card-section">Loader overrides</h3>
-        <div class="kv">
+        <h3 class="{cardSection} {colSpanFull}">Loader overrides</h3>
+        <div class={kvRow}>
           <span class="dim">Tokenizer</span>
           <input
             type="text"
@@ -1046,7 +1088,7 @@
             }}
           />
         </div>
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">Weights dir</span>
           <input
             type="text"
@@ -1059,7 +1101,7 @@
             }}
           />
         </div>
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">Compute /buf</span>
           <input
             type="number"
@@ -1073,7 +1115,7 @@
             }}
           />
         </div>
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">Repeat pen.</span>
           <input
             type="number"
@@ -1087,20 +1129,20 @@
             }}
           />
         </div>
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">Skip warmup</span>
-          <label class="toggle">
-            <input type="checkbox" bind:checked={config.server.skip_warmup} />
+          <label class={toggleLabel}>
+            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.skip_warmup} />
             <span class="dim">faster start, first request slower</span>
           </label>
         </div>
 
-        <h3 class="card-section">TurboQuant internals</h3>
-        <p class="debug-note dim">
+        <h3 class="{cardSection} {colSpanFull}">TurboQuant internals</h3>
+        <p class="dim {colSpanFull} my-1 mb-2 text-[11px] leading-normal italic">
           Stage-2 residual correction knobs. Leave at defaults — these only matter when
           tuning the compression algorithm itself or reproducing a benchmark run.
         </p>
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">QJL m</span>
           <input
             type="number"
@@ -1111,14 +1153,14 @@
             onchange={saveQuant}
           />
         </div>
-        <div class="debug-hint dim">
+        <div class={debugHint}>
           QJL projection dimension for residual sign-bit correction. Recommended:
-          <b>head_dim / 2</b> (typically 64). Higher = more accurate inner-product
-          estimate but more KV memory; lower = noisier attention scores. <b>When to
+          <b class="text-text">head_dim / 2</b> (typically 64). Higher = more accurate inner-product
+          estimate but more KV memory; lower = noisier attention scores. <b class="text-text">When to
           change:</b> only when running quality vs memory ablation studies.
         </div>
 
-        <div class="kv">
+        <div class={kvRow}>
           <span class="dim">Seed</span>
           <input
             type="number"
@@ -1126,15 +1168,15 @@
             onchange={saveQuant}
           />
         </div>
-        <div class="debug-hint dim">
+        <div class={debugHint}>
           Random seed for the orthogonal rotation matrix + Gaussian projection
           matrix. Same seed → bit-identical compression output for the same input.
-          <b>When to change:</b> reproducing a specific benchmark, or A/B-testing
+          <b class="text-text">When to change:</b> reproducing a specific benchmark, or A/B-testing
           whether a particular seed got lucky/unlucky on a corner case. Different
           seeds are statistically equivalent — don't expect quality differences.
         </div>
       </div>
-      <div class="actions-row">
+      <div class="mt-2.5 flex justify-end">
         <button class="primary" onclick={saveServer}>Save</button>
       </div>
     {/if}
@@ -1143,7 +1185,7 @@
 
   {#if activeTab === "api"}
   <!-- API (OpenAI / Claude tabs) -->
-  <section class="card span-3">
+  <section class="{cardBase} col-span-3">
     {#if config}
       <ApiTabs
         {config}
@@ -1177,11 +1219,11 @@
 </main>
 
 <!-- ── Footer panel: logs + env overrides ──────────────────────── -->
-<footer class="footer">
+<footer class="border-t border-border bg-panel flex flex-col fixed left-0 right-0 bottom-0 z-8">
   {#if logsOpen}
-    <div class="panel-scroll logs-body mono">
+    <div class="{panelScroll} mono px-4 py-1.5 pb-2.5 text-xs">
       {#each logs as l}
-        <div class="log-line {l.stream}">{l.line}</div>
+        <div class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}>{l.line}</div>
       {/each}
       {#if logs.length === 0}
         <div class="dim">No log output yet. Start the server to see decode/encode traces.</div>
@@ -1189,7 +1231,7 @@
     </div>
   {/if}
   {#if envOpen && config}
-    <div class="panel-scroll">
+    <div class={panelScroll}>
       <EnvOverrides
         value={config.env_overrides}
         typedKeys={typedEnvKeys}
@@ -1198,7 +1240,7 @@
     </div>
   {/if}
   {#if doctorOpen}
-    <div class="panel-scroll">
+    <div class={panelScroll}>
       <DoctorPanel
         report={doctorReport}
         onReport={(r) => (doctorReport = r)}
@@ -1206,14 +1248,13 @@
     </div>
   {/if}
   {#if updateOpen}
-    <div class="panel-scroll">
+    <div class={panelScroll}>
       <UpdatePanel serverRunning={status.state === "running" || status.state === "starting"} />
     </div>
   {/if}
-  <div class="footer-tabs">
+  <div class="flex items-center h-9 shrink-0 border-t border-border bg-panel">
     <button
-      class="footer-tab"
-      class:active={logsOpen}
+      class={`${footerTabBase} ${logsOpen ? footerTabActive : ""}`}
       onclick={() => {
         logsOpen = !logsOpen;
         if (logsOpen) {
@@ -1226,8 +1267,7 @@
       Logs {logsOpen ? "▾" : "▸"} <span class="dim mono">({logs.length})</span>
     </button>
     <button
-      class="footer-tab"
-      class:active={envOpen}
+      class={`${footerTabBase} ${envOpen ? footerTabActive : ""}`}
       onclick={() => {
         envOpen = !envOpen;
         if (envOpen) {
@@ -1241,8 +1281,7 @@
       <span class="dim mono">({config ? Object.keys(config.env_overrides).length : 0})</span>
     </button>
     <button
-      class="footer-tab"
-      class:active={doctorOpen}
+      class={`${footerTabBase} ${doctorOpen ? footerTabActive : ""}`}
       onclick={() => {
         doctorOpen = !doctorOpen;
         if (doctorOpen) {
@@ -1260,8 +1299,7 @@
       {/if}
     </button>
     <button
-      class="footer-tab"
-      class:active={updateOpen}
+      class={`${footerTabBase} ${updateOpen ? footerTabActive : ""}`}
       onclick={() => {
         updateOpen = !updateOpen;
         if (updateOpen) {
@@ -1277,241 +1315,6 @@
 </footer>
 
 <style>
-  .topbar {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 10px 16px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
-    position: sticky;
-    top: 0;
-    z-index: 10;
-  }
-
-  .tab-bar {
-    display: flex;
-    gap: 4px;
-    padding: 6px 16px;
-    background: var(--bg);
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 53px;
-    z-index: 9;
-  }
-  .top-tab {
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    padding: 8px 16px;
-    font-size: 13px;
-    color: var(--text-dim);
-    border-radius: 0;
-    transition: color 120ms ease, border-color 120ms ease;
-  }
-  .top-tab:hover {
-    color: var(--text);
-    background: transparent;
-  }
-  .top-tab.active {
-    color: var(--text);
-    border-bottom-color: var(--accent);
-    font-weight: 500;
-  }
-  .brand {
-    font-weight: 600;
-    font-size: 14px;
-    color: var(--accent);
-  }
-  .status {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .actions {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .err {
-    color: var(--err);
-  }
-  .ok {
-    color: var(--ok);
-  }
-  .warn {
-    color: var(--warn);
-  }
-
-  .health {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-  }
-  .health .health-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--text-dim);
-  }
-  .health.healthy .health-dot {
-    background: var(--ok);
-    box-shadow: 0 0 6px var(--ok);
-  }
-  .health.degraded .health-dot {
-    background: var(--warn);
-  }
-  .health.blocked .health-dot {
-    background: var(--err);
-    box-shadow: 0 0 6px var(--err);
-  }
-  .health-badge {
-    color: var(--text-dim);
-    font-size: 11px;
-    margin-left: 2px;
-  }
-
-  .mem-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    color: var(--text-dim);
-    padding: 2px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--panel);
-  }
-  .mem-indicator.warn {
-    color: var(--warn);
-    border-color: var(--warn);
-  }
-  .mem-indicator.hot {
-    color: var(--err);
-    border-color: var(--err);
-  }
-  .mem-bar {
-    display: inline-block;
-    width: 48px;
-    height: 6px;
-    background: var(--border);
-    border-radius: 3px;
-    overflow: hidden;
-  }
-  .mem-bar-fill {
-    display: block;
-    height: 100%;
-    background: var(--text-dim);
-    transition: width 0.4s ease-out;
-  }
-  .mem-indicator.warn .mem-bar-fill {
-    background: var(--warn);
-  }
-  .mem-indicator.hot .mem-bar-fill {
-    background: var(--err);
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 16px;
-    padding: 18px;
-  }
-  /* Tuning tab uses a finer 6-column grid so QUANT (span-3) + METRICS (span-3)
-     fill row 1 as halves, and CONTEXT (span-3) lands as a half on row 2. */
-  .grid.tuning-mode {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 18px 20px;
-    min-height: 0;
-  }
-  .card.span-2 {
-    grid-column: span 2;
-  }
-  .card.span-3 {
-    grid-column: span 3;
-  }
-  .card.span-6 {
-    grid-column: span 6;
-  }
-  .card h2 {
-    margin: 0 0 14px 0;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    color: var(--text-dim);
-    text-transform: uppercase;
-  }
-  .card-h-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 4px;
-  }
-  .card-h-row h2 {
-    margin: 0 0 14px 0;
-  }
-  .ram-tuned-hint {
-    font-size: 10px;
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
-    margin-left: 8px;
-  }
-  .reset-mem {
-    margin-left: 8px;
-    padding: 2px 8px;
-    font-size: 10px;
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
-  }
-  .ram-hint {
-    font-size: 11px;
-    margin-bottom: 6px;
-  }
-
-  .kv {
-    display: grid;
-    grid-template-columns: 120px 1fr;
-    align-items: center;
-    gap: 10px;
-    padding: 5px 0;
-  }
-  .kv .path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .help {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 14px;
-    height: 14px;
-    margin-left: 4px;
-    border-radius: 50%;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    font-size: 10px;
-    line-height: 1;
-    cursor: help;
-    user-select: none;
-    transition: color 120ms, border-color 120ms;
-  }
-  .help:hover {
-    color: var(--text);
-    border-color: var(--text);
-  }
-
   /* Tooltip portal: appended to <body> by the `tooltip` action so it
      escapes ancestor overflow / stacking clipping. Must be :global() since
      the element lives outside this component's scoped CSS. */
@@ -1532,344 +1335,18 @@
     z-index: 10000;
   }
 
-  .seg {
-    display: flex;
-    gap: 4px;
-  }
-  .seg button {
-    padding: 4px 10px;
-    min-width: 36px;
-  }
-
-  .ctx-banner {
-    margin: -4px 0 12px;
-    padding: 8px 10px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 4px;
-    font-size: 12px;
-    line-height: 1.55;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .ctx-banner-warn {
-    border-left-color: var(--warn);
-  }
-  .ctx-banner b {
-    color: var(--text);
-  }
-  .ctx-banner .warn {
-    color: var(--warn);
-  }
-
-  .ctx-hint {
-    margin: -2px 0 8px 130px;
-    font-size: 11px;
-    line-height: 1.55;
-  }
-  .ctx-hint code {
-    padding: 1px 5px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    font-size: 10.5px;
-  }
-  .ctx-hint b {
-    color: var(--text);
-  }
-
-  .quant-tradeoff {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    margin: 4px 0 0 130px;
-    font-size: 11px;
-    line-height: 1.5;
-  }
-  .qt-row b {
-    color: var(--text);
-  }
-  .qt-row .ok {
-    color: var(--ok);
-  }
-  .qt-row .warn {
-    color: var(--warn);
-  }
-  .qt-delta {
-    color: var(--text-dim);
-  }
-
-  .debug-intro {
-    margin: 0 0 12px;
-    padding: 8px 12px;
-    background: var(--panel-2);
-    border-radius: 5px;
-    font-size: 12px;
-    line-height: 1.5;
-  }
-  .debug-note {
-    grid-column: 1 / -1;
-    margin: 4px 0 8px;
-    font-size: 11px;
-    line-height: 1.5;
-    font-style: italic;
-  }
-  .debug-hint {
-    grid-column: 1 / -1;
-    margin: -2px 0 6px 130px;
-    font-size: 11px;
-    line-height: 1.55;
-  }
-  .debug-hint b {
-    color: var(--text);
-  }
-
-  .wired-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .wired-row input {
-    flex: 1;
-  }
-  .wired-hint {
-    font-size: 11px;
-    white-space: nowrap;
-  }
-
-  .ro-display {
-    padding: 6px 10px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    font-size: 13px;
-  }
-  .ro-note {
-    margin-left: 8px;
-    font-size: 11px;
-  }
-
-  .mem-explainer {
-    grid-column: 1 / -1;
-    margin: 2px 0 6px;
-    font-size: 12px;
-  }
-  .mem-explainer > summary {
-    cursor: pointer;
-    list-style: none;
-    padding: 4px 0;
-  }
-  .mem-explainer > summary::-webkit-details-marker {
+  /* Custom `<details>` marker — pseudo-elements (`::before` and the
+     webkit-specific `::-webkit-details-marker`) aren't reachable via Tailwind
+     utility classes, so the "What do these mean?" Metal-memory explainer in
+     the SERVER card keeps a small CSS rule here. */
+  details.mem-explainer > summary::-webkit-details-marker {
     display: none;
   }
-  .mem-explainer > summary::before {
+  details.mem-explainer > summary::before {
     content: "▸ ";
     color: var(--text-dim);
   }
-  .mem-explainer[open] > summary::before {
+  details.mem-explainer[open] > summary::before {
     content: "▾ ";
-  }
-  .mem-explainer-body {
-    padding: 6px 0 4px;
-    line-height: 1.6;
-  }
-  .mem-explainer-body ul {
-    margin: 6px 0 0;
-    padding-left: 18px;
-  }
-  .mem-explainer-body li {
-    margin-bottom: 4px;
-  }
-  .mem-explainer-body b {
-    color: var(--text);
-  }
-
-  .actions-row {
-    margin-top: 10px;
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .models {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px 12px;
-    margin-bottom: 14px;
-  }
-  .model-row {
-    display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) 90px auto auto;
-    align-items: center;
-    gap: 12px;
-    padding: 8px 10px;
-    border-radius: 6px;
-    background: var(--panel-2);
-    border: 1px solid transparent;
-  }
-  .model-row:hover {
-    border-color: var(--border);
-  }
-  .model-row.dimmed {
-    opacity: 0.55;
-  }
-  .model-row.row-active {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent) inset;
-    background: rgba(127, 179, 255, 0.06);
-  }
-  .model-row.row-outdated {
-    border-color: var(--warn);
-    background: rgba(255, 184, 108, 0.08);
-  }
-  .model-row.row-outdated.row-active {
-    border-color: var(--warn);
-    box-shadow: 0 0 0 1px var(--warn) inset;
-    background: rgba(255, 184, 108, 0.14);
-  }
-  .mark {
-    color: var(--ok);
-    font-weight: 700;
-  }
-  .model-cell {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .model-id {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
-  }
-  .model-label {
-    font-size: 11px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .model-size {
-    text-align: right;
-    font-size: 12px;
-  }
-  .models-empty {
-    grid-column: 1 / -1;
-    margin: 0;
-  }
-  .hint-inline {
-    font-size: 11px;
-    font-style: italic;
-  }
-
-  .dl-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 10px;
-  }
-  .dl-hint {
-    margin-top: 6px;
-    font-size: 11px;
-    line-height: 1.5;
-  }
-  .downloads {
-    margin-top: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .dl-line {
-    display: grid;
-    grid-template-columns: 16px 1fr 80px;
-    font-size: 12px;
-    gap: 6px;
-  }
-
-  .card-section {
-    margin: 16px 0 6px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    border-top: 1px solid var(--border);
-    padding-top: 10px;
-  }
-  .srv-grid,
-  .adv-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    column-gap: 24px;
-    row-gap: 0;
-  }
-  .srv-grid .card-section,
-  .adv-grid .card-section {
-    grid-column: 1 / -1;
-  }
-  .toggle {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    cursor: pointer;
-  }
-  .toggle input[type="checkbox"] {
-    accent-color: var(--accent);
-    width: 14px;
-    height: 14px;
-    margin: 0;
-  }
-
-  .footer {
-    border-top: 1px solid var(--border);
-    background: var(--panel);
-    display: flex;
-    flex-direction: column;
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 8;
-  }
-  .footer-tabs {
-    display: flex;
-    align-items: center;
-    height: 36px;
-    flex-shrink: 0;
-    border-top: 1px solid var(--border);
-    background: var(--panel);
-  }
-  .panel-scroll {
-    max-height: 40vh;
-    overflow-y: auto;
-    background: var(--panel);
-  }
-  .footer-tab {
-    text-align: left;
-    border: none;
-    background: transparent;
-    padding: 4px 14px;
-    font-size: 12px;
-    border-radius: 0;
-    border-bottom: 2px solid transparent;
-  }
-  .footer-tab:hover {
-    background: var(--panel-2);
-  }
-  .footer-tab.active {
-    background: var(--panel-2);
-    border-bottom-color: var(--accent);
-  }
-  .logs-body {
-    padding: 6px 16px 10px;
-    font-size: 12px;
-  }
-  .log-line {
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: var(--text-dim);
-  }
-  .log-line.stderr {
-    color: #d6b9ff;
   }
 </style>
