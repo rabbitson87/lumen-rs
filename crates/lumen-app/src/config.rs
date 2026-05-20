@@ -91,10 +91,39 @@ pub enum CorsMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantConfig {
-    /// → `TQ_BITS` — TurboQuant scalar bits (2/3/4).
+    /// TurboQuant Lloyd-Max scalar bits (2/3/4).  Lower = more memory
+    /// savings on KV cache, more quantization error.  Emitted as both
+    /// `TQ_BITS` (legacy turboquant-cache path) and
+    /// `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS` (Gemma 4 native
+    /// runner) so the same slider drives both backends.
     pub bits: u8,
+    /// QJL Stage-2 projection dimension.  `D · π/2` is the theoretical
+    /// crossover; default `D · 4 = 1024` for Gemma 4 (D=256) sits well
+    /// into the regime where QJL beats Stage 1 alone.  Emits `TQ_QJL_M`
+    /// + `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M`.
     pub qjl_m: usize,
     pub seed: u64,
+    /// Turn TurboQuant Stage 1 (Lloyd-Max + rotation) on for the sliding
+    /// KV cache.  Default ON — measured safe across the same 11K Korean
+    /// context that the model rebuild was validated against, and the
+    /// KV cache memory delta vs bf16 is the primary win at long context.
+    /// Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT`.
+    #[serde(default = "default_turboquant_enabled")]
+    pub turboquant_enabled: bool,
+    /// Add the QJL 1-bit residual correction layer on top of Stage 1.
+    /// Default ON when `turboquant_enabled = true` — closes the small
+    /// inner-product reconstruction gap left by pure Lloyd-Max nearest-
+    /// centroid.  Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL`.
+    #[serde(default = "default_turboquant_qjl_enabled")]
+    pub turboquant_qjl_enabled: bool,
+}
+
+fn default_turboquant_enabled() -> bool {
+    true
+}
+
+fn default_turboquant_qjl_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,8 +215,10 @@ impl Default for PersistentConfig {
             },
             quant: QuantConfig {
                 bits: 3,
-                qjl_m: 64,
+                qjl_m: 1024, // D·4 for Gemma 4 head_dim=256 — Stage 2 regime
                 seed: 42,
+                turboquant_enabled: true,
+                turboquant_qjl_enabled: true,
             },
             context: ContextConfig {
                 max: 8192,

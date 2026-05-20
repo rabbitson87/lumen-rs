@@ -496,11 +496,43 @@
     <h2>QUANT <span class="dim">(TurboQuant KV cache)</span></h2>
     {#if config}
       <div class="kv">
+        <span class="dim">TurboQuant</span>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={config.quant.turboquant_enabled}
+            onchange={(e) => {
+              if (!config) return;
+              config.quant.turboquant_enabled = (e.currentTarget as HTMLInputElement).checked;
+              saveQuant();
+            }}
+          />
+          <span>{config.quant.turboquant_enabled ? "ON" : "OFF"}</span>
+        </label>
+      </div>
+      <div class="kv">
+        <span class="dim">QJL residual (Stage 2)</span>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={config.quant.turboquant_qjl_enabled}
+            disabled={!config.quant.turboquant_enabled}
+            onchange={(e) => {
+              if (!config) return;
+              config.quant.turboquant_qjl_enabled = (e.currentTarget as HTMLInputElement).checked;
+              saveQuant();
+            }}
+          />
+          <span>{config.quant.turboquant_qjl_enabled ? "ON" : "OFF"}</span>
+        </label>
+      </div>
+      <div class="kv">
         <span class="dim">Bits</span>
         <div class="seg">
           {#each [2, 3, 4] as b}
             <button
               class={config.quant.bits === b ? "primary" : ""}
+              disabled={!config.quant.turboquant_enabled}
               onclick={() => {
                 if (!config) return;
                 config.quant.bits = b;
@@ -511,7 +543,9 @@
         </div>
       </div>
       <div class="quant-tradeoff dim">
-        {#if config.quant.bits === 2}
+        {#if !config.quant.turboquant_enabled}
+          <span class="qt-row warn">TurboQuant OFF — KV cache stays bf16 (~5 GB at 11K Korean context on Gemma 4)</span>
+        {:else if config.quant.bits === 2}
           <span class="qt-row"><b>2-bit</b> · ~8× smaller vs FP16 · cosine <b>0.9851</b> · Top-5 <b>89%</b></span>
           <span class="qt-row qt-delta">vs 4-bit baseline: <b class="ok">−50% KV memory</b> · cosine <b class="warn">−1.3%</b></span>
         {:else if config.quant.bits === 3}

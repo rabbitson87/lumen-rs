@@ -23,9 +23,18 @@ export interface ServerConfig {
 }
 
 export interface QuantConfig {
+  /** TurboQuant Lloyd-Max bits (2/3/4). Drives both legacy `TQ_BITS` and
+   *  Gemma 4 native `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS`. */
   bits: number;
+  /** QJL Stage-2 projection dimension. Theoretical crossover is `D·π/2`;
+   *  default `D·4 = 1024` for Gemma 4 (D=256). */
   qjl_m: number;
   seed: number;
+  /** Master switch for TurboQuant Stage 1 (Lloyd-Max + Haar rotation) on
+   *  the sliding KV cache. Default ON — measured safe at 11K context. */
+  turboquant_enabled: boolean;
+  /** QJL 1-bit residual correction layer (Stage 2). Requires Stage 1. */
+  turboquant_qjl_enabled: boolean;
 }
 
 export interface ContextConfig {

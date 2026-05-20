@@ -604,9 +604,28 @@ fn apply_env(
     }
 
     // ── Quantization (TurboQuant) ──────────────────────────────────
+    // Legacy turboquant-cache crate path (Candle backends, MoE 1.5B etc.):
     cmd.env("TQ_BITS", cfg.quant.bits.to_string());
     cmd.env("TQ_QJL_M", cfg.quant.qjl_m.to_string());
     cmd.env("TQ_SEED", cfg.quant.seed.to_string());
+    // Gemma 4 native MLX runner reads its own env namespace — the same
+    // QUANT card slider drives both backends so users see one mental model.
+    // Stage 1 (Lloyd-Max + Haar rotation on the sliding KV cache):
+    if cfg.quant.turboquant_enabled {
+        cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT", "1");
+        cmd.env(
+            "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
+            cfg.quant.bits.to_string(),
+        );
+        // Stage 2 (QJL 1-bit residual correction over Stage 1):
+        if cfg.quant.turboquant_qjl_enabled {
+            cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL", "1");
+            cmd.env(
+                "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M",
+                cfg.quant.qjl_m.to_string(),
+            );
+        }
+    }
 
     // ── Context ────────────────────────────────────────────────────
     // Three knobs from the CONTEXT card; each maps to a single env var the
@@ -704,6 +723,10 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "TQ_BITS",
     "TQ_QJL_M",
     "TQ_SEED",
+    "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT",
+    "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
+    "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL",
+    "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M",
     "LUMEN_MAX_CTX",
     "LUMEN_SLIDING_WINDOW",
     "LUMEN_PREFILL_CHUNK",
