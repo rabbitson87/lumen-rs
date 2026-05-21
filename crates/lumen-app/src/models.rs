@@ -129,6 +129,13 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
                     .map(|ext| ext == "safetensors" || ext == "gguf")
                     .unwrap_or(false)
             });
+        // Multi-shard models advertise their shard set in
+        // `model.safetensors.index.json`. A snapshot is only "ready" if every
+        // listed shard actually exists on disk — otherwise the loader will
+        // crash with a missing-tensor error mid-decode. This catches the case
+        // where the in-app downloader is killed between shards or the user
+        // closes the app before all shards finish.
+        let shards_complete = verify_shards_complete(&scan_dir);
         // Size is summed from the original entry path (covers both HF blobs/
         // and flat layout). `follow_links=false` (the default) so symlinks
         // in HF snapshots aren't double-counted.
@@ -146,7 +153,7 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
             id,
             path,
             size_bytes,
-            ready: config_present && weight_present,
+            ready: config_present && weight_present && shards_complete,
             supported: rec.is_some(),
             label: rec.map(|r| r.label.clone()),
             local_sha,
@@ -154,6 +161,47 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
+}
+
+/// Verify every shard referenced by `model.safetensors.index.json` is
+/// present on disk. Returns `true` when:
+///   - no index file is present (single-shard model — the surrounding
+///     `weight_present` check already covers this), OR
+///   - the index parses cleanly AND every unique shard filename it lists
+///     exists as a regular file in `scan_dir`.
+///
+/// The in-app downloader (see [`download`]) streams shards sequentially.
+/// If it's killed between shards, the index.json (cheap, written first)
+/// still claims every shard, but the later shards are missing on disk.
+/// The MLX loader then crashes with a misleading "missing top-level
+/// weight `<name>`" error mid-load — the actual root cause is the missing
+/// `model-NN-of-NN.safetensors`. This check surfaces the truncation at
+/// scan time so the desktop UI can flag the model as not-ready.
+///
+/// Does NOT validate individual file sizes — a shard that's present but
+/// truncated will still slip through. Sufficient for the common
+/// "downloader killed cleanly between shards" failure mode.
+fn verify_shards_complete(scan_dir: &Path) -> bool {
+    let index_path = scan_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&index_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(weight_map) = json.get("weight_map").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let mut shards: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for v in weight_map.values() {
+        if let Some(s) = v.as_str() {
+            shards.insert(s);
+        }
+    }
+    shards.iter().all(|shard| scan_dir.join(shard).is_file())
 }
 
 /// Locate the active snapshot directory inside an `models--<org>--<repo>/`
@@ -442,4 +490,54 @@ pub async fn delete(models_dir: &Path, repo_id: &str) -> Result<()> {
             .with_context(|| format!("remove_dir_all {}", target.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("lumen-models-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_index(dir: &Path, shards: &[&str]) {
+        let map: serde_json::Map<String, serde_json::Value> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("tensor.{i}"), serde_json::Value::String((*s).to_string())))
+            .collect();
+        let json = serde_json::json!({ "metadata": {}, "weight_map": map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shards_complete_returns_true_when_no_index() {
+        let dir = tmpdir("no-index");
+        assert!(verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_returns_true_when_all_shards_present() {
+        let dir = tmpdir("all-present");
+        write_index(&dir, &["shard-a.safetensors", "shard-b.safetensors"]);
+        std::fs::write(dir.join("shard-a.safetensors"), b"x").unwrap();
+        std::fs::write(dir.join("shard-b.safetensors"), b"y").unwrap();
+        assert!(verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_returns_false_when_shard_missing() {
+        let dir = tmpdir("missing");
+        write_index(&dir, &["s1.safetensors", "s2.safetensors", "s3.safetensors"]);
+        std::fs::write(dir.join("s1.safetensors"), b"x").unwrap();
+        // s2 + s3 missing — mirrors the killed-mid-download case
+        assert!(!verify_shards_complete(&dir));
+    }
 }
