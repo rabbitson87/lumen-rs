@@ -7,45 +7,49 @@ license.workspace = true
 description = "Lumen desktop control plane — Tauri 2.x dashboard for the lumen-server inference engine"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
-tauri-plugin-shell = "2"
-tauri-plugin-updater = "2"
-tauri-plugin-process = "2"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-fs = "2.5.1"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
 
 # Async runtime — shared with lumen-server
 tokio = { workspace = true }
 
 # Process lifecycle (SIGTERM / kill / pipe streaming) + statvfs for doctor
-nix = { version = "0.29", features = ["signal"] }
-libc = "0.2"
+nix = { version = "0.31.3", features = ["signal"] }
+libc = "0.2.186"
 
 # HTTP: health check against /v1/models, plus streaming model downloads
 # from huggingface.co (no `hf-hub` crate, no external CLI — keeps the
 # Tauri app self-contained, ships as a single `.app`).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13.3", default-features = false, features = [
+    "json",
+    "rustls",
+    "stream",
+] }
 
 # Config persistence (TOML at ~/Library/Application Support/Lumen/config.toml)
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "0.8"
+toml = "1.1.2+spec-1.1.0"
 
 # Model registry — local scan only. Downloads use raw HTTPS via reqwest.
-walkdir = "2"
+walkdir = "2.5.0"
 
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # OS dirs (~/Library/Application Support on macOS, etc.)
-directories = "5"
+directories = "6.0.0"
 
 # Locate the lumen-server binary on PATH (dev fallback)
-which = "6"
+which = "8.0.2"
 
 [features]
 # `bundled-server` includes the lumen-server binary as a Tauri sidecar in the
