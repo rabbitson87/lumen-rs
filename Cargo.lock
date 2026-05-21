@@ -128,15 +128,16 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atomic_http"
-version = "0.11.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce41f378cb3e66b6a3eef9c021262526245a7e029412ff5b7e2ba8d13b3a4b47"
+checksum = "ba4ce9336cf7df8dda2becad895169c02279bd86b7b6542660176e65de530126"
 dependencies = [
  "async-trait",
  "bumpalo",
  "dashmap",
  "futures",
  "http",
+ "httparse",
  "matchit",
  "memmap2",
  "mime_guess",
@@ -1048,9 +1049,9 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "6.1.0"
+version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
 dependencies = [
  "cfg-if",
  "crossbeam-utils",

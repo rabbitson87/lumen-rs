@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 # .env auto-load. Read at server startup so callers can drop a `.env`
 # file next to the binary (or in CWD) instead of exporting every var.
-dotenvy = "0.15"
+dotenvy = "0.15.7"
 
 [features]
 # mlx-native makes the mlx-rs gather_qmm path the runtime default

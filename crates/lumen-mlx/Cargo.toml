@@ -57,4 +57,4 @@ mlx-native = [
 mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
 
 [dev-dependencies]
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
