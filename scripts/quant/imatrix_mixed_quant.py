@@ -4,6 +4,11 @@ Inputs:
   --imatrix-dir : directory produced by imatrix_capture_gemma4.py containing
                   importance.npz (per-path activation sumsq, shape [in_dim]).
   --src, --dst  : bf16 source + output dir (same shape as quantize_gemma4_safe_3bit.py).
+  --apply-awq-scales (optional)
+                : path to awq_scales.npz from awq_search.py.  When given,
+                  AWQ per-input-channel scales are applied to model weights
+                  in-memory before quantization — avoids materializing a
+                  48 GB AWQ-only bf16 intermediate directory.
 
 Algorithm:
   1. For every quantizable Linear/SwitchLinear path in the model, look up the
@@ -46,7 +51,9 @@ Run:
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
 import sys
 
 import numpy as np
@@ -54,7 +61,7 @@ import safetensors.numpy
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.convert import convert as mlx_lm_convert
-from mlx_lm.utils import load
+from mlx_lm.utils import load, load_config, quantize_model, save_model, save_config
 from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
 
 LINEAR_CLASSES = (nn.Linear, nn.QuantizedLinear)
@@ -63,7 +70,10 @@ SWITCH_CLASSES = (SwitchLinear, QuantizedSwitchLinear)
 # Layers that NEVER quantize regardless of sensitivity.  Same set V1 used —
 # these are architectural amplifiers / hooks where any quant-error broadcasts.
 HARD_SKIP_SUBSTR = (
-    "embed_tokens",
+    # embed_tokens intentionally NOT skipped: Gemma 4 ties lm_head to it, so
+    # leaving embed_tokens at bf16 makes tied lm_head matmul read 1.07 GB/step
+    # (262K vocab × 2048 hidden × 2 byte), ~1.7 ms BW cost per decode step.
+    # Quantizing it brings parity with mlx-community uniform 4-bit speed.
     "norm",
     "vision_tower",
     "audio_tower",
@@ -74,6 +84,20 @@ HARD_SKIP_SUBSTR = (
     "embedding_post_projection",
     "lm_head",
 )
+
+# Per-tensor bit override for tensors the sensitivity ranking misses.
+# embed_tokens is the canonical case: its imatrix sumsq is low (each token
+# only activates one row), so the data-driven ranking would push it to
+# 3-bit, but tied lm_head reads every row on every step. Empirical PPL
+# vs baseline imatrix3plus (mean across seeds 7/42/123) on Gemma 4 26B-A4B:
+#   bf16 embed: −17.33 ppl   (slow: tied lm_head = 1.07 GB read/step)
+#   8-bit embed: TBD          (middle: ~540 MB read/step)
+#   4-bit embed: −12.51 ppl   (fast: ~270 MB read/step)
+#   3-bit embed: −3.15 ppl    (collapsed; do not use)
+# Tunable via the dict below — substring match against the path.
+FORCE_BITS_SUBSTR: dict[str, int] = {
+    "embed_tokens": int(os.environ.get("LUMEN_EMBED_BITS", "4")),
+}
 
 GROUP_SIZE = 64
 HIGH_PRECISION_BITS = 4   # top-sensitivity tier
@@ -153,7 +177,21 @@ def build_bit_table(
             bit_table[path] = MID_PRECISION_BITS
         else:
             bit_table[path] = LOW_PRECISION_BITS
-    return bit_table, ranked, n_high, n_low
+
+    forced_overrides: list[tuple[str, int]] = []
+    for path in bit_table:
+        for sub, forced_bits in FORCE_BITS_SUBSTR.items():
+            if sub in path and bit_table[path] != forced_bits:
+                bit_table[path] = forced_bits
+                forced_overrides.append((path, forced_bits))
+                break
+    if forced_overrides:
+        print(f"[plan] forced bit override on {len(forced_overrides)} tensor(s):")
+        for path, b in forced_overrides:
+            print(f"  → {path}  ({b}-bit)")
+
+    n_high_final = sum(1 for b in bit_table.values() if b == HIGH_PRECISION_BITS)
+    return bit_table, ranked, n_high_final, n_low
 
 
 def make_predicate(bit_table: dict[str, int]):
@@ -173,10 +211,122 @@ def make_predicate(bit_table: dict[str, int]):
             return False
         if hasattr(module, "weight") and module.weight.size % GROUP_SIZE != 0:
             return False
+        # FORCE_BITS_SUBSTR takes priority over bit_table lookup.
+        # Sensitivity ranking only considers Linear/SwitchLinear, so non-Linear
+        # quantizable layers (e.g. nn.Embedding) aren't in bit_table at all
+        # and would fall through to MID_PRECISION_BITS unless forced here.
+        for sub, forced_bits in FORCE_BITS_SUBSTR.items():
+            if sub in path:
+                return {"group_size": GROUP_SIZE, "bits": forced_bits, "mode": "affine"}
         bits = bit_table.get(path, MID_PRECISION_BITS)
         return {"group_size": GROUP_SIZE, "bits": bits, "mode": "affine"}
 
     return predicate
+
+
+def _apply_awq_scales_inplace(model, scales_path: pathlib.Path) -> tuple[int, int]:
+    """Apply AWQ per-input-channel scales to model weights in-memory.
+
+    Reads awq_scales.npz + sibling .json (from awq_search.py).  For each kept
+    group: multiplies member weights by s along innermost axis, then divides
+    the absorption target weight (RMSNorm γ elementwise OR Linear out-axis).
+
+    Returns (n_groups_applied, n_groups_failed).  Math identity verified by
+    scripts/quant/test_awq_apply_parity.py.
+    """
+    report_path = scales_path.with_suffix(".json")
+    if not scales_path.exists():
+        raise FileNotFoundError(f"AWQ scales not found: {scales_path}")
+    if not report_path.exists():
+        raise FileNotFoundError(f"AWQ report sidecar not found: {report_path}")
+
+    with np.load(scales_path) as npz:
+        scales_np = {k: npz[k].astype(np.float32) for k in npz.files if k != "_empty"}
+    groups_meta: dict = json.loads(report_path.read_text())["groups"]
+    if not scales_np:
+        print("[awq] no scales to apply (sentinel .npz)", file=sys.stderr)
+        return 0, 0
+
+    path_to_module = dict(model.named_modules())
+    n_applied = 0
+    n_failed = 0
+
+    for group_name, scale_arr in scales_np.items():
+        g_meta = groups_meta.get(group_name)
+        if not g_meta or not g_meta.get("kept", False):
+            continue
+
+        s = mx.array(scale_arr.astype(np.float32))
+        absorb = g_meta["absorb"]
+        target_mod = path_to_module.get(absorb["target_path"])
+        if target_mod is None:
+            print(f"  [awq fail] {group_name}: absorb target {absorb['target_path']} "
+                  f"not in model", file=sys.stderr)
+            n_failed += 1
+            continue
+
+        member_mods = []
+        ok = True
+        for m_info in g_meta["members"]:
+            mod = path_to_module.get(m_info["path"])
+            if mod is None or mod.weight.shape[-1] != s.shape[0]:
+                print(f"  [awq fail] {group_name}: member {m_info['path']} "
+                      f"missing or shape mismatch", file=sys.stderr)
+                ok = False
+                break
+            member_mods.append(mod)
+        if not ok:
+            n_failed += 1
+            continue
+
+        try:
+            # Scale members: W ← W · diag(s)  along innermost (input) axis.
+            for mod in member_mods:
+                w = mod.weight
+                if isinstance(mod, SWITCH_CLASSES):
+                    mod.weight = (w.astype(mx.float32) * s[None, None, :]).astype(w.dtype)
+                else:
+                    mod.weight = (w.astype(mx.float32) * s[None, :]).astype(w.dtype)
+
+            # Absorb 1/s into the upstream op.
+            old = target_mod.weight
+            kind = absorb["kind"]
+            if kind == "norm_weight":
+                target_mod.weight = (old.astype(mx.float32) / s).astype(old.dtype)
+            elif kind == "linear_out_axis":
+                target_mod.weight = (old.astype(mx.float32) / s[:, None]).astype(old.dtype)
+            else:
+                raise ValueError(f"unknown absorb kind: {kind!r}")
+        except Exception as e:
+            print(f"  [awq fail] {group_name}: {e}", file=sys.stderr)
+            n_failed += 1
+            continue
+
+        n_applied += 1
+
+    print(f"[awq] applied {n_applied} group scales, {n_failed} failed "
+          f"(out of {len(scales_np)} kept in scales file)")
+    return n_applied, n_failed
+
+
+def _copy_tokenizer_files(src: pathlib.Path, dst: pathlib.Path) -> int:
+    """Copy non-weight metadata (tokenizer, generation_config, …) from src to dst.
+
+    Skips model.safetensors* (save_model writes fresh shards) and config.json
+    (save_config writes the quant-augmented version).
+    """
+    n = 0
+    for p in src.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name
+        if name == "config.json":
+            continue
+        if name.endswith(".safetensors") or name.endswith(".safetensors.index.json"):
+            continue
+        shutil.copy2(p, dst / name)
+        n += 1
+    return n
 
 
 def main() -> int:
@@ -184,6 +334,14 @@ def main() -> int:
     ap.add_argument("--imatrix-dir", required=True)
     ap.add_argument("--src", required=True)
     ap.add_argument("--dst", required=True)
+    ap.add_argument(
+        "--apply-awq-scales",
+        type=str,
+        default=None,
+        help="optional path to awq_scales.npz (sibling .json auto-resolved). "
+             "When given, AWQ scales are applied in-memory before quantize, "
+             "skipping the 48 GB AWQ-only bf16 intermediate.",
+    )
     ap.add_argument(
         "--top4-fraction",
         type=float,
@@ -296,43 +454,79 @@ def main() -> int:
         return 0
 
     predicate = make_predicate(bit_table)
-    print(f"[convert] {src} → {dst}")
-    mlx_lm_convert(
-        hf_path=str(src),
-        mlx_path=str(dst),
-        quantize=True,
-        q_group_size=GROUP_SIZE,
-        q_bits=MID_PRECISION_BITS,  # ignored when predicate returns dict per layer
-        dtype="bfloat16",
-        quant_predicate=predicate,
-    )
 
-    recipe_name = (
+    awq_applied = 0
+    awq_failed = 0
+    awq_scales_path: pathlib.Path | None = None
+
+    if args.apply_awq_scales:
+        # In-memory path: load full bf16 → apply AWQ → quantize_model → save manually.
+        # Avoids producing a 48 GB AWQ-only intermediate dir.
+        awq_scales_path = pathlib.Path(args.apply_awq_scales)
+        print(f"[awq] loading FULL bf16 model {src} (not lazy — needed for in-place scale apply)")
+        full_model, _tok = load(
+            str(src), tokenizer_config={"eos_token": "<end_of_turn>"}, lazy=False
+        )
+        awq_applied, awq_failed = _apply_awq_scales_inplace(full_model, awq_scales_path)
+        mx.eval(full_model.parameters())
+
+        print(f"[convert] in-memory quantize → {dst}")
+        config = load_config(src)
+        full_model, quantized_config = quantize_model(
+            full_model,
+            config,
+            group_size=GROUP_SIZE,
+            bits=MID_PRECISION_BITS,
+            mode="affine",
+            quant_predicate=predicate,
+        )
+
+        dst.mkdir(parents=True, exist_ok=True)
+        save_model(dst, full_model, donate_model=True)
+        save_config(quantized_config, dst / "config.json")
+        n_copied = _copy_tokenizer_files(src, dst)
+        print(f"[convert] saved weights + config; copied {n_copied} tokenizer/metadata files")
+    else:
+        print(f"[convert] {src} → {dst}")
+        mlx_lm_convert(
+            hf_path=str(src),
+            mlx_path=str(dst),
+            quantize=True,
+            q_group_size=GROUP_SIZE,
+            q_bits=MID_PRECISION_BITS,  # ignored when predicate returns dict per layer
+            dtype="bfloat16",
+            quant_predicate=predicate,
+        )
+
+    base_recipe = (
         "lumen.gemma4.imatrix3tier" if args.low2_fraction > 0
         else "lumen.gemma4.imatrix3"
     )
+    recipe_name = f"{base_recipe}-awq" if args.apply_awq_scales else base_recipe
     marker = dst / "lumen_quant_recipe.json"
-    marker.write_text(
-        json.dumps(
-            {
-                "recipe": recipe_name,
-                "source": str(src),
-                "imatrix_dir": str(imatrix_dir),
-                "top4_fraction": args.top4_fraction,
-                "low2_fraction": args.low2_fraction,
-                "high_precision_bits": HIGH_PRECISION_BITS,
-                "mid_precision_bits": MID_PRECISION_BITS,
-                "low_precision_bits": LOW_PRECISION_BITS,
-                "group_size": GROUP_SIZE,
-                "n_tensors_high": n_high,
-                "n_tensors_mid": n_mid,
-                "n_tensors_low": n_low,
-                "skip_substr": list(HARD_SKIP_SUBSTR),
-                "bit_table": bit_table,
-            },
-            indent=2,
-        )
-    )
+    marker_payload = {
+        "recipe": recipe_name,
+        "source": str(src),
+        "imatrix_dir": str(imatrix_dir),
+        "top4_fraction": args.top4_fraction,
+        "low2_fraction": args.low2_fraction,
+        "high_precision_bits": HIGH_PRECISION_BITS,
+        "mid_precision_bits": MID_PRECISION_BITS,
+        "low_precision_bits": LOW_PRECISION_BITS,
+        "group_size": GROUP_SIZE,
+        "n_tensors_high": n_high,
+        "n_tensors_mid": n_mid,
+        "n_tensors_low": n_low,
+        "skip_substr": list(HARD_SKIP_SUBSTR),
+        "bit_table": bit_table,
+    }
+    if args.apply_awq_scales:
+        marker_payload["awq"] = {
+            "scales_path": str(awq_scales_path),
+            "n_groups_applied": awq_applied,
+            "n_groups_failed": awq_failed,
+        }
+    marker.write_text(json.dumps(marker_payload, indent=2))
     print(f"[convert] wrote {marker.name}")
     return 0
 

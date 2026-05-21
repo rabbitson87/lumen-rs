@@ -30,7 +30,7 @@ pub struct ModelEntry {
     /// for legacy installs from before v0.1.3 (no SHA was tracked at the time)
     /// and for local-only models without an HF id. Used by `check_model_updates`
     /// to detect when the Hub-side repo has been re-uploaded (same id, new
-    /// weights — e.g. `hsng95/gemma-4-26b-a4b-mlx-3bit` after the imatrix
+    /// weights — e.g. `hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq` after the imatrix
     /// rebuild). Persisted in a small `.lumen_hub_sha` text file inside the
     /// model directory.
     #[serde(default)]
@@ -186,7 +186,7 @@ pub fn local_path_for(models_dir: &Path, repo_id: &str) -> PathBuf {
 }
 
 /// Latest commit SHA for the `main` branch of an HF Hub repo. Used to detect
-/// "same repo id, new weights" the way `hsng95/gemma-4-26b-a4b-mlx-3bit` was
+/// "same repo id, new weights" the way `hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq` was
 /// rebuilt in v0.1.3 — the old broken-3bit and the new imatrix mixed-precision
 /// build live at the same id, so byte-for-byte comparison would require
 /// re-downloading.  The Hub commit SHA is the single 40-char string that

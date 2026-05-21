@@ -19,8 +19,13 @@ statistic that captures the magnitude information GPTQ / AWQ / imatrix-style
 methods use to drive bit allocation.
 
 Output:
-  <out_dir>/importance.npz   — one f32 array per path, shape [in_dim]
-  <out_dir>/meta.json        — corpus + token counts metadata
+  <out_dir>/importance.npz        — sumsq per path [in_dim]   (bit allocation, imatrix_mixed_quant)
+  <out_dir>/activation_stats.npz  — sumabs per path [in_dim]  (AWQ per-column scaling, awq_search)
+  <out_dir>/meta.json             — schema_version=2, corpus + token counts metadata
+
+Both sumsq and sumabs come from the same forward pass — capturing both costs
+~0 extra time (one extra reduction per Linear call). Files are split so older
+consumers reading only `importance.npz` remain working.
 
 Run:
   python scripts/quant/imatrix_capture_gemma4.py \\
@@ -61,17 +66,23 @@ SWITCH_CLASSES = (SwitchLinear, QuantizedSwitchLinear)
 
 
 def install_hooks(model):
-    """Monkey-patch Linear/SwitchLinear __call__ to record per-input-channel sumsq.
+    """Monkey-patch Linear/SwitchLinear __call__ to record per-input-channel stats.
 
-    We accumulate in a dict keyed by module path. Returns (accum, token_counts,
-    uninstall_fn). Call uninstall_fn() after forward to restore original methods.
+    Accumulates two parallel per-input-channel statistics, keyed by module path:
+      sumsq[path][c]  = Σ_t (x_t[c])²   — diagonal of input cov; bit-allocation input
+      sumabs[path][c] = Σ_t |x_t[c]|    — first-moment magnitude; AWQ scale input
+
+    Both come for free from the same forward pass. Returns
+    (sumsq_accum, sumabs_accum, token_counts, uninstall_fn).
+    Call uninstall_fn() after forward to restore original methods.
     """
     id_to_path = {}
     for path, m in model.named_modules():
         if isinstance(m, LINEAR_CLASSES + SWITCH_CLASSES):
             id_to_path[id(m)] = path
 
-    accum: dict[str, mx.array] = {}
+    sumsq_accum: dict[str, mx.array] = {}
+    sumabs_accum: dict[str, mx.array] = {}
     token_counts: dict[str, int] = defaultdict(int)
 
     # Patch every concrete class — QuantizedLinear has its own __call__
@@ -80,13 +91,16 @@ def install_hooks(model):
     orig_switch_calls = {cls: cls.__call__ for cls in SWITCH_CLASSES}
 
     def _accum(path: str, x: mx.array) -> None:
-        # x shape: [..., in_dim].  Flatten to [N, in_dim], compute sumsq → [in_dim].
+        # x shape: [..., in_dim].  Flatten to [N, in_dim], compute sumsq + sumabs → [in_dim].
         x_flat = x.reshape(-1, x.shape[-1]).astype(mx.float32)
         sumsq = (x_flat * x_flat).sum(axis=0)
-        if path in accum:
-            accum[path] = accum[path] + sumsq
+        sumabs = mx.abs(x_flat).sum(axis=0)
+        if path in sumsq_accum:
+            sumsq_accum[path] = sumsq_accum[path] + sumsq
+            sumabs_accum[path] = sumabs_accum[path] + sumabs
         else:
-            accum[path] = sumsq
+            sumsq_accum[path] = sumsq
+            sumabs_accum[path] = sumabs
         token_counts[path] += x_flat.shape[0]
 
     def _make_linear_hook(orig):
@@ -116,7 +130,7 @@ def install_hooks(model):
         for cls, orig in orig_switch_calls.items():
             cls.__call__ = orig
 
-    return accum, token_counts, uninstall
+    return sumsq_accum, sumabs_accum, token_counts, uninstall
 
 
 def main() -> int:
@@ -149,7 +163,7 @@ def main() -> int:
           f"{sum(len(s) for s in sequences)} total tokens")
 
     print("[hooks] installing on nn.Linear + SwitchLinear ...")
-    accum, token_counts, uninstall = install_hooks(model)
+    sumsq_accum, sumabs_accum, token_counts, uninstall = install_hooks(model)
 
     print("[forward] running calibration pass ...")
     model.eval()
@@ -160,7 +174,7 @@ def main() -> int:
             ids_arr = mx.array(ids)[None]  # [1, T]
             _ = model(ids_arr)
             # Force materialization to free graph before next sequence (memory)
-            mx.eval(*list(accum.values()))
+            mx.eval(*list(sumsq_accum.values()), *list(sumabs_accum.values()))
             total_tokens += ids_arr.size
             dt = time.time() - t0
             tps = total_tokens / max(dt, 1e-6)
@@ -170,23 +184,32 @@ def main() -> int:
     finally:
         uninstall()
 
-    print("[save] importance.npz + meta.json ...")
-    np_dict: dict[str, np.ndarray] = {}
-    for path, arr in accum.items():
-        np_dict[path] = np.asarray(arr, dtype=np.float32)
-    np.savez_compressed(out_dir / "importance.npz", **np_dict)
+    print("[save] importance.npz + activation_stats.npz + meta.json ...")
+    sumsq_np: dict[str, np.ndarray] = {}
+    sumabs_np: dict[str, np.ndarray] = {}
+    for path, arr in sumsq_accum.items():
+        sumsq_np[path] = np.asarray(arr, dtype=np.float32)
+    for path, arr in sumabs_accum.items():
+        sumabs_np[path] = np.asarray(arr, dtype=np.float32)
+    np.savez_compressed(out_dir / "importance.npz", **sumsq_np)
+    np.savez_compressed(out_dir / "activation_stats.npz", **sumabs_np)
 
     meta = {
+        "schema_version": 2,
         "src": str(src),
         "out_dir": str(out_dir),
         "n_sequences": len(sequences),
         "total_tokens": total_tokens,
         "max_tokens_per_seq": args.max_tokens_per_seq,
-        "n_tensors": len(accum),
+        "n_tensors": len(sumsq_accum),
         "token_counts_per_path": dict(token_counts),
+        "files": {
+            "importance.npz": "sumsq per path [in_dim] — diagonal of input cov (bit allocation, imatrix_mixed_quant)",
+            "activation_stats.npz": "sumabs per path [in_dim] — first-moment magnitude (AWQ scaling, awq_search)",
+        },
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"[done] {len(accum)} tensors written.  total_tokens={total_tokens}")
+    print(f"[done] {len(sumsq_accum)} tensors written.  total_tokens={total_tokens}")
     return 0
 
 

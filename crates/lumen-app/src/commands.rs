@@ -338,8 +338,8 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     }
 
     // Resolve the on-disk path of the active model. Flat-layout dirs use the
-    // dir name (e.g. `gemma-4-26b-a4b-mlx-3bit`) which won't match the HF Hub
-    // id (`mlx-community/gemma-4-26b-a4b-mlx-3bit`). When the model is found
+    // dir name (e.g. `gemma-4-26b-a4b-mlx-imatrix3plus-awq`) which won't match the HF Hub
+    // id (`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`). When the model is found
     // locally we pass the absolute path as MODEL_ID — the MLX native runner
     // and tokenizer loader both detect `is_dir()` and skip HF Hub entirely.
     let cat = state.catalog.lock().await;

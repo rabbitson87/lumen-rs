@@ -122,10 +122,7 @@ def run_model(model_path: str, max_tokens: int = 768, temperature: float = 0.7, 
 
 def main():
     models = [
-        "/Users/sonheesung/models/gemma-4-26b-a4b-mlx-4bit",          # reference (15 GB)
-        "/Users/sonheesung/models/gemma-4-26b-a4b-mlx-imatrix3plus",  # top4=0.35 (12.5 GB)
-        "/Users/sonheesung/models/gemma-4-26b-a4b-mlx-imatrix3",      # top4=0.25 (12 GB)
-        "/Users/sonheesung/models/gemma-4-26b-a4b-mlx-3bit",          # control (11 GB, broken)
+        "/Users/sonheesung/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq-qembed8",  # 8-bit embed ship candidate
     ]
     summaries = []
     for path in models:

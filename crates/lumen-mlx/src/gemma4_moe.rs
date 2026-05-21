@@ -2437,6 +2437,20 @@ pub(crate) mod imp {
         pub mode: &'static CStr,
     }
 
+    /// `embed_tokens` is the one weight that may legitimately ship as bf16:
+    /// `imatrix_mixed_quant.py` (and mlx-lm's `convert.py` predicate path)
+    /// keeps the embedding table at bf16 by default since the gather/lookup
+    /// path is bandwidth-bound on the row dimension, not arithmetic-bound,
+    /// and the bpw savings are negligible (~0.5% of total) against the
+    /// quality hit. mlx-lm's loader infers quant vs bf16 from the presence
+    /// of `.scales`; we mirror that here. All other linear layers go
+    /// through `ResolvedGemma4QuantLinear` unchanged (they're always
+    /// quantized in production catalog builds).
+    pub enum EmbedTokensWeights {
+        Quantized(ResolvedGemma4QuantLinear),
+        Bf16(Array),
+    }
+
     pub struct ResolvedGemma4AttnWeights {
         pub q_proj: ResolvedGemma4QuantLinear,
         pub k_proj: ResolvedGemma4QuantLinear,
@@ -2517,6 +2531,22 @@ pub(crate) mod imp {
             bits,
             mode,
         })
+    }
+
+    /// `embed_tokens`-only resolver — accepts bf16 weights when `.scales` is
+    /// absent (skip-list build), delegates to `resolve_quant_linear` otherwise.
+    fn resolve_embed_tokens(
+        weights: &NativeGemma4Weights,
+        cfg: &NativeGemma4Config,
+        base: &str,
+    ) -> Result<EmbedTokensWeights> {
+        if weights.get(&format!("{base}.scales")).is_some() {
+            return Ok(EmbedTokensWeights::Quantized(resolve_quant_linear(
+                weights, cfg, base,
+            )?));
+        }
+        let w = require_clone(weights, &format!("{base}.weight"))?;
+        Ok(EmbedTokensWeights::Bf16(w))
     }
 
     fn resolve_attn_layer(
@@ -2891,7 +2921,7 @@ pub(crate) mod imp {
 
     pub struct NativeGemma4Model {
         config: NativeGemma4Config,
-        embed_tokens: ResolvedGemma4QuantLinear,
+        embed_tokens: EmbedTokensWeights,
         final_norm: Array,
         layers: Vec<ResolvedGemma4LayerWeights>,
         // pre-allocated constants reused on every forward call.
@@ -2953,7 +2983,7 @@ pub(crate) mod imp {
             weights.validate_keys_against_config(&cfg.text_config)?;
 
             let embed_tokens =
-                resolve_quant_linear(&weights, &cfg, "language_model.model.embed_tokens")?;
+                resolve_embed_tokens(&weights, &cfg, "language_model.model.embed_tokens")?;
             let final_norm = require_clone(&weights, "language_model.model.norm.weight")?;
 
             let mut layers = cfg
@@ -3504,7 +3534,7 @@ pub(crate) mod imp {
             &self.config.text_config
         }
 
-        pub fn embed_tokens(&self) -> &ResolvedGemma4QuantLinear {
+        pub fn embed_tokens(&self) -> &EmbedTokensWeights {
             &self.embed_tokens
         }
 
@@ -5333,7 +5363,14 @@ pub(crate) mod imp {
         /// + dequantize_with_mode pattern with the optional biases plumbed
         /// through.
         fn embed_lookup_affine(&self, token_ids: &Array) -> Result<Array> {
-            let embed = &self.embed_tokens;
+            let embed = match &self.embed_tokens {
+                EmbedTokensWeights::Bf16(w) => {
+                    return w
+                        .take_axis(token_ids, 0)
+                        .context("embed_lookup(bf16): take_axis failed");
+                }
+                EmbedTokensWeights::Quantized(q) => q,
+            };
             let selected_packed = embed
                 .weight
                 .take_axis(token_ids, 0)
@@ -5579,17 +5616,25 @@ pub(crate) mod imp {
         /// `forward_array_impl` so the MTP drafter path can reuse the same
         /// trunk lm_head when projecting drafter hidden → vocab logits.
         pub fn tied_lm_head_plus_softcap(&self, h: &Array) -> Result<Array> {
-            let logits = quantized_matmul_with_mode(
-                h,
-                &self.embed_tokens.weight,
-                &self.embed_tokens.scales,
-                self.embed_tokens.biases.as_ref(),
-                /* transpose */ true,
-                self.embed_tokens.group_size,
-                self.embed_tokens.bits,
-                self.embed_tokens.mode,
-            )
-            .context("tied_lm_head_plus_softcap: quantized_matmul failed")?;
+            let logits = match &self.embed_tokens {
+                EmbedTokensWeights::Bf16(w) => {
+                    let w_t = mlx_rs::ops::transpose_axes(w, &[1, 0])
+                        .context("tied_lm_head(bf16): transpose embed weights")?;
+                    mlx_rs::ops::matmul(h, &w_t)
+                        .context("tied_lm_head(bf16): matmul h @ W.T")?
+                }
+                EmbedTokensWeights::Quantized(embed) => quantized_matmul_with_mode(
+                    h,
+                    &embed.weight,
+                    &embed.scales,
+                    embed.biases.as_ref(),
+                    /* transpose */ true,
+                    embed.group_size,
+                    embed.bits,
+                    embed.mode,
+                )
+                .context("tied_lm_head_plus_softcap: quantized_matmul failed")?,
+            };
             self.apply_logit_softcap(&logits)
         }
 

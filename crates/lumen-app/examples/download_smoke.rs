@@ -3,8 +3,8 @@
 //! Validates that the raw-HTTPS downloader (no `hf-hub` crate, no external
 //! CLI) actually fetches all weight + metadata files for both:
 //!   1. Single-file repos (e.g. `Qwen/Qwen2.5-0.5B` ships one `model.safetensors`)
-//!   2. Multi-shard repos (e.g. `hsng95/gemma-4-26b-a4b-mlx-3bit` ships
-//!      3 `model-NNNNN-of-00003.safetensors` + index.json).
+//!   2. Multi-shard repos (e.g. `hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`
+//!      ships 3 `model-NNNNN-of-00003.safetensors` + index.json).
 //!
 //! Run:
 //!   cargo run --release -p lumen-app --example download_smoke -- <repo_id> [models_dir]

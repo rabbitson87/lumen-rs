@@ -23,7 +23,7 @@ Ships in two forms:
 Other model paths exist in the codebase and should be treated as exploratory
 (may not work without local tweaks):
 
-- **Qwen3.5 30B-A3B / Qwen3.6 27B MoE** — full Candle backend including a
+- **Qwen3.5 35B-A3B / Qwen3.6 27B MoE** — full Candle backend including a
   256-expert MoE assembly + native MLX runner. Opt-in via
   `--features qwen3_5_moe` (off by default). Mostly working; see source
   comments and the `LUMEN_QWEN35_SHARDS` env var.

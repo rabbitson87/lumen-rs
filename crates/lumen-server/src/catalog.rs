@@ -111,12 +111,12 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         notes: "Gemma 4 26B MoE, ~4B active per token. 4-bit quant — balanced quality. Community build by LM Studio.",
     },
     RecommendedModel {
-        id: "hsng95/gemma-4-26b-a4b-mlx-3bit",
+        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (imatrix mixed 4/3-bit, hsng95)",
-        approx_size_gb: 13,
+        label: "Gemma 4 — 26B A4B (imatrix3plus + AWQ, hsng95)",
+        approx_size_gb: 12,
         min_ram_gb: 16,
-        notes: "Mixed 4/3-bit AFFINE driven by activation imatrix calibration on a multilingual corpus. 12.5 GB on disk, 4.14 bpw. Fixes the long-context token corruption that pure 3-bit had at 11K Korean prompts; quality close to the 4-bit build but 2.4 GB smaller.",
+        notes: "Mixed 4/3-bit AFFINE imatrix + AWQ per-channel scaling (Option B mean_sq proxy, mlp_down absorption groups filtered out, embed_tokens at AFFINE 8-bit). 12 GB on disk, 3.916 bpw. 3-seed mean PPL is 16.2 ppl better than the no-AWQ imatrix3plus baseline (67.98 vs 84.19 on tulu-3-sft-mixture) AND decode is faster than uniform 4-bit (73 vs 71 tok/s on M3 Max). 11K Korean long-context CLEAN on greedy + sampled.",
     },
 ];
 
