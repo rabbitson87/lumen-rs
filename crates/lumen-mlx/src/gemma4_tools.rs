@@ -450,6 +450,46 @@ pub(crate) mod imp {
         Ok(text)
     }
 
+    /// Format the body of an assistant `<|tool_call>call:NAME{...}<tool_call|>`
+    /// block — used by Gemma 4's `render_chat_history` to round-trip a
+    /// prior assistant turn's tool calls back into the prompt.
+    ///
+    /// Layout per the canonical jinja:
+    /// ```text
+    /// call:NAME{key1:VAL1,key2:VAL2}
+    /// ```
+    /// Keys are emitted bare (NOT escaped with `<|"|>` — this matches the
+    /// assistant-side format which differs from the tool-definition format
+    /// where some keys are escaped). String values still use `<|"|>` pairs;
+    /// numbers / booleans / arrays raw.
+    ///
+    /// Returns plain text without the `<|tool_call>` / `<tool_call|>`
+    /// special-token markers — the caller splices those in as token IDs.
+    pub fn format_tool_call_body(name: &str, arguments: &Value) -> String {
+        let mut out = String::with_capacity(name.len() + 8);
+        out.push_str("call:");
+        out.push_str(name);
+        out.push('{');
+        if let Some(map) = arguments.as_object() {
+            // Keep insertion order — assistant tool-call arguments are
+            // structured by the model and tend to match the parameter
+            // declaration order; sorting alphabetically would diverge from
+            // training-distribution emission.
+            let mut first = true;
+            for (key, value) in map.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(key);
+                out.push(':');
+                format_argument(&mut out, value, /* escape_keys */ false);
+            }
+        }
+        out.push('}');
+        out
+    }
+
     // Unit tests live in `crates/lumen-mlx/tests/gemma4_tools.rs` as
     // integration tests so they don't get entangled with pre-existing
     // compile errors in the library's `#[cfg(test)]` blocks for unrelated

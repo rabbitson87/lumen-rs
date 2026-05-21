@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use lumen_mlx::chat_io::{ParsedResponse, ParsedToolCall, ToolDef};
+use lumen_mlx::chat_io::{AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ToolDef};
 use lumen_model::gemma::GemmaModel;
 use lumen_model::gemma_gguf::GemmaGgufModel;
 use lumen_model::qwen::QwenModel;
@@ -324,6 +324,68 @@ fn text_only_response(visible: String) -> ParsedResponse {
     }
 }
 
+impl ModelBackend {
+    /// Structured-history dispatch — used when the request contains
+    /// `assistant.tool_calls` or `role:"tool"` entries. Only the Mlx
+    /// (Gemma 4) path gets the full structured renderer; legacy backends
+    /// (Candle Qwen / Gemma / GemmaGguf / Qwen35Moe) flatten the history
+    /// to plain `(role, content)` (dropping tool metadata) and call the
+    /// existing chat path. Tool turns are surfaced as user-role
+    /// `"[tool result] ..."` text so legacy paths don't reject them
+    /// outright — quality may suffer until each backend gains a real
+    /// tool-aware renderer.
+    fn chat_from_history(
+        &mut self,
+        turns: &[ChatTurn<'_>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+    ) -> Result<ParsedResponse> {
+        if let Self::Mlx(m) = self {
+            return m.chat_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                thinking,
+                session_id,
+                tools,
+            );
+        }
+        // Legacy backends: flatten + delegate to plain chat.
+        let plain = flatten_turns_for_plain_backend(turns);
+        self.chat(
+            &plain,
+            max_new_tokens,
+            temperature,
+            top_p,
+            thinking,
+            session_id,
+            tools,
+        )
+    }
+}
+
+fn flatten_turns_for_plain_backend(turns: &[ChatTurn<'_>]) -> Vec<(String, String)> {
+    turns
+        .iter()
+        .map(|t| match t {
+            ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
+            ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
+            ChatTurn::Assistant { text, .. } => {
+                ("assistant".to_string(), (*text).to_string())
+            }
+            ChatTurn::Tool { content, .. } => (
+                "user".to_string(),
+                format!("[tool result] {}", *content),
+            ),
+        })
+        .collect()
+}
+
 /// Inference engine wrapping a model backend and tokenizer.
 pub struct InferenceEngine {
     backend: ModelBackend,
@@ -613,38 +675,135 @@ impl InferenceEngine {
         &mut self,
         req: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
+        // Detect turn-2+ shape: any message carries tool_calls (assistant
+        // replay) or role=="tool" (tool result). When present we route
+        // through the structured `chat_from_history` path which can stitch
+        // these into the canonical Gemma 4 model turn. Otherwise the
+        // simple flat `(role, content)` path is fastest and avoids any
+        // chat-template behavior change for non-tool flows.
+        let needs_structured = needs_structured_history(&req.messages);
+
+        let prompt_bytes: usize =
+            req.messages.iter().map(|m| m.content.len()).sum();
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
+        eprintln!(
+            "[chat] msgs={} prompt_bytes={} max_tokens={} thinking={} stream={} tools={} structured={}",
+            req.messages.len(),
+            prompt_bytes,
+            req.max_tokens,
+            req.thinking,
+            req.stream,
+            tools_owned.len(),
+            needs_structured,
+        );
+
+        // Build the prompt-token-count input regardless of path. For the
+        // plain path this is the same `(role, content)` vector the
+        // backend receives; for the structured path it's a flattened
+        // view used only for billing token estimates (the actual prompt
+        // tokenization happens inside Gemma4Backend with the rich layout).
         let messages: Vec<(String, String)> = req
             .messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
 
-        // log per-request prompt size
-        // so we can diagnose OOMs that originate from oversized requests
-        // (e.g. an external agent stuffing its skill catalog into a system
-        // prompt). Bytes ≠ tokens but is a fast proxy: anything past ~64 KB
-        // is a strong signal to investigate before suspecting a kernel bug.
-        let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
-        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
-        eprintln!(
-            "[chat] msgs={} prompt_bytes={} max_tokens={} thinking={} stream={} tools={}",
-            messages.len(),
-            prompt_bytes,
-            req.max_tokens,
-            req.thinking,
-            req.stream,
-            tools_owned.len(),
-        );
+        // Owning storage for `ChatTurn` borrows when routing structured.
+        let arg_values: Vec<serde_json::Value> = if needs_structured {
+            req.messages
+                .iter()
+                .flat_map(|m| {
+                    m.tool_calls
+                        .iter()
+                        .flat_map(|calls| calls.iter())
+                        .map(|c| {
+                            // OpenAI ships arguments as a JSON-encoded
+                            // string. Parse to a Value so the renderer can
+                            // walk the structure; fall back to {} on
+                            // malformed input rather than failing the whole
+                            // request.
+                            serde_json::from_str(&c.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = if needs_structured {
+            let mut next_arg = 0;
+            req.messages
+                .iter()
+                .map(|m| {
+                    m.tool_calls
+                        .as_ref()
+                        .map(|calls| {
+                            calls
+                                .iter()
+                                .map(|c| {
+                                    let av = &arg_values[next_arg];
+                                    next_arg += 1;
+                                    AssistantToolCall {
+                                        id: c.id.as_str(),
+                                        name: c.function.name.as_str(),
+                                        arguments: av,
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let parsed = self.backend.chat(
-            &messages,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.thinking,
-            req.session_id.as_deref(),
-            &tools_owned,
-        )?;
+        let parsed = if needs_structured {
+            let turns: Vec<ChatTurn<'_>> = req
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| match m.role.as_str() {
+                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
+                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
+                    "tool" => ChatTurn::Tool {
+                        tool_call_id: m
+                            .tool_call_id
+                            .as_deref()
+                            .unwrap_or(""),
+                        name: m.name.as_deref(),
+                        content: m.content.as_str(),
+                    },
+                    _ => ChatTurn::Assistant {
+                        text: m.content.as_str(),
+                        tool_calls: assistant_tc_buf
+                            .get(i)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    },
+                })
+                .collect();
+            self.backend.chat_from_history(
+                &turns,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+            )?
+        } else {
+            self.backend.chat(
+                &messages,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+            )?
+        };
 
         let prompt_tokens = self
             .backend
@@ -730,38 +889,209 @@ impl InferenceEngine {
 
     /// Handle an Anthropic Messages API request.
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
-        let mut messages: Vec<(String, String)> = Vec::new();
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let needs_structured = anthropic_needs_structured_history(&req.messages);
 
-        // System message
-        if let Some(ref system) = req.system {
-            let system_text = match system {
+        let system_text = req
+            .system
+            .as_ref()
+            .map(|sys| match sys {
                 AnthropicSystem::Text(s) => s.clone(),
                 AnthropicSystem::Blocks(blocks) => blocks
                     .iter()
                     .filter_map(|b| b.text.clone())
                     .collect::<Vec<_>>()
                     .join("\n"),
-            };
-            if !system_text.is_empty() {
-                messages.push(("system".into(), system_text));
-            }
-        }
+            })
+            .filter(|s| !s.is_empty());
 
-        // User/assistant messages
+        // Flat `(role, content)` view — used as the plain-path input AND
+        // by `count_chat_prompt_tokens` regardless of which dispatch path
+        // we take below. For the structured path it's a token-budget
+        // approximation only; the actual prompt may include more tokens
+        // (tool definitions + tool_response wrapping).
+        let mut messages: Vec<(String, String)> = Vec::new();
+        if let Some(ref s) = system_text {
+            messages.push(("system".into(), s.clone()));
+        }
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
 
-        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
-        let parsed = self.backend.chat(
-            &messages,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.thinking,
-            req.session_id.as_deref(),
-            &tools_owned,
-        )?;
+        let parsed = if needs_structured {
+            // Owning storage for ChatTurn::Assistant.tool_calls borrows.
+            // Anthropic ships `tool_use.input` as a real JSON Value, so we
+            // don't need to parse strings (vs OpenAI's JSON-encoded
+            // arguments). Per-message expansion: one assistant message
+            // with text + N tool_use blocks becomes one ChatTurn::Assistant;
+            // one user message with tool_result blocks expands to N
+            // ChatTurn::Tool entries plus any remaining text becomes a
+            // ChatTurn::User.
+            // Per-message extraction with direct match on the content
+            // variant — avoids the `Cow::synthesize` path through
+            // `.blocks()` which would return a temporary slice and cause
+            // borrow-checker grief on subsequent ChatTurn references.
+            let assistant_text_buf: Vec<String> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "assistant" {
+                        return String::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(s) => s.clone(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                })
+                .collect();
+            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "assistant" {
+                        return Vec::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(_) => Vec::new(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::ToolUse { id, name, input } => {
+                                    Some(AssistantToolCall {
+                                        id: id.as_str(),
+                                        name: name.as_str(),
+                                        arguments: input,
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            // tool_result content can be string or array-of-text-blocks;
+            // pre-flatten to owned strings so the ChatTurn::Tool borrows
+            // are stable for the request lifetime.
+            let tool_result_buf: Vec<Vec<(String, String)>> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "user" {
+                        return Vec::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(_) => Vec::new(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    ..
+                                } => Some((tool_use_id.clone(), content.as_text())),
+                                _ => None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            // Extra `user` text in a tool-result message (Anthropic allows
+            // mixing text + tool_result blocks in one user message). We
+            // emit that text as a User turn AFTER all tool_result turns.
+            let user_text_buf: Vec<String> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "user" {
+                        return String::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(s) => s.clone(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                })
+                .collect();
+
+            let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
+            if let Some(ref s) = system_text {
+                turns.push(ChatTurn::System(s.as_str()));
+            }
+            for (i, msg) in req.messages.iter().enumerate() {
+                match msg.role.as_str() {
+                    "assistant" => {
+                        turns.push(ChatTurn::Assistant {
+                            text: assistant_text_buf[i].as_str(),
+                            tool_calls: assistant_tc_buf[i].as_slice(),
+                        });
+                    }
+                    "user" => {
+                        // Emit any tool_result blocks first (they belong
+                        // inside the preceding model turn per Gemma 4's
+                        // layout, which `render_chat_history` handles by
+                        // consuming consecutive Tool turns into the prior
+                        // Assistant turn).
+                        for (tcid, content) in &tool_result_buf[i] {
+                            turns.push(ChatTurn::Tool {
+                                tool_call_id: tcid.as_str(),
+                                name: None,
+                                content: content.as_str(),
+                            });
+                        }
+                        // Then any free-text portion of the user message.
+                        // (`user_text_buf` already covers both
+                        // `AnthropicContent::Text(s)` — via the synthesized
+                        // single-block view — and `AnthropicContent::Blocks`
+                        // shapes, so a missing text means the message had
+                        // no text content at all.)
+                        let utext = user_text_buf[i].as_str();
+                        if !utext.is_empty() {
+                            turns.push(ChatTurn::User(utext));
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "anthropic_messages: unsupported role {:?}",
+                            msg.role
+                        ));
+                    }
+                }
+            }
+            self.backend.chat_from_history(
+                &turns,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+            )?
+        } else {
+            // Plain path — uses the flat messages built above. Matches
+            // the pre-Phase-1.4 behavior bit-for-bit.
+            self.backend.chat(
+                &messages,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+            )?
+        };
 
         let prompt_tokens = self
             .backend
@@ -1022,6 +1352,39 @@ fn gen_id() -> String {
 // `ToolDef<'_>` shape, and the backend's `ParsedToolCall` output back into
 // each API's wire format. Lifetimes flow from the request that owns the
 // underlying strings, so the returned `Vec<ToolDef>` borrows from `req.tools`.
+
+/// Decide whether the request needs the structured-history chat path. We
+/// route there only when at least one message carries tool metadata that
+/// the flat `(role, content)` shape can't preserve (assistant.tool_calls
+/// on a prior turn, or a `role:"tool"` response). Vanilla single-turn
+/// requests with `tools[]` defined but no history fall through to the
+/// plain path — which still renders tool *definitions* via Phase 1.3's
+/// `render_to_ids_with_tools`.
+fn needs_structured_history(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.role == "tool"
+            || m.tool_calls
+                .as_ref()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false)
+    })
+}
+
+/// Anthropic variant of `needs_structured_history`. We scan content blocks
+/// for `tool_use` (assistant emitted) or `tool_result` (user replying)
+/// since Anthropic encodes tool turns inside the message body rather than
+/// via a separate `role:"tool"`.
+fn anthropic_needs_structured_history(messages: &[AnthropicMessage]) -> bool {
+    messages.iter().any(|m| match &m.content {
+        AnthropicContent::Text(_) => false,
+        AnthropicContent::Blocks(blocks) => blocks.iter().any(|b| {
+            matches!(
+                b,
+                AnthropicContentBlock::ToolUse { .. } | AnthropicContentBlock::ToolResult { .. }
+            )
+        }),
+    })
+}
 
 fn openai_tools_to_defs(tools: Option<&[Tool]>) -> Vec<ToolDef<'_>> {
     let Some(tools) = tools else {
@@ -2492,4 +2855,123 @@ pub(crate) struct ActiveSeqState {
     pub repeat_penalty: f32,
     /// EOS token IDs used by the batched decode loop for this sequence's backend.
     pub eos_tokens: Vec<u32>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 1.4 helpers — unit tests
+//
+// Pure functions only; full integration (request → backend dispatch →
+// response) is exercised via manual smoke tests against a loaded model.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod phase_1_4_dispatch_tests {
+    use super::*;
+
+    fn mk_msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage::new_text(role, content)
+    }
+
+    #[test]
+    fn needs_structured_history_plain_chat_returns_false() {
+        let msgs = vec![mk_msg("user", "weather?")];
+        assert!(!needs_structured_history(&msgs));
+    }
+
+    #[test]
+    fn needs_structured_history_with_tool_role_returns_true() {
+        let msgs = vec![
+            mk_msg("user", "weather?"),
+            mk_msg("assistant", ""),
+            ChatMessage {
+                role: "tool".into(),
+                content: "20C".into(),
+                tool_call_id: Some("call_abc".into()),
+                ..Default::default()
+            },
+        ];
+        assert!(needs_structured_history(&msgs));
+    }
+
+    #[test]
+    fn needs_structured_history_with_assistant_tool_calls_returns_true() {
+        let msgs = vec![
+            mk_msg("user", "weather?"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_abc".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "get_weather".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                ..Default::default()
+            },
+        ];
+        assert!(needs_structured_history(&msgs));
+    }
+
+    #[test]
+    fn needs_structured_history_empty_tool_calls_array_returns_false() {
+        let msgs = vec![
+            mk_msg("user", "weather?"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Seoul is sunny".into(),
+                tool_calls: Some(vec![]),
+                ..Default::default()
+            },
+        ];
+        // An assistant message with an explicit-but-empty tool_calls array
+        // is just a normal text turn — the structured path would add
+        // no value here.
+        assert!(!needs_structured_history(&msgs));
+    }
+
+    #[test]
+    fn flatten_turns_preserves_text_roles() {
+        let turns = vec![
+            ChatTurn::System("be brief"),
+            ChatTurn::User("hi"),
+            ChatTurn::Assistant {
+                text: "hello",
+                tool_calls: &[],
+            },
+        ];
+        let flat = flatten_turns_for_plain_backend(&turns);
+        assert_eq!(
+            flat,
+            vec![
+                ("system".to_string(), "be brief".to_string()),
+                ("user".to_string(), "hi".to_string()),
+                ("assistant".to_string(), "hello".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_turns_maps_tool_to_user_marker() {
+        // Tool turns must NOT propagate as role="tool" to legacy backends
+        // (they reject unknown roles). They get wrapped as user-role text
+        // with a marker so the chat-template still accepts them.
+        let turns = vec![
+            ChatTurn::User("weather"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &[],
+            },
+            ChatTurn::Tool {
+                tool_call_id: "call_abc",
+                name: Some("get_weather"),
+                content: "20C sunny",
+            },
+        ];
+        let flat = flatten_turns_for_plain_backend(&turns);
+        assert_eq!(flat[2].0, "user");
+        assert!(flat[2].1.contains("20C sunny"));
+        assert!(flat[2].1.contains("[tool result]"));
+    }
 }

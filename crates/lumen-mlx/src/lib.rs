@@ -79,7 +79,8 @@ pub mod gemma4 {
         TOK_TOOL_CALL_OPEN,
     };
     pub use crate::gemma4_tools::imp::{
-        ToolDef, render_tool_definitions, render_tool_definitions_text,
+        ToolDef, format_tool_call_body, render_tool_definitions,
+        render_tool_definitions_text,
     };
 
     /// MTP (Multi-Token Prediction) drafter for Gemma 4. Phase 1: types +
@@ -883,6 +884,83 @@ impl MlxBackend {
                 } else {
                     m.chat(messages, max_new_tokens, temperature, top_p, thinking, tools)
                 }
+            }
+        }
+    }
+
+    /// Structured-history variant of `chat`. Used by the turn-2+ path
+    /// where the request carries assistant.tool_calls / role:tool entries
+    /// that the legacy `(role, content)` shape can't represent. Falls
+    /// through to plain-text rendering for Qwen 3.5 (Phase 2 will wire its
+    /// own structured renderer).
+    pub fn chat_from_history(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        use crate::chat_io::{ChatTurn, ParsedResponse};
+        match self {
+            Self::Qwen35Family(m) => {
+                // Phase 2 will add Qwen 3.6's Hermes-style structured
+                // renderer. For now, flatten the history dropping
+                // tool_calls / tool_call_id and call the existing
+                // plain-text chat path. role:Tool turns become text
+                // markers so the model gets *something* (better than
+                // erroring out).
+                let _ = (top_p, tools);
+                let plain: Vec<(String, String)> = turns
+                    .iter()
+                    .map(|t| match t {
+                        ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
+                        ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
+                        ChatTurn::Assistant { text, .. } => {
+                            ("assistant".to_string(), (*text).to_string())
+                        }
+                        ChatTurn::Tool { content, .. } => {
+                            // Surface as user so the existing chat path
+                            // accepts it. Quality may suffer until
+                            // Phase 2 wires the real Qwen tool path.
+                            (
+                                "user".to_string(),
+                                format!("[tool result] {}", *content),
+                            )
+                        }
+                    })
+                    .collect();
+                let visible = if let Some(sid) = session_id {
+                    m.chat_streaming_session(
+                        &plain,
+                        max_new_tokens,
+                        thinking,
+                        sid,
+                        |_| {},
+                    )?
+                } else {
+                    let seq_id = m.alloc_seq_id();
+                    m.chat_streaming(&plain, max_new_tokens, thinking, seq_id, |_| {})?
+                };
+                Ok(ParsedResponse {
+                    visible,
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                })
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id; // Phase 1.4 doesn't wire prefix cache yet
+                m.chat_from_history(
+                    turns,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    thinking,
+                    tools,
+                )
             }
         }
     }

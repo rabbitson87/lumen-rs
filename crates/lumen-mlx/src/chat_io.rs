@@ -50,3 +50,49 @@ pub struct ToolDef<'a> {
     /// / Anthropic specs don't expose this directly).
     pub response: Option<&'a JsonValue>,
 }
+
+/// Structured chat turn used by the tool-aware backend path. Carries the
+/// extra fields (`tool_calls`, `tool_call_id`) that the legacy `(role,
+/// content)` shape can't represent. The chat-template renderer groups a
+/// `Assistant{ tool_calls }` followed by N `Tool{ tool_call_id, ... }`
+/// turns into a single model turn per the canonical Gemma 4 layout.
+#[derive(Debug, Clone)]
+pub enum ChatTurn<'a> {
+    System(&'a str),
+    User(&'a str),
+    Assistant {
+        /// Visible text. May be empty when `tool_calls` is non-empty.
+        text: &'a str,
+        /// Tool calls the assistant emitted on this turn (in order).
+        tool_calls: &'a [AssistantToolCall<'a>],
+    },
+    /// Tool execution result coming back from the client. Always follows
+    /// (in input order) the Assistant turn that issued the matching
+    /// `tool_call_id`.
+    Tool {
+        /// Matches `AssistantToolCall::id` from the prior assistant turn.
+        tool_call_id: &'a str,
+        /// Optional function name — clients may or may not send it.
+        /// Renderers that need the name resolve via `tool_call_id` lookup
+        /// against the preceding assistant's `tool_calls`.
+        name: Option<&'a str>,
+        /// Raw tool output. The renderer is responsible for any
+        /// model-specific wrapping (Gemma 4 puts this inside
+        /// `<|tool_response>response:NAME{value:<|"|>...<|"|>}<tool_response|>`).
+        content: &'a str,
+    },
+}
+
+/// One historical tool call attached to an `Assistant` turn — used when
+/// the client is replaying a prior turn whose assistant message issued
+/// tool calls. Mirrors `ParsedToolCall` but borrows its fields rather than
+/// owning them (the surrounding request keeps them alive).
+#[derive(Debug, Clone)]
+pub struct AssistantToolCall<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    /// Parsed JSON arguments. The OpenAI wire format ships these as a
+    /// JSON-encoded string; engine.rs deserializes before constructing
+    /// the borrow.
+    pub arguments: &'a JsonValue,
+}

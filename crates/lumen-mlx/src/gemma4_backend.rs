@@ -162,6 +162,26 @@ pub(crate) mod imp {
             self.build_chat_input_with_tools(messages, thinking, &[])
         }
 
+        /// Structured-history variant — accepts `ChatTurn`s carrying
+        /// `tool_calls` / tool result data the `(role, content)` shape
+        /// can't represent. Used by the turn-2 continuation path
+        /// (`chat_with_history`).
+        pub fn build_chat_input_from_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
+            self.chat.render_chat_history(
+                turns,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                },
+                tools,
+            )
+        }
+
         /// Tool-aware variant of `build_chat_input`. Empty `tools` slice
         /// produces the exact same token sequence as `build_chat_input`;
         /// otherwise tool definitions get injected into the system turn
@@ -228,6 +248,39 @@ pub(crate) mod imp {
         ///
         /// Returns the parsed response (visible text, reasoning, tool calls)
         /// so the HTTP layer can ship structured fields per the OpenAI spec.
+        /// Structured-history variant of `chat`. Used when the request
+        /// includes assistant messages with `tool_calls` or `role:"tool"`
+        /// messages (i.e. turn-2+ of an agent loop). Renders the Gemma 4
+        /// model turn with interleaved tool_call / tool_response blocks
+        /// then runs the same generate + parse path as `chat`.
+        pub fn chat_from_history(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+        ) -> Result<ParsedResponse> {
+            let prompt = self.build_chat_input_from_history(turns, thinking, tools)?;
+            let cfg = GenerateConfig {
+                max_new_tokens,
+                stop_on_eos: true,
+                sampling: build_sampling_config(temperature, top_p),
+            };
+            let stats = self.model.generate(&prompt, &cfg)?;
+            eprintln!(
+                "[gemma4] chat_from_history done: {} tokens in {:.0}ms ({:.1} tok/s)",
+                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            );
+
+            let mut parser = ResponseParser::new(&self.chat);
+            for token in &stats.generated_tokens {
+                parser.push(*token)?;
+            }
+            parser.finalize()
+        }
+
         pub fn chat(
             &mut self,
             messages: &[(String, String)],

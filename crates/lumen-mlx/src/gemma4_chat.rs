@@ -296,6 +296,231 @@ pub(crate) mod imp {
             Ok(out)
         }
 
+        /// Tool-aware structured chat renderer.
+        ///
+        /// Accepts `ChatTurn`s (with `Assistant.tool_calls` and `Tool`
+        /// variants the legacy `render_to_ids` can't represent) and emits
+        /// the canonical Gemma 4 layout where an assistant's tool calls and
+        /// the corresponding tool results live INSIDE a single model turn:
+        ///
+        /// ```text
+        /// <|turn>model
+        /// [reasoning]
+        /// <|tool_call>call:F1{...}<tool_call|>
+        /// <|tool_response>response:F1{...}<tool_response|>
+        /// <|tool_call>call:F2{...}<tool_call|>
+        /// <|tool_response>response:F2{...}<tool_response|>
+        /// [next visible content if assistant continued]
+        /// <turn|>
+        /// ```
+        ///
+        /// The renderer walks turns linearly and groups consecutive
+        /// `Tool` turns into the previous `Assistant` turn's model block.
+        /// `name` for the tool response is resolved by matching
+        /// `Tool.tool_call_id` against the assistant's prior
+        /// `tool_calls[].id`, with `Tool.name` as a fallback when the
+        /// client supplies one.
+        pub fn render_chat_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            opts: &RenderOptions,
+            tools: &[crate::chat_io::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
+            use crate::chat_io::ChatTurn;
+
+            let mut out: Vec<u32> = Vec::with_capacity(64 + turns.len() * 64);
+            out.push(TOK_BOS);
+
+            // ── System / tools header ─────────────────────────────────
+            let (system_text, body_start): (Option<&str>, usize) = match turns.first() {
+                Some(ChatTurn::System(s)) => (Some(*s), 1),
+                _ => (None, 0),
+            };
+            let has_tools = !tools.is_empty();
+            let need_header = opts.enable_thinking || system_text.is_some() || has_tools;
+            if need_header {
+                out.push(TOK_TURN_OPEN);
+                out.extend(
+                    self.encode_plain("system\n")
+                        .context("encode 'system\\n'")?,
+                );
+                if opts.enable_thinking {
+                    out.push(TOK_THINK);
+                    out.extend(self.encode_plain("\n").context("encode '\\n'")?);
+                }
+                if let Some(sys) = system_text {
+                    out.extend(
+                        self.encode_plain(sys.trim())
+                            .context("encode system content")?,
+                    );
+                }
+                if has_tools {
+                    let tool_text =
+                        crate::gemma4_tools::imp::render_tool_definitions_text(tools)
+                            .context("render tool definitions text")?;
+                    out.extend(
+                        self.encode_plain(&tool_text)
+                            .context("encode tool definitions")?,
+                    );
+                }
+                out.push(TOK_TURN_CLOSE);
+                out.extend(self.encode_plain("\n").context("encode '\\n' after sys")?);
+            }
+
+            // ── Body turns ─────────────────────────────────────────────
+            // Walk with index; advance manually so assistant-with-tool-calls
+            // can consume the trailing Tool turns into the same model turn.
+            let mut i = body_start;
+            while i < turns.len() {
+                match &turns[i] {
+                    ChatTurn::System(_) => {
+                        return Err(anyhow!(
+                            "render_chat_history: extra system turn at index {i} (must be first)"
+                        ));
+                    }
+                    ChatTurn::User(text) => {
+                        out.push(TOK_TURN_OPEN);
+                        out.extend(
+                            self.encode_plain("user\n").context("encode 'user\\n'")?,
+                        );
+                        out.extend(
+                            self.encode_plain(text.trim())
+                                .context("encode user content")?,
+                        );
+                        out.push(TOK_TURN_CLOSE);
+                        out.extend(
+                            self.encode_plain("\n").context("encode '\\n' after user")?,
+                        );
+                        i += 1;
+                    }
+                    ChatTurn::Tool { .. } => {
+                        return Err(anyhow!(
+                            "render_chat_history: Tool turn at index {i} has no preceding Assistant turn"
+                        ));
+                    }
+                    ChatTurn::Assistant { text, tool_calls } => {
+                        out.push(TOK_TURN_OPEN);
+                        out.extend(
+                            self.encode_plain("model\n")
+                                .context("encode 'model\\n'")?,
+                        );
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            out.extend(
+                                self.encode_plain(trimmed)
+                                    .context("encode assistant content")?,
+                            );
+                        }
+                        // Emit each tool_call + the matching tool_response
+                        // (if a following Tool turn answers it). Tool turns
+                        // are consumed in input order; we resolve names by
+                        // tool_call_id lookup but fall back to the assistant's
+                        // call name when the Tool turn doesn't supply one.
+                        let mut next = i + 1;
+                        for tc in tool_calls.iter() {
+                            out.extend(
+                                self.encode_tool_call(tc.name, tc.arguments)
+                                    .with_context(|| {
+                                        format!("encode tool_call {:?}", tc.name)
+                                    })?,
+                            );
+                            // Find the next Tool turn that answers this call.
+                            // We accept either an exact tool_call_id match or
+                            // positional fallback (consume the next Tool turn
+                            // unconditionally) — some clients omit ids.
+                            if let Some(ChatTurn::Tool {
+                                tool_call_id,
+                                name,
+                                content,
+                            }) = turns.get(next)
+                            {
+                                let _ = tool_call_id; // matched positionally
+                                let resolved_name = name.unwrap_or(tc.name);
+                                out.extend(
+                                    self.render_tool_response_block(resolved_name, content)
+                                        .with_context(|| {
+                                            format!(
+                                                "render tool_response for {resolved_name:?}"
+                                            )
+                                        })?,
+                                );
+                                next += 1;
+                            }
+                        }
+                        // Consume any *trailing* unmatched Tool turns
+                        // immediately after the assistant block. They
+                        // typically belong to this same model turn (the
+                        // client may have batched them all).
+                        while let Some(ChatTurn::Tool {
+                            tool_call_id: _,
+                            name,
+                            content,
+                        }) = turns.get(next)
+                        {
+                            let resolved_name = name.unwrap_or("unknown");
+                            out.extend(
+                                self.render_tool_response_block(resolved_name, content)
+                                    .with_context(|| {
+                                        format!(
+                                            "render trailing tool_response {resolved_name:?}"
+                                        )
+                                    })?,
+                            );
+                            next += 1;
+                        }
+                        out.push(TOK_TURN_CLOSE);
+                        out.extend(
+                            self.encode_plain("\n").context("encode '\\n' after model")?,
+                        );
+                        i = next;
+                    }
+                }
+            }
+
+            // ── Generation prompt ─────────────────────────────────────
+            if opts.add_generation_prompt {
+                out.push(TOK_TURN_OPEN);
+                out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
+                if !opts.enable_thinking {
+                    out.push(TOK_CHANNEL_OPEN);
+                    out.extend(
+                        self.encode_plain("thought\n")
+                            .context("encode 'thought\\n'")?,
+                    );
+                    out.push(TOK_CHANNEL_CLOSE);
+                }
+            }
+
+            Ok(out)
+        }
+
+        /// Encode one `<|tool_call>call:NAME{key:VAL,...}<tool_call|>` block.
+        ///
+        /// Mirrors the canonical jinja layout from
+        /// `chat_template.jinja`'s assistant `message.tool_calls` branch:
+        /// keys are unquoted, string values escape via `<|"|>`-pairs,
+        /// numbers / booleans / arrays raw. Uses the same `format_argument`
+        /// serializer the tool-definition renderer uses, with
+        /// `escape_keys=false` since tool-call arguments use bare keys.
+        fn encode_tool_call(
+            &self,
+            name: &str,
+            arguments: &serde_json::Value,
+        ) -> Result<Vec<u32>> {
+            if name.is_empty() {
+                return Err(anyhow!("encode_tool_call: empty function name"));
+            }
+            let mut out = Vec::with_capacity(32);
+            out.push(crate::gemma4_response::imp::TOK_TOOL_CALL_OPEN);
+            let body = crate::gemma4_tools::imp::format_tool_call_body(name, arguments);
+            out.extend(
+                self.encode_plain(&body)
+                    .with_context(|| format!("encode tool_call body {name:?}"))?,
+            );
+            out.push(crate::gemma4_response::imp::TOK_TOOL_CALL_CLOSE);
+            Ok(out)
+        }
+
         /// Render a single Gemma 4 tool-response block.
         ///
         /// Format (mirrors `format_tool_response_block` in
