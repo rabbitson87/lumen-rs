@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -221,9 +221,14 @@ impl Default for PersistentConfig {
                 turboquant_qjl_enabled: true,
             },
             context: ContextConfig {
-                max: 8192,
+                // Bumped 10× over the initial 8192 / 4096 defaults at
+                // schema v4. Both Gemma 4 (128K native cap) and
+                // Qwen 3.6 (256K with YaRN) comfortably handle ~80K
+                // when TurboQuant is ON; the UI's "realistic ctx"
+                // hint still clamps to the host's actual RAM budget.
+                max: 81920,
                 sliding: 1024,
-                prefill: 4096,
+                prefill: 40960,
             },
             advanced: AdvancedConfig {
                 backend_mode: BackendMode::Auto,
@@ -332,6 +337,20 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
             }
         }
         cfg.schema_version = 3;
+    }
+    // v3 -> v4: context.max and context.prefill defaults bumped 10× to
+    // 81920 / 40960 (TurboQuant + modern model native caps make the old
+    // 8192 / 4096 a needlessly tight budget). Only rewrite when the
+    // saved value matches the *old default exactly* — any explicit
+    // user choice (smaller or larger) is preserved.
+    if cfg.schema_version < 4 {
+        if cfg.context.max == 8192 {
+            cfg.context.max = 81920;
+        }
+        if cfg.context.prefill == 4096 {
+            cfg.context.prefill = 40960;
+        }
+        cfg.schema_version = 4;
     }
     // Future migrations append here.
 }

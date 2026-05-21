@@ -210,7 +210,7 @@
   let recommendedMemoryGbExact = $derived.by(() => {
     if (!activeModel || !config) return null;
     const modelGb = activeModel.size_bytes / 1024 ** 3;
-    const ctx = config.context.max ?? 8192;
+    const ctx = config.context.max ?? 81920;
     return modelGb + 2 + kvEstimateGb(ctx);
   });
   let recommendedMemoryGb = $derived.by(() =>
