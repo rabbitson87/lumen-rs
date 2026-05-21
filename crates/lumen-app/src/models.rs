@@ -163,27 +163,96 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
     Ok(out)
 }
 
+/// Parse a `.safetensors` file's header and return the EXPECTED total file
+/// size in bytes (8-byte length prefix + JSON header + tensor body). Reads
+/// ONLY the prefix + header (typically < 1 MB) — the body is never touched.
+///
+/// safetensors layout:
+///   [u64 LE: header_len][JSON header of header_len bytes][raw tensor body]
+///
+/// The JSON header maps each tensor name to its `data_offsets: [start, end]`
+/// **relative to the body start** (i.e. byte 8 + header_len of the file).
+/// The body's total length is therefore `max(end over all tensors)`.
+///
+/// Returns `None` on any I/O / parse error so the caller can fall back to
+/// presence-only checks.
+fn expected_safetensors_size(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header_len_buf = [0u8; 8];
+    f.read_exact(&mut header_len_buf).ok()?;
+    let header_len = u64::from_le_bytes(header_len_buf);
+    // Sanity bounds: real safetensors headers are KB-MB range. Reject
+    // anything < 2 (invalid JSON) or > 100 MB (likely truncated /
+    // corrupted file producing a bogus length).
+    if header_len < 2 || header_len > 100 * 1024 * 1024 {
+        return None;
+    }
+    let mut header_buf = vec![0u8; header_len as usize];
+    f.read_exact(&mut header_buf).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&header_buf).ok()?;
+    let obj = json.as_object()?;
+    let mut max_end: u64 = 0;
+    for (key, v) in obj {
+        // `__metadata__` is an opaque string-keyed dict, not a tensor.
+        if key == "__metadata__" {
+            continue;
+        }
+        let offsets = v.get("data_offsets")?.as_array()?;
+        if offsets.len() != 2 {
+            return None;
+        }
+        let end = offsets[1].as_u64()?;
+        if end > max_end {
+            max_end = end;
+        }
+    }
+    Some(8 + header_len + max_end)
+}
+
 /// Verify every shard referenced by `model.safetensors.index.json` is
-/// present on disk. Returns `true` when:
-///   - no index file is present (single-shard model — the surrounding
-///     `weight_present` check already covers this), OR
-///   - the index parses cleanly AND every unique shard filename it lists
-///     exists as a regular file in `scan_dir`.
+/// present on disk AND has the byte length its safetensors header
+/// promises. Also rejects any directory that still contains in-progress
+/// `*.part` files (the new downloader's atomic-rename sentinel).
+///
+/// Returns `true` when:
+///   - the index exists, parses cleanly, every shard exists, every
+///     shard's actual size matches `expected_safetensors_size`, AND no
+///     `.part` files linger, OR
+///   - no index file is present (single-shard / non-safetensors model
+///     — covered by `verify_no_part_files` + the surrounding
+///     `weight_present` check), AND no `.part` files linger
 ///
 /// The in-app downloader (see [`download`]) streams shards sequentially.
-/// If it's killed between shards, the index.json (cheap, written first)
-/// still claims every shard, but the later shards are missing on disk.
-/// The MLX loader then crashes with a misleading "missing top-level
-/// weight `<name>`" error mid-load — the actual root cause is the missing
-/// `model-NN-of-NN.safetensors`. This check surfaces the truncation at
-/// scan time so the desktop UI can flag the model as not-ready.
-///
-/// Does NOT validate individual file sizes — a shard that's present but
-/// truncated will still slip through. Sufficient for the common
-/// "downloader killed cleanly between shards" failure mode.
+/// Failure modes this catches:
+///   1. Killed BETWEEN shards: later shard files are missing → not
+///      ready (also caught by the legacy check this replaces).
+///   2. Killed MID shard: previously the truncated 1.8 GB shard was
+///      treated as "ready" because the filename existed. Now the
+///      header-vs-actual size check rejects it, AND the new
+///      `<shard>.part` sidecar makes the in-flight state explicit so
+///      a clean re-launch re-downloads.
 fn verify_shards_complete(scan_dir: &Path) -> bool {
+    if !verify_no_part_files(scan_dir) {
+        return false;
+    }
+    // Filename-pattern check FIRST — covers the case where
+    // `model.safetensors.index.json` itself never finished downloading
+    // but some shards already landed. Returns Some(false) if shards
+    // exist but the `MMMMM` total claims more than are present.
+    if let Some(filename_complete) = verify_shard_filename_completeness(scan_dir) {
+        if !filename_complete {
+            return false;
+        }
+    }
     let index_path = scan_dir.join("model.safetensors.index.json");
     if !index_path.exists() {
+        // Non-sharded: still validate any standalone `model.safetensors`
+        // against its own header so a single-file truncation is caught.
+        let single = scan_dir.join("model.safetensors");
+        if single.exists() {
+            return safetensors_size_matches(&single);
+        }
         return true;
     }
     let Ok(text) = std::fs::read_to_string(&index_path) else {
@@ -201,7 +270,109 @@ fn verify_shards_complete(scan_dir: &Path) -> bool {
             shards.insert(s);
         }
     }
-    shards.iter().all(|shard| scan_dir.join(shard).is_file())
+    shards.iter().all(|shard| {
+        let path = scan_dir.join(shard);
+        path.is_file() && safetensors_size_matches(&path)
+    })
+}
+
+/// Compare a `.safetensors` file's on-disk size with the size its header
+/// promises. Returns `true` when they match exactly, OR when the header
+/// can't be parsed (we don't want to false-positive on legitimately
+/// unusual / future formats — the loader will catch real corruption).
+fn safetensors_size_matches(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let actual = meta.len();
+    match expected_safetensors_size(path) {
+        Some(expected) => actual == expected,
+        // Header unreadable. Could be a truncation so severe it can't
+        // even hold an 8-byte length prefix, or a non-safetensors file
+        // that happens to be named `.safetensors`. Conservative: only
+        // reject when the file is implausibly small (< 1 KB — every
+        // real safetensors has at least an 8-byte prefix + a non-empty
+        // JSON header that easily exceeds 1 KB for multi-tensor files).
+        None => actual >= 1024,
+    }
+}
+
+/// Reject directories containing any `*.part` file (the new download
+/// sentinel — see [`download`]). A `.part` file means a previous
+/// download was killed mid-write and the corresponding final file is
+/// missing or incomplete.
+fn verify_no_part_files(scan_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(scan_dir) else {
+        return true; // Don't reject on missing dir — surrounding code handles that.
+    };
+    for e in entries.flatten() {
+        if let Some(name) = e.file_name().to_str() {
+            if name.ends_with(".part") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Catch the failure mode where the downloader was killed BEFORE writing
+/// `model.safetensors.index.json` but some shards already landed. Without
+/// the index file, `verify_shards_complete` can't tell that shards are
+/// missing — but the surviving shards' filenames advertise the total
+/// shard count via the canonical HF pattern `model-NNNNN-of-MMMMM.safetensors`.
+///
+/// This pulls `MMMMM` out of any shard's filename and verifies that all
+/// `NNNNN` from 1 to `MMMMM` exist on disk. Returns:
+///   - `Some(true)` if a complete shard set is present.
+///   - `Some(false)` if shards exist but are missing some sequence
+///     numbers (the truncation case).
+///   - `None` if NO sharded filenames are present (caller should fall
+///     back to single-file checks).
+fn verify_shard_filename_completeness(scan_dir: &Path) -> Option<bool> {
+    use std::collections::BTreeSet;
+    let entries = std::fs::read_dir(scan_dir).ok()?;
+    let mut seen_total: Option<u32> = None;
+    let mut present_indices: BTreeSet<u32> = BTreeSet::new();
+    for e in entries.flatten() {
+        let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        // Match `model-NNNNN-of-MMMMM.safetensors` (also tolerate
+        // 1-6 digit widths since some HF repos pad differently).
+        let Some(rest) = name
+            .strip_prefix("model-")
+            .and_then(|s| s.strip_suffix(".safetensors"))
+        else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(2, "-of-").collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (Ok(n), Ok(m)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else {
+            continue;
+        };
+        if m == 0 {
+            continue;
+        }
+        match seen_total {
+            Some(prev) if prev != m => {
+                // Inconsistent `-of-MMMMM` across shards — likely a
+                // mix-up. Treat as broken.
+                return Some(false);
+            }
+            _ => seen_total = Some(m),
+        }
+        present_indices.insert(n);
+    }
+    let total = seen_total?;
+    // HF shard numbering is 1-based, contiguous.
+    for i in 1..=total {
+        if !present_indices.contains(&i) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Locate the active snapshot directory inside an `models--<org>--<repo>/`
@@ -374,24 +545,62 @@ pub async fn download(
     for file in &files {
         let url = resolve_url(file);
         let dest = target.join(file);
+        let part = target.join(format!("{file}.part"));
 
-        // Skip if a non-empty file already exists at the destination (resume
-        // semantics — coarse, but matches user expectation when re-clicking
-        // download on an already-complete model).
+        // Skip the network round-trip only when the destination file
+        // ALREADY exists at its full advertised size. Truncated files
+        // (downloader killed mid-write before .part rename existed)
+        // are detected here by HEAD-ing the remote size and comparing
+        // — mismatched local size triggers re-download.
         if let Ok(meta) = std::fs::metadata(&dest) {
             if meta.len() > 0 {
-                let _ = tx
-                    .send(DownloadProgress {
-                        repo_id: repo_id.into(),
-                        file: file.clone(),
-                        downloaded_bytes: meta.len(),
-                        total_bytes: Some(meta.len()),
-                        done: true,
-                    })
-                    .await;
-                continue;
+                let head = client
+                    .head(&url)
+                    .send()
+                    .await
+                    .with_context(|| format!("HEAD {url}"))?;
+                let expected = head.content_length();
+                let local_ok = match expected {
+                    Some(n) => meta.len() == n,
+                    // HEAD didn't report size (rare on HF) — fall back to
+                    // safetensors header self-check for known shard files.
+                    None => {
+                        if file.ends_with(".safetensors") {
+                            safetensors_size_matches(&dest)
+                        } else {
+                            true
+                        }
+                    }
+                };
+                if local_ok {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            repo_id: repo_id.into(),
+                            file: file.clone(),
+                            downloaded_bytes: meta.len(),
+                            total_bytes: Some(meta.len()),
+                            done: true,
+                        })
+                        .await;
+                    continue;
+                }
+                // Truncated — drop the bogus file so the loop below
+                // can re-fetch from scratch.
+                eprintln!(
+                    "[lumen-app] {} is {} bytes but remote reports {} — re-downloading",
+                    dest.display(),
+                    meta.len(),
+                    expected.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                );
+                let _ = std::fs::remove_file(&dest);
             }
         }
+
+        // Clean up any stale `.part` from a prior killed run so we
+        // restart from byte 0. (Real Range/resume support is a later
+        // enhancement — for now, the safer simpler thing is to throw
+        // away the partial bytes and re-download cleanly.)
+        let _ = std::fs::remove_file(&part);
 
         let _ = tx
             .send(DownloadProgress {
@@ -419,9 +628,9 @@ pub async fn download(
             .with_context(|| format!("GET {url}"))?;
         let total = resp.content_length();
 
-        let mut file_w = tokio::fs::File::create(&dest)
+        let mut file_w = tokio::fs::File::create(&part)
             .await
-            .with_context(|| format!("create {}", dest.display()))?;
+            .with_context(|| format!("create {}", part.display()))?;
         let mut downloaded: u64 = 0;
         let mut last_emit: u64 = 0;
         while let Some(chunk) = resp
@@ -433,7 +642,7 @@ pub async fn download(
             file_w
                 .write_all(&chunk)
                 .await
-                .with_context(|| format!("write {}", dest.display()))?;
+                .with_context(|| format!("write {}", part.display()))?;
             downloaded += chunk.len() as u64;
             // Throttle progress events to every ~512 KB so the frontend isn't
             // flooded on large shards (5+ GB).
@@ -454,7 +663,31 @@ pub async fn download(
         file_w
             .flush()
             .await
-            .with_context(|| format!("flush {}", dest.display()))?;
+            .with_context(|| format!("flush {}", part.display()))?;
+        // Drop the handle BEFORE the rename so Windows-style locks
+        // (no-op on macOS / Linux but cheap insurance) don't bite.
+        drop(file_w);
+
+        // Post-write sanity: if the server told us the content length,
+        // verify the bytes on disk match before promoting to the final
+        // name. A short read (server dropped connection silently) gets
+        // surfaced here instead of leaking a truncated file under the
+        // canonical name.
+        if let Some(expected) = total {
+            if downloaded != expected {
+                let _ = std::fs::remove_file(&part);
+                return Err(anyhow::anyhow!(
+                    "short read for {file}: got {downloaded} bytes, expected {expected}"
+                ));
+            }
+        }
+
+        // Atomic promotion: `.part` → final filename. On any sane FS
+        // (HFS+ / APFS / ext4) this is a single inode rename, so a
+        // crash between flush and rename leaves the `.part` for the
+        // scan to detect — never a half-named final file.
+        std::fs::rename(&part, &dest)
+            .with_context(|| format!("rename {} -> {}", part.display(), dest.display()))?;
 
         let _ = tx
             .send(DownloadProgress {
@@ -495,6 +728,7 @@ pub async fn delete(models_dir: &Path, repo_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn tmpdir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("lumen-models-test-{name}-{}", std::process::id()));
@@ -517,6 +751,36 @@ mod tests {
         .unwrap();
     }
 
+    /// Write a syntactically-valid (but tiny) safetensors file whose
+    /// header advertises a `body_len`-byte body. Used to fabricate
+    /// both "well-formed" and "truncated" shards in tests without
+    /// pulling in the real `safetensors` crate.
+    fn write_safetensors(path: &Path, body_len: u64) {
+        let header_json = format!(
+            "{{\"t\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[0,{}]}}}}",
+            body_len / 4,
+            body_len,
+        );
+        let header_bytes = header_json.as_bytes();
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header_bytes).unwrap();
+        f.write_all(&vec![0u8; body_len as usize]).unwrap();
+    }
+
+    fn write_truncated_safetensors(path: &Path, advertised_body: u64, actual_body: u64) {
+        let header_json = format!(
+            "{{\"t\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[0,{}]}}}}",
+            advertised_body / 4,
+            advertised_body,
+        );
+        let header_bytes = header_json.as_bytes();
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header_bytes).unwrap();
+        f.write_all(&vec![0u8; actual_body as usize]).unwrap();
+    }
+
     #[test]
     fn shards_complete_returns_true_when_no_index() {
         let dir = tmpdir("no-index");
@@ -527,8 +791,8 @@ mod tests {
     fn shards_complete_returns_true_when_all_shards_present() {
         let dir = tmpdir("all-present");
         write_index(&dir, &["shard-a.safetensors", "shard-b.safetensors"]);
-        std::fs::write(dir.join("shard-a.safetensors"), b"x").unwrap();
-        std::fs::write(dir.join("shard-b.safetensors"), b"y").unwrap();
+        write_safetensors(&dir.join("shard-a.safetensors"), 4096);
+        write_safetensors(&dir.join("shard-b.safetensors"), 4096);
         assert!(verify_shards_complete(&dir));
     }
 
@@ -536,8 +800,71 @@ mod tests {
     fn shards_complete_returns_false_when_shard_missing() {
         let dir = tmpdir("missing");
         write_index(&dir, &["s1.safetensors", "s2.safetensors", "s3.safetensors"]);
-        std::fs::write(dir.join("s1.safetensors"), b"x").unwrap();
-        // s2 + s3 missing — mirrors the killed-mid-download case
+        write_safetensors(&dir.join("s1.safetensors"), 4096);
+        // s2 + s3 missing — mirrors the killed-between-shards case
         assert!(!verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_returns_false_when_shard_truncated() {
+        // The exact scenario the user reported: shard file exists on
+        // disk, has substantial bytes, but is short of what its own
+        // safetensors header claims (e.g. 1.8 GB of a 5 GB shard).
+        let dir = tmpdir("truncated");
+        write_index(&dir, &["only.safetensors"]);
+        write_truncated_safetensors(&dir.join("only.safetensors"), 4096, 1024);
+        assert!(!verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_returns_false_when_part_file_present() {
+        let dir = tmpdir("part-sentinel");
+        write_index(&dir, &["a.safetensors"]);
+        write_safetensors(&dir.join("a.safetensors"), 4096);
+        // Stale `.part` from an interrupted run.
+        std::fs::write(dir.join("a.safetensors.part"), b"in-progress").unwrap();
+        assert!(!verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_catches_missing_index_with_partial_shards() {
+        // index.json never finished downloading, but the model dir has
+        // 2/8 advertised shards. Filename pattern reveals MMMMM=8.
+        let dir = tmpdir("no-index-partial");
+        write_safetensors(&dir.join("model-00001-of-00008.safetensors"), 4096);
+        write_safetensors(&dir.join("model-00002-of-00008.safetensors"), 4096);
+        assert!(!verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn shards_complete_passes_complete_shard_set_without_index() {
+        // All 3 shards present, no index file (legacy / partial download
+        // of optional metadata). Filename pattern says MMMMM=3 → ready.
+        let dir = tmpdir("no-index-complete");
+        write_safetensors(&dir.join("model-00001-of-00003.safetensors"), 4096);
+        write_safetensors(&dir.join("model-00002-of-00003.safetensors"), 4096);
+        write_safetensors(&dir.join("model-00003-of-00003.safetensors"), 4096);
+        assert!(verify_shards_complete(&dir));
+    }
+
+    #[test]
+    fn expected_safetensors_size_matches_actual_for_valid_file() {
+        let dir = tmpdir("expected-size");
+        let path = dir.join("t.safetensors");
+        write_safetensors(&path, 8192);
+        let expected = expected_safetensors_size(&path).expect("header parse");
+        let actual = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn expected_safetensors_size_detects_truncation() {
+        let dir = tmpdir("expected-size-trunc");
+        let path = dir.join("t.safetensors");
+        write_truncated_safetensors(&path, 8192, 2048);
+        let expected = expected_safetensors_size(&path).expect("header parse");
+        let actual = std::fs::metadata(&path).unwrap().len();
+        assert_ne!(expected, actual);
+        assert!(!safetensors_size_matches(&path));
     }
 }
