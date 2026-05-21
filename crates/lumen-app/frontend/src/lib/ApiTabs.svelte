@@ -16,6 +16,7 @@
     onEmbeddingChange: (value: string | null) => void;
     onApiKeyChange: (value: string | null) => void;
     onDownloadEmbedding: (repoId: string) => void;
+    onDeleteEmbedding: (repoId: string) => void;
   }
   let {
     config,
@@ -26,6 +27,7 @@
     onEmbeddingChange,
     onApiKeyChange,
     onDownloadEmbedding,
+    onDeleteEmbedding,
   }: Props = $props();
 
   // Embeddings already downloaded locally — selectable in the dropdown.
@@ -181,31 +183,49 @@
       </div>
       <div class="flex flex-col gap-1">
         <span class="dim">Embedding model</span>
-        <select
-          value={config.server.embedding_model_id ?? ""}
-          onchange={(e) => {
-            const v = (e.target as HTMLSelectElement).value;
-            onEmbeddingChange(v === "" ? null : v);
-          }}
-        >
-          <option value="">(none — /v1/embeddings disabled)</option>
-          {#each downloadedEmbeddings as emb}
-            <option value={emb.id}>
-              {emb.label} · {emb.approx_size_gb}GB
-            </option>
-          {/each}
-          {#if config.server.embedding_model_id && !downloadedEmbeddings.find((e) => e.id === config.server.embedding_model_id)}
-            <option value={config.server.embedding_model_id}>
-              {config.server.embedding_model_id} (custom)
-            </option>
+        {#if downloadedEmbeddings.length === 0}
+          <div class="text-[11px] leading-normal text-warn">
+            No embedding models downloaded yet — pick one below to download first.
+          </div>
+        {:else}
+          <div class="flex flex-col gap-1.5">
+            {#each downloadedEmbeddings as emb}
+              {@const isActive = config.server.embedding_model_id === emb.id}
+              <div
+                class={`grid grid-cols-[18px_minmax(0,1fr)_70px_auto_auto] items-center gap-3 px-2.5 py-2 rounded-md bg-panel-2 border ${
+                  isActive
+                    ? "border-accent shadow-[0_0_0_1px_var(--color-accent)_inset] bg-accent/6"
+                    : "border-transparent hover:border-border"
+                }`}
+              >
+                <span class="mono text-ok font-bold">{isActive ? "✓" : ""}</span>
+                <div class="min-w-0 flex flex-col gap-0.5">
+                  <div class="mono overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">{emb.label}</div>
+                  <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-text-dim">{emb.id}</div>
+                </div>
+                <span class="mono text-text-dim text-right text-xs">{emb.approx_size_gb}GB</span>
+                <button
+                  onclick={() => onEmbeddingChange(emb.id)}
+                  disabled={isActive}
+                >Use</button>
+                <button class="danger" onclick={() => onDeleteEmbedding(emb.id)}>Delete</button>
+              </div>
+            {/each}
+          </div>
+          {#if config.server.embedding_model_id}
+            <button
+              class="self-start mt-1 text-[11px]"
+              onclick={() => onEmbeddingChange(null)}
+              title="Stop using any embedding model (disables /v1/embeddings)"
+            >Disable embedding</button>
           {/if}
-        </select>
+          {#if config.server.embedding_model_id && !downloadedEmbeddings.find((e) => e.id === config.server.embedding_model_id)}
+            <div class="mt-0.5 text-[11px] leading-normal text-warn">
+              Active embedding <span class="mono">{config.server.embedding_model_id}</span> is not in the local catalog.
+            </div>
+          {/if}
+        {/if}
       </div>
-      {#if downloadedEmbeddings.length === 0}
-        <div class="mt-0.5 text-[11px] leading-normal text-warn">
-          No embedding models downloaded yet — pick one below to download first.
-        </div>
-      {/if}
       {#if availableEmbeddings.length > 0}
         <div class="flex flex-col gap-1">
           <span class="dim">Download embedding</span>

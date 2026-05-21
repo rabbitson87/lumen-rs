@@ -450,11 +450,50 @@
     }
   }
 
-  async function removeModel(id: string) {
-    if (!confirm(`Delete ${id}? Weights will be removed from disk.`)) return;
-    await api.deleteModel(id);
-    models = await api.listModels();
-    refreshOutdated();
+  // Confirmation modal state. Used by both chat-model row Delete buttons
+  // (kind="chat") and the embedding picker's Delete button (kind="embedding").
+  // The kind controls labelling + post-delete cleanup (clearing the active
+  // embedding_model_id from config when its weights are removed).
+  let confirmDel = $state<{ id: string; kind: "chat" | "embedding" } | null>(null);
+  let confirmDelBusy = $state(false);
+
+  function removeModel(id: string) {
+    confirmDel = { id, kind: "chat" };
+  }
+
+  function deleteEmbedding(id: string) {
+    confirmDel = { id, kind: "embedding" };
+  }
+
+  async function performConfirmedDelete() {
+    if (!confirmDel || confirmDelBusy) return;
+    const { id, kind } = confirmDel;
+    confirmDelBusy = true;
+    try {
+      await api.deleteModel(id);
+      models = await api.listModels();
+      refreshOutdated();
+      // If we just deleted the currently-selected embedding, clear it from
+      // config so /v1/embeddings doesn't keep pointing at a missing dir.
+      if (
+        kind === "embedding" &&
+        config &&
+        config.server.embedding_model_id === id
+      ) {
+        config.server.embedding_model_id = null;
+        await saveServer();
+      }
+      confirmDel = null;
+    } catch (e) {
+      statusMessage = `Delete failed: ${e}`;
+    } finally {
+      confirmDelBusy = false;
+    }
+  }
+
+  function cancelConfirmedDelete() {
+    if (confirmDelBusy) return;
+    confirmDel = null;
   }
 
   /// "Update" button handler for an out-of-date installed model.  Deletes
@@ -1210,6 +1249,7 @@
             statusMessage = `Embedding download failed: ${e}`;
           }
         }}
+        onDeleteEmbedding={deleteEmbedding}
       />
     {/if}
   </section>
@@ -1217,6 +1257,45 @@
   {/if}
 
 </main>
+
+<!-- ── Delete confirmation modal ─────────────────────────────────
+     Used by both the chat-model row Delete buttons and the embedding
+     picker's Delete button. Backdrop click + Esc dismiss. -->
+{#if confirmDel}
+  <div
+    class="fixed inset-0 z-100 flex items-center justify-center bg-black/55 backdrop-blur-sm"
+    onclick={cancelConfirmedDelete}
+    onkeydown={(e) => { if (e.key === "Escape") cancelConfirmedDelete(); }}
+    role="presentation"
+  >
+    <div
+      class="bg-panel border border-border rounded-xl shadow-[0_8px_32px_rgba(0,0,0,0.5)] p-5 min-w-105 max-w-135"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-del-title"
+      tabindex="-1"
+    >
+      <h3 id="confirm-del-title" class="m-0 mb-2.5 text-sm font-semibold text-text">
+        Delete {confirmDel.kind === "embedding" ? "embedding model" : "model"}?
+      </h3>
+      <p class="mb-1.5 text-[13px] text-text leading-normal break-all">
+        <span class="mono text-accent">{confirmDel.id}</span>
+      </p>
+      <p class="mb-4 text-xs text-text-dim leading-[1.55]">
+        Weights will be removed from disk. You can re-download from the
+        catalog later.{confirmDel.kind === "embedding" && config && config.server.embedding_model_id === confirmDel.id ? " The active embedding will be cleared." : ""}
+      </p>
+      <div class="flex justify-end gap-2">
+        <button onclick={cancelConfirmedDelete} disabled={confirmDelBusy}>Cancel</button>
+        <button class="danger" onclick={performConfirmedDelete} disabled={confirmDelBusy}>
+          {confirmDelBusy ? "Deleting…" : "Delete"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- ── Footer panel: logs + env overrides ──────────────────────── -->
 <footer class="border-t border-border bg-panel flex flex-col fixed left-0 right-0 bottom-0 z-8">
