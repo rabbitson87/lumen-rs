@@ -117,6 +117,7 @@ mod native_snapshot;
 pub mod native_ssm;
 mod qwen3_5_moe;
 mod qwen3_5_mtp;
+mod qwen3_5_tools;
 // Phase 2 Step B microbench — synthetic-weight latency probe at
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
@@ -853,11 +854,24 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                // Qwen 3.5 family doesn't yet render tools into its prompt
-                // (Phase 2 wires that up). For now we accept the slice and
-                // ignore it so the API surface stays uniform — tool_calls
-                // in the response will be empty. tool_choice also ignored.
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, temperature);
+                // Phase 2: when tools are provided, route through the
+                // Qwen 3.6 nested-XML tool template + parser. No-tools
+                // path keeps the existing fast lane (MTP / spec /
+                // prefix-cache friendly).
+                if !tools.is_empty() {
+                    let _ = session_id; // tool-aware path doesn't yet use prefix-cache
+                    let seq_id = m.alloc_seq_id();
+                    return m.chat_with_tools(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                    );
+                }
+                let _ = tool_choice;
                 let visible = if let Some(sid) = session_id {
                     m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})?
                 } else {
@@ -917,49 +931,24 @@ impl MlxBackend {
         use crate::chat_io::{ChatTurn, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                // Phase 2 will add Qwen 3.6's Hermes-style structured
-                // renderer. For now, flatten the history dropping
-                // tool_calls / tool_call_id and call the existing
-                // plain-text chat path. role:Tool turns become text
-                // markers so the model gets *something* (better than
-                // erroring out). tool_choice ignored on this fallback.
-                let _ = (top_p, tools, tool_choice);
-                let plain: Vec<(String, String)> = turns
-                    .iter()
-                    .map(|t| match t {
-                        ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
-                        ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
-                        ChatTurn::Assistant { text, .. } => {
-                            ("assistant".to_string(), (*text).to_string())
-                        }
-                        ChatTurn::Tool { content, .. } => {
-                            // Surface as user so the existing chat path
-                            // accepts it. Quality may suffer until
-                            // Phase 2 wires the real Qwen tool path.
-                            (
-                                "user".to_string(),
-                                format!("[tool result] {}", *content),
-                            )
-                        }
-                    })
-                    .collect();
-                let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(
-                        &plain,
-                        max_new_tokens,
-                        thinking,
-                        sid,
-                        |_| {},
-                    )?
-                } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(&plain, max_new_tokens, thinking, seq_id, |_| {})?
-                };
-                Ok(ParsedResponse {
-                    visible,
-                    reasoning: String::new(),
-                    tool_calls: Vec::new(),
-                })
+                // Phase 2: structured-history paths ALWAYS go through
+                // the tool-aware renderer — the legacy IM-only template
+                // cannot represent `<tool_call>` blocks or
+                // `<tool_response>` turns. Tools may be empty (rare —
+                // history-only replay without re-declaring tools); in
+                // that case the renderer omits the system `<tools>`
+                // block but still emits the assistant tool_calls and
+                // tool_response blocks correctly.
+                let _ = (top_p, temperature, session_id);
+                let seq_id = m.alloc_seq_id();
+                m.chat_with_tools_from_history(
+                    turns,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    tools,
+                    tool_choice,
+                )
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
@@ -1001,14 +990,26 @@ impl MlxBackend {
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, tools, tool_choice);
-                // Qwen35 has no tool-call demux yet — adapter wraps every
-                // visible-text delta as a Text event.
+                let _ = (top_p, temperature);
+                // Phase 2: with tools provided, route through tool-aware
+                // streaming path so `<tool_call>` blocks demux into
+                // `BackendStreamEvent::ToolCallStart` + `parsed.tool_calls`.
+                // No-tools path keeps the existing fast lane.
+                if !tools.is_empty() {
+                    let _ = session_id;
+                    let seq_id = m.alloc_seq_id();
+                    return m.chat_streaming_with_tools(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    );
+                }
+                let _ = tool_choice;
                 let mut text_adapter = |chunk: &str| {
-                    // Inner Qwen35 callbacks are infallible `FnMut(&str)`;
-                    // we swallow any propagation errors from `on_event` here
-                    // (rare — SSE channel-closed is the realistic case and
-                    // higher layers detect it independently).
                     let _ = on_event(BackendStreamEvent::Text(chunk));
                 };
                 let visible = if let Some(sid) = session_id {
@@ -1074,33 +1075,17 @@ impl MlxBackend {
     {
         use crate::chat_io::ParsedResponse;
         match self {
-            Self::Qwen35Family(_) => {
-                // Qwen 3.5/3.6 family doesn't have a tool-aware renderer
-                // yet (Phase 2 lands the Hermes path). Flatten ChatTurn
-                // history to `(role, content)`; tool results become
-                // user-role "[tool result] …" text so the chat-template
-                // accepts them. Quality is degraded vs the structured
-                // Gemma 4 path but the request doesn't error.
-                let plain: Vec<(String, String)> = turns
-                    .iter()
-                    .map(|t| match t {
-                        crate::chat_io::ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
-                        crate::chat_io::ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
-                        crate::chat_io::ChatTurn::Assistant { text, .. } => {
-                            ("assistant".to_string(), (*text).to_string())
-                        }
-                        crate::chat_io::ChatTurn::Tool { content, .. } => {
-                            ("user".to_string(), format!("[tool result] {}", *content))
-                        }
-                    })
-                    .collect();
-                self.chat_streaming(
-                    &plain,
+            Self::Qwen35Family(m) => {
+                // Phase 2: structured-history streaming ALWAYS routes
+                // through the tool-aware path — same rationale as the
+                // non-streaming `chat_from_history` branch above.
+                let _ = (top_p, temperature, session_id);
+                let seq_id = m.alloc_seq_id();
+                m.chat_streaming_with_tools_from_history(
+                    turns,
                     max_new_tokens,
-                    temperature,
-                    top_p,
                     thinking,
-                    session_id,
+                    seq_id,
                     tools,
                     tool_choice,
                     on_event,
@@ -1594,6 +1579,47 @@ impl MlxQwen35Backend {
         self.encode(&prompt)
     }
 
+    /// Phase 2: tool-aware variant of `build_chat_input` that uses Qwen
+    /// 3.6's nested-XML tool template. Returns the token ids AND the
+    /// raw prefill string (which the caller must feed into the
+    /// `Qwen35ResponseParser` before decoding so it starts in the
+    /// correct state for Required/Tool(name) prefills).
+    pub fn build_chat_input_with_tools(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(Vec<u32>, String)> {
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str,
+        };
+        let mut prompt = format_qwen3_chat_with_tools(messages, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        prompt.push_str(&prefill);
+        let ids = self.encode(&prompt)?;
+        Ok((ids, prefill))
+    }
+
+    /// Structured-history variant — used when the request carries
+    /// prior assistant tool_calls or role:"tool" turns.
+    pub fn build_chat_input_with_tools_from_history(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(Vec<u32>, String)> {
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+        };
+        let mut prompt = format_qwen3_chat_with_tools_from_history(turns, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        prompt.push_str(&prefill);
+        let ids = self.encode(&prompt)?;
+        Ok((ids, prefill))
+    }
+
     pub fn alloc_seq_id(&self) -> u64 {
         self.next_seq_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -1806,6 +1832,199 @@ impl MlxQwen35Backend {
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
         Ok(out)
+    }
+
+    /// Phase 2: tool-aware non-streaming chat. Routes through the
+    /// Qwen 3.6 nested-XML chat template and parses any
+    /// `<tool_call>...</tool_call>` blocks from the model's output.
+    /// Bypasses MTP / spec-decode / prefix-cache for now — tool-calling
+    /// is a feature gate and the fast paths can be re-added once the
+    /// happy path is verified on real hardware.
+    pub fn chat_with_tools(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        let (prompt_ids, prefill) =
+            self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            |_ev| Ok(()),
+        )
+    }
+
+    /// Phase 2: tool-aware streaming chat. Emits
+    /// `BackendStreamEvent::Text` for visible-text deltas and
+    /// `BackendStreamEvent::ToolCallStart { name }` the moment the
+    /// parser sees `<function=NAME>`.
+    pub fn chat_streaming_with_tools<F>(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let (prompt_ids, prefill) =
+            self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
+        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, on_event)
+    }
+
+    /// Structured-history non-streaming variant.
+    pub fn chat_with_tools_from_history(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        let (prompt_ids, prefill) =
+            self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            |_ev| Ok(()),
+        )
+    }
+
+    /// Structured-history streaming variant.
+    pub fn chat_streaming_with_tools_from_history<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let (prompt_ids, prefill) =
+            self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
+        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, on_event)
+    }
+
+    /// Shared decode loop for the four tool-aware entry points. Prefill
+    /// the prompt (including any tool_choice prefill suffix), feed the
+    /// prefill string into the parser so its state machine starts at
+    /// the right place (`InToolCallHeader` for Required, `InToolCallBody`
+    /// for Tool(name)), then drive a simple greedy decode loop calling
+    /// the parser on each new text delta and surfacing events upstream.
+    fn chat_with_tools_impl<F>(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        prefill_str: String,
+        max_new_tokens: usize,
+        seq_id: u64,
+        mut on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        use crate::chat_io::BackendStreamEvent;
+        use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
+
+        if prompt_ids.is_empty() {
+            return Err(anyhow!("empty prompt after tokenization"));
+        }
+
+        let mut parser = Qwen35ResponseParser::new();
+        // Prime the parser with the prefill so its state machine
+        // transitions OUT of Visible BEFORE the model starts generating.
+        // Events from the prefill are SUPPRESSED — the engine assigns
+        // the wire id only when the MODEL produces the call, not when
+        // the prompt does.
+        if !prefill_str.is_empty() {
+            let _ = parser.feed(&prefill_str);
+        }
+
+        let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
+        let t_prefill = std::time::Instant::now();
+        let (mut last, mut pos) = self.prefill(seq_id, &prompt_ids)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
+            prompt_ids.len(),
+            prompt_ids.len() as f64 / (prefill_ms / 1000.0)
+        );
+
+        // Detokenize + parser-feed for the first decoded token.
+        let mut generated: Vec<u32> = vec![last];
+        let mut emitted_idx: usize = 0;
+        if let Ok(text) = self.decode(&generated) {
+            if debug_qwen_tools {
+                eprintln!("[qwen35-tools] first decoded text: {text:?}");
+            }
+            if !text.is_empty() && !text.contains('\u{FFFD}') {
+                for ev in parser.feed(&text) {
+                    forward_parse_event(ev, &mut on_event)?;
+                }
+                emitted_idx = generated.len();
+            }
+        }
+        if self.eos_tokens.contains(&last) {
+            self.remove_seq(seq_id).ok();
+            return Ok(parser.finish());
+        }
+
+        let t_decode = std::time::Instant::now();
+        for step in 1..max_new_tokens {
+            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            last = next;
+            pos = new_pos;
+            generated.push(next);
+            let tail_start = emitted_idx;
+            if tail_start < generated.len() {
+                if let Ok(text) = self.decode(&generated[tail_start..]) {
+                    if !text.is_empty() && !text.contains('\u{FFFD}') {
+                        if debug_qwen_tools {
+                            eprintln!("[qwen35-tools] step={step} text={text:?}");
+                        }
+                        for ev in parser.feed(&text) {
+                            forward_parse_event(ev, &mut on_event)?;
+                        }
+                        emitted_idx = generated.len();
+                    }
+                }
+            }
+            if self.eos_tokens.contains(&next) {
+                eprintln!(
+                    "[mlx] seq {seq_id} EOS-tools at step {step} ({:.1} tok/s)",
+                    step as f64 / (t_decode.elapsed().as_secs_f64())
+                );
+                break;
+            }
+        }
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let n_gen = generated.len();
+        eprintln!(
+            "[mlx] seq {seq_id} done-tools: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
+            n_gen as f64 / (decode_ms / 1000.0)
+        );
+        if debug_qwen_tools {
+            let full = self.decode(&generated).unwrap_or_default();
+            eprintln!("[qwen35-tools] full output ({} tokens):\n---\n{full}\n---", n_gen);
+        }
+        self.remove_seq(seq_id).ok();
+        Ok(parser.finish())
     }
 
     /// Prefix-cache-aware variant of `chat_streaming` (Track A1).
@@ -2736,6 +2955,26 @@ fn pick_prefix_eviction_victims(
     }
 
     out
+}
+
+/// Phase 2: bridges Qwen35ResponseParser events to the generic
+/// `BackendStreamEvent` shape the engine consumes. Mirrors the
+/// Gemma 4 `emit_token_event` adapter.
+fn forward_parse_event<F>(
+    ev: crate::qwen3_5_tools::Qwen35ParseEvent,
+    on_event: &mut F,
+) -> Result<()>
+where
+    F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+{
+    use crate::chat_io::BackendStreamEvent;
+    use crate::qwen3_5_tools::Qwen35ParseEvent;
+    match ev {
+        Qwen35ParseEvent::Text(text) => on_event(BackendStreamEvent::Text(&text)),
+        Qwen35ParseEvent::ToolCallStart { name } => {
+            on_event(BackendStreamEvent::ToolCallStart { name: &name })
+        }
+    }
 }
 
 /// Qwen3 chat template — same as `format_qwen3_chat` in lumen-model.

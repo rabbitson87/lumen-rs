@@ -1292,7 +1292,17 @@ pub(crate) mod imp {
             assert_eq!(backend.model_id(), "gemma-4-26b-a4b");
 
             let msgs = vec![("user".to_string(), "Say hi in one word.".to_string())];
-            let resp = backend.chat(&msgs, 8, 0.0, false).expect("chat");
+            let resp = backend
+                .chat(
+                    &msgs,
+                    8,
+                    0.0,
+                    1.0,
+                    false,
+                    &[],
+                    &crate::chat_io::ResolvedToolChoice::Auto,
+                )
+                .expect("chat");
             eprintln!(
                 "[backend-chat] visible={:?} reasoning={:?} tools={}",
                 resp.visible,
@@ -1318,10 +1328,21 @@ pub(crate) mod imp {
             let msgs = vec![("user".to_string(), "Say hi in one word.".to_string())];
             let mut chunks: Vec<String> = Vec::new();
             let resp = backend
-                .chat_streaming(&msgs, 8, false, |chunk| {
-                    chunks.push(chunk.to_string());
-                    Ok(())
-                })
+                .chat_streaming(
+                    &msgs,
+                    8,
+                    0.0,
+                    1.0,
+                    false,
+                    &[],
+                    &crate::chat_io::ResolvedToolChoice::Auto,
+                    |ev| {
+                        if let crate::chat_io::BackendStreamEvent::Text(t) = ev {
+                            chunks.push(t.to_string());
+                        }
+                        Ok(())
+                    },
+                )
                 .expect("chat_streaming");
 
             eprintln!(

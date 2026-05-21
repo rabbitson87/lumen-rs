@@ -1169,7 +1169,7 @@ mod qjl_correctness_tests {
         let wv_b_dq = dequantize_with_mode(
             &wv_b_q,
             &wv_b_scales,
-            &wv_b_biases,
+            wv_b_biases.as_ref(),
             group_size,
             bits,
             MODE_AFFINE,
