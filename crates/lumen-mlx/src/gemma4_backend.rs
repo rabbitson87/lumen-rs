@@ -26,6 +26,7 @@ pub(crate) mod imp {
     use std::path::Path;
     use std::time::Instant;
 
+    use crate::chat_io::BackendStreamEvent;
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
     use crate::gemma4_moe::imp::{GenerateConfig, NativeGemma4Model, NativeGemma4PromptCache};
     use crate::gemma4_response::imp::{ParseState, ParsedResponse, ResponseParser};
@@ -84,6 +85,53 @@ pub(crate) mod imp {
     #[inline]
     fn is_tool_call_boundary(before: ParseState, after: ParseState) -> bool {
         matches!(before, ParseState::ToolCall) || matches!(after, ParseState::ToolCall)
+    }
+
+    /// Phase 1.6c: shared per-token event dispatch. Replaces the
+    /// previous inline visible-token suppression at each callback
+    /// site. Three cases:
+    ///   1. Visible→Visible token (regular text). Decode with
+    ///      `skip_special=true` and emit `BackendStreamEvent::Text`.
+    ///   2. Inside `<|tool_call>...<tool_call|>` body. Decode with
+    ///      `skip_special=false` so the body chars reach the parser,
+    ///      feed `ResponseParser::observe_tool_text_fragment`, and
+    ///      fire `BackendStreamEvent::ToolCallStart{name}` the moment
+    ///      `call:NAME{` becomes parseable. (Args body keeps
+    ///      buffering inside the parser; the engine emits one
+    ///      `ArgumentsDelta` chunk at `<tool_call|>` close.)
+    ///   3. Boundary tokens (`<|tool_call>` open / `<tool_call|>`
+    ///      close). Suppressed — no event fires.
+    fn emit_token_event(
+        chat: &Gemma4ChatTemplate,
+        parser: &mut ResponseParser<'_>,
+        token: u32,
+        state_before: ParseState,
+        on_event: &mut impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let state_after = parser.state();
+        let in_tool_call_span =
+            matches!(state_before, ParseState::ToolCall) || matches!(state_after, ParseState::ToolCall);
+        if !in_tool_call_span {
+            // Pure visible-channel token.
+            let chunk = chat.decode(&[token], true)?;
+            if !chunk.is_empty() {
+                on_event(BackendStreamEvent::Text(&chunk))?;
+            }
+            return Ok(());
+        }
+        // We're inside a tool_call span. Suppress the visible-channel
+        // emit (would leak the body into delta.content), but feed the
+        // body chars to the parser so it can detect `call:NAME{` and
+        // fire the early ToolCallStart event.
+        if matches!(state_after, ParseState::ToolCall) {
+            let body_chunk = chat.decode(&[token], /* skip_special */ false)?;
+            if !body_chunk.is_empty() {
+                if let Some(name) = parser.observe_tool_text_fragment(&body_chunk) {
+                    on_event(BackendStreamEvent::ToolCallStart { name: name.as_str() })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Prefix-cache entry: snapshot of a prompt-prefilled cache that can be
@@ -547,7 +595,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            on_token: impl FnMut(&str) -> Result<()>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
@@ -557,7 +605,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
-                on_token,
+                on_event,
             )
         }
 
@@ -577,7 +625,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            on_token: impl FnMut(&str) -> Result<()>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
@@ -587,7 +635,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
-                on_token,
+                on_event,
             )
         }
 
@@ -598,7 +646,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
-            mut on_token: impl FnMut(&str) -> Result<()>,
+            mut on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             // ── Manual prefill + decode loop so we can inject the
             //    on_token callback between steps.
@@ -768,12 +816,13 @@ pub(crate) mod imp {
                     all_tokens.push(first_tok);
                     let state_before = parser.state();
                     parser.push(first_tok)?;
-                    if !is_tool_call_boundary(state_before, parser.state()) {
-                        let chunk = self.chat.decode(&[first_tok], true)?;
-                        if !chunk.is_empty() {
-                            on_token(&chunk)?;
-                        }
-                    }
+                    emit_token_event(
+                        &self.chat,
+                        &mut parser,
+                        first_tok,
+                        state_before,
+                        &mut on_event,
+                    )?;
 
                     if !eos.contains(&first_tok) {
                         let mut current_u32 = first_tok;
@@ -798,12 +847,13 @@ pub(crate) mod imp {
                             all_tokens.push(next_tok);
                             let state_before = parser.state();
                             parser.push(next_tok)?;
-                            if !is_tool_call_boundary(state_before, parser.state()) {
-                                let decoded = self.chat.decode(&[next_tok], true)?;
-                                if !decoded.is_empty() {
-                                    on_token(&decoded)?;
-                                }
-                            }
+                            emit_token_event(
+                                &self.chat,
+                                &mut parser,
+                                next_tok,
+                                state_before,
+                                &mut on_event,
+                            )?;
                             if eos.contains(&next_tok) {
                                 break;
                             }
@@ -917,12 +967,13 @@ pub(crate) mod imp {
                             .context("chat_streaming: read final token")?;
                         let state_before = parser.state();
                         parser.push(token)?;
-                        if !is_tool_call_boundary(state_before, parser.state()) {
-                            let chunk = self.chat.decode(&[token], true)?;
-                            if !chunk.is_empty() {
-                                on_token(&chunk)?;
-                            }
-                        }
+                        emit_token_event(
+                            &self.chat,
+                            &mut parser,
+                            token,
+                            state_before,
+                            &mut on_event,
+                        )?;
                         break;
                     }
 
@@ -1007,12 +1058,13 @@ pub(crate) mod imp {
                     let state_before = parser.state();
                     parser.push(token)?;
                     count += 1;
-                    if !is_tool_call_boundary(state_before, parser.state()) {
-                        let chunk = self.chat.decode(&[token], true)?;
-                        if !chunk.is_empty() {
-                            on_token(&chunk)?;
-                        }
-                    }
+                    emit_token_event(
+                        &self.chat,
+                        &mut parser,
+                        token,
+                        state_before,
+                        &mut on_event,
+                    )?;
 
                     // Stop Metal capture after `capture_steps` decode steps.
                     // We do this AFTER reading the token so the synchronously

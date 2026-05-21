@@ -55,6 +55,18 @@ pub(crate) mod imp {
         reasoning_tokens: Vec<u32>,
         tool_tokens: Vec<u32>,
         tool_calls: Vec<ParsedToolCall>,
+        /// Phase 1.6c: incremental tool-call name detection state.
+        /// Cleared at each `<|tool_call>` open. Holds the decoded
+        /// prefix of the current tool-call body so we can fire a
+        /// `ToolCallStart{name}` event the moment `call:NAME{` is
+        /// parseable — typically 10-30ms into decode vs 200-500ms
+        /// at full-buffer flush.
+        tool_text_prefix: String,
+        /// Set true after we've fired the name event for the current
+        /// `<|tool_call>…<tool_call|>` span. Prevents double-firing
+        /// when more body tokens arrive after the name was already
+        /// detected.
+        tool_name_emitted: bool,
     }
 
     impl<'a> ResponseParser<'a> {
@@ -66,6 +78,8 @@ pub(crate) mod imp {
                 reasoning_tokens: Vec::new(),
                 tool_tokens: Vec::new(),
                 tool_calls: Vec::new(),
+                tool_text_prefix: String::new(),
+                tool_name_emitted: false,
             }
         }
 
@@ -91,6 +105,8 @@ pub(crate) mod imp {
                 (ParseState::Visible, t) if t == TOK_TOOL_CALL_OPEN => {
                     self.state = ParseState::ToolCall;
                     self.tool_tokens.clear();
+                    self.tool_text_prefix.clear();
+                    self.tool_name_emitted = false;
                 }
                 (ParseState::ToolCall, t) if t == TOK_TOOL_CALL_CLOSE => {
                     let raw = self
@@ -101,6 +117,8 @@ pub(crate) mod imp {
                         self.tool_calls.push(call);
                     }
                     self.tool_tokens.clear();
+                    self.tool_text_prefix.clear();
+                    self.tool_name_emitted = false;
                     self.state = ParseState::Visible;
                 }
 
@@ -110,6 +128,67 @@ pub(crate) mod imp {
                 (ParseState::ToolCall, _) => self.tool_tokens.push(token),
             }
             Ok(())
+        }
+
+        /// Phase 1.6c: incremental tool-call name detection. Append
+        /// the decoded text fragment of the most recently pushed
+        /// token (text decoded with `skip_special=false` so the body
+        /// chars are visible) and return `Some(name)` exactly once
+        /// per `<|tool_call>` span — at the moment `call:NAME{` first
+        /// becomes parseable. Subsequent calls within the same span
+        /// return `None`. Returns `None` at all times outside a
+        /// `ToolCall` state.
+        ///
+        /// The HTTP / SSE layer uses this to emit the OpenAI
+        /// `delta.tool_calls[].function.name` (or Anthropic
+        /// `content_block_start tool_use`) chunk early, BEFORE the
+        /// args body has been fully buffered. Args still emit in
+        /// one chunk at `<|tool_call>` close (Approach C — args
+        /// buffered, start eager).
+        pub fn observe_tool_text_fragment(&mut self, fragment: &str) -> Option<String> {
+            if !matches!(self.state, ParseState::ToolCall) {
+                return None;
+            }
+            if self.tool_name_emitted {
+                return None;
+            }
+            self.tool_text_prefix.push_str(fragment);
+            // Look for the first `call:NAME{` pattern. Bytes are
+            // ASCII-only in this prefix path; NAME chars are
+            // `[A-Za-z0-9_-]`. Whitespace between NAME and `{` is
+            // tolerated (mirrors the post-buffer parser).
+            let bytes = self.tool_text_prefix.as_bytes();
+            let needle = b"call:";
+            let Some(start) = bytes
+                .windows(needle.len())
+                .position(|w| w == needle)
+            else {
+                return None;
+            };
+            let name_start = start + needle.len();
+            let mut name_end = name_start;
+            while name_end < bytes.len() {
+                let c = bytes[name_end];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+                    name_end += 1;
+                } else {
+                    break;
+                }
+            }
+            if name_end == name_start {
+                return None;
+            }
+            // Tolerate whitespace between NAME and `{`.
+            let mut brace_pos = name_end;
+            while brace_pos < bytes.len() && bytes[brace_pos].is_ascii_whitespace() {
+                brace_pos += 1;
+            }
+            if brace_pos >= bytes.len() || bytes[brace_pos] != b'{' {
+                return None;
+            }
+            let name = String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned();
+            self.tool_name_emitted = true;
+            Some(name)
         }
 
         /// Finalize the parser, decoding accumulated buffers into strings.

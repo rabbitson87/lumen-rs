@@ -97,6 +97,27 @@ pub struct AssistantToolCall<'a> {
     pub arguments: &'a JsonValue,
 }
 
+/// Phase 1.6c: streaming events emitted from the backend's decode loop
+/// up to the engine. Replaces the old `Fn(&str)` text-only callback so
+/// backends can also signal "I just parsed the name of a tool call"
+/// before the full tool-call body is produced, shaving 200-400ms off
+/// the time-to-first-tool-call-chunk for clients (Claude Code, Cursor,
+/// Aider, etc.) that render a "🔧 calling <name>..." indicator.
+///
+/// The id is NOT emitted by the backend — the HTTP layer assigns
+/// wire ids (`call_…` / `toolu_…`) when relaying to SSE.
+#[derive(Debug, Clone)]
+pub enum BackendStreamEvent<'a> {
+    /// Visible-text delta (the assistant's natural-language reply).
+    Text(&'a str),
+    /// Backend's parser has identified the start of a tool call —
+    /// it's seen `call:NAME{` and accumulated `NAME`. Args body is
+    /// not yet known; the engine emits the SSE start chunk now and
+    /// fills in args via a separate `ArgumentsDelta` event after
+    /// the backend finishes parsing the body.
+    ToolCallStart { name: &'a str },
+}
+
 /// Phase 1.6: normalized tool-choice intent passed from the HTTP layer
 /// to the backend renderer. OpenAI's `ToolChoice` and Anthropic's
 /// `AnthropicToolChoice` both map onto this — `Auto` is the default

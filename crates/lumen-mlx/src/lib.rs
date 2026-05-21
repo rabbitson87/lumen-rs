@@ -977,11 +977,12 @@ impl MlxBackend {
         }
     }
 
-    /// Unified streaming chat — same shape as `chat` but with a token callback.
-    /// `on_token` receives visible-text deltas only (reasoning + tool_call
-    /// tokens are demux'd before the callback fires for Gemma 4; Qwen35
-    /// streams raw deltas as it has no demux). The final `ParsedResponse`
-    /// carries the full structured result including any tool_calls.
+    /// Unified streaming chat — same shape as `chat` but with an event callback.
+    /// `on_event` receives `BackendStreamEvent::Text` for visible-text deltas
+    /// and `BackendStreamEvent::ToolCallStart { name }` when the backend's
+    /// parser identifies the start of a tool call (Gemma 4 only at Phase 1.6c;
+    /// Qwen35 family emits Text only). The final `ParsedResponse` carries
+    /// the full structured result including any tool_calls.
     pub fn chat_streaming<F>(
         &mut self,
         messages: &[(String, String)],
@@ -992,20 +993,41 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        mut on_token: F,
+        mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        use crate::chat_io::ParsedResponse;
+        use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
                 let _ = (top_p, tools, tool_choice);
+                // Qwen35 has no tool-call demux yet — adapter wraps every
+                // visible-text delta as a Text event.
+                let mut text_adapter = |chunk: &str| {
+                    // Inner Qwen35 callbacks are infallible `FnMut(&str)`;
+                    // we swallow any propagation errors from `on_event` here
+                    // (rare — SSE channel-closed is the realistic case and
+                    // higher layers detect it independently).
+                    let _ = on_event(BackendStreamEvent::Text(chunk));
+                };
                 let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)?
+                    m.chat_streaming_session(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        sid,
+                        &mut text_adapter,
+                    )?
                 } else {
                     let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, on_token)?
+                    m.chat_streaming(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        &mut text_adapter,
+                    )?
                 };
                 Ok(ParsedResponse {
                     visible,
@@ -1024,10 +1046,7 @@ impl MlxBackend {
                     thinking,
                     tools,
                     tool_choice,
-                    |chunk| {
-                        on_token(chunk);
-                        Ok(())
-                    },
+                    on_event,
                 )
             }
         }
@@ -1048,10 +1067,10 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        mut on_token: F,
+        on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
         use crate::chat_io::ParsedResponse;
         match self {
@@ -1084,7 +1103,7 @@ impl MlxBackend {
                     session_id,
                     tools,
                     tool_choice,
-                    on_token,
+                    on_event,
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -1098,10 +1117,7 @@ impl MlxBackend {
                     thinking,
                     tools,
                     tool_choice,
-                    |chunk| {
-                        on_token(chunk);
-                        Ok(())
-                    },
+                    on_event,
                 )
             }
         }

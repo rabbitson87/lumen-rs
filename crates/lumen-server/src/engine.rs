@@ -2,7 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use lumen_mlx::chat_io::{
-    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ResolvedToolChoice, ToolDef,
+    AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
+    ResolvedToolChoice, ToolDef,
 };
 use lumen_model::gemma::GemmaModel;
 use lumen_model::gemma_gguf::GemmaGgufModel;
@@ -270,38 +271,42 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
-        on_token: F,
+        mut on_event: F,
     ) -> Result<ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
     {
         match self {
             Self::GemmaGguf(m) => {
                 let _ = (top_p, tools, tool_choice);
+                let mut adapter = |chunk: &str| {
+                    let _ = on_event(BackendStreamEvent::Text(chunk));
+                };
                 let visible =
-                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
+                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, &mut adapter)?;
                 Ok(text_only_response(visible))
             }
             // Fallback: generate all, send as one chunk
             Self::Qwen(m) => {
                 let _ = (top_p, tools, tool_choice);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
-                let mut on_token = on_token;
-                on_token(&text);
+                on_event(BackendStreamEvent::Text(&text))?;
                 Ok(text_only_response(text))
             }
             Self::Gemma(m) => {
                 let _ = (top_p, tools, tool_choice);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
-                let mut on_token = on_token;
-                on_token(&text);
+                on_event(BackendStreamEvent::Text(&text))?;
                 Ok(text_only_response(text))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
                 let _ = (top_p, tools, tool_choice);
+                let mut adapter = |chunk: &str| {
+                    let _ = on_event(BackendStreamEvent::Text(chunk));
+                };
                 let visible =
-                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
+                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, &mut adapter)?;
                 Ok(text_only_response(visible))
             }
             Self::Mlx(m) => m.chat_streaming(
@@ -313,7 +318,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
-                on_token,
+                on_event,
             ),
         }
     }
@@ -391,10 +396,10 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
-        on_token: F,
+        on_event: F,
     ) -> Result<ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
     {
         if let Self::Mlx(m) = self {
             return m.chat_streaming_from_history(
@@ -406,7 +411,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
-                on_token,
+                on_event,
             );
         }
         let plain = flatten_turns_for_plain_backend(turns);
@@ -419,7 +424,7 @@ impl ModelBackend {
             session_id,
             tools,
             tool_choice,
-            on_token,
+            on_event,
         )
     }
 }
@@ -1296,6 +1301,12 @@ impl InferenceEngine {
         // chat_completion non-stream path. Owning buffers
         // (`arg_values`, `assistant_tc_buf`) keep ChatTurn borrows
         // stable until the call returns.
+        // Phase 1.6c: tracks tool_calls the backend's parser announced
+        // mid-decode via `BackendStreamEvent::ToolCallStart`. Lives
+        // outside both branches so the post-decode emission loop can
+        // skip Start chunks already on the wire.
+        let mut early_tc: Vec<(String, u32, String)> = Vec::new();
+        let mut next_index: u32 = 0;
         let result = if needs_structured {
             let arg_values: Vec<serde_json::Value> = req
                 .messages
@@ -1366,8 +1377,24 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                |text: &str| {
-                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                |ev: BackendStreamEvent<'_>| -> Result<()> {
+                    match ev {
+                        BackendStreamEvent::Text(t) => {
+                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::ToolCallStart { name } => {
+                            let idx = next_index;
+                            next_index += 1;
+                            let id = format!("call_{}", gen_id());
+                            early_tc.push((name.to_string(), idx, id.clone()));
+                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                                index: idx,
+                                id,
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
                 },
             )
         } else {
@@ -1380,8 +1407,24 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                |text: &str| {
-                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                |ev: BackendStreamEvent<'_>| -> Result<()> {
+                    match ev {
+                        BackendStreamEvent::Text(t) => {
+                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::ToolCallStart { name } => {
+                            let idx = next_index;
+                            next_index += 1;
+                            let id = format!("call_{}", gen_id());
+                            early_tc.push((name.to_string(), idx, id.clone()));
+                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                                index: idx,
+                                id,
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
                 },
             )
         };
@@ -1390,22 +1433,38 @@ impl InferenceEngine {
             Ok(parsed) => {
                 // Phase 1.5: emit each parsed tool_call as the
                 // start / arguments / stop trio so the SSE layer can
-                // synthesize OpenAI `delta.tool_calls` chunks. We do
-                // this AFTER the visible-text Delta stream so existing
-                // clients that ignore tool_calls still see the natural
-                // text first. MVP: single arguments chunk per call;
-                // future token-aware backends may split.
+                // synthesize OpenAI `delta.tool_calls` chunks. Phase
+                // 1.6c: if the backend already announced this call
+                // via `BackendStreamEvent::ToolCallStart`, skip the
+                // redundant Start (we just emit ArgumentsDelta + Stop
+                // with the matching index).
+                //
+                // NOTE: `early_tc` lives inside the `if/else` branch
+                // above so it's not visible here — we re-derive
+                // index/id from the call order. The early Start chunks
+                // already went out on the wire; this loop only owns
+                // ArgumentsDelta + Stop.
                 let has_tool_calls = !parsed.tool_calls.is_empty();
                 for (i, call) in parsed.tool_calls.iter().enumerate() {
-                    let index = i as u32;
-                    let id = format!("call_{}", gen_id());
+                    // Phase 1.6c: if the backend already announced
+                    // this call mid-decode (early_tc[i] matches by
+                    // name) we reuse its (index, id). Otherwise emit
+                    // a fresh Start now — covers legacy backends that
+                    // don't fire `BackendStreamEvent::ToolCallStart`.
+                    let (index, already_started) = match early_tc.get(i) {
+                        Some((name, idx, _)) if name == &call.name => (*idx, true),
+                        _ => (i as u32, false),
+                    };
+                    if !already_started {
+                        let id = format!("call_{}", gen_id());
+                        let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                            index,
+                            id,
+                            name: call.name.clone(),
+                        });
+                    }
                     let args =
                         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                        index,
-                        id,
-                        name: call.name.clone(),
-                    });
                     let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
                         index,
                         partial_json: args,
@@ -1475,6 +1534,11 @@ impl InferenceEngine {
         // (`assistant_text_buf`, `assistant_tc_buf`, `tool_result_buf`,
         // `user_text_buf`) so ChatTurn borrows stay alive across the
         // backend call.
+        //
+        // Phase 1.6c: tracks tool_calls the backend announced mid-decode
+        // so the post-decode loop skips redundant Start chunks.
+        let mut early_tc: Vec<(String, u32, String)> = Vec::new();
+        let mut next_index: u32 = 0;
         let result = if needs_structured {
             let assistant_text_buf: Vec<String> = req
                 .messages
@@ -1610,8 +1674,24 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                |text: &str| {
-                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                |ev: BackendStreamEvent<'_>| -> Result<()> {
+                    match ev {
+                        BackendStreamEvent::Text(t) => {
+                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::ToolCallStart { name } => {
+                            let idx = next_index;
+                            next_index += 1;
+                            let id = format!("toolu_{}", gen_id());
+                            early_tc.push((name.to_string(), idx, id.clone()));
+                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                                index: idx,
+                                id,
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
                 },
             )
         } else {
@@ -1624,8 +1704,24 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                |text: &str| {
-                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                |ev: BackendStreamEvent<'_>| -> Result<()> {
+                    match ev {
+                        BackendStreamEvent::Text(t) => {
+                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::ToolCallStart { name } => {
+                            let idx = next_index;
+                            next_index += 1;
+                            let id = format!("toolu_{}", gen_id());
+                            early_tc.push((name.to_string(), idx, id.clone()));
+                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                                index: idx,
+                                id,
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
                 },
             )
         };
@@ -1634,15 +1730,20 @@ impl InferenceEngine {
             Ok(parsed) => {
                 let has_tool_calls = !parsed.tool_calls.is_empty();
                 for (i, call) in parsed.tool_calls.iter().enumerate() {
-                    let index = i as u32;
-                    let id = format!("toolu_{}", gen_id());
+                    let (index, already_started) = match early_tc.get(i) {
+                        Some((name, idx, _)) if name == &call.name => (*idx, true),
+                        _ => (i as u32, false),
+                    };
+                    if !already_started {
+                        let id = format!("toolu_{}", gen_id());
+                        let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                            index,
+                            id,
+                            name: call.name.clone(),
+                        });
+                    }
                     let args =
                         serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                    let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                        index,
-                        id,
-                        name: call.name.clone(),
-                    });
                     let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
                         index,
                         partial_json: args,
