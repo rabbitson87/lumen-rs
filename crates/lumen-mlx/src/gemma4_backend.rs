@@ -43,6 +43,55 @@ pub(crate) mod imp {
     /// preserves existing behavior. Operators flip `REPEAT_PENALTY` to
     /// ~1.1 in the app's SERVER card to suppress degenerate loops on
     /// aggressively quantized models (3-bit MXFP4 etc.).
+    /// Emit the canonical `[gemma4] chat done:` log split into prefill
+    /// (prompt-processing), decode (per-step generation), and the
+    /// composite end-to-end rate.
+    ///
+    /// The user-perceived "answer is slow" complaint usually has a
+    /// specific bottleneck — short prompt + long answer = decode-bound;
+    /// long prompt + short answer = prefill-bound. Reporting only the
+    /// decode rate (the previous behavior) hid which one was the
+    /// problem and tempted users to chase the wrong knob (`bits`,
+    /// `sliding`, quant level — none of which help if prefill is the
+    /// limiter).
+    ///
+    /// Output shape (the order matters — `lumen-app`'s
+    /// `parse_tok_per_sec` picks the LAST `(N.N tok/s)` group, so
+    /// putting e2e last surfaces it in the UI):
+    ///
+    ///   `[gemma4] chat done: prefill P tok in Pms ({P_tps} tok/s) | decode D tok in Dms ({D_tps} tok/s) | e2e E tok in Ems ({E_tps} tok/s)`
+    ///
+    /// Where E_tps uses `decode_tokens / (prefill_ms + decode_ms)` —
+    /// the e2e rate from the user's perspective is determined by
+    /// answer tokens produced over total wall-clock, not (prompt +
+    /// answer) / wall-clock.
+    fn log_chat_done(
+        prefill_tokens: usize,
+        prefill_ms: f64,
+        decode_tokens: usize,
+        decode_ms: f64,
+    ) {
+        let p_tps = if prefill_ms > 0.0 && prefill_tokens > 0 {
+            prefill_tokens as f64 / (prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let d_tps = if decode_ms > 0.0 && decode_tokens > 0 {
+            decode_tokens as f64 / (decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let e2e_ms = prefill_ms + decode_ms;
+        let e_tps = if e2e_ms > 0.0 && decode_tokens > 0 {
+            decode_tokens as f64 / (e2e_ms / 1000.0)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[gemma4] chat done: prefill {prefill_tokens} tok in {prefill_ms:.0}ms ({p_tps:.1} tok/s) | decode {decode_tokens} tok in {decode_ms:.0}ms ({d_tps:.1} tok/s) | e2e {decode_tokens} tok in {e2e_ms:.0}ms ({e_tps:.1} tok/s)"
+        );
+    }
+
     fn build_sampling_config(temperature: f32, top_p: f32) -> Option<SamplingConfig> {
         let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
             .ok()
@@ -367,9 +416,11 @@ pub(crate) mod imp {
                 sampling: build_sampling_config(temperature, top_p),
             };
             let stats = self.model.generate(&prompt, &cfg)?;
-            eprintln!(
-                "[gemma4] chat done: {} tokens in {:.0}ms ({:.1} tok/s)",
-                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            log_chat_done(
+                stats.prompt_tokens,
+                stats.prefill_ms,
+                stats.decode_steps,
+                stats.decode_ms,
             );
 
             let mut parser = ResponseParser::new(&self.chat);
@@ -520,9 +571,11 @@ pub(crate) mod imp {
                 .model
                 .generate_with_cache(suffix, &cfg, Some(&mut cache))
                 .context("chat_with_prefix_cache: generate_with_cache")?;
-            eprintln!(
-                "[gemma4] chat done: {} tokens in {:.0}ms ({:.1} tok/s)",
-                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+            log_chat_done(
+                stats.prompt_tokens,
+                stats.prefill_ms,
+                stats.decode_steps,
+                stats.decode_ms,
             );
 
             // ── Snapshot post-prompt state as the new master ──
@@ -718,6 +771,13 @@ pub(crate) mod imp {
                     chunk_size,
                     prompt.len()
                 );
+                // Wall-clock spanning all chunks + the final async_eval —
+                // surfaces prefill cost separately in the chat done log
+                // so users can see whether a slow response was prompt
+                // processing or generation (the two costs are very
+                // different per-token).
+                let t_prefill_total = std::time::Instant::now();
+                let prefill_prompt_tokens = prompt.len();
                 let mut logits_opt: Option<mlx_rs::Array> = None;
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     let t0 = std::time::Instant::now();
@@ -776,6 +836,7 @@ pub(crate) mod imp {
                     .context("chat_streaming: prefill argmax_lazy")?;
                 mlx_rs::transforms::async_eval([&current])
                     .context("chat_streaming: prefill async_eval")?;
+                let prefill_total_ms = t_prefill_total.elapsed().as_secs_f64() * 1000.0;
 
                 // tested mlx-lm's `mx.clear_cache()`
                 // post-prefill pattern (generate.py:451) → NEGATIVE -4.4σ
@@ -862,13 +923,11 @@ pub(crate) mod imp {
                     }
                     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
                     let count = all_tokens.len();
-                    let tok_per_sec = if decode_ms > 0.0 && count > 0 {
-                        count as f64 / (decode_ms / 1000.0)
-                    } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "[gemma4] chat done: {count} tokens in {decode_ms:.0}ms ({tok_per_sec:.1} tok/s)"
+                    log_chat_done(
+                        prefill_prompt_tokens,
+                        prefill_total_ms,
+                        count,
+                        decode_ms,
                     );
                     return parser.finalize();
                 }
@@ -1086,13 +1145,11 @@ pub(crate) mod imp {
                     current = next_lazy;
                 }
                 let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-                let tok_per_sec = if decode_ms > 0.0 && count > 0 {
-                    count as f64 / (decode_ms / 1000.0)
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[gemma4] chat done: {count} tokens in {decode_ms:.0}ms ({tok_per_sec:.1} tok/s)"
+                log_chat_done(
+                    prefill_prompt_tokens,
+                    prefill_total_ms,
+                    count,
+                    decode_ms,
                 );
 
                 // Defensive: ensure capture is stopped even if loop ends early

@@ -153,7 +153,11 @@ fn parse_tok_per_sec(line: &str) -> Option<f64> {
     if !line.contains("done:") {
         return None;
     }
-    if let Some(idx) = line.find(" tok/s)") {
+    // Take the LAST " tok/s)" occurrence so a multi-rate done line
+    // (`prefill ... (X tok/s) | decode ... (Y tok/s) | e2e ... (Z
+    // tok/s)`) reports the end-to-end Z — what the user actually
+    // perceives — rather than the prefill X they'd otherwise see.
+    if let Some(idx) = line.rfind(" tok/s)") {
         let prefix = &line[..idx];
         let num: String = prefix
             .chars()
@@ -223,6 +227,16 @@ mod parse_tests {
         // gemma4_backend emits this format from chat / completion paths.
         let line = "[gemma4] chat done: 42 tokens in 1530ms (27.5 tok/s)";
         assert!((parse_tok_per_sec(line).unwrap() - 27.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_gemma4_done_picks_e2e_from_multi_rate_line() {
+        // New (post split-prefill-vs-decode) format. Three rates in one
+        // line; the parser must surface the LAST one (end-to-end) so the
+        // tok/s number the user sees in the UI matches their wall-clock
+        // experience, not the prefill burst that always looks faster.
+        let line = "[gemma4] chat done: prefill 12tok in 250ms (48.0 tok/s) | decode 100tok in 2000ms (50.0 tok/s) | e2e 112tok in 2250ms (49.8 tok/s)";
+        assert!((parse_tok_per_sec(line).unwrap() - 49.8).abs() < 1e-6);
     }
 }
 
