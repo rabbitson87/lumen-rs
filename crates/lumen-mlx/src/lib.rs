@@ -40,6 +40,7 @@ mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;
 mod gemma4_sampling;
+mod gemma4_tools;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).
@@ -75,6 +76,9 @@ pub mod gemma4 {
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
         TOK_TOOL_CALL_OPEN,
+    };
+    pub use crate::gemma4_tools::imp::{
+        ToolDef, render_tool_definitions, render_tool_definitions_text,
     };
 
     /// MTP (Multi-Token Prediction) drafter for Gemma 4. Phase 1: types +
