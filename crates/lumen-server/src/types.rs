@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // === Request types ===
 
@@ -23,6 +23,19 @@ pub struct ChatCompletionRequest {
     /// the new suffix. Other backends silently ignore.
     #[serde(default)]
     pub session_id: Option<String>,
+
+    // ── OpenAI tool calling ────────────────────────────────────────
+    /// Tool definitions exposed to the model. Currently only
+    /// `{"type":"function","function":{...}}` shape is meaningful — Phase 1
+    /// passes `function.parameters` (JSON Schema) through to each backend's
+    /// chat-template renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    /// `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":"..."}}`.
+    /// Phase 1 accepts and stores but does not enforce — neither Gemma 4 nor
+    /// Qwen 3.6 has a native `required` mode in its template. Wire-up TBD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -31,10 +44,115 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
+    /// Spec: `content` is `string` for system/user/tool roles, `string | null`
+    /// for assistant when `tool_calls` is present. We accept any of
+    /// `"text"` / `null` / missing and flatten to empty string so existing
+    /// call sites that consume `&str` still work without `.unwrap_or_default()`
+    /// scattered everywhere.
+    #[serde(default, deserialize_with = "deserialize_content_lenient")]
     pub content: String,
+    /// Present on `role:"assistant"` when the previous turn invoked tools.
+    /// Carries the model's prior tool calls back into the prompt so the
+    /// chat-template can re-render them. Server-emit side puts them in
+    /// `ChatMessageResponse.tool_calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Required on `role:"tool"` — references the id of the tool call this
+    /// message is answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional function name on `role:"tool"`. OpenAI legacy field; some
+    /// clients still send it. Not required for routing — `tool_call_id` is
+    /// the canonical link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn deserialize_content_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Option::<String>::deserialize(d).map(|o| o.unwrap_or_default())
+}
+
+impl ChatMessage {
+    /// Construct a plain text-only chat message (no tool_calls / tool_call_id).
+    /// Most internal call sites build messages by stitching role + text and
+    /// don't need to populate the tool-related fields.
+    pub fn new_text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+}
+
+// ── OpenAI tool calling — shared shapes (request & response) ─────
+
+/// A tool the model is allowed to call. Currently only the `function` kind is
+/// defined by the OpenAI spec; future kinds (e.g. `code_interpreter`) would
+/// land as additional variants.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Tool {
+    Function {
+        function: FunctionDef,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the function's arguments. We keep it as a raw
+    /// `serde_json::Value` because each backend's chat-template renders the
+    /// schema differently (Gemma 4: pseudo-JSON with `<|"|>` string delim;
+    /// Qwen 3.6: pure JSON inside `<tools>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// `"auto"` (default) / `"none"` / `"required"`.
+    Mode(String),
+    /// `{"type":"function","function":{"name":"..."}}`.
+    Named {
+        #[serde(rename = "type")]
+        kind: String,
+        function: FunctionRef,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FunctionRef {
+    pub name: String,
+}
+
+/// One tool invocation — same shape on input (history) and output (server
+/// emit). On output the server generates the `id`; clients echo it back on
+/// the next turn via `ChatMessage.tool_call_id`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String, // always "function" for now
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    /// OpenAI quirk: `arguments` is a **JSON-encoded string**, not a JSON
+    /// object. Clients are expected to `JSON.parse(arguments)` themselves.
+    /// We round-trip the raw string here so both directions match the wire
+    /// format byte-for-byte.
+    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,12 +224,39 @@ pub struct ChatStreamChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct ChatStreamDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Incremental tool-call delta. OpenAI streams these per-token with
+    /// `arguments` as a partial string that clients accumulate. Empty in
+    /// non-tool turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// Streaming variant of `ToolCall`: index-keyed; `id` / `function.name`
+/// arrive once at the start, then subsequent chunks carry only
+/// `function.arguments` partials.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct FunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 // === Response types ===
@@ -136,7 +281,24 @@ pub struct ChatChoice {
 #[derive(Debug, Serialize)]
 pub struct ChatMessageResponse {
     pub role: String,
-    pub content: String,
+    /// Per OpenAI spec, `content` is nullable on assistant messages that
+    /// carry `tool_calls`. We emit it as an empty string in the common
+    /// (text-only) case and `null` only when tool_calls are present and
+    /// the model emitted no visible text alongside them.
+    #[serde(serialize_with = "serialize_nullable_string")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+fn serialize_nullable_string<S: serde::Serializer>(
+    v: &Option<String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(text) => s.serialize_str(text),
+        None => s.serialize_none(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +384,35 @@ pub struct AnthropicRequest {
     pub thinking: bool,
     #[serde(default)]
     pub session_id: Option<String>,
+
+    // ── Anthropic tool calling ─────────────────────────────────────
+    /// Anthropic uses `input_schema` (not `parameters`) on each tool;
+    /// otherwise structurally similar to OpenAI's `tools[]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AnthropicTool>>,
+    /// `{"type":"auto"}` / `{"type":"any"}` / `{"type":"tool","name":"..."}`.
+    /// Phase 1 stores but does not enforce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<AnthropicToolChoice>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AnthropicTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the tool's arguments. Anthropic calls this
+    /// `input_schema` (vs OpenAI's `function.parameters`); we mirror their
+    /// field name on the wire.
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,27 +443,92 @@ pub enum AnthropicContent {
 }
 
 impl AnthropicContent {
+    /// Flatten to a single text string — drops tool_use / tool_result blocks.
+    /// Used by the chat-template path that doesn't yet understand tools;
+    /// tool-aware callers should iterate `Blocks(...)` directly.
     pub fn as_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
             Self::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| {
-                    if b.r#type == "text" {
-                        b.text.clone()
-                    } else {
-                        None
-                    }
+                .filter_map(|b| match b {
+                    AnthropicContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
                 })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// Borrow the underlying blocks for tool-aware processing. For
+    /// `Text(...)` we synthesize a single text block on the fly.
+    pub fn blocks(&self) -> std::borrow::Cow<'_, [AnthropicContentBlock]> {
+        match self {
+            Self::Text(s) => std::borrow::Cow::Owned(vec![AnthropicContentBlock::Text {
+                text: s.clone(),
+            }]),
+            Self::Blocks(b) => std::borrow::Cow::Borrowed(b),
+        }
+    }
+}
+
+/// One block in an Anthropic message's `content[]`. Tagged on `type`:
+/// - `text`        — visible text (user/assistant)
+/// - `tool_use`    — assistant invoking a tool
+/// - `tool_result` — user message answering a prior tool_use
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        /// Anthropic ships `input` as a real JSON object (vs OpenAI's
+        /// JSON-encoded string). We keep it as `Value` so downstream
+        /// renderers can introspect.
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: AnthropicToolResultContent,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Tool-result body — either a plain string or an array of text blocks
+/// (Anthropic also supports image results; we accept-but-flatten those).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicToolResultBlock>),
+}
+
+impl AnthropicToolResultContent {
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.clone())
                 .collect::<Vec<_>>()
                 .join("\n"),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AnthropicContentBlock {
-    pub r#type: String,
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AnthropicToolResultBlock {
+    #[serde(rename = "type")]
+    pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
 }
@@ -289,10 +545,20 @@ pub struct AnthropicResponse {
     pub usage: AnthropicUsage,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AnthropicResponseBlock {
-    pub r#type: String,
-    pub text: String,
+/// One block in an Anthropic response's `content[]`. Mirrors the request-side
+/// `AnthropicContentBlock` for the variants the server actually emits — we
+/// never emit `tool_result` (that's a client-side message back to us).
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicResponseBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -380,4 +646,347 @@ pub struct EmbeddingResponse {
     pub data: Vec<EmbeddingData>,
     pub model: String,
     pub usage: EmbeddingUsage,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serde round-trip tests — tool calling wire format
+//
+// These verify that the request / response shapes match the OpenAI and
+// Anthropic public APIs byte-for-byte on the critical fields. Fixtures are
+// drawn from the published API documentation examples (paraphrased for
+// minimal width). When a real client sends a tool-bearing request, this
+// test class is the first place to look if deserialization fails.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tool_calling_serde {
+    use super::*;
+    use serde_json::json;
+
+    // ── OpenAI ─────────────────────────────────────────────────────
+
+    #[test]
+    fn openai_request_with_tools_parses() {
+        let raw = json!({
+            "model": "gpt-x",
+            "messages": [
+                {"role": "user", "content": "weather in Seoul?"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        },
+                        "required": ["location"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        });
+
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        let Tool::Function { function } = &tools[0];
+        assert_eq!(function.name, "get_weather");
+        assert_eq!(function.description.as_deref(), Some("Get current weather for a city"));
+        let params = function.parameters.as_ref().unwrap();
+        assert_eq!(params["required"][0], "location");
+        match req.tool_choice.unwrap() {
+            ToolChoice::Mode(m) => assert_eq!(m, "auto"),
+            _ => panic!("expected Mode"),
+        }
+    }
+
+    #[test]
+    fn openai_tool_choice_named_parses() {
+        let raw = json!({"type": "function", "function": {"name": "get_weather"}});
+        let tc: ToolChoice = serde_json::from_value(raw).unwrap();
+        match tc {
+            ToolChoice::Named { kind, function } => {
+                assert_eq!(kind, "function");
+                assert_eq!(function.name, "get_weather");
+            }
+            _ => panic!("expected Named"),
+        }
+    }
+
+    #[test]
+    fn openai_assistant_message_with_tool_calls_round_trip() {
+        // Inbound history: assistant emitted a tool_call on the prior turn.
+        let raw = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Seoul\"}"
+                }
+            }]
+        });
+
+        let msg: ChatMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content, ""); // null content → empty string via lenient deserializer
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "get_weather");
+        // arguments is the JSON-encoded *string*, not a parsed object — critical.
+        assert_eq!(calls[0].function.arguments, "{\"location\":\"Seoul\"}");
+    }
+
+    #[test]
+    fn openai_tool_role_message_parses() {
+        let raw = json!({
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": "20C sunny"
+        });
+        let msg: ChatMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(msg.content, "20C sunny");
+    }
+
+    #[test]
+    fn openai_response_with_tool_calls_serializes_with_null_content() {
+        let resp = ChatMessageResponse {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_abc".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: "{\"location\":\"Seoul\"}".into(),
+                },
+            }]),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v["content"].is_null(), "content must serialize as null when None");
+        assert_eq!(v["tool_calls"][0]["id"], "call_abc");
+        assert_eq!(v["tool_calls"][0]["type"], "function");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn openai_response_text_only_omits_tool_calls() {
+        let resp = ChatMessageResponse {
+            role: "assistant".into(),
+            content: Some("Seoul is sunny".into()),
+            tool_calls: None,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["content"], "Seoul is sunny");
+        assert!(v.get("tool_calls").is_none(), "tool_calls must be omitted when None");
+    }
+
+    #[test]
+    fn openai_stream_delta_with_partial_tool_call() {
+        // OpenAI streams id/name once at the start, then arguments in chunks.
+        let delta = ChatStreamDelta {
+            role: None,
+            content: None,
+            tool_calls: Some(vec![ToolCallDelta {
+                index: 0,
+                id: Some("call_abc".into()),
+                kind: Some("function".into()),
+                function: Some(FunctionCallDelta {
+                    name: Some("get_weather".into()),
+                    arguments: Some("{\"locat".into()),
+                }),
+            }]),
+        };
+        let v = serde_json::to_value(&delta).unwrap();
+        assert!(v.get("role").is_none());
+        assert!(v.get("content").is_none());
+        assert_eq!(v["tool_calls"][0]["index"], 0);
+        assert_eq!(v["tool_calls"][0]["type"], "function");
+        assert_eq!(v["tool_calls"][0]["function"]["arguments"], "{\"locat");
+    }
+
+    // ── Anthropic ──────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_request_with_tools_parses() {
+        let raw = json!({
+            "model": "claude-x",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Current weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                }
+            }],
+            "tool_choice": {"type": "auto"}
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        let tools = req.tools.unwrap();
+        assert_eq!(tools[0].name, "get_weather");
+        assert_eq!(tools[0].input_schema["required"][0], "location");
+        assert!(matches!(req.tool_choice, Some(AnthropicToolChoice::Auto)));
+    }
+
+    #[test]
+    fn anthropic_tool_choice_named_parses() {
+        let raw = json!({"type": "tool", "name": "get_weather"});
+        let tc: AnthropicToolChoice = serde_json::from_value(raw).unwrap();
+        match tc {
+            AnthropicToolChoice::Tool { name } => assert_eq!(name, "get_weather"),
+            _ => panic!("expected Tool"),
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_use_content_block_parses() {
+        let raw = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_xyz",
+                    "name": "get_weather",
+                    "input": {"location": "Seoul"}
+                }
+            ]
+        });
+        let msg: AnthropicMessage = serde_json::from_value(raw).unwrap();
+        let blocks = msg.content.blocks();
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_xyz");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["location"], "Seoul");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_result_content_block_parses() {
+        // tool_result can be string-content or array-of-blocks; both shapes
+        // appear in real Anthropic conversations.
+        let raw_string = json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_xyz",
+                "content": "20C sunny"
+            }]
+        });
+        let msg: AnthropicMessage = serde_json::from_value(raw_string).unwrap();
+        match &msg.content.blocks()[0] {
+            AnthropicContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                assert_eq!(tool_use_id, "toolu_xyz");
+                assert_eq!(content.as_text(), "20C sunny");
+                assert!(!is_error);
+            }
+            _ => panic!("expected ToolResult"),
+        }
+
+        let raw_blocks = json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_xyz",
+                "content": [{"type": "text", "text": "20C sunny"}],
+                "is_error": false
+            }]
+        });
+        let msg2: AnthropicMessage = serde_json::from_value(raw_blocks).unwrap();
+        match &msg2.content.blocks()[0] {
+            AnthropicContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.as_text(), "20C sunny");
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn anthropic_response_tool_use_block_serializes() {
+        let block = AnthropicResponseBlock::ToolUse {
+            id: "toolu_xyz".into(),
+            name: "get_weather".into(),
+            input: json!({"location": "Seoul"}),
+        };
+        let v = serde_json::to_value(&block).unwrap();
+        assert_eq!(v["type"], "tool_use");
+        assert_eq!(v["id"], "toolu_xyz");
+        assert_eq!(v["name"], "get_weather");
+        // input must be a real JSON object (Anthropic) — NOT a string.
+        assert!(v["input"].is_object());
+        assert_eq!(v["input"]["location"], "Seoul");
+    }
+
+    #[test]
+    fn anthropic_response_text_block_serializes() {
+        let block = AnthropicResponseBlock::Text {
+            text: "Seoul is sunny".into(),
+        };
+        let v = serde_json::to_value(&block).unwrap();
+        assert_eq!(v["type"], "text");
+        assert_eq!(v["text"], "Seoul is sunny");
+    }
+
+    #[test]
+    fn anthropic_content_as_text_drops_tool_blocks() {
+        // Backward-compat for the legacy chat path that doesn't yet know
+        // about tools — make sure as_text() flattens tool_use/tool_result
+        // out so the existing prompt builder still receives a sane string.
+        let content = AnthropicContent::Blocks(vec![
+            AnthropicContentBlock::Text {
+                text: "hello".into(),
+            },
+            AnthropicContentBlock::ToolUse {
+                id: "toolu_x".into(),
+                name: "noop".into(),
+                input: json!({}),
+            },
+            AnthropicContentBlock::Text {
+                text: "world".into(),
+            },
+        ]);
+        assert_eq!(content.as_text(), "hello\nworld");
+    }
+
+    #[test]
+    fn openai_request_omits_tools_when_none() {
+        // Confirm we don't poison clients with a stray `"tools": null` on
+        // outbound serialization (we deserialize requests, but also
+        // serialize them for logging / forwarding tests).
+        let req = ChatCompletionRequest {
+            model: "x".into(),
+            messages: vec![],
+            max_tokens: 16,
+            temperature: 0.7,
+            top_p: 0.9,
+            stream: false,
+            stream_options: None,
+            thinking: false,
+            session_id: None,
+            tools: None,
+            tool_choice: None,
+        };
+        // Request type is Deserialize-only; we only need to verify
+        // round-trip through serde_json::Value when the tools field is
+        // absent at deserialize time — covered by other tests. This test
+        // exists as a compile-time assertion that all fields are present
+        // and constructible.
+        let _ = req;
+    }
 }

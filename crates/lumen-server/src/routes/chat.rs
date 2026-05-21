@@ -101,6 +101,7 @@ async fn handle_streaming(
             delta: ChatStreamDelta {
                 role: Some("assistant".into()),
                 content: None,
+                tool_calls: None,
             },
             finish_reason: None,
         }],
@@ -241,6 +242,7 @@ async fn handle_streaming(
                         delta: ChatStreamDelta {
                             role: None,
                             content: None,
+                            tool_calls: None,
                         },
                         finish_reason: Some("stop".into()),
                     }],
@@ -407,6 +409,7 @@ mod tests {
                 delta: ChatStreamDelta {
                     role: None,
                     content: Some(text.to_string()),
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],

@@ -627,7 +627,8 @@ impl InferenceEngine {
                 index: 0,
                 message: ChatMessageResponse {
                     role: "assistant".into(),
-                    content,
+                    content: Some(content),
+                    tool_calls: None,
                 },
                 finish_reason: "stop".into(),
             }],
@@ -715,10 +716,7 @@ impl InferenceEngine {
             r#type: "message".into(),
             role: "assistant".into(),
             model: req.model.clone(),
-            content: vec![AnthropicResponseBlock {
-                r#type: "text".into(),
-                text: content,
-            }],
+            content: vec![AnthropicResponseBlock::Text { text: content }],
             stop_reason: "end_turn".into(),
             stop_sequence: None,
             usage: AnthropicUsage {
@@ -1223,17 +1221,14 @@ impl InferenceEngine {
                                     .join("\n"),
                             };
                             if !system_text.is_empty() {
-                                messages.push(ChatMessage {
-                                    role: "system".into(),
-                                    content: system_text,
-                                });
+                                messages.push(ChatMessage::new_text("system", system_text));
                             }
                         }
                         for msg in &req.messages {
-                            messages.push(ChatMessage {
-                                role: msg.role.clone(),
-                                content: msg.content.as_text(),
-                            });
+                            messages.push(ChatMessage::new_text(
+                                msg.role.clone(),
+                                msg.content.as_text(),
+                            ));
                         }
                         match self.start_streaming_seq(
                             next_seq_id,
@@ -1305,17 +1300,14 @@ impl InferenceEngine {
                                                 .join("\n"),
                                         };
                                         if !system_text.is_empty() {
-                                            messages.push(ChatMessage {
-                                                role: "system".into(),
-                                                content: system_text,
-                                            });
+                                            messages.push(ChatMessage::new_text("system", system_text));
                                         }
                                     }
                                     for msg in &req.messages {
-                                        messages.push(ChatMessage {
-                                            role: msg.role.clone(),
-                                            content: msg.content.as_text(),
-                                        });
+                                        messages.push(ChatMessage::new_text(
+                                            msg.role.clone(),
+                                            msg.content.as_text(),
+                                        ));
                                     }
                                     match self.start_streaming_seq(
                                         next_seq_id,
@@ -1662,17 +1654,14 @@ impl InferenceEngine {
                                     .join("\n"),
                             };
                             if !system_text.is_empty() {
-                                messages.push(ChatMessage {
-                                    role: "system".into(),
-                                    content: system_text,
-                                });
+                                messages.push(ChatMessage::new_text("system", system_text));
                             }
                         }
                         for msg in &req.messages {
-                            messages.push(ChatMessage {
-                                role: msg.role.clone(),
-                                content: msg.content.as_text(),
-                            });
+                            messages.push(ChatMessage::new_text(
+                                msg.role.clone(),
+                                msg.content.as_text(),
+                            ));
                         }
                         match self.start_streaming_seq_qwen35(
                             next_seq_id,
@@ -1741,17 +1730,14 @@ impl InferenceEngine {
                                                 .join("\n"),
                                         };
                                         if !system_text.is_empty() {
-                                            messages.push(ChatMessage {
-                                                role: "system".into(),
-                                                content: system_text,
-                                            });
+                                            messages.push(ChatMessage::new_text("system", system_text));
                                         }
                                     }
                                     for msg in &req.messages {
-                                        messages.push(ChatMessage {
-                                            role: msg.role.clone(),
-                                            content: msg.content.as_text(),
-                                        });
+                                        messages.push(ChatMessage::new_text(
+                                            msg.role.clone(),
+                                            msg.content.as_text(),
+                                        ));
                                     }
                                     match self.start_streaming_seq_qwen35(
                                         next_seq_id,
