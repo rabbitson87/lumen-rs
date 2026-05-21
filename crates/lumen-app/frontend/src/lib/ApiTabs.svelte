@@ -5,7 +5,9 @@
     Catalog,
     ModelEntry,
     SystemInfo,
+    DownloadProgress,
   } from "./api";
+  import type { SvelteMap } from "svelte/reactivity";
 
   interface Props {
     config: PersistentConfig;
@@ -13,6 +15,10 @@
     catalog: Catalog;
     models: ModelEntry[];
     systemInfo: SystemInfo | null;
+    /** Shared with App.svelte — same map, same ghost-cleanup timeouts
+     * (10s for 0-byte placeholders, 3s for completed). We just filter
+     * it to embedding repos here so the picker shows its own progress. */
+    downloads: SvelteMap<string, DownloadProgress>;
     onEmbeddingChange: (value: string | null) => void;
     onApiKeyChange: (value: string | null) => void;
     onDownloadEmbedding: (repoId: string) => void;
@@ -24,11 +30,28 @@
     catalog,
     models,
     systemInfo,
+    downloads,
     onEmbeddingChange,
     onApiKeyChange,
     onDownloadEmbedding,
     onDeleteEmbedding,
   }: Props = $props();
+
+  // Filter `downloads` to embedding repos only — progress for the chat
+  // model lives in the MODELS card. Without this filter the API tab
+  // would show every in-flight download regardless of which picker the
+  // user is interacting with.
+  let embeddingDownloads = $derived.by(() => {
+    const embIds = new Set(catalog.embeddings.map((e) => e.id));
+    return [...downloads.entries()].filter(([_k, p]) => embIds.has(p.repo_id));
+  });
+
+  function bytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
 
   // Embeddings already downloaded locally — selectable in the dropdown.
   // Matches `catalog.embeddings` against `models` (which is the unified
@@ -243,6 +266,17 @@
               Download
             </button>
           </div>
+        </div>
+      {/if}
+      {#if embeddingDownloads.length > 0}
+        <div class="mt-1.5 flex flex-col gap-0.5">
+          {#each embeddingDownloads as [key, p]}
+            <div class="mono grid grid-cols-[16px_1fr_80px] text-xs gap-1.5">
+              <span class={p.done ? "text-ok" : "text-text-dim"}>{p.done ? "✓" : "…"}</span>
+              <span>{key}</span>
+              <span class="dim">{bytes(p.downloaded_bytes)}</span>
+            </div>
+          {/each}
         </div>
       {/if}
       <div class="mt-2 pt-2.5 border-t border-border">

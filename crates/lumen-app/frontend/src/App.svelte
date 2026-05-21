@@ -1248,6 +1248,7 @@
         {catalog}
         {models}
         {systemInfo}
+        {downloads}
         onEmbeddingChange={(v) => {
           if (!config) return;
           config.server.embedding_model_id = v;
