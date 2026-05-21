@@ -29,6 +29,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Embedding, Linear, VarBuilder, embedding, linear_b, linear_no_bias};
 use candle_transformers::models::qwen3::Config;
 use candle_transformers::utils::repeat_kv;
+use lumen_metal::affine4_linear::Affine4Linear;
 use lumen_metal::affine8_linear::Affine8Linear;
 
 #[derive(Debug)]
@@ -67,12 +68,32 @@ impl RotaryEmbedding {
     }
 }
 
+/// MLX-quantized projection — either 8-bit (Affine8) or 4-bit (Affine4)
+/// packed weight backed by a fused dequant+matmul Metal kernel. Both
+/// expose bf16 → bf16 forward semantics so the surrounding transformer
+/// code is dtype-agnostic.
+pub enum QuantProj {
+    A4(Affine4Linear),
+    A8(Affine8Linear),
+}
+
+impl QuantProj {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            // Affine4 forwards through its bf16-in/bf16-out qmv_fast kernel
+            // when the shape supports it; otherwise the wrapper transparently
+            // falls back to f32 path inside Affine4Linear itself.
+            Self::A4(q) => q.forward_bf16_in_bf16_out(x),
+            Self::A8(q) => q.forward(x),
+        }
+    }
+}
+
 /// A linear projection — either a plain candle `Linear` over dequanted
-/// bf16 weights, or an `Affine8Linear` that runs an MLX 8-bit packed
-/// weight through a fused Metal dequant+matmul kernel.
+/// bf16 weights, or a fused-kernel MLX-quantized projection.
 pub enum LinearKind {
     Plain(Linear),
-    Quant(Affine8Linear),
+    Quant(QuantProj),
 }
 
 impl LinearKind {
@@ -278,7 +299,7 @@ impl StatelessQwen3 {
     pub fn new_quantized(
         cfg: &Config,
         vb: VarBuilder,
-        mut projections: HashMap<String, Affine8Linear>,
+        mut projections: HashMap<String, QuantProj>,
     ) -> Result<Self> {
         let embed = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
@@ -286,7 +307,7 @@ impl StatelessQwen3 {
         let vbl = vb.pp("model.layers");
 
         let take =
-            |projections: &mut HashMap<String, Affine8Linear>, key: &str| -> Result<LinearKind> {
+            |projections: &mut HashMap<String, QuantProj>, key: &str| -> Result<LinearKind> {
                 projections
                     .remove(key)
                     .map(LinearKind::Quant)
