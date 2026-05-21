@@ -102,14 +102,31 @@ async fn handle_streaming(
     let mut text_block_open: bool = false;
     let mut current_tool_wire_index: Option<u32> = None;
 
+    // Phase 1.6: Anthropic SSE `ping` keepalive. Matches real Claude
+    // wire — when prefill is long-running (≥1s with no decoded token
+    // yet), some proxies / clients drop the SSE connection. Periodic
+    // `event: ping` keeps the channel alive. Real Claude emits these
+    // occasionally during long generations as well; we mirror the
+    // pattern. Static bytes — no allocation per send.
+    let ping_event: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
     let mut carry: Option<StreamEvent> = None;
     loop {
-        let event = match carry.take() {
-            Some(e) => e,
-            None => match token_rx.recv().await {
-                Some(e) => e,
-                None => break,
+        let event_opt: Option<StreamEvent> = match carry.take() {
+            Some(e) => Some(e),
+            None => loop {
+                tokio::select! {
+                    res = token_rx.recv() => break res,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1000)) => {
+                        tcp.write_all(ping_event).await?;
+                        tcp.flush().await?;
+                    }
+                }
             },
+        };
+        let event = match event_opt {
+            Some(e) => e,
+            None => break,
         };
         match event {
             StreamEvent::Delta(text) => {

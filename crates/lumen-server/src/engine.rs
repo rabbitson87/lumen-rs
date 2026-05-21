@@ -1069,8 +1069,22 @@ impl InferenceEngine {
                                 AnthropicContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
-                                    ..
-                                } => Some((tool_use_id.clone(), content.as_text())),
+                                    is_error,
+                                } => {
+                                    // Phase 1.6: when is_error:true, prefix
+                                    // the content with "[ERROR] " so the
+                                    // model recognizes it as a failure and
+                                    // can recover gracefully (apologize,
+                                    // suggest alternatives, retry with
+                                    // different args, etc.). Mirrors how
+                                    // Claude interprets is_error blocks.
+                                    let body = if *is_error {
+                                        format!("[ERROR] {}", content.as_text())
+                                    } else {
+                                        content.as_text()
+                                    };
+                                    Some((tool_use_id.clone(), body))
+                                }
                                 _ => None,
                             })
                             .collect(),
@@ -1522,8 +1536,15 @@ impl InferenceEngine {
                                 AnthropicContentBlock::ToolResult {
                                     tool_use_id,
                                     content,
-                                    ..
-                                } => Some((tool_use_id.clone(), content.as_text())),
+                                    is_error,
+                                } => {
+                                    let body = if *is_error {
+                                        format!("[ERROR] {}", content.as_text())
+                                    } else {
+                                        content.as_text()
+                                    };
+                                    Some((tool_use_id.clone(), body))
+                                }
                                 _ => None,
                             })
                             .collect(),

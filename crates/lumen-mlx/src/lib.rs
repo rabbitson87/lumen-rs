@@ -76,7 +76,7 @@ pub mod gemma4 {
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
-        TOK_TOOL_CALL_OPEN,
+        TOK_TOOL_CALL_OPEN, gemma4_args_to_json, parse_tool_call_body,
     };
     pub use crate::gemma4_tools::imp::{
         ToolDef, format_tool_call_body, render_tool_definitions,

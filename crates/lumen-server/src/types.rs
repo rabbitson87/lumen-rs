@@ -16,8 +16,23 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Lumen extension: simple bool toggle. Use [`Self::enable_thinking`]
+    /// instead of reading this field directly — that helper also folds in
+    /// OpenAI's standard `reasoning_effort` and vLLM/SGLang's
+    /// `chat_template_kwargs.enable_thinking`.
     #[serde(default)]
     pub thinking: bool,
+    /// OpenAI o-series / GPT-5 standard reasoning toggle. Accepted values:
+    /// `"minimal"` / `"none"` / `"low"` / `"medium"` / `"high"`. Any value
+    /// other than `minimal`/`none` enables thinking on supported families
+    /// (Gemma 4, Qwen 3.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// vLLM / SGLang convention for chat-template-controlled thinking
+    /// toggles (Qwen3, DeepSeek-R1, …). Sent as `extra_body` from the
+    /// official OpenAI SDKs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Optional client-supplied session id. When present and the MLX backend
     /// is active, the server reuses the prior turn's KV cache and only feeds
     /// the new suffix. Other backends silently ignore.
@@ -42,6 +57,39 @@ pub struct ChatCompletionRequest {
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
+}
+
+/// Subset of vLLM / SGLang's `chat_template_kwargs` that we honor today.
+/// Only the thinking toggle is wired; unknown keys are silently dropped by
+/// serde — matching upstream behavior.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ChatTemplateKwargs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+}
+
+impl ChatCompletionRequest {
+    /// Resolve the effective thinking flag from all supported input shapes.
+    /// Precedence (highest first):
+    ///   1. `chat_template_kwargs.enable_thinking` — vLLM / SGLang convention,
+    ///      explicit per-request override.
+    ///   2. `reasoning_effort` — OpenAI o-series / GPT-5 convention.
+    ///      `"minimal"` / `"none"` → off; any other recognized value → on.
+    ///   3. `thinking` — Lumen extension flat bool.
+    pub fn enable_thinking(&self) -> bool {
+        if let Some(kw) = self.chat_template_kwargs.as_ref() {
+            if let Some(v) = kw.enable_thinking {
+                return v;
+            }
+        }
+        if let Some(eff) = self.reasoning_effort.as_deref() {
+            return !matches!(
+                eff.trim().to_ascii_lowercase().as_str(),
+                "minimal" | "none" | "off" | "disabled" | ""
+            );
+        }
+        self.thinking
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -380,8 +428,13 @@ pub struct AnthropicRequest {
     pub stream: bool,
     #[serde(default)]
     pub stop_sequences: Option<Vec<String>>,
+    /// Anthropic Extended Thinking parameter. Accepts the canonical Claude
+    /// shape `{"type": "enabled", "budget_tokens": N}` /
+    /// `{"type": "disabled"}` and a legacy bool. Read via
+    /// [`Self::enable_thinking`] — `budget_tokens` is currently
+    /// informational only (no real budget tracking on local models).
     #[serde(default)]
-    pub thinking: bool,
+    pub thinking: AnthropicThinking,
     #[serde(default)]
     pub session_id: Option<String>,
 
@@ -413,6 +466,54 @@ pub enum AnthropicToolChoice {
     Auto,
     Any,
     Tool { name: String },
+}
+
+/// Anthropic Extended Thinking flag, polymorphic on the wire.
+///
+/// Canonical Claude shape (per Anthropic Messages API):
+/// ```json
+/// "thinking": {"type": "enabled", "budget_tokens": 10000}
+/// "thinking": {"type": "disabled"}
+/// ```
+/// Legacy / Lumen shorthand:
+/// ```json
+/// "thinking": true
+/// "thinking": false
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum AnthropicThinking {
+    Object(AnthropicThinkingConfig),
+    Bool(bool),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AnthropicThinkingConfig {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Optional reasoning-token budget hint. Currently parsed but unused
+    /// (local backends don't differentiate budget vs `max_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+impl Default for AnthropicThinking {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
+}
+
+impl AnthropicRequest {
+    /// True iff the client opted in to extended thinking. Mirrors the
+    /// Anthropic API: object-form requires `type == "enabled"`, anything
+    /// else (including the bool shorthand `false` and unknown `type` values)
+    /// is off.
+    pub fn enable_thinking(&self) -> bool {
+        match &self.thinking {
+            AnthropicThinking::Bool(b) => *b,
+            AnthropicThinking::Object(cfg) => cfg.r#type.eq_ignore_ascii_case("enabled"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,19 +619,80 @@ impl AnthropicToolResultContent {
             Self::Text(s) => s.clone(),
             Self::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| b.text.clone())
+                .map(|b| b.as_text())
+                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n"),
         }
     }
 }
 
+/// One block inside an Anthropic `tool_result.content` array. Per spec
+/// these can be `text`, `image`, or `document` blocks. Gemma 4 is a
+/// text-only model; we accept the wire shape without erroring (so
+/// agent loops with multimodal tool outputs don't fail) but flatten
+/// image / document blocks to a `[image: media_type]` /
+/// `[document: media_type]` text placeholder so the model at least
+/// knows non-text data was returned.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AnthropicToolResultBlock {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    /// Image blocks carry `source: { type, media_type, data }`. We
+    /// only need media_type for the placeholder; the base64 / URL
+    /// data is discarded since the underlying model can't consume it.
+    #[serde(default)]
+    pub source: Option<AnthropicToolResultBlockSource>,
+}
+
+impl AnthropicToolResultBlock {
+    pub fn as_text(&self) -> String {
+        match self.kind.as_str() {
+            "text" => self.text.clone().unwrap_or_default(),
+            "image" => {
+                let media = self
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.media_type.as_deref())
+                    .unwrap_or("image");
+                format!("[image: {media}]")
+            }
+            "document" => {
+                let media = self
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.media_type.as_deref())
+                    .unwrap_or("document");
+                // Inline the document's textual payload when it's a
+                // text document — Anthropic's `source.type:"text"`
+                // carries `data` as the plain document body.
+                if let Some(src) = &self.source {
+                    if src.kind.as_deref() == Some("text") {
+                        if let Some(data) = &src.data {
+                            return format!("[document: {media}]\n{data}");
+                        }
+                    }
+                }
+                format!("[document: {media}]")
+            }
+            other => format!("[{other}]"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AnthropicToolResultBlockSource {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// Optional URL source (Anthropic's `source.type:"url"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -978,6 +1140,8 @@ mod tool_calling_serde {
             stream: false,
             stream_options: None,
             thinking: false,
+            reasoning_effort: None,
+            chat_template_kwargs: None,
             session_id: None,
             tools: None,
             tool_choice: None,
@@ -988,5 +1152,128 @@ mod tool_calling_serde {
         // exists as a compile-time assertion that all fields are present
         // and constructible.
         let _ = req;
+    }
+
+    #[test]
+    fn openai_thinking_flat_bool_round_trip() {
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "thinking": true,
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking());
+    }
+
+    #[test]
+    fn openai_reasoning_effort_enables_thinking() {
+        for v in ["low", "medium", "high", "LOW", " High "] {
+            let raw = serde_json::json!({
+                "model": "x",
+                "messages": [],
+                "reasoning_effort": v,
+            });
+            let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+            assert!(req.enable_thinking(), "expected on for {v:?}");
+        }
+        for v in ["minimal", "none", "off", "disabled", ""] {
+            let raw = serde_json::json!({
+                "model": "x",
+                "messages": [],
+                "reasoning_effort": v,
+            });
+            let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+            assert!(!req.enable_thinking(), "expected off for {v:?}");
+        }
+    }
+
+    #[test]
+    fn openai_chat_template_kwargs_overrides_thinking() {
+        // Even if `thinking: true` and `reasoning_effort: "high"` would
+        // both enable, vLLM-style explicit override wins.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "thinking": true,
+            "reasoning_effort": "high",
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+
+        // And the inverse — flat thinking false but kwargs flips it on.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "thinking": false,
+            "chat_template_kwargs": { "enable_thinking": true },
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking());
+    }
+
+    #[test]
+    fn anthropic_thinking_accepts_bool_shorthand() {
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+            "thinking": true,
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking());
+
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+            "thinking": false,
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+    }
+
+    #[test]
+    fn anthropic_thinking_accepts_canonical_object() {
+        // Claude canonical shape — `enabled` with budget hint.
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+            "thinking": { "type": "enabled", "budget_tokens": 8000 },
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking());
+
+        // Disabled object.
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+            "thinking": { "type": "disabled" },
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+
+        // Unknown `type` defaults to off (forward-compat).
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+            "thinking": { "type": "future-mode" },
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+    }
+
+    #[test]
+    fn anthropic_thinking_defaults_off_when_absent() {
+        let raw = serde_json::json!({
+            "model": "x",
+            "max_tokens": 16,
+            "messages": [],
+        });
+        let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
     }
 }
