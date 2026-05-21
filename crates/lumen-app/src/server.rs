@@ -226,6 +226,71 @@ mod parse_tests {
     }
 }
 
+#[cfg(test)]
+mod resolve_tests {
+    use super::prefer_release_over_dev_debug;
+    use std::path::PathBuf;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("lumen-resolve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn prefer_release_when_both_exist() {
+        let root = tmpdir("both");
+        let debug = root.join("target").join("debug");
+        let release = root.join("target").join("release");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(debug.join("lumen-server"), b"").unwrap();
+        std::fs::write(release.join("lumen-server"), b"").unwrap();
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
+        assert_eq!(chosen.as_deref(), Some(release.join("lumen-server").as_path()));
+    }
+
+    #[test]
+    fn fallback_to_debug_when_no_release() {
+        let root = tmpdir("debug-only");
+        let debug = root.join("target").join("debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::write(debug.join("lumen-server"), b"").unwrap();
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
+        assert!(chosen.is_none(), "no release available -> return None so caller keeps debug");
+    }
+
+    #[test]
+    fn skip_override_for_non_target_paths() {
+        // .app bundle sibling: dir != "debug" so override is a no-op.
+        let root = tmpdir("bundle");
+        let resources = root.join("Contents").join("Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("lumen-server"), b"").unwrap();
+        let chosen = prefer_release_over_dev_debug(&resources.join("lumen-server"));
+        assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn respect_lumen_use_debug_server_env() {
+        let root = tmpdir("env-opt-out");
+        let debug = root.join("target").join("debug");
+        let release = root.join("target").join("release");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(debug.join("lumen-server"), b"").unwrap();
+        std::fs::write(release.join("lumen-server"), b"").unwrap();
+        // Safety: scoped to this test thread; tests in this module run
+        // sequentially under cargo's default config.
+        unsafe { std::env::set_var("LUMEN_USE_DEBUG_SERVER", "1") };
+        let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
+        unsafe { std::env::remove_var("LUMEN_USE_DEBUG_SERVER") };
+        assert!(chosen.is_none(), "explicit opt-out must short-circuit");
+    }
+}
+
 impl ServerSupervisor {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -279,6 +344,7 @@ impl ServerSupervisor {
 
         let bin = resolve_binary(cfg.server_binary_path.as_deref())
             .context("resolve lumen-server binary path")?;
+        eprintln!("[lumen-app] using lumen-server: {}", bin.display());
 
         // If a previous app exit (or force-quit / crash) left an orphaned
         // lumen-server holding the configured port, reclaim it before
@@ -824,6 +890,11 @@ fn reclaim_port_if_lumen_server(host: &str, port: u16) {
 /// Resolution order:
 /// 1. Explicit `cfg.server_binary_path` if set
 /// 2. Sibling binary in the .app bundle (Resources/lumen-server)
+///    — but if the sibling resolves to `target/debug/lumen-server`
+///    (i.e. running `cargo tauri dev`), prefer the workspace
+///    `target/release/lumen-server` when present, since debug builds
+///    are 5-10× slower (~8 tok/s vs ~70 tok/s on Gemma 4 26B).
+///    Set `LUMEN_USE_DEBUG_SERVER=1` to bypass this override.
 /// 3. `LUMEN_SERVER_BIN` env var
 /// 4. `lumen-server` on PATH
 /// 5. Workspace target dir (dev fallback): `target/release/lumen-server`,
@@ -838,6 +909,13 @@ fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf> {
         if let Some(dir) = exe.parent() {
             let sibling = dir.join("lumen-server");
             if sibling.exists() {
+                // `target/debug/lumen-server` is the `cargo tauri dev`
+                // sidecar — fast iteration but 5-10× slower than release
+                // (LTO + opt-level=3). Surface release silently if the
+                // dev'r has built one, unless explicitly opted out.
+                if let Some(release) = prefer_release_over_dev_debug(&sibling) {
+                    return Ok(release);
+                }
                 return Ok(sibling);
             }
             // macOS .app: Resources/ sibling
@@ -872,4 +950,34 @@ fn resolve_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     anyhow::bail!(
         "lumen-server binary not found — set `server_binary_path` in config.toml or build it via `cargo build -p lumen-server --release`"
     )
+}
+
+/// If `sibling` is `<…>/target/debug/lumen-server` AND its sibling
+/// `<…>/target/release/lumen-server` exists, return the release path.
+/// Returns `None` otherwise — i.e. when the sibling lives in a real
+/// bundle (`.app/Contents/Resources/`), a user-customized dir, or
+/// when no release build is available. Honors `LUMEN_USE_DEBUG_SERVER=1`
+/// for the rare developer who wants symbols + assertions live.
+fn prefer_release_over_dev_debug(sibling: &Path) -> Option<PathBuf> {
+    if std::env::var("LUMEN_USE_DEBUG_SERVER")
+        .ok()
+        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_some()
+    {
+        return None;
+    }
+    let parent = sibling.parent()?;
+    if parent.file_name()? != "debug" {
+        return None;
+    }
+    let target_dir = parent.parent()?;
+    if target_dir.file_name()? != "target" {
+        return None;
+    }
+    let release = target_dir.join("release").join("lumen-server");
+    if release.exists() {
+        Some(release)
+    } else {
+        None
+    }
 }
