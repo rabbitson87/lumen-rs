@@ -131,21 +131,21 @@ pub const EMBEDDINGS: &[RecommendedEmbedding] = &[
         label: "Qwen 3 Embedding — 0.6B (8-bit)",
         approx_size_gb: 1,
         min_ram_gb: 4,
-        notes: "Small, fast embedding model. Good default for retrieval / semantic search.",
+        notes: "Small, fast embedding model. Good default for retrieval / semantic search. Runs on the fused 8-bit Metal kernel — packed weights stay GPU-resident (~600 MB).",
     },
     RecommendedEmbedding {
-        id: "mlx-community/Qwen3-Embedding-4B-8bit",
-        label: "Qwen 3 Embedding — 4B (8-bit)",
+        id: "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+        label: "Qwen 3 Embedding — 4B (4-bit DWQ)",
+        approx_size_gb: 3,
+        min_ram_gb: 6,
+        notes: "Mid-size, distilled-weight quant (DWQ). Noticeably better recall on long passages and multilingual queries vs 0.6B. Runs on the fused 4-bit Metal kernel (`affine4_qmv_fast_bf16in_bf16out`) — packed weights stay GPU-resident (~2.3 GB), no eager dequant.",
+    },
+    RecommendedEmbedding {
+        id: "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+        label: "Qwen 3 Embedding — 8B (4-bit DWQ)",
         approx_size_gb: 5,
-        min_ram_gb: 12,
-        notes: "Mid-size. Noticeably better recall on long passages and multilingual queries; slower per request than 0.6B.",
-    },
-    RecommendedEmbedding {
-        id: "mlx-community/Qwen3-Embedding-8B-8bit",
-        label: "Qwen 3 Embedding — 8B (8-bit)",
-        approx_size_gb: 9,
-        min_ram_gb: 20,
-        notes: "Top-of-family accuracy. Use when retrieval quality matters more than per-request latency.",
+        min_ram_gb: 10,
+        notes: "Top-of-family accuracy. Use when retrieval quality matters more than per-request latency. Fused 4-bit Metal kernel — packed weights stay GPU-resident (~4.3 GB), no eager dequant.",
     },
 ];
 
