@@ -324,6 +324,22 @@
             downloads.delete(key);
           }
         }, 3000);
+      } else if (p.downloaded_bytes === 0) {
+        // The backend emits a `0 bytes / done:false` placeholder right before
+        // each HTTP GET, then `continue`s silently on 404 (common for the
+        // optional metadata files in the default probe list: tokenizer.model,
+        // special_tokens_map.json, added_tokens.json, preprocessor_config.json
+        // — most modern repos ship a subset). Those entries never get a
+        // follow-up event and would sit in the UI forever. Auto-remove after
+        // 10s IFF still at 0 bytes and not done — any real file is throttled
+        // to emit chunks every 512 KB, so a true active download will bump
+        // downloaded_bytes well before the timeout fires.
+        setTimeout(() => {
+          const curr = downloads.get(key);
+          if (curr && !curr.done && curr.downloaded_bytes === 0) {
+            downloads.delete(key);
+          }
+        }, 10000);
       }
     });
 
