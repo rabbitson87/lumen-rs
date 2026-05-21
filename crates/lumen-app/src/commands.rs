@@ -163,6 +163,31 @@ pub async fn set_active_model(
     state: State<'_, AppState>,
     model_id: String,
 ) -> CmdResult<PersistentConfig> {
+    // Validate the model is on disk AND its download completed cleanly
+    // before promoting it to active. Without this, a truncated shard
+    // can be selected as the active model and the server crashes
+    // mid-load with a misleading "missing weight" error.
+    {
+        let g = state.config.lock().await;
+        let models_dir = g.models_dir.clone();
+        drop(g);
+        let cat = state.catalog.lock().await;
+        let entries = models::scan_local(&models_dir, &cat).map_err(err)?;
+        match entries.iter().find(|e| e.id == model_id) {
+            Some(e) if !e.ready => {
+                return Err(format!(
+                    "model '{model_id}' download is incomplete — re-download required before use",
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "model '{model_id}' not found in {}",
+                    models_dir.display()
+                ));
+            }
+            _ => {}
+        }
+    }
     let mut g = state.config.lock().await;
     g.active_model = Some(model_id);
     g.save().map_err(err)?;

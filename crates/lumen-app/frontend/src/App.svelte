@@ -531,6 +531,24 @@
     }
   }
 
+  // Re-download for a model whose previous download was interrupted
+  // (truncated shard, missing index, etc.). Wipes any stale .part / partial
+  // files and starts the download fresh. The downloader itself will skip
+  // any file that already exists at its full advertised size — so resumed
+  // model dirs only re-transfer the broken / missing pieces.
+  async function repairModel(id: string) {
+    if (!confirm(
+      `Re-download ${id}? Existing files in the model directory will be wiped first to ensure a clean state.`
+    )) return;
+    try {
+      await api.deleteModel(id);
+      models = await api.listModels();
+      await api.downloadModel(id, null);
+    } catch (e) {
+      statusMessage = `Re-download failed: ${e}`;
+    }
+  }
+
   // ── Shared utility-class chains (Tailwind 4) ─────────────────────
   // Declared as plain string consts because Svelte's `{@const}` can only
   // live at the top of `{#if}`/`{#each}`/etc. — not at the top of `<main>`.
@@ -881,10 +899,12 @@
       {#each visibleModels as m}
         {@const needsUpdate = outdatedModels.has(m.id)}
         {@const isActive = config?.active_model === m.id}
+        {@const isBroken = !m.ready}
         <div
           class={`grid grid-cols-[18px_minmax(0,1fr)_90px_auto_auto] items-center gap-3 px-2.5 py-2 rounded-md bg-panel-2 border hover:border-border ${
             !m.supported ? "opacity-55" : ""
           } ${
+            isBroken ? "border-err shadow-[0_0_0_1px_var(--color-err)_inset] bg-err/10" :
             needsUpdate && isActive ? "border-warn shadow-[0_0_0_1px_var(--color-warn)_inset] bg-warn/15" :
             needsUpdate ? "border-warn bg-warn/10" :
             isActive ? "border-accent shadow-[0_0_0_1px_var(--color-accent)_inset] bg-accent/[0.06]" :
@@ -894,7 +914,9 @@
           <span class="mono text-ok font-bold">{isActive ? "✓" : ""}</span>
           <div class="min-w-0 flex flex-col gap-0.5">
             <div class="mono overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">{m.id}</div>
-            {#if needsUpdate}
+            {#if isBroken}
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-err">⚠ Incomplete download — re-download required before use</div>
+            {:else if needsUpdate}
               <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">⚠ Newer weights available on Hub — update required before use</div>
             {:else if m.label}
               <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-text-dim">{m.label}</div>
@@ -903,7 +925,13 @@
             {/if}
           </div>
           <span class="mono text-text-dim text-right text-xs">{bytes(m.size_bytes)}</span>
-          {#if needsUpdate}
+          {#if isBroken}
+            <button
+              class="primary"
+              onclick={() => repairModel(m.id)}
+              title="Verify and re-download missing or truncated files"
+            >Re-download</button>
+          {:else if needsUpdate}
             <button
               class="primary"
               onclick={() => updateOutdated(m.id)}
