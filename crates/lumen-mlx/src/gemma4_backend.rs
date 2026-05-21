@@ -159,6 +159,19 @@ pub(crate) mod imp {
             messages: &[(String, String)],
             thinking: bool,
         ) -> Result<Vec<u32>> {
+            self.build_chat_input_with_tools(messages, thinking, &[])
+        }
+
+        /// Tool-aware variant of `build_chat_input`. Empty `tools` slice
+        /// produces the exact same token sequence as `build_chat_input`;
+        /// otherwise tool definitions get injected into the system turn
+        /// per the canonical `chat_template.jinja`.
+        pub fn build_chat_input_with_tools(
+            &self,
+            messages: &[(String, String)],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
             let parsed: Vec<ChatMessage<'_>> = messages
                 .iter()
                 .map(|(role, content)| {
@@ -178,12 +191,13 @@ pub(crate) mod imp {
                     })
                 })
                 .collect::<Result<_>>()?;
-            self.chat.render_to_ids(
+            self.chat.render_to_ids_with_tools(
                 &parsed,
                 &RenderOptions {
                     enable_thinking: thinking,
                     add_generation_prompt: true,
                 },
+                tools,
             )
         }
 
@@ -221,8 +235,9 @@ pub(crate) mod imp {
             temperature: f32,
             top_p: f32,
             thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input(messages, thinking)?;
+            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -269,8 +284,9 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             prefix_cache_key: &str,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input(messages, thinking)?;
+            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
             }
@@ -394,9 +410,10 @@ pub(crate) mod imp {
             temperature: f32,
             top_p: f32,
             thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             mut on_token: impl FnMut(&str) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input(messages, thinking)?;
+            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
             // ── Manual prefill + decode loop so we can inject the
             //    on_token callback between steps.
             //

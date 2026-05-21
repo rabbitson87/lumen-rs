@@ -34,6 +34,7 @@ use anyhow::{Context, Result, anyhow};
 use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
+pub mod chat_io;
 mod gemma4_backend;
 mod gemma4_chat;
 mod gemma4_moe;
@@ -845,20 +846,31 @@ impl MlxBackend {
         top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
-    ) -> Result<String> {
+        tools: &[crate::chat_io::ToolDef<'_>],
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = top_p;
-                if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})
+                // Qwen 3.5 family doesn't yet render tools into its prompt
+                // (Phase 2 wires that up). For now we accept the slice and
+                // ignore it so the API surface stays uniform — tool_calls
+                // in the response will be empty.
+                let _ = (top_p, tools);
+                let visible = if let Some(sid) = session_id {
+                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})?
                 } else {
                     let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})
-                }
+                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})?
+                };
+                Ok(ParsedResponse {
+                    visible,
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                })
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                let resp = if let Some(sid) = session_id {
+                if let Some(sid) = session_id {
                     m.chat_with_prefix_cache(
                         messages,
                         max_new_tokens,
@@ -866,20 +878,20 @@ impl MlxBackend {
                         top_p,
                         thinking,
                         sid,
-                    )?
+                        tools,
+                    )
                 } else {
-                    m.chat(messages, max_new_tokens, temperature, top_p, thinking)?
-                };
-                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
-                    Ok(resp.reasoning)
-                } else {
-                    Ok(resp.visible)
+                    m.chat(messages, max_new_tokens, temperature, top_p, thinking, tools)
                 }
             }
         }
     }
 
     /// Unified streaming chat — same shape as `chat` but with a token callback.
+    /// `on_token` receives visible-text deltas only (reasoning + tool_call
+    /// tokens are demux'd before the callback fires for Gemma 4; Qwen35
+    /// streams raw deltas as it has no demux). The final `ParsedResponse`
+    /// carries the full structured result including any tool_calls.
     pub fn chat_streaming<F>(
         &mut self,
         messages: &[(String, String)],
@@ -888,40 +900,43 @@ impl MlxBackend {
         top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
         mut on_token: F,
-    ) -> Result<String>
+    ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(&str),
     {
+        use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = top_p;
-                if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)
+                let _ = (top_p, tools);
+                let visible = if let Some(sid) = session_id {
+                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)?
                 } else {
                     let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, on_token)
-                }
+                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, on_token)?
+                };
+                Ok(ParsedResponse {
+                    visible,
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                })
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                let resp = m.chat_streaming(
+                m.chat_streaming(
                     messages,
                     max_new_tokens,
                     temperature,
                     top_p,
                     thinking,
+                    tools,
                     |chunk| {
                         on_token(chunk);
                         Ok(())
                     },
-                )?;
-                if resp.visible.is_empty() && !resp.reasoning.is_empty() {
-                    Ok(resp.reasoning)
-                } else {
-                    Ok(resp.visible)
-                }
+                )
             }
         }
     }

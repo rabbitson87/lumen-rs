@@ -48,24 +48,11 @@ pub(crate) mod imp {
 
     use crate::gemma4_chat::imp::Gemma4ChatTemplate;
 
-    /// One tool surface the model is allowed to invoke. Shape is intentionally
-    /// independent of `lumen-server`'s `Tool` enum so this crate doesn't have
-    /// to depend on the server crate (which would be circular). Callers
-    /// extract `(name, description, parameters)` from whatever request
-    /// representation they hold.
-    #[derive(Debug, Clone)]
-    pub struct ToolDef<'a> {
-        pub name: &'a str,
-        pub description: Option<&'a str>,
-        /// JSON Schema for the function's arguments. Required keys are read
-        /// from `parameters.required` (an array) and properties from
-        /// `parameters.properties` (an object).
-        pub parameters: Option<&'a Value>,
-        /// Optional response shape — Gemma 4's template emits a
-        /// `response:{...}` block when present. Rare in practice (OpenAI /
-        /// Anthropic specs don't expose this) but supported for parity.
-        pub response: Option<&'a Value>,
-    }
+    // The `ToolDef` struct lives in non-feature-gated `chat_io` so
+    // lumen-server can hold it without depending on `mlx-native`. The
+    // renderers below stay feature-gated because they call into the
+    // Gemma 4 tokenizer.
+    pub use crate::chat_io::ToolDef;
 
     /// Render the tool-definition section that goes inside the system turn.
     ///

@@ -24,6 +24,12 @@ pub(crate) mod imp {
 
     use crate::gemma4_chat::imp::{Gemma4ChatTemplate, TOK_CHANNEL_CLOSE, TOK_CHANNEL_OPEN};
 
+    // Re-export the non-feature-gated data types from `chat_io` so existing
+    // call sites (`gemma4_response::imp::ParsedResponse` etc.) keep
+    // resolving. The parser itself stays feature-gated since it depends on
+    // the tokenizer-backed `Gemma4ChatTemplate`.
+    pub use crate::chat_io::{ParsedResponse, ParsedToolCall};
+
     // Tool-call delimiters from `tokenizer.json` added_tokens:
     //   <|tool_call> = 48,  <tool_call|> = 49
     pub const TOK_TOOL_CALL_OPEN: u32 = 48;
@@ -39,24 +45,6 @@ pub(crate) mod imp {
         /// Inside `<|tool_call>…<tool_call|>` — tool buffer (decoded as one
         /// blob when the closing token arrives).
         ToolCall,
-    }
-
-    /// One parsed function call extracted from a `<|tool_call>…<tool_call|>`
-    /// block.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ParsedToolCall {
-        pub name: String,
-        /// JSON-shaped arguments. We store the canonicalized
-        /// `serde_json::Value` so HTTP serialization is one step.
-        pub arguments: JsonValue,
-    }
-
-    /// Final structured response after all tokens have been consumed.
-    #[derive(Debug, Clone, Default)]
-    pub struct ParsedResponse {
-        pub visible: String,
-        pub reasoning: String,
-        pub tool_calls: Vec<ParsedToolCall>,
     }
 
     /// Token-streaming parser. Lives for the lifetime of a single request.

@@ -170,15 +170,47 @@ pub(crate) mod imp {
         ///   • Remaining messages: user / assistant alternation.
         ///   • Thinking toggle as described on `RenderOptions::enable_thinking`.
         ///
-        /// Tool calls / images / audio / video are intentionally rejected
-        /// at this layer to keep the contract narrow until W4 (b).
+        /// Image / audio / video blocks are rejected at this layer.
+        /// Tool calls in *history* (e.g. an assistant message that previously
+        /// invoked a tool) are not yet handled — Phase 1.4 owns turn-2
+        /// stitching. For Phase 1.3 the model only sees the *definitions*
+        /// (via `tools` argument on `render_to_ids_with_tools`) and a clean
+        /// user turn.
         pub fn render_to_ids(
             &self,
             messages: &[ChatMessage<'_>],
             opts: &RenderOptions,
         ) -> Result<Vec<u32>> {
+            self.render_to_ids_with_tools(messages, opts, &[])
+        }
+
+        /// Like `render_to_ids` but also injects tool *definitions* into the
+        /// system turn. Empty `tools` slice produces output identical to
+        /// `render_to_ids` (no system turn forced).
+        ///
+        /// Tools layout inside the system turn (matches the canonical
+        /// `chat_template.jinja`):
+        ///
+        /// ```text
+        /// <|turn>system
+        /// [system content]
+        /// <|tool>declaration:NAME{...}<tool|>
+        /// <|tool>declaration:NAME2{...}<tool|>
+        /// <turn|>
+        /// ```
+        ///
+        /// When `tools` is non-empty the system turn header is forced to
+        /// appear even if neither `enable_thinking` is set nor a system
+        /// message is present.
+        pub fn render_to_ids_with_tools(
+            &self,
+            messages: &[ChatMessage<'_>],
+            opts: &RenderOptions,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
             // ── header ────────────────────────────────────────────────
-            let mut out: Vec<u32> = Vec::with_capacity(64 + messages.len() * 32);
+            let mut out: Vec<u32> =
+                Vec::with_capacity(64 + messages.len() * 32 + tools.len() * 96);
             out.push(TOK_BOS);
 
             let (system_msg, body) = match messages.first() {
@@ -187,7 +219,8 @@ pub(crate) mod imp {
             };
 
             let has_system = system_msg.is_some();
-            let need_header = opts.enable_thinking || has_system;
+            let has_tools = !tools.is_empty();
+            let need_header = opts.enable_thinking || has_system || has_tools;
             if need_header {
                 out.push(TOK_TURN_OPEN);
                 out.extend(
@@ -202,6 +235,21 @@ pub(crate) mod imp {
                     out.extend(
                         self.encode_plain(sys.content.trim())
                             .context("encode system content")?,
+                    );
+                }
+                if has_tools {
+                    // Tool definitions follow the system content directly
+                    // (the jinja just concatenates — no separator). Render
+                    // to pseudo-JSON text then tokenize through the same
+                    // `encode_plain` path so `<|tool>` / `<tool|>` / `<|"|>`
+                    // resolve via the tokenizer's added_tokens table.
+                    let tool_text = crate::gemma4_tools::imp::render_tool_definitions_text(
+                        tools,
+                    )
+                    .context("render tool definitions text")?;
+                    out.extend(
+                        self.encode_plain(&tool_text)
+                            .context("encode tool definitions")?,
                     );
                 }
                 out.push(TOK_TURN_CLOSE);

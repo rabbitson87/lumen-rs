@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use lumen_mlx::chat_io::{ParsedResponse, ParsedToolCall, ToolDef};
 use lumen_model::gemma::GemmaModel;
 use lumen_model::gemma_gguf::GemmaGgufModel;
 use lumen_model::qwen::QwenModel;
@@ -218,28 +219,40 @@ impl ModelBackend {
         top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
-    ) -> Result<String> {
+        tools: &[ToolDef<'_>],
+    ) -> Result<ParsedResponse> {
         match self {
             Self::Qwen(m) => {
-                let _ = top_p;
-                m.chat(messages, max_new_tokens, temperature)
+                let _ = (top_p, tools);
+                let visible = m.chat(messages, max_new_tokens, temperature)?;
+                Ok(text_only_response(visible))
             }
             Self::Gemma(m) => {
-                let _ = top_p;
-                m.chat(messages, max_new_tokens, temperature)
+                let _ = (top_p, tools);
+                let visible = m.chat(messages, max_new_tokens, temperature)?;
+                Ok(text_only_response(visible))
             }
             Self::GemmaGguf(m) => {
-                let _ = top_p;
-                m.chat_with_options(messages, max_new_tokens, temperature, thinking)
+                let _ = (top_p, tools);
+                let visible =
+                    m.chat_with_options(messages, max_new_tokens, temperature, thinking)?;
+                Ok(text_only_response(visible))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = top_p;
-                m.chat(messages, max_new_tokens, temperature, thinking)
+                let _ = (top_p, tools);
+                let visible = m.chat(messages, max_new_tokens, temperature, thinking)?;
+                Ok(text_only_response(visible))
             }
-            Self::Mlx(m) => {
-                m.chat(messages, max_new_tokens, temperature, top_p, thinking, session_id)
-            }
+            Self::Mlx(m) => m.chat(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                thinking,
+                session_id,
+                tools,
+            ),
         }
     }
 
@@ -251,35 +264,40 @@ impl ModelBackend {
         top_p: f32,
         thinking: bool,
         session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
         on_token: F,
-    ) -> Result<String>
+    ) -> Result<ParsedResponse>
     where
         F: FnMut(&str),
     {
         match self {
             Self::GemmaGguf(m) => {
-                let _ = top_p;
-                m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)
+                let _ = (top_p, tools);
+                let visible =
+                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
+                Ok(text_only_response(visible))
             }
             // Fallback: generate all, send as one chunk
             Self::Qwen(m) => {
-                let _ = top_p;
+                let _ = (top_p, tools);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
-                Ok(text)
+                Ok(text_only_response(text))
             }
             Self::Gemma(m) => {
-                let _ = top_p;
+                let _ = (top_p, tools);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
-                Ok(text)
+                Ok(text_only_response(text))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = top_p;
-                m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)
+                let _ = (top_p, tools);
+                let visible =
+                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
+                Ok(text_only_response(visible))
             }
             Self::Mlx(m) => m.chat_streaming(
                 messages,
@@ -288,9 +306,21 @@ impl ModelBackend {
                 top_p,
                 thinking,
                 session_id,
+                tools,
                 on_token,
             ),
         }
+    }
+}
+
+/// Wrap a plain visible-text response for backends that don't yet emit
+/// structured tool_calls. Phase 1.3 keeps the API uniform; Phase 2 wires
+/// Qwen 3.6 tool-call parsing to populate `tool_calls` for that family.
+fn text_only_response(visible: String) -> ParsedResponse {
+    ParsedResponse {
+        visible,
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
     }
 }
 
@@ -561,7 +591,7 @@ impl InferenceEngine {
 
         // Single short pass — just compiles Metal shaders + stabilizes GPU
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 3, 0.0, 1.0, false, None)?;
+        let _ = self.backend.chat(&messages, 3, 0.0, 1.0, false, None, &[])?;
         eprintln!(
             "  pass 1 done ({:.0}ms)",
             t.elapsed().as_secs_f64() * 1000.0
@@ -569,7 +599,7 @@ impl InferenceEngine {
 
         // One more decode step to ensure pipeline is warm
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 2, 0.0, 1.0, false, None)?;
+        let _ = self.backend.chat(&messages, 2, 0.0, 1.0, false, None, &[])?;
 
         eprintln!(
             "  warmup complete in {:.0}ms",
@@ -595,28 +625,53 @@ impl InferenceEngine {
         // prompt). Bytes ≠ tokens but is a fast proxy: anything past ~64 KB
         // is a strong signal to investigate before suspecting a kernel bug.
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         eprintln!(
-            "[chat] msgs={} prompt_bytes={} max_tokens={} thinking={} stream={}",
+            "[chat] msgs={} prompt_bytes={} max_tokens={} thinking={} stream={} tools={}",
             messages.len(),
             prompt_bytes,
             req.max_tokens,
             req.thinking,
             req.stream,
+            tools_owned.len(),
         );
 
-        let content = self.backend.chat(
+        let parsed = self.backend.chat(
             &messages,
             req.max_tokens,
             req.temperature,
             req.top_p,
             req.thinking,
             req.session_id.as_deref(),
+            &tools_owned,
         )?;
 
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
-        let completion_tokens = count_tokens(&self.backend, &content);
+        // Token counting on the visible reply only — the reasoning channel
+        // and tool-call markup are billable tokens too in principle, but
+        // the OpenAI spec defines `completion_tokens` against the visible
+        // assistant content. Tool-call argument JSON sits inside the
+        // visible-text count via Gemma 4's response parser already.
+        let completion_tokens = count_tokens(&self.backend, &parsed.visible);
+
+        // Decide finish_reason + message shape from whether the model
+        // emitted any tool_calls. OpenAI spec: when tool_calls present,
+        // content may be null; finish_reason="tool_calls".
+        let has_tool_calls = !parsed.tool_calls.is_empty();
+        let (content, tool_calls) = if has_tool_calls {
+            let visible = parsed.visible.trim();
+            let content = if visible.is_empty() {
+                None
+            } else {
+                Some(visible.to_string())
+            };
+            (content, Some(parsed_to_openai_tool_calls(&parsed.tool_calls)))
+        } else {
+            (Some(parsed.visible), None)
+        };
+        let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
         Ok(ChatCompletionResponse {
             id: format!("chatcmpl-{}", gen_id()),
@@ -627,10 +682,10 @@ impl InferenceEngine {
                 index: 0,
                 message: ChatMessageResponse {
                     role: "assistant".into(),
-                    content: Some(content),
-                    tool_calls: None,
+                    content,
+                    tool_calls,
                 },
-                finish_reason: "stop".into(),
+                finish_reason: finish_reason.into(),
             }],
             usage: Usage {
                 prompt_tokens,
@@ -697,27 +752,59 @@ impl InferenceEngine {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
 
-        let content = self.backend.chat(
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let parsed = self.backend.chat(
             &messages,
             req.max_tokens,
             req.temperature,
             req.top_p,
             req.thinking,
             req.session_id.as_deref(),
+            &tools_owned,
         )?;
 
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
-        let output_tokens = count_tokens(&self.backend, &content);
+        let output_tokens = count_tokens(&self.backend, &parsed.visible);
+
+        // Assemble content[] per Anthropic spec: any leading visible text
+        // as a `text` block, then one `tool_use` block per parsed tool call.
+        // stop_reason="tool_use" when tool calls present, else "end_turn".
+        let has_tool_calls = !parsed.tool_calls.is_empty();
+        let mut content: Vec<AnthropicResponseBlock> = Vec::new();
+        let visible = parsed.visible.trim();
+        if !visible.is_empty() {
+            content.push(AnthropicResponseBlock::Text {
+                text: visible.to_string(),
+            });
+        }
+        if has_tool_calls {
+            for call in &parsed.tool_calls {
+                content.push(AnthropicResponseBlock::ToolUse {
+                    id: format!("toolu_{}", gen_id()),
+                    name: call.name.clone(),
+                    input: call.arguments.clone(),
+                });
+            }
+        }
+        // If the model produced nothing visible AND no tool calls, fall
+        // back to an empty text block so the response still conforms to
+        // the spec (content[] cannot be empty).
+        if content.is_empty() {
+            content.push(AnthropicResponseBlock::Text {
+                text: String::new(),
+            });
+        }
+        let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
 
         Ok(AnthropicResponse {
             id: format!("msg_{}", gen_id()),
             r#type: "message".into(),
             role: "assistant".into(),
             model: req.model.clone(),
-            content: vec![AnthropicResponseBlock::Text { text: content }],
-            stop_reason: "end_turn".into(),
+            content,
+            stop_reason: stop_reason.into(),
             stop_sequence: None,
             usage: AnthropicUsage {
                 input_tokens: prompt_tokens,
@@ -777,6 +864,7 @@ impl InferenceEngine {
             return;
         }
 
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         let result = self.backend.chat_streaming(
             &messages,
             req.max_tokens,
@@ -784,14 +872,21 @@ impl InferenceEngine {
             req.top_p,
             req.thinking,
             req.session_id.as_deref(),
-            |text| {
+            &tools_owned,
+            |text: &str| {
                 let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
             },
         );
 
         match result {
-            Ok(full_text) => {
-                let completion_tokens = count_tokens(&self.backend, &full_text);
+            Ok(parsed) => {
+                // Phase 1.5 will surface tool_calls as incremental SSE
+                // deltas. For now, we still terminate the stream with a
+                // Done event carrying the visible-text completion count;
+                // any tool_calls the model emitted are dropped on the
+                // streaming path. Non-streaming requests (chat_completion)
+                // surface them correctly.
+                let completion_tokens = count_tokens(&self.backend, &parsed.visible);
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -834,6 +929,7 @@ impl InferenceEngine {
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
 
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let result = self.backend.chat_streaming(
             &messages,
             req.max_tokens,
@@ -841,14 +937,15 @@ impl InferenceEngine {
             req.top_p,
             req.thinking,
             req.session_id.as_deref(),
-            |text| {
+            &tools_owned,
+            |text: &str| {
                 let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
             },
         );
 
         match result {
-            Ok(full_text) => {
-                let completion_tokens = count_tokens(&self.backend, &full_text);
+            Ok(parsed) => {
+                let completion_tokens = count_tokens(&self.backend, &parsed.visible);
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -917,6 +1014,64 @@ fn gen_id() -> String {
     // the same second don't collide (unix_timestamp has 1s resolution).
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:x}-{:x}", unix_timestamp(), n)
+}
+
+// ── Tool-calling bridges ─────────────────────────────────────────────────
+//
+// Convert the OpenAI / Anthropic request types into the backend-facing
+// `ToolDef<'_>` shape, and the backend's `ParsedToolCall` output back into
+// each API's wire format. Lifetimes flow from the request that owns the
+// underlying strings, so the returned `Vec<ToolDef>` borrows from `req.tools`.
+
+fn openai_tools_to_defs(tools: Option<&[Tool]>) -> Vec<ToolDef<'_>> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .map(|t| {
+            let Tool::Function { function } = t;
+            ToolDef {
+                name: function.name.as_str(),
+                description: function.description.as_deref(),
+                parameters: function.parameters.as_ref(),
+                response: None,
+            }
+        })
+        .collect()
+}
+
+fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .map(|t| ToolDef {
+            name: t.name.as_str(),
+            description: t.description.as_deref(),
+            parameters: Some(&t.input_schema),
+            response: None,
+        })
+        .collect()
+}
+
+/// Convert backend-parsed tool calls into OpenAI-shaped `ToolCall`s. The
+/// `id` is generated server-side; clients echo it on the next turn as
+/// `tool_call_id`. `function.arguments` is JSON-encoded into a string per
+/// OpenAI spec (the client `JSON.parse`'s it themselves).
+fn parsed_to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<ToolCall> {
+    calls
+        .iter()
+        .map(|c| ToolCall {
+            id: format!("call_{}", gen_id()),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: c.name.clone(),
+                arguments: serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into()),
+            },
+        })
+        .collect()
 }
 
 // ── Channel-based Engine Handle ──────────────────────────────────────────
