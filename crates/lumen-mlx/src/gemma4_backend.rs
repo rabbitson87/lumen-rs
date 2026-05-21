@@ -28,7 +28,7 @@ pub(crate) mod imp {
 
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
     use crate::gemma4_moe::imp::{GenerateConfig, NativeGemma4Model, NativeGemma4PromptCache};
-    use crate::gemma4_response::imp::{ParsedResponse, ResponseParser};
+    use crate::gemma4_response::imp::{ParseState, ParsedResponse, ResponseParser};
     use crate::gemma4_sampling::imp::SamplingConfig;
 
     /// Builds a `SamplingConfig` from request-supplied `temperature`/`top_p`
@@ -69,6 +69,21 @@ pub(crate) mod imp {
             seed,
         };
         if cfg.is_greedy() { None } else { Some(cfg) }
+    }
+
+    /// Phase 1.5: predicate guarding visible-text emission in
+    /// `chat_streaming`. Returns `true` if the just-pushed token is the
+    /// `<|tool_call>` open sentinel, lives inside a tool-call body, or
+    /// closes one with `<tool_call|>`. We MUST NOT fire the visible-text
+    /// callback in any of those cases — the tool-call body is surfaced
+    /// separately via `ParsedResponse.tool_calls` after generation
+    /// finishes and (in streaming mode) via the `ToolCall*` envelope.
+    /// Otherwise SSE clients would see the raw `call:NAME{...}` body
+    /// streamed as visible content AND the tool_calls envelope, double-
+    /// rendering the same data.
+    #[inline]
+    fn is_tool_call_boundary(before: ParseState, after: ParseState) -> bool {
+        matches!(before, ParseState::ToolCall) || matches!(after, ParseState::ToolCall)
     }
 
     /// Prefix-cache entry: snapshot of a prompt-prefilled cache that can be
@@ -464,9 +479,53 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            mut on_token: impl FnMut(&str) -> Result<()>,
+            on_token: impl FnMut(&str) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
+            self.decode_streaming_with_prompt(
+                prompt,
+                max_new_tokens,
+                temperature,
+                top_p,
+                on_token,
+            )
+        }
+
+        /// Phase 1.5: structured-history variant of `chat_streaming` for
+        /// turn-2+ agent loops. The flat-history streaming path can't
+        /// represent `role:"tool"` messages — this one routes through
+        /// the structured renderer (`build_chat_input_from_history`)
+        /// and shares the same decode loop. Used when the request's
+        /// message stream includes an assistant `tool_calls` or
+        /// `role:"tool"` entry.
+        pub fn chat_streaming_from_history(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            on_token: impl FnMut(&str) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            let prompt = self.build_chat_input_from_history(turns, thinking, tools)?;
+            self.decode_streaming_with_prompt(
+                prompt,
+                max_new_tokens,
+                temperature,
+                top_p,
+                on_token,
+            )
+        }
+
+        fn decode_streaming_with_prompt(
+            &mut self,
+            prompt: Vec<u32>,
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            mut on_token: impl FnMut(&str) -> Result<()>,
+        ) -> Result<ParsedResponse> {
             // ── Manual prefill + decode loop so we can inject the
             //    on_token callback between steps.
             //
@@ -627,10 +686,13 @@ pub(crate) mod imp {
                     let first_tok = sample_next_token(&logits, &all_tokens, &sampling, &mut rng)
                         .context("chat_streaming(sampled): sample prefill token")?;
                     all_tokens.push(first_tok);
+                    let state_before = parser.state();
                     parser.push(first_tok)?;
-                    let chunk = self.chat.decode(&[first_tok], true)?;
-                    if !chunk.is_empty() {
-                        on_token(&chunk)?;
+                    if !is_tool_call_boundary(state_before, parser.state()) {
+                        let chunk = self.chat.decode(&[first_tok], true)?;
+                        if !chunk.is_empty() {
+                            on_token(&chunk)?;
+                        }
                     }
 
                     if !eos.contains(&first_tok) {
@@ -654,10 +716,13 @@ pub(crate) mod imp {
                             )
                             .context("chat_streaming(sampled): sample step")?;
                             all_tokens.push(next_tok);
+                            let state_before = parser.state();
                             parser.push(next_tok)?;
-                            let decoded = self.chat.decode(&[next_tok], true)?;
-                            if !decoded.is_empty() {
-                                on_token(&decoded)?;
+                            if !is_tool_call_boundary(state_before, parser.state()) {
+                                let decoded = self.chat.decode(&[next_tok], true)?;
+                                if !decoded.is_empty() {
+                                    on_token(&decoded)?;
+                                }
                             }
                             if eos.contains(&next_tok) {
                                 break;
@@ -770,10 +835,13 @@ pub(crate) mod imp {
                             .model
                             .read_token_u32(&current)
                             .context("chat_streaming: read final token")?;
+                        let state_before = parser.state();
                         parser.push(token)?;
-                        let chunk = self.chat.decode(&[token], true)?;
-                        if !chunk.is_empty() {
-                            on_token(&chunk)?;
+                        if !is_tool_call_boundary(state_before, parser.state()) {
+                            let chunk = self.chat.decode(&[token], true)?;
+                            if !chunk.is_empty() {
+                                on_token(&chunk)?;
+                            }
                         }
                         break;
                     }
@@ -856,11 +924,14 @@ pub(crate) mod imp {
                         prev_sched_wait = sched_wait;
                     }
 
+                    let state_before = parser.state();
                     parser.push(token)?;
                     count += 1;
-                    let chunk = self.chat.decode(&[token], true)?;
-                    if !chunk.is_empty() {
-                        on_token(&chunk)?;
+                    if !is_tool_call_boundary(state_before, parser.state()) {
+                        let chunk = self.chat.decode(&[token], true)?;
+                        if !chunk.is_empty() {
+                            on_token(&chunk)?;
+                        }
                     }
 
                     // Stop Metal capture after `capture_steps` decode steps.

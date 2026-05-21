@@ -1019,6 +1019,78 @@ impl MlxBackend {
         }
     }
 
+    /// Phase 1.5: structured-history streaming entry point. Routes
+    /// Gemma 4 through `chat_streaming_from_history` so turn-2 agent
+    /// loops can stream natural-language continuations. Qwen 3.5
+    /// family currently flattens to plain text (loses tool metadata);
+    /// future Hermes-style structured streaming lands in Phase 2.
+    pub fn chat_streaming_from_history<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        mut on_token: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
+        use crate::chat_io::ParsedResponse;
+        match self {
+            Self::Qwen35Family(_) => {
+                // Qwen 3.5/3.6 family doesn't have a tool-aware renderer
+                // yet (Phase 2 lands the Hermes path). Flatten ChatTurn
+                // history to `(role, content)`; tool results become
+                // user-role "[tool result] …" text so the chat-template
+                // accepts them. Quality is degraded vs the structured
+                // Gemma 4 path but the request doesn't error.
+                let plain: Vec<(String, String)> = turns
+                    .iter()
+                    .map(|t| match t {
+                        crate::chat_io::ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
+                        crate::chat_io::ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
+                        crate::chat_io::ChatTurn::Assistant { text, .. } => {
+                            ("assistant".to_string(), (*text).to_string())
+                        }
+                        crate::chat_io::ChatTurn::Tool { content, .. } => {
+                            ("user".to_string(), format!("[tool result] {}", *content))
+                        }
+                    })
+                    .collect();
+                self.chat_streaming(
+                    &plain,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    thinking,
+                    session_id,
+                    tools,
+                    on_token,
+                )
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                m.chat_streaming_from_history(
+                    turns,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    thinking,
+                    tools,
+                    |chunk| {
+                        on_token(chunk);
+                        Ok(())
+                    },
+                )
+            }
+        }
+        .map(|p: ParsedResponse| p)
+    }
+
     /// Unified completion (`/v1/completions`) — greedy raw token generation.
     pub fn generate(
         &mut self,

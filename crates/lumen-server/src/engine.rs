@@ -367,6 +367,49 @@ impl ModelBackend {
             tools,
         )
     }
+
+    /// Phase 1.5: streaming variant of `chat_from_history`. Mlx path
+    /// (Gemma 4) routes through the structured renderer; legacy
+    /// backends flatten + delegate to `chat_streaming` so the request
+    /// doesn't error out.
+    fn chat_streaming_from_history<F>(
+        &mut self,
+        turns: &[ChatTurn<'_>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+        on_token: F,
+    ) -> Result<ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
+        if let Self::Mlx(m) = self {
+            return m.chat_streaming_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                thinking,
+                session_id,
+                tools,
+                on_token,
+            );
+        }
+        let plain = flatten_turns_for_plain_backend(turns);
+        self.chat_streaming(
+            &plain,
+            max_new_tokens,
+            temperature,
+            top_p,
+            thinking,
+            session_id,
+            tools,
+            on_token,
+        )
+    }
 }
 
 fn flatten_turns_for_plain_backend(turns: &[ChatTurn<'_>]) -> Vec<(String, String)> {
@@ -808,12 +851,8 @@ impl InferenceEngine {
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
-        // Token counting on the visible reply only — the reasoning channel
-        // and tool-call markup are billable tokens too in principle, but
-        // the OpenAI spec defines `completion_tokens` against the visible
-        // assistant content. Tool-call argument JSON sits inside the
-        // visible-text count via Gemma 4's response parser already.
-        let completion_tokens = count_tokens(&self.backend, &parsed.visible);
+        let completion_tokens =
+            completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
         // Decide finish_reason + message shape from whether the model
         // emitted any tool_calls. OpenAI spec: when tool_calls present,
@@ -1096,7 +1135,8 @@ impl InferenceEngine {
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
-        let output_tokens = count_tokens(&self.backend, &parsed.visible);
+        let output_tokens =
+            completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
         // Assemble content[] per Anthropic spec: any leading visible text
         // as a `text` block, then one `tool_use` block per parsed tool call.
@@ -1159,16 +1199,16 @@ impl InferenceEngine {
             .backend
             .count_chat_prompt_tokens(&messages, req.thinking);
 
-        // mirror chat_completion log
-        // on the streaming path. Moltis defaults to stream=true.
+        let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
         eprintln!(
-            "[chat-stream] msgs={} prompt_bytes={} prompt_tokens={} max_tokens={} thinking={}",
+            "[chat-stream] msgs={} prompt_bytes={} prompt_tokens={} max_tokens={} thinking={} structured={}",
             messages.len(),
             prompt_bytes,
             prompt_tokens,
             req.max_tokens,
             req.thinking,
+            needs_structured,
         );
 
         // chunked prefill
@@ -1195,31 +1235,141 @@ impl InferenceEngine {
         }
 
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
-        let result = self.backend.chat_streaming(
-            &messages,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.thinking,
-            req.session_id.as_deref(),
-            &tools_owned,
-            |text: &str| {
-                let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
-            },
-        );
+
+        // Phase 1.5: when prior assistant tool_calls or role:"tool" are
+        // in the request, dispatch through chat_streaming_from_history
+        // so the structured renderer handles them. Mirrors the
+        // chat_completion non-stream path. Owning buffers
+        // (`arg_values`, `assistant_tc_buf`) keep ChatTurn borrows
+        // stable until the call returns.
+        let result = if needs_structured {
+            let arg_values: Vec<serde_json::Value> = req
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.tool_calls
+                        .iter()
+                        .flat_map(|calls| calls.iter())
+                        .map(|c| {
+                            serde_json::from_str(&c.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = {
+                let mut next_arg = 0;
+                req.messages
+                    .iter()
+                    .map(|m| {
+                        m.tool_calls
+                            .as_ref()
+                            .map(|calls| {
+                                calls
+                                    .iter()
+                                    .map(|c| {
+                                        let av = &arg_values[next_arg];
+                                        next_arg += 1;
+                                        AssistantToolCall {
+                                            id: c.id.as_str(),
+                                            name: c.function.name.as_str(),
+                                            arguments: av,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            };
+            let turns: Vec<ChatTurn<'_>> = req
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| match m.role.as_str() {
+                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
+                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
+                    "tool" => ChatTurn::Tool {
+                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
+                        name: m.name.as_deref(),
+                        content: m.content.as_str(),
+                    },
+                    _ => ChatTurn::Assistant {
+                        text: m.content.as_str(),
+                        tool_calls: assistant_tc_buf
+                            .get(i)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    },
+                })
+                .collect();
+            self.backend.chat_streaming_from_history(
+                &turns,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                |text: &str| {
+                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                },
+            )
+        } else {
+            self.backend.chat_streaming(
+                &messages,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                |text: &str| {
+                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                },
+            )
+        };
 
         match result {
             Ok(parsed) => {
-                // Phase 1.5 will surface tool_calls as incremental SSE
-                // deltas. For now, we still terminate the stream with a
-                // Done event carrying the visible-text completion count;
-                // any tool_calls the model emitted are dropped on the
-                // streaming path. Non-streaming requests (chat_completion)
-                // surface them correctly.
-                let completion_tokens = count_tokens(&self.backend, &parsed.visible);
+                // Phase 1.5: emit each parsed tool_call as the
+                // start / arguments / stop trio so the SSE layer can
+                // synthesize OpenAI `delta.tool_calls` chunks. We do
+                // this AFTER the visible-text Delta stream so existing
+                // clients that ignore tool_calls still see the natural
+                // text first. MVP: single arguments chunk per call;
+                // future token-aware backends may split.
+                let has_tool_calls = !parsed.tool_calls.is_empty();
+                for (i, call) in parsed.tool_calls.iter().enumerate() {
+                    let index = i as u32;
+                    let id = format!("call_{}", gen_id());
+                    let args =
+                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                    let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                        index,
+                        id,
+                        name: call.name.clone(),
+                    });
+                    let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
+                        index,
+                        partial_json: args,
+                    });
+                    let _ = token_tx.try_send(StreamEvent::ToolCallStop { index });
+                }
+                let completion_tokens = completion_tokens_with_tools(
+                    &self.backend,
+                    &parsed.visible,
+                    &parsed.tool_calls,
+                );
+                let finish_reason = if has_tool_calls {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                };
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    finish_reason,
                 });
             }
             Err(e) => {
@@ -1235,22 +1385,23 @@ impl InferenceEngine {
         req: &AnthropicRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
-        let mut messages: Vec<(String, String)> = Vec::new();
+        let needs_structured = anthropic_needs_structured_history(&req.messages);
 
-        if let Some(ref system) = req.system {
-            let system_text = match system {
-                AnthropicSystem::Text(s) => s.clone(),
-                AnthropicSystem::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            };
-            if !system_text.is_empty() {
-                messages.push(("system".into(), system_text));
+        let system_text: Option<String> = req.system.as_ref().map(|sys| match sys {
+            AnthropicSystem::Text(s) => s.clone(),
+            AnthropicSystem::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+
+        let mut messages: Vec<(String, String)> = Vec::new();
+        if let Some(ref s) = system_text {
+            if !s.is_empty() {
+                messages.push(("system".into(), s.clone()));
             }
         }
-
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
@@ -1260,25 +1411,191 @@ impl InferenceEngine {
             .count_chat_prompt_tokens(&messages, req.thinking);
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
-        let result = self.backend.chat_streaming(
-            &messages,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.thinking,
-            req.session_id.as_deref(),
-            &tools_owned,
-            |text: &str| {
-                let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
-            },
-        );
+
+        // Phase 1.5: structured-history dispatch for Anthropic streaming.
+        // Mirrors `anthropic_messages` non-stream: build owning buffers
+        // (`assistant_text_buf`, `assistant_tc_buf`, `tool_result_buf`,
+        // `user_text_buf`) so ChatTurn borrows stay alive across the
+        // backend call.
+        let result = if needs_structured {
+            let assistant_text_buf: Vec<String> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "assistant" {
+                        return String::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(s) => s.clone(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                })
+                .collect();
+            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "assistant" {
+                        return Vec::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(_) => Vec::new(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::ToolUse { id, name, input } => {
+                                    Some(AssistantToolCall {
+                                        id: id.as_str(),
+                                        name: name.as_str(),
+                                        arguments: input,
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            let tool_result_buf: Vec<Vec<(String, String)>> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "user" {
+                        return Vec::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(_) => Vec::new(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    ..
+                                } => Some((tool_use_id.clone(), content.as_text())),
+                                _ => None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            let user_text_buf: Vec<String> = req
+                .messages
+                .iter()
+                .map(|m| {
+                    if m.role != "user" {
+                        return String::new();
+                    }
+                    match &m.content {
+                        AnthropicContent::Text(s) => s.clone(),
+                        AnthropicContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                })
+                .collect();
+
+            let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
+            if let Some(ref s) = system_text {
+                if !s.is_empty() {
+                    turns.push(ChatTurn::System(s.as_str()));
+                }
+            }
+            for (i, msg) in req.messages.iter().enumerate() {
+                match msg.role.as_str() {
+                    "assistant" => {
+                        turns.push(ChatTurn::Assistant {
+                            text: assistant_text_buf[i].as_str(),
+                            tool_calls: assistant_tc_buf[i].as_slice(),
+                        });
+                    }
+                    "user" => {
+                        for (tid, body) in &tool_result_buf[i] {
+                            turns.push(ChatTurn::Tool {
+                                tool_call_id: tid.as_str(),
+                                name: None,
+                                content: body.as_str(),
+                            });
+                        }
+                        if !user_text_buf[i].is_empty() {
+                            turns.push(ChatTurn::User(user_text_buf[i].as_str()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.backend.chat_streaming_from_history(
+                &turns,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                |text: &str| {
+                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                },
+            )
+        } else {
+            self.backend.chat_streaming(
+                &messages,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                |text: &str| {
+                    let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+                },
+            )
+        };
 
         match result {
             Ok(parsed) => {
-                let completion_tokens = count_tokens(&self.backend, &parsed.visible);
+                let has_tool_calls = !parsed.tool_calls.is_empty();
+                for (i, call) in parsed.tool_calls.iter().enumerate() {
+                    let index = i as u32;
+                    let id = format!("toolu_{}", gen_id());
+                    let args =
+                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+                    let _ = token_tx.try_send(StreamEvent::ToolCallStart {
+                        index,
+                        id,
+                        name: call.name.clone(),
+                    });
+                    let _ = token_tx.try_send(StreamEvent::ToolCallArgumentsDelta {
+                        index,
+                        partial_json: args,
+                    });
+                    let _ = token_tx.try_send(StreamEvent::ToolCallStop { index });
+                }
+                let completion_tokens = completion_tokens_with_tools(
+                    &self.backend,
+                    &parsed.visible,
+                    &parsed.tool_calls,
+                );
+                let finish_reason = if has_tool_calls {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                };
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    finish_reason,
                 });
             }
             Err(e) => {
@@ -1335,6 +1652,27 @@ fn count_tokens(backend: &ModelBackend, text: &str) -> u32 {
         Ok(ids) => ids.len() as u32,
         Err(_) => ((text.len() as u32) / 4).max(1),
     }
+}
+
+/// Completion tokens that account for tool-call body output. The visible
+/// channel is the assistant's natural-language text; tool-call markup
+/// (id + name + JSON-serialized arguments) is emitted by the model but
+/// the response parser strips it from `visible`, so a tool-only turn
+/// would otherwise report `0` — diverging from real OpenAI / Anthropic
+/// APIs which always count the serialized tool_use body. We approximate
+/// the missing cost by re-tokenizing `name + JSON(arguments)` per call.
+fn completion_tokens_with_tools(
+    backend: &ModelBackend,
+    visible: &str,
+    tool_calls: &[ParsedToolCall],
+) -> u32 {
+    let mut total = count_tokens(backend, visible);
+    for call in tool_calls {
+        let args = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
+        total = total.saturating_add(count_tokens(backend, &call.name));
+        total = total.saturating_add(count_tokens(backend, &args));
+    }
+    total
 }
 
 fn gen_id() -> String {
@@ -1443,15 +1781,62 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Events emitted during streaming generation.
 pub enum StreamEvent {
-    /// New text fragment (delta).
+    /// New visible-text fragment (assistant content).
     Delta(String),
-    /// Generation complete with token counts.
+    /// A tool call has been parsed; emit the OpenAI-style envelope
+    /// (id + name once, then incremental `arguments` deltas) or the
+    /// Anthropic-style envelope (content_block_start tool_use, then
+    /// `input_json_delta` chunks). `index` is monotonically increasing
+    /// across all tool calls in the response, NOT counting any
+    /// preceding text block.
+    ToolCallStart {
+        index: u32,
+        id: String,
+        name: String,
+    },
+    /// Incremental JSON-string fragment of the tool call's arguments.
+    /// Clients accumulate these into a single JSON object. Phase 1.5
+    /// MVP emits the full serialized argument string in one chunk per
+    /// call; future token-aware backends may emit multiple chunks.
+    ToolCallArgumentsDelta { index: u32, partial_json: String },
+    /// Closes the tool-call envelope. OpenAI clients ignore this;
+    /// Anthropic clients use it to emit `content_block_stop`.
+    ToolCallStop { index: u32 },
+    /// Generation complete with token counts and a finish-reason hint.
     Done {
         prompt_tokens: u32,
         completion_tokens: u32,
+        finish_reason: FinishReason,
     },
     /// Error during generation.
     Error(String),
+}
+
+/// Why the model stopped generating. Maps to OpenAI `finish_reason`
+/// (`"stop"` / `"tool_calls"` / `"length"`) and Anthropic
+/// `stop_reason` (`"end_turn"` / `"tool_use"` / `"max_tokens"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+}
+
+impl FinishReason {
+    pub fn openai_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::ToolCalls => "tool_calls",
+            FinishReason::Length => "length",
+        }
+    }
+    pub fn anthropic_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "end_turn",
+            FinishReason::ToolCalls => "tool_use",
+            FinishReason::Length => "max_tokens",
+        }
+    }
 }
 
 /// Request sent through the channel to the engine thread.
@@ -2097,6 +2482,7 @@ impl InferenceEngine {
                     let _ = seq.token_tx.try_send(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: n_gen as u32,
+                        finish_reason: FinishReason::Stop,
                     });
                     to_remove.push(id);
                 }
@@ -2457,6 +2843,7 @@ impl InferenceEngine {
                     let _ = seq.token_tx.try_send(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: n_gen as u32,
+                        finish_reason: FinishReason::Stop,
                     });
                     to_remove.push(id);
                 }

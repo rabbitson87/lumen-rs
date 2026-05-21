@@ -4,9 +4,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::engine::{EngineHandle, StreamEvent};
+#[allow(unused_imports)]
+use crate::engine::FinishReason;
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatStreamChoice, ChatStreamDelta, ErrorResponse,
-    Usage,
+    FunctionCallDelta, ToolCallDelta, Usage,
 };
 
 pub async fn handle(
@@ -225,9 +227,76 @@ async fn handle_streaming(
                     t_last_write = Some(std::time::Instant::now());
                 }
             }
+            StreamEvent::ToolCallStart { index, id: call_id, name } => {
+                // Phase 1.5: OpenAI tool_calls start chunk. Carries
+                // `index`, `id`, `type:"function"`, and `function.name`
+                // exactly once; subsequent argument chunks reference
+                // the same `index` without re-sending id/name.
+                let chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatStreamChoice {
+                        index: 0,
+                        delta: ChatStreamDelta {
+                            role: None,
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index,
+                                id: Some(call_id),
+                                kind: Some("function".into()),
+                                function: Some(FunctionCallDelta {
+                                    name: Some(name),
+                                    arguments: Some(String::new()),
+                                }),
+                            }]),
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                write_sse(&mut tcp, &chunk).await?;
+            }
+            StreamEvent::ToolCallArgumentsDelta {
+                index,
+                partial_json,
+            } => {
+                let chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatStreamChoice {
+                        index: 0,
+                        delta: ChatStreamDelta {
+                            role: None,
+                            content: None,
+                            tool_calls: Some(vec![ToolCallDelta {
+                                index,
+                                id: None,
+                                kind: None,
+                                function: Some(FunctionCallDelta {
+                                    name: None,
+                                    arguments: Some(partial_json),
+                                }),
+                            }]),
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                write_sse(&mut tcp, &chunk).await?;
+            }
+            StreamEvent::ToolCallStop { .. } => {
+                // OpenAI SSE has no per-tool-call stop event; the
+                // final `finish_reason: "tool_calls"` chunk closes the
+                // implicit envelope. Suppress.
+            }
             StreamEvent::Done {
                 prompt_tokens,
                 completion_tokens,
+                finish_reason,
             } => {
                 // Final content chunk with finish_reason. Per OpenAI spec, this
                 // chunk's `usage` is null even when include_usage=true; the
@@ -244,7 +313,7 @@ async fn handle_streaming(
                             content: None,
                             tool_calls: None,
                         },
-                        finish_reason: Some("stop".into()),
+                        finish_reason: Some(finish_reason.openai_str().into()),
                     }],
                     usage: None,
                 };

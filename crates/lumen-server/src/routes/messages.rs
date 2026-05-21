@@ -84,20 +84,24 @@ async fn handle_streaming(
 
     // message_start
     let start = format!(
-        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n"
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":1}}}}}}\n\n"
     );
     tcp.write_all(start.as_bytes()).await?;
 
-    // content_block_start
-    tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
-
-    // Hot-path delta envelope (Anthropic content_block_delta). Static prefix/suffix
-    // bytes — only the content text is escaped and appended per token.
+    // Phase 1.5: content_block_start is now LAZY — we don't pre-emit it
+    // because tool-only responses have no leading text. The first text
+    // Delta opens a text block (index 0); the first ToolCallStart opens
+    // a tool_use block at whichever wire index is next. The static
+    // delta_prefix / delta_suffix below stays pinned to `index:0` since
+    // visible text Deltas always precede tool_calls in our backends.
     let delta_prefix: &[u8] = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":";
     let delta_suffix: &[u8] = b"}}\n\n";
     let mut buf: Vec<u8> = Vec::with_capacity(delta_prefix.len() + delta_suffix.len() + 256);
 
-    // content_block_delta events
+    let mut wire_index: u32 = 0;
+    let mut text_block_open: bool = false;
+    let mut current_tool_wire_index: Option<u32> = None;
+
     let mut carry: Option<StreamEvent> = None;
     loop {
         let event = match carry.take() {
@@ -109,6 +113,12 @@ async fn handle_streaming(
         };
         match event {
             StreamEvent::Delta(text) => {
+                if !text_block_open {
+                    tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
+                    text_block_open = true;
+                    // text block always claims index 0; tool blocks start at 1
+                    wire_index = 1;
+                }
                 buf.clear();
                 append_anthropic_delta(&mut buf, delta_prefix, delta_suffix, &text);
                 loop {
@@ -125,23 +135,68 @@ async fn handle_streaming(
                 }
                 tcp.write_all(&buf).await?;
             }
+            StreamEvent::ToolCallStart { id, name, .. } => {
+                if text_block_open {
+                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
+                    text_block_open = false;
+                }
+                let idx = wire_index;
+                let id_json = serde_json::to_string(&id)
+                    .map_err(|e| SendableError::from(e.to_string()))?;
+                let name_json = serde_json::to_string(&name)
+                    .map_err(|e| SendableError::from(e.to_string()))?;
+                let evt = format!(
+                    "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"tool_use\",\"id\":{id_json},\"name\":{name_json},\"input\":{{}}}}}}\n\n"
+                );
+                tcp.write_all(evt.as_bytes()).await?;
+                current_tool_wire_index = Some(idx);
+            }
+            StreamEvent::ToolCallArgumentsDelta { partial_json, .. } => {
+                let idx = current_tool_wire_index.unwrap_or(wire_index);
+                // partial_json is the raw JSON object string; double-encode it
+                // into the wire envelope's `partial_json` string field.
+                let pj = serde_json::to_string(&partial_json)
+                    .map_err(|e| SendableError::from(e.to_string()))?;
+                let evt = format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{idx},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{pj}}}}}\n\n"
+                );
+                tcp.write_all(evt.as_bytes()).await?;
+            }
+            StreamEvent::ToolCallStop { .. } => {
+                if let Some(idx) = current_tool_wire_index.take() {
+                    let evt = format!(
+                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"
+                    );
+                    tcp.write_all(evt.as_bytes()).await?;
+                    wire_index = idx.saturating_add(1);
+                }
+            }
             StreamEvent::Done {
                 prompt_tokens,
                 completion_tokens: output_tokens,
+                finish_reason,
             } => {
-                // content_block_stop
-                tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
+                // Close any lingering text block.
+                if text_block_open {
+                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
+                }
+                // If the model produced nothing AND no tool calls, emit a
+                // pro-forma empty text block so downstream parsers never see
+                // a content[] array that's effectively empty.
+                if wire_index == 0 && current_tool_wire_index.is_none() {
+                    tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
+                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
+                }
 
-                // message_delta
+                let stop_reason = finish_reason.anthropic_str();
                 let delta = format!(
-                    "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
+                    "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
                 );
                 tcp.write_all(delta.as_bytes()).await?;
 
-                // message_stop
                 tcp.write_all(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
                     .await?;
-                let _ = prompt_tokens; // used in message_start above (approximated)
+                let _ = prompt_tokens; // surfaced in message_start above
                 break;
             }
             StreamEvent::Error(_) => break,
