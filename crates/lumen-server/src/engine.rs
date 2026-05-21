@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use lumen_mlx::chat_io::{AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ToolDef};
+use lumen_mlx::chat_io::{
+    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ResolvedToolChoice, ToolDef,
+};
 use lumen_model::gemma::GemmaModel;
 use lumen_model::gemma_gguf::GemmaGgufModel;
 use lumen_model::qwen::QwenModel;
@@ -220,27 +222,28 @@ impl ModelBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
     ) -> Result<ParsedResponse> {
         match self {
             Self::Qwen(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible = m.chat(messages, max_new_tokens, temperature)?;
                 Ok(text_only_response(visible))
             }
             Self::Gemma(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible = m.chat(messages, max_new_tokens, temperature)?;
                 Ok(text_only_response(visible))
             }
             Self::GemmaGguf(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible =
                     m.chat_with_options(messages, max_new_tokens, temperature, thinking)?;
                 Ok(text_only_response(visible))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible = m.chat(messages, max_new_tokens, temperature, thinking)?;
                 Ok(text_only_response(visible))
             }
@@ -252,6 +255,7 @@ impl ModelBackend {
                 thinking,
                 session_id,
                 tools,
+                tool_choice,
             ),
         }
     }
@@ -265,6 +269,7 @@ impl ModelBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
         on_token: F,
     ) -> Result<ParsedResponse>
     where
@@ -272,21 +277,21 @@ impl ModelBackend {
     {
         match self {
             Self::GemmaGguf(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible =
                     m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
                 Ok(text_only_response(visible))
             }
             // Fallback: generate all, send as one chunk
             Self::Qwen(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
                 Ok(text_only_response(text))
             }
             Self::Gemma(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 let mut on_token = on_token;
                 on_token(&text);
@@ -294,7 +299,7 @@ impl ModelBackend {
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible =
                     m.chat_streaming(messages, max_new_tokens, temperature, thinking, on_token)?;
                 Ok(text_only_response(visible))
@@ -307,6 +312,7 @@ impl ModelBackend {
                 thinking,
                 session_id,
                 tools,
+                tool_choice,
                 on_token,
             ),
         }
@@ -343,6 +349,7 @@ impl ModelBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
     ) -> Result<ParsedResponse> {
         if let Self::Mlx(m) = self {
             return m.chat_from_history(
@@ -353,6 +360,7 @@ impl ModelBackend {
                 thinking,
                 session_id,
                 tools,
+                tool_choice,
             );
         }
         // Legacy backends: flatten + delegate to plain chat.
@@ -365,6 +373,7 @@ impl ModelBackend {
             thinking,
             session_id,
             tools,
+            tool_choice,
         )
     }
 
@@ -381,6 +390,7 @@ impl ModelBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
         on_token: F,
     ) -> Result<ParsedResponse>
     where
@@ -395,6 +405,7 @@ impl ModelBackend {
                 thinking,
                 session_id,
                 tools,
+                tool_choice,
                 on_token,
             );
         }
@@ -407,6 +418,7 @@ impl ModelBackend {
             thinking,
             session_id,
             tools,
+            tool_choice,
             on_token,
         )
     }
@@ -696,7 +708,16 @@ impl InferenceEngine {
 
         // Single short pass — just compiles Metal shaders + stabilizes GPU
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 3, 0.0, 1.0, false, None, &[])?;
+        let _ = self.backend.chat(
+            &messages,
+            3,
+            0.0,
+            1.0,
+            false,
+            None,
+            &[],
+            &ResolvedToolChoice::Auto,
+        )?;
         eprintln!(
             "  pass 1 done ({:.0}ms)",
             t.elapsed().as_secs_f64() * 1000.0
@@ -704,7 +725,16 @@ impl InferenceEngine {
 
         // One more decode step to ensure pipeline is warm
         let messages = vec![("user".to_string(), "Hi".to_string())];
-        let _ = self.backend.chat(&messages, 2, 0.0, 1.0, false, None, &[])?;
+        let _ = self.backend.chat(
+            &messages,
+            2,
+            0.0,
+            1.0,
+            false,
+            None,
+            &[],
+            &ResolvedToolChoice::Auto,
+        )?;
 
         eprintln!(
             "  warmup complete in {:.0}ms",
@@ -734,7 +764,7 @@ impl InferenceEngine {
             req.messages.len(),
             prompt_bytes,
             req.max_tokens,
-            req.thinking,
+            req.enable_thinking(),
             req.stream,
             tools_owned.len(),
             needs_structured,
@@ -802,6 +832,8 @@ impl InferenceEngine {
             Vec::new()
         };
 
+        let tool_choice =
+            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
         let parsed = if needs_structured {
             let turns: Vec<ChatTurn<'_>> = req
                 .messages
@@ -832,9 +864,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
             )?
         } else {
             self.backend.chat(
@@ -842,15 +875,16 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
             )?
         };
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.thinking);
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -930,6 +964,8 @@ impl InferenceEngine {
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let needs_structured = anthropic_needs_structured_history(&req.messages);
+        let tool_choice =
+            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
 
         let system_text = req
             .system
@@ -1114,9 +1150,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
             )?
         } else {
             // Plain path — uses the flat messages built above. Matches
@@ -1126,15 +1163,16 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
             )?
         };
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.thinking);
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1197,7 +1235,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.thinking);
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
 
         let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
@@ -1207,7 +1245,7 @@ impl InferenceEngine {
             prompt_bytes,
             prompt_tokens,
             req.max_tokens,
-            req.thinking,
+            req.enable_thinking(),
             needs_structured,
         );
 
@@ -1235,6 +1273,8 @@ impl InferenceEngine {
         }
 
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -1308,9 +1348,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
                 |text: &str| {
                     let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
                 },
@@ -1321,9 +1362,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
                 |text: &str| {
                     let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
                 },
@@ -1408,9 +1450,11 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.thinking);
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -1541,9 +1585,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
                 |text: &str| {
                     let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
                 },
@@ -1554,9 +1599,10 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.thinking,
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
+                &tool_choice,
                 |text: &str| {
                     let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
                 },
@@ -1722,6 +1768,48 @@ fn anthropic_needs_structured_history(messages: &[AnthropicMessage]) -> bool {
             )
         }),
     })
+}
+
+/// Phase 1.6: resolve the OpenAI `tool_choice` into our canonical
+/// `ResolvedToolChoice`. Maps `"auto"` / `"required"` / `"none"` and
+/// `{type:"function", function:{name}}`. `Required` collapses to
+/// `Auto` when no tools are defined (no point in forcing a tool call
+/// with nothing to choose from).
+fn resolve_openai_tool_choice<'a>(
+    tool_choice: Option<&'a ToolChoice>,
+    has_tools: bool,
+) -> ResolvedToolChoice<'a> {
+    match tool_choice {
+        None => ResolvedToolChoice::Auto,
+        Some(ToolChoice::Mode(m)) => match m.as_str() {
+            "none" => ResolvedToolChoice::None,
+            "required" if has_tools => ResolvedToolChoice::Required,
+            _ => ResolvedToolChoice::Auto,
+        },
+        Some(ToolChoice::Named { function, .. }) if has_tools => {
+            ResolvedToolChoice::Tool(function.name.as_str())
+        }
+        Some(ToolChoice::Named { .. }) => ResolvedToolChoice::Auto,
+    }
+}
+
+/// Phase 1.6: Anthropic equivalent — `Auto` / `Any` (≈ OpenAI's
+/// `required`) / `Tool{name}`. Anthropic has no explicit `None`;
+/// callers omit `tools[]` instead.
+fn resolve_anthropic_tool_choice<'a>(
+    tool_choice: Option<&'a AnthropicToolChoice>,
+    has_tools: bool,
+) -> ResolvedToolChoice<'a> {
+    match tool_choice {
+        None => ResolvedToolChoice::Auto,
+        Some(AnthropicToolChoice::Auto) => ResolvedToolChoice::Auto,
+        Some(AnthropicToolChoice::Any) if has_tools => ResolvedToolChoice::Required,
+        Some(AnthropicToolChoice::Any) => ResolvedToolChoice::Auto,
+        Some(AnthropicToolChoice::Tool { name }) if has_tools => {
+            ResolvedToolChoice::Tool(name.as_str())
+        }
+        Some(AnthropicToolChoice::Tool { .. }) => ResolvedToolChoice::Auto,
+    }
 }
 
 fn openai_tools_to_defs(tools: Option<&[Tool]>) -> Vec<ToolDef<'_>> {
@@ -2100,7 +2188,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.thinking,
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2139,7 +2227,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9, // AnthropicRequest has no top_p; use default
-                            req.thinking,
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2178,7 +2266,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.thinking,
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2218,7 +2306,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.thinking,
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2534,7 +2622,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.thinking,
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2573,7 +2661,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9,
-                            req.thinking,
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2609,7 +2697,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.thinking,
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2649,7 +2737,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.thinking,
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {

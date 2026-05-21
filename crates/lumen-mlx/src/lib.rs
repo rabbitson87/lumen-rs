@@ -848,6 +848,7 @@ impl MlxBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         use crate::chat_io::ParsedResponse;
         match self {
@@ -855,8 +856,8 @@ impl MlxBackend {
                 // Qwen 3.5 family doesn't yet render tools into its prompt
                 // (Phase 2 wires that up). For now we accept the slice and
                 // ignore it so the API surface stays uniform — tool_calls
-                // in the response will be empty.
-                let _ = (top_p, tools);
+                // in the response will be empty. tool_choice also ignored.
+                let _ = (top_p, tools, tool_choice);
                 let visible = if let Some(sid) = session_id {
                     m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})?
                 } else {
@@ -880,9 +881,18 @@ impl MlxBackend {
                         thinking,
                         sid,
                         tools,
+                        tool_choice,
                     )
                 } else {
-                    m.chat(messages, max_new_tokens, temperature, top_p, thinking, tools)
+                    m.chat(
+                        messages,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        tools,
+                        tool_choice,
+                    )
                 }
             }
         }
@@ -902,6 +912,7 @@ impl MlxBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         use crate::chat_io::{ChatTurn, ParsedResponse};
         match self {
@@ -911,8 +922,8 @@ impl MlxBackend {
                 // tool_calls / tool_call_id and call the existing
                 // plain-text chat path. role:Tool turns become text
                 // markers so the model gets *something* (better than
-                // erroring out).
-                let _ = (top_p, tools);
+                // erroring out). tool_choice ignored on this fallback.
+                let _ = (top_p, tools, tool_choice);
                 let plain: Vec<(String, String)> = turns
                     .iter()
                     .map(|t| match t {
@@ -960,6 +971,7 @@ impl MlxBackend {
                     top_p,
                     thinking,
                     tools,
+                    tool_choice,
                 )
             }
         }
@@ -979,6 +991,7 @@ impl MlxBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         mut on_token: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -987,7 +1000,7 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, tools);
+                let _ = (top_p, tools, tool_choice);
                 let visible = if let Some(sid) = session_id {
                     m.chat_streaming_session(messages, max_new_tokens, thinking, sid, on_token)?
                 } else {
@@ -1010,6 +1023,7 @@ impl MlxBackend {
                     top_p,
                     thinking,
                     tools,
+                    tool_choice,
                     |chunk| {
                         on_token(chunk);
                         Ok(())
@@ -1033,6 +1047,7 @@ impl MlxBackend {
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         mut on_token: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -1068,6 +1083,7 @@ impl MlxBackend {
                     thinking,
                     session_id,
                     tools,
+                    tool_choice,
                     on_token,
                 )
             }
@@ -1081,6 +1097,7 @@ impl MlxBackend {
                     top_p,
                     thinking,
                     tools,
+                    tool_choice,
                     |chunk| {
                         on_token(chunk);
                         Ok(())

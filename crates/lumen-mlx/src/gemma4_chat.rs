@@ -96,6 +96,39 @@ pub(crate) mod imp {
         }
     }
 
+    impl Gemma4ChatTemplate {
+        /// Phase 1.6: produce the prefill token sequence that enforces a
+        /// non-`Auto` tool_choice. The caller appends these to the
+        /// generation prompt AND replays them through the response
+        /// parser so the parser's state machine is in sync when the
+        /// model's first generated token arrives.
+        ///
+        ///   - `Auto` / `None` → empty (model decides; for `None` the
+        ///     caller is expected to drop tool definitions from the
+        ///     renderer altogether).
+        ///   - `Required` → `[<|tool_call>]` (single token, id 48).
+        ///   - `Tool(name)` → `[<|tool_call>, …encode("call:NAME{")…]`
+        ///     so the model only has the args body left to generate.
+        pub fn tool_choice_prefill_tokens(
+            &self,
+            choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<Vec<u32>> {
+            use crate::chat_io::ResolvedToolChoice;
+            use crate::gemma4_response::imp::TOK_TOOL_CALL_OPEN;
+            match choice {
+                ResolvedToolChoice::Auto | ResolvedToolChoice::None => Ok(Vec::new()),
+                ResolvedToolChoice::Required => Ok(vec![TOK_TOOL_CALL_OPEN]),
+                ResolvedToolChoice::Tool(name) => {
+                    let mut out = vec![TOK_TOOL_CALL_OPEN];
+                    let body = format!("call:{name}{{");
+                    let mut body_ids = self.encode_plain(&body)?;
+                    out.append(&mut body_ids);
+                    Ok(out)
+                }
+            }
+        }
+    }
+
     /// Loaded tokenizer + chat-template state. Cheap to clone (it carries a
     /// single `Tokenizer` which is itself `Arc`-internally).
     pub struct Gemma4ChatTemplate {

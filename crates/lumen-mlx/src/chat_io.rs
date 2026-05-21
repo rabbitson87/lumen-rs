@@ -96,3 +96,24 @@ pub struct AssistantToolCall<'a> {
     /// the borrow.
     pub arguments: &'a JsonValue,
 }
+
+/// Phase 1.6: normalized tool-choice intent passed from the HTTP layer
+/// to the backend renderer. OpenAI's `ToolChoice` and Anthropic's
+/// `AnthropicToolChoice` both map onto this — `Auto` is the default
+/// (model decides), `None` strips tool definitions from the prompt
+/// entirely, `Required` and `Tool(name)` prefill `<|tool_call>` (and
+/// optionally `call:NAME{`) at the end of the generation prompt so
+/// the model MUST start generating a tool call.
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedToolChoice<'a> {
+    Auto,
+    None,
+    Required,
+    Tool(&'a str),
+}
+
+impl Default for ResolvedToolChoice<'_> {
+    fn default() -> Self {
+        ResolvedToolChoice::Auto
+    }
+}

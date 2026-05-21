@@ -276,8 +276,10 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input_from_history(turns, thinking, tools)?;
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -290,6 +292,9 @@ pub(crate) mod imp {
             );
 
             let mut parser = ResponseParser::new(&self.chat);
+            for tok in &prefill_tokens {
+                parser.push(*tok)?;
+            }
             for token in &stats.generated_tokens {
                 parser.push(*token)?;
             }
@@ -304,8 +309,10 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -318,10 +325,65 @@ pub(crate) mod imp {
             );
 
             let mut parser = ResponseParser::new(&self.chat);
+            // Phase 1.6: feed tool_choice prefill tokens to the parser
+            // first so its state machine matches the prompt the model
+            // saw. Required: parser enters ToolCall on token 48.
+            // Tool(name): parser enters ToolCall on token 48 and
+            // accumulates "call:NAME{" before the model's first
+            // generated args token arrives.
+            for tok in &prefill_tokens {
+                parser.push(*tok)?;
+            }
             for token in &stats.generated_tokens {
                 parser.push(*token)?;
             }
             parser.finalize()
+        }
+
+        /// Phase 1.6: assemble prompt + tool_choice prefill in one call.
+        /// `None` choice means strip tool defs entirely (we hand an
+        /// empty `tools` slice to the renderer so the system turn never
+        /// mentions tools); `Required` / `Tool(name)` append the
+        /// `<|tool_call>` (+ `call:NAME{`) prefill to the generation
+        /// prompt. Returns the full prompt token vector and the prefill
+        /// slice the caller must replay through the response parser.
+        fn build_prompt_and_prefill(
+            &self,
+            messages: &[(String, String)],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools: &[crate::gemma4_tools::imp::ToolDef<'_>] = match tool_choice {
+                ResolvedToolChoice::None => &[],
+                _ => tools,
+            };
+            let mut prompt =
+                self.build_chat_input_with_tools(messages, thinking, effective_tools)?;
+            let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
+            prompt.extend(prefill.iter().copied());
+            Ok((prompt, prefill))
+        }
+
+        /// History variant of `build_prompt_and_prefill`.
+        fn build_prompt_and_prefill_from_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
+                ResolvedToolChoice::None => &[],
+                _ => tools,
+            };
+            let mut prompt =
+                self.build_chat_input_from_history(turns, thinking, effective_tools)?;
+            let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
+            prompt.extend(prefill.iter().copied());
+            Ok((prompt, prefill))
         }
 
         /// Prefix-cache-aware `chat()` variant for the Moltis batch workload.
@@ -353,8 +415,10 @@ pub(crate) mod imp {
             thinking: bool,
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
             }
@@ -440,6 +504,9 @@ pub(crate) mod imp {
 
             // ── Parse decoded tokens into ParsedResponse ──
             let mut parser = ResponseParser::new(&self.chat);
+            for tok in &prefill_tokens {
+                parser.push(*tok)?;
+            }
             for token in &stats.generated_tokens {
                 parser.push(*token)?;
             }
@@ -479,11 +546,14 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
             on_token: impl FnMut(&str) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input_with_tools(messages, thinking, tools)?;
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
             self.decode_streaming_with_prompt(
                 prompt,
+                prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
@@ -506,11 +576,14 @@ pub(crate) mod imp {
             top_p: f32,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
             on_token: impl FnMut(&str) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let prompt = self.build_chat_input_from_history(turns, thinking, tools)?;
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
             self.decode_streaming_with_prompt(
                 prompt,
+                prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
@@ -521,6 +594,7 @@ pub(crate) mod imp {
         fn decode_streaming_with_prompt(
             &mut self,
             prompt: Vec<u32>,
+            prefill_tokens: Vec<u32>,
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
@@ -663,6 +737,12 @@ pub(crate) mod imp {
                 // No clear_cache().
 
                 let mut parser = ResponseParser::new(&self.chat);
+                // Phase 1.6: replay tool_choice prefill tokens so the
+                // parser's state machine matches the prompt the model
+                // saw (e.g. enters ToolCall on token 48 for Required).
+                for tok in &prefill_tokens {
+                    parser.push(*tok)?;
+                }
                 let eos = self.model.eos_tokens().to_vec();
 
                 // ── Sampled decode branch ──
