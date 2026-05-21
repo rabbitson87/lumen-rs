@@ -125,6 +125,17 @@
     config?.active_model != null && outdatedModels.has(config.active_model)
   );
 
+  // True when the configured active model exists on disk but its
+  // download is incomplete (truncated shard, missing index, stray
+  // .part file). Block the Start button so the server doesn't crash
+  // mid-load with a missing-weight error — the user must Re-download
+  // from the MODELS card first.
+  let activeBroken = $derived.by(() => {
+    if (!config?.active_model) return false;
+    const m = models.find((x) => x.id === config!.active_model);
+    return m != null && !m.ready;
+  });
+
   /// Refresh the outdated-set against HF Hub. Best-effort: any network failure
   /// just leaves the previous state in place (we never auto-flag-as-outdated
   /// on a transient offline check, otherwise users would be blocked from
@@ -648,10 +659,14 @@
       class={status.state === "running" || status.state === "starting" ? "danger" : "primary"}
       onclick={toggleServer}
       disabled={status.state === "starting" || status.state === "stopping" ||
-        (status.state !== "running" && activeOutdated)}
-      title={activeOutdated && status.state !== "running"
-        ? "Active model has a newer version on Hub. Update it first (MODELS card → Update)."
-        : ""}
+        (status.state !== "running" && (activeOutdated || activeBroken))}
+      title={status.state === "running"
+        ? ""
+        : activeBroken
+          ? "Active model's download is incomplete. Re-download it first (MODELS card → Re-download)."
+          : activeOutdated
+            ? "Active model has a newer version on Hub. Update it first (MODELS card → Update)."
+            : ""}
     >
       {status.state === "running" || status.state === "starting" ? "Stop" : "Start"}
     </button>
