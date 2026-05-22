@@ -246,8 +246,7 @@ mod resolve_tests {
     use std::path::PathBuf;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir()
-            .join(format!("lumen-resolve-{name}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("lumen-resolve-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -263,7 +262,10 @@ mod resolve_tests {
         std::fs::write(debug.join("lumen-server"), b"").unwrap();
         std::fs::write(release.join("lumen-server"), b"").unwrap();
         let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
-        assert_eq!(chosen.as_deref(), Some(release.join("lumen-server").as_path()));
+        assert_eq!(
+            chosen.as_deref(),
+            Some(release.join("lumen-server").as_path())
+        );
     }
 
     #[test]
@@ -273,7 +275,10 @@ mod resolve_tests {
         std::fs::create_dir_all(&debug).unwrap();
         std::fs::write(debug.join("lumen-server"), b"").unwrap();
         let chosen = prefer_release_over_dev_debug(&debug.join("lumen-server"));
-        assert!(chosen.is_none(), "no release available -> return None so caller keeps debug");
+        assert!(
+            chosen.is_none(),
+            "no release available -> return None so caller keeps debug"
+        );
     }
 
     #[test]

@@ -45,10 +45,7 @@ async fn main() -> Result<()> {
         while let Some(p) = rx.recv().await {
             if p.done {
                 let mb = p.downloaded_bytes as f64 / 1e6;
-                eprintln!(
-                    "  ✓ {:<40} {:>9.2} MB",
-                    p.file, mb
-                );
+                eprintln!("  ✓ {:<40} {:>9.2} MB", p.file, mb);
             } else if let Some(total) = p.total_bytes {
                 if total == 0 {
                     continue;

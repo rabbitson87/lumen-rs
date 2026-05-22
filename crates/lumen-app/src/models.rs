@@ -414,10 +414,7 @@ pub fn local_path_for(models_dir: &Path, repo_id: &str) -> PathBuf {
 /// API: `GET https://huggingface.co/api/models/<repo_id>` → JSON with `sha`.
 /// Falls back to `None` on any error (offline, repo gone, etc.) — the caller
 /// treats unknown remote SHA as "can't determine update status, allow use".
-pub async fn fetch_hub_sha(
-    client: &reqwest::Client,
-    repo_id: &str,
-) -> Result<String> {
+pub async fn fetch_hub_sha(client: &reqwest::Client, repo_id: &str) -> Result<String> {
     let url = format!("https://huggingface.co/api/models/{repo_id}");
     let resp = client
         .get(&url)
@@ -488,9 +485,8 @@ pub async fn download(
     std::fs::create_dir_all(&target)
         .with_context(|| format!("create_dir_all {}", target.display()))?;
 
-    let resolve_url = |file: &str| {
-        format!("https://huggingface.co/{}/resolve/main/{}", repo_id, file)
-    };
+    let resolve_url =
+        |file: &str| format!("https://huggingface.co/{}/resolve/main/{}", repo_id, file);
 
     // Resolve file list: caller-supplied OR probe repo for standard layout.
     let files = match files {
@@ -518,8 +514,8 @@ pub async fn download(
             if idx_resp.status().is_success() {
                 list.push("model.safetensors.index.json".into());
                 let idx_text = idx_resp.text().await.context("read index body")?;
-                let v: serde_json::Value = serde_json::from_str(&idx_text)
-                    .context("parse safetensors index")?;
+                let v: serde_json::Value =
+                    serde_json::from_str(&idx_text).context("parse safetensors index")?;
                 if let Some(wm) = v.get("weight_map").and_then(|w| w.as_object()) {
                     let mut shards = std::collections::BTreeSet::new();
                     for (_k, vv) in wm {
@@ -590,7 +586,9 @@ pub async fn download(
                     "[lumen-app] {} is {} bytes but remote reports {} — re-downloading",
                     dest.display(),
                     meta.len(),
-                    expected.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                    expected
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".into()),
                 );
                 let _ = std::fs::remove_file(&dest);
             }
@@ -731,7 +729,8 @@ mod tests {
     use std::io::Write;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("lumen-models-test-{name}-{}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("lumen-models-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -741,7 +740,12 @@ mod tests {
         let map: serde_json::Map<String, serde_json::Value> = shards
             .iter()
             .enumerate()
-            .map(|(i, s)| (format!("tensor.{i}"), serde_json::Value::String((*s).to_string())))
+            .map(|(i, s)| {
+                (
+                    format!("tensor.{i}"),
+                    serde_json::Value::String((*s).to_string()),
+                )
+            })
             .collect();
         let json = serde_json::json!({ "metadata": {}, "weight_map": map });
         std::fs::write(
@@ -763,7 +767,8 @@ mod tests {
         );
         let header_bytes = header_json.as_bytes();
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
         f.write_all(header_bytes).unwrap();
         f.write_all(&vec![0u8; body_len as usize]).unwrap();
     }
@@ -776,7 +781,8 @@ mod tests {
         );
         let header_bytes = header_json.as_bytes();
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
         f.write_all(header_bytes).unwrap();
         f.write_all(&vec![0u8; actual_body as usize]).unwrap();
     }
@@ -799,7 +805,10 @@ mod tests {
     #[test]
     fn shards_complete_returns_false_when_shard_missing() {
         let dir = tmpdir("missing");
-        write_index(&dir, &["s1.safetensors", "s2.safetensors", "s3.safetensors"]);
+        write_index(
+            &dir,
+            &["s1.safetensors", "s2.safetensors", "s3.safetensors"],
+        );
         write_safetensors(&dir.join("s1.safetensors"), 4096);
         // s2 + s3 missing — mirrors the killed-between-shards case
         assert!(!verify_shards_complete(&dir));
