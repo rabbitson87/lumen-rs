@@ -24,6 +24,7 @@
   import UpdatePanel from "./lib/UpdatePanel.svelte";
   import ApiTabs from "./lib/ApiTabs.svelte";
   import { bytes, duration } from "./lib/format";
+  import { i18n, t, LOCALE_LABELS, type Locale } from "./lib/i18n.svelte";
 
   // Tooltip action: portals tooltip into <body> on hover so it escapes any
   // ancestor overflow / stacking-context clipping (cards near the window edge
@@ -100,7 +101,7 @@
   let doctorReport = $state<DoctorReport | null>(null);
   let updateOpen = $state(false);
 
-  type TopTab = "main" | "tuning" | "api" | "debug";
+  type TopTab = "main" | "tuning" | "api" | "debug" | "language";
   let activeTab = $state<TopTab>("main");
   // SvelteMap (not plain Map) so `.set()`/`.delete()` mutations trigger UI
   // updates without manual reassignment — fixes the case where completed
@@ -192,7 +193,11 @@
     const bits = config.quant.bits;
     // bf16 = 16 bits/scalar; head_dim=256 → 4096 bits/vector
     const stage1Bits = bits * 256;
-    const qjlBits = config.quant.turboquant_qjl_enabled ? config.quant.qjl_m : 0;
+    // QJL Stage-2 projection dimension is now a server-side constant
+    // (`D · 4 = 1024` for Gemma 4 head_dim=256). Used to be configurable
+    // via DEBUG → "QJL m" but was benchmark-only — see server.rs constants.
+    const QJL_M = 1024;
+    const qjlBits = config.quant.turboquant_qjl_enabled ? QJL_M : 0;
     const totalBits = stage1Bits + qjlBits;
     return totalBits > 0 ? 4096 / totalBits : 1.0;
   });
@@ -591,7 +596,7 @@
   <div class="font-semibold text-sm text-accent">● Lumen</div>
   <div class="flex items-center gap-1.5">
     <span class="dot {status.state}"></span>
-    <span class="mono">{status.state}</span>
+    <span class="mono">{t(`status.${status.state}`)}</span>
     {#if status.state === "running"}
       <span class="dim mono">:{status.port}</span>
       {#if status.uptime_secs != null}
@@ -600,7 +605,7 @@
       {/if}
     {/if}
     {#if status.last_error}
-      <span class="text-err" title={status.last_error}>· error</span>
+      <span class="text-err" title={status.last_error}>{t("header.statusError")}</span>
     {/if}
   </div>
   <div class="ml-auto flex items-center gap-2.5">
@@ -647,7 +652,7 @@
         doctorReport?.overall === "blocked" ? "bg-err shadow-[0_0_6px_var(--color-err)]" :
         "bg-text-dim"
       }`}></span>
-      Doctor
+      {t("header.doctor")}
       {#if doctorReport && (doctorCounts.warn > 0 || doctorCounts.fail > 0)}
         <span class="text-text-dim text-[11px] ml-0.5 mono">
           {#if doctorCounts.fail > 0}{doctorCounts.fail}✗{/if}
@@ -663,12 +668,12 @@
       title={status.state === "running"
         ? ""
         : activeBroken
-          ? "Active model's download is incomplete. Re-download it first (MODELS card → Re-download)."
+          ? t("header.title.brokenActive")
           : activeOutdated
-            ? "Active model has a newer version on Hub. Update it first (MODELS card → Update)."
+            ? t("header.title.outdatedActive")
             : ""}
     >
-      {status.state === "running" || status.state === "starting" ? "Stop" : "Start"}
+      {status.state === "running" || status.state === "starting" ? t("header.stop") : t("header.start")}
     </button>
   </div>
 </header>
@@ -678,19 +683,23 @@
   <button
     class={`${tabBase} ${activeTab === "main" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "main")}
-  >Models &amp; Server</button>
+  >{t("tabs.main")}</button>
   <button
     class={`${tabBase} ${activeTab === "tuning" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "tuning")}
-  >Tuning</button>
+  >{t("tabs.tuning")}</button>
   <button
     class={`${tabBase} ${activeTab === "api" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "api")}
-  >API</button>
+  >{t("tabs.api")}</button>
   <button
     class={`${tabBase} ${activeTab === "debug" ? tabActive : tabIdle}`}
     onclick={() => (activeTab = "debug")}
-  >Debug</button>
+  >{t("tabs.debug")}</button>
+  <button
+    class={`${tabBase} ${activeTab === "language" ? tabActive : tabIdle}`}
+    onclick={() => (activeTab = "language")}
+  >{t("tabs.language")}</button>
 </nav>
 
 <!-- ── Card grid ───────────────────────────────────────────────── -->
@@ -698,15 +707,15 @@
   {#if activeTab === "tuning"}
   <!-- QUANT -->
   <section class="{cardBase} col-span-3">
-    <h2 class={cardH2}>QUANT <span class="dim">(TurboQuant KV cache)</span></h2>
+    <h2 class={cardH2}>{t("quant.title")} <span class="dim">{t("quant.titleHint")}</span></h2>
     {#if config}
       <div class={kvRow}>
         <span class="dim">
-          TurboQuant
+          {t("quant.master")}
           <span
             class={helpIcon}
             use:tooltip
-            data-tooltip="Master switch for KV-cache quantization (Lloyd-Max + Haar rotation, Stage 1). ON saves ~4–8× KV memory at small accuracy cost. OFF keeps KV in bf16 — recommended only if you see quality issues at long context."
+            data-tooltip={t("quant.tooltip.master")}
           >?</span>
         </span>
         <label class={toggleLabel}>
@@ -720,16 +729,16 @@
               saveQuant();
             }}
           />
-          <span>{config.quant.turboquant_enabled ? "ON" : "OFF"}</span>
+          <span>{config.quant.turboquant_enabled ? t("quant.on") : t("quant.off")}</span>
         </label>
       </div>
       <div class={kvRow}>
         <span class="dim">
-          QJL residual (Stage 2)
+          {t("quant.qjl")}
           <span
             class={helpIcon}
             use:tooltip
-            data-tooltip="Stage-2 unbiased 1-bit correction for the Stage-1 residual: projects (original − reconstructed) into m-dim Gaussian space and packs only the sign. Recovers ~2–3% Top-5 / +0.003 cosine at small extra cost (~m/8 bytes per K/V vector; ~25 MB for Gemma 4 sliding window at m=1024). Requires Stage 1 ON."
+            data-tooltip={t("quant.tooltip.qjl")}
           >?</span>
         </span>
         <label class={toggleLabel}>
@@ -744,16 +753,16 @@
               saveQuant();
             }}
           />
-          <span>{config.quant.turboquant_qjl_enabled ? "ON" : "OFF"}</span>
+          <span>{config.quant.turboquant_qjl_enabled ? t("quant.on") : t("quant.off")}</span>
         </label>
       </div>
       <div class={kvRow}>
         <span class="dim">
-          Bits
+          {t("quant.bits")}
           <span
             class={helpIcon}
             use:tooltip
-            data-tooltip="Lloyd-Max bits per KV channel. 4: highest quality, ~4× smaller than FP16. 3: balanced — recommended default. 2: max compression (~8× smaller), small quality drop. Applies to the sliding-window KV on Gemma 4."
+            data-tooltip={t("quant.tooltip.bits")}
           >?</span>
         </span>
         <div class="flex gap-1">
@@ -772,74 +781,71 @@
       </div>
       <div class="dim flex flex-col gap-0.5 mt-1 ml-32.5 text-[11px] leading-normal">
         {#if !config.quant.turboquant_enabled}
-          <span class="text-warn">TurboQuant OFF — KV cache stays bf16 (~5 GB at 11K Korean context on Gemma 4)</span>
+          <span class="text-warn">{t("quant.hint.tqOff")}</span>
         {:else if config.quant.bits === 2}
-          <span><b class="text-text">2-bit</b> · ~8× smaller vs FP16 · cosine <b class="text-text">0.9851</b> · Top-5 <b class="text-text">89%</b></span>
-          <span class="text-text-dim">vs 4-bit baseline: <b class="text-ok">−50% KV memory</b> · cosine <b class="text-warn">−1.3%</b></span>
+          <span><b class="text-text">2-bit</b> · ~8{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9851</b> · {t("quant.hint.top5")} <b class="text-text">89%</b></span>
+          <span class="text-text-dim">{t("quant.hint.vs4bit")} <b class="text-ok">−50% {t("quant.hint.kvMemory")}</b> · {t("quant.hint.cosine")} <b class="text-warn">−1.3%</b></span>
         {:else if config.quant.bits === 3}
-          <span><b class="text-text">3-bit</b> · ~5× smaller vs FP16 · cosine <b class="text-text">0.9945</b> · Top-5 <b class="text-text">94%</b></span>
-          <span class="text-text-dim">vs 4-bit baseline: <b class="text-ok">−25% KV memory</b> · cosine <b class="text-text">−0.4%</b></span>
+          <span><b class="text-text">3-bit</b> · ~5{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9945</b> · {t("quant.hint.top5")} <b class="text-text">94%</b></span>
+          <span class="text-text-dim">{t("quant.hint.vs4bit")} <b class="text-ok">−25% {t("quant.hint.kvMemory")}</b> · {t("quant.hint.cosine")} <b class="text-text">−0.4%</b></span>
         {:else if config.quant.bits === 4}
-          <span><b class="text-text">4-bit</b> · ~4× smaller vs FP16 · cosine <b class="text-text">0.9983</b> · Top-5 <b class="text-text">96%</b></span>
-          <span class="text-text-dim">baseline (highest quality)</span>
+          <span><b class="text-text">4-bit</b> · ~4{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9983</b> · {t("quant.hint.top5")} <b class="text-text">96%</b></span>
+          <span class="text-text-dim">{t("quant.hint.baseline")}</span>
         {/if}
-        <span class="text-text-dim">
-          QJL m + seed (TurboQuant internals) → Debug tab
-        </span>
       </div>
     {/if}
   </section>
 
   <!-- METRICS -->
   <section class="{cardBase} col-span-3">
-    <h2 class={cardH2}>METRICS</h2>
+    <h2 class={cardH2}>{t("metrics.title")}</h2>
     <div class={kvRow}>
-      <span class="dim">tokens/sec</span>
+      <span class="dim">{t("metrics.tokensPerSec")}</span>
       <span class="mono">{metrics.tokens_per_sec?.toFixed(1) ?? "—"}</span>
     </div>
     <div class={kvRow}>
-      <span class="dim">ms / step</span>
+      <span class="dim">{t("metrics.msPerStep")}</span>
       <span class="mono">{metrics.ms_per_step?.toFixed(2) ?? "—"}</span>
     </div>
     <div class={kvRow}>
-      <span class="dim">KV cache</span>
+      <span class="dim">{t("metrics.kvCache")}</span>
       <span class="mono">{metrics.kv_cache_mb != null ? `${metrics.kv_cache_mb} MB` : "—"}</span>
     </div>
     <div class={kvRow}>
-      <span class="dim">req/min</span>
+      <span class="dim">{t("metrics.requestsPerMin")}</span>
       <span class="mono">{metrics.requests_per_min ?? "—"}</span>
     </div>
   </section>
 
   <!-- CONTEXT -->
   <section class="{cardBase} col-span-6">
-    <h2 class={cardH2}>CONTEXT <span class="dim">(driven by QUANT state)</span></h2>
+    <h2 class={cardH2}>{t("context.title")} <span class="dim">{t("context.titleHint")}</span></h2>
     {#if config}
       <div class={`-mt-1 mb-3 px-2.5 py-2 bg-panel-2 border border-border border-l-[3px] rounded text-xs leading-[1.55] flex flex-col gap-0.5 ${
         config.quant.turboquant_enabled ? "border-l-accent" : "border-l-warn"
       }`}>
         <div>
-          <span class="dim">TurboQuant:</span>
+          <span class="dim">{t("context.turboquant.on")}</span>
           <b class="text-text">{turboquantStateLabel}</b>
           {#if config.quant.turboquant_enabled}
-            <span class="dim">· KV cache ~{turboquantKvRatio.toFixed(1)}× smaller than bf16</span>
+            <span class="dim">· {t("context.banner.kvCache")}{turboquantKvRatio.toFixed(1)}{t("context.banner.smallerThanBf16")}</span>
           {:else}
-            <span class="dim">· baseline KV memory (no compression)</span>
+            <span class="dim">{t("context.turboquant.off")}</span>
           {/if}
         </div>
         {#if realisticMaxCtxK != null}
           <div class="dim">
-            Recommended max on this Mac ({systemInfo?.ram_gb} GB):
-            <b class="text-text">~{realisticMaxCtxK}K tokens</b>
+            {t("context.recommended")} ({systemInfo?.ram_gb} GB):
+            <b class="text-text">~{realisticMaxCtxK}K {t("context.recommended.suffix")}</b>
             {#if !config.quant.turboquant_enabled}
-              <span class="text-warn">— turn TurboQuant ON to handle longer contexts safely</span>
+              <span class="text-warn">{t("context.warn.turnOnTurboquant")}</span>
             {/if}
           </div>
         {/if}
       </div>
 
       <div class={kvRow}>
-        <span class="dim">Max</span>
+        <span class="dim">{t("context.max")}</span>
         <input
           type="number"
           min="512"
@@ -849,22 +855,21 @@
         />
       </div>
       <div class={ctxHint}>
-        Max sequence length (tokens). Caps the model's <code class={inlineCode}>max_position_embeddings</code>
-        when host RAM can't hold the model's native limit (Gemma 4 claims 128K).
+        {t("context.hint.max.prefix")}
         {#if config.quant.turboquant_enabled}
-          Current TurboQuant <b class="text-text">{turboquantStateLabel}</b> gives ~{turboquantKvRatio.toFixed(1)}× KV compression
+          {t("context.hint.max.tqOn")}
           {#if realisticMaxCtxK != null}
-            — realistic on this Mac: <b class="text-text">~{realisticMaxCtxK}K</b>.
+            {t("context.hint.max.tqOnRealistic")} <b class="text-text">~{realisticMaxCtxK}K</b>.
           {:else}.{/if}
         {:else}
-          <span class="text-warn">TurboQuant OFF</span> — KV stays bf16, so practical limit on this Mac
-          {#if realisticMaxCtxK != null}is <b class="text-text">~{realisticMaxCtxK}K</b>{:else}is much lower than the model's native max{/if}.
+          {t("context.hint.max.tqOff")}
+          {#if realisticMaxCtxK != null}<b class="text-text">~{realisticMaxCtxK}K</b>{:else}{t("context.hint.max.tqOffFallback")}{/if}.
         {/if}
-        Env: <code class={inlineCode}>LUMEN_MAX_CTX</code>.
+        {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_MAX_CTX</code>.
       </div>
 
       <div class={kvRow}>
-        <span class="dim">Sliding</span>
+        <span class="dim">{t("context.sliding")}</span>
         <input
           type="number"
           min="0"
@@ -874,18 +879,15 @@
         />
       </div>
       <div class={ctxHint}>
-        Sliding-window attention size. Some layers (Gemma 4: 25 of 30) only attend
-        to the last N tokens instead of the full sequence → bounded KV memory for
-        long contexts. <b class="text-text">0</b> = use the model's built-in default; <b class="text-text">N&gt;0</b> overrides it
-        (smaller = less KV, weaker long-range recall).
+        {t("context.hint.sliding")}
         {#if config.quant.turboquant_enabled}
-          Stacks with TurboQuant — sliding bounds <i>which</i> tokens are kept, TurboQuant compresses <i>how</i> they're stored.
+          {t("context.hint.sliding.stacks")}
         {/if}
-        Env: <code class={inlineCode}>LUMEN_SLIDING_WINDOW</code>.
+        {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_SLIDING_WINDOW</code>.
       </div>
 
       <div class={kvRow}>
-        <span class="dim">Prefill</span>
+        <span class="dim">{t("context.prefill")}</span>
         <input
           type="number"
           min="512"
@@ -895,11 +897,8 @@
         />
       </div>
       <div class={ctxHint}>
-        Prompt-processing chunk cap. Server rejects prompts longer than this with
-        a "prompt too large" error. Larger = accepts long prompts but more peak
-        memory during prefill (attention QK<sup>T</sup> = chunk × KV
-        {#if config.quant.turboquant_enabled}, shrunk ~{turboquantKvRatio.toFixed(1)}× by TurboQuant{/if}).
-        Env: <code class={inlineCode}>LUMEN_PREFILL_CHUNK</code>.
+        {t("context.hint.prefill")}{#if config.quant.turboquant_enabled}, ~{turboquantKvRatio.toFixed(1)}×{/if}).
+        {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_PREFILL_CHUNK</code>.
       </div>
     {/if}
   </section>
@@ -909,7 +908,7 @@
   {#if activeTab === "main"}
   <!-- MODELS -->
   <section class="{cardBase} col-span-3">
-    <h2 class={cardH2}>MODELS</h2>
+    <h2 class={cardH2}>{t("models.title")}</h2>
     <div class="grid grid-cols-2 gap-x-3 gap-y-1.5 mb-3.5">
       {#each visibleModels as m}
         {@const needsUpdate = outdatedModels.has(m.id)}
@@ -930,13 +929,13 @@
           <div class="min-w-0 flex flex-col gap-0.5">
             <div class="mono overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">{m.id}</div>
             {#if isBroken}
-              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-err">⚠ Incomplete download — re-download required before use</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-err">{t("models.broken.label")}</div>
             {:else if needsUpdate}
-              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">⚠ Newer weights available on Hub — update required before use</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">{t("models.outdated.label")}</div>
             {:else if m.label}
               <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-text-dim">{m.label}</div>
             {:else if !m.supported}
-              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">not in supported catalog</div>
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">{t("models.unsupported.label")}</div>
             {/if}
           </div>
           <span class="mono text-text-dim text-right text-xs">{bytes(m.size_bytes)}</span>
@@ -944,38 +943,38 @@
             <button
               class="primary"
               onclick={() => repairModel(m.id)}
-              title="Verify and re-download missing or truncated files"
-            >Re-download</button>
+              title={t("models.action.title.redownload")}
+            >{t("action.redownload")}</button>
           {:else if needsUpdate}
             <button
               class="primary"
               onclick={() => updateOutdated(m.id)}
-              title="Re-download with the latest Hub weights"
-            >Update</button>
+              title={t("models.action.title.update")}
+            >{t("action.update")}</button>
           {:else}
             <button
               onclick={() => setActive(m.id)}
               disabled={isActive || !m.supported}
-              title={!m.supported ? "Not in the server-side supported catalog" : ""}
-            >Use</button>
+              title={!m.supported ? t("models.action.title.unsupported") : ""}
+            >{t("action.use")}</button>
           {/if}
-          <button class="danger" onclick={() => removeModel(m.id)}>Delete</button>
+          <button class="danger" onclick={() => removeModel(m.id)}>{t("action.delete")}</button>
         </div>
       {/each}
       {#if visibleModels.length === 0 && models.length > 0}
-        <p class="dim col-span-full m-0">No supported models on disk. Download one from the curated list below.</p>
+        <p class="dim col-span-full m-0">{t("models.empty.unsupported")}</p>
       {:else if models.length === 0}
-        <p class="dim col-span-full m-0">No local models. Download one from the curated list below.</p>
+        <p class="dim col-span-full m-0">{t("models.empty.none")}</p>
       {/if}
     </div>
     {#if systemInfo}
       <div class="dim mono text-[11px] mb-1.5">
-        This Mac: <b class="text-text">{systemInfo.ram_gb} GB RAM</b> ({systemInfo.arch}) — models over this size are marked.
+        {t("models.thisMac")} <b class="text-text">{systemInfo.ram_gb} {t("models.thisMac.ramSuffix")}</b> ({systemInfo.arch}) {t("models.thisMac.overflow")}
       </div>
     {/if}
     <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2.5">
       <select bind:value={selectedRecommend}>
-        <option value="" disabled>— pick a recommended model —</option>
+        <option value="" disabled>{t("models.picker.placeholder")}</option>
         {#each availableRecommended as r}
           {@const fits = !systemInfo || r.min_ram_gb <= systemInfo.ram_gb}
           <option value={r.id}>
@@ -983,14 +982,14 @@
           </option>
         {/each}
         {#if availableRecommended.length === 0}
-          <option value="" disabled>all recommended already downloaded</option>
+          <option value="" disabled>{t("models.picker.allDownloaded")}</option>
         {/if}
       </select>
       <button
         class="primary"
         onclick={startDownload}
         disabled={!selectedRecommend}
-      >Download</button>
+      >{t("action.download")}</button>
     </div>
     {#if selectedRecommend}
       {@const r = catalog.recommended.find((x) => x.id === selectedRecommend)}
@@ -1013,11 +1012,11 @@
 
   <!-- SERVER -->
   <section class="{cardBase} col-span-3">
-    <h2 class={cardH2}>SERVER</h2>
+    <h2 class={cardH2}>{t("server.title")}</h2>
     {#if config}
       <div class={sectionGrid}>
       <div class={kvRow}>
-        <span class="dim">CORS</span>
+        <span class="dim">{t("server.cors")}</span>
         <select
           value={config.server.cors}
           onchange={(e) => {
@@ -1028,76 +1027,63 @@
             // need them independent. `off` lets the user pin a specific IP.
             if (v === "localhost") config.server.host = "127.0.0.1";
             else if (v === "all") config.server.host = "0.0.0.0";
+            saveServer();
           }}
         >
-          <option value="off">off (specific IP)</option>
-          <option value="localhost">localhost (127.0.0.1)</option>
-          <option value="all">all / 0.0.0.0 (risky)</option>
+          <option value="off">{t("server.cors.off")}</option>
+          <option value="localhost">{t("server.cors.localhost")}</option>
+          <option value="all">{t("server.cors.all")}</option>
         </select>
       </div>
       <div class={kvRow}>
-        <span class="dim">Host</span>
+        <span class="dim">{t("server.host")}</span>
         <input
           type="text"
           bind:value={config.server.host}
           disabled={config.server.cors !== "off"}
-          title={config.server.cors === "off" ? "Pin to a specific IP" : "Auto-set by CORS scope"}
+          onchange={saveServer}
+          title={config.server.cors === "off" ? t("server.host.title.pin") : t("server.host.title.auto")}
         />
       </div>
       <div class={kvRow}>
-        <span class="dim">Port</span>
-        <input type="number" min="1" max="65535" bind:value={config.server.port} />
+        <span class="dim">{t("server.port")}</span>
+        <input type="number" min="1" max="65535" bind:value={config.server.port} onchange={saveServer} />
       </div>
       <div class={kvRow}>
-        <span class="dim">API key</span>
-        <span class="dim text-[11px] italic">→ set in the API card</span>
+        <span class="dim">{t("server.apiKey")}</span>
+        <span class="dim text-[11px] italic">{t("server.apiKey.hint")}</span>
       </div>
 
       <h3 class="{cardSection} {colSpanFull}">
-        Metal memory <span class="dim">(mlx-native)</span>
+        {t("server.memory.title")} <span class="dim">{t("server.memory.titleHint")}</span>
         {#if activeModel && recommendedMemoryGbExact != null && recommendedWiredGb != null && recommendedCacheGb != null}
           <span class={ramTunedHint}>
-            · tuned for <b class="text-text">{activeModel.id.split("/").pop()}</b>
+            · {t("server.memory.tunedFor")} <b class="text-text">{activeModel.id.split("/").pop()}</b>
             + ctx {config.context.max}
             ({recommendedWiredGb.toFixed(3)}/{recommendedCacheGb.toFixed(3)}/{recommendedMemoryGbExact.toFixed(3)} GB)
           </span>
-          <button class={resetMemBtn} onclick={resetMemoryCaps}>Reset</button>
+          <button class={resetMemBtn} onclick={resetMemoryCaps}>{t("action.reset")}</button>
         {:else if systemInfo}
           <span class={ramTunedHint}>
-            · system default for {systemInfo.ram_gb} GB
+            · {t("server.memory.systemDefault")} {systemInfo.ram_gb} GB
             ({systemInfo.recommended.wired_limit_gb.toFixed(3)}/{systemInfo.recommended.cache_limit_gb.toFixed(3)}/{systemInfo.recommended.memory_limit_gb.toFixed(3)} GB)
           </span>
-          <button class={resetMemBtn} onclick={resetMemoryCaps}>Reset</button>
+          <button class={resetMemBtn} onclick={resetMemoryCaps}>{t("action.reset")}</button>
         {/if}
       </h3>
       <details class="mem-explainer {colSpanFull} my-0.5 mb-1.5 text-xs">
-        <summary class="dim cursor-pointer list-none py-1">What do these mean?</summary>
+        <summary class="dim cursor-pointer list-none py-1">{t("server.memory.explainer")}</summary>
         <div class="dim py-1.5 pb-1 leading-relaxed">
-          Apple Silicon shares one pool of RAM between CPU and GPU. These three caps
-          tell MLX how much of that pool it may use:
+          {t("server.memory.explainer.intro")}
           <ul class="mt-1.5 pl-4.5 list-disc">
-            <li class="mb-1">
-              <b class="text-text">Wired GB</b> — RAM that stays pinned for the GPU and can never be
-              paged out. Auto-set to the <i>exact</i> safetensors byte size of the
-              active model (via <code class={inlineCode}>LUMEN_WIRED_LIMIT_BYTES</code>), so a
-              14.45 GB model isn't truncated to a 14 GB ceiling. Override the
-              input if you want extra headroom for KV cache.
-            </li>
-            <li class="mb-1">
-              <b class="text-text">Cache GB</b> — MLX's transient buffer reuse pool (activations,
-              scratch). A small fixed budget (2 GB) is enough; scaling it with
-              system RAM just reserves memory you'd rather give back to the OS.
-            </li>
-            <li class="mb-1">
-              <b class="text-text">Memory GB</b> — Soft total ceiling for Metal allocations.
-              Hitting it triggers cache eviction before the hard wired limit.
-              Set to model size + 2 GB + KV cache budget (≈ ctx ÷ 8K).
-            </li>
+            <li class="mb-1">{t("server.memory.explainer.wired")}</li>
+            <li class="mb-1">{t("server.memory.explainer.cache")}</li>
+            <li class="mb-1">{t("server.memory.explainer.memory")}</li>
           </ul>
         </div>
       </details>
       <div class={kvRow}>
-        <span class="dim">Wired GB</span>
+        <span class="dim">{t("server.memory.wired")}</span>
         <div class="flex items-center gap-2">
           <input
             class="flex-1"
@@ -1109,16 +1095,17 @@
               const v = (e.target as HTMLInputElement).value;
               config.server.wired_limit_gb = v === "" ? null : Number(v);
             }}
+            onchange={saveServer}
           />
           {#if activeModel && config.server.wired_limit_gb == null}
-            <span class="dim mono text-[11px] whitespace-nowrap" title="LUMEN_WIRED_LIMIT_BYTES — exact safetensors size">
+            <span class="dim mono text-[11px] whitespace-nowrap" title={t("server.memory.wired.titleHint")}>
               = {Math.round(activeModel.size_bytes / 1024 ** 2).toLocaleString()} MB
             </span>
           {/if}
         </div>
       </div>
       <div class={kvRow}>
-        <span class="dim">Cache GB</span>
+        <span class="dim">{t("server.memory.cache")}</span>
         <input
           type="number"
           placeholder={String(recommendedCacheGb ?? systemInfo?.recommended.cache_limit_gb ?? 8)}
@@ -1128,10 +1115,11 @@
             const v = (e.target as HTMLInputElement).value;
             config.server.cache_limit_gb = v === "" ? null : Number(v);
           }}
+          onchange={saveServer}
         />
       </div>
       <div class={kvRow}>
-        <span class="dim">Memory GB</span>
+        <span class="dim">{t("server.memory.memory")}</span>
         <input
           type="number"
           placeholder={String(recommendedMemoryGb ?? systemInfo?.recommended.memory_limit_gb ?? 32)}
@@ -1141,11 +1129,9 @@
             const v = (e.target as HTMLInputElement).value;
             config.server.memory_limit_gb = v === "" ? null : Number(v);
           }}
+          onchange={saveServer}
         />
       </div>
-      </div>
-      <div class="mt-2.5 flex justify-end">
-        <button class="primary" onclick={saveServer}>Save</button>
       </div>
     {/if}
   </section>
@@ -1155,127 +1141,57 @@
   {#if activeTab === "debug"}
   <!-- DEBUG / power-user knobs (A/B testing, loader overrides) -->
   <section class="{cardBase} col-span-3">
-    <h2 class={cardH2}>DEBUG <span class="dim">(A/B + loader overrides)</span></h2>
+    <h2 class={cardH2}>{t("debug.title")} <span class="dim">{t("debug.titleHint")}</span></h2>
     {#if config}
       <p class="dim m-0 mb-3 px-3 py-2 bg-panel-2 rounded-[5px] text-xs leading-normal">
-        These knobs are for benchmarking + troubleshooting. Leave everything blank/off
-        for normal use — the values that actually matter (model, memory caps, backend)
-        live in the Models &amp; Server tab.
+        {t("debug.intro")}
       </p>
       <div class={sectionGrid}>
-        <h3 class="{cardSection} {colSpanFull}">Memory bypass</h3>
+        <h3 class="{cardSection} {colSpanFull}">{t("debug.memoryBypass")}</h3>
         <div class={kvRow}>
-          <span class="dim">Bypass all caps</span>
+          <span class="dim">{t("debug.memoryBypass.label")}</span>
           <label class={toggleLabel}>
-            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.disable_wired_limit} />
-            <span class="dim">skip wired+cache+memory; let MLX/macOS manage</span>
+            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.disable_wired_limit} onchange={saveServer} />
+            <span class="dim">{t("debug.memoryBypass.hint")}</span>
           </label>
         </div>
 
-        <h3 class="{cardSection} {colSpanFull}">Loader overrides</h3>
+        <h3 class="{cardSection} {colSpanFull}">{t("debug.loader")}</h3>
         <div class={kvRow}>
-          <span class="dim">Tokenizer</span>
+          <span class="dim">{t("debug.tokenizer")}</span>
           <input
             type="text"
-            placeholder="HF repo id (override)"
+            placeholder={t("debug.tokenizer.placeholder")}
             value={config.server.tokenizer_id ?? ""}
             oninput={(e) => {
               if (!config) return;
               const v = (e.target as HTMLInputElement).value;
               config.server.tokenizer_id = v === "" ? null : v;
             }}
+            onchange={saveServer}
           />
         </div>
         <div class={kvRow}>
-          <span class="dim">Weights dir</span>
+          <span class="dim">{t("debug.weightsDir")}</span>
           <input
             type="text"
-            placeholder="auto-set from active model"
+            placeholder={t("debug.weightsDir.placeholder")}
             value={config.server.local_model_dir ?? ""}
             oninput={(e) => {
               if (!config) return;
               const v = (e.target as HTMLInputElement).value;
               config.server.local_model_dir = v === "" ? null : v;
             }}
+            onchange={saveServer}
           />
         </div>
         <div class={kvRow}>
-          <span class="dim">Compute /buf</span>
-          <input
-            type="number"
-            placeholder="10 (candle only)"
-            min="1"
-            value={config.server.candle_compute_per_buffer ?? ""}
-            oninput={(e) => {
-              if (!config) return;
-              const v = (e.target as HTMLInputElement).value;
-              config.server.candle_compute_per_buffer = v === "" ? null : Number(v);
-            }}
-          />
-        </div>
-        <div class={kvRow}>
-          <span class="dim">Repeat pen.</span>
-          <input
-            type="number"
-            step="0.05"
-            placeholder="1.0"
-            value={config.server.repeat_penalty ?? ""}
-            oninput={(e) => {
-              if (!config) return;
-              const v = (e.target as HTMLInputElement).value;
-              config.server.repeat_penalty = v === "" ? null : Number(v);
-            }}
-          />
-        </div>
-        <div class={kvRow}>
-          <span class="dim">Skip warmup</span>
+          <span class="dim">{t("debug.skipWarmup")}</span>
           <label class={toggleLabel}>
-            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.skip_warmup} />
-            <span class="dim">faster start, first request slower</span>
+            <input class="w-3.5 h-3.5 m-0 accent-accent" type="checkbox" bind:checked={config.server.skip_warmup} onchange={saveServer} />
+            <span class="dim">{t("debug.skipWarmup.hint")}</span>
           </label>
         </div>
-
-        <h3 class="{cardSection} {colSpanFull}">TurboQuant internals</h3>
-        <p class="dim {colSpanFull} my-1 mb-2 text-[11px] leading-normal italic">
-          Stage-2 residual correction knobs. Leave at defaults — these only matter when
-          tuning the compression algorithm itself or reproducing a benchmark run.
-        </p>
-        <div class={kvRow}>
-          <span class="dim">QJL m</span>
-          <input
-            type="number"
-            min="16"
-            max="256"
-            step="16"
-            bind:value={config.quant.qjl_m}
-            onchange={saveQuant}
-          />
-        </div>
-        <div class={debugHint}>
-          QJL projection dimension for residual sign-bit correction. Recommended:
-          <b class="text-text">head_dim / 2</b> (typically 64). Higher = more accurate inner-product
-          estimate but more KV memory; lower = noisier attention scores. <b class="text-text">When to
-          change:</b> only when running quality vs memory ablation studies.
-        </div>
-
-        <div class={kvRow}>
-          <span class="dim">Seed</span>
-          <input
-            type="number"
-            bind:value={config.quant.seed}
-            onchange={saveQuant}
-          />
-        </div>
-        <div class={debugHint}>
-          Random seed for the orthogonal rotation matrix + Gaussian projection
-          matrix. Same seed → bit-identical compression output for the same input.
-          <b class="text-text">When to change:</b> reproducing a specific benchmark, or A/B-testing
-          whether a particular seed got lucky/unlucky on a corner case. Different
-          seeds are statistically equivalent — don't expect quality differences.
-        </div>
-      </div>
-      <div class="mt-2.5 flex justify-end">
-        <button class="primary" onclick={saveServer}>Save</button>
       </div>
     {/if}
   </section>
@@ -1316,6 +1232,35 @@
 
   {/if}
 
+  {#if activeTab === "language"}
+  <!-- LANGUAGE picker. Persisted to localStorage by `i18n.svelte.ts`; switch
+       takes effect immediately because every translated string reads
+       `i18n.locale` reactively. -->
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>{t("language.title")}</h2>
+    <p class="dim m-0 mb-3 px-3 py-2 bg-panel-2 rounded-[5px] text-xs leading-normal">
+      {t("language.note")}
+    </p>
+    <h3 class={cardSection}>{t("language.choose")}</h3>
+    <div class="flex flex-col gap-1 mt-1">
+      {#each Object.entries(LOCALE_LABELS) as [code, label]}
+        <label class="flex items-center gap-2 px-2.5 py-2 rounded-md bg-panel-2 cursor-pointer hover:border-border border border-transparent">
+          <input
+            type="radio"
+            name="locale"
+            value={code}
+            checked={i18n.locale === code}
+            onchange={() => i18n.set(code as Locale)}
+            class="w-3.5 h-3.5 m-0 accent-accent"
+          />
+          <span>{label}</span>
+          <span class="dim mono text-[11px] ml-auto">{code}</span>
+        </label>
+      {/each}
+    </div>
+  </section>
+  {/if}
+
 </main>
 
 <!-- ── Delete confirmation modal ─────────────────────────────────
@@ -1338,19 +1283,18 @@
       tabindex="-1"
     >
       <h3 id="confirm-del-title" class="m-0 mb-2.5 text-sm font-semibold text-text">
-        Delete {confirmDel.kind === "embedding" ? "embedding model" : "model"}?
+        {confirmDel.kind === "embedding" ? t("confirm.delete.embedding.title") : t("confirm.delete.chat.title")}
       </h3>
       <p class="mb-1.5 text-[13px] text-text leading-normal break-all">
         <span class="mono text-accent">{confirmDel.id}</span>
       </p>
       <p class="mb-4 text-xs text-text-dim leading-[1.55]">
-        Weights will be removed from disk. You can re-download from the
-        catalog later.{confirmDel.kind === "embedding" && config && config.server.embedding_model_id === confirmDel.id ? " The active embedding will be cleared." : ""}
+        {t("confirm.delete.warning")}{confirmDel.kind === "embedding" && config && config.server.embedding_model_id === confirmDel.id ? t("confirm.delete.embedding.activeNote") : ""}
       </p>
       <div class="flex justify-end gap-2">
-        <button onclick={cancelConfirmedDelete} disabled={confirmDelBusy}>Cancel</button>
+        <button onclick={cancelConfirmedDelete} disabled={confirmDelBusy}>{t("action.cancel")}</button>
         <button class="danger" onclick={performConfirmedDelete} disabled={confirmDelBusy}>
-          {confirmDelBusy ? "Deleting…" : "Delete"}
+          {confirmDelBusy ? t("confirm.delete.busy") : t("action.delete")}
         </button>
       </div>
     </div>
@@ -1365,7 +1309,7 @@
         <div class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}>{l.line}</div>
       {/each}
       {#if logs.length === 0}
-        <div class="dim">No log output yet. Start the server to see decode/encode traces.</div>
+        <div class="dim">{t("footer.logs.empty")}</div>
       {/if}
     </div>
   {/if}
@@ -1403,7 +1347,7 @@
         }
       }}
     >
-      Logs {logsOpen ? "▾" : "▸"} <span class="dim mono">({logs.length})</span>
+      {t("footer.logs")} {logsOpen ? "▾" : "▸"} <span class="dim mono">({logs.length})</span>
     </button>
     <button
       class={`${footerTabBase} ${envOpen ? footerTabActive : ""}`}
@@ -1416,7 +1360,7 @@
         }
       }}
     >
-      Env overrides {envOpen ? "▾" : "▸"}
+      {t("footer.env")} {envOpen ? "▾" : "▸"}
       <span class="dim mono">({config ? Object.keys(config.env_overrides).length : 0})</span>
     </button>
     <button
@@ -1430,7 +1374,7 @@
         }
       }}
     >
-      Doctor {doctorOpen ? "▾" : "▸"}
+      {t("footer.doctor")} {doctorOpen ? "▾" : "▸"}
       {#if doctorReport}
         <span class="dim mono">
           ({doctorCounts.pass}✓{doctorCounts.warn > 0 ? ` ${doctorCounts.warn}!` : ""}{doctorCounts.fail > 0 ? ` ${doctorCounts.fail}✗` : ""})
@@ -1448,7 +1392,7 @@
         }
       }}
     >
-      Update {updateOpen ? "▾" : "▸"}
+      {t("footer.update")} {updateOpen ? "▾" : "▸"}
     </button>
   </div>
 </footer>

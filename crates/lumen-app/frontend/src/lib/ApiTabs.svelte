@@ -8,6 +8,7 @@
     DownloadProgress,
   } from "./api";
   import type { SvelteMap } from "svelte/reactivity";
+  import { t } from "./i18n.svelte";
 
   interface Props {
     config: PersistentConfig;
@@ -144,10 +145,10 @@
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      copyHint = "copied";
+      copyHint = t("api.copied");
       setTimeout(() => (copyHint = null), 1200);
     } catch (e) {
-      copyHint = "copy failed: " + e;
+      copyHint = t("api.copyFailed") + " " + e;
     }
   }
 
@@ -160,24 +161,24 @@
 </script>
 
 <div class="flex items-center gap-4 mb-3">
-  <h2 class="m-0 text-xs font-semibold tracking-[0.08em] text-text-dim uppercase">API</h2>
+  <h2 class="m-0 text-xs font-semibold tracking-[0.08em] text-text-dim uppercase">{t("api.title")}</h2>
   <div class="flex gap-0.5 bg-panel-2 border border-border rounded-md p-0.5">
     <button
       class={`${tabBase} ${activeStyle === "openai" ? tabActive : tabIdle}`}
       onclick={() => (activeStyle = "openai")}
     >
-      OpenAI-style
+      {t("api.style.openai")}
     </button>
     <button
       class={`${tabBase} ${activeStyle === "claude" ? tabActive : tabIdle}`}
       onclick={() => (activeStyle = "claude")}
     >
-      Claude-style
+      {t("api.style.claude")}
     </button>
   </div>
   {#if status.state !== "running"}
     <span class="dim text-[11px] ml-auto">
-      server is <span class="text-warn">{status.state}</span> — values shown are what clients will use once you Start
+      {t("api.serverNotRunning").replace("{state}", t(`status.${status.state}`))}
     </span>
   {/if}
 </div>
@@ -186,17 +187,17 @@
   {#if activeStyle === "openai"}
     <div class="flex flex-col gap-1.5 min-w-0">
       <div class="flex flex-col gap-1">
-        <span class="dim">Base URL</span>
+        <span class="dim">{t("api.baseUrl")}</span>
         <div class="flex items-center gap-2">
           <code class="mono flex-1 px-2.5 py-[7px] bg-bg border border-border rounded text-accent overflow-x-auto whitespace-nowrap">{openaiBase}</code>
-          <button onclick={() => copy(openaiBase)}>Copy</button>
+          <button onclick={() => copy(openaiBase)}>{t("api.copy")}</button>
         </div>
       </div>
       <div class="flex flex-col gap-1">
-        <span class="dim">API key</span>
+        <span class="dim">{t("api.apiKey")}</span>
         <input
           type="password"
-          placeholder="(none — auth disabled)"
+          placeholder={t("api.apiKey.placeholder")}
           value={config.server.api_key ?? ""}
           oninput={(e) => {
             const v = (e.target as HTMLInputElement).value;
@@ -205,10 +206,10 @@
         />
       </div>
       <div class="flex flex-col gap-1">
-        <span class="dim">Embedding model</span>
+        <span class="dim">{t("api.embedding.title")}</span>
         {#if downloadedEmbeddings.length === 0}
           <div class="text-[11px] leading-normal text-warn">
-            No embedding models downloaded yet — pick one below to download first.
+            {t("api.embedding.empty")}
           </div>
         {:else}
           <div class="flex flex-col gap-1.5">
@@ -230,8 +231,8 @@
                 <button
                   onclick={() => onEmbeddingChange(emb.id)}
                   disabled={isActive}
-                >Use</button>
-                <button class="danger" onclick={() => onDeleteEmbedding(emb.id)}>Delete</button>
+                >{t("action.use")}</button>
+                <button class="danger" onclick={() => onDeleteEmbedding(emb.id)}>{t("action.delete")}</button>
               </div>
             {/each}
           </div>
@@ -239,22 +240,22 @@
             <button
               class="self-start mt-1 text-[11px]"
               onclick={() => onEmbeddingChange(null)}
-              title="Stop using any embedding model (disables /v1/embeddings)"
-            >Disable embedding</button>
+              title={t("api.embedding.disable.title")}
+            >{t("api.embedding.disable")}</button>
           {/if}
           {#if config.server.embedding_model_id && !downloadedEmbeddings.find((e) => e.id === config.server.embedding_model_id)}
             <div class="mt-0.5 text-[11px] leading-normal text-warn">
-              Active embedding <span class="mono">{config.server.embedding_model_id}</span> is not in the local catalog.
+              {t("api.embedding.activeMissing.prefix")} <span class="mono">{config.server.embedding_model_id}</span> {t("api.embedding.activeMissing.suffix")}
             </div>
           {/if}
         {/if}
       </div>
       {#if availableEmbeddings.length > 0}
         <div class="flex flex-col gap-1">
-          <span class="dim">Download embedding</span>
+          <span class="dim">{t("api.embedding.download.title")}</span>
           <div class="flex items-center gap-1.5">
             <select class="flex-1" bind:value={selectedEmbDl}>
-              <option value="" disabled>— pick to download —</option>
+              <option value="" disabled>{t("api.embedding.download.placeholder")}</option>
               {#each availableEmbeddings as emb}
                 {@const fits = !systemInfo || emb.min_ram_gb <= systemInfo.ram_gb}
                 <option value={emb.id}>
@@ -263,7 +264,7 @@
               {/each}
             </select>
             <button onclick={triggerEmbeddingDownload} disabled={!selectedEmbDl}>
-              Download
+              {t("action.download")}
             </button>
           </div>
         </div>
@@ -280,36 +281,36 @@
         </div>
       {/if}
       <div class="mt-2 pt-2.5 border-t border-border">
-        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">Endpoints</div>
+        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">{t("api.endpoints")}</div>
         <div class="mono text-xs py-0.5 text-text-dim">POST /chat/completions</div>
         <div class="mono text-xs py-0.5 text-text-dim">POST /completions</div>
         <div class="mono text-xs py-0.5 text-text-dim">
-          POST /embeddings <span class="dim">(requires Embedding model)</span>
+          POST /embeddings <span class="dim">{t("api.embedding.endpointRequiresEmbedding")}</span>
         </div>
         <div class="mono text-xs py-0.5 text-text-dim">GET  /models</div>
       </div>
     </div>
     <div class="flex flex-col gap-1.5 min-w-0">
       <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.06em] mb-1">
-        <span class="dim">curl example</span>
-        <button onclick={() => copy(openaiCurl)}>Copy</button>
+        <span class="dim">{t("api.curlExample")}</span>
+        <button onclick={() => copy(openaiCurl)}>{t("api.copy")}</button>
       </div>
       <pre class="mono m-0 px-3 py-2.5 bg-bg border border-border rounded-md text-[11px] leading-[1.55] text-text overflow-x-auto whitespace-pre">{openaiCurl}</pre>
     </div>
   {:else}
     <div class="flex flex-col gap-1.5 min-w-0">
       <div class="flex flex-col gap-1">
-        <span class="dim">Base URL</span>
+        <span class="dim">{t("api.baseUrl")}</span>
         <div class="flex items-center gap-2">
           <code class="mono flex-1 px-2.5 py-[7px] bg-bg border border-border rounded text-accent overflow-x-auto whitespace-nowrap">{claudeBase}</code>
-          <button onclick={() => copy(claudeBase)}>Copy</button>
+          <button onclick={() => copy(claudeBase)}>{t("api.copy")}</button>
         </div>
       </div>
       <div class="flex flex-col gap-1">
-        <span class="dim">API key</span>
+        <span class="dim">{t("api.apiKey")}</span>
         <input
           type="password"
-          placeholder="(none — auth disabled)"
+          placeholder={t("api.apiKey.placeholder")}
           value={config.server.api_key ?? ""}
           oninput={(e) => {
             const v = (e.target as HTMLInputElement).value;
@@ -318,18 +319,18 @@
         />
       </div>
       <div class="flex flex-col gap-1">
-        <span class="dim">anthropic-version</span>
+        <span class="dim">{t("api.anthropicVersion")}</span>
         <code class="mono inline-block px-2 py-1 bg-bg border border-border rounded">2023-06-01</code>
       </div>
       <div class="mt-2 pt-2.5 border-t border-border">
-        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">Endpoints</div>
+        <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1">{t("api.endpoints")}</div>
         <div class="mono text-xs py-0.5 text-text-dim">POST /v1/messages</div>
       </div>
     </div>
     <div class="flex flex-col gap-1.5 min-w-0">
       <div class="flex items-center justify-between text-[11px] uppercase tracking-[0.06em] mb-1">
-        <span class="dim">curl example</span>
-        <button onclick={() => copy(claudeCurl)}>Copy</button>
+        <span class="dim">{t("api.curlExample")}</span>
+        <button onclick={() => copy(claudeCurl)}>{t("api.copy")}</button>
       </div>
       <pre class="mono m-0 px-3 py-2.5 bg-bg border border-border rounded-md text-[11px] leading-[1.55] text-text overflow-x-auto whitespace-pre">{claudeCurl}</pre>
     </div>

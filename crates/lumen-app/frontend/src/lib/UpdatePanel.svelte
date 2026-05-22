@@ -7,6 +7,7 @@
     type UpdateProgress,
   } from "./api";
   import { bytes } from "./format";
+  import { t } from "./i18n.svelte";
 
   interface Props {
     /** Set when the parent has a running server — we surface a confirm before
@@ -58,9 +59,7 @@
   async function install() {
     if (!info?.available) return;
     if (serverRunning) {
-      const ok = confirm(
-        "The inference server is running. Installing the update will stop it and restart the app. Continue?",
-      );
+      const ok = confirm(t("update.confirm.running"));
       if (!ok) return;
     }
     installing = true;
@@ -85,22 +84,22 @@
       {#if info?.available && info.latest_version}
         <div class="mt-0.5">
           <span class="text-ok font-medium">v{info.latest_version}</span>
-          <span class="dim">available</span>
+          <span class="dim">{t("update.availableSuffix")}</span>
           {#if info.published_at}
             <span class="dim mono">· {info.published_at}</span>
           {/if}
         </div>
       {:else if info && !info.available}
-        <div class="dim">You're on the latest version.</div>
+        <div class="dim">{t("update.onLatest")}</div>
       {/if}
     </div>
     <div class="flex gap-2">
       <button onclick={check} disabled={checking || installing}>
-        {checking ? "Checking…" : "Check for updates"}
+        {checking ? t("update.checking") : t("update.check")}
       </button>
       {#if info?.available}
         <button class="primary" onclick={install} disabled={installing}>
-          {installing ? "Installing…" : "Install & restart"}
+          {installing ? t("update.installing") : t("update.installRestart")}
         </button>
       {/if}
     </div>
@@ -123,14 +122,14 @@
       <div class="dim mono mt-1 text-[11px]">
         {bytes(progress.downloaded_bytes)}
         {#if progress.total_bytes} / {bytes(progress.total_bytes)}{/if}
-        {progress.done ? "— applying…" : ""}
+        {progress.done ? t("update.applying") : ""}
       </div>
     </div>
   {/if}
 
   {#if info?.available && info.release_notes}
     <div class="mt-3 border-t border-border pt-2">
-      <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1.5">Release notes</div>
+      <div class="dim text-[11px] uppercase tracking-[0.06em] mb-1.5">{t("update.releaseNotes")}</div>
       <pre class="mono m-0 whitespace-pre-wrap wrap-break-word text-[11px] leading-normal text-text max-h-50 overflow-y-auto">{info.release_notes}</pre>
     </div>
   {/if}

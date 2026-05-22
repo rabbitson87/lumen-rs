@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "./i18n.svelte";
   interface Props {
     value: Record<string, string>;
     typedKeys: Set<string>;
@@ -63,9 +64,7 @@
 
 <div class="px-4 pt-2 pb-3 text-xs">
   <div class="dim mb-2 text-[11px] leading-normal">
-    Raw env-var overrides passed to the <code class={inlineCode}>lumen-server</code> subprocess. Useful for
-    one-off knobs not surfaced in the UI (e.g. <code class={inlineCode}>LUMEN_GEMMA4_FUSE_EXPERTS</code>,
-    <code class={inlineCode}>LUMEN_AFFINE4_FORCE_CPU</code>). Keys that shadow a typed UI field are highlighted.
+    {t("env.intro2")}
   </div>
   <div class="flex flex-col gap-1 mb-2">
     {#each rows as r, i}
@@ -77,31 +76,31 @@
           placeholder="LUMEN_..."
           bind:value={r.key}
         />
-        <input class="mono" type="text" placeholder="value" bind:value={r.value} />
+        <input class="mono" type="text" placeholder={t("env.placeholder.value")} bind:value={r.value} />
         <button
           class="min-w-0 px-2 py-0.5 bg-transparent text-text-dim hover:bg-panel-2 hover:text-err"
           onclick={() => remove(i)}
-          title="Remove"
+          title={t("env.row.remove")}
         >×</button>
       </div>
       {#if shadowed}
         <div class="text-[11px] text-warn pl-1">
-          ⚠ shadows the UI field for <code class="mono">{r.key.trim()}</code>
+          {t("env.row.shadowsPrefix")} <code class="mono">{r.key.trim()}</code>
         </div>
       {/if}
     {/each}
     {#if rows.length === 0}
-      <div class="dim">No overrides set.</div>
+      <div class="dim">{t("env.empty2")}</div>
     {/if}
   </div>
   <div class="flex items-center gap-2">
-    <button onclick={add}>+ Add</button>
-    <button class="primary" disabled={!dirty} onclick={commit}>Save</button>
+    <button onclick={add}>{t("env.add2")}</button>
+    <button class="primary" disabled={!dirty} onclick={commit}>{t("env.save")}</button>
     {#if dirty}
-      <button onclick={resetFromProp}>Revert</button>
+      <button onclick={resetFromProp}>{t("env.revert")}</button>
     {/if}
     <span class="dim ml-auto text-[11px]">
-      Changes apply on next server start.
+      {t("env.applyHint")}
     </span>
   </div>
 </div>
