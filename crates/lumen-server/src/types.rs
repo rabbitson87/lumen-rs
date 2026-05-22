@@ -146,9 +146,7 @@ impl ChatMessage {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Tool {
-    Function {
-        function: FunctionDef,
-    },
+    Function { function: FunctionDef },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -242,8 +240,17 @@ pub struct ClearPrefixCacheResponse {
     pub cleared: usize,
 }
 
+/// Server-side default applied to chat / completion `max_tokens` when the
+/// client omits the field. Reads `LUMEN_DEFAULT_MAX_TOKENS` (set by the
+/// lumen-app CONTEXT card); falls back to 2048 for out-of-tree usage where
+/// the env var isn't plumbed. `0` means "unbounded — generate until EOS /
+/// stop / context budget" and is forwarded as-is to the engine layer (which
+/// already treats `max_tokens == 0` as the no-limit sentinel).
 fn default_max_tokens() -> usize {
-    2048
+    std::env::var("LUMEN_DEFAULT_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048)
 }
 fn default_temperature() -> f32 {
     0.7
@@ -565,9 +572,9 @@ impl AnthropicContent {
     /// `Text(...)` we synthesize a single text block on the fly.
     pub fn blocks(&self) -> std::borrow::Cow<'_, [AnthropicContentBlock]> {
         match self {
-            Self::Text(s) => std::borrow::Cow::Owned(vec![AnthropicContentBlock::Text {
-                text: s.clone(),
-            }]),
+            Self::Text(s) => {
+                std::borrow::Cow::Owned(vec![AnthropicContentBlock::Text { text: s.clone() }])
+            }
             Self::Blocks(b) => std::borrow::Cow::Borrowed(b),
         }
     }
@@ -857,7 +864,10 @@ mod tool_calling_serde {
         assert_eq!(tools.len(), 1);
         let Tool::Function { function } = &tools[0];
         assert_eq!(function.name, "get_weather");
-        assert_eq!(function.description.as_deref(), Some("Get current weather for a city"));
+        assert_eq!(
+            function.description.as_deref(),
+            Some("Get current weather for a city")
+        );
         let params = function.parameters.as_ref().unwrap();
         assert_eq!(params["required"][0], "location");
         match req.tool_choice.unwrap() {
@@ -934,7 +944,10 @@ mod tool_calling_serde {
             }]),
         };
         let v = serde_json::to_value(&resp).unwrap();
-        assert!(v["content"].is_null(), "content must serialize as null when None");
+        assert!(
+            v["content"].is_null(),
+            "content must serialize as null when None"
+        );
         assert_eq!(v["tool_calls"][0]["id"], "call_abc");
         assert_eq!(v["tool_calls"][0]["type"], "function");
         assert_eq!(v["tool_calls"][0]["function"]["name"], "get_weather");
@@ -949,7 +962,10 @@ mod tool_calling_serde {
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["content"], "Seoul is sunny");
-        assert!(v.get("tool_calls").is_none(), "tool_calls must be omitted when None");
+        assert!(
+            v.get("tool_calls").is_none(),
+            "tool_calls must be omitted when None"
+        );
     }
 
     #[test]
@@ -1053,7 +1069,11 @@ mod tool_calling_serde {
         });
         let msg: AnthropicMessage = serde_json::from_value(raw_string).unwrap();
         match &msg.content.blocks()[0] {
-            AnthropicContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
                 assert_eq!(tool_use_id, "toolu_xyz");
                 assert_eq!(content.as_text(), "20C sunny");
                 assert!(!is_error);

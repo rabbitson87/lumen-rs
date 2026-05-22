@@ -181,9 +181,7 @@ impl ModelBackend {
             Self::GemmaGguf(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
-            Self::Mlx(m) => {
-                m.generate(input_ids, max_new_tokens, temperature, top_p, session_id)
-            }
+            Self::Mlx(m) => m.generate(input_ids, max_new_tokens, temperature, top_p, session_id),
         }
     }
 
@@ -282,8 +280,13 @@ impl ModelBackend {
                 let mut adapter = |chunk: &str| {
                     let _ = on_event(BackendStreamEvent::Text(chunk));
                 };
-                let visible =
-                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, &mut adapter)?;
+                let visible = m.chat_streaming(
+                    messages,
+                    max_new_tokens,
+                    temperature,
+                    thinking,
+                    &mut adapter,
+                )?;
                 Ok(text_only_response(visible))
             }
             // Fallback: generate all, send as one chunk
@@ -305,8 +308,13 @@ impl ModelBackend {
                 let mut adapter = |chunk: &str| {
                     let _ = on_event(BackendStreamEvent::Text(chunk));
                 };
-                let visible =
-                    m.chat_streaming(messages, max_new_tokens, temperature, thinking, &mut adapter)?;
+                let visible = m.chat_streaming(
+                    messages,
+                    max_new_tokens,
+                    temperature,
+                    thinking,
+                    &mut adapter,
+                )?;
                 Ok(text_only_response(visible))
             }
             Self::Mlx(m) => m.chat_streaming(
@@ -435,13 +443,10 @@ fn flatten_turns_for_plain_backend(turns: &[ChatTurn<'_>]) -> Vec<(String, Strin
         .map(|t| match t {
             ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
             ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
-            ChatTurn::Assistant { text, .. } => {
-                ("assistant".to_string(), (*text).to_string())
+            ChatTurn::Assistant { text, .. } => ("assistant".to_string(), (*text).to_string()),
+            ChatTurn::Tool { content, .. } => {
+                ("user".to_string(), format!("[tool result] {}", *content))
             }
-            ChatTurn::Tool { content, .. } => (
-                "user".to_string(),
-                format!("[tool result] {}", *content),
-            ),
         })
         .collect()
 }
@@ -761,8 +766,7 @@ impl InferenceEngine {
         // chat-template behavior change for non-tool flows.
         let needs_structured = needs_structured_history(&req.messages);
 
-        let prompt_bytes: usize =
-            req.messages.iter().map(|m| m.content.len()).sum();
+        let prompt_bytes: usize = req.messages.iter().map(|m| m.content.len()).sum();
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         eprintln!(
             "[chat] msgs={} prompt_bytes={} max_tokens={} thinking={} stream={} tools={} structured={}",
@@ -848,19 +852,13 @@ impl InferenceEngine {
                     "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
                     "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
                     "tool" => ChatTurn::Tool {
-                        tool_call_id: m
-                            .tool_call_id
-                            .as_deref()
-                            .unwrap_or(""),
+                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
                         name: m.name.as_deref(),
                         content: m.content.as_str(),
                     },
                     _ => ChatTurn::Assistant {
                         text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf
-                            .get(i)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
+                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
                     },
                 })
                 .collect();
@@ -904,7 +902,10 @@ impl InferenceEngine {
             } else {
                 Some(visible.to_string())
             };
-            (content, Some(parsed_to_openai_tool_calls(&parsed.tool_calls)))
+            (
+                content,
+                Some(parsed_to_openai_tool_calls(&parsed.tool_calls)),
+            )
         } else {
             (Some(parsed.visible), None)
         };
@@ -1223,7 +1224,11 @@ impl InferenceEngine {
                 text: String::new(),
             });
         }
-        let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+        let stop_reason = if has_tool_calls {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
 
         Ok(AnthropicResponse {
             id: format!("msg_{}", gen_id()),
@@ -1361,10 +1366,7 @@ impl InferenceEngine {
                     },
                     _ => ChatTurn::Assistant {
                         text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf
-                            .get(i)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
+                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
                     },
                 })
                 .collect();
@@ -2413,7 +2415,8 @@ impl InferenceEngine {
                                                 .join("\n"),
                                         };
                                         if !system_text.is_empty() {
-                                            messages.push(ChatMessage::new_text("system", system_text));
+                                            messages
+                                                .push(ChatMessage::new_text("system", system_text));
                                         }
                                     }
                                     for msg in &req.messages {
@@ -2844,7 +2847,8 @@ impl InferenceEngine {
                                                 .join("\n"),
                                         };
                                         if !system_text.is_empty() {
-                                            messages.push(ChatMessage::new_text("system", system_text));
+                                            messages
+                                                .push(ChatMessage::new_text("system", system_text));
                                         }
                                     }
                                     for msg in &req.messages {

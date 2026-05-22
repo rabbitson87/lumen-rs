@@ -31,6 +31,7 @@ use candle_transformers::models::qwen3::Config;
 use candle_transformers::utils::repeat_kv;
 use lumen_metal::affine4_linear::Affine4Linear;
 use lumen_metal::affine8_linear::Affine8Linear;
+use lumen_metal::mxfp8_linear::Mxfp8Linear;
 
 #[derive(Debug)]
 struct RotaryEmbedding {
@@ -68,13 +69,14 @@ impl RotaryEmbedding {
     }
 }
 
-/// MLX-quantized projection — either 8-bit (Affine8) or 4-bit (Affine4)
-/// packed weight backed by a fused dequant+matmul Metal kernel. Both
+/// MLX-quantized projection — AFFINE 4-bit, AFFINE 8-bit, or MXFP8 (OCP)
+/// packed weight backed by a fused dequant+matmul Metal kernel. All three
 /// expose bf16 → bf16 forward semantics so the surrounding transformer
 /// code is dtype-agnostic.
 pub enum QuantProj {
     A4(Affine4Linear),
     A8(Affine8Linear),
+    M8(Mxfp8Linear),
 }
 
 impl QuantProj {
@@ -85,6 +87,7 @@ impl QuantProj {
             // falls back to f32 path inside Affine4Linear itself.
             Self::A4(q) => q.forward_bf16_in_bf16_out(x),
             Self::A8(q) => q.forward(x),
+            Self::M8(q) => q.forward(x),
         }
     }
 }

@@ -3,9 +3,9 @@ use atomic_http::*;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use crate::engine::{EngineHandle, StreamEvent};
 #[allow(unused_imports)]
 use crate::engine::FinishReason;
+use crate::engine::{EngineHandle, StreamEvent};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatStreamChoice, ChatStreamDelta, ErrorResponse,
     FunctionCallDelta, ToolCallDelta, Usage,
@@ -227,7 +227,11 @@ async fn handle_streaming(
                     t_last_write = Some(std::time::Instant::now());
                 }
             }
-            StreamEvent::ToolCallStart { index, id: call_id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id: call_id,
+                name,
+            } => {
                 // Phase 1.5: OpenAI tool_calls start chunk. Carries
                 // `index`, `id`, `type:"function"`, and `function.name`
                 // exactly once; subsequent argument chunks reference

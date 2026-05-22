@@ -48,6 +48,11 @@ export interface ContextConfig {
   max: number;
   sliding: number;
   prefill: number;
+  /** Default `max_tokens` (generation budget) for OpenAI-compatible chat /
+   *  completion requests that omit the field. Default 2048. Emitted as the
+   *  `LUMEN_DEFAULT_MAX_TOKENS` env var; explicit `max_tokens` in the request
+   *  body always wins. */
+  default_max_tokens: number;
 }
 
 export type BackendMode = "auto" | "candle" | "mlx-native" | "mlx-pyo3";

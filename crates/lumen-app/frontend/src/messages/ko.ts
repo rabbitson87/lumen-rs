@@ -89,6 +89,7 @@ export const ko: Record<string, string> = {
   "context.max": "최대",
   "context.sliding": "슬라이딩",
   "context.prefill": "프리필",
+  "context.defaultMaxTokens": "기본 max_tokens",
   "context.turboquant.on": "TurboQuant:",
   "context.turboquant.off": "· 기본 KV 메모리 (압축 없음)",
   "context.recommended": "이 Mac 권장 최대",
@@ -177,6 +178,8 @@ export const ko: Record<string, string> = {
     "TurboQuant와 함께 적용됩니다 — 슬라이딩은 어떤 토큰을 유지할지 결정, TurboQuant는 어떻게 저장할지 결정.",
   "context.hint.prefill":
     "프롬프트 처리 청크 상한. 이 값보다 긴 프롬프트는 \"prompt too large\" 오류로 거부됩니다. 클수록 긴 프롬프트를 받지만 프리필 동안 피크 메모리도 증가 (어텐션 QK·T = 청크 × KV",
+  "context.hint.defaultMaxTokens":
+    "OpenAI 호환 chat/completion 요청에서 `max_tokens`가 빠졌을 때 서버가 적용하는 생성 토큰 예산. 요청 본문에 `max_tokens`가 명시되어 있으면 그 값이 항상 우선합니다 — 이 값은 서버 측 폴백일 뿐입니다.",
 
   // ── SERVER 메모리 설명 ──────────────────────────────────────────
   "server.memory.explainer.intro":

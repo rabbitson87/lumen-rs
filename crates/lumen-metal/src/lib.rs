@@ -27,6 +27,9 @@ pub mod mxfp4;
 pub mod mxfp4_gpu;
 #[cfg(feature = "model-integration")]
 pub mod mxfp4_linear;
+pub mod mxfp8_gpu;
+#[cfg(feature = "model-integration")]
+pub mod mxfp8_linear;
 pub mod pipeline;
 #[cfg(feature = "model-integration")]
 pub mod rms_norm;
@@ -69,7 +72,7 @@ pub struct GpuCompressor {
     /// Reserved for upcoming attention-scoring kernel output. Pre-allocated
     /// alongside the other `scratch_*` buffers; no read path yet.
     #[allow(dead_code)]
-    scratch_output: crate::metal::Buffer,  // [max_heads * dim] f32
+    scratch_output: crate::metal::Buffer, // [max_heads * dim] f32
     scratch_qjl_proj: crate::metal::Buffer, // [qjl_m] f32 — precomputed per attention call
 }
 

@@ -94,6 +94,7 @@ export const en: Record<string, string> = {
   "context.max": "Max",
   "context.sliding": "Sliding",
   "context.prefill": "Prefill",
+  "context.defaultMaxTokens": "Default max_tokens",
   "context.turboquant.on": "TurboQuant:",
   "context.turboquant.off": "· baseline KV memory (no compression)",
   "context.recommended": "Recommended max on this Mac",
@@ -183,6 +184,8 @@ export const en: Record<string, string> = {
     "Stacks with TurboQuant — sliding bounds which tokens are kept, TurboQuant compresses how they're stored.",
   "context.hint.prefill":
     "Prompt-processing chunk cap. Server rejects prompts longer than this with a \"prompt too large\" error. Larger = accepts long prompts but more peak memory during prefill (attention QK·T = chunk × KV",
+  "context.hint.defaultMaxTokens":
+    "Generation budget applied to OpenAI-compatible chat / completion requests that omit `max_tokens`. Request bodies that explicitly set `max_tokens` always win — this is only the server-side fallback.",
 
   // ── SERVER memory explainer ─────────────────────────────────────
   "server.memory.explainer.intro":

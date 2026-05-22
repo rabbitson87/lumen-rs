@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -162,6 +162,16 @@ pub struct ContextConfig {
     pub max: usize,
     pub sliding: usize,
     pub prefill: usize,
+    /// Default `max_tokens` (generation budget) applied to chat / completion
+    /// requests that omit the field. Emitted as `LUMEN_DEFAULT_MAX_TOKENS`;
+    /// `lumen-server` reads it in `types.rs::default_max_tokens()`. `0` means
+    /// "unbounded — generate until EOS / stop / context budget".
+    #[serde(default = "default_default_max_tokens")]
+    pub default_max_tokens: u32,
+}
+
+fn default_default_max_tokens() -> u32 {
+    2048
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +268,7 @@ impl Default for PersistentConfig {
                 max: 81920,
                 sliding: 1024,
                 prefill: 40960,
+                default_max_tokens: 2048,
             },
             advanced: AdvancedConfig {
                 backend_mode: BackendMode::Auto,
@@ -410,6 +421,19 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
             cfg.quant.turboquant_auto_threshold_tokens = 4096;
         }
         cfg.schema_version = 6;
+    }
+    // v6 -> v7: introduced `context.default_max_tokens` so the OpenAI-compat
+    // server-side default for chat/completion `max_tokens` (when the client
+    // omits the field) is user-configurable instead of hardcoded to 2048.
+    // Existing configs that serialized without the field deserialize as 0
+    // (serde's u32 default) — that would silently mean "unbounded" and is a
+    // behaviour change from v6. Stamp the legacy 2048 default explicitly so
+    // upgraders see no surprise.
+    if cfg.schema_version < 7 {
+        if cfg.context.default_max_tokens == 0 {
+            cfg.context.default_max_tokens = 2048;
+        }
+        cfg.schema_version = 7;
     }
     // Future migrations append here.
 }

@@ -938,6 +938,21 @@
         {t("context.hint.prefill")}{#if config.quant.turboquant_enabled}, ~{turboquantKvRatio.toFixed(1)}×{/if}).
         {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_PREFILL_CHUNK</code>.
       </div>
+
+      <div class={kvRow}>
+        <span class="dim">{t("context.defaultMaxTokens")}</span>
+        <input
+          type="number"
+          min="1"
+          step="256"
+          bind:value={config.context.default_max_tokens}
+          onchange={saveContext}
+        />
+      </div>
+      <div class={ctxHint}>
+        {t("context.hint.defaultMaxTokens")}
+        {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_DEFAULT_MAX_TOKENS</code>.
+      </div>
     {/if}
   </section>
 

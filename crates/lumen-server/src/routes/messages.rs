@@ -158,10 +158,10 @@ async fn handle_streaming(
                     text_block_open = false;
                 }
                 let idx = wire_index;
-                let id_json = serde_json::to_string(&id)
-                    .map_err(|e| SendableError::from(e.to_string()))?;
-                let name_json = serde_json::to_string(&name)
-                    .map_err(|e| SendableError::from(e.to_string()))?;
+                let id_json =
+                    serde_json::to_string(&id).map_err(|e| SendableError::from(e.to_string()))?;
+                let name_json =
+                    serde_json::to_string(&name).map_err(|e| SendableError::from(e.to_string()))?;
                 let evt = format!(
                     "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"tool_use\",\"id\":{id_json},\"name\":{name_json},\"input\":{{}}}}}}\n\n"
                 );

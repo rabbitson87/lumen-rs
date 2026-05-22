@@ -77,6 +77,31 @@ fn read_sha_marker(model_dir: &Path) -> Option<String> {
 ///    actual files under `snapshots/<commit_sha>/` (symlinks to `blobs/`).
 ///    `id` = `<org>/<repo>`.
 ///
+/// HuggingFace Hub repo id grammar: `<org>/<repo>` where each segment is
+/// `[A-Za-z0-9._-]+`. Rejects empty parts, missing slash, multiple slashes,
+/// and any character HF wouldn't accept in a repo URL — notably whitespace
+/// (Finder's "Item 2" duplicate convention) which would 401 every update
+/// check and never resolve to a real Hub URL.
+fn is_valid_hf_repo_id(id: &str) -> bool {
+    let mut parts = id.split('/');
+    let (Some(org), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !org.is_empty() && !repo.is_empty() && is_hf_segment(org) && is_hf_segment(repo)
+}
+
+/// Plain flat (no-org) local-only model directory name. Same character class
+/// as an HF segment — no whitespace, no slash. Skips Finder duplicates and
+/// scratch dirs that would otherwise surface as bogus model entries.
+fn is_valid_flat_id(name: &str) -> bool {
+    !name.is_empty() && is_hf_segment(name)
+}
+
+fn is_hf_segment(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
 /// `catalog` is consulted to set the `supported` / `label` flags.
 pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry>> {
     if !models_dir.exists() {
@@ -100,6 +125,9 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
         let (id, scan_dir) = if let Some(rest) = name.strip_prefix("models--") {
             // hf-hub cache layout: `models--<org>--<repo>/snapshots/<sha>/<files>`
             let id = rest.replacen("--", "/", 1);
+            if !is_valid_hf_repo_id(&id) {
+                continue;
+            }
             let snapshot = resolve_hf_snapshot(&path);
             match snapshot {
                 Some(snap) => (id, snap),
@@ -111,9 +139,22 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
             // canonical `<org>/<repo>` id so catalog matching works the
             // same as for hf-hub-style caches.
             let id = name.replacen("--", "/", 1);
+            // Strict HF naming check filters Finder duplicates (`… 2`),
+            // .DS_Store siblings, and anything else that wouldn't round-trip
+            // to a valid Hub URL. Avoids spamming HF API with 401s on the
+            // periodic update check.
+            if !is_valid_hf_repo_id(&id) {
+                continue;
+            }
             (id, path.clone())
         } else {
             // Plain flat (README convention, no org prefix in dir name).
+            // Skip names with whitespace or other non-HF-id characters —
+            // these are almost always Finder duplicates or scratch dirs,
+            // never real local-only models.
+            if !is_valid_flat_id(&name) {
+                continue;
+            }
             (name, path.clone())
         };
 

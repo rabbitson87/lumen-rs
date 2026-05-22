@@ -5,16 +5,16 @@
 //! `/v1/embeddings`. No Python, no subprocess — runs in the same process
 //! as the chat backend, sharing the Metal device.
 //!
-//! Supports **three checkpoint layouts**:
+//! Supports **four checkpoint layouts**:
 //!   1. Plain bf16/f16 safetensors (`*.weight` only).
-//!   2. **MLX 8-bit quantized** (`*.weight` uint32-packed, 4 bytes/u32 +
-//!      `*.scales` + `*.biases` f16, per-group). Default path keeps the
-//!      8-bit packed weights resident on-GPU and runs a fused
-//!      dequant+matmul Metal kernel (`affine8_matmul_bf16`). Memory
-//!      ~600 MB (vs ~1.2 GB with eager dequant). Opt-out via
+//!   2. **MLX AFFINE 8-bit** (`*.weight` uint32-packed, 4 bytes/u32 +
+//!      `*.scales` + `*.biases` f16, per-group, group_size=64). Default
+//!      path keeps the 8-bit packed weights resident on-GPU and runs a
+//!      fused dequant+matmul Metal kernel (`affine8_matmul_bf16`).
+//!      Memory ~600 MB (vs ~1.2 GB with eager dequant). Opt-out via
 //!      `LUMEN_EMBEDDING_QUANT_KERNEL=0` to fall back to CPU dequant +
 //!      standard bf16 inference.
-//!   3. **MLX 4-bit quantized** (`*.weight` uint32-packed, 8 nibbles/u32
+//!   3. **MLX AFFINE 4-bit** (`*.weight` uint32-packed, 8 nibbles/u32
 //!      + `*.scales` + `*.biases` f16, per-group, group_size=64). Default
 //!      path uses the fused `affine4_qmv_fast_bf16in_bf16out` Metal kernel
 //!      (`Affine4Linear`) — packed weights stay GPU-resident, no eager
@@ -23,6 +23,13 @@
 //!      to CPU eager dequant when `LUMEN_EMBEDDING_QUANT_KERNEL=0` or
 //!      when a projection shape misses qmv_fast's `in % 512 == 0 &&
 //!      out % 8 == 0` requirement.
+//!   4. **MLX MXFP8 (OCP)** — `mode="mxfp8"`, bits=8, group_size=32.
+//!      `*.weight` is uint32-packed E4M3 (4 bytes/u32 again) + `*.scales`
+//!      as raw u8 E8M0 bytes, NO `.biases` (E4M3 sign bit carries the
+//!      sign). Runs on the fused `mxfp8_qmv_fast_bf16` Metal kernel
+//!      (`Mxfp8Linear`) — packed weights stay GPU-resident. GPU↔CPU parity
+//!      validated bit-identical at random inputs. Used by e.g.
+//!      `mlx-community/Qwen3-Embedding-4B-mxfp8`.
 //!
 //! Pooling: **last-token** (Qwen3-Embedding standard). The hidden state
 //! at the final input position is taken as the sentence embedding.
@@ -51,6 +58,8 @@ use lumen_metal::affine4_gpu::{Affine4Context, Affine4Weight};
 use lumen_metal::affine4_linear::Affine4Linear;
 use lumen_metal::affine8_gpu::{Affine8Context, Affine8Weight};
 use lumen_metal::affine8_linear::Affine8Linear;
+use lumen_metal::mxfp8_gpu::{Mxfp8Context, Mxfp8Weight, e4m3_to_f32, e8m0_to_f32};
+use lumen_metal::mxfp8_linear::Mxfp8Linear;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use safetensors::SafeTensors;
@@ -289,6 +298,21 @@ impl EmbeddingModel {
 struct QuantConfig {
     group_size: usize,
     bits: usize,
+    /// MLX quantization mode. Absent / `"affine"` → AFFINE (uint + zp + scale,
+    /// f16 scale/bias, group_size=64 typical). `"mxfp8"` → OCP MXFP8
+    /// (E4M3 elements + E8M0 byte scales, group_size=32, no biases).
+    /// Any other value is rejected at load time so a future format isn't
+    /// silently mis-loaded as AFFINE.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+impl QuantConfig {
+    /// Normalized mode string (`"affine"` is the default when the field is
+    /// missing — matches MLX's pre-mxfp4 convention).
+    fn mode_str(&self) -> &str {
+        self.mode.as_deref().unwrap_or("affine")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,15 +484,23 @@ fn load_weights_into(
     use_quant_kernel: bool,
 ) -> Result<LoadedWeights> {
     if let Some(qc) = quant {
-        // Both 8-bit (`Affine8Linear`, 4 bytes / u32) and 4-bit
-        // (`Affine4Linear`, 8 nibbles / u32) have fused dequant+matmul
-        // Metal kernels. The 4-bit qmv_fast path further requires
-        // `in % 512 == 0 && out % 8 == 0` — Qwen3-Embedding-{0.6B,4B,8B}
-        // satisfy this for every projection. If a shape misses the
-        // constraint, `Affine4Linear::forward_bf16_in_bf16_out` falls back
-        // internally to its f32 path. Anything other than bits ∈ {4, 8}
-        // drops to the CPU eager-dequant branch below.
-        if matches!(qc.bits, 4 | 8) && use_quant_kernel {
+        // Three fused dequant+matmul kernels live behind `QuantProj`:
+        //   - AFFINE 4-bit / 8-bit (Qwen3-Embedding-0.6B-8bit,
+        //     Qwen3-Embedding-{4B,8B}-4bit-DWQ): `mode` absent / "affine".
+        //   - MXFP8 (OCP, Qwen3-Embedding-4B-mxfp8): `mode == "mxfp8"`,
+        //     bits=8, group_size=32, no biases (E4M3 elements + E8M0 scales).
+        //
+        // Any other (bits, mode) combination drops to the CPU eager-dequant
+        // branch below; truly unsupported modes are rejected explicitly in
+        // `load_quant_kernel` so a future format isn't silently misloaded.
+        let mode = qc.mode_str();
+        let kernel_eligible = use_quant_kernel
+            && match (qc.bits, mode) {
+                (4 | 8, "affine") => true,
+                (8, "mxfp8") => true,
+                _ => false,
+            };
+        if kernel_eligible {
             return load_quant_kernel(paths, target_dtype, device, qc).map(
                 |(tensors, projections)| LoadedWeights::Quantized {
                     tensors,
@@ -491,20 +523,27 @@ fn load_quant_kernel(
     device: &Device,
     qc: &QuantConfig,
 ) -> Result<(HashMap<String, Tensor>, HashMap<String, QuantProj>)> {
-    // Both contexts compile their pipeline lazily on construction. We pay
-    // that one-time cost per bit-width and re-use the context across all
-    // ~196 projections so the shader compiles once.
-    let ctx8: Option<Arc<Affine8Context>> = if qc.bits == 8 {
+    let mode = qc.mode_str();
+    let is_mxfp8 = mode == "mxfp8";
+
+    // Lazy per-mode context construction. Each compiles its Metal pipelines
+    // once, then is reused across all ~196 projections in the model.
+    let ctx8: Option<Arc<Affine8Context>> = if qc.bits == 8 && !is_mxfp8 {
         Some(Arc::new(
             Affine8Context::new().context("Affine8Context::new")?,
         ))
     } else {
         None
     };
-    let ctx4: Option<Arc<Affine4Context>> = if qc.bits == 4 {
+    let ctx4: Option<Arc<Affine4Context>> = if qc.bits == 4 && !is_mxfp8 {
         Some(Arc::new(
             Affine4Context::new().context("Affine4Context::new")?,
         ))
+    } else {
+        None
+    };
+    let ctx_mxfp8: Option<Arc<Mxfp8Context>> = if is_mxfp8 {
+        Some(Arc::new(Mxfp8Context::new().context("Mxfp8Context::new")?))
     } else {
         None
     };
@@ -529,9 +568,8 @@ fn load_quant_kernel(
         }
     }
 
-    // Partition (weight, scales, biases) triples into:
-    //   - layer projections → Affine{4,8}Linear (kept on-GPU, fused kernel)
-    //   - everything else (embed_tokens) → CPU dequant → bf16 Tensor
+    // A `.weight` is part of a quant triple iff it has a `.scales` sibling.
+    // (MXFP8 omits `.biases`; AFFINE includes it.)
     let weight_keys: Vec<String> = all
         .keys()
         .filter(|k| k.ends_with(".weight") && all.contains_key(&k.replace(".weight", ".scales")))
@@ -551,41 +589,49 @@ fn load_quant_kernel(
         }
     }
     eprintln!(
-        "[embedding] quant load (bits={}): {} layer projections (GPU-resident packed) + {} eager-dequant weights",
+        "[embedding] quant load (bits={}, mode={}): {} layer projections (GPU-resident packed) + {} eager-dequant weights",
         qc.bits,
+        mode,
         projection_paths.len(),
         dequant_paths.len()
     );
 
     // Parallel CPU dequant for the non-projection (eager) weights.
-    // embed_tokens is the only such weight on Qwen3-Embedding; using the
-    // same dispatch logic here as in `load_weight_map`.
+    // embed_tokens is the only such weight on Qwen3-Embedding.
     let dequanted: Vec<(String, Vec<half::bf16>, (usize, usize))> = dequant_paths
         .par_iter()
         .map(|wkey| -> Result<_> {
             let skey = wkey.replace(".weight", ".scales");
-            let bkey = wkey.replace(".weight", ".biases");
             let w_view = open_view(&mmaps, &all[wkey])?;
             let s_view = open_view(&mmaps, &all[&skey])?;
-            let b_view = open_view(&mmaps, &all[&bkey])?;
-            let (buf, shape) = if qc.bits == 8 {
-                dequant_mlx_8bit_to_buf(
-                    w_view.0,
-                    &w_view.1,
-                    s_view.0,
-                    &s_view.1,
-                    b_view.0,
-                    qc.group_size,
-                )
+            let (buf, shape) = if is_mxfp8 {
+                dequant_mlx_mxfp8_to_buf(w_view.0, &w_view.1, s_view.0, &s_view.1, qc.group_size)
             } else {
-                dequant_mlx_4bit_to_buf(
-                    w_view.0,
-                    &w_view.1,
-                    s_view.0,
-                    &s_view.1,
-                    b_view.0,
-                    qc.group_size,
-                )
+                let bkey = wkey.replace(".weight", ".biases");
+                let b_view = open_view(&mmaps, &all[&bkey])?;
+                if qc.bits == 8 {
+                    dequant_mlx_8bit_to_buf(
+                        w_view.0,
+                        &w_view.1,
+                        s_view.0,
+                        &s_view.1,
+                        s_view.2,
+                        b_view.0,
+                        b_view.2,
+                        qc.group_size,
+                    )
+                } else {
+                    dequant_mlx_4bit_to_buf(
+                        w_view.0,
+                        &w_view.1,
+                        s_view.0,
+                        &s_view.1,
+                        s_view.2,
+                        b_view.0,
+                        b_view.2,
+                        qc.group_size,
+                    )
+                }
             }
             .with_context(|| format!("dequant {wkey}"))?;
             Ok((wkey.clone(), buf, shape))
@@ -615,54 +661,76 @@ fn load_quant_kernel(
         tensors.insert(k.clone(), tensor);
     }
 
-    // Build GPU-resident projection wrappers (Affine4Linear for bits=4,
-    // Affine8Linear for bits=8). Both expose the same bf16→bf16 forward
-    // semantics through `QuantProj`.
+    // Build GPU-resident projection wrappers. The on-disk layout determines
+    // the variant: AFFINE has `.weight` + `.scales` + `.biases`; MXFP8 has
+    // `.weight` + `.scales` (u8 E8M0) only.
     let mut projections: HashMap<String, QuantProj> = HashMap::new();
     for prefix in projection_paths {
         let wkey = format!("{prefix}.weight");
         let skey = format!("{prefix}.scales");
-        let bkey = format!("{prefix}.biases");
         let w_view = open_view(&mmaps, &all[&wkey])?;
         let s_view = open_view(&mmaps, &all[&skey])?;
-        let b_view = open_view(&mmaps, &all[&bkey])?;
 
-        // MLX packs (32 / bits) logical weights per u32 — 4 bytes for
-        // bits=8, 8 nibbles for bits=4. weight.shape[1] is the packed
-        // last-dim; logical `in_features = packed_last_dim * (32/bits)`.
+        // MLX packs (32 / bits) logical weights per u32 — 4 E4M3 / uint8
+        // bytes for bits=8 (both AFFINE and MXFP8), 8 nibbles for bits=4.
+        // weight.shape[1] is the packed last-dim; logical
+        // `in_features = packed_last_dim * (32/bits)`.
         let out_features = w_view.1[0];
         let packs_per_row = w_view.1[1];
         let in_features = packs_per_row * (32 / qc.bits);
-
         let packed_u32 = bytes_to_u32_vec(w_view.0);
-        // safetensors stores scales/biases as f16; both kernels expect bf16.
-        let scales_u16 = f16_bytes_to_bf16_bits(s_view.0);
-        let biases_u16 = f16_bytes_to_bf16_bits(b_view.0);
 
-        let proj = if qc.bits == 8 {
-            let ctx = ctx8.as_ref().expect("ctx8 must exist for bits=8");
-            let weight = Affine8Weight::from_host(
-                &ctx.ctx,
-                &packed_u32,
-                &scales_u16,
-                &biases_u16,
-                out_features,
-                in_features,
-            )
-            .with_context(|| format!("upload Affine8Weight {prefix}"))?;
-            QuantProj::A8(Affine8Linear::new(weight, ctx.clone()))
+        let proj = if is_mxfp8 {
+            // MXFP8: scales are raw u8 E8M0 bytes — no f16 decode.
+            anyhow::ensure!(
+                s_view.2 == safetensors::Dtype::U8,
+                "mxfp8 expects U8 scales for {prefix}, got {:?}",
+                s_view.2
+            );
+            let ctx = ctx_mxfp8
+                .as_ref()
+                .expect("ctx_mxfp8 must exist when mode=mxfp8");
+            let weight =
+                Mxfp8Weight::from_host(&ctx.ctx, &packed_u32, s_view.0, out_features, in_features)
+                    .with_context(|| format!("upload Mxfp8Weight {prefix}"))?;
+            QuantProj::M8(Mxfp8Linear::new(weight, ctx.clone()))
         } else {
-            let ctx = ctx4.as_ref().expect("ctx4 must exist for bits=4");
-            let weight = Affine4Weight::from_host(
-                &ctx.ctx,
-                &packed_u32,
-                &scales_u16,
-                &biases_u16,
-                out_features,
-                in_features,
-            )
-            .with_context(|| format!("upload Affine4Weight {prefix}"))?;
-            QuantProj::A4(Affine4Linear::new(weight, None, ctx.clone()))
+            // AFFINE: scales/biases are F16 (original builds) OR BF16
+            // (e.g. DWQ rebuilds) on disk; kernel expects bf16. Dispatch on
+            // the safetensors dtype — see `scales_to_bf16_bits` for the
+            // bug that motivated this branch (4B-4bit-DWQ ships BF16 and
+            // produced all-NaN embeddings when read as F16).
+            let bkey = format!("{prefix}.biases");
+            let b_view = open_view(&mmaps, &all[&bkey])?;
+            let scales_u16 = scales_to_bf16_bits(s_view.0, s_view.2)
+                .with_context(|| format!("scales {prefix}"))?;
+            let biases_u16 = scales_to_bf16_bits(b_view.0, b_view.2)
+                .with_context(|| format!("biases {prefix}"))?;
+            if qc.bits == 8 {
+                let ctx = ctx8.as_ref().expect("ctx8 must exist for bits=8");
+                let weight = Affine8Weight::from_host(
+                    &ctx.ctx,
+                    &packed_u32,
+                    &scales_u16,
+                    &biases_u16,
+                    out_features,
+                    in_features,
+                )
+                .with_context(|| format!("upload Affine8Weight {prefix}"))?;
+                QuantProj::A8(Affine8Linear::new(weight, ctx.clone()))
+            } else {
+                let ctx = ctx4.as_ref().expect("ctx4 must exist for bits=4");
+                let weight = Affine4Weight::from_host(
+                    &ctx.ctx,
+                    &packed_u32,
+                    &scales_u16,
+                    &biases_u16,
+                    out_features,
+                    in_features,
+                )
+                .with_context(|| format!("upload Affine4Weight {prefix}"))?;
+                QuantProj::A4(Affine4Linear::new(weight, None, ctx.clone()))
+            }
         };
         projections.insert(prefix, proj);
     }
@@ -684,20 +752,56 @@ fn bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
     v
 }
 
-/// MLX checkpoints store quant `scales` / `biases` as **f16** (IEEE
-/// half-precision, 5-bit exponent). Our Metal kernel reads those buffers
-/// as **bf16** (8-bit exponent) — different bit layouts. Convert at load
-/// time so the kernel sees the right values without an extra in-kernel
-/// branch.
-fn f16_bytes_to_bf16_bits(bytes: &[u8]) -> Vec<u16> {
+/// Normalize the quant `scales` / `biases` byte slice to bf16 bits, which
+/// is what the Metal kernel + CPU reference both consume.
+///
+/// MLX checkpoints disagree on the on-disk dtype:
+///   - Original AFFINE builds (e.g. `Qwen3-Embedding-0.6B-8bit`) use
+///     **F16** (IEEE half, 5-bit exponent).
+///   - DWQ builds (e.g. `Qwen3-Embedding-4B-4bit-DWQ`) use **BF16**
+///     already.
+///
+/// Both formats are 16-bit but their exponent widths differ — reading a
+/// BF16 byte pair as F16 yields garbage (NaN/Inf on most values), which
+/// is the bug that made `Qwen3-Embedding-4B-4bit-DWQ` emit all-NaN
+/// embeddings before this branch existed. Dispatch on the safetensors
+/// dtype enum so we get correct values for both.
+fn scales_to_bf16_bits(bytes: &[u8], dtype: safetensors::Dtype) -> Result<Vec<u16>> {
     let n = bytes.len() / 2;
     let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let f16 = half::f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-        let bf16 = half::bf16::from_f32(f16.to_f32());
-        out.push(bf16.to_bits());
+    match dtype {
+        safetensors::Dtype::F16 => {
+            for i in 0..n {
+                let f = half::f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+                out.push(half::bf16::from_f32(f.to_f32()).to_bits());
+            }
+        }
+        safetensors::Dtype::BF16 => {
+            for i in 0..n {
+                out.push(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]));
+            }
+        }
+        other => {
+            return Err(anyhow!(
+                "scales/biases dtype must be F16 or BF16, got {other:?}"
+            ));
+        }
     }
-    out
+    Ok(out)
+}
+
+/// Decode one 16-bit scalar at byte offset `byte_off` to f32. Handles both
+/// F16 and BF16 on-disk dtypes (mirrors [`scales_to_bf16_bits`]). Used by
+/// the host-side eager dequant helpers that walk the scales buffer
+/// element by element instead of pre-converting.
+fn read_scale_f32(bytes: &[u8], byte_off: usize, dtype: safetensors::Dtype) -> f32 {
+    let lo = bytes[byte_off];
+    let hi = bytes[byte_off + 1];
+    match dtype {
+        safetensors::Dtype::F16 => half::f16::from_le_bytes([lo, hi]).to_f32(),
+        safetensors::Dtype::BF16 => half::bf16::from_le_bytes([lo, hi]).to_f32(),
+        _ => f32::NAN,
+    }
 }
 
 fn load_weight_map(
@@ -768,7 +872,9 @@ fn load_weight_map(
                         &w_view.1,
                         s_view.0,
                         &s_view.1,
+                        s_view.2,
                         b_view.0,
+                        b_view.2,
                         qc.group_size,
                     )
                 } else {
@@ -777,7 +883,9 @@ fn load_weight_map(
                         &w_view.1,
                         s_view.0,
                         &s_view.1,
+                        s_view.2,
                         b_view.0,
+                        b_view.2,
                         qc.group_size,
                     )
                 }
@@ -908,7 +1016,9 @@ fn dequant_mlx_4bit_to_buf(
     w_shape: &[usize],
     s_raw: &[u8],
     s_shape: &[usize],
+    s_dtype: safetensors::Dtype,
     b_raw: &[u8],
+    b_dtype: safetensors::Dtype,
     group_size: usize,
 ) -> Result<(Vec<half::bf16>, (usize, usize))> {
     if w_shape.len() != 2 || s_shape.len() != 2 {
@@ -955,8 +1065,8 @@ fn dequant_mlx_4bit_to_buf(
                     let q = ((pack >> (4 * nib_idx)) & 0xF) as f32;
                     let g = i / group_size;
                     let sbi = (s_off + g) * 2;
-                    let scale = half::f16::from_le_bytes([s_raw[sbi], s_raw[sbi + 1]]).to_f32();
-                    let bias = half::f16::from_le_bytes([b_raw[sbi], b_raw[sbi + 1]]).to_f32();
+                    let scale = read_scale_f32(s_raw, sbi, s_dtype);
+                    let bias = read_scale_f32(b_raw, sbi, b_dtype);
                     row_out[i] = half::bf16::from_f32(q * scale + bias);
                 }
             }
@@ -980,7 +1090,9 @@ fn dequant_mlx_8bit_to_buf(
     w_shape: &[usize],
     s_raw: &[u8],
     s_shape: &[usize],
+    s_dtype: safetensors::Dtype,
     b_raw: &[u8],
+    b_dtype: safetensors::Dtype,
     group_size: usize,
 ) -> Result<(Vec<half::bf16>, (usize, usize))> {
     if w_shape.len() != 2 || s_shape.len() != 2 {
@@ -1028,9 +1140,80 @@ fn dequant_mlx_8bit_to_buf(
                     let q = ((pack >> (8 * byte_idx)) & 0xFF) as f32;
                     let g = i / group_size;
                     let sbi = (s_off + g) * 2;
-                    let scale = half::f16::from_le_bytes([s_raw[sbi], s_raw[sbi + 1]]).to_f32();
-                    let bias = half::f16::from_le_bytes([b_raw[sbi], b_raw[sbi + 1]]).to_f32();
+                    let scale = read_scale_f32(s_raw, sbi, s_dtype);
+                    let bias = read_scale_f32(b_raw, sbi, b_dtype);
                     row_out[i] = half::bf16::from_f32(q * scale + bias);
+                }
+            }
+        });
+
+    Ok((out_bf16, (out_features, in_features)))
+}
+
+/// CPU dequant for MLX MXFP8 (OCP). Mirrors [`dequant_mlx_8bit_to_buf`] but:
+///   - Each packed byte is OCP E4M3 instead of AFFINE uint8 + zp + scale.
+///   - Scales are raw u8 E8M0 bytes (NOT f16), one per group of 32.
+///   - No biases (MXFP8 is symmetric — E4M3 sign bit carries the sign).
+///
+/// Used for the `embed_tokens` weight (the only non-projection quantized
+/// tensor on Qwen3-Embedding) so candle's `embedding` row-lookup helper
+/// sees a plain bf16 matrix. All projection weights stay GPU-resident in
+/// the MXFP8 packed form via [`Mxfp8Linear`].
+fn dequant_mlx_mxfp8_to_buf(
+    w_raw: &[u8],
+    w_shape: &[usize],
+    s_raw: &[u8],
+    s_shape: &[usize],
+    group_size: usize,
+) -> Result<(Vec<half::bf16>, (usize, usize))> {
+    if w_shape.len() != 2 || s_shape.len() != 2 {
+        return Err(anyhow!(
+            "unexpected MLX mxfp8 shape: w={:?} s={:?}",
+            w_shape,
+            s_shape
+        ));
+    }
+    if group_size != 32 {
+        return Err(anyhow!("mxfp8 requires group_size=32 (got {group_size})"));
+    }
+    let out_features = w_shape[0];
+    let packs_per_row = w_shape[1];
+    let in_features = packs_per_row * 4;
+    if !in_features.is_multiple_of(group_size) {
+        return Err(anyhow!(
+            "in_features ({in_features}) not divisible by group_size ({group_size})"
+        ));
+    }
+    let groups_per_row = in_features / group_size;
+    if s_shape[0] != out_features || s_shape[1] != groups_per_row {
+        return Err(anyhow!(
+            "mxfp8 scales shape mismatch: got {:?}, expected ({}, {})",
+            s_shape,
+            out_features,
+            groups_per_row
+        ));
+    }
+
+    let mut out_bf16: Vec<half::bf16> = vec![half::bf16::ZERO; out_features * in_features];
+
+    out_bf16
+        .par_chunks_mut(in_features)
+        .enumerate()
+        .for_each(|(o, row_out)| {
+            let s_off = o * groups_per_row;
+            let w_off = o * packs_per_row;
+            for p in 0..packs_per_row {
+                let bi = (w_off + p) * 4;
+                let pack =
+                    u32::from_le_bytes([w_raw[bi], w_raw[bi + 1], w_raw[bi + 2], w_raw[bi + 3]]);
+                let base_i = p * 4;
+                for byte_idx in 0..4 {
+                    let i = base_i + byte_idx;
+                    let raw_byte = ((pack >> (8 * byte_idx)) & 0xFF) as u8;
+                    let g = i / group_size;
+                    let scale = e8m0_to_f32(s_raw[s_off + g]);
+                    let val = e4m3_to_f32(raw_byte) * scale;
+                    row_out[i] = half::bf16::from_f32(val);
                 }
             }
         });
@@ -1079,7 +1262,9 @@ mod tests {
             &[out_features, packs_per_row],
             &s_raw,
             &[out_features, groups_per_row],
+            safetensors::Dtype::F16,
             &b_raw,
+            safetensors::Dtype::F16,
             group_size,
         )
         .expect("dequant ok");
@@ -1107,7 +1292,17 @@ mod tests {
         let w_raw = [0u8; 4];
         let s_raw = [0u8; 2];
         let b_raw = [0u8; 2];
-        let err = dequant_mlx_4bit_to_buf(&w_raw, &[1, 1], &s_raw, &[1, 1], &b_raw, 10).unwrap_err();
+        let err = dequant_mlx_4bit_to_buf(
+            &w_raw,
+            &[1, 1],
+            &s_raw,
+            &[1, 1],
+            safetensors::Dtype::F16,
+            &b_raw,
+            safetensors::Dtype::F16,
+            10,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("not divisible by group_size"),
             "expected divisibility error, got: {err}"

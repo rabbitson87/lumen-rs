@@ -739,6 +739,13 @@ fn apply_env(
     if cfg.context.sliding > 0 {
         cmd.env("LUMEN_SLIDING_WINDOW", cfg.context.sliding.to_string());
     }
+    // Default `max_tokens` budget when the API client omits the field on
+    // /v1/chat/completions or /v1/completions. `0` is forwarded as "unbounded
+    // — generate until EOS / stop / context budget".
+    cmd.env(
+        "LUMEN_DEFAULT_MAX_TOKENS",
+        cfg.context.default_max_tokens.to_string(),
+    );
 
     // ── Advanced ───────────────────────────────────────────────────
     match cfg.advanced.backend_mode {
@@ -833,6 +840,7 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_MAX_CTX",
     "LUMEN_SLIDING_WINDOW",
     "LUMEN_PREFILL_CHUNK",
+    "LUMEN_DEFAULT_MAX_TOKENS",
     "LUMEN_WIRED_LIMIT_BYTES",
     "LUMEN_MLX_BACKEND",
     "LUMEN_SPEC",
