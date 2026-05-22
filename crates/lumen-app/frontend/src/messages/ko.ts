@@ -100,6 +100,11 @@ export const ko: Record<string, string> = {
   "quant.title": "QUANT",
   "quant.titleHint": "(TurboQuant KV 캐시)",
   "quant.master": "TurboQuant",
+  "quant.mode": "TurboQuant 모드",
+  "quant.mode.off": "끔",
+  "quant.mode.on": "켬",
+  "quant.mode.auto": "자동",
+  "quant.autoThreshold": "자동 임계값 (토큰)",
   "quant.qjl": "QJL 잔차 (Stage 2)",
   "quant.bits": "비트",
   "quant.on": "켜짐",
@@ -146,6 +151,10 @@ export const ko: Record<string, string> = {
   // ── QUANT 카드 툴팁 ─────────────────────────────────────────────
   "quant.tooltip.master":
     "KV 캐시 양자화의 마스터 스위치 (Lloyd-Max + Haar 회전, Stage 1). 켜면 정확도 손실이 적은 대신 KV 메모리를 약 4–8× 절감합니다. 끄면 KV가 bf16으로 유지됩니다 — 긴 컨텍스트에서 품질 문제가 보이는 경우에만 권장합니다.",
+  "quant.tooltip.mode":
+    "끔: KV를 절대 압축하지 않음 (짧은 prompt 디코드가 가장 빠름). 켬: 항상 압축 (긴 컨텍스트 메모리 절감 최대, 디코드 약 20–56% 느림). 자동: 이번 요청의 prompt 가 아래 임계값 이상일 때만 압축 — 짧은 대화는 빠르게, 긴 컨텍스트는 메모리 절감. 요청별 결정은 `[gemma4] tq_auto: ...` 로 로그에 기록됩니다.",
+  "quant.tooltip.autoThreshold":
+    "자동 모드가 TurboQuant 를 켜는 prompt 토큰 수. 기본 4096 — 이하에서는 bf16 슬라이딩 캐시가 충분히 작아서 풀 속도 디코드가 이득이고, 이상에서는 TQ 의 step 당 오버헤드가 KV 대역폭 절감으로 상쇄됩니다.",
   "quant.tooltip.qjl":
     "Stage 1 잔차에 대한 비편향 1비트 보정. (원본 − 복원)을 m차원 가우시안 공간에 투영하고 부호만 패킹합니다. 약간의 추가 비용(K/V 벡터당 m/8 바이트, Gemma 4 슬라이딩 윈도우 m=1024 기준 약 25 MB)으로 Top-5 약 2–3% / 코사인 +0.003을 회복합니다. Stage 1이 켜져 있어야 합니다.",
   "quant.tooltip.bits":

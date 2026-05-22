@@ -460,13 +460,13 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b wiring in runner_native.rs.
 pub(crate) use imp::{
-    MODE_AFFINE, MODE_MXFP4, dequantize_with_mode, gather_qmm_with_mode, quantize_with_mode,
-    quantized_matmul_with_mode,
+    MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, dequantize_with_mode, gather_qmm_with_mode,
+    quantize_with_mode, quantized_matmul_with_mode,
 };
 
 #[cfg(all(test, feature = "mlx-native"))]
 #[allow(unused_imports)]
-pub(crate) use imp::{MODE_MXFP8, MODE_NVFP4};
+pub(crate) use imp::MODE_NVFP4;
 
 // Single-tensor MXFP4 dequant parity tests against MLX's reference.
 //

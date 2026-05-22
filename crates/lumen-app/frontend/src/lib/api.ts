@@ -18,23 +18,30 @@ export interface ServerConfig {
   tokenizer_id: string | null;
   local_model_dir: string | null;
   skip_warmup: boolean;
-  candle_compute_per_buffer: number | null;
-  repeat_penalty: number | null;
 }
 
 export interface QuantConfig {
   /** TurboQuant Lloyd-Max bits (2/3/4). Drives both legacy `TQ_BITS` and
    *  Gemma 4 native `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS`. */
   bits: number;
-  /** QJL Stage-2 projection dimension. Theoretical crossover is `D·π/2`;
-   *  default `D·4 = 1024` for Gemma 4 (D=256). */
-  qjl_m: number;
-  seed: number;
-  /** Master switch for TurboQuant Stage 1 (Lloyd-Max + Haar rotation) on
-   *  the sliding KV cache. Default ON — measured safe at 11K context. */
+  /** Legacy master switch for TurboQuant Stage 1 (v5 and earlier). v6+
+   *  mirrors it from `turboquant_mode` so external tools still see a
+   *  meaningful boolean; UI controls only `turboquant_mode`. */
   turboquant_enabled: boolean;
-  /** QJL 1-bit residual correction layer (Stage 2). Requires Stage 1. */
+  /** QJL 1-bit residual correction layer (Stage 2). Only takes effect on
+   *  requests where the per-request TQ resolution is ON. */
   turboquant_qjl_enabled: boolean;
+  /** Three-way TurboQuant control (v6+).
+   *   - `off`  — never apply TQ; sliding cache stays bf16 (fastest short-
+   *              prompt decode, no memory savings).
+   *   - `on`   — always apply TQ (max KV memory savings, ~20-56% slower).
+   *   - `auto` — apply only when `prompt_tokens >= turboquant_auto_threshold_tokens`.
+   *              Default. Short chats get bf16 decode speed; long context
+   *              gets the memory savings. */
+  turboquant_mode: "off" | "on" | "auto";
+  /** Prompt-length threshold (tokens) at which `auto` mode flips TQ ON.
+   *  Default 4096. Ignored unless mode = auto. */
+  turboquant_auto_threshold_tokens: number;
 }
 
 export interface ContextConfig {

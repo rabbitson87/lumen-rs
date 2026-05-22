@@ -25,8 +25,8 @@ pub(crate) mod imp {
     };
     use crate::native_norm::rms_norm;
     use crate::native_quant::{
-        MODE_AFFINE, dequantize_with_mode, gather_qmm_with_mode, quantize_with_mode,
-        quantized_matmul_with_mode,
+        MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, dequantize_with_mode, gather_qmm_with_mode,
+        quantize_with_mode, quantized_matmul_with_mode,
     };
     use crate::native_rope::{rope, rope_with_freqs};
     use mlx_rs::error::Exception;
@@ -1357,6 +1357,13 @@ pub(crate) mod imp {
     pub struct NativeGemma4QuantizationOverride {
         pub group_size: usize,
         pub bits: usize,
+        /// Optional per-tensor mode override. When absent the override
+        /// inherits MODE_AFFINE (Qwen3.6 reference convention: overrides
+        /// encode AFFINE exceptions inside an otherwise non-AFFINE model,
+        /// e.g. 8-bit AFFINE gate layers inside an MXFP4 model). When
+        /// present, must be one of `"affine" | "mxfp4"`.
+        #[serde(default)]
+        pub mode: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1474,9 +1481,9 @@ pub(crate) mod imp {
             }
             self.text_config.validate()?;
             if let Some(quant) = self.effective_quantization() {
-                if quant.mode != "affine" || quant.group_size == 0 {
+                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8") || quant.group_size == 0 {
                     return Err(anyhow!(
-                        "quantization must default to affine/non-zero group, got mode='{}' bits={} group={}",
+                        "quantization default must be mode∈{{affine, mxfp4, mxfp8}} with non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
                         quant.bits,
                         quant.group_size
@@ -1494,12 +1501,22 @@ pub(crate) mod imp {
                 // the default bit-width or pick different mixed recipes.
                 // Per-key dispatch via `quant_params_for` handles whatever
                 // overrides the config actually contains.)
-                // All overrides must specify the same group_size as the default
-                // (so dequantize calls can share the group_size param).
+                // Override `group_size` is only required to match the default
+                // when the override's mode matches the default mode — when
+                // modes differ (e.g. MXFP4 g=32 default with AFFINE g=64 embed
+                // override), per-tensor dispatch through `quant_params_for`
+                // routes each tensor to a kernel that consumes its own
+                // `(group_size, bits, mode)` triple, so cross-mode group_size
+                // mismatches are safe. This mirrors Qwen3.5's loader which has
+                // no mixed-group-size check at all and ships in production
+                // (Qwen3.6 MXFP4 g=32 default + AFFINE g=64 gate overrides).
+                let top_mode = quant.mode.as_str();
                 for (k, ov) in &quant.overrides {
-                    if ov.group_size != quant.group_size {
+                    let ov_mode = ov.mode.as_deref().unwrap_or("affine");
+                    let modes_match = ov_mode == top_mode;
+                    if modes_match && ov.group_size != quant.group_size {
                         return Err(anyhow!(
-                            "override '{k}' has group_size={} but default is {} — mixed group_size not supported yet",
+                            "override '{k}' has group_size={} but default is {} (same mode={top_mode}) — mixed group_size within one mode not supported",
                             ov.group_size,
                             quant.group_size
                         ));
@@ -1989,10 +2006,87 @@ pub(crate) mod imp {
     /// fixed N(0,1) codebook + per-vector σ). V uses Lloyd-Max without rotation.
     /// Mutually exclusive with `LUMEN_GEMMA4_QUANT_KV_SLIDING` (TurboQuant
     /// takes precedence when both set).
+    ///
+    /// Legacy entry point — reads only the static env var (no per-request
+    /// adaptive decision). New code should consult [`Gemma4TqMode`] /
+    /// [`resolve_tq_for_request`] instead and pass the resolved boolean into
+    /// the cache constructor explicitly.
     fn gemma4_quant_kv_sliding_turboquant_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT")
+        // For backward compatibility with code paths that don't know the
+        // per-request prompt length yet (e.g. `tq_bake_r_enabled` reads at
+        // model-load time): treat MODE=on as ON, MODE=auto as ON (so V/Wo
+        // bake is still applied — that's harmless when TQ is OFF at runtime
+        // because R@R^T = I cancels), and MODE=off as OFF. Legacy env var
+        // continues to work.
+        match gemma4_tq_mode() {
+            Gemma4TqMode::Off => false,
+            Gemma4TqMode::On | Gemma4TqMode::Auto => true,
+        }
+    }
+
+    /// Three-way TurboQuant mode controlled by `LUMEN_GEMMA4_TQ_MODE`.
+    ///
+    /// * `Off` — never apply TurboQuant; sliding cache stays in bf16.
+    /// * `On` — always apply TurboQuant on the sliding cache.
+    /// * `Auto` — apply TurboQuant only when the request's `prompt_tokens`
+    ///   meets or exceeds `LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS` (default 4096).
+    ///   Below the threshold, the sliding cache stays in bf16 (full decode
+    ///   speed). Above, TQ kicks in to bound memory at long context.
+    ///
+    /// Backward compatibility: when `LUMEN_GEMMA4_TQ_MODE` is unset, falls
+    /// back to the legacy `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=0/1`
+    /// gate so existing deployments keep working unchanged.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Gemma4TqMode {
+        Off,
+        On,
+        Auto,
+    }
+
+    pub fn gemma4_tq_mode() -> Gemma4TqMode {
+        if let Ok(s) = std::env::var("LUMEN_GEMMA4_TQ_MODE") {
+            return match s.trim().to_ascii_lowercase().as_str() {
+                "off" | "0" | "false" | "no" => Gemma4TqMode::Off,
+                "on" | "1" | "true" | "yes" => Gemma4TqMode::On,
+                "auto" => Gemma4TqMode::Auto,
+                other => {
+                    eprintln!(
+                        "[gemma4] WARN unknown LUMEN_GEMMA4_TQ_MODE={other:?}, defaulting to off"
+                    );
+                    Gemma4TqMode::Off
+                }
+            };
+        }
+        // Legacy env var fallback (kept for backward compat).
+        if std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT")
             .map(|v| v == "1")
             .unwrap_or(false)
+        {
+            Gemma4TqMode::On
+        } else {
+            Gemma4TqMode::Off
+        }
+    }
+
+    /// Auto-mode prompt-length threshold (in tokens) at which TQ kicks in.
+    /// `LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS`, default 4096.
+    pub fn gemma4_tq_auto_threshold() -> usize {
+        std::env::var("LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096usize)
+            .max(1)
+    }
+
+    /// Per-request resolution of TQ on/off based on the mode + prompt length.
+    /// Returns `true` iff this request should build a `SlidingTurboquant`
+    /// cache for its sliding-attention layers.
+    pub fn resolve_tq_for_request(prompt_tokens: usize) -> bool {
+        match gemma4_tq_mode() {
+            Gemma4TqMode::Off => false,
+            Gemma4TqMode::On => true,
+            Gemma4TqMode::Auto => prompt_tokens >= gemma4_tq_auto_threshold(),
+        }
     }
 
     /// QJL Stage-2 (1-bit residual correction) on top of the TurboQuant
@@ -2043,14 +2137,42 @@ pub(crate) mod imp {
         /// 26B-A4B sets `num_kv_shared_layers=0`, so every layer gets its own
         /// cache. Variants with shared KVs (2B/4B) would skip the trailing
         /// `num_kv_shared_layers` slots — deferred until we extend support.
+        /// Allocate caches reading TurboQuant on/off from the static env var
+        /// only (no per-request adaptive). Equivalent to
+        /// `for_config_with_tq(cfg, None)`. Kept as the legacy entry for
+        /// callers that don't yet know the prompt length.
         pub fn for_config(cfg: &NativeGemma4TextConfig) -> Self {
+            Self::for_config_with_tq(cfg, None)
+        }
+
+        /// Allocate caches with an explicit TurboQuant on/off decision for
+        /// the sliding layers. `force_tq=Some(true|false)` overrides the
+        /// env-driven gate; `None` falls back to the env (legacy behaviour).
+        ///
+        /// Per-request adaptive callers (see [`resolve_tq_for_request`])
+        /// should always pass `Some(_)` so the decision reflects this
+        /// request's prompt length, not whatever the server's global env
+        /// var said at launch.
+        pub fn for_config_with_tq(
+            cfg: &NativeGemma4TextConfig,
+            force_tq: Option<bool>,
+        ) -> Self {
             assert_eq!(
                 cfg.num_kv_shared_layers, 0,
                 "NativeGemma4PromptCache: num_kv_shared_layers > 0 not yet supported (26B-A4B uses 0)"
             );
             let quant_kv = gemma4_quant_kv_enabled();
             let quant_kv_sliding = gemma4_quant_kv_sliding_enabled();
-            let quant_kv_sliding_tq = gemma4_quant_kv_sliding_turboquant_enabled();
+            // TQ decision: caller's explicit override wins. Otherwise read
+            // legacy env (treating Auto without prompt info as Off — conservative).
+            let quant_kv_sliding_tq = force_tq.unwrap_or_else(|| {
+                match gemma4_tq_mode() {
+                    Gemma4TqMode::Off => false,
+                    Gemma4TqMode::On => true,
+                    // Auto without prompt-length info → default OFF (fast path).
+                    Gemma4TqMode::Auto => false,
+                }
+            });
             let layers: Vec<NativeGemma4LayerCache> = cfg
                 .layer_types
                 .iter()
@@ -2396,7 +2518,9 @@ pub(crate) mod imp {
     /// Overrides are looked up in the parsed `quantization` block by the
     /// **un-suffixed** base path; `.weight`/`.scales`/`.biases` are stripped
     /// here. Falls back to the block default when no override matches.
-    /// Mode is always `"affine"` for Gemma 4 (mlx-lm uses affine quant).
+    /// Mirrors Qwen3.5's convention: per-tensor overrides are always MODE_AFFINE
+    /// (typically used to keep a high-precision tensor inside an MXFP4 model),
+    /// while the block default dispatches on `quant.mode` ("affine" | "mxfp4").
     pub fn quant_params_for(
         cfg: &NativeGemma4Config,
         base: &str,
@@ -2408,19 +2532,85 @@ pub(crate) mod imp {
             .trim_end_matches(".weight")
             .trim_end_matches(".scales")
             .trim_end_matches(".biases");
-        let (group_size, bits) = match quant.overrides.get(base_key) {
-            Some(ov) => (ov.group_size, ov.bits),
-            None => (quant.group_size, quant.bits),
-        };
-        // mlx supports 2/3/4/5/6/8-bit affine quantization. We accept all but
-        // gate fused MLP kernels behind bits==4 (see expert path) — non-4-bit
-        // weights fall back to the generic gather_qmm path automatically.
-        if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
-            return Err(anyhow!(
-                "quant_params_for({base_key}): unsupported bits={bits} (mlx supports 2/3/4/5/6/8)"
-            ));
+        if let Some(ov) = quant.overrides.get(base_key) {
+            // Override mode defaults to AFFINE when absent (Qwen3.6
+            // convention). When the override carries an explicit mode,
+            // dispatch on it the same way as the top-level default.
+            let ov_mode = ov.mode.as_deref().unwrap_or("affine");
+            match ov_mode {
+                "affine" => {
+                    if !matches!(ov.bits, 2 | 3 | 4 | 5 | 6 | 8) {
+                        return Err(anyhow!(
+                            "quant_params_for({base_key}): affine override bits={} unsupported (mlx supports 2/3/4/5/6/8)",
+                            ov.bits
+                        ));
+                    }
+                    return Ok((ov.group_size as i32, ov.bits as i32, MODE_AFFINE));
+                }
+                "mxfp4" => {
+                    if ov.bits != 4 || ov.group_size != 32 {
+                        return Err(anyhow!(
+                            "quant_params_for({base_key}): mxfp4 override requires bits=4 group_size=32, got bits={} group={}",
+                            ov.bits,
+                            ov.group_size
+                        ));
+                    }
+                    return Ok((ov.group_size as i32, ov.bits as i32, MODE_MXFP4));
+                }
+                "mxfp8" => {
+                    if ov.bits != 8 || ov.group_size != 32 {
+                        return Err(anyhow!(
+                            "quant_params_for({base_key}): mxfp8 override requires bits=8 group_size=32, got bits={} group={}",
+                            ov.bits,
+                            ov.group_size
+                        ));
+                    }
+                    return Ok((ov.group_size as i32, ov.bits as i32, MODE_MXFP8));
+                }
+                other => {
+                    return Err(anyhow!(
+                        "quant_params_for({base_key}): override has unsupported mode {other:?} (supported: affine, mxfp4, mxfp8)"
+                    ));
+                }
+            }
         }
-        Ok((group_size as i32, bits as i32, MODE_AFFINE))
+        let mode_cstr = match quant.mode.as_str() {
+            "affine" => {
+                if !matches!(quant.bits, 2 | 3 | 4 | 5 | 6 | 8) {
+                    return Err(anyhow!(
+                        "quant_params_for({base_key}): affine bits={} unsupported (mlx supports 2/3/4/5/6/8)",
+                        quant.bits
+                    ));
+                }
+                MODE_AFFINE
+            }
+            "mxfp4" => {
+                if quant.bits != 4 || quant.group_size != 32 {
+                    return Err(anyhow!(
+                        "quant_params_for({base_key}): mxfp4 requires bits=4 group_size=32, got bits={} group={}",
+                        quant.bits,
+                        quant.group_size
+                    ));
+                }
+                MODE_MXFP4
+            }
+            "mxfp8" => {
+                if quant.bits != 8 || quant.group_size != 32 {
+                    return Err(anyhow!(
+                        "quant_params_for({base_key}): mxfp8 requires bits=8 group_size=32, got bits={} group={}",
+                        quant.bits,
+                        quant.group_size
+                    ));
+                }
+                MODE_MXFP8
+            }
+            other => {
+                return Err(anyhow!(
+                    "quant_params_for({base_key}): unsupported quantization mode {other:?} (supported: affine, mxfp4, mxfp8)"
+                ));
+            }
+        };
+        Ok((quant.group_size as i32, quant.bits as i32, mode_cstr))
     }
 
     // ───────────────────────── resolved per-layer weights ─────────────────────────
@@ -2862,9 +3052,13 @@ pub(crate) mod imp {
     /// Default ON when TQ is on (the bake fixes a known V rotation perf
     /// cost; opt-out via `LUMEN_GEMMA4_TQ_BAKE_R=0`).
     fn tq_bake_r_enabled() -> bool {
-        let tq_on = std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT")
-            .map(|s| s == "1")
-            .unwrap_or(false);
+        // Read through the new mode helper so MODE=on AND MODE=auto both
+        // trigger the bake. For Auto, bake is a no-op when the runtime TQ
+        // path is OFF for a given request (R @ Rᵀ = I cancels the bake in
+        // the non-TQ matmul) — so always baking when TQ may fire is
+        // strictly better than gating bake on a per-request decision the
+        // load-time code can't see.
+        let tq_on = !matches!(gemma4_tq_mode(), Gemma4TqMode::Off);
         if !tq_on {
             return false;
         }
@@ -3552,6 +3746,20 @@ pub(crate) mod imp {
 
         pub fn make_cache(&self) -> NativeGemma4PromptCache {
             NativeGemma4PromptCache::for_config(&self.config.text_config)
+        }
+
+        /// Allocate a fresh cache with an explicit TurboQuant on/off
+        /// decision. Used by `generate_with_cache` when adaptive TQ
+        /// (`LUMEN_GEMMA4_TQ_MODE=auto`) needs to react to this request's
+        /// prompt length. `None` defers to the env (legacy behaviour).
+        pub fn make_cache_with_tq(
+            &self,
+            force_tq: Option<bool>,
+        ) -> NativeGemma4PromptCache {
+            NativeGemma4PromptCache::for_config_with_tq(
+                &self.config.text_config,
+                force_tq,
+            )
         }
 
         pub fn eos_tokens(&self) -> &[u32] {
@@ -5734,7 +5942,21 @@ pub(crate) mod imp {
             let cache_ref: &mut NativeGemma4PromptCache = match cache_in {
                 Some(c) => c,
                 None => {
-                    owned_cache = self.make_cache();
+                    // Per-request adaptive TQ: when MODE=auto, the threshold
+                    // is compared against this prompt's length. MODE=on/off
+                    // bypass the threshold. Caller-supplied caches keep
+                    // whatever TQ choice they were built with (we don't
+                    // override mid-flight).
+                    let force_tq = resolve_tq_for_request(prompt_ids.len());
+                    if gemma4_tq_mode() == Gemma4TqMode::Auto {
+                        eprintln!(
+                            "[gemma4] tq_auto: prompt_tokens={} threshold={} → tq={}",
+                            prompt_ids.len(),
+                            gemma4_tq_auto_threshold(),
+                            if force_tq { "ON" } else { "OFF" }
+                        );
+                    }
+                    owned_cache = self.make_cache_with_tq(Some(force_tq));
                     &mut owned_cache
                 }
             };
@@ -6392,6 +6614,115 @@ pub(crate) mod imp {
                 quant
                     .overrides
                     .contains_key("language_model.model.layers.0.mlp.gate_proj")
+            );
+        }
+
+        /// MXFP4 ship-recipe config (group_size=32, bits=4, mode="mxfp4")
+        /// validates clean, and `quant_params_for` dispatches MODE_MXFP4 for
+        /// default tensors while a per-tensor AFFINE override (e.g. embed_tokens
+        /// kept at higher precision inside an MXFP4 model — mirrors Qwen3.6's
+        /// gate-layers-at-8-bit pattern) dispatches MODE_AFFINE.
+        #[test]
+        fn quant_params_for_dispatches_mxfp4_with_affine_override() {
+            let json = minimal_config_json(
+                r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
+                true,
+            )
+            .replace(
+                r#","quantization":{"group_size":64,"bits":4,"mode":"affine","language_model.model.layers.0.mlp.gate_proj":{"group_size":64,"bits":8}}"#,
+                r#","quantization":{"group_size":32,"bits":4,"mode":"mxfp4","language_model.model.embed_tokens":{"group_size":32,"bits":8}}"#,
+            );
+            let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
+            cfg.validate_gemma4_family().expect("mxfp4 validate");
+            let quant = cfg.effective_quantization().expect("quant present");
+            assert_eq!(quant.mode, "mxfp4");
+            assert_eq!(quant.group_size, 32);
+            // Default tensor → MXFP4 dispatch.
+            let (gs, bits, mode) =
+                quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
+                    .expect("default dispatch");
+            assert_eq!(gs, 32);
+            assert_eq!(bits, 4);
+            assert_eq!(mode, MODE_MXFP4);
+            // Override path → AFFINE dispatch at override's bit-width.
+            let (gs, bits, mode) =
+                quant_params_for(&cfg, "language_model.model.embed_tokens.weight")
+                    .expect("override dispatch");
+            assert_eq!(gs, 32);
+            assert_eq!(bits, 8);
+            assert_eq!(mode, MODE_AFFINE);
+        }
+
+        /// Mode strings outside the supported set must be rejected at validation
+        /// time, with the offending mode echoed in the error message so
+        /// `mlx_lm.convert`'s `--q-mode nvfp4` / `mxfp8` builds fail fast at
+        /// load rather than producing silent garbage during decode.
+        #[test]
+        fn rejects_unsupported_quant_mode() {
+            let json = minimal_config_json(
+                r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
+                true,
+            )
+            .replace(r#""mode":"affine""#, r#""mode":"nvfp4""#);
+            let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
+            let err = cfg.validate_gemma4_family().unwrap_err().to_string();
+            assert!(err.contains("nvfp4"), "error should echo bad mode: {err}");
+        }
+
+        /// Overrides with an explicit `"mode": "mxfp4"` dispatch MODE_MXFP4
+        /// instead of the default MODE_AFFINE. This matters when mlx-lm.convert
+        /// emits per-tensor overrides during build (some quantize_model code
+        /// paths inline the predicate's dict into the config). The post-build
+        /// strip script removes redundant mode-matching overrides, but the
+        /// loader must still handle the explicit-mode case for forward-compat
+        /// with future mixed-mode configs (e.g. MXFP4 default + mxfp4-with-
+        /// different-group-size override, or future MXFP8 in either slot).
+        #[test]
+        fn quant_params_for_honors_mxfp4_override_mode() {
+            let json = minimal_config_json(
+                r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
+                true,
+            )
+            .replace(
+                r#","quantization":{"group_size":64,"bits":4,"mode":"affine","language_model.model.layers.0.mlp.gate_proj":{"group_size":64,"bits":8}}"#,
+                r#","quantization":{"group_size":64,"bits":4,"mode":"affine","language_model.model.layers.0.mlp.gate_proj":{"group_size":32,"bits":4,"mode":"mxfp4"}}"#,
+            );
+            let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
+            cfg.validate_gemma4_family().expect(
+                "cross-mode group_size mismatch is allowed (each tensor dispatches with its own params)",
+            );
+            // Cross-mode mismatch is OK because per-tensor dispatch routes each
+            // tensor to a kernel that consumes its own (group_size, bits, mode).
+            let (gs, bits, mode) =
+                quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
+                    .expect("override dispatch");
+            assert_eq!(gs, 32);
+            assert_eq!(bits, 4);
+            assert_eq!(mode, MODE_MXFP4);
+        }
+
+        /// MXFP4 has fixed format requirements (bits=4, group_size=32). Configs
+        /// that pass validation but slip past with non-MXFP4-shaped weights are
+        /// caught at the `quant_params_for` dispatch site.
+        #[test]
+        fn mxfp4_rejects_wrong_group_size_at_dispatch() {
+            let json = minimal_config_json(
+                r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
+                true,
+            )
+            .replace(
+                r#","quantization":{"group_size":64,"bits":4,"mode":"affine","language_model.model.layers.0.mlp.gate_proj":{"group_size":64,"bits":8}}"#,
+                r#","quantization":{"group_size":64,"bits":4,"mode":"mxfp4"}"#,
+            );
+            let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
+            cfg.validate_gemma4_family().expect("validate (group check is at dispatch)");
+            let err =
+                quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("mxfp4") && err.contains("group_size=32"),
+                "error should explain mxfp4 shape: {err}"
             );
         }
 

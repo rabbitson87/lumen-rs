@@ -105,6 +105,11 @@ export const en: Record<string, string> = {
   "quant.title": "QUANT",
   "quant.titleHint": "(TurboQuant KV cache)",
   "quant.master": "TurboQuant",
+  "quant.mode": "TurboQuant mode",
+  "quant.mode.off": "Off",
+  "quant.mode.on": "On",
+  "quant.mode.auto": "Auto",
+  "quant.autoThreshold": "Auto threshold (tokens)",
   "quant.qjl": "QJL residual (Stage 2)",
   "quant.bits": "Bits",
   "quant.on": "ON",
@@ -152,6 +157,10 @@ export const en: Record<string, string> = {
   // ── QUANT card tooltips ─────────────────────────────────────────
   "quant.tooltip.master":
     "Master switch for KV-cache quantization (Lloyd-Max + Haar rotation, Stage 1). ON saves ~4–8× KV memory at small accuracy cost. OFF keeps KV in bf16 — recommended only if you see quality issues at long context.",
+  "quant.tooltip.mode":
+    "Off: never compress KV (fastest short-prompt decode). On: always compress (max long-context memory savings, ~20–56% slower decode). Auto: compress only when this request's prompt is at or above the threshold below — short chats stay fast, long context still saves memory. Per-request decision logged as `[gemma4] tq_auto: ...`.",
+  "quant.tooltip.autoThreshold":
+    "Prompt-token count at which Auto mode flips TurboQuant ON for the request. Default 4096 — below this, the bf16 sliding cache fits comfortably and full-speed decode wins; above it, TQ's per-step overhead is amortised by the KV bandwidth savings.",
   "quant.tooltip.qjl":
     "Stage-2 unbiased 1-bit correction for the Stage-1 residual: projects (original − reconstructed) into m-dim Gaussian space and packs only the sign. Recovers ~2–3% Top-5 / +0.003 cosine at small extra cost (~m/8 bytes per K/V vector; ~25 MB for Gemma 4 sliding window at m=1024). Requires Stage 1 ON.",
   "quant.tooltip.bits":

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::config::{BackendMode, CorsMode, PersistentConfig, SpecKind};
+use crate::config::{BackendMode, CorsMode, PersistentConfig, SpecKind, TurboquantMode};
 
 /// Tauri event name for streaming server log lines.
 pub const EVENT_LOG: &str = "lumen://log";
@@ -674,36 +674,54 @@ fn apply_env(
     if cfg.server.skip_warmup {
         cmd.env("SKIP_WARMUP", "1");
     }
-    if let Some(n) = cfg.server.candle_compute_per_buffer {
-        cmd.env("CANDLE_METAL_COMPUTE_PER_BUFFER", n.to_string());
-    }
-
-    // ── Generation defaults ────────────────────────────────────────
-    if let Some(rp) = cfg.server.repeat_penalty {
-        cmd.env("REPEAT_PENALTY", format!("{rp}"));
-    }
 
     // ── Quantization (TurboQuant) ──────────────────────────────────
+    // QJL Stage-2 projection dimension is fixed to D·4 = 1024 (Gemma 4
+    // head_dim=256) — the regime where QJL reliably beats Stage 1 alone.
+    // RNG seed is fixed to 42 — different seeds are statistically
+    // equivalent for the rotation matrix. Both used to be configurable
+    // via the DEBUG tab but were benchmark-only knobs; the env vars stay
+    // settable via the Env Overrides tab for ablation runs.
+    const TQ_QJL_M: &str = "1024";
+    const TQ_SEED: &str = "42";
     // Legacy turboquant-cache crate path (Candle backends, MoE 1.5B etc.):
     cmd.env("TQ_BITS", cfg.quant.bits.to_string());
-    cmd.env("TQ_QJL_M", cfg.quant.qjl_m.to_string());
-    cmd.env("TQ_SEED", cfg.quant.seed.to_string());
+    cmd.env("TQ_QJL_M", TQ_QJL_M);
+    cmd.env("TQ_SEED", TQ_SEED);
     // Gemma 4 native MLX runner reads its own env namespace — the same
     // QUANT card slider drives both backends so users see one mental model.
-    // Stage 1 (Lloyd-Max + Haar rotation on the sliding KV cache):
-    if cfg.quant.turboquant_enabled {
+    //
+    // TQ mode is the v6+ source of truth (Off/On/Auto). We also write the
+    // legacy `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=0/1` flag so any
+    // tooling or pre-v6 server build still sees a sensible value.
+    let tq_mode_str = match cfg.quant.turboquant_mode {
+        TurboquantMode::Off => "off",
+        TurboquantMode::On => "on",
+        TurboquantMode::Auto => "auto",
+    };
+    cmd.env("LUMEN_GEMMA4_TQ_MODE", tq_mode_str);
+    if matches!(cfg.quant.turboquant_mode, TurboquantMode::Auto) {
+        cmd.env(
+            "LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS",
+            cfg.quant.turboquant_auto_threshold_tokens.to_string(),
+        );
+    }
+    // Legacy shim — On + Auto both surface as "1" so the bake-R load-time
+    // gate triggers (Auto mode reuses bake harmlessly when runtime TQ is
+    // OFF, because R · Rᵀ = I cancels the bake in the non-TQ matmul).
+    let tq_on_for_bake = !matches!(cfg.quant.turboquant_mode, TurboquantMode::Off);
+    if tq_on_for_bake {
         cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT", "1");
         cmd.env(
             "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
             cfg.quant.bits.to_string(),
         );
-        // Stage 2 (QJL 1-bit residual correction over Stage 1):
+        // Stage 2 (QJL 1-bit residual correction over Stage 1). Only takes
+        // effect on requests where the per-request TQ resolution turns out
+        // ON; the env flag here is the static gate read at cache build.
         if cfg.quant.turboquant_qjl_enabled {
             cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL", "1");
-            cmd.env(
-                "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M",
-                cfg.quant.qjl_m.to_string(),
-            );
+            cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M", TQ_QJL_M);
         }
     }
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -72,13 +72,6 @@ pub struct ServerConfig {
     /// → `SKIP_WARMUP=1`
     #[serde(default)]
     pub skip_warmup: bool,
-    /// → `CANDLE_METAL_COMPUTE_PER_BUFFER` (default 10 — empirically +7% tok/s
-    /// on M-series for Qwen3.6-27B Dense).
-    pub candle_compute_per_buffer: Option<u32>,
-
-    // ── Generation defaults ─────────────────────────────────────────
-    /// → `REPEAT_PENALTY` (default 1.0).
-    pub repeat_penalty: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,17 +90,15 @@ pub struct QuantConfig {
     /// `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS` (Gemma 4 native
     /// runner) so the same slider drives both backends.
     pub bits: u8,
-    /// QJL Stage-2 projection dimension.  `D · π/2` is the theoretical
-    /// crossover; default `D · 4 = 1024` for Gemma 4 (D=256) sits well
-    /// into the regime where QJL beats Stage 1 alone.  Emits `TQ_QJL_M`
-    /// + `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M`.
-    pub qjl_m: usize,
-    pub seed: u64,
     /// Turn TurboQuant Stage 1 (Lloyd-Max + rotation) on for the sliding
     /// KV cache.  Default ON — measured safe across the same 11K Korean
     /// context that the model rebuild was validated against, and the
     /// KV cache memory delta vs bf16 is the primary win at long context.
-    /// Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT`.
+    /// Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT` (legacy gate).
+    ///
+    /// Superseded by `turboquant_mode` in schema v6 — kept on the struct so
+    /// downgrades / external tools that read this field still see a value
+    /// matching the current mode (mirrored in `apply_env`).
     #[serde(default = "default_turboquant_enabled")]
     pub turboquant_enabled: bool,
     /// Add the QJL 1-bit residual correction layer on top of Stage 1.
@@ -116,6 +107,38 @@ pub struct QuantConfig {
     /// centroid.  Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL`.
     #[serde(default = "default_turboquant_qjl_enabled")]
     pub turboquant_qjl_enabled: bool,
+
+    /// Three-way TurboQuant control (v6+). `Auto` enables TQ only when a
+    /// request's `prompt_tokens` ≥ `turboquant_auto_threshold_tokens`,
+    /// giving full-bf16 decode speed for short chats while keeping the
+    /// long-context memory savings.  Emits `LUMEN_GEMMA4_TQ_MODE`.
+    #[serde(default = "default_turboquant_mode")]
+    pub turboquant_mode: TurboquantMode,
+
+    /// Prompt-length threshold (in tokens) at which `TurboquantMode::Auto`
+    /// switches TQ ON for a request. Default 4096 (empirically the regime
+    /// where TQ's per-step overhead is amortised by KV bandwidth savings).
+    /// Ignored unless `turboquant_mode = Auto`.
+    /// Emits `LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS`.
+    #[serde(default = "default_turboquant_auto_threshold_tokens")]
+    pub turboquant_auto_threshold_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TurboquantMode {
+    /// Never apply TurboQuant on the sliding KV cache. Best for short-
+    /// prompt conversational workloads (full-bf16 decode is ~20-56%
+    /// faster than TQ ON; no memory savings).
+    Off,
+    /// Always apply TurboQuant on the sliding KV cache. Saves KV memory
+    /// at long context at the cost of per-step compute on every request.
+    On,
+    /// Apply TurboQuant only when a request's `prompt_tokens` meets or
+    /// exceeds `turboquant_auto_threshold_tokens`. Default — gives short
+    /// chats their full decode speed and only pays TQ overhead when the
+    /// memory savings matter.
+    Auto,
 }
 
 fn default_turboquant_enabled() -> bool {
@@ -124,6 +147,14 @@ fn default_turboquant_enabled() -> bool {
 
 fn default_turboquant_qjl_enabled() -> bool {
     true
+}
+
+fn default_turboquant_mode() -> TurboquantMode {
+    TurboquantMode::Auto
+}
+
+fn default_turboquant_auto_threshold_tokens() -> u32 {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,15 +241,13 @@ impl Default for PersistentConfig {
                 tokenizer_id: None,
                 local_model_dir: None,
                 skip_warmup: false,
-                candle_compute_per_buffer: None,
-                repeat_penalty: None,
             },
             quant: QuantConfig {
                 bits: 3,
-                qjl_m: 1024, // D·4 for Gemma 4 head_dim=256 — Stage 2 regime
-                seed: 42,
                 turboquant_enabled: true,
                 turboquant_qjl_enabled: true,
+                turboquant_mode: TurboquantMode::Auto,
+                turboquant_auto_threshold_tokens: 4096,
             },
             context: ContextConfig {
                 // Bumped 10× over the initial 8192 / 4096 defaults at
@@ -351,6 +380,36 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
             cfg.context.prefill = 40960;
         }
         cfg.schema_version = 4;
+    }
+    // v4 -> v5: dropped four debug-tab knobs that were either dead-path
+    // (`candle_compute_per_buffer` — Candle backend, replaced by mlx-native
+    // default) or misplaced (`repeat_penalty` is a per-request generation
+    // param, not a debug switch), plus the TurboQuant `qjl_m` / `seed`
+    // ablation knobs that belonged in benchmarks rather than UI. Existing
+    // serialized values are silently dropped by serde on parse; this step
+    // exists purely to stamp the version.
+    if cfg.schema_version < 5 {
+        cfg.schema_version = 5;
+    }
+    // v5 -> v6: introduced `quant.turboquant_mode` (Off / On / Auto) and
+    // `quant.turboquant_auto_threshold_tokens`. Existing configs are
+    // mapped so behaviour is preserved unless the user opts in to Auto:
+    //   - `turboquant_enabled = true`  → `Mode::On` (legacy behaviour)
+    //   - `turboquant_enabled = false` → `Mode::Off`
+    // serde already filled `turboquant_mode` with the v6 default (Auto)
+    // because the deserializer ran first. We overwrite it here to honour
+    // the user's existing v5 choice — Auto is opt-in via UI/env once they
+    // know what it means.
+    if cfg.schema_version < 6 {
+        cfg.quant.turboquant_mode = if cfg.quant.turboquant_enabled {
+            TurboquantMode::On
+        } else {
+            TurboquantMode::Off
+        };
+        if cfg.quant.turboquant_auto_threshold_tokens == 0 {
+            cfg.quant.turboquant_auto_threshold_tokens = 4096;
+        }
+        cfg.schema_version = 6;
     }
     // Future migrations append here.
 }

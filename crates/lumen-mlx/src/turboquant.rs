@@ -243,6 +243,15 @@ pub fn rotation_matrix_f32(dim: usize, seed: u64) -> Result<Array> {
 /// Apply rotation: `x @ R`. Last axis of `x` must equal `R.shape[0]`.
 /// Casts `x` (bf16) → f32 for the matmul to preserve orthogonality precision,
 /// then back to bf16 for downstream consumers (cache + SDPA).
+///
+/// NEGATIVE (2026-05-22): tried removing the bf16→f32 input cast and
+/// passing bf16 directly into `matmul(bf16, f32)` — MLX accepts mixed
+/// dtype and the output is bit-identical, but the decode-step wall time
+/// REGRESSED ~7-16% with variance jumping 14×. Hypothesis: Apple MPS /
+/// Metal GEMM has fast kernels for matching-dtype inputs (f32×f32 here);
+/// mixed-dtype falls back to a slower generic path. The explicit cast is
+/// the "setup for fast kernel" pattern, NOT a redundant dispatch. Keep
+/// the cast; do not retry without a fused custom Metal kernel.
 #[cfg(feature = "mlx-native")]
 pub fn rotate_last_axis(x: &Array, rotation_f32: &Array) -> Result<Array> {
     let x_f32 = x
@@ -486,6 +495,27 @@ pub fn qjl_correction_scale(m: usize) -> f32 {
     (std::f32::consts::FRAC_PI_2.sqrt()) / (m as f32).sqrt()
 }
 
+#[cfg(feature = "mlx-native")]
+static QJL_SCALE_F32_CACHE: OnceLock<Mutex<HashMap<usize, Array>>> = OnceLock::new();
+
+/// Cached 0-D f32 `Array` holding `qjl_correction_scale(m)`. Avoids the
+/// per-decode-step `Array::from_f32(scale)` FFI allocation inside
+/// `qjl_apply_correction_to_k_dq` (called per layer per step under QJL ON).
+/// Keyed by `m`; in production there is exactly one entry per process.
+#[cfg(feature = "mlx-native")]
+fn qjl_correction_scale_array_f32(m: usize) -> Result<Array> {
+    let cache = QJL_SCALE_F32_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|e| anyhow!("turboquant: qjl scale cache mutex poisoned: {e}"))?;
+    if let Some(arr) = guard.get(&m) {
+        return Ok(arr.clone());
+    }
+    let arr = Array::from_f32(qjl_correction_scale(m));
+    guard.insert(m, arr.clone());
+    Ok(arr)
+}
+
 /// QJL Stage-2 encode. Given rotated K and its Stage-1 dequantization,
 /// produces:
 ///   - `signs` bf16 `[..., m]` with values in {-1, +1}, the sign of each
@@ -631,9 +661,11 @@ pub fn qjl_apply_correction_to_k_dq(
     let phi_inv_matmul =
         mlx_rs::ops::matmul(&signs_f32, projection).context("qjl_apply_correction: signs @ Φ")?;
 
-    // Scale by ‖r‖_k × √(π/2)/√m.
-    let scale = qjl_correction_scale(qjl_m);
-    let scaled_norm = mlx_rs::ops::multiply(r_norm_f32, &Array::from_f32(scale))
+    // Scale by ‖r‖_k × √(π/2)/√m. The scale Array is cached (see
+    // `qjl_correction_scale_array_f32`) so we don't pay an `Array::from_f32`
+    // host allocation per decode step per layer.
+    let scale_arr = qjl_correction_scale_array_f32(qjl_m)?;
+    let scaled_norm = mlx_rs::ops::multiply(r_norm_f32, &scale_arr)
         .context("qjl_apply_correction: scale ‖r‖ × √(π/2)/√m")?;
     let correction_f32 = mlx_rs::ops::multiply(&phi_inv_matmul, &scaled_norm)
         .context("qjl_apply_correction: scaled correction")?;
@@ -1636,5 +1668,60 @@ mod qjl_correctness_tests {
             (1.0 - ratio).abs() * 100.0,
             if ratio < 1.0 { "FASTER" } else { "SLOWER" }
         );
+    }
+
+    /// Probe: does MLX accept `matmul(bf16, f32)` directly?
+    /// If yes — we can skip the bf16→f32 input cast in `rotate_last_axis`
+    /// since R is already f32 (orthogonality precision). MLX should auto-
+    /// upcast internally with f32 accumulator (same path the explicit cast
+    /// triggers, minus one host-side dispatch).
+    ///
+    /// Logs the output dtype + max-abs-error vs the cast-then-matmul path.
+    #[test]
+    fn probe_matmul_mixed_dtype_bf16_x_f32() {
+        let d = 256usize;
+        // bf16 input vector
+        let x_bf16 = random::normal::<f32>(&[1, d as i32], None, None, None)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        // f32 rotation
+        let r_f32 = rotation_matrix_f32(d, TURBOQUANT_SEED).unwrap();
+
+        // Path A (current): cast → matmul(f32, f32) → cast back
+        let xa_f32 = x_bf16.as_dtype(Dtype::Float32).unwrap();
+        let ya_f32 = mlx_rs::ops::matmul(&xa_f32, &r_f32).unwrap();
+        let ya_bf16 = ya_f32.as_dtype(Dtype::Bfloat16).unwrap();
+
+        // Path B (mixed): matmul(bf16, f32) directly — what dtype comes out?
+        let yb_attempt = mlx_rs::ops::matmul(&x_bf16, &r_f32);
+        match yb_attempt {
+            Ok(yb) => {
+                let yb_dtype = yb.dtype();
+                eprintln!("[probe] matmul(bf16, f32) OK, output dtype = {:?}", yb_dtype);
+                // Compare with Path A (cast to common dtype first for comparison).
+                let yb_f32 = yb.as_dtype(Dtype::Float32).unwrap();
+                let diff = mlx_rs::ops::subtract(&ya_f32, &yb_f32).unwrap();
+                let abs = mlx_rs::ops::abs(&diff).unwrap();
+                let max_err =
+                    mlx_rs::ops::max(&abs, false).unwrap().item::<f32>();
+                let ya_max =
+                    mlx_rs::ops::max(&mlx_rs::ops::abs(&ya_f32).unwrap(), false)
+                        .unwrap()
+                        .item::<f32>();
+                let rel = if ya_max > 0.0 { max_err / ya_max } else { max_err };
+                eprintln!(
+                    "[probe] |Path_A - Path_B|_max = {:.3e}, relative {:.3e}",
+                    max_err, rel
+                );
+                // If bit-identical: rel ≈ 0. If f32 accum + bf16 output truncation: ~1/128.
+                // If bf16 accum (precision loss): potentially larger.
+                let _ = ya_bf16; // unused in B's existence is informational only
+            }
+            Err(e) => {
+                eprintln!("[probe] matmul(bf16, f32) NOT SUPPORTED: {e}");
+                eprintln!("[probe] -> B-1 lever blocked, must use explicit cast or write fused kernel");
+            }
+        }
     }
 }

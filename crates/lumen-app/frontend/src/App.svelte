@@ -189,24 +189,32 @@
   // QJL Stage-2 at default m=1024 adds ~128 B/vector, which dilutes Stage-1
   // ratio roughly: total = bf16/(stage1_bytes + qjl_bytes).
   let turboquantKvRatio = $derived.by(() => {
-    if (!config?.quant.turboquant_enabled) return 1.0;
-    const bits = config.quant.bits;
+    // Treat Off as 1.0 (no compression); On / Auto both compress when
+    // the request lands on the TQ path. The estimate here is the
+    // best-case potential, not a per-request guarantee.
+    if (config?.quant.turboquant_mode === "off") return 1.0;
+    const bits = config!.quant.bits;
     // bf16 = 16 bits/scalar; head_dim=256 → 4096 bits/vector
     const stage1Bits = bits * 256;
     // QJL Stage-2 projection dimension is now a server-side constant
     // (`D · 4 = 1024` for Gemma 4 head_dim=256). Used to be configurable
     // via DEBUG → "QJL m" but was benchmark-only — see server.rs constants.
     const QJL_M = 1024;
-    const qjlBits = config.quant.turboquant_qjl_enabled ? QJL_M : 0;
+    const qjlBits = config!.quant.turboquant_qjl_enabled ? QJL_M : 0;
     const totalBits = stage1Bits + qjlBits;
     return totalBits > 0 ? 4096 / totalBits : 1.0;
   });
 
   let turboquantStateLabel = $derived.by(() => {
-    if (!config?.quant.turboquant_enabled) return "OFF (bf16 KV)";
+    if (!config) return "—";
+    const mode = config.quant.turboquant_mode;
+    if (mode === "off") return "OFF (bf16 KV)";
     const stage = `${config.quant.bits}-bit`;
     const qjl = config.quant.turboquant_qjl_enabled ? " + QJL" : "";
-    return `${stage}${qjl}`;
+    const suffix = mode === "auto"
+      ? ` (auto ≥${config.quant.turboquant_auto_threshold_tokens}t)`
+      : "";
+    return `${stage}${qjl}${suffix}`;
   });
 
   // Realistic max-context budget. Assumes ~2 GB free for KV after model +
@@ -711,27 +719,57 @@
     {#if config}
       <div class={kvRow}>
         <span class="dim">
-          {t("quant.master")}
+          {t("quant.mode")}
           <span
             class={helpIcon}
             use:tooltip
-            data-tooltip={t("quant.tooltip.master")}
+            data-tooltip={t("quant.tooltip.mode")}
           >?</span>
         </span>
-        <label class={toggleLabel}>
+        <div class="flex gap-1">
+          {#each [["off","quant.mode.off"],["on","quant.mode.on"],["auto","quant.mode.auto"]] as [v, key]}
+            <button
+              class={`px-2.5 py-1 min-w-12 ${config.quant.turboquant_mode === v ? "primary" : ""}`}
+              onclick={() => {
+                if (!config) return;
+                config.quant.turboquant_mode = v as "off" | "on" | "auto";
+                // Mirror to legacy boolean so any code still reading
+                // `turboquant_enabled` sees a sensible value.
+                config.quant.turboquant_enabled = v !== "off";
+                saveQuant();
+              }}
+            >{t(key)}</button>
+          {/each}
+        </div>
+      </div>
+      {#if config.quant.turboquant_mode === "auto"}
+        <div class={kvRow}>
+          <span class="dim">
+            {t("quant.autoThreshold")}
+            <span
+              class={helpIcon}
+              use:tooltip
+              data-tooltip={t("quant.tooltip.autoThreshold")}
+            >?</span>
+          </span>
           <input
-            class="w-3.5 h-3.5 m-0 accent-accent"
-            type="checkbox"
-            checked={config.quant.turboquant_enabled}
+            class="mono w-24 text-right"
+            type="number"
+            min="1"
+            max="200000"
+            step="256"
+            value={config.quant.turboquant_auto_threshold_tokens}
             onchange={(e) => {
               if (!config) return;
-              config.quant.turboquant_enabled = (e.currentTarget as HTMLInputElement).checked;
-              saveQuant();
+              const v = parseInt((e.currentTarget as HTMLInputElement).value, 10);
+              if (!isNaN(v) && v >= 1) {
+                config.quant.turboquant_auto_threshold_tokens = v;
+                saveQuant();
+              }
             }}
           />
-          <span>{config.quant.turboquant_enabled ? t("quant.on") : t("quant.off")}</span>
-        </label>
-      </div>
+        </div>
+      {/if}
       <div class={kvRow}>
         <span class="dim">
           {t("quant.qjl")}
