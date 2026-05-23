@@ -288,11 +288,12 @@ pub async fn check_model_updates(
     let entries = models::scan_local(&dir, &cat).map_err(err)?;
     drop(cat);
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // 8s timeout — anonymous HF API replies in <200ms; if we hit the cap
+    // something is wrong with the network and we'd rather skip the update
+    // check than wedge the UI. `hf_client` attaches HF_TOKEN automatically
+    // when set, so private/gated repos work for users who configured one.
+    let client =
+        models::hf_client(Some(std::time::Duration::from_secs(8))).map_err(|e| e.to_string())?;
 
     let mut results = Vec::with_capacity(repo_ids.len());
     let mut new_outdated = std::collections::HashSet::new();

@@ -445,6 +445,43 @@ pub fn local_path_for(models_dir: &Path, repo_id: &str) -> PathBuf {
     models_dir.join(flat)
 }
 
+/// Build a `reqwest::Client` configured for HuggingFace Hub calls.
+///
+/// Attaches `Authorization: Bearer <token>` automatically when one of the
+/// well-known HF token env vars is set:
+///   - `HF_TOKEN` (preferred; matches `huggingface_hub` Python lib + the
+///     `huggingface-cli login` convention)
+///   - `HUGGING_FACE_HUB_TOKEN` (legacy fallback)
+///
+/// Without a token the client behaves identically to before — anonymous
+/// access works for any non-gated repo.
+///
+/// Single source of truth so `fetch_hub_sha`, `download`, and the
+/// periodic `check_model_updates` path all auth-up consistently. Adding a
+/// new HTTP call site? Use this builder, don't roll your own.
+pub fn hf_client(timeout: Option<std::time::Duration>) -> Result<reqwest::Client> {
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")));
+    if let Some(d) = timeout {
+        builder = builder.timeout(d);
+    }
+    if let Some(t) = &token {
+        use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        let mut val = HeaderValue::try_from(format!("Bearer {t}"))
+            .context("invalid HF_TOKEN — must be ASCII (no newline / non-printable bytes)")?;
+        val.set_sensitive(true);
+        headers.insert(AUTHORIZATION, val);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().context("init hf http client")
+}
+
 /// Latest commit SHA for the `main` branch of an HF Hub repo. Used to detect
 /// "same repo id, new weights" the way `hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq` was
 /// rebuilt in v0.1.3 — the old broken-3bit and the new imatrix mixed-precision
@@ -517,10 +554,7 @@ pub async fn download(
     files: Option<Vec<String>>,
     tx: tokio::sync::mpsc::Sender<DownloadProgress>,
 ) -> Result<PathBuf> {
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("init http client")?;
+    let client = hf_client(None).context("init hf http client for download")?;
 
     let target = local_path_for(models_dir, repo_id);
     std::fs::create_dir_all(&target)

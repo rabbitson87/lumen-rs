@@ -17,6 +17,36 @@ use state::AppState;
 use tauri::Manager;
 
 fn main() {
+    // Surface HF_TOKEN detection at startup so users who configured one
+    // can see it took effect (no token value is logged — only its
+    // presence + source env var). Token unlocks gated HF repos and
+    // raises the anonymous rate limit ceiling for periodic update checks.
+    let hf_token_src = if std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .is_some()
+    {
+        Some("HF_TOKEN")
+    } else if std::env::var("HUGGING_FACE_HUB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .is_some()
+    {
+        Some("HUGGING_FACE_HUB_TOKEN")
+    } else {
+        None
+    };
+    match hf_token_src {
+        Some(name) => {
+            eprintln!("[lumen-app] HuggingFace token detected via ${name} — gated repos accessible");
+        }
+        None => {
+            eprintln!(
+                "[lumen-app] no HuggingFace token configured (HF_TOKEN / HUGGING_FACE_HUB_TOKEN); anonymous HF access only — gated repos will 401"
+            );
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
