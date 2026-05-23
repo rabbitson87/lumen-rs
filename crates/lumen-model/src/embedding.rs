@@ -167,14 +167,65 @@ impl EmbeddingModel {
             t0.elapsed().as_secs_f32()
         );
 
-        Ok(Self {
+        let mut model = Self {
             model,
             tokenizer,
             device,
             dim,
             max_seq_len,
             model_id: model_id_or_path.to_string(),
-        })
+        };
+        // Smoke check: catch silent loader corruption (e.g. dtype mismatch on
+        // scales/biases — the `Qwen3-Embedding-4B-4bit-DWQ` NaN-emission bug
+        // that motivated this guard) BEFORE the model is exposed to requests.
+        // One forward over a tiny multilingual probe; ~50ms for 0.6B-8bit,
+        // ~1s for 4B variants — cheap relative to load itself.
+        model
+            .smoke_check()
+            .with_context(|| format!("post-load smoke check failed for {model_id_or_path}"))?;
+
+        Ok(model)
+    }
+
+    /// Run one forward pass on a tiny probe and verify the output embedding
+    /// is finite. Surfaces silent loader corruption (NaN-class bugs from
+    /// scales/biases dtype mismatch, weight shard misalignment, etc.) at
+    /// load time rather than letting it propagate into user requests.
+    ///
+    /// Probe = `"hello 안녕"` — 2-3 tokens in any BPE we ship, exercises
+    /// both Latin and Hangul codepoints so a tokenizer mis-mapping also
+    /// surfaces here rather than as garbage embeddings.
+    fn smoke_check(&mut self) -> Result<()> {
+        let probe = vec!["hello 안녕".to_string()];
+        let batch = self.embed(&probe).context("smoke probe embed failed")?;
+        let v = batch.embeddings.first().ok_or_else(|| {
+            anyhow!("smoke probe: embed returned 0 vectors (expected 1)")
+        })?;
+        let nan = v.iter().filter(|x| !x.is_finite()).count();
+        if nan != 0 {
+            return Err(anyhow!(
+                "smoke probe: {nan}/{} embedding components are NaN/Inf — \
+                 model output corrupted (likely loader bug: scales/biases \
+                 dtype mismatch, truncated shard, or quantization mode \
+                 misdetected)",
+                v.len()
+            ));
+        }
+        let l2: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if !(0.5..=2.0).contains(&l2) {
+            // EmbeddingModel L2-normalizes — output norm should be ≈ 1.0.
+            // A wildly different norm would indicate a normalization
+            // path bug; allow a generous band to avoid false positives.
+            return Err(anyhow!(
+                "smoke probe: embedding L2 norm {l2:.3} far from unit \
+                 (expected ≈ 1.0 since EmbeddingModel L2-normalizes its output)"
+            ));
+        }
+        eprintln!(
+            "[embedding] smoke probe OK (dim={}, l2={l2:.3})",
+            v.len()
+        );
+        Ok(())
     }
 
     pub fn model_id(&self) -> &str {
