@@ -121,7 +121,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         label: "Gemma 4 — 26B A4B Standard (HIGH=4, hsng95)",
         approx_size_gb: 12,
         min_ram_gb: 16,
-        notes: "Standard tier — 12 GB, 4.135 bpw. Mixed 4/3-bit AFFINE imatrix + AWQ Option B (mean_sq), mlp_down groups dropped, embed_tokens at AFFINE 8-bit. Best for 24 GB Macs. Wins multi-angle eval on wikitext / TruthfulQA / GSM8K chain-of-thought. 11K Korean long-context CLEAN.",
+        notes: "Standard tier — 12 GB, 3.916 bpw. Mixed 4/3-bit AFFINE imatrix + AWQ Option B (mean_sq), mlp_down groups dropped, embed_tokens at AFFINE 8-bit. Best for 24 GB Macs. Wins multi-angle eval on wikitext / TruthfulQA / GSM8K chain-of-thought. 11K Korean long-context CLEAN.",
     },
     RecommendedModel {
         id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6",
@@ -129,7 +129,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         label: "Gemma 4 — 26B A4B Quality (HIGH=6, hsng95)",
         approx_size_gb: 14,
         min_ram_gb: 24,
-        notes: "Quality tier — 14 GB, 4.674 bpw. Top sensitivity tier elevated to 6-bit AFFINE on top of Standard recipe. 3-seed mean Tulu PPL 62.68 (vs Standard 66.86, Δ −4.18). Wins multi-angle eval on MMLU / ARC / KMMLU — most balanced knowledge model. Recommended default for 32 GB+ Macs.",
+        notes: "Quality tier — 14 GB, 4.674 bpw. Top sensitivity tier elevated to 6-bit AFFINE on top of Standard recipe (Standard 3.916 bpw → +0.76 bpw for top-35% tensors). 3-seed mean Tulu PPL 62.68 (vs Standard 66.86, Δ −4.18). Wins multi-angle eval on MMLU / ARC / KMMLU — most balanced knowledge model. Recommended default for 32 GB+ Macs.",
     },
     RecommendedModel {
         id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40",

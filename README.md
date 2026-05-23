@@ -220,7 +220,7 @@ tasks: MMLU / ARC / HellaSwag / TruthfulQA / GSM8K / KMMLU / HAERAE):
 
 | Tier | Repo | Size | bpw | Min RAM | Specialty |
 |---|---|---|---|---|---|
-| **Standard** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq) | 12 GB | 4.135 | 16 GB | wikitext / TruthfulQA / GSM8K — best on 24 GB Macs |
+| **Standard** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq) | 12 GB | 3.916 | 16 GB | wikitext / TruthfulQA / GSM8K — best on 24 GB Macs |
 | **Quality** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6) | 14 GB | 4.674 | 24 GB | MMLU / ARC / KMMLU — most balanced knowledge model |
 | **Flagship-KR** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40) | 15 GB | 5.057 | 32 GB | HAERAE / Korean chat / lowest tulu PPL |
 
