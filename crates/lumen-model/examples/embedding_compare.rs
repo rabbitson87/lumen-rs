@@ -187,7 +187,12 @@ fn spearman_rank_agreement(a: &[Vec<usize>], b: &[Vec<usize>]) -> f64 {
     sum / n as f64
 }
 
-fn run_variant(label: &str, model_id: &str, texts: &[String], labels: &[&str]) -> Result<VariantResult> {
+fn run_variant(
+    label: &str,
+    model_id: &str,
+    texts: &[String],
+    labels: &[&str],
+) -> Result<VariantResult> {
     eprintln!("=== variant [{label}] ===");
     let t = Instant::now();
     let mut model = EmbeddingModel::load(model_id)?;
@@ -315,7 +320,10 @@ fn main() -> Result<()> {
     let n = texts.len();
     eprintln!(
         "[compare] corpus: {n} prompts across {} categories",
-        labels.iter().collect::<std::collections::BTreeSet<_>>().len()
+        labels
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     );
 
     let mut results: Vec<VariantResult> = Vec::new();

@@ -159,10 +159,7 @@ pub(crate) mod imp {
             // tolerated (mirrors the post-buffer parser).
             let bytes = self.tool_text_prefix.as_bytes();
             let needle = b"call:";
-            let Some(start) = bytes
-                .windows(needle.len())
-                .position(|w| w == needle)
-            else {
+            let Some(start) = bytes.windows(needle.len()).position(|w| w == needle) else {
                 return None;
             };
             let name_start = start + needle.len();

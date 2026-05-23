@@ -26,7 +26,8 @@ fn parallel_calls_in_one_block_parse() {
     // mlx_lm allows multiple `call:NAME{...}` blocks in one
     // `<|tool_call>...<tool_call|>` span. Parser handles up to N
     // (~8 verified in practice).
-    let body = "call:get_weather{location:<|\"|>Seoul<|\"|>}call:get_weather{location:<|\"|>Tokyo<|\"|>}";
+    let body =
+        "call:get_weather{location:<|\"|>Seoul<|\"|>}call:get_weather{location:<|\"|>Tokyo<|\"|>}";
     let calls = parse_tool_call_body(body).expect("parses");
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].arguments, json!({"location": "Seoul"}));
@@ -56,8 +57,7 @@ fn empty_body_errors_not_panic() {
 fn unbalanced_braces_errors_not_panic() {
     // Missing closing brace. Parser should NOT walk off the end of
     // the buffer — anyhow Err is the contract.
-    let err = parse_tool_call_body("call:noop{key:42")
-        .expect_err("unbalanced brace should error");
+    let err = parse_tool_call_body("call:noop{key:42").expect_err("unbalanced brace should error");
     let msg = format!("{err:#}");
     assert!(msg.contains("unbalanced"), "unexpected error: {msg}");
 }

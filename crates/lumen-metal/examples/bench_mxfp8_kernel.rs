@@ -194,25 +194,9 @@ fn encode_n(
         let encoder = cmd.auto_compute_encoder();
         encoder.set_label("lumen:mxfp8_bench");
         if force_naive {
-            ctx.encode_naive_bf16_dispatch(
-                encoder.as_ref(),
-                weight,
-                x_buf,
-                0,
-                y_buf,
-                0,
-                batch,
-            );
+            ctx.encode_naive_bf16_dispatch(encoder.as_ref(), weight, x_buf, 0, y_buf, 0, batch);
         } else {
-            ctx.encode_matmul_bf16_dispatch(
-                encoder.as_ref(),
-                weight,
-                x_buf,
-                0,
-                y_buf,
-                0,
-                batch,
-            );
+            ctx.encode_matmul_bf16_dispatch(encoder.as_ref(), weight, x_buf, 0, y_buf, 0, batch);
         }
         encoder.end_encoding();
     }
@@ -269,9 +253,7 @@ fn main() -> Result<()> {
         .unwrap_or(false);
 
     if env_naive {
-        println!(
-            "[bench] LUMEN_MXFP8_NAIVE=1 — running naive kernel only for all shapes\n"
-        );
+        println!("[bench] LUMEN_MXFP8_NAIVE=1 — running naive kernel only for all shapes\n");
         print_header("naive (mxfp8_matmul_bf16)");
         for s in SHAPES {
             bench_one(&ctx, s, true)?;

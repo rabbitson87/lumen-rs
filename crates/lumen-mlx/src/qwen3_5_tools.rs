@@ -551,7 +551,11 @@ impl Qwen35ResponseParser {
         // whitespace/newlines, then look for `<function=NAME>` followed
         // by `\n`.
         // Skip leading whitespace
-        let leading_ws = self.buffer.chars().take_while(|c| c.is_whitespace()).count();
+        let leading_ws = self
+            .buffer
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .count();
         if leading_ws > 0 {
             // Drain the whitespace bytes (char count == byte count for ASCII).
             self.buffer.drain(..leading_ws);
@@ -790,9 +794,7 @@ pub fn validate_tool_choice_against_defs<'a>(
 ) -> Result<()> {
     if let ResolvedToolChoice::Tool(name) = choice {
         if !tools.iter().any(|t| t.name == *name) {
-            return Err(anyhow!(
-                "tool_choice references unknown function: {name}"
-            ));
+            return Err(anyhow!("tool_choice references unknown function: {name}"));
         }
     }
     Ok(())
@@ -980,9 +982,9 @@ mod tests {
         let stream = "I'll call the function.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n<parameter=unit>\nc\n</parameter>\n</function>\n</tool_call>";
         let evs = p.feed(stream);
         // Must contain a ToolCallStart event with the right name.
-        let has_start = evs
-            .iter()
-            .any(|e| matches!(e, Qwen35ParseEvent::ToolCallStart { name } if name == "get_weather"));
+        let has_start = evs.iter().any(
+            |e| matches!(e, Qwen35ParseEvent::ToolCallStart { name } if name == "get_weather"),
+        );
         assert!(has_start, "expected ToolCallStart event");
         let resp = p.finish();
         assert_eq!(resp.tool_calls.len(), 1);
@@ -1125,8 +1127,14 @@ mod tests {
 
     #[test]
     fn prefill_str_auto_none_empty() {
-        assert_eq!(qwen35_tool_choice_prefill_str(&ResolvedToolChoice::Auto), "");
-        assert_eq!(qwen35_tool_choice_prefill_str(&ResolvedToolChoice::None), "");
+        assert_eq!(
+            qwen35_tool_choice_prefill_str(&ResolvedToolChoice::Auto),
+            ""
+        );
+        assert_eq!(
+            qwen35_tool_choice_prefill_str(&ResolvedToolChoice::None),
+            ""
+        );
     }
 
     #[test]

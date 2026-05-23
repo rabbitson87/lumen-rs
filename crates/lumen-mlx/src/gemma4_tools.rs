@@ -73,8 +73,9 @@ pub(crate) mod imp {
         let mut text = String::new();
         for (i, tool) in tools.iter().enumerate() {
             text.push_str("<|tool>");
-            format_function_declaration(&mut text, tool)
-                .with_context(|| format!("format_function_declaration tool[{i}] {:?}", tool.name))?;
+            format_function_declaration(&mut text, tool).with_context(|| {
+                format!("format_function_declaration tool[{i}] {:?}", tool.name)
+            })?;
             text.push_str("<tool|>");
         }
         template
@@ -88,13 +89,7 @@ pub(crate) mod imp {
     /// OBJECT properties (mirrors jinja's `standard_keys`). When
     /// `filter_keys=true` (inline-object case), these are emitted by the
     /// dedicated branches and skipped from the generic loop.
-    const STANDARD_KEYS: &[&str] = &[
-        "description",
-        "type",
-        "properties",
-        "required",
-        "nullable",
-    ];
+    const STANDARD_KEYS: &[&str] = &["description", "type", "properties", "required", "nullable"];
 
     /// `format_function_declaration` macro port:
     ///
@@ -310,8 +305,7 @@ pub(crate) mod imp {
     /// Body of an ARRAY's `items:{...}` block. Mirrors the jinja branches
     /// over `(item_key, item_value)` pairs.
     fn emit_items_body(out: &mut String, items: &serde_json::Map<String, Value>) -> Result<()> {
-        let sorted: BTreeMap<&str, &Value> =
-            items.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let sorted: BTreeMap<&str, &Value> = items.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let mut first = true;
         for (key, value) in sorted {
             if value.is_null() {

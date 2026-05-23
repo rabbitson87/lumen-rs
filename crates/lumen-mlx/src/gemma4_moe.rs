@@ -1481,7 +1481,9 @@ pub(crate) mod imp {
             }
             self.text_config.validate()?;
             if let Some(quant) = self.effective_quantization() {
-                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8") || quant.group_size == 0 {
+                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8")
+                    || quant.group_size == 0
+                {
                     return Err(anyhow!(
                         "quantization default must be mode∈{{affine, mxfp4, mxfp8}} with non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
@@ -2153,10 +2155,7 @@ pub(crate) mod imp {
         /// should always pass `Some(_)` so the decision reflects this
         /// request's prompt length, not whatever the server's global env
         /// var said at launch.
-        pub fn for_config_with_tq(
-            cfg: &NativeGemma4TextConfig,
-            force_tq: Option<bool>,
-        ) -> Self {
+        pub fn for_config_with_tq(cfg: &NativeGemma4TextConfig, force_tq: Option<bool>) -> Self {
             assert_eq!(
                 cfg.num_kv_shared_layers, 0,
                 "NativeGemma4PromptCache: num_kv_shared_layers > 0 not yet supported (26B-A4B uses 0)"
@@ -3752,14 +3751,8 @@ pub(crate) mod imp {
         /// decision. Used by `generate_with_cache` when adaptive TQ
         /// (`LUMEN_GEMMA4_TQ_MODE=auto`) needs to react to this request's
         /// prompt length. `None` defers to the env (legacy behaviour).
-        pub fn make_cache_with_tq(
-            &self,
-            force_tq: Option<bool>,
-        ) -> NativeGemma4PromptCache {
-            NativeGemma4PromptCache::for_config_with_tq(
-                &self.config.text_config,
-                force_tq,
-            )
+        pub fn make_cache_with_tq(&self, force_tq: Option<bool>) -> NativeGemma4PromptCache {
+            NativeGemma4PromptCache::for_config_with_tq(&self.config.text_config, force_tq)
         }
 
         pub fn eos_tokens(&self) -> &[u32] {
@@ -5828,8 +5821,7 @@ pub(crate) mod imp {
                 EmbedTokensWeights::Bf16(w) => {
                     let w_t = mlx_rs::ops::transpose_axes(w, &[1, 0])
                         .context("tied_lm_head(bf16): transpose embed weights")?;
-                    mlx_rs::ops::matmul(h, &w_t)
-                        .context("tied_lm_head(bf16): matmul h @ W.T")?
+                    mlx_rs::ops::matmul(h, &w_t).context("tied_lm_head(bf16): matmul h @ W.T")?
                 }
                 EmbedTokensWeights::Quantized(embed) => quantized_matmul_with_mode(
                     h,
@@ -6025,7 +6017,12 @@ pub(crate) mod imp {
             // discard it and re-sample the prefill logits with the same
             // sampler so the very first decoded token also respects
             // temperature / top-p.
-            if cfg.sampling.as_ref().map(|s| !s.is_greedy()).unwrap_or(false) {
+            if cfg
+                .sampling
+                .as_ref()
+                .map(|s| !s.is_greedy())
+                .unwrap_or(false)
+            {
                 use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
                 let sampling = cfg.sampling.as_ref().unwrap();
                 // Discard the lazy prefill argmax; we'll sample from
@@ -6035,9 +6032,8 @@ pub(crate) mod imp {
                 let mut rng = Xorshift64::new(sampling.seed);
                 let decode_start = Instant::now();
 
-                let first_tok =
-                    sample_next_token(&logits, &generated, sampling, &mut rng)
-                        .context("generate(sampled): sample prefill token")?;
+                let first_tok = sample_next_token(&logits, &generated, sampling, &mut rng)
+                    .context("generate(sampled): sample prefill token")?;
                 generated.push(first_tok);
                 let mut hit_eos_s = cfg.stop_on_eos && eos.contains(&first_tok);
 
@@ -6050,9 +6046,8 @@ pub(crate) mod imp {
                     let step_logits = self
                         .forward_array_last_token(&input, &mut cache)
                         .context("generate(sampled): decode forward")?;
-                    let next_tok =
-                        sample_next_token(&step_logits, &generated, sampling, &mut rng)
-                            .context("generate(sampled): sample step")?;
+                    let next_tok = sample_next_token(&step_logits, &generated, sampling, &mut rng)
+                        .context("generate(sampled): sample step")?;
                     generated.push(next_tok);
                     decode_steps_s += 1;
                     if cfg.stop_on_eos && eos.contains(&next_tok) {
@@ -6715,11 +6710,11 @@ pub(crate) mod imp {
                 r#","quantization":{"group_size":64,"bits":4,"mode":"mxfp4"}"#,
             );
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
-            cfg.validate_gemma4_family().expect("validate (group check is at dispatch)");
-            let err =
-                quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
-                    .unwrap_err()
-                    .to_string();
+            cfg.validate_gemma4_family()
+                .expect("validate (group check is at dispatch)");
+            let err = quant_params_for(&cfg, "language_model.model.layers.0.mlp.gate_proj.weight")
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("mxfp4") && err.contains("group_size=32"),
                 "error should explain mxfp4 shape: {err}"

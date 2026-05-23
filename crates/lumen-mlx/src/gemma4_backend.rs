@@ -65,12 +65,7 @@ pub(crate) mod imp {
     /// the e2e rate from the user's perspective is determined by
     /// answer tokens produced over total wall-clock, not (prompt +
     /// answer) / wall-clock.
-    fn log_chat_done(
-        prefill_tokens: usize,
-        prefill_ms: f64,
-        decode_tokens: usize,
-        decode_ms: f64,
-    ) {
+    fn log_chat_done(prefill_tokens: usize, prefill_ms: f64, decode_tokens: usize, decode_ms: f64) {
         let p_tps = if prefill_ms > 0.0 && prefill_tokens > 0 {
             prefill_tokens as f64 / (prefill_ms / 1000.0)
         } else {
@@ -158,8 +153,8 @@ pub(crate) mod imp {
         on_event: &mut impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
     ) -> Result<()> {
         let state_after = parser.state();
-        let in_tool_call_span =
-            matches!(state_before, ParseState::ToolCall) || matches!(state_after, ParseState::ToolCall);
+        let in_tool_call_span = matches!(state_before, ParseState::ToolCall)
+            || matches!(state_after, ParseState::ToolCall);
         if !in_tool_call_span {
             // Pure visible-channel token.
             let chunk = chat.decode(&[token], true)?;
@@ -176,7 +171,9 @@ pub(crate) mod imp {
             let body_chunk = chat.decode(&[token], /* skip_special */ false)?;
             if !body_chunk.is_empty() {
                 if let Some(name) = parser.observe_tool_text_fragment(&body_chunk) {
-                    on_event(BackendStreamEvent::ToolCallStart { name: name.as_str() })?;
+                    on_event(BackendStreamEvent::ToolCallStart {
+                        name: name.as_str(),
+                    })?;
                 }
             }
         }
@@ -888,23 +885,16 @@ pub(crate) mod imp {
                     if !eos.contains(&first_tok) {
                         let mut current_u32 = first_tok;
                         while all_tokens.len() < max_new_tokens {
-                            let input = mlx_rs::Array::from_slice(
-                                &[current_u32 as i32],
-                                &[1, 1],
-                            )
-                            .as_dtype(mlx_rs::Dtype::Int32)
-                            .context("chat_streaming(sampled): build input array")?;
+                            let input = mlx_rs::Array::from_slice(&[current_u32 as i32], &[1, 1])
+                                .as_dtype(mlx_rs::Dtype::Int32)
+                                .context("chat_streaming(sampled): build input array")?;
                             let step_logits = self
                                 .model
                                 .forward_array_last_token(&input, &mut cache)
                                 .context("chat_streaming(sampled): decode forward")?;
-                            let next_tok = sample_next_token(
-                                &step_logits,
-                                &all_tokens,
-                                &sampling,
-                                &mut rng,
-                            )
-                            .context("chat_streaming(sampled): sample step")?;
+                            let next_tok =
+                                sample_next_token(&step_logits, &all_tokens, &sampling, &mut rng)
+                                    .context("chat_streaming(sampled): sample step")?;
                             all_tokens.push(next_tok);
                             let state_before = parser.state();
                             parser.push(next_tok)?;
@@ -923,12 +913,7 @@ pub(crate) mod imp {
                     }
                     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
                     let count = all_tokens.len();
-                    log_chat_done(
-                        prefill_prompt_tokens,
-                        prefill_total_ms,
-                        count,
-                        decode_ms,
-                    );
+                    log_chat_done(prefill_prompt_tokens, prefill_total_ms, count, decode_ms);
                     return parser.finalize();
                 }
 
@@ -1117,13 +1102,7 @@ pub(crate) mod imp {
                     let state_before = parser.state();
                     parser.push(token)?;
                     count += 1;
-                    emit_token_event(
-                        &self.chat,
-                        &mut parser,
-                        token,
-                        state_before,
-                        &mut on_event,
-                    )?;
+                    emit_token_event(&self.chat, &mut parser, token, state_before, &mut on_event)?;
 
                     // Stop Metal capture after `capture_steps` decode steps.
                     // We do this AFTER reading the token so the synchronously
@@ -1145,12 +1124,7 @@ pub(crate) mod imp {
                     current = next_lazy;
                 }
                 let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-                log_chat_done(
-                    prefill_prompt_tokens,
-                    prefill_total_ms,
-                    count,
-                    decode_ms,
-                );
+                log_chat_done(prefill_prompt_tokens, prefill_total_ms, count, decode_ms);
 
                 // Defensive: ensure capture is stopped even if loop ends early
                 // (e.g. EOS before capture_steps reached).

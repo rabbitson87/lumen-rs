@@ -1698,18 +1698,23 @@ mod qjl_correctness_tests {
         match yb_attempt {
             Ok(yb) => {
                 let yb_dtype = yb.dtype();
-                eprintln!("[probe] matmul(bf16, f32) OK, output dtype = {:?}", yb_dtype);
+                eprintln!(
+                    "[probe] matmul(bf16, f32) OK, output dtype = {:?}",
+                    yb_dtype
+                );
                 // Compare with Path A (cast to common dtype first for comparison).
                 let yb_f32 = yb.as_dtype(Dtype::Float32).unwrap();
                 let diff = mlx_rs::ops::subtract(&ya_f32, &yb_f32).unwrap();
                 let abs = mlx_rs::ops::abs(&diff).unwrap();
-                let max_err =
-                    mlx_rs::ops::max(&abs, false).unwrap().item::<f32>();
-                let ya_max =
-                    mlx_rs::ops::max(&mlx_rs::ops::abs(&ya_f32).unwrap(), false)
-                        .unwrap()
-                        .item::<f32>();
-                let rel = if ya_max > 0.0 { max_err / ya_max } else { max_err };
+                let max_err = mlx_rs::ops::max(&abs, false).unwrap().item::<f32>();
+                let ya_max = mlx_rs::ops::max(&mlx_rs::ops::abs(&ya_f32).unwrap(), false)
+                    .unwrap()
+                    .item::<f32>();
+                let rel = if ya_max > 0.0 {
+                    max_err / ya_max
+                } else {
+                    max_err
+                };
                 eprintln!(
                     "[probe] |Path_A - Path_B|_max = {:.3e}, relative {:.3e}",
                     max_err, rel
@@ -1720,7 +1725,9 @@ mod qjl_correctness_tests {
             }
             Err(e) => {
                 eprintln!("[probe] matmul(bf16, f32) NOT SUPPORTED: {e}");
-                eprintln!("[probe] -> B-1 lever blocked, must use explicit cast or write fused kernel");
+                eprintln!(
+                    "[probe] -> B-1 lever blocked, must use explicit cast or write fused kernel"
+                );
             }
         }
     }

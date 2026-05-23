@@ -79,8 +79,7 @@ pub mod gemma4 {
         TOK_TOOL_CALL_OPEN, gemma4_args_to_json, parse_tool_call_body,
     };
     pub use crate::gemma4_tools::imp::{
-        ToolDef, format_tool_call_body, render_tool_definitions,
-        render_tool_definitions_text,
+        ToolDef, format_tool_call_body, render_tool_definitions, render_tool_definitions_text,
     };
 
     /// MTP (Multi-Token Prediction) drafter for Gemma 4. Phase 1: types +
@@ -1591,9 +1590,7 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<(Vec<u32>, String)> {
-        use crate::qwen3_5_tools::{
-            format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str,
-        };
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
         let mut prompt = format_qwen3_chat_with_tools(messages, thinking, tools);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         prompt.push_str(&prefill);
@@ -1851,13 +1848,7 @@ impl MlxQwen35Backend {
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            max_new_tokens,
-            seq_id,
-            |_ev| Ok(()),
-        )
+        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, |_ev| Ok(()))
     }
 
     /// Phase 2: tool-aware streaming chat. Emits
@@ -1894,13 +1885,7 @@ impl MlxQwen35Backend {
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            max_new_tokens,
-            seq_id,
-            |_ev| Ok(()),
-        )
+        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, |_ev| Ok(()))
     }
 
     /// Structured-history streaming variant.
@@ -2021,7 +2006,10 @@ impl MlxQwen35Backend {
         );
         if debug_qwen_tools {
             let full = self.decode(&generated).unwrap_or_default();
-            eprintln!("[qwen35-tools] full output ({} tokens):\n---\n{full}\n---", n_gen);
+            eprintln!(
+                "[qwen35-tools] full output ({} tokens):\n---\n{full}\n---",
+                n_gen
+            );
         }
         self.remove_seq(seq_id).ok();
         Ok(parser.finish())

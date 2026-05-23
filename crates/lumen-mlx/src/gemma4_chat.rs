@@ -242,8 +242,7 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
             // ── header ────────────────────────────────────────────────
-            let mut out: Vec<u32> =
-                Vec::with_capacity(64 + messages.len() * 32 + tools.len() * 96);
+            let mut out: Vec<u32> = Vec::with_capacity(64 + messages.len() * 32 + tools.len() * 96);
             out.push(TOK_BOS);
 
             let (system_msg, body) = match messages.first() {
@@ -276,10 +275,8 @@ pub(crate) mod imp {
                     // to pseudo-JSON text then tokenize through the same
                     // `encode_plain` path so `<|tool>` / `<tool|>` / `<|"|>`
                     // resolve via the tokenizer's added_tokens table.
-                    let tool_text = crate::gemma4_tools::imp::render_tool_definitions_text(
-                        tools,
-                    )
-                    .context("render tool definitions text")?;
+                    let tool_text = crate::gemma4_tools::imp::render_tool_definitions_text(tools)
+                        .context("render tool definitions text")?;
                     out.extend(
                         self.encode_plain(&tool_text)
                             .context("encode tool definitions")?,
@@ -388,9 +385,8 @@ pub(crate) mod imp {
                     );
                 }
                 if has_tools {
-                    let tool_text =
-                        crate::gemma4_tools::imp::render_tool_definitions_text(tools)
-                            .context("render tool definitions text")?;
+                    let tool_text = crate::gemma4_tools::imp::render_tool_definitions_text(tools)
+                        .context("render tool definitions text")?;
                     out.extend(
                         self.encode_plain(&tool_text)
                             .context("encode tool definitions")?,
@@ -413,17 +409,13 @@ pub(crate) mod imp {
                     }
                     ChatTurn::User(text) => {
                         out.push(TOK_TURN_OPEN);
-                        out.extend(
-                            self.encode_plain("user\n").context("encode 'user\\n'")?,
-                        );
+                        out.extend(self.encode_plain("user\n").context("encode 'user\\n'")?);
                         out.extend(
                             self.encode_plain(text.trim())
                                 .context("encode user content")?,
                         );
                         out.push(TOK_TURN_CLOSE);
-                        out.extend(
-                            self.encode_plain("\n").context("encode '\\n' after user")?,
-                        );
+                        out.extend(self.encode_plain("\n").context("encode '\\n' after user")?);
                         i += 1;
                     }
                     ChatTurn::Tool { .. } => {
@@ -433,10 +425,7 @@ pub(crate) mod imp {
                     }
                     ChatTurn::Assistant { text, tool_calls } => {
                         out.push(TOK_TURN_OPEN);
-                        out.extend(
-                            self.encode_plain("model\n")
-                                .context("encode 'model\\n'")?,
-                        );
+                        out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             out.extend(
@@ -453,9 +442,7 @@ pub(crate) mod imp {
                         for tc in tool_calls.iter() {
                             out.extend(
                                 self.encode_tool_call(tc.name, tc.arguments)
-                                    .with_context(|| {
-                                        format!("encode tool_call {:?}", tc.name)
-                                    })?,
+                                    .with_context(|| format!("encode tool_call {:?}", tc.name))?,
                             );
                             // Find the next Tool turn that answers this call.
                             // We accept either an exact tool_call_id match or
@@ -472,9 +459,7 @@ pub(crate) mod imp {
                                 out.extend(
                                     self.render_tool_response_block(resolved_name, content)
                                         .with_context(|| {
-                                            format!(
-                                                "render tool_response for {resolved_name:?}"
-                                            )
+                                            format!("render tool_response for {resolved_name:?}")
                                         })?,
                                 );
                                 next += 1;
@@ -494,16 +479,15 @@ pub(crate) mod imp {
                             out.extend(
                                 self.render_tool_response_block(resolved_name, content)
                                     .with_context(|| {
-                                        format!(
-                                            "render trailing tool_response {resolved_name:?}"
-                                        )
+                                        format!("render trailing tool_response {resolved_name:?}")
                                     })?,
                             );
                             next += 1;
                         }
                         out.push(TOK_TURN_CLOSE);
                         out.extend(
-                            self.encode_plain("\n").context("encode '\\n' after model")?,
+                            self.encode_plain("\n")
+                                .context("encode '\\n' after model")?,
                         );
                         i = next;
                     }
@@ -535,11 +519,7 @@ pub(crate) mod imp {
         /// numbers / booleans / arrays raw. Uses the same `format_argument`
         /// serializer the tool-definition renderer uses, with
         /// `escape_keys=false` since tool-call arguments use bare keys.
-        fn encode_tool_call(
-            &self,
-            name: &str,
-            arguments: &serde_json::Value,
-        ) -> Result<Vec<u32>> {
+        fn encode_tool_call(&self, name: &str, arguments: &serde_json::Value) -> Result<Vec<u32>> {
             if name.is_empty() {
                 return Err(anyhow!("encode_tool_call: empty function name"));
             }
