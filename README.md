@@ -8,7 +8,11 @@
 a personal research project. Apple Silicon only. Currently validated:
 
 - `/v1/embeddings` via Qwen3-Embedding-0.6B (MLX 8-bit)
-- `/v1/chat/completions` via Gemma 4 26B-A4B MoE (MLX 3- or 4-bit)
+- `/v1/chat/completions` via Gemma 4 26B-A4B MoE — recommended path is the
+  [**lumen 3-tier family**](#chat-model-gemma-4-26b-a4b-moe) (Standard / Quality /
+  Flagship-KR), custom AWQ + imatrix MLX builds validated across 11 measurement
+  axes. The upstream `mlx-community/gemma-4-26b-a4b-mlx-4bit` and `-3bit`
+  variants also work.
 
 Ships in two forms:
 
@@ -71,7 +75,7 @@ commit on this repo.
 | OS | macOS 14+ |
 | Toolchain | Rust 1.85+ (edition 2024). Install via `rustup`. |
 | Disk | ~50 GB free for a full Gemma 4 26B MoE checkpoint + workspace target/ |
-| Memory | Embedding alone: ~1 GB. Gemma 4 26B-A4B MLX 4-bit: ~22 GB unified memory at steady state. |
+| Memory | Embedding alone: ~1 GB. Gemma 4 26B-A4B lumen Standard (12 GB on disk): runs on 16 GB+ unified memory; ~15 GB peak at 4K context. Quality (14 GB): 24 GB+. Flagship-KR (15 GB): 32 GB+. |
 
 Optional (only if running mlx-lm parity benches or regenerating fixtures):
 
@@ -210,7 +214,36 @@ export EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit
 
 ### Chat model (Gemma 4 26B-A4B MoE)
 
-Download an MLX 4-bit or 3-bit Gemma 4 26B-A4B checkpoint:
+The recommended path is the **lumen 3-tier family** — three custom AWQ + imatrix
+quantizations validated across 11 measurement axes (PPL × 4 corpora + 7 downstream
+tasks: MMLU / ARC / HellaSwag / TruthfulQA / GSM8K / KMMLU / HAERAE):
+
+| Tier | Repo | Size | bpw | Min RAM | Specialty |
+|---|---|---|---|---|---|
+| **Standard** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq) | 12 GB | 4.135 | 16 GB | wikitext / TruthfulQA / GSM8K — best on 24 GB Macs |
+| **Quality** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6) | 14 GB | 4.674 | 24 GB | MMLU / ARC / KMMLU — most balanced knowledge model |
+| **Flagship-KR** | [`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40`](https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40) | 15 GB | 5.057 | 32 GB | HAERAE / Korean chat / lowest tulu PPL |
+
+Download the tier matching your RAM:
+
+```bash
+# Standard (recommended default for 24 GB Macs):
+huggingface-cli download \
+  hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq \
+  --local-dir ~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq
+
+# Quality (32 GB+ Macs, broad knowledge):
+huggingface-cli download \
+  hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6 \
+  --local-dir ~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6
+
+# Flagship-KR (36 GB+ Macs, Korean chat):
+huggingface-cli download \
+  hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40 \
+  --local-dir ~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40
+```
+
+Or use the upstream LM Studio community 4-bit (14 GB, no AWQ, ~7 ppl worse on Tulu PPL):
 
 ```bash
 huggingface-cli download \
@@ -221,9 +254,9 @@ huggingface-cli download \
 Then point either of:
 
 ```bash
-export MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit
+export MODEL_ID=~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq
 # or
-export LUMEN_GEMMA4_DIR=~/models/gemma-4-26b-a4b-mlx-4bit
+export LUMEN_GEMMA4_DIR=~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq
 ```
 
 ---
@@ -233,7 +266,7 @@ export LUMEN_GEMMA4_DIR=~/models/gemma-4-26b-a4b-mlx-4bit
 ```bash
 # Both endpoints enabled:
 EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
-MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
+MODEL_ID=~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq \
   cargo run --release --features mlx-native --bin lumen-server
 ```
 
@@ -534,9 +567,12 @@ intermittent issue when interleaving Candle and mlx kernels on the same
 queue. Restart the server; this happens during shutdown for the most
 part.
 
-**Out-of-memory on Gemma 4** — the 26B-A4B model needs ~22 GB unified
-memory. On 24 GB machines, switch to the 3-bit MLX variant
-(`mlx-community/gemma-4-26b-a4b-mlx-3bit`) which fits in ~16 GB.
+**Out-of-memory on Gemma 4** — the upstream LM Studio 4-bit checkpoint needs
+~22 GB. On 24 GB machines, use the lumen **Standard** tier
+(`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`, 12 GB on disk, ~15 GB peak at
+4K context) — it both fits better and scores higher on multi-angle eval than
+the community 3-bit. The Quality / Flagship-KR tiers want 24 GB+ / 32 GB+
+respectively. See the "Configure models" section for the full tier table.
 
 ---
 

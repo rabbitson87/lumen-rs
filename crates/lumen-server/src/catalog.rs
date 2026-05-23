@@ -110,13 +110,34 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 20,
         notes: "Gemma 4 26B MoE, ~4B active per token. 4-bit quant — balanced quality. Community build by LM Studio.",
     },
+    // Lumen Gemma 4 26B-A4B 3-tier family — pick the tier matching the host RAM and
+    // workload. Multi-angle eval (PPL × 4 corpora + 7 downstream tasks: MMLU, ARC,
+    // HellaSwag, TruthfulQA, GSM8K, KMMLU, HAERAE) confirms each tier has a distinct
+    // specialty: Standard wins English narrative + factual + CoT-math, Quality wins
+    // broad knowledge + balanced, Flagship-KR wins Korean chat + lowest tulu PPL.
     RecommendedModel {
         id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (imatrix3plus + AWQ, hsng95)",
+        label: "Gemma 4 — 26B A4B Standard (HIGH=4, hsng95)",
         approx_size_gb: 12,
         min_ram_gb: 16,
-        notes: "Mixed 4/3-bit AFFINE imatrix + AWQ per-channel scaling (Option B mean_sq proxy, mlp_down absorption groups filtered out, embed_tokens at AFFINE 8-bit). 12 GB on disk, 3.916 bpw. 3-seed mean PPL is 16.2 ppl better than the no-AWQ imatrix3plus baseline (67.98 vs 84.19 on tulu-3-sft-mixture) AND decode is faster than uniform 4-bit (73 vs 71 tok/s on M3 Max). 11K Korean long-context CLEAN on greedy + sampled.",
+        notes: "Standard tier — 12 GB, 4.135 bpw. Mixed 4/3-bit AFFINE imatrix + AWQ Option B (mean_sq), mlp_down groups dropped, embed_tokens at AFFINE 8-bit. Best for 24 GB Macs. Wins multi-angle eval on wikitext / TruthfulQA / GSM8K chain-of-thought. 11K Korean long-context CLEAN.",
+    },
+    RecommendedModel {
+        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — 26B A4B Quality (HIGH=6, hsng95)",
+        approx_size_gb: 14,
+        min_ram_gb: 24,
+        notes: "Quality tier — 14 GB, 4.674 bpw. Top sensitivity tier elevated to 6-bit AFFINE on top of Standard recipe. 3-seed mean Tulu PPL 62.68 (vs Standard 66.86, Δ −4.18). Wins multi-angle eval on MMLU / ARC / KMMLU — most balanced knowledge model. Recommended default for 32 GB+ Macs.",
+    },
+    RecommendedModel {
+        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — 26B A4B Flagship-KR (HIGH=6 + top4=0.40, hsng95)",
+        approx_size_gb: 15,
+        min_ram_gb: 32,
+        notes: "Flagship Korean tier — 15 GB, 5.057 bpw. HIGH=6 with top4_fraction=0.40 (40% tensors at 6-bit). 3-seed mean Tulu PPL 57.85 (vs Standard 66.86, Δ −9.01) — lowest-PPL MLX-loadable Gemma 4 26B-A4B build available. Wins HAERAE Korean knowledge (0.752) + tulu PPL. Korean chat flagship. Requires 36 GB+ for ≥8K context.",
     },
 ];
 
