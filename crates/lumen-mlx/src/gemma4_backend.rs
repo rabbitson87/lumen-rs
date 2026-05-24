@@ -234,6 +234,16 @@ pub(crate) mod imp {
             &self.model
         }
 
+        /// Load the Gemma 4 assistant drafter from `drafter_dir` and enable
+        /// MTP speculative decoding. Returns `Ok(true)` when the drafter
+        /// passes the trunk/drafter `backbone_hidden_size` compatibility
+        /// check and is wired in. After this call, requests routed through
+        /// `chat_streaming` (greedy) will use `mtp_step()` whenever
+        /// `LUMEN_GEMMA4_MTP=1` is set.
+        pub fn try_enable_mtp(&mut self, drafter_dir: &std::path::Path) -> Result<bool> {
+            self.model.try_enable_mtp(drafter_dir)
+        }
+
         pub fn chat_template(&self) -> &Gemma4ChatTemplate {
             &self.chat
         }
@@ -851,6 +861,124 @@ pub(crate) mod imp {
                 }
                 let eos = self.model.eos_tokens().to_vec();
 
+                let sampling_cfg = build_sampling_config(temperature, top_p);
+
+                // ── MTP decode branch (DEFAULT OFF — opt-in only) ──
+                //
+                // ⚠️  PERF WARNING: measured NET LOSS −51% on Apple Silicon
+                // M3 Max batch=1 with Korean conversational workload
+                // (77.8 → 37.4 tok/s decode, accept 19.8% at n_draft=6,
+                // 256-token output). See memory
+                // `gemma4_mtp_chat_path_default_off_2026_05_24.md` for the
+                // full measurement + root-cause analysis.
+                //
+                // ⚠️  GREEDY NON-IDENTICAL by design: OFF path uses the
+                // custom-FA-2 attention kernel on full-attn layers (5-10%
+                // faster) while mtp_step internally forces mlx::fast::sdpa
+                // (so Step A's S=1 and Step C's S=K+1 stay on the same
+                // kernel for accept-rate sanity). The ~1-ULP kernel drift
+                // means OFF and ON produce different greedy continuations
+                // even at temperature=0. See gemma4_moe.rs:4820 +
+                // `mtp_active` flag.
+                //
+                // STRUCTURAL LIMIT (external evidence): Apple Silicon
+                // batch=1 + 26B-A4B MoE + spec decode rarely net-positive.
+                // Best published M-series batch=1 number is +13% (M1 Max
+                // code prompt, accept ~60%, lilting.ch). Korean
+                // conversational n_draft=6 falls far below that. Likely
+                // useful regimes: (a) batch ≥ 2 server scenarios, (b)
+                // dense model class, (c) extremely repetitive workloads
+                // (code completion). For Mac mini single-user agent
+                // deploy, leave default OFF.
+                //
+                // Mirrors `NativeGemma4Model::generate`'s MTP path
+                // (gemma4_moe.rs:6076). Routes through `mtp_step()`
+                // (Step A→E speculative decoding); each call yields up
+                // to `n_draft + 2` tokens.
+                //
+                // Gate: greedy only (`sampling_cfg.is_none()`), drafter
+                // loaded via `try_enable_mtp()` at startup, AND
+                // `LUMEN_GEMMA4_MTP=1` explicit opt-in. Falls through to
+                // the existing sampled / greedy branches otherwise —
+                // bit-identical to v0.4.3 when env is unset.
+                if sampling_cfg.is_none()
+                    && self.model.mtp_enabled()
+                    && NativeGemma4Model::mtp_decode_enabled_env()
+                {
+                    let n_draft = NativeGemma4Model::mtp_block_size_env();
+                    let t_decode = std::time::Instant::now();
+                    // Sync-read the prefill argmax (already async_eval'd).
+                    let mut current_u32 = self
+                        .model
+                        .read_token_u32(&current)
+                        .context("chat_streaming(mtp): read prefill first token")?;
+                    let mut all_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
+                    all_tokens.push(current_u32);
+                    let state_before = parser.state();
+                    parser.push(current_u32)?;
+                    emit_token_event(
+                        &self.chat,
+                        &mut parser,
+                        current_u32,
+                        state_before,
+                        &mut on_event,
+                    )?;
+                    let mut hit_eos = eos.contains(&current_u32);
+                    let mut n_cycles: usize = 0;
+                    let mut accepted_total: usize = 0;
+                    let mut attempted_total: usize = 0;
+                    while all_tokens.len() < max_new_tokens && !hit_eos {
+                        let out = self
+                            .model
+                            .mtp_step(&mut cache, current_u32, n_draft)
+                            .with_context(|| {
+                                format!("chat_streaming(mtp): mtp_step cycle {n_cycles}")
+                            })?;
+                        n_cycles += 1;
+                        accepted_total += out.n_accepted;
+                        attempted_total += out.n_attempted;
+                        for tok in &out.committed {
+                            if all_tokens.len() >= max_new_tokens {
+                                break;
+                            }
+                            all_tokens.push(*tok);
+                            let state_before = parser.state();
+                            parser.push(*tok)?;
+                            emit_token_event(
+                                &self.chat,
+                                &mut parser,
+                                *tok,
+                                state_before,
+                                &mut on_event,
+                            )?;
+                            if eos.contains(tok) {
+                                hit_eos = true;
+                                break;
+                            }
+                        }
+                        // The last committed entry is the next call's input
+                        // (correction on partial reject / bonus on full
+                        // accept). Mirrors generate(MTP)'s loop.
+                        current_u32 = *out
+                            .committed
+                            .last()
+                            .expect("chat_streaming(mtp): mtp_step committed non-empty");
+                    }
+                    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+                    let count = all_tokens.len();
+                    let accept_rate = if attempted_total > 0 {
+                        100.0 * accepted_total as f64 / attempted_total as f64
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[gemma4-mtp] chat decode: {count} tokens in {n_cycles} cycles \
+                         accept={accepted_total}/{attempted_total} ({accept_rate:.1}%) n_draft={n_draft}"
+                    );
+                    log_chat_done(prefill_prompt_tokens, prefill_total_ms, count, decode_ms);
+                    return parser.finalize();
+                }
+
                 // ── Sampled decode branch ──
                 //
                 // When request triggers non-greedy sampling
@@ -862,7 +990,6 @@ pub(crate) mod imp {
                 // at vocab 262144 vs ~30 ms GPU step time, so the net
                 // impact is < 5%. The greedy path below stays bit-
                 // identical when sampling is disabled.
-                let sampling_cfg = build_sampling_config(temperature, top_p);
                 if let Some(sampling) = sampling_cfg {
                     use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
                     let mut rng = Xorshift64::new(sampling.seed);

@@ -465,8 +465,8 @@ pub fn hf_client(timeout: Option<std::time::Duration>) -> Result<reqwest::Client
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    let mut builder = reqwest::Client::builder()
-        .user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")));
+    let mut builder =
+        reqwest::Client::builder().user_agent(concat!("lumen-app/", env!("CARGO_PKG_VERSION")));
     if let Some(d) = timeout {
         builder = builder.timeout(d);
     }

@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 
 #[cfg(feature = "mlx-native")]
 fn main() -> Result<()> {
-    use lumen_mlx::gemma4::Gemma4Backend;
+    use lumen_mlx::chat_io::ResolvedToolChoice;
+    use lumen_mlx::gemma4::{Gemma4Backend, ToolDef};
 
     let model_id = std::env::var("MODEL_ID")
         .unwrap_or_else(|_| "/path/to/models/gemma-4-26b-a4b-mlx-3bit".into());
@@ -62,6 +63,8 @@ fn main() -> Result<()> {
 
     let max_new_tokens = 200;
     let prefix_key = "moltis-sports-batch-001";
+    let tools: &[ToolDef<'_>] = &[];
+    let tool_choice = ResolvedToolChoice::Auto;
 
     println!("\n=== Gemma4Backend prefix_cache end-to-end smoke ===\n");
     for (i, query) in queries.iter().enumerate() {
@@ -79,6 +82,8 @@ fn main() -> Result<()> {
                 /* top_p */ 1.0,
                 /* thinking */ false,
                 prefix_key,
+                tools,
+                &tool_choice,
             )
             .with_context(|| format!("request {} failed", i + 1))?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1e3;

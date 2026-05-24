@@ -1447,6 +1447,29 @@ pub(crate) mod imp {
                     }
                 }
             }
+            // `LUMEN_GEMMA4_TOP_K` overrides the MoE router's top-k expert
+            // count at load time. Quality knob — model was trained at k=8;
+            // lowering to k=4 ~halves expert FFN compute per token but may
+            // degrade output. Use for A/B measurement; ship only after
+            // multi-axis quality eval (HAERAE / KMMLU / GSM8K).
+            if let Ok(s) = std::env::var("LUMEN_GEMMA4_TOP_K") {
+                if let Ok(n) = s.parse::<usize>() {
+                    if n > 0 && n <= cfg.text_config.num_experts {
+                        if n != cfg.text_config.top_k_experts {
+                            eprintln!(
+                                "[gemma4] top_k_experts overridden via LUMEN_GEMMA4_TOP_K: {} → {n}",
+                                cfg.text_config.top_k_experts
+                            );
+                            cfg.text_config.top_k_experts = n;
+                        }
+                    } else {
+                        eprintln!(
+                            "[gemma4] LUMEN_GEMMA4_TOP_K={n} ignored (must be 1..={}, got {n})",
+                            cfg.text_config.num_experts
+                        );
+                    }
+                }
+            }
             Ok(cfg)
         }
 
@@ -2249,9 +2272,11 @@ pub(crate) mod imp {
             self.layers.len()
         }
 
-        /// MTP rollback hook — truncate this cache's offset to `target`.
-        /// Errors on quantized caches (Phase 4). Lossy for sliding cache if
-        /// the rolled-back range crossed a rotation boundary (Phase 3 limit).
+        /// MTP / prefix-cache rollback hook — truncate this cache's offset
+        /// to `target`. Quantized caches dispatch to their own `truncate_to`
+        /// (step-prealloc only — see [`NativeKvCacheQuantized::truncate_to`]
+        /// for the legacy-concat constraint). Lossy for any rotating cache
+        /// if the rolled-back range crossed a sliding-window rotation.
         pub fn truncate_to(&mut self, target: usize) -> Result<()> {
             for (i, lc) in self.layers.iter_mut().enumerate() {
                 match lc {
@@ -2261,14 +2286,15 @@ pub(crate) mod imp {
                     NativeGemma4LayerCache::Full(c) => c
                         .truncate_to(target)
                         .with_context(|| format!("layer {i} full truncate"))?,
-                    NativeGemma4LayerCache::FullQuantized(_)
-                    | NativeGemma4LayerCache::SlidingQuantized(_)
-                    | NativeGemma4LayerCache::SlidingTurboquant(_) => {
-                        return Err(anyhow!(
-                            "truncate_to: layer {i} is quantized — MTP rollback only \
-                             supports bf16 caches in Phase 3"
-                        ));
-                    }
+                    NativeGemma4LayerCache::FullQuantized(c) => c
+                        .truncate_to(target)
+                        .with_context(|| format!("layer {i} full quantized truncate"))?,
+                    NativeGemma4LayerCache::SlidingQuantized(c) => c
+                        .truncate_to(target)
+                        .with_context(|| format!("layer {i} sliding quantized truncate"))?,
+                    NativeGemma4LayerCache::SlidingTurboquant(c) => c
+                        .truncate_to(target)
+                        .with_context(|| format!("layer {i} sliding turboquant truncate"))?,
                 }
             }
             Ok(())

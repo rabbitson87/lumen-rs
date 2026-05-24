@@ -375,6 +375,47 @@ mod imp {
             self.offset = 0;
         }
 
+        /// Prefix-cache rollback hook. Mirrors `NativeKvCache::truncate_to`:
+        /// the buffer stays put (step-prealloc grows in 256-token blocks so
+        /// `keys/values` already over-allocate past `offset`); we just lower
+        /// the logical offset. The next `update_and_fetch` writes at the new
+        /// offset and overwrites the stale slots. Force-evaluates outstanding
+        /// concat ops so the rewound write sees a settled buffer.
+        ///
+        /// Errors on the legacy concat path because there `keys/values`
+        /// shape == offset, and lowering offset without slicing would leave
+        /// the buffer pointing at unrelated data on the next concat. Callers
+        /// that rely on prefix cache must keep step-prealloc enabled
+        /// (`LUMEN_NATIVE_KV_STEP_PREALLOC` default).
+        pub fn truncate_to(&mut self, target: usize) -> Result<()> {
+            if target > self.offset {
+                return Err(anyhow!(
+                    "NativeKvCacheQuantized::truncate_to: target {target} > offset {}",
+                    self.offset
+                ));
+            }
+            if target == self.offset {
+                return Ok(());
+            }
+            if !use_step_prealloc() {
+                return Err(anyhow!(
+                    "NativeKvCacheQuantized::truncate_to: legacy concat path \
+                     does not support truncate (buffer shape == offset). \
+                     Enable step-prealloc to use prefix cache + QUANT_KV."
+                ));
+            }
+            if let (Some((kp, ks, kb)), Some((vp, vs, vb))) =
+                (self.keys.as_ref(), self.values.as_ref())
+            {
+                for arr in [kp, ks, kb, vp, vs, vb] {
+                    arr.eval()
+                        .context("NativeKvCacheQuantized::truncate_to: eval triple component")?;
+                }
+            }
+            self.offset = target;
+            Ok(())
+        }
+
         /// Append `keys` / `values` (bf16 shape `[B, n_kv_heads, S, head_dim]`)
         /// after quantizing them. Returns the concatenated quantized cache as
         /// two 3-tuples ready for `quantized_matmul`.
@@ -1024,6 +1065,45 @@ mod imp {
             self.idx = 0;
         }
 
+        /// Prefix-cache rollback hook. Same shape as
+        /// `NativeRotatingKvCache::truncate_to` (rotation guard +
+        /// offset/idx rewind), but evals the 6 triple components instead
+        /// of 2 dense arrays. Pre-rotation only — post-rotation rollback
+        /// is unsafe because the rolled-back range may have overwritten
+        /// the oldest tokens of the prior window.
+        pub fn truncate_to(&mut self, target: usize) -> Result<()> {
+            if target > self.offset {
+                return Err(anyhow!(
+                    "NativeRotatingKvCacheQuantized::truncate_to: target {target} > offset {}",
+                    self.offset
+                ));
+            }
+            if target == self.offset {
+                return Ok(());
+            }
+            if self.offset > self.max_size {
+                return Err(anyhow!(
+                    "NativeRotatingKvCacheQuantized::truncate_to: post-rotation rollback \
+                     not supported (offset={} > max_size={}). Prefix cache must keep \
+                     prompts ≤ sliding_window.",
+                    self.offset,
+                    self.max_size
+                ));
+            }
+            if let (Some((kp, ks, kb)), Some((vp, vs, vb))) =
+                (self.keys.as_ref(), self.values.as_ref())
+            {
+                for arr in [kp, ks, kb, vp, vs, vb] {
+                    arr.eval().context(
+                        "NativeRotatingKvCacheQuantized::truncate_to: eval triple component",
+                    )?;
+                }
+            }
+            self.offset = target;
+            self.idx = target;
+            Ok(())
+        }
+
         /// Append `keys` / `values` (bf16, shape `[B, n_kv_heads, S, head_dim]`)
         /// after quantizing them. Returns the in-ring quantized cache as two
         /// 3-tuples ready for `quantized_matmul`.
@@ -1438,6 +1518,48 @@ mod imp {
             self.values_sigma = None;
             self.offset = 0;
             self.idx = 0;
+        }
+
+        /// Prefix-cache rollback hook for TurboQuant Stage-1 (+ optional
+        /// Stage-2 QJL) caches. Mirrors `NativeRotatingKvCacheQuantized`:
+        /// pre-rotation only, evals all ring slots before rewinding
+        /// `offset`/`idx`. QJL slots (`keys_signs` / `keys_residual_norm`)
+        /// are evaluated when present so Stage-2 cache stays in sync.
+        pub fn truncate_to(&mut self, target: usize) -> Result<()> {
+            if target > self.offset {
+                return Err(anyhow!(
+                    "NativeRotatingKvCacheTurboQuant::truncate_to: target {target} > offset {}",
+                    self.offset
+                ));
+            }
+            if target == self.offset {
+                return Ok(());
+            }
+            if self.offset > self.max_size {
+                return Err(anyhow!(
+                    "NativeRotatingKvCacheTurboQuant::truncate_to: post-rotation rollback \
+                     not supported (offset={} > max_size={}).",
+                    self.offset,
+                    self.max_size
+                ));
+            }
+            for arr in [
+                self.keys_codes.as_ref(),
+                self.keys_sigma.as_ref(),
+                self.values_codes.as_ref(),
+                self.values_sigma.as_ref(),
+                self.keys_signs.as_ref(),
+                self.keys_residual_norm.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                arr.eval()
+                    .context("NativeRotatingKvCacheTurboQuant::truncate_to: eval ring slot")?;
+            }
+            self.offset = target;
+            self.idx = target;
+            Ok(())
         }
 
         /// Insert pre-quantized `(k_codes, k_sigma, v_codes, v_sigma)` and

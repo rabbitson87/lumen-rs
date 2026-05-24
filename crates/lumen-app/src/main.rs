@@ -38,7 +38,9 @@ fn main() {
     };
     match hf_token_src {
         Some(name) => {
-            eprintln!("[lumen-app] HuggingFace token detected via ${name} — gated repos accessible");
+            eprintln!(
+                "[lumen-app] HuggingFace token detected via ${name} — gated repos accessible"
+            );
         }
         None => {
             eprintln!(

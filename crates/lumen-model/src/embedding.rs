@@ -198,9 +198,10 @@ impl EmbeddingModel {
     fn smoke_check(&mut self) -> Result<()> {
         let probe = vec!["hello 안녕".to_string()];
         let batch = self.embed(&probe).context("smoke probe embed failed")?;
-        let v = batch.embeddings.first().ok_or_else(|| {
-            anyhow!("smoke probe: embed returned 0 vectors (expected 1)")
-        })?;
+        let v = batch
+            .embeddings
+            .first()
+            .ok_or_else(|| anyhow!("smoke probe: embed returned 0 vectors (expected 1)"))?;
         let nan = v.iter().filter(|x| !x.is_finite()).count();
         if nan != 0 {
             return Err(anyhow!(
@@ -221,10 +222,7 @@ impl EmbeddingModel {
                  (expected ≈ 1.0 since EmbeddingModel L2-normalizes its output)"
             ));
         }
-        eprintln!(
-            "[embedding] smoke probe OK (dim={}, l2={l2:.3})",
-            v.len()
-        );
+        eprintln!("[embedding] smoke probe OK (dim={}, l2={l2:.3})", v.len());
         Ok(())
     }
 

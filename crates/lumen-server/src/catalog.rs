@@ -139,6 +139,20 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 32,
         notes: "Flagship Korean tier — 15 GB, 5.057 bpw. HIGH=6 with top4_fraction=0.40 (40% tensors at 6-bit). 3-seed mean Tulu PPL 57.85 (vs Standard 66.86, Δ −9.01) — lowest-PPL MLX-loadable Gemma 4 26B-A4B build available. Wins HAERAE Korean knowledge (0.752) + tulu PPL. Korean chat flagship. Requires 36 GB+ for ≥8K context.",
     },
+    // Custom Korean-tuned build — Flagship-KR with 961 dormant MoE experts (25% of
+    // 3840 total cells) pruned via workload-specific imatrix routing analysis.
+    // Per-layer variable expert count (79~117) — requires lumen-mlx native loader
+    // (auto-handled here) or the mlx_lm DecoderLayer patch. Korean axes preserved
+    // within stderr (HAERAE 0.683 vs Flagship 0.687); English fact / math degraded
+    // (TruthfulQA −13%, GSM8K −80%) — Korean-first trade-off.
+    RecommendedModel {
+        id: "hsng95/gemma-4-26b-a4b-mlx-fit-korean",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — 26B A4B Fit-Korean (custom, hsng95)",
+        approx_size_gb: 11,
+        min_ram_gb: 24,
+        notes: "**Custom Korean-tuned build** — Flagship-KR with 961 dormant MoE experts pruned (25% of cells). 11 GB / 5.057 bpw base. Korean axes preserved (HAERAE 0.683 within stderr of Flagship 0.687), English commonsense within stderr (HellaSwag-norm 0.395). Mac mini 24 GB stable. Trade-off: English ARC/TruthfulQA −13~14%, math CoT (GSM8K) −80%. HF model card: https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-fit-korean",
+    },
 ];
 
 /// Recommended embedding models. Curated list of Qwen3-Embedding family —
