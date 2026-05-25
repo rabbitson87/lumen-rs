@@ -1917,6 +1917,15 @@ pub(crate) mod imp {
         /// original space so SDPA output → o_proj path is unchanged.
         /// Opt-in via `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=1`.
         SlidingTurboquant(NativeRotatingKvCacheTurboQuant),
+        /// TurboQuant Stage-1 **full-attention** cache (2026-05-26). Same
+        /// math as `SlidingTurboquant` but `max_size = max_position_embeddings`
+        /// so the rotation never fires under normal operation — behaves as a
+        /// step-prealloc append-only buffer. Opt-in via
+        /// `LUMEN_GEMMA4_TQ_FULL_ATTN=1` (also requires `LUMEN_GEMMA4_TQ_MODE`
+        /// = on or auto). Designed for the long-context BW-bound regime
+        /// where full-attn KV grows unbounded — compression's ROI scales
+        /// with context length while dispatch overhead stays constant.
+        FullTurboquant(NativeRotatingKvCacheTurboQuant),
     }
 
     impl NativeGemma4LayerCache {
@@ -1927,6 +1936,7 @@ pub(crate) mod imp {
                 NativeGemma4LayerCache::FullQuantized(c) => c.offset(),
                 NativeGemma4LayerCache::SlidingQuantized(c) => c.offset(),
                 NativeGemma4LayerCache::SlidingTurboquant(c) => c.offset(),
+                NativeGemma4LayerCache::FullTurboquant(c) => c.offset(),
             }
         }
 
@@ -1937,6 +1947,7 @@ pub(crate) mod imp {
                 NativeGemma4LayerCache::FullQuantized(c) => c.offset(),
                 NativeGemma4LayerCache::SlidingQuantized(c) => c.cached_len(),
                 NativeGemma4LayerCache::SlidingTurboquant(c) => c.cached_len(),
+                NativeGemma4LayerCache::FullTurboquant(c) => c.cached_len(),
             }
         }
 
@@ -1947,6 +1958,7 @@ pub(crate) mod imp {
                 NativeGemma4LayerCache::FullQuantized(c) => c.empty(),
                 NativeGemma4LayerCache::SlidingQuantized(c) => c.empty(),
                 NativeGemma4LayerCache::SlidingTurboquant(c) => c.empty(),
+                NativeGemma4LayerCache::FullTurboquant(c) => c.empty(),
             }
         }
 
@@ -1957,6 +1969,7 @@ pub(crate) mod imp {
                 NativeGemma4LayerCache::FullQuantized(c) => c.clear(),
                 NativeGemma4LayerCache::SlidingQuantized(c) => c.clear(),
                 NativeGemma4LayerCache::SlidingTurboquant(c) => c.clear(),
+                NativeGemma4LayerCache::FullTurboquant(c) => c.clear(),
             }
         }
 
@@ -2114,6 +2127,22 @@ pub(crate) mod imp {
         }
     }
 
+    /// Apply TurboQuant Stage-1 quantization to the **full-attention** layers
+    /// (5 of 30 in Gemma 4 26B-A4B) in addition to / instead of the sliding
+    /// layers. Default OFF. Independent of [`Gemma4TqMode`] —
+    /// `LUMEN_GEMMA4_TQ_FULL_ATTN=1` opts in regardless of whether sliding
+    /// TQ is on, because full-attn TQ has a different ROI profile (BW
+    /// scales with context, sliding KV is BW-capped at the window size).
+    ///
+    /// Allocation honors the `tq_mode` gate — if mode is Off, no TQ at
+    /// any layer kind. If mode is On / Auto-triggered, this env decides
+    /// whether full-attn layers also get the TurboQuant cache.
+    pub fn gemma4_tq_full_attn_enabled() -> bool {
+        std::env::var("LUMEN_GEMMA4_TQ_FULL_ATTN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
     /// QJL Stage-2 (1-bit residual correction) on top of the TurboQuant
     /// Stage-1 sliding cache. Requires
     /// `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=1` to take effect.
@@ -2195,12 +2224,37 @@ pub(crate) mod imp {
                     Gemma4TqMode::Auto => false,
                 }
             });
+            let tq_full_attn = quant_kv_sliding_tq && gemma4_tq_full_attn_enabled();
             let layers: Vec<NativeGemma4LayerCache> = cfg
                 .layer_types
                 .iter()
                 .map(|kind| match kind {
                     NativeGemma4LayerType::FullAttention => {
-                        if quant_kv {
+                        if tq_full_attn {
+                            // Full-attn TurboQuant: same Lloyd-Max + rotation
+                            // math as sliding, but with `max_size` set to the
+                            // configured context cap so the ring rotation
+                            // never fires (acts as a step-prealloc append-
+                            // only buffer). The 5 full-attn layers are the
+                            // BW-bound target — KV grows linearly with
+                            // context, so compression's ROI scales while
+                            // dispatch overhead is constant.
+                            let bits: u32 =
+                                std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(4);
+                            let max_ctx = cfg.max_position_embeddings.max(1);
+                            let cache =
+                                NativeRotatingKvCacheTurboQuant::new(max_ctx, 0, bits);
+                            let cache = if gemma4_quant_kv_sliding_turboquant_qjl_enabled() {
+                                let qjl_m = gemma4_quant_kv_sliding_turboquant_qjl_m(cfg.head_dim);
+                                cache.with_qjl(qjl_m)
+                            } else {
+                                cache
+                            };
+                            NativeGemma4LayerCache::FullTurboquant(cache)
+                        } else if quant_kv {
                             NativeGemma4LayerCache::FullQuantized(NativeKvCacheQuantized::new(
                                 64, 4,
                             ))
@@ -2295,6 +2349,9 @@ pub(crate) mod imp {
                     NativeGemma4LayerCache::SlidingTurboquant(c) => c
                         .truncate_to(target)
                         .with_context(|| format!("layer {i} sliding turboquant truncate"))?,
+                    NativeGemma4LayerCache::FullTurboquant(c) => c
+                        .truncate_to(target)
+                        .with_context(|| format!("layer {i} full turboquant truncate"))?,
                 }
             }
             Ok(())
@@ -2366,7 +2423,8 @@ pub(crate) mod imp {
                 }
                 NativeGemma4LayerCache::FullQuantized(_)
                 | NativeGemma4LayerCache::SlidingQuantized(_)
-                | NativeGemma4LayerCache::SlidingTurboquant(_) => Err(anyhow!(
+                | NativeGemma4LayerCache::SlidingTurboquant(_)
+                | NativeGemma4LayerCache::FullTurboquant(_) => Err(anyhow!(
                     "layer_kv_bf16: layer {layer_idx} cache is quantized; MTP currently \
                      requires bf16 caches (no quant). Disable LUMEN_GEMMA4_QUANT_KV* or wait \
                      for the Phase 4 dequant fallback."
@@ -3385,6 +3443,13 @@ pub(crate) mod imp {
             self.mtp.is_some()
         }
 
+        /// TQ rotation-bake state set at load time. `(bake_v, bake_o)`.
+        /// Exposed so the startup log can surface whether the runtime V
+        /// rotation matmul + V_dq un-rotation are actually being skipped.
+        pub fn tq_bake_state(&self) -> (bool, bool) {
+            (self.tq_bake_v_active, self.tq_bake_o_active)
+        }
+
         /// Toggle the MTP capture hook in `forward_array_impl`. When set,
         /// the next forward call stashes a clone of the post-final-norm
         /// hidden into `mtp_capture_slot` for `mtp_step()` to consume via
@@ -4247,7 +4312,12 @@ pub(crate) mod imp {
             // space so SDPA output flows straight to o_proj). Decode dispatch
             // uses bf16 SDPA on dequantized K/V (not quantized_matmul, which
             // doesn't fit Lloyd-Max codebook semantics).
-            if let NativeGemma4LayerCache::SlidingTurboquant(c) = cache {
+            let tq_cache = match cache {
+                NativeGemma4LayerCache::SlidingTurboquant(c) => Some(c),
+                NativeGemma4LayerCache::FullTurboquant(c) => Some(c),
+                _ => None,
+            };
+            if let Some(c) = tq_cache {
                 let centroids = crate::turboquant::lloyd_max_centroids(c.bits())?;
 
                 // ── Diagnostic env gates (Stage 1 root-cause bisection) ──
@@ -4302,8 +4372,16 @@ pub(crate) mod imp {
                 // absorbed there → skip the runtime un-rotation. Each
                 // leg is independently gated so we can isolate which side
                 // of the bake is responsible if quality regresses.
-                let bake_v = self.tq_bake_v_active;
-                let bake_o = self.tq_bake_o_active;
+                // Bake state is per-LAYER-KIND. The load-time bake loop
+                // applies the Wv/Wo rotation only to sliding-attention layers
+                // (see `bake_r_into_v_proj` / `bake_r_into_o_proj` callsites);
+                // full-attention layers' Wv/Wo are untouched. So for the
+                // FullTurboquant branch, ignore the model-wide bake flags —
+                // V must be rotated at runtime AND V_dq must be un-rotated
+                // before o_proj (Wo has no R baked in to absorb it).
+                let is_sliding_layer = matches!(kind, NativeGemma4LayerType::SlidingAttention);
+                let bake_v = self.tq_bake_v_active && is_sliding_layer;
+                let bake_o = self.tq_bake_o_active && is_sliding_layer;
                 let rotate_v = !skip_v_rotate && !bake_v;
                 let unrotate_v_dq = !skip_v_rotate && !bake_o;
 
@@ -4312,49 +4390,81 @@ pub(crate) mod imp {
                     crate::turboquant::TURBOQUANT_SEED,
                 )?;
 
-                let (k_rot, q_rot) = if skip_k_rotate {
-                    (k_rope.clone(), q_rope.clone())
-                } else {
-                    // Rotate K (write side) + Q (read side).
-                    let k_rot = crate::turboquant::rotate_last_axis(&k_rope, &r_arr)?;
-                    let q_rot = crate::turboquant::rotate_last_axis(&q_rope, &r_arr)?;
-                    (k_rot, q_rot)
-                };
+                // QJL on/off is needed BEFORE the K encode dispatch because
+                // K rot+encode fusion is only safe when QJL Stage-2 is off
+                // (Stage-2 reads k_rot to compute the residual K - K_dq, and
+                // the fused kernel doesn't materialize k_rot).
+                let qjl_m = c.qjl_m();
 
                 // Lloyd-Max quantize K (rotated) and V (un-rotated). Fused
                 // kernel collapses σ + normalize + encode into one dispatch;
                 // env gate `LUMEN_GEMMA4_TQ_FUSED_ENCODE=0` falls back to the
                 // non-fused multi-op chain for A/B comparison.
                 //
-                // V-side super-fusion: `LUMEN_GEMMA4_TQ_FUSED_VROT=1`
-                // bakes V's rotation matmul into the encode kernel —
-                // `(V @ R) → σ → encode` in one dispatch. Skips the bf16
-                // V_rot intermediate plus the separate matmul + cast
-                // dispatches. K cannot use this path because K_rot is
-                // also consumed by the QJL Stage-2 residual computation.
+                // **Super-fusion gates (default OFF — A/B opt-in)**:
                 //
-                // **Default OFF (NEGATIVE A/B 2026-05-17)**: 3-pair cool
-                // 8K decode showed -5% regression vs (rotate_last_axis;
-                // encode_fused). mlx's standalone matmul (steel_gemm /
-                // simdgroup_matrix tiles) beats our naive in-kernel
-                // per-thread dot product — fewer dispatches doesn't
-                // automatically win when the matmul implementation
-                // quality differs. Code retained behind the env gate so
-                // future iterations (simdgroup_matrix tiles, register-tile
-                // GEMM) can re-attempt without re-plumbing 5 layers.
+                // `LUMEN_GEMMA4_TQ_FUSED_VROT=1` collapses
+                //   `(V @ R) → σ → encode` into one Metal kernel. Skips the
+                //   bf16 V_rot intermediate plus the matmul + 2 cast
+                //   dispatches per layer. NEGATIVE A/B 2026-05-17 at 8K
+                //   showed −5% (mlx steel_gemm beat the in-kernel naive
+                //   per-thread dot product). Worth retesting at long ctx
+                //   where dispatch overhead dominates.
+                //
+                // `LUMEN_GEMMA4_TQ_FUSED_KROT=1` (added 2026-05-25) does the
+                //   same for K — only valid when QJL Stage-2 is OFF (Stage-2
+                //   reads k_rot for the residual; fused kernel discards it).
+                //   Saves matmul + 2 casts × 25 sliding layers per step
+                //   when long-context decode is dispatch-bound.
+                //
+                // Both retained behind env gates so future iterations
+                // (simdgroup_matrix tiles, register-tile GEMM) can re-attempt
+                // the trade without re-plumbing the SDPA path.
                 let use_fused = std::env::var("LUMEN_GEMMA4_TQ_FUSED_ENCODE")
                     .map(|s| s != "0")
                     .unwrap_or(true);
+                let fuse_k_rotate = use_fused
+                    && !skip_k_rotate
+                    && qjl_m.is_none()
+                    && std::env::var("LUMEN_GEMMA4_TQ_FUSED_KROT")
+                        .map(|s| s == "1")
+                        .unwrap_or(false);
                 let fuse_v_rotate = use_fused
                     && rotate_v
                     && std::env::var("LUMEN_GEMMA4_TQ_FUSED_VROT")
                         .map(|s| s == "1")
                         .unwrap_or(false);
 
-                let (k_codes, k_sigma) = if use_fused {
-                    crate::turboquant::lloyd_max_quantize_stage1_fused(&k_rot, &centroids)?
+                // Q is always rotated separately (its result feeds qk_inline /
+                // SDPA, not the encode kernel). When `fuse_k_rotate` is on,
+                // k_rot is not materialized — only Q rotation runs through the
+                // explicit `rotate_last_axis` path.
+                let (k_rot_opt, q_rot) = if skip_k_rotate {
+                    (Some(k_rope.clone()), q_rope.clone())
+                } else if fuse_k_rotate {
+                    // k_rot stays inside the fused encode kernel.
+                    let q_rot = crate::turboquant::rotate_last_axis(&q_rope, &r_arr)?;
+                    (None, q_rot)
                 } else {
-                    crate::turboquant::lloyd_max_quantize_stage1(&k_rot, &centroids)?
+                    let k_rot = crate::turboquant::rotate_last_axis(&k_rope, &r_arr)?;
+                    let q_rot = crate::turboquant::rotate_last_axis(&q_rope, &r_arr)?;
+                    (Some(k_rot), q_rot)
+                };
+
+                let (k_codes, k_sigma) = if fuse_k_rotate {
+                    // (K @ R) + σ + encode in one Metal kernel.
+                    crate::turboquant::rotate_and_lloyd_max_quantize_stage1_fused(
+                        &k_rope, &r_arr, &centroids,
+                    )?
+                } else {
+                    let k_rot = k_rot_opt
+                        .as_ref()
+                        .expect("k_rot must be materialized when fuse_k_rotate=false");
+                    if use_fused {
+                        crate::turboquant::lloyd_max_quantize_stage1_fused(k_rot, &centroids)?
+                    } else {
+                        crate::turboquant::lloyd_max_quantize_stage1(k_rot, &centroids)?
+                    }
                 };
 
                 let (v_codes, v_sigma) = if fuse_v_rotate {
@@ -4397,7 +4507,6 @@ pub(crate) mod imp {
                 // showed +21% decode (37.4 → 45.2 tok/s) vs (TQ Stage 1 +
                 // Wo bake) baseline. Inline-correctness gate: unit test
                 // `qk_inline_matches_dequant_then_matmul` (rel-MSE < 1e-3).
-                let qjl_m = c.qjl_m();
                 let qk_inline_enabled = std::env::var("LUMEN_GEMMA4_TQ_QK_INLINE")
                     .map(|s| s != "0")
                     .unwrap_or(true);
@@ -4417,7 +4526,16 @@ pub(crate) mod imp {
                 let sv_inline_enabled = std::env::var("LUMEN_GEMMA4_TQ_SV_INLINE")
                     .map(|s| s == "1")
                     .unwrap_or(false);
-                let do_inline = qk_inline_enabled && (l as usize) == 1 && qjl_m.is_none();
+                // `turboquant_qk_inline` kernel currently hardcodes D=256
+                // (see lumen_tq_qk_inline.cpp factory constraints). Full-attn
+                // Gemma 4 layers have head_dim=512, so the inline path is
+                // disabled there — falls back to materialized K_dq + mlx
+                // matmul. Sliding layers (head_dim=256) keep the inline win.
+                let inline_kernel_eligible = head_dim == 256;
+                let do_inline = qk_inline_enabled
+                    && (l as usize) == 1
+                    && qjl_m.is_none()
+                    && inline_kernel_eligible;
                 // Stage 3 (`turboquant_sv_inline`) requires Stage 2 active +
                 // V stays in rotated space (Wo bake absorbs the un-rotation).
                 // When `unrotate_v_dq=true` the runtime applies Rᵀ to V_dq
@@ -4437,9 +4555,14 @@ pub(crate) mod imp {
                         )?;
                         // Packed encode: signs stored as u32 [..., ceil(m/32)]
                         // — 16× smaller than the bf16 ±1 [..., m] equivalent.
+                        // `fuse_k_rotate` is forced off when QJL is on (see
+                        // gating above), so k_rot_opt is always Some here.
+                        let k_rot_ref = k_rot_opt
+                            .as_ref()
+                            .expect("QJL Stage-2 requires materialized k_rot");
                         let (k_signs_packed, k_rnorm) =
                             crate::turboquant::qjl_encode_stage2_packed(
-                                &k_rot,
+                                k_rot_ref,
                                 &k_dq_local,
                                 &qjl_proj,
                             )?;
@@ -4681,6 +4804,9 @@ pub(crate) mod imp {
                 }
                 NativeGemma4LayerCache::SlidingTurboquant(_) => {
                     unreachable!("SlidingTurboquant handled in early return above")
+                }
+                NativeGemma4LayerCache::FullTurboquant(_) => {
+                    unreachable!("FullTurboquant handled in early return above")
                 }
             };
             if let Some(t0) = cache_start {
@@ -6894,7 +7020,8 @@ pub(crate) mod imp {
                     // env vars are set; default-env test should never see them.
                     NativeGemma4LayerCache::FullQuantized(_)
                     | NativeGemma4LayerCache::SlidingQuantized(_)
-                    | NativeGemma4LayerCache::SlidingTurboquant(_) => {
+                    | NativeGemma4LayerCache::SlidingTurboquant(_)
+                    | NativeGemma4LayerCache::FullTurboquant(_) => {
                         panic!("layer {i}: unexpected quantized variant under default env")
                     }
                 }

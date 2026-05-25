@@ -241,8 +241,29 @@ pub(crate) mod imp {
         /// disk config.json claims.
         pub fn runtime_config_summary(&self) -> String {
             let cfg = &self.model.config().text_config;
+            let tq_mode = match crate::gemma4_moe::imp::gemma4_tq_mode() {
+                crate::gemma4_moe::imp::Gemma4TqMode::Off => "off",
+                crate::gemma4_moe::imp::Gemma4TqMode::On => "on",
+                crate::gemma4_moe::imp::Gemma4TqMode::Auto => "auto",
+            };
+            let tq_threshold = crate::gemma4_moe::imp::gemma4_tq_auto_threshold();
+            let (bake_v, bake_o) = self.model.tq_bake_state();
+            let fused_vrot = std::env::var("LUMEN_GEMMA4_TQ_FUSED_VROT")
+                .map(|s| s == "1")
+                .unwrap_or(false);
+            let fused_krot = std::env::var("LUMEN_GEMMA4_TQ_FUSED_KROT")
+                .map(|s| s == "1")
+                .unwrap_or(false);
+            let qjl = std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL")
+                .map(|s| s == "1")
+                .unwrap_or(false);
+            let tq_full_attn = crate::gemma4_moe::imp::gemma4_tq_full_attn_enabled();
             format!(
-                "max_ctx={} sliding_window={} top_k_experts={}/{} layers={} vocab={} mtp={}",
+                "max_ctx={} sliding_window={} top_k_experts={}/{} layers={} vocab={} mtp={} \
+                 tq_mode={tq_mode} tq_auto_threshold={tq_threshold} \
+                 tq_full_attn={tq_full_attn} \
+                 tq_bake_v={bake_v} tq_bake_o={bake_o} \
+                 tq_fused_krot={fused_krot} tq_fused_vrot={fused_vrot} tq_qjl={qjl}",
                 cfg.max_position_embeddings,
                 cfg.sliding_window,
                 cfg.top_k_experts,
