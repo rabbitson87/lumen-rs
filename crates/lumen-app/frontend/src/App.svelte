@@ -665,8 +665,21 @@
   const resetMemBtn = "ml-2 px-2 py-0.5 text-[10px] font-normal normal-case tracking-normal";
   const debugHint = "dim col-span-full -mt-0.5 mb-1.5 ml-32.5 text-[11px] leading-[1.55]";
   const panelScroll = "max-h-[40vh] overflow-y-auto bg-panel";
-  const footerTabBase = "text-left border-0 bg-transparent px-3.5 py-1 text-xs rounded-none border-b-2 border-b-transparent hover:bg-panel-2";
-  const footerTabActive = "bg-panel-2 border-b-accent";
+  // Vertical-divider tabs: each footer tab carries only a right border
+  // (`border-r border-border`) so they line up cleanly with the container's
+  // own `border-t` and don't show any bottom/top notches against the nav
+  // row above. `last:border-r-0` keeps the rightmost tab's edge clean.
+  // `!rounded-none` (Tailwind 4 important prefix) overrides the unlayered
+  // `button { border-radius: 6px }` rule in app.css — without it the
+  // hover/active background's rounded corners pushed past the divider
+  // lines and produced visible notches.
+  //
+  // Active state is signalled inline (text color → accent) rather than via
+  // an outline-style background tint or underline. Hover keeps `bg-panel-2`
+  // as a separate cue so hovering an active tab still gives feedback
+  // without two signals competing for the same channel.
+  const footerTabBase = "text-left !border-0 !border-r !border-border last:!border-r-0 bg-transparent px-3.5 py-1 text-xs !rounded-none hover:bg-panel-2";
+  const footerTabActive = "text-accent";
 </script>
 
 <!-- ── Top bar ──────────────────────────────────────────────────── -->
