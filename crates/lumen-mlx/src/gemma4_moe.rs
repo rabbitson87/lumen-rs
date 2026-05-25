@@ -4526,12 +4526,21 @@ pub(crate) mod imp {
                 let sv_inline_enabled = std::env::var("LUMEN_GEMMA4_TQ_SV_INLINE")
                     .map(|s| s == "1")
                     .unwrap_or(false);
-                // `turboquant_qk_inline` kernel currently hardcodes D=256
-                // (see lumen_tq_qk_inline.cpp factory constraints). Full-attn
-                // Gemma 4 layers have head_dim=512, so the inline path is
-                // disabled there — falls back to materialized K_dq + mlx
-                // matmul. Sliding layers (head_dim=256) keep the inline win.
-                let inline_kernel_eligible = head_dim == 256;
+                // `turboquant_qk_inline` D=256 (sliding head_dim) is the
+                // shipping inline path.
+                //
+                // A D=512 variant (`lumen_tq_qk_inline_d512`, VPT=16) is
+                // landed in the mlx fork (full-attn global_head_dim=512) but
+                // currently crashes at runtime — root cause not yet
+                // identified. The full-attn TQ branch falls back to the
+                // materialize K_dq + mlx matmul path until that kernel is
+                // debugged. Opt-in flag exists for future re-enable:
+                //   LUMEN_GEMMA4_TQ_QK_INLINE_D512=1
+                let qk_inline_d512_enabled = std::env::var("LUMEN_GEMMA4_TQ_QK_INLINE_D512")
+                    .map(|s| s == "1")
+                    .unwrap_or(false);
+                let inline_kernel_eligible =
+                    head_dim == 256 || (head_dim == 512 && qk_inline_d512_enabled);
                 let do_inline = qk_inline_enabled
                     && (l as usize) == 1
                     && qjl_m.is_none()
