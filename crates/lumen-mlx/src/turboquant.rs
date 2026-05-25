@@ -1448,6 +1448,78 @@ mod qjl_correctness_tests {
         );
     }
 
+    /// D=512 variant of `qk_inline_matches_dequant_then_matmul`. Exercises
+    /// the `lumen_tq_qk_inline_d512` Metal kernel (VPT=16) — the kernel that
+    /// crashes in full-attn end-to-end runs. Same correctness contract: rel
+    /// MSE < 1e-3 vs the dequant + bf16 matmul reference. Failure mode this
+    /// test isolates: if mlx-rs swallows the crash error in the full forward
+    /// path, here the kernel is dispatched alone so the underlying mlx
+    /// exception surfaces directly via `.unwrap()`.
+    #[test]
+    fn qk_inline_d512_matches_dequant_then_matmul() {
+        use mlx_rs::random;
+        let bits = 4u32;
+        let b: i32 = 1;
+        let h: i32 = 32;  // Gemma 4 full-attn H
+        let h_kv: i32 = 2; // Gemma 4 full-attn H_kv (GQA group=16)
+        let t: i32 = 1;
+        let n: i32 = 64;
+        let d: i32 = 512; // global_head_dim
+        let centroids = lloyd_max_centroids(bits).unwrap();
+
+        let key_q = random::key(0xD512001u64).unwrap();
+        let key_k = random::key(0xD512002u64).unwrap();
+        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
+
+        // Reference: dequant + GQA-broadcast K + matmul. With GQA the K head
+        // axis must be expanded to match Q's H. Easiest reference: replicate
+        // K along the head dim via reshape + broadcast, then matmul with Q.
+        let k_dq = lloyd_max_dequantize_scaled(&k_codes, &k_sigma, &centroids).unwrap();
+        let group = (h / h_kv) as i32;
+        // [B, H_kv, N, D] → [B, H_kv, 1, N, D] → broadcast to [B, H_kv, group, N, D]
+        //                → [B, H, N, D]
+        let k_dq_5d = mlx_rs::ops::reshape(&k_dq, &[b, h_kv, 1, n, d]).unwrap();
+        let k_dq_b = mlx_rs::ops::broadcast_to(&k_dq_5d, &[b, h_kv, group, n, d]).unwrap();
+        let k_dq_full = mlx_rs::ops::reshape(&k_dq_b, &[b, h, n, d]).unwrap();
+        let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq_full, &[0, 1, 3, 2]).unwrap();
+        let scores_ref = mlx_rs::ops::matmul(&q_bf16, &k_dq_t).unwrap();
+
+        let scores_fused =
+            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
+
+        let r = scores_ref.as_dtype(Dtype::Float32).unwrap();
+        let f = scores_fused.as_dtype(Dtype::Float32).unwrap();
+        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
+        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
+        let nelems = (b * h * t * n) as f32;
+        let sum_arr = mlx_rs::ops::sum(&sq, false).unwrap();
+        let mse_val = sum_arr.item::<f32>() / nelems;
+
+        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
+        let r_sum_arr = mlx_rs::ops::sum(&r_sq, false).unwrap();
+        let r_var = r_sum_arr.item::<f32>() / nelems;
+
+        let rel = mse_val / (r_var + 1e-12);
+        eprintln!(
+            "qk_inline_d512 vs reference: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
+            mse_val, r_var, rel
+        );
+        assert!(
+            rel < 1e-3,
+            "qk_inline_d512 output relative MSE too large vs reference: rel={}",
+            rel
+        );
+    }
+
     /// `turboquant_sv_inline` must match the reference path
     ///   `lloyd_max_dequantize_scaled(V_codes, V_sigma) → bf16 matmul(S, V_dq)`
     /// up to bf16 fma-ordering noise. Both paths accumulate in f32; the
