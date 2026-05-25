@@ -234,6 +234,29 @@ pub(crate) mod imp {
             &self.model
         }
 
+        /// One-line runtime config summary for startup logging. Captures
+        /// the effective values AFTER all env overrides (LUMEN_MAX_CTX,
+        /// LUMEN_SLIDING_WINDOW, LUMEN_GEMMA4_TOP_K, etc.) have been
+        /// applied — what the model actually runs with, not what the on-
+        /// disk config.json claims.
+        pub fn runtime_config_summary(&self) -> String {
+            let cfg = &self.model.config().text_config;
+            format!(
+                "max_ctx={} sliding_window={} top_k_experts={}/{} layers={} vocab={} mtp={}",
+                cfg.max_position_embeddings,
+                cfg.sliding_window,
+                cfg.top_k_experts,
+                cfg.num_experts,
+                cfg.num_hidden_layers,
+                cfg.vocab_size,
+                if self.model.mtp_enabled() {
+                    "loaded"
+                } else {
+                    "off"
+                },
+            )
+        }
+
         /// Load the Gemma 4 assistant drafter from `drafter_dir` and enable
         /// MTP speculative decoding. Returns `Ok(true)` when the drafter
         /// passes the trunk/drafter `backbone_hidden_size` compatibility
@@ -301,6 +324,22 @@ pub(crate) mod imp {
             )
         }
 
+        fn build_chat_input_from_history_no_gen(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
+            self.chat.render_chat_history(
+                turns,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: false,
+                },
+                tools,
+            )
+        }
+
         /// Tool-aware variant of `build_chat_input`. Empty `tools` slice
         /// produces the exact same token sequence as `build_chat_input`;
         /// otherwise tool definitions get injected into the system turn
@@ -311,7 +350,44 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            let parsed: Vec<ChatMessage<'_>> = messages
+            let parsed = Self::parse_role_pairs(messages)?;
+            self.chat.render_to_ids_with_tools(
+                &parsed,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                },
+                tools,
+            )
+        }
+
+        /// Like `build_chat_input_with_tools` but without the trailing
+        /// `<start_of_turn>model\n` generation prompt (and the empty thought
+        /// channel that gets appended when `thinking=false`). Used by
+        /// prefix-cache callers to compute the trailing header token count
+        /// so the cache snapshot can stop just before it — the trailing
+        /// header is the only part that diverges between turn N (where it
+        /// sits at the prompt tail) and turn N+1 (where it sits in the
+        /// middle, followed by the actual assistant response).
+        fn build_chat_input_no_gen(
+            &self,
+            messages: &[(String, String)],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
+            let parsed = Self::parse_role_pairs(messages)?;
+            self.chat.render_to_ids_with_tools(
+                &parsed,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: false,
+                },
+                tools,
+            )
+        }
+
+        fn parse_role_pairs(messages: &[(String, String)]) -> Result<Vec<ChatMessage<'_>>> {
+            messages
                 .iter()
                 .map(|(role, content)| {
                     let role = match role.as_str() {
@@ -329,15 +405,7 @@ pub(crate) mod imp {
                         content: content.as_str(),
                     })
                 })
-                .collect::<Result<_>>()?;
-            self.chat.render_to_ids_with_tools(
-                &parsed,
-                &RenderOptions {
-                    enable_thinking: thinking,
-                    add_generation_prompt: true,
-                },
-                tools,
-            )
+                .collect()
         }
 
         /// `/v1/completions` path. When `temperature > 0` (or
@@ -591,24 +659,43 @@ pub(crate) mod imp {
             // so the master snapshot represents only the prompt prefix —
             // this is what subsequent requests with the same system prompt
             // want to fork from.
+            //
+            // NOTE: this non-streaming path uses `generate_with_cache`
+            // (bundled prefill+decode), so we can't snapshot pre-decode
+            // like the streaming path does. truncate_to MAY fail for
+            // rotating sliding caches when prompt > sliding_window (KV
+            // for early positions has been overwritten by post-rotation
+            // ring writes). Treat the failure as non-fatal: skip the
+            // cache write and let the next request cold-prefill.
+            // Long-prompt callers should prefer the streaming path which
+            // snapshots pre-decode and avoids this failure mode entirely.
             let target_offset = prompt.len();
             let mut master_snapshot = cache.clone();
-            if master_snapshot.offset() > target_offset {
-                master_snapshot
-                    .truncate_to(target_offset)
-                    .context("chat_with_prefix_cache: truncate master to prompt end")?;
+            let truncate_ok = if master_snapshot.offset() > target_offset {
+                match master_snapshot.truncate_to(target_offset) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "[gemma4-backend] chat_with_prefix_cache snapshot skipped \
+                             (truncate failed, key={prefix_cache_key:?}): {e:#}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if truncate_ok {
+                self.prefix_caches.insert(
+                    prefix_cache_key.to_string(),
+                    Gemma4PrefixCacheEntry {
+                        master: master_snapshot,
+                        prefix_tokens: prompt.clone(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                    },
+                );
             }
-            // Drop any prior entry for this key (cheap; just frees the old
-            // master arrays via refcount).
-            self.prefix_caches.insert(
-                prefix_cache_key.to_string(),
-                Gemma4PrefixCacheEntry {
-                    master: master_snapshot,
-                    prefix_tokens: prompt.clone(),
-                    last_access: Instant::now(),
-                    hits: 0,
-                },
-            );
 
             // ── Parse decoded tokens into ParsedResponse ──
             let mut parser = ResponseParser::new(&self.chat);
@@ -638,6 +725,303 @@ pub(crate) mod imp {
             self.prefix_caches.len()
         }
 
+        /// Lookup-or-make helper shared by all `*_with_prefix_cache` entry
+        /// points. Returns the cache to feed to the chunked prefill (already
+        /// truncated to the longest common prefix with `prompt`), the human-
+        /// readable hit kind for logging, and the LCP length.
+        ///
+        /// Edge case: an exact match (LCP == prompt.len()) would leave an
+        /// empty suffix and skip the prefill loop entirely, but the decode
+        /// loop still needs fresh next-token logits to start. We clamp
+        /// `lcp <= prompt.len() - 1` so there's always at least one suffix
+        /// token to forward through the model.
+        fn lookup_or_make_cache_for_prompt(
+            &mut self,
+            prompt: &[u32],
+            key: &str,
+        ) -> (NativeGemma4PromptCache, &'static str, usize) {
+            let prompt_max = prompt.len().saturating_sub(1);
+            match self.prefix_caches.get_mut(key) {
+                Some(entry) => {
+                    let raw_lcp = entry
+                        .prefix_tokens
+                        .iter()
+                        .zip(prompt.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let lcp = raw_lcp.min(prompt_max);
+                    if lcp > 0 && lcp <= entry.prefix_tokens.len() {
+                        entry.last_access = Instant::now();
+                        entry.hits += 1;
+                        let mut cache = entry.master.clone();
+                        if lcp < cache.offset() {
+                            // Truncate failures are recoverable: drop the
+                            // cache and fall through to a cold start so the
+                            // request still succeeds.
+                            if let Err(e) = cache.truncate_to(lcp) {
+                                eprintln!(
+                                    "[gemma4-backend] prefix-cache truncate failed (lcp={lcp}): {e:#}, falling back to cold prefill"
+                                );
+                                return (self.model.make_cache(), "miss-truncate-fail", 0);
+                            }
+                        }
+                        (cache, "hit", lcp)
+                    } else {
+                        (self.model.make_cache(), "miss-no-overlap", 0)
+                    }
+                }
+                None => (self.model.make_cache(), "miss-no-entry", 0),
+            }
+        }
+
+        /// Snapshot the post-prefill cache under `key` for future requests
+        /// to fork from. MUST be called immediately after prefill, when
+        /// `cache.offset() == prompt.len()` exactly — that's the only point
+        /// where the snapshot represents just the prompt prefix without
+        /// needing a `truncate_to` step. Post-decode snapshots used to call
+        /// `truncate_to(prompt.len())` to roll back the offset advance from
+        /// decoded tokens, but rotating sliding caches reject post-rotation
+        /// rollback (offset > max_size). Snapshotting pre-decode avoids the
+        /// rollback entirely and works regardless of which decode branch
+        /// (greedy/sampled/MTP) runs next.
+        fn save_prefix_snapshot(
+            &mut self,
+            key: &str,
+            cache: &NativeGemma4PromptCache,
+            prompt: &[u32],
+        ) {
+            debug_assert_eq!(
+                cache.offset(),
+                prompt.len(),
+                "save_prefix_snapshot must be called at post-prefill (cache.offset == prompt.len)"
+            );
+            self.prefix_caches.insert(
+                key.to_string(),
+                Gemma4PrefixCacheEntry {
+                    master: cache.clone(),
+                    prefix_tokens: prompt.to_vec(),
+                    last_access: Instant::now(),
+                    hits: 0,
+                },
+            );
+        }
+
+        /// Streaming variant of `chat_with_prefix_cache`. Mirrors the same
+        /// lookup → fork → suffix-prefill → snapshot flow but routes through
+        /// `decode_streaming_with_prompt` so per-token `BackendStreamEvent`s
+        /// reach the caller's SSE writer. Used by the chat-stream HTTP path
+        /// (the GUI / OpenAI clients) when an auto-key from the system
+        /// prompt or an explicit session_id resolves to a string.
+        pub fn chat_streaming_with_prefix_cache(
+            &mut self,
+            messages: &[(String, String)],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            thinking: bool,
+            prefix_cache_key: &str,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+            if prompt.is_empty() {
+                return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
+            }
+            // Compute the trailing `<start_of_turn>model\n` (+ optional empty
+            // thought channel + optional tool_choice prefill) length so the
+            // snapshot can stop just before it. This is the only segment
+            // that diverges between turn N (where it sits at the prompt
+            // tail with no following content) and turn N+1 (where the same
+            // template segment sits mid-prompt followed by the actual
+            // assistant response from turn N). Critically: use the *same*
+            // tools / tool_choice as the full prompt build, otherwise tool
+            // definitions in the system block create a spurious diff that
+            // inflates trailing_header_len by hundreds-to-thousands of
+            // tokens (and we'd snapshot way too early, cache becomes a
+            // misleading subset of the actual prompt prefix).
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools_for_no_gen: &[crate::gemma4_tools::imp::ToolDef<'_>] =
+                match tool_choice {
+                    ResolvedToolChoice::None => &[],
+                    _ => tools,
+                };
+            // `prompt` is `render_to_ids_with_tools(add_gen=true) +
+            // tool_choice_prefill`. `no_gen` is
+            // `render_to_ids_with_tools(add_gen=false)`. Diff =
+            // generation prompt block + tool_choice prefill. All three of
+            // those segments are PROMPT-TAIL-only and diverge in the next
+            // turn the same way (mid-prompt model header tokens differ from
+            // prompt-tail).
+            let trailing_header_len = self
+                .build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
+                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
+                .unwrap_or(0);
+            let (cache, hit_kind, lcp) =
+                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
+            let suffix_len = prompt.len().saturating_sub(cache.offset());
+            eprintln!(
+                "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
+                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len}"
+            );
+            self.decode_streaming_with_prompt(
+                prompt,
+                prefill_tokens,
+                max_new_tokens,
+                temperature,
+                top_p,
+                Some(cache),
+                Some((prefix_cache_key.to_string(), trailing_header_len)),
+                on_event,
+            )
+        }
+
+        /// History variant of `chat_streaming_with_prefix_cache` — same
+        /// caching behavior but builds the prompt from structured
+        /// `ChatTurn`s (turn-2+ requests that include `tool_calls` or
+        /// `role:"tool"` entries the flat `(role, content)` tuple shape
+        /// can't represent).
+        pub fn chat_streaming_from_history_with_prefix_cache(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            thinking: bool,
+            prefix_cache_key: &str,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            if prompt.is_empty() {
+                return Err(anyhow!(
+                    "chat_streaming_from_history_with_prefix_cache: empty prompt"
+                ));
+            }
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools_for_no_gen: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
+                ResolvedToolChoice::None => &[],
+                _ => tools,
+            };
+            // Pass the same `effective_tools` as the full prompt build so the
+            // diff captures ONLY the generation prompt (+ optional tool_choice
+            // prefill) — not tool definitions in the system block (those are
+            // shared across turns and must NOT be excluded from the snapshot).
+            let trailing_header_len = self
+                .build_chat_input_from_history_no_gen(turns, thinking, effective_tools_for_no_gen)
+                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
+                .unwrap_or(0);
+            let (cache, hit_kind, lcp) =
+                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
+            let suffix_len = prompt.len().saturating_sub(cache.offset());
+            eprintln!(
+                "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
+                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)"
+            );
+            self.decode_streaming_with_prompt(
+                prompt,
+                prefill_tokens,
+                max_new_tokens,
+                temperature,
+                top_p,
+                Some(cache),
+                Some((prefix_cache_key.to_string(), trailing_header_len)),
+                on_event,
+            )
+        }
+
+        /// Non-streaming history variant — used by tool-aware completion
+        /// requests that issue follow-up calls after a tool result arrives.
+        /// Same lookup → fork → snapshot pattern as `chat_with_prefix_cache`,
+        /// but the prompt comes from `ChatTurn`s instead of `(role,
+        /// content)` tuples.
+        pub fn chat_from_history_with_prefix_cache(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            thinking: bool,
+            prefix_cache_key: &str,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            let (prompt, prefill_tokens) =
+                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            if prompt.is_empty() {
+                return Err(anyhow!(
+                    "chat_from_history_with_prefix_cache: empty prompt"
+                ));
+            }
+            let (mut cache, hit_kind, lcp) =
+                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
+            let suffix_len = prompt.len().saturating_sub(cache.offset());
+            eprintln!(
+                "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
+                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} (from-history non-streaming)"
+            );
+
+            let suffix = &prompt[cache.offset()..];
+            let cfg = GenerateConfig {
+                max_new_tokens,
+                stop_on_eos: true,
+                sampling: build_sampling_config(temperature, top_p),
+            };
+            let stats = self
+                .model
+                .generate_with_cache(suffix, &cfg, Some(&mut cache))
+                .context("chat_from_history_with_prefix_cache: generate_with_cache")?;
+            log_chat_done(
+                stats.prompt_tokens,
+                stats.prefill_ms,
+                stats.decode_steps,
+                stats.decode_ms,
+            );
+
+            // Snapshot post-prompt master for subsequent forks.
+            let target_offset = prompt.len();
+            let mut master_snapshot = cache.clone();
+            if master_snapshot.offset() > target_offset {
+                if let Err(e) = master_snapshot.truncate_to(target_offset) {
+                    eprintln!(
+                        "[gemma4-backend] prefix-cache snapshot skipped (truncate failed): {e:#}"
+                    );
+                } else {
+                    self.prefix_caches.insert(
+                        prefix_cache_key.to_string(),
+                        Gemma4PrefixCacheEntry {
+                            master: master_snapshot,
+                            prefix_tokens: prompt.clone(),
+                            last_access: Instant::now(),
+                            hits: 0,
+                        },
+                    );
+                }
+            } else {
+                self.prefix_caches.insert(
+                    prefix_cache_key.to_string(),
+                    Gemma4PrefixCacheEntry {
+                        master: master_snapshot,
+                        prefix_tokens: prompt.clone(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                    },
+                );
+            }
+
+            let mut parser = ResponseParser::new(&self.chat);
+            for tok in &prefill_tokens {
+                parser.push(*tok)?;
+            }
+            for token in &stats.generated_tokens {
+                parser.push(*token)?;
+            }
+            parser.finalize()
+        }
+
         /// Streaming variant of `chat()`. Calls `on_token` once per
         /// generated token with the *decoded* text fragment (special
         /// tokens stripped) so the caller can flush SSE events as they
@@ -665,6 +1049,8 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                None,
+                None,
                 on_event,
             )
         }
@@ -695,6 +1081,8 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                None,
+                None,
                 on_event,
             )
         }
@@ -706,6 +1094,25 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            // Pre-built cache from a prefix-cache lookup. When `Some`, its
+            // `offset()` tells the chunked prefill where the new suffix
+            // begins — only `&prompt[offset..]` gets prefilled. When `None`,
+            // the function allocates a fresh empty cache (legacy behavior).
+            pre_built_cache: Option<NativeGemma4PromptCache>,
+            // When `Some((key, trailing_header_len))`, the cache state is
+            // snapshotted under `key` AFTER prefilling `prompt[..prompt.len()
+            // - trailing_header_len]` but BEFORE prefilling the trailing
+            // header. The trailing header is the `<start_of_turn>model\n`
+            // (+ optional empty thought channel) segment that the chat
+            // template appends when add_generation_prompt=true; it sits at
+            // the tail of turn N but mid-prompt of turn N+1, so excluding it
+            // from the snapshot lets turn N+1 hit with exact LCP match
+            // instead of falling 4-6 tokens short and triggering a truncate
+            // on the cloned master (which fails for rotating sliding caches
+            // post-rotation). `None` means "do not record" (one-off / debug
+            // requests). `Some((key, 0))` snapshots the full prompt — used
+            // when trailing header detection isn't available.
+            snapshot_prefix_key: Option<(String, usize)>,
             mut on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             // ── Manual prefill + decode loop so we can inject the
@@ -725,7 +1132,7 @@ pub(crate) mod imp {
             // for the decode pipeline.
             let gen_stream = mlx_rs::Stream::gpu();
             mlx_rs::with_new_default_stream(gen_stream, || -> Result<ParsedResponse> {
-                let mut cache = self.model.make_cache();
+                let mut cache = pre_built_cache.unwrap_or_else(|| self.model.make_cache());
 
                 // DISABLED 2026-05-14 (debt #X):
                 // The mlx_lm-style chunked prefill broke for Gemma 4's
@@ -770,23 +1177,69 @@ pub(crate) mod imp {
                 // Chunked prefill re-enabled (2026-05-14, take 2): the mask
                 // builder now reads kv_actual from k_full.shape, so rotated
                 // sliding caches no longer trigger broadcast mismatches.
-                let chunks: Vec<&[u32]> = prompt.chunks(chunk_size).collect();
-                let n_chunks = chunks.len();
-                eprintln!(
-                    "[prefill] start {} chunks (size {}, total {} tokens)",
-                    n_chunks,
-                    chunk_size,
-                    prompt.len()
-                );
+                //
+                // Prefix-cache hit path: when `pre_built_cache` already covers
+                // tokens [0..cache.offset()] of the prompt, only the suffix
+                // [cache.offset()..] needs to be prefilled. For a turn-2+ chat
+                // where the system prompt is unchanged, this collapses the
+                // common ~5K-token system prefix into a no-op and prefills
+                // only the new user message (typically <100 tokens).
+                let prefill_start = cache.offset();
+                // Snapshot-split offset: when set, prefill is split into two
+                // stages — chunks for `[prefill_start..snapshot_split]` run
+                // first, then the snapshot is taken (cache.offset ==
+                // snapshot_split exactly), then the trailing chunk for
+                // `[snapshot_split..prompt.len()]` runs. The trailing chunk
+                // is the assistant turn header (3-6 tokens). Excluding it
+                // from the snapshot prefix lets the next turn's request hit
+                // with exact LCP match instead of falling short and
+                // requiring a truncate on the cloned master.
+                let snapshot_split = match snapshot_prefix_key.as_ref() {
+                    Some((_, h)) if *h > 0 && prefill_start + *h <= prompt.len() => {
+                        Some(prompt.len() - *h)
+                    }
+                    _ => None,
+                };
+                let stage1_end = snapshot_split.unwrap_or(prompt.len());
+                let stage1_data = &prompt[prefill_start..stage1_end];
+                let stage1_chunks: Vec<&[u32]> = stage1_data.chunks(chunk_size).collect();
+                let n_chunks = stage1_chunks.len();
+                if prefill_start > 0 {
+                    eprintln!(
+                        "[prefill] prefix-cache fork: cached {} tokens, prefilling suffix {} tokens in {} chunks (size {})",
+                        prefill_start,
+                        stage1_data.len() + (prompt.len() - stage1_end),
+                        n_chunks + if snapshot_split.is_some() { 1 } else { 0 },
+                        chunk_size
+                    );
+                } else {
+                    eprintln!(
+                        "[prefill] start {} chunks (size {}, total {} tokens){}",
+                        n_chunks + if snapshot_split.is_some() { 1 } else { 0 },
+                        chunk_size,
+                        prompt.len(),
+                        if let Some(s) = snapshot_split {
+                            format!(" [split at {} for prefix-cache snapshot, trailing {} tokens]", s, prompt.len() - s)
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
                 // Wall-clock spanning all chunks + the final async_eval —
                 // surfaces prefill cost separately in the chat done log
                 // so users can see whether a slow response was prompt
                 // processing or generation (the two costs are very
                 // different per-token).
                 let t_prefill_total = std::time::Instant::now();
-                let prefill_prompt_tokens = prompt.len();
+                // Report the number of tokens we actually prefilled in this
+                // call (== suffix length on a cache fork, == full prompt
+                // length on a cold start). The downstream
+                // `log_chat_done(prefill_prompt_tokens, prefill_total_ms, ...)`
+                // tok/s reading should reflect the real work done, not the
+                // cached prefix the GPU never touched.
+                let prefill_prompt_tokens = prompt.len() - prefill_start;
                 let mut logits_opt: Option<mlx_rs::Array> = None;
-                for (i, chunk) in chunks.into_iter().enumerate() {
+                for (i, chunk) in stage1_chunks.into_iter().enumerate() {
                     let t0 = std::time::Instant::now();
                     // Use forward_last_token: only the final chunk's logits feed
                     // into `argmax_last_token_lazy` below (intermediate chunks'
@@ -835,6 +1288,46 @@ pub(crate) mod imp {
                         logits_opt = Some(chunk_logits);
                     }
                 }
+
+                // ── Snapshot AFTER stage 1, BEFORE stage 2 ──
+                // At this point `cache.offset() == stage1_end ==
+                // prompt.len() - trailing_header_len`. The cache state
+                // represents the conversation up through the last user
+                // turn's `<end_of_turn>` — exactly the boundary that
+                // matches across turn N and turn N+1. Snapshotting before
+                // the trailing `<start_of_turn>model\n` (+ thought channel)
+                // is what makes the next turn's LCP check land on the full
+                // prefix length, no truncate needed on the cloned master.
+                if let Some((key, _)) = snapshot_prefix_key.as_ref() {
+                    if snapshot_split.is_some() {
+                        self.save_prefix_snapshot(key, &cache, &prompt[..stage1_end]);
+                    } else {
+                        // No split (header_len == 0 or stage1 was the whole
+                        // prompt): snapshot at post-prefill, full prompt.
+                        // Future turns will fall through to the truncate
+                        // path which may fail for rotating caches with long
+                        // prompts (logged + skipped, non-fatal).
+                        self.save_prefix_snapshot(key, &cache, &prompt);
+                    }
+                }
+
+                // ── Stage 2: prefill the trailing header ──
+                // The trailing `<start_of_turn>model\n` (+ optional thought
+                // channel) is short (3-6 tokens) so a single forward call
+                // is enough. Its logits become the prefill's last-token
+                // logits feeding into the decode argmax.
+                if let Some(split) = snapshot_split {
+                    let trailing = &prompt[split..];
+                    let trailing_logits = self
+                        .model
+                        .forward_last_token(trailing, &mut cache)
+                        .context("chat_streaming: prefill trailing header")?;
+                    trailing_logits
+                        .eval()
+                        .context("chat_streaming: prefill trailing header eval")?;
+                    logits_opt = Some(trailing_logits);
+                }
+
                 let logits = logits_opt
                     .ok_or_else(|| anyhow!("chat_streaming: empty prompt has no chunks"))?;
                 let mut current = self

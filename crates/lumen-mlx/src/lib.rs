@@ -623,11 +623,26 @@ fn read_session_limits() -> (Option<Duration>, Option<usize>) {
 
 /// Read A1 prefix-cache config from env.
 ///
-/// - `LUMEN_MLX_PREFIX_CACHE=1`         — enable feature (default OFF).
+/// - `LUMEN_MLX_PREFIX_CACHE=0`         — opt OUT (default ON since v0.4.7).
 /// - `LUMEN_MLX_PREFIX_CACHE_TTL_SECS=N` — drop entries idle > N seconds.
 /// - `LUMEN_MLX_PREFIX_CACHE_MAX=N`      — keep at most N entries, LRU-evict.
+///
+/// Default flipped from OFF → ON: the feature has been validated since
+/// 2026-05-18 and provides the 5-6× speedup users expect for repeated
+/// chat turns with a shared system prompt. Anyone running the feature
+/// in production wants it on; the env var is now the escape hatch for
+/// debugging, not the gate.
 fn read_prefix_cache_limits() -> (bool, Option<Duration>, Option<usize>) {
-    let enabled = truthy_env(std::env::var("LUMEN_MLX_PREFIX_CACHE").ok().as_deref());
+    // Default ON: anything other than an explicit "0" / "false" / "no" /
+    // "off" stays enabled. Empty string + unset both yield ON.
+    let enabled = match std::env::var("LUMEN_MLX_PREFIX_CACHE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        None => true,
+        Some(v) if v.is_empty() => true,
+        Some(v) => !matches!(v.as_str(), "0" | "false" | "no" | "off"),
+    };
     let ttl = std::env::var("LUMEN_MLX_PREFIX_CACHE_TTL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -667,6 +682,23 @@ fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     if role != "system" || content.is_empty() {
         return None;
     }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    content.hash(&mut h);
+    Some(format!("auto-{:016x}", h.finish()))
+}
+
+/// `auto_prefix_key` for the structured-history shape. Hashes the first
+/// turn's content iff it's a `System` turn. Returns `None` when the chat
+/// starts with `User` (no shared prefix worth caching) or when the system
+/// content is empty.
+fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<String> {
+    use crate::chat_io::ChatTurn;
+    let content = match turns.first()? {
+        ChatTurn::System(s) if !s.is_empty() => *s,
+        _ => return None,
+    };
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -769,6 +801,17 @@ impl MlxBackend {
             Self::Qwen35Family(_) => MlxBackendKind::Qwen35Family,
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => MlxBackendKind::Gemma4,
+        }
+    }
+
+    /// One-line summary of the effective runtime config (post env override)
+    /// for startup logging. Returns empty string for backends that don't
+    /// implement this yet — caller should skip the log line in that case.
+    pub fn runtime_config_summary(&self) -> String {
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.runtime_config_summary(),
+            _ => String::new(),
         }
     }
 
@@ -885,14 +928,24 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                if let Some(sid) = session_id {
+                // Resolve prefix-cache key. Priority:
+                //   1. Explicit `session_id` from the request (deterministic
+                //      across clients that opt in).
+                //   2. Auto-key from the system prompt hash (works for any
+                //      OpenAI-style client that doesn't know about
+                //      `session_id` but does include a stable system turn —
+                //      the common case for chat UIs).
+                let key = session_id
+                    .map(String::from)
+                    .or_else(|| auto_prefix_key(messages));
+                if let Some(k) = key {
                     m.chat_with_prefix_cache(
                         messages,
                         max_new_tokens,
                         temperature,
                         top_p,
                         thinking,
-                        sid,
+                        &k,
                         tools,
                         tool_choice,
                     )
@@ -951,16 +1004,37 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                let _ = session_id; // Phase 1.4 doesn't wire prefix cache yet
-                m.chat_from_history(
-                    turns,
-                    max_new_tokens,
-                    temperature,
-                    top_p,
-                    thinking,
-                    tools,
-                    tool_choice,
-                )
+                // Prefix-cache wiring (was Phase 1.4 TODO; landed v0.4.7).
+                // Same key-resolution policy as the flat-message `chat()`
+                // path above — explicit session_id > auto-hash of System
+                // turn content. Falls through to the no-prefix-cache path
+                // when neither yields a key (e.g. user-first chat with no
+                // system turn).
+                let key = session_id
+                    .map(String::from)
+                    .or_else(|| auto_prefix_key_from_turns(turns));
+                if let Some(k) = key {
+                    m.chat_from_history_with_prefix_cache(
+                        turns,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        &k,
+                        tools,
+                        tool_choice,
+                    )
+                } else {
+                    m.chat_from_history(
+                        turns,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        tools,
+                        tool_choice,
+                    )
+                }
             }
         }
     }
@@ -1037,17 +1111,41 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                let _ = session_id;
-                m.chat_streaming(
-                    messages,
-                    max_new_tokens,
-                    temperature,
-                    top_p,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    on_event,
-                )
+                // Prefix-cache wiring (landed v0.4.7) — this is the path
+                // GUI / OpenAI streaming clients hit. Previously
+                // `let _ = session_id;` discarded the chance to fork from
+                // a shared system-prompt cache; turn-2+ requests would
+                // cold-prefill the entire 5K-token chat history every
+                // time. With auto-key from the system turn, the chat
+                // history grows by ~70 tokens per turn and we prefill
+                // only the new suffix → ~5s → ~100ms per turn.
+                let key = session_id
+                    .map(String::from)
+                    .or_else(|| auto_prefix_key(messages));
+                if let Some(k) = key {
+                    m.chat_streaming_with_prefix_cache(
+                        messages,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        &k,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    )
+                } else {
+                    m.chat_streaming(
+                        messages,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    )
+                }
             }
         }
     }
@@ -1092,17 +1190,38 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                let _ = session_id;
-                m.chat_streaming_from_history(
-                    turns,
-                    max_new_tokens,
-                    temperature,
-                    top_p,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    on_event,
-                )
+                // Prefix-cache wiring (landed v0.4.7). Same key resolution
+                // as the flat-message streaming path; the structured-turns
+                // shape is used by turn-2+ tool-call loops where the saved
+                // common prefix is even larger (system + tool defs +
+                // multiple prior assistant/tool exchanges).
+                let key = session_id
+                    .map(String::from)
+                    .or_else(|| auto_prefix_key_from_turns(turns));
+                if let Some(k) = key {
+                    m.chat_streaming_from_history_with_prefix_cache(
+                        turns,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        &k,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    )
+                } else {
+                    m.chat_streaming_from_history(
+                        turns,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    )
+                }
             }
         }
         .map(|p: ParsedResponse| p)
@@ -1848,7 +1967,15 @@ impl MlxQwen35Backend {
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, |_ev| Ok(()))
+        let prefix_key = auto_prefix_key(messages);
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            |_ev| Ok(()),
+        )
     }
 
     /// Phase 2: tool-aware streaming chat. Emits
@@ -1870,7 +1997,15 @@ impl MlxQwen35Backend {
     {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, on_event)
+        let prefix_key = auto_prefix_key(messages);
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            on_event,
+        )
     }
 
     /// Structured-history non-streaming variant.
@@ -1885,7 +2020,15 @@ impl MlxQwen35Backend {
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, |_ev| Ok(()))
+        let prefix_key = auto_prefix_key_from_turns(turns);
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            |_ev| Ok(()),
+        )
     }
 
     /// Structured-history streaming variant.
@@ -1904,7 +2047,94 @@ impl MlxQwen35Backend {
     {
         let (prompt_ids, prefill) =
             self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
-        self.chat_with_tools_impl(prompt_ids, prefill, max_new_tokens, seq_id, on_event)
+        let prefix_key = auto_prefix_key_from_turns(turns);
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            on_event,
+        )
+    }
+
+    /// Prefill helper that consults `self.prefix_caches` when a key is
+    /// provided and the feature is enabled. On cache hit, forks from the
+    /// stored snapshot and extends by the suffix (skips re-processing the
+    /// common prefix). On miss, runs a normal prefill and snapshots the
+    /// result under `key` so the next request can fork from it.
+    ///
+    /// Falls through to plain `runner.prefill` when `prefix_cache_key` is
+    /// `None` or when `LUMEN_MLX_PREFIX_CACHE=0` is set (escape hatch for
+    /// debugging). Snapshot failures are logged but non-fatal — the
+    /// request completes, just without populating the cache.
+    fn prefill_optionally_cached(
+        &mut self,
+        seq_id: u64,
+        prompt_ids: &[u32],
+        prefix_cache_key: Option<&str>,
+    ) -> Result<(u32, usize)> {
+        let key = match prefix_cache_key.filter(|_| self.prefix_cache_enabled) {
+            Some(k) => k,
+            None => return self.runner.prefill(seq_id, prompt_ids),
+        };
+        self.evict_stale_prefix_caches();
+
+        let cached = self
+            .prefix_caches
+            .get(key)
+            .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone()));
+
+        if let Some((master, prefix)) = cached.filter(|(_, p)| {
+            !p.is_empty() && prompt_ids.len() > p.len() && prompt_ids.starts_with(p)
+        }) {
+            let suffix = &prompt_ids[prefix.len()..];
+            let t = std::time::Instant::now();
+            let _ = self.runner.fork_from_snapshot(master, seq_id)?;
+            let (last, pos) = self.runner.extend(seq_id, suffix)?;
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if let Some(entry) = self.prefix_caches.get_mut(key) {
+                entry.last_access = Instant::now();
+                entry.hits += 1;
+            }
+            eprintln!(
+                "[mlx] prefix-cache HIT (tools) key={key:?} prefix={} suffix={} fork+extend={ms:.0}ms",
+                prefix.len(),
+                suffix.len()
+            );
+            return Ok((last, pos));
+        }
+
+        // Cold prefill, then snapshot under `key` so the next request with
+        // the same key + extended prompt can fork from here.
+        let (last, pos) = self.runner.prefill(seq_id, prompt_ids)?;
+        match self.runner.snapshot_state_deep(seq_id) {
+            Ok((snap_id, _snap_pos)) => {
+                if let Some(old) = self.prefix_caches.remove(key) {
+                    let _ = self.runner.release_snapshot(old.master_snapshot_id);
+                }
+                self.prefix_caches.insert(
+                    key.to_string(),
+                    PrefixCacheEntry {
+                        master_snapshot_id: snap_id,
+                        prefix_tokens: prompt_ids.to_vec(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                    },
+                );
+                self.evict_stale_prefix_caches();
+                eprintln!(
+                    "[mlx] prefix-cache MISS (tools) key={key:?} stored snapshot={snap_id} prefix_len={}",
+                    prompt_ids.len()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[mlx] prefix-cache snapshot skipped (tools, key={key:?}): {e:#}"
+                );
+            }
+        }
+        Ok((last, pos))
     }
 
     /// Shared decode loop for the four tool-aware entry points. Prefill
@@ -1919,6 +2149,11 @@ impl MlxQwen35Backend {
         prefill_str: String,
         max_new_tokens: usize,
         seq_id: u64,
+        // Auto-derived key (from system message hash) or explicit session_id
+        // passed by the public callers. `None` disables prefix caching for
+        // this request even when the feature is enabled — useful for ad-hoc
+        // benchmarks that want clean cold-prefill timing.
+        prefix_cache_key: Option<&str>,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -1943,7 +2178,8 @@ impl MlxQwen35Backend {
 
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
         let t_prefill = std::time::Instant::now();
-        let (mut last, mut pos) = self.prefill(seq_id, &prompt_ids)?;
+        let (mut last, mut pos) =
+            self.prefill_optionally_cached(seq_id, &prompt_ids, prefix_cache_key)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",

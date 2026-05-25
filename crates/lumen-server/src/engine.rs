@@ -547,6 +547,10 @@ impl InferenceEngine {
             eprintln!("Loading MLX backend (mode={mode:?}): {model_id}");
             let backend = lumen_mlx::MlxBackend::load(model_id)?;
             eprintln!("[mlx] family={:?}", backend.kind());
+            let cfg_summary = backend.runtime_config_summary();
+            if !cfg_summary.is_empty() {
+                eprintln!("[mlx-config] {cfg_summary}");
+            }
             return Ok(Self {
                 backend: ModelBackend::Mlx(backend),
                 model_id: model_id.to_string(),
