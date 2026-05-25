@@ -267,6 +267,12 @@ export const ko: Record<string, string> = {
   "env.applyHint": "변경 사항은 다음 서버 시작 시 적용됩니다.",
   "env.empty2": "설정된 오버라이드가 없습니다.",
 
+  // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
+  // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
+  // (TurboQuant, KV quant, ctx caps 등) 는 재시작 시점에만 반영됨.
+  "config.savedRestartHint": "저장됨. 적용하려면 서버 재시작 (중지 → 시작).",
+  "config.saved": "저장됨.",
+
   // ── 진단 패널 ───────────────────────────────────────────────────
   "doctor.title": "진단",
   "doctor.run": "점검 실행",

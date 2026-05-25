@@ -276,6 +276,13 @@ export const en: Record<string, string> = {
   "env.applyHint": "Changes apply on next server start.",
   "env.empty2": "No overrides set.",
 
+  // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
+  // depends on whether the inference server is currently running — running
+  // server needs a restart for env-derived knobs (TurboQuant, KV quant, ctx
+  // caps, etc.) to take effect.
+  "config.savedRestartHint": "Saved. Restart the server to apply (Stop → Start).",
+  "config.saved": "Saved.",
+
   // ── DoctorPanel ─────────────────────────────────────────────────
   "doctor.title": "Doctor",
   "doctor.run": "Run checks",

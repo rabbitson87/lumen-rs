@@ -435,16 +435,32 @@
     config = await api.updateServerConfig(config.server);
   }
 
+  // Shared toast text — restart hint only when the server is currently
+  // running (otherwise just "Saved", since next start will pick the new
+  // env vars naturally). Without this, users who change TurboQuant /
+  // KV-quant / ctx caps while the server is running see the UI update
+  // but the running process keeps the OLD env vars until manual
+  // Stop → Start. The QUANT / CONTEXT / SERVER cards previously had no
+  // hint at all (only env_overrides did).
+  function savedToast(): string {
+    if (status.state === "running" || status.state === "starting") {
+      return t("config.savedRestartHint");
+    }
+    return t("config.saved");
+  }
+
   async function saveServer() {
     if (!config) return;
     config = await api.updateServerConfig(config.server);
-    statusMessage = "Server config saved";
-    setTimeout(() => (statusMessage = null), 1500);
+    statusMessage = savedToast();
+    setTimeout(() => (statusMessage = null), 3000);
   }
 
   async function saveQuant() {
     if (!config) return;
     config = await api.updateQuantConfig(config.quant);
+    statusMessage = savedToast();
+    setTimeout(() => (statusMessage = null), 3000);
   }
 
   async function saveContext() {
@@ -453,6 +469,8 @@
     // ctx affects KV-cache headroom in the tuned memory recommendation
     // (~1 GB per 8K tokens). Re-sync so saved caps follow.
     await syncTunedMemoryCaps();
+    statusMessage = savedToast();
+    setTimeout(() => (statusMessage = null), 3000);
   }
 
   async function resetMemoryCaps() {
