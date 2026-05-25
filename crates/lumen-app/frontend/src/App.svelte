@@ -108,6 +108,11 @@
   // download lines wouldn't disappear after the 3s auto-dismiss timer.
   let downloads = new SvelteMap<string, DownloadProgress>();
   let statusMessage = $state<string | null>(null);
+  // Optional inline action attached to the current statusMessage. Used by
+  // `savedToast()` to surface a "Restart now" button on the same toast when
+  // a config save would otherwise require manual Stop → Start. `null` =
+  // plain informational toast (legacy behavior).
+  let statusAction = $state<{ label: string; onClick: () => Promise<void> } | null>(null);
   let typedEnvKeys = $state<Set<string>>(new Set());
   let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
   let systemInfo = $state<SystemInfo | null>(null);
@@ -435,32 +440,80 @@
     config = await api.updateServerConfig(config.server);
   }
 
-  // Shared toast text — restart hint only when the server is currently
-  // running (otherwise just "Saved", since next start will pick the new
-  // env vars naturally). Without this, users who change TurboQuant /
-  // KV-quant / ctx caps while the server is running see the UI update
-  // but the running process keeps the OLD env vars until manual
-  // Stop → Start. The QUANT / CONTEXT / SERVER cards previously had no
-  // hint at all (only env_overrides did).
-  function savedToast(): string {
-    if (status.state === "running" || status.state === "starting") {
-      return t("config.savedRestartHint");
+  // One-click "Stop → wait → Start" — used by the inline action button on
+  // the savedToast when the server is running. Polls `serverStatus` until
+  // it drains to `stopped` (or `errored`) before issuing `startServer` so
+  // the new env vars from `spawn_server_command` are actually used. Without
+  // the drain wait, `startServer` would race the still-tearing-down
+  // supervisor and surface a stale state.
+  async function restartServer() {
+    statusMessage = t("config.restarting");
+    statusAction = null;
+    try {
+      if (status.state === "running" || status.state === "starting") {
+        status = await api.stopServer();
+        let waited = 0;
+        const POLL_MS = 200;
+        const TIMEOUT_MS = 30_000;
+        while (
+          status.state !== "stopped" &&
+          status.state !== "errored" &&
+          waited < TIMEOUT_MS
+        ) {
+          await new Promise((r) => setTimeout(r, POLL_MS));
+          status = await api.serverStatus();
+          waited += POLL_MS;
+        }
+      }
+      status = await api.startServer();
+      statusMessage = t("config.restarted");
+      setTimeout(() => (statusMessage = null), 2000);
+    } catch (e) {
+      statusMessage = String(e);
+      setTimeout(() => (statusMessage = null), 4000);
     }
-    return t("config.saved");
+  }
+
+  // Shared post-save toast. Two modes:
+  //   * server running   → "Saved. Restart to apply" + inline [Restart now]
+  //                        button (calls `restartServer`).
+  //   * server stopped   → plain "Saved." (next start picks up the change
+  //                        naturally — no restart needed).
+  // Without this, users who change TurboQuant / KV-quant / ctx caps while
+  // the server is running see the UI update but the running process keeps
+  // the OLD env vars until manual Stop → Start. The QUANT / CONTEXT /
+  // SERVER cards previously had no hint at all (only env_overrides did).
+  function savedToast() {
+    if (status.state === "running" || status.state === "starting") {
+      statusMessage = t("config.savedRestartHint");
+      statusAction = { label: t("config.restartNow"), onClick: restartServer };
+      setTimeout(() => {
+        if (statusMessage === t("config.savedRestartHint")) {
+          statusMessage = null;
+          statusAction = null;
+        }
+      }, 6000);
+    } else {
+      statusMessage = t("config.saved");
+      statusAction = null;
+      setTimeout(() => {
+        if (statusMessage === t("config.saved")) {
+          statusMessage = null;
+        }
+      }, 2000);
+    }
   }
 
   async function saveServer() {
     if (!config) return;
     config = await api.updateServerConfig(config.server);
-    statusMessage = savedToast();
-    setTimeout(() => (statusMessage = null), 3000);
+    savedToast();
   }
 
   async function saveQuant() {
     if (!config) return;
     config = await api.updateQuantConfig(config.quant);
-    statusMessage = savedToast();
-    setTimeout(() => (statusMessage = null), 3000);
+    savedToast();
   }
 
   async function saveContext() {
@@ -469,8 +522,7 @@
     // ctx affects KV-cache headroom in the tuned memory recommendation
     // (~1 GB per 8K tokens). Re-sync so saved caps follow.
     await syncTunedMemoryCaps();
-    statusMessage = savedToast();
-    setTimeout(() => (statusMessage = null), 3000);
+    savedToast();
   }
 
   async function resetMemoryCaps() {
@@ -635,7 +687,15 @@
     {/if}
   </div>
   <div class="ml-auto flex items-center gap-2.5">
-    {#if statusMessage}<span class="dim">{statusMessage}</span>{/if}
+    {#if statusMessage}
+      <span class="dim">{statusMessage}</span>
+      {#if statusAction}
+        <button
+          class="text-[11px] px-2 py-0.5 border border-accent text-accent rounded-md hover:bg-accent/6 transition-colors"
+          onclick={statusAction.onClick}
+        >{statusAction.label}</button>
+      {/if}
+    {/if}
     {#if memoryUsage}
       {@const usedGb = memoryUsage.used_bytes / 1024 ** 3}
       {@const totalGb = memoryUsage.total_bytes / 1024 ** 3}

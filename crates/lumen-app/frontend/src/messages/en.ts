@@ -282,6 +282,11 @@ export const en: Record<string, string> = {
   // caps, etc.) to take effect.
   "config.savedRestartHint": "Saved. Restart the server to apply (Stop → Start).",
   "config.saved": "Saved.",
+  // Inline action button on the savedToast — single-click "Stop → wait →
+  // Start" so users don't have to find the toggle in the header.
+  "config.restartNow": "Restart now",
+  "config.restarting": "Restarting server…",
+  "config.restarted": "Server restarted.",
 
   // ── DoctorPanel ─────────────────────────────────────────────────
   "doctor.title": "Doctor",

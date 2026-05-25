@@ -272,6 +272,11 @@ export const ko: Record<string, string> = {
   // (TurboQuant, KV quant, ctx caps 등) 는 재시작 시점에만 반영됨.
   "config.savedRestartHint": "저장됨. 적용하려면 서버 재시작 (중지 → 시작).",
   "config.saved": "저장됨.",
+  // savedToast 옆 인라인 액션 버튼 — 헤더의 토글을 찾지 않아도
+  // 한 번에 "중지 → 대기 → 시작" 까지 끝내는 단축키.
+  "config.restartNow": "지금 재시작",
+  "config.restarting": "서버 재시작 중…",
+  "config.restarted": "서버 재시작 완료.",
 
   // ── 진단 패널 ───────────────────────────────────────────────────
   "doctor.title": "진단",
