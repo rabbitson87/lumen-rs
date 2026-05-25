@@ -29,17 +29,33 @@ dotenvy = "0.15.7"
 # is set). +57% tok/s vs Candle at short prompts, 33× vs Candle at
 # PROMPT_LEN=2048 on Qwen3.6-35B-A3B-mxfp4 (M3 Max).
 #
-# qwen3_5_moe enables the Candle backend for the Qwen3.5/3.6 family
-# (both 35B-A3B MoE and 27B Dense — shared loader/scheduler). It's the
-# `LUMEN_MODE=candle` fallback path and the only path that currently
-# wires MTP (`LUMEN_SPEC=mtp` requires the Candle backend).
-default = ["turboquant-gpu", "mlx-native", "qwen3_5_moe"]
+# `qwen3_5_moe` was a default feature through v0.4.6 — it pulled the
+# ~22K-LOC Candle Qwen3.5/3.6 MoE backend (and its MTP support) into
+# every build even though MLX has been the only catalog-recommended
+# inference path on macOS since v0.4.x. Dropped from default in v0.4.7
+# to remove the compile cost. Re-enable explicitly when needed:
+#
+#     cargo build --features legacy-candle
+#
+# `legacy-candle` is the umbrella that pulls every Candle code path
+# the lumen-server engine knows about — Qwen3.5/3.6 MoE today, plus
+# any future Candle-only sub-feature. The smaller Qwen 2.5 / Gemma /
+# Gemma-GGUF dense Candle backends still compile unconditionally;
+# they're unreachable from the catalog but kept for `LUMEN_MLX_BACKEND=candle`
+# escape hatches and may be feature-gated in a follow-up patch.
+default = ["turboquant-gpu", "mlx-native"]
 turboquant-gpu = ["lumen-model/turboquant-gpu", "dep:lumen-metal"]
 mpsgraph = ["lumen-model/mpsgraph", "lumen-metal/mpsgraph"]
 mlx-native = ["lumen-mlx/mlx-native"]
-# WIP: forwards `qwen3_5_moe` to lumen-model. Off by default; the Qwen3.5/3.6
-# backend code is excluded from the first public release. Implies
-# `turboquant-gpu` (the qwen3.6 MoE path depends on the 4-bit affine GPU kernel).
+# Umbrella feature for everything Candle-backend-related. Off by default.
+# Toggles the Qwen 3.5/3.6 MoE Candle path (and any future Candle-only
+# integrations) in one flag.
+legacy-candle = ["qwen3_5_moe"]
+# Forwards `qwen3_5_moe` to lumen-model. Off by default — the Qwen 3.5/3.6
+# Candle backend code is excluded from the first public release. Implies
+# `turboquant-gpu` (the Qwen 3.6 MoE path depends on the 4-bit affine
+# GPU kernel). Prefer `legacy-candle` for new build invocations; this
+# feature stays for callers that want only the MoE backend.
 qwen3_5_moe = ["turboquant-gpu", "lumen-model/qwen3_5_moe"]
 # Forwards lumen-model's turboquant feature (candle-side Gemma 4 E4B
 # path). Off by default — needs a sibling lumen-rs / candle checkout
