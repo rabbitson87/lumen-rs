@@ -41,6 +41,7 @@ mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;
 mod gemma4_sampling;
+mod gemma4_thinking;
 mod gemma4_tools;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
@@ -741,6 +742,23 @@ pub enum MlxBackend {
 }
 
 impl MlxBackend {
+    /// Whether the loaded backend is a Gemma 4 family model. Used by the
+    /// HTTP layer to enable thinking-mode by default — Gemma 4's chat
+    /// template needs `<|think|>` injection to activate the reasoning
+    /// block, and OpenAI-compat clients (Ayla, Moltis) routinely
+    /// hard-code `model: "gpt-3.5-turbo"` so we can't infer the family
+    /// from the request payload.
+    pub fn is_gemma4(&self) -> bool {
+        #[cfg(feature = "mlx-native")]
+        {
+            matches!(self, Self::Gemma4(_))
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            false
+        }
+    }
+
     /// Load a model, picking the correct family path from `model_id` (a
     /// local directory or an HF Hub repo id). Family detection is
     /// substring-based; explicit override via `LUMEN_MLX_FAMILY=gemma4|qwen`

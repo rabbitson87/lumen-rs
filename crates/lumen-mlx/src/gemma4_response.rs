@@ -153,37 +153,34 @@ pub(crate) mod imp {
                 return None;
             }
             self.tool_text_prefix.push_str(fragment);
-            // Look for the first `call:NAME{` pattern. Bytes are
-            // ASCII-only in this prefix path; NAME chars are
-            // `[A-Za-z0-9_-]`. Whitespace between NAME and `{` is
-            // tolerated (mirrors the post-buffer parser).
-            let bytes = self.tool_text_prefix.as_bytes();
-            let needle = b"call:";
-            let Some(start) = bytes.windows(needle.len()).position(|w| w == needle) else {
+            // Look for the first `call:NAME{` pattern. NAME is read
+            // permissively — any character until the first `{` (or
+            // newline as a hard boundary) is allowed. This accepts
+            // non-OpenAI-spec names that clients like Ayla may pass
+            // through (e.g. MCP server prefixes containing spaces /
+            // parens like `Playwright (Stealth)__browser_navigate`).
+            // Trailing whitespace between NAME and `{` is trimmed.
+            let prefix = self.tool_text_prefix.as_str();
+            let Some(start) = prefix.find("call:") else {
                 return None;
             };
-            let name_start = start + needle.len();
-            let mut name_end = name_start;
-            while name_end < bytes.len() {
-                let c = bytes[name_end];
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
-                    name_end += 1;
-                } else {
-                    break;
-                }
-            }
-            if name_end == name_start {
+            let name_start = start + "call:".len();
+            let after = &prefix[name_start..];
+            // Scan until '{' or newline (which acts as a hard boundary
+            // so a stray `call:` token on its own line can't swallow
+            // following text).
+            let Some(stop_offset) = after.find(|c: char| c == '{' || c == '\n' || c == '\r')
+            else {
+                return None;
+            };
+            if after.as_bytes().get(stop_offset) != Some(&b'{') {
                 return None;
             }
-            // Tolerate whitespace between NAME and `{`.
-            let mut brace_pos = name_end;
-            while brace_pos < bytes.len() && bytes[brace_pos].is_ascii_whitespace() {
-                brace_pos += 1;
-            }
-            if brace_pos >= bytes.len() || bytes[brace_pos] != b'{' {
+            let name = after[..stop_offset].trim();
+            if name.is_empty() {
                 return None;
             }
-            let name = String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned();
+            let name = name.to_string();
             self.tool_name_emitted = true;
             Some(name)
         }
@@ -221,32 +218,34 @@ pub(crate) mod imp {
             let Some(call_pos) = find_substr(text, "call:", i) else {
                 break;
             };
-            // Read identifier [\w-]+
+            // Read NAME permissively — any character up to the first
+            // '{' (newline is a hard boundary). Accepts non-OpenAI-spec
+            // function names (spaces, parens, dots, …) so clients like
+            // Ayla can pass MCP-prefixed names through without
+            // sanitizing — e.g. `Playwright (Stealth)__browser_navigate`.
             let name_start = call_pos + "call:".len();
-            let mut name_end = name_start;
-            while name_end < bytes.len() {
-                let c = bytes[name_end];
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
-                    name_end += 1;
-                } else {
+            let mut brace_start = name_start;
+            while brace_start < bytes.len() {
+                let b = bytes[brace_start];
+                if b == b'{' || b == b'\n' || b == b'\r' {
                     break;
                 }
-            }
-            if name_end == name_start {
-                i = name_start;
-                continue;
-            }
-            let name = &text[name_start..name_end];
-
-            // Expect '{' next (skip whitespace in between for resilience).
-            let mut brace_start = name_end;
-            while brace_start < bytes.len() && bytes[brace_start].is_ascii_whitespace() {
                 brace_start += 1;
             }
             if brace_start >= bytes.len() || bytes[brace_start] != b'{' {
-                i = name_end;
+                i = name_start;
                 continue;
             }
+            // Trim trailing whitespace from NAME.
+            let mut name_end = brace_start;
+            while name_end > name_start && bytes[name_end - 1].is_ascii_whitespace() {
+                name_end -= 1;
+            }
+            if name_end == name_start {
+                i = brace_start + 1;
+                continue;
+            }
+            let name = &text[name_start..name_end];
 
             // Balanced-brace span starting at brace_start.
             let brace_end = match_balanced_braces(text, brace_start)
@@ -484,6 +483,34 @@ pub(crate) mod imp {
         fn body_parser_rejects_empty_body() {
             let err = parse_tool_call_body("(no calls here)").unwrap_err();
             assert!(format!("{err}").contains("no call:"));
+        }
+
+        #[test]
+        fn body_parser_accepts_spaces_and_parens_in_name() {
+            // Ayla MCP server prefix has spaces+parens — must round-trip
+            // without 500 error. Mirrors `getAllTools()` output shape.
+            let body = r#"call:Playwright (Stealth)__browser_navigate{url:<|"|>https://example.com<|"|>}"#;
+            let calls = parse_tool_call_body(body).expect("parse permissive name");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "Playwright (Stealth)__browser_navigate");
+            assert_eq!(calls[0].arguments["url"], "https://example.com");
+        }
+
+        #[test]
+        fn body_parser_trims_trailing_whitespace_from_name() {
+            // Whitespace between NAME and `{` must be tolerated AND
+            // stripped from the emitted name.
+            let body = r#"call:my tool   {x:1}"#;
+            let calls = parse_tool_call_body(body).expect("parse trimmed name");
+            assert_eq!(calls[0].name, "my tool");
+        }
+
+        #[test]
+        fn body_parser_handles_dots_in_name() {
+            // Some MCP / non-OpenAI clients use dots (e.g. namespace.method).
+            let body = r#"call:fs.read_file{path:<|"|>/tmp/x<|"|>}"#;
+            let calls = parse_tool_call_body(body).expect("parse dotted name");
+            assert_eq!(calls[0].name, "fs.read_file");
         }
 
         #[test]

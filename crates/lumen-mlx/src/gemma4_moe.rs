@@ -2127,6 +2127,104 @@ pub(crate) mod imp {
         }
     }
 
+    /// Three-way Simple 4-bit KV-cache mode controlled by
+    /// `LUMEN_GEMMA4_QUANT_KV_MODE`.
+    ///
+    /// * `Off` — never apply Q4; full-attention layers stay in bf16.
+    /// * `On` — always apply Q4 on the full-attention KV cache.
+    /// * `Auto` — apply Q4 only when the request's `prompt_tokens`
+    ///   meets or exceeds `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`
+    ///   (default 8192). Below the threshold, KV stays in bf16 for full
+    ///   decode speed. Above, Q4 compresses 4× to keep memory bounded.
+    ///
+    /// Backward compatibility: when `LUMEN_GEMMA4_QUANT_KV_MODE` is unset,
+    /// falls back to the legacy `LUMEN_GEMMA4_QUANT_KV=0/1` gate.
+    ///
+    /// Empirical motivation (2026-05-26 sweep): simple Q4 ≈ bf16 in perf
+    /// at 8K-32K (within ±5%), so Auto-mode threshold at 8K trades zero
+    /// perceived speed for 4× KV memory headroom on long-context requests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Gemma4QuantKvMode {
+        Off,
+        On,
+        Auto,
+    }
+
+    pub fn gemma4_quant_kv_mode() -> Gemma4QuantKvMode {
+        if let Ok(s) = std::env::var("LUMEN_GEMMA4_QUANT_KV_MODE") {
+            return match s.trim().to_ascii_lowercase().as_str() {
+                "off" | "0" | "false" | "no" => Gemma4QuantKvMode::Off,
+                "on" | "1" | "true" | "yes" => Gemma4QuantKvMode::On,
+                "auto" => Gemma4QuantKvMode::Auto,
+                other => {
+                    eprintln!(
+                        "[gemma4] WARN unknown LUMEN_GEMMA4_QUANT_KV_MODE={other:?}, \
+                         defaulting to off"
+                    );
+                    Gemma4QuantKvMode::Off
+                }
+            };
+        }
+        // Legacy env var fallback (kept for backward compat).
+        if std::env::var("LUMEN_GEMMA4_QUANT_KV")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            Gemma4QuantKvMode::On
+        } else {
+            Gemma4QuantKvMode::Off
+        }
+    }
+
+    /// Auto-mode prompt-length threshold (in tokens) at which Q4 kicks in.
+    /// `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`, default 131072 (128K).
+    ///
+    /// Rationale (2026-05-26 3-way sweep on M3 Max): Q4 is ≈ neutral vs bf16
+    /// for decode at 8K-32K (within ±5%), so users only see memory benefit
+    /// without throughput cost. 128K default is conservative — only kicks in
+    /// when bf16 KV approaches platform memory ceiling (≈32 GB at 128K on
+    /// Gemma 4 26B-A4B), preserving full speed for normal usage.
+    pub fn gemma4_quant_kv_auto_threshold() -> usize {
+        std::env::var("LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(131072usize)
+            .max(1)
+    }
+
+    /// Bit width for the simple Q4 cache (`NativeKvCacheQuantized`).
+    /// `LUMEN_GEMMA4_QUANT_KV_BITS`, accepts 3 / 4 / 6 / 8. Default 4.
+    /// Trade-off: more bits = less quant noise = closer to bf16 quality at
+    /// the cost of smaller memory savings. 4-bit gives 4× compression, 8-bit
+    /// gives 2×. Invalid values fall back to 4 with a warning.
+    pub fn gemma4_quant_kv_bits() -> u32 {
+        let raw = std::env::var("LUMEN_GEMMA4_QUANT_KV_BITS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        match raw {
+            Some(b) if b == 3 || b == 4 || b == 6 || b == 8 => b,
+            Some(b) => {
+                eprintln!(
+                    "[gemma4] WARN LUMEN_GEMMA4_QUANT_KV_BITS={b} not in {{3,4,6,8}}, \
+                     defaulting to 4"
+                );
+                4
+            }
+            None => 4,
+        }
+    }
+
+    /// Per-request resolution of simple Q4 on/off based on mode + prompt length.
+    /// Returns `true` iff this request should build a `NativeKvCacheQuantized`
+    /// cache for its full-attention layers.
+    pub fn resolve_quant_kv_for_request(prompt_tokens: usize) -> bool {
+        match gemma4_quant_kv_mode() {
+            Gemma4QuantKvMode::Off => false,
+            Gemma4QuantKvMode::On => true,
+            Gemma4QuantKvMode::Auto => prompt_tokens >= gemma4_quant_kv_auto_threshold(),
+        }
+    }
+
     /// Apply TurboQuant Stage-1 quantization to the **full-attention** layers
     /// (5 of 30 in Gemma 4 26B-A4B) in addition to / instead of the sliding
     /// layers. Default OFF. Independent of [`Gemma4TqMode`] —
@@ -2193,26 +2291,40 @@ pub(crate) mod imp {
         /// `num_kv_shared_layers` slots — deferred until we extend support.
         /// Allocate caches reading TurboQuant on/off from the static env var
         /// only (no per-request adaptive). Equivalent to
-        /// `for_config_with_tq(cfg, None)`. Kept as the legacy entry for
+        /// `for_config_with_tq(cfg, None, None)`. Kept as the legacy entry for
         /// callers that don't yet know the prompt length.
         pub fn for_config(cfg: &NativeGemma4TextConfig) -> Self {
-            Self::for_config_with_tq(cfg, None)
+            Self::for_config_with_tq(cfg, None, None)
         }
 
-        /// Allocate caches with an explicit TurboQuant on/off decision for
-        /// the sliding layers. `force_tq=Some(true|false)` overrides the
-        /// env-driven gate; `None` falls back to the env (legacy behaviour).
+        /// Allocate caches with explicit TurboQuant and simple-Q4 on/off
+        /// decisions. `force_tq=Some(true|false)` overrides the TQ env gate;
+        /// `force_quant_kv=Some(...)` overrides the simple-Q4 env gate.
+        /// `None` for either falls back to the env (legacy behaviour, which
+        /// for Auto modes without prompt info defaults to Off — conservative).
         ///
-        /// Per-request adaptive callers (see [`resolve_tq_for_request`])
-        /// should always pass `Some(_)` so the decision reflects this
-        /// request's prompt length, not whatever the server's global env
-        /// var said at launch.
-        pub fn for_config_with_tq(cfg: &NativeGemma4TextConfig, force_tq: Option<bool>) -> Self {
+        /// Per-request adaptive callers (see [`resolve_tq_for_request`] /
+        /// [`resolve_quant_kv_for_request`]) should always pass `Some(_)`
+        /// so the decision reflects this request's prompt length.
+        pub fn for_config_with_tq(
+            cfg: &NativeGemma4TextConfig,
+            force_tq: Option<bool>,
+            force_quant_kv: Option<bool>,
+        ) -> Self {
             assert_eq!(
                 cfg.num_kv_shared_layers, 0,
                 "NativeGemma4PromptCache: num_kv_shared_layers > 0 not yet supported (26B-A4B uses 0)"
             );
-            let quant_kv = gemma4_quant_kv_enabled();
+            // Simple Q4 decision: caller's explicit override wins. Without
+            // override, read mode env (Auto without prompt-length info →
+            // Off, same conservative fallback as TQ).
+            let quant_kv = force_quant_kv.unwrap_or_else(|| {
+                match gemma4_quant_kv_mode() {
+                    Gemma4QuantKvMode::Off => false,
+                    Gemma4QuantKvMode::On => true,
+                    Gemma4QuantKvMode::Auto => false,
+                }
+            });
             let quant_kv_sliding = gemma4_quant_kv_sliding_enabled();
             // TQ decision: caller's explicit override wins. Otherwise read
             // legacy env (treating Auto without prompt info as Off — conservative).
@@ -2255,8 +2367,12 @@ pub(crate) mod imp {
                             };
                             NativeGemma4LayerCache::FullTurboquant(cache)
                         } else if quant_kv {
+                            // Bits driven by LUMEN_GEMMA4_QUANT_KV_BITS env
+                            // (3 / 4 / 6 / 8, default 4). group_size=64
+                            // matches the original FullQuantized layout.
+                            let bits = gemma4_quant_kv_bits() as i32;
                             NativeGemma4LayerCache::FullQuantized(NativeKvCacheQuantized::new(
-                                64, 4,
+                                64, bits,
                             ))
                         } else {
                             NativeGemma4LayerCache::Full(NativeKvCache::new())
@@ -3220,6 +3336,13 @@ pub(crate) mod imp {
         // Independent gates per-leg so we can A/B Wv-only vs Wo-only.
         tq_bake_v_active: bool,
         tq_bake_o_active: bool,
+        // Wo bake on full-attention layers (separate from sliding bake_o
+        // because full-attn uses global_head_dim=512 — its own R cached
+        // separately). Opt-in via LUMEN_GEMMA4_TQ_BAKE_R_O_FULL_ATTN=1.
+        // When ON, runtime branch skips V_dq un-rotation for full-attn
+        // layers and `sv_inline` becomes eligible (V stays rotated all
+        // the way to o_proj).
+        tq_bake_o_full_attn_active: bool,
         // MTP (Multi-Token Prediction) drafter — set via `try_enable_mtp()`.
         // None by default; when Some, callers can route through `mtp_step()`.
         // Drafter shares the trunk's KV cache for its last full-attn + last
@@ -3295,6 +3418,13 @@ pub(crate) mod imp {
                 && std::env::var("LUMEN_GEMMA4_TQ_BAKE_R_O")
                     .map(|s| s != "0")
                     .unwrap_or(true);
+            // Full-attn Wo bake: separate opt-in, only valid when sliding
+            // bake_o is also on (the runtime forward path that consumes the
+            // baked weight is shared logic gated on `tq_bake_o_active`).
+            let bake_o_full_attn = bake_o
+                && std::env::var("LUMEN_GEMMA4_TQ_BAKE_R_O_FULL_ATTN")
+                    .map(|s| s == "1")
+                    .unwrap_or(false);
             if tq_bake_active {
                 let head_dim_sliding_usize = cfg.text_config.head_dim;
                 let r_arr = crate::turboquant::rotation_matrix_f32(
@@ -3305,7 +3435,7 @@ pub(crate) mod imp {
                 let h_kv = cfg.text_config.num_key_value_heads as i32;
                 let h_q = cfg.text_config.num_attention_heads as i32;
                 let head_dim = head_dim_sliding_usize as i32;
-                let mut baked = 0usize;
+                let mut baked_sliding = 0usize;
                 for (idx, lw) in layers.iter_mut().enumerate() {
                     if lw.kind != NativeGemma4LayerType::SlidingAttention {
                         continue;
@@ -3324,16 +3454,46 @@ pub(crate) mod imp {
                             .with_context(|| format!("load: bake R into o_proj (layer {idx})"))?;
                         lw.attn.o_proj = op_rot;
                     }
-                    baked += 1;
+                    baked_sliding += 1;
                 }
+
+                // Full-attn Wo bake: independent R (D=global_head_dim=512)
+                // cached separately by `rotation_matrix_f32` keyed on
+                // (dim, seed). `bake_r_into_o_proj` is D-agnostic — takes
+                // head_dim as an arg.
+                let mut baked_full = 0usize;
+                if bake_o_full_attn {
+                    let head_dim_full_usize = cfg.text_config.global_head_dim;
+                    let r_arr_full = crate::turboquant::rotation_matrix_f32(
+                        head_dim_full_usize,
+                        crate::turboquant::TURBOQUANT_SEED,
+                    )
+                    .context("load: build rotation R (D=full) for full-attn Wo bake")?;
+                    let head_dim_full = head_dim_full_usize as i32;
+                    for (idx, lw) in layers.iter_mut().enumerate() {
+                        if lw.kind != NativeGemma4LayerType::FullAttention {
+                            continue;
+                        }
+                        let op_rot =
+                            bake_r_into_o_proj(&lw.attn.o_proj, &r_arr_full, h_q, head_dim_full)
+                                .with_context(|| {
+                                    format!("load: bake R into o_proj full-attn (layer {idx})")
+                                })?;
+                        lw.attn.o_proj = op_rot;
+                        baked_full += 1;
+                    }
+                }
+
                 eprintln!(
-                    "[gemma4-load] TQ rotation bake: layers={baked} bake_v={bake_v} bake_o={bake_o}"
+                    "[gemma4-load] TQ rotation bake: sliding={baked_sliding} full_attn={baked_full} \
+                     bake_v={bake_v} bake_o={bake_o} bake_o_full_attn={bake_o_full_attn}"
                 );
             }
             // The runtime SlidingTurboquant branch needs to know which legs
             // were baked to correctly skip the corresponding runtime matmul.
             let tq_bake_v_active = bake_v;
             let tq_bake_o_active = bake_o;
+            let tq_bake_o_full_attn_active = bake_o_full_attn;
 
             // Pre-bake hot-path constants. Saves ~60 mlx Array
             // allocations per decode step (30 ones + 30 router scalars).
@@ -3399,6 +3559,7 @@ pub(crate) mod imp {
                 tq_bake_active,
                 tq_bake_v_active,
                 tq_bake_o_active,
+                tq_bake_o_full_attn_active,
                 mtp: None,
                 last_full_attn_idx,
                 last_sliding_attn_idx,
@@ -3448,6 +3609,12 @@ pub(crate) mod imp {
         /// rotation matmul + V_dq un-rotation are actually being skipped.
         pub fn tq_bake_state(&self) -> (bool, bool) {
             (self.tq_bake_v_active, self.tq_bake_o_active)
+        }
+
+        /// Exposes whether Wo bake is also active on full-attention layers.
+        /// Independent flag because full-attn uses a separate R (D=512).
+        pub fn tq_bake_o_full_attn_state(&self) -> bool {
+            self.tq_bake_o_full_attn_active
         }
 
         /// Toggle the MTP capture hook in `forward_array_impl`. When set,
@@ -3838,12 +4005,21 @@ pub(crate) mod imp {
             NativeGemma4PromptCache::for_config(&self.config.text_config)
         }
 
-        /// Allocate a fresh cache with an explicit TurboQuant on/off
-        /// decision. Used by `generate_with_cache` when adaptive TQ
-        /// (`LUMEN_GEMMA4_TQ_MODE=auto`) needs to react to this request's
-        /// prompt length. `None` defers to the env (legacy behaviour).
-        pub fn make_cache_with_tq(&self, force_tq: Option<bool>) -> NativeGemma4PromptCache {
-            NativeGemma4PromptCache::for_config_with_tq(&self.config.text_config, force_tq)
+        /// Allocate a fresh cache with explicit TurboQuant and simple-Q4
+        /// on/off decisions. Used by `generate_with_cache` when adaptive
+        /// modes (`LUMEN_GEMMA4_TQ_MODE=auto`, `LUMEN_GEMMA4_QUANT_KV_MODE=auto`)
+        /// need to react to this request's prompt length. `None` for either
+        /// defers to the env (legacy behaviour).
+        pub fn make_cache_with_tq(
+            &self,
+            force_tq: Option<bool>,
+            force_quant_kv: Option<bool>,
+        ) -> NativeGemma4PromptCache {
+            NativeGemma4PromptCache::for_config_with_tq(
+                &self.config.text_config,
+                force_tq,
+                force_quant_kv,
+            )
         }
 
         pub fn eos_tokens(&self) -> &[u32] {
@@ -4381,7 +4557,13 @@ pub(crate) mod imp {
                 // before o_proj (Wo has no R baked in to absorb it).
                 let is_sliding_layer = matches!(kind, NativeGemma4LayerType::SlidingAttention);
                 let bake_v = self.tq_bake_v_active && is_sliding_layer;
-                let bake_o = self.tq_bake_o_active && is_sliding_layer;
+                // bake_o applies to:
+                //   sliding layers when tq_bake_o_active (default ON with TQ)
+                //   full-attn layers when tq_bake_o_full_attn_active (opt-in,
+                //     default OFF). Both require tq_bake_o_active (the runtime
+                //     state machine that consumes baked-Wo is shared logic).
+                let bake_o = self.tq_bake_o_active
+                    && (is_sliding_layer || self.tq_bake_o_full_attn_active);
                 let rotate_v = !skip_v_rotate && !bake_v;
                 let unrotate_v_dq = !skip_v_rotate && !bake_o;
 
@@ -4526,6 +4708,17 @@ pub(crate) mod imp {
                 let sv_inline_enabled = std::env::var("LUMEN_GEMMA4_TQ_SV_INLINE")
                     .map(|s| s == "1")
                     .unwrap_or(false);
+                // Full-attn-only variant: sliding D=256 sv_inline is prior
+                // NEGATIVE (B*H = 32 → ~13% GPU occupancy underutilizes the
+                // SM array vs mlx tile-MMA matmul), but full-attn D=512 with
+                // 4× larger V_dq makes materialize cost dominate. This env
+                // lets the runtime activate sv_inline only on full-attn
+                // layers, sidestepping the sliding regression.
+                let sv_inline_full_only = std::env::var("LUMEN_GEMMA4_TQ_SV_INLINE_FULL")
+                    .map(|s| s == "1")
+                    .unwrap_or(false);
+                let sv_inline_for_kind =
+                    sv_inline_enabled || (sv_inline_full_only && !is_sliding_layer);
                 // `turboquant_qk_inline` D=256 (sliding head_dim) is the
                 // shipping inline path.
                 //
@@ -4550,7 +4743,7 @@ pub(crate) mod imp {
                 // When `unrotate_v_dq=true` the runtime applies Rᵀ to V_dq
                 // before SDPA — the inline kernel can't do that, so fall back
                 // to materialized V on that path.
-                let do_sv_inline = do_inline && sv_inline_enabled && !unrotate_v_dq;
+                let do_sv_inline = do_inline && sv_inline_for_kind && !unrotate_v_dq;
                 let (kv_actual_tq, k_dq_opt, v_dq_opt, kc_inline, ks_inline, vc_inline, vs_inline) =
                     if let Some(m) = qjl_m {
                         // Local Stage-1 K dequant for residual computation.
@@ -4717,6 +4910,38 @@ pub(crate) mod imp {
                     let use_ref = std::env::var("LUMEN_GEMMA4_TQ_QK_INLINE_REF")
                         .map(|s| s == "1")
                         .unwrap_or(false);
+
+                    // Fused attention path: single kernel does (Q@K_dq^T +
+                    // softmax + S@V_dq) inline. Eliminates 2 of 3 dispatches
+                    // (qk_inline + softmax + sv_inline → fused_attn). Requires
+                    // that V codes are plumbed (`do_sv_inline=true`, i.e.
+                    // bake_o is ON so V stays in rotated space all the way
+                    // through to o_proj). T=1 decode only.
+                    let fused_attn_enabled = std::env::var("LUMEN_GEMMA4_TQ_FUSED_ATTN")
+                        .map(|s| s == "1")
+                        .unwrap_or(false);
+                    if fused_attn_enabled
+                        && !use_ref
+                        && vc_inline.is_some()
+                        && vs_inline.is_some()
+                    {
+                        // Q in head_dim space already (q_rot is Q after RoPE +
+                        // R rotation, same input the qk_inline kernel takes).
+                        // Gemma 4 doesn't apply 1/sqrt(D) attention scale (the
+                        // q_norm RMSNorm normalizes Q to unit RMS so the raw
+                        // inner product against equally-normalized K is
+                        // numerically stable without extra scaling — verified
+                        // empirically: existing `qk_inline` path also uses
+                        // scale=1.0 implicit via score = Q@K_dq^T).
+                        let vc = vc_inline.as_ref().expect("fused_attn: vc_inline");
+                        let vs = vs_inline.as_ref().expect("fused_attn: vs_inline");
+                        // Outer block bumps sdpa_start timing after the match
+                        // expression — do not double-bump here.
+                        crate::turboquant::turboquant_fused_attn(
+                            &q_rot, kc, ks, vc, vs, &centroids, 1.0,
+                        )?
+                    } else {
+
                     let scores = if use_ref {
                         let k_dq_dbg =
                             crate::turboquant::lloyd_max_dequantize_scaled(kc, ks, &centroids)?;
@@ -4771,6 +4996,7 @@ pub(crate) mod imp {
                         mlx_rs::ops::reshape(&attn_out_r, &[b, n_heads, 1, head_dim])
                             .context("tq_sliding inline: collapse GQA matmul output")?
                     }
+                    }  // end of `else` for fused_attn_enabled branch
                 } else {
                     // Decode L=1, bf16 path: no mask needed (sliding window
                     // enforced by ring already; SDPA over the ring's K is
@@ -6095,12 +6321,13 @@ pub(crate) mod imp {
             let cache_ref: &mut NativeGemma4PromptCache = match cache_in {
                 Some(c) => c,
                 None => {
-                    // Per-request adaptive TQ: when MODE=auto, the threshold
-                    // is compared against this prompt's length. MODE=on/off
-                    // bypass the threshold. Caller-supplied caches keep
-                    // whatever TQ choice they were built with (we don't
-                    // override mid-flight).
+                    // Per-request adaptive TQ + simple Q4: when MODE=auto,
+                    // the threshold is compared against this prompt's length.
+                    // MODE=on/off bypass the threshold. Caller-supplied
+                    // caches keep whatever choice they were built with
+                    // (we don't override mid-flight).
                     let force_tq = resolve_tq_for_request(prompt_ids.len());
+                    let force_quant_kv = resolve_quant_kv_for_request(prompt_ids.len());
                     if gemma4_tq_mode() == Gemma4TqMode::Auto {
                         eprintln!(
                             "[gemma4] tq_auto: prompt_tokens={} threshold={} → tq={}",
@@ -6109,7 +6336,16 @@ pub(crate) mod imp {
                             if force_tq { "ON" } else { "OFF" }
                         );
                     }
-                    owned_cache = self.make_cache_with_tq(Some(force_tq));
+                    if gemma4_quant_kv_mode() == Gemma4QuantKvMode::Auto {
+                        eprintln!(
+                            "[gemma4] quant_kv_auto: prompt_tokens={} threshold={} → q4={}",
+                            prompt_ids.len(),
+                            gemma4_quant_kv_auto_threshold(),
+                            if force_quant_kv { "ON" } else { "OFF" }
+                        );
+                    }
+                    owned_cache =
+                        self.make_cache_with_tq(Some(force_tq), Some(force_quant_kv));
                     &mut owned_cache
                 }
             };
@@ -6184,17 +6420,42 @@ pub(crate) mod imp {
                 .map(|s| !s.is_greedy())
                 .unwrap_or(false)
             {
-                use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
+                use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token_with_eos_guard};
                 let sampling = cfg.sampling.as_ref().unwrap();
                 // Discard the lazy prefill argmax; we'll sample from
                 // `logits` (the [1, 1, V] prefill output already in scope)
                 // directly. No extra prefill pass.
                 let _ = current;
                 let mut rng = Xorshift64::new(sampling.seed);
+                let runaway = lumen_core::runaway::RunawayDetector::from_env();
+                let mut thinking_budget = crate::gemma4_thinking::ChannelBudget::from_env();
                 let decode_start = Instant::now();
 
-                let first_tok = sample_next_token(&logits, &generated, sampling, &mut rng)
-                    .context("generate(sampled): sample prefill token")?;
+                // Soft-EOS suppression (see gemma4_sampling docs).
+                let min_tokens_before_eos: usize = std::env::var("LUMEN_MIN_TOKENS_BEFORE_EOS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let eos_top_k_guard: usize = std::env::var("LUMEN_EOS_TOP_K_GUARD")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let eos_min_logit_margin: f32 = std::env::var("LUMEN_EOS_MIN_LOGIT_MARGIN")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(0.0);
+
+                let first_tok = sample_next_token_with_eos_guard(
+                    &logits,
+                    &generated,
+                    sampling,
+                    &mut rng,
+                    min_tokens_before_eos,
+                    eos_top_k_guard,
+                    eos_min_logit_margin,
+                    &eos,
+                )
+                .context("generate(sampled): sample prefill token")?;
                 generated.push(first_tok);
                 let mut hit_eos_s = cfg.stop_on_eos && eos.contains(&first_tok);
 
@@ -6207,11 +6468,54 @@ pub(crate) mod imp {
                     let step_logits = self
                         .forward_array_last_token(&input, &mut cache)
                         .context("generate(sampled): decode forward")?;
-                    let next_tok = sample_next_token(&step_logits, &generated, sampling, &mut rng)
-                        .context("generate(sampled): sample step")?;
+                    let sampled = sample_next_token_with_eos_guard(
+                        &step_logits,
+                        &generated,
+                        sampling,
+                        &mut rng,
+                        min_tokens_before_eos,
+                        eos_top_k_guard,
+                        eos_min_logit_margin,
+                        &eos,
+                    )
+                    .context("generate(sampled): sample step")?;
+                    thinking_budget.observe(sampled);
+                    let next_tok = if let Some(forced) =
+                        thinking_budget.try_force_close()
+                    {
+                        eprintln!(
+                            "[thinking-budget] forcing channel close at step {decode_steps_s} ({} tokens)",
+                            generated.len()
+                        );
+                        forced
+                    } else if thinking_budget.should_block_channel_open()
+                        && sampled == crate::gemma4_thinking::TOK_CHANNEL_OPEN
+                    {
+                        eprintln!(
+                            "[thinking-budget] blocking channel re-open at step {decode_steps_s} ({} tokens); emitting <turn|>",
+                            generated.len()
+                        );
+                        crate::gemma4_thinking::TOK_TURN_CLOSE
+                    } else {
+                        sampled
+                    };
                     generated.push(next_tok);
                     decode_steps_s += 1;
                     if cfg.stop_on_eos && eos.contains(&next_tok) {
+                        hit_eos_s = true;
+                    }
+                    if let Some(reason) = runaway.check(&generated) {
+                        eprintln!(
+                            "[runaway] sampled decode aborted at step {decode_steps_s} ({} tokens): {reason}",
+                            generated.len()
+                        );
+                        hit_eos_s = true;
+                    }
+                    if thinking_budget.should_hard_break() {
+                        eprintln!(
+                            "[thinking-budget] hard break at step {decode_steps_s} ({} tokens) — force-close did not help",
+                            generated.len()
+                        );
                         hit_eos_s = true;
                     }
                     current_u32 = next_tok;
@@ -6255,6 +6559,9 @@ pub(crate) mod imp {
                 generated.push(current_u32);
                 let mut decode_steps_mtp: usize = 0;
                 let mut hit_eos_mtp = cfg.stop_on_eos && eos.contains(&current_u32);
+                let runaway_mtp = lumen_core::runaway::RunawayDetector::from_env();
+                let mut budget_mtp = crate::gemma4_thinking::ChannelBudget::from_env();
+                budget_mtp.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_mtp {
                     let out = self
                         .mtp_step(&mut cache, current_u32, n_draft)
@@ -6271,6 +6578,26 @@ pub(crate) mod imp {
                         if cfg.stop_on_eos && eos.contains(t) {
                             hit_eos_mtp = true;
                             break;
+                        }
+                    }
+                    if !hit_eos_mtp {
+                        if let Some(reason) = runaway_mtp.check(&generated) {
+                            eprintln!(
+                                "[runaway] MTP decode aborted at step {decode_steps_mtp} ({} tokens): {reason}",
+                                generated.len()
+                            );
+                            hit_eos_mtp = true;
+                        }
+                        for t in &out.committed {
+                            budget_mtp.observe(*t);
+                        }
+                        if budget_mtp.exceeded() {
+                            eprintln!(
+                                "[thinking-budget] MTP decode aborted at step {decode_steps_mtp} ({} tokens, count={})",
+                                generated.len(),
+                                budget_mtp.thought_count(),
+                            );
+                            hit_eos_mtp = true;
                         }
                     }
                     current_u32 = next_input;
@@ -6331,6 +6658,9 @@ pub(crate) mod imp {
                     Vec::with_capacity(prompt_ids.len() + cfg.max_new_tokens);
                 history.extend_from_slice(prompt_ids);
                 history.push(current_u32);
+                let runaway_lk = lumen_core::runaway::RunawayDetector::from_env();
+                let mut budget_lk = crate::gemma4_thinking::ChannelBudget::from_env();
+                budget_lk.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_lk {
                     let out = self
                         .lookup_step(&mut cache, current_u32, &history, n_lookup, n_draft)
@@ -6346,6 +6676,26 @@ pub(crate) mod imp {
                         if cfg.stop_on_eos && eos.contains(t) {
                             hit_eos_lk = true;
                             break;
+                        }
+                    }
+                    if !hit_eos_lk {
+                        if let Some(reason) = runaway_lk.check(&generated) {
+                            eprintln!(
+                                "[runaway] LOOKUP decode aborted at step {decode_steps_lk} ({} tokens): {reason}",
+                                generated.len()
+                            );
+                            hit_eos_lk = true;
+                        }
+                        for t in &out.committed {
+                            budget_lk.observe(*t);
+                        }
+                        if budget_lk.exceeded() {
+                            eprintln!(
+                                "[thinking-budget] LOOKUP decode aborted at step {decode_steps_lk} ({} tokens, count={})",
+                                generated.len(),
+                                budget_lk.thought_count(),
+                            );
+                            hit_eos_lk = true;
                         }
                     }
                     current_u32 = next_input;
@@ -6388,6 +6738,8 @@ pub(crate) mod imp {
             let decode_start = Instant::now();
             let mut decode_steps: usize = 0;
             let mut hit_eos = false;
+            let runaway_greedy = lumen_core::runaway::RunawayDetector::from_env();
+            let mut budget_greedy = crate::gemma4_thinking::ChannelBudget::from_env();
 
             // gated by `LUMEN_GEMMA4_PER_STEP_LATENCY=1`.
             // Collects per-step wall-clock + 3-substage breakdown so step[0]
@@ -6562,6 +6914,24 @@ pub(crate) mod imp {
                     hit_eos = true;
                     // Even though we already scheduled `next_lazy`, we throw
                     // it away — caller's contract is to stop on EOS.
+                    break;
+                }
+                if let Some(reason) = runaway_greedy.check(&generated) {
+                    eprintln!(
+                        "[runaway] greedy decode aborted at step {decode_steps} ({} tokens): {reason}",
+                        generated.len()
+                    );
+                    hit_eos = true;
+                    break;
+                }
+                budget_greedy.observe(token);
+                if budget_greedy.exceeded() {
+                    eprintln!(
+                        "[thinking-budget] greedy decode aborted at step {decode_steps} ({} tokens, count={})",
+                        generated.len(),
+                        budget_greedy.thought_count(),
+                    );
+                    hit_eos = true;
                     break;
                 }
                 current = next_lazy;
