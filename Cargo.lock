@@ -3270,7 +3270,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumen-app"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -3542,6 +3542,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -3553,6 +3554,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3563,6 +3565,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -3587,6 +3590,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
 dependencies = [
  "bindgen",
  "cc",
