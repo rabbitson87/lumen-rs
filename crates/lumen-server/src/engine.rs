@@ -100,6 +100,20 @@ enum ModelBackend {
 }
 
 impl ModelBackend {
+    /// Kept for API stability — always returns `false`.
+    ///
+    /// Previously this returned `true` for Gemma 4 backends so the server
+    /// could default `enable_thinking=true` for OpenAI-compat clients that
+    /// don't send a thinking signal. That default destabilized both
+    /// imatrix-AWQ builds (channel-open over-amplified → infinite reasoning)
+    /// and mlx-community uniform 4bit (channel weights too weak → degenerate
+    /// system-prompt cycling). Clients must now opt in explicitly via
+    /// `chat_template_kwargs.enable_thinking`, `reasoning_effort`, or
+    /// `thinking: true`.
+    fn is_reasoning_first_family(&self) -> bool {
+        false
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Qwen(m) => m.encode(text),
@@ -777,7 +791,7 @@ impl InferenceEngine {
             req.messages.len(),
             prompt_bytes,
             req.max_tokens,
-            req.enable_thinking(),
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
             req.stream,
             tools_owned.len(),
             needs_structured,
@@ -788,11 +802,12 @@ impl InferenceEngine {
         // backend receives; for the structured path it's a flattened
         // view used only for billing token estimates (the actual prompt
         // tokenization happens inside Gemma4Backend with the rich layout).
-        let messages: Vec<(String, String)> = req
+        let mut messages: Vec<(String, String)> = req
             .messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
         // Owning storage for `ChatTurn` borrows when routing structured.
         let arg_values: Vec<serde_json::Value> = if needs_structured {
@@ -847,8 +862,13 @@ impl InferenceEngine {
 
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        // Resolve enable_thinking once — the backend hint covers the
+        // common case where OpenAI-compat clients send placeholder model
+        // ids ("gpt-3.5-turbo") that hide the actual loaded family.
+        let thinking_on =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
         let parsed = if needs_structured {
-            let turns: Vec<ChatTurn<'_>> = req
+            let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
                 .iter()
                 .enumerate()
@@ -866,12 +886,13 @@ impl InferenceEngine {
                     },
                 })
                 .collect();
+            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
             self.backend.chat_from_history(
                 &turns,
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                thinking_on,
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -882,7 +903,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                thinking_on,
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -891,7 +912,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking());
+            .count_chat_prompt_tokens(&messages, thinking_on);
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -899,6 +920,18 @@ impl InferenceEngine {
         // emitted any tool_calls. OpenAI spec: when tool_calls present,
         // content may be null; finish_reason="tool_calls".
         let has_tool_calls = !parsed.tool_calls.is_empty();
+        // Strip Gemma 4 chat-template role label (`thought\n` / `thought `) from
+        // the start of the reasoning channel — it's a template artifact, not
+        // user-visible reasoning content. Matches vLLM's reasoning parser.
+        let reasoning_trimmed = {
+            let r = parsed.reasoning.trim();
+            r.strip_prefix("thought\n")
+                .or_else(|| r.strip_prefix("thought "))
+                .unwrap_or(r)
+                .trim()
+                .to_string()
+        };
+        let has_reasoning = !reasoning_trimmed.is_empty();
         let (content, tool_calls) = if has_tool_calls {
             let visible = parsed.visible.trim();
             let content = if visible.is_empty() {
@@ -911,7 +944,27 @@ impl InferenceEngine {
                 Some(parsed_to_openai_tool_calls(&parsed.tool_calls)),
             )
         } else {
-            (Some(parsed.visible), None)
+            (Some(parsed.visible.clone()), None)
+        };
+        // Dual emission: populate the OpenAI-spec `reasoning` field AND
+        // prepend a `<think>…</think>` envelope to `content` for clients
+        // that parse text-tag thinking (Ayla UI ChatWindow.tsx). The two
+        // representations carry the same bytes so a client only ever
+        // displays one (whichever it recognizes first; OpenAI-spec
+        // clients should prefer the `reasoning` field).
+        let content = if has_reasoning {
+            let envelope = format!("<think>\n{reasoning_trimmed}\n</think>\n\n");
+            Some(match content {
+                Some(c) if !c.is_empty() => format!("{envelope}{c}"),
+                _ => envelope,
+            })
+        } else {
+            content
+        };
+        let reasoning = if has_reasoning {
+            Some(reasoning_trimmed)
+        } else {
+            None
         };
         let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
 
@@ -926,6 +979,7 @@ impl InferenceEngine {
                     role: "assistant".into(),
                     content,
                     tool_calls,
+                    reasoning,
                 },
                 finish_reason: finish_reason.into(),
             }],
@@ -1002,6 +1056,7 @@ impl InferenceEngine {
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
+        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
         let parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
@@ -1169,12 +1224,13 @@ impl InferenceEngine {
                     }
                 }
             }
+            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
             self.backend.chat_from_history(
                 &turns,
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1187,7 +1243,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1196,7 +1252,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking());
+            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1255,15 +1311,37 @@ impl InferenceEngine {
         req: &ChatCompletionRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
-        let messages: Vec<(String, String)> = req
+        let mut messages: Vec<(String, String)> = req
             .messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
+
+        let tool_names: Vec<&str> = req
+            .tools
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|t| match t {
+                crate::types::Tool::Function { function } => function.name.as_str(),
+            })
+            .collect();
+        let inferred_mode = lumen_mlx::chat_io::classify_request_mode(&messages, &tool_names);
+        eprintln!(
+            "[chat-io] inferred_mode={} (tools={}, system_len={})",
+            inferred_mode.as_str(),
+            tool_names.len(),
+            messages
+                .iter()
+                .find(|(r, _)| r.eq_ignore_ascii_case("system"))
+                .map(|(_, c)| c.len())
+                .unwrap_or(0)
+        );
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking());
+            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
 
         let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
@@ -1273,7 +1351,7 @@ impl InferenceEngine {
             prompt_bytes,
             prompt_tokens,
             req.max_tokens,
-            req.enable_thinking(),
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
             needs_structured,
         );
 
@@ -1356,7 +1434,7 @@ impl InferenceEngine {
                     })
                     .collect()
             };
-            let turns: Vec<ChatTurn<'_>> = req
+            let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
                 .iter()
                 .enumerate()
@@ -1374,12 +1452,13 @@ impl InferenceEngine {
                     },
                 })
                 .collect();
+            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
             self.backend.chat_streaming_from_history(
                 &turns,
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1387,6 +1466,10 @@ impl InferenceEngine {
                     match ev {
                         BackendStreamEvent::Text(t) => {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::Reasoning(t) => {
+                            let _ = token_tx
+                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             let idx = next_index;
@@ -1409,7 +1492,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1417,6 +1500,10 @@ impl InferenceEngine {
                     match ev {
                         BackendStreamEvent::Text(t) => {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::Reasoning(t) => {
+                            let _ = token_tx
+                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             let idx = next_index;
@@ -1526,10 +1613,11 @@ impl InferenceEngine {
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
+        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking());
+            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
@@ -1671,12 +1759,13 @@ impl InferenceEngine {
                     _ => {}
                 }
             }
+            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
             self.backend.chat_streaming_from_history(
                 &turns,
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1684,6 +1773,10 @@ impl InferenceEngine {
                     match ev {
                         BackendStreamEvent::Text(t) => {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::Reasoning(t) => {
+                            let _ = token_tx
+                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             let idx = next_index;
@@ -1706,7 +1799,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking(),
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1714,6 +1807,10 @@ impl InferenceEngine {
                     match ev {
                         BackendStreamEvent::Text(t) => {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                        }
+                        BackendStreamEvent::Reasoning(t) => {
+                            let _ = token_tx
+                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             let idx = next_index;
@@ -1999,6 +2096,12 @@ use tokio::sync::{mpsc, oneshot};
 pub enum StreamEvent {
     /// New visible-text fragment (assistant content).
     Delta(String),
+    /// Reasoning-channel fragment (Gemma 4 `<|channel>thought\n…<channel|>`
+    /// block content). The SSE handler emits this dual-channel: into the
+    /// OpenAI `delta.reasoning` field for spec-compliant clients AND
+    /// wrapped in `<think>…</think>` inside `delta.content` for clients
+    /// (Ayla UI ChatWindow.tsx) that parse text-tag thinking.
+    ReasoningDelta(String),
     /// A tool call has been parsed; emit the OpenAI-style envelope
     /// (id + name once, then incremental `arguments` deltas) or the
     /// Anthropic-style envelope (content_block_start tool_use, then
@@ -2316,7 +2419,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking(),
+                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2355,7 +2458,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9, // AnthropicRequest has no top_p; use default
-                            req.enable_thinking(),
+                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2394,7 +2497,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking(),
+                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2435,7 +2538,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.enable_thinking(),
+                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2751,7 +2854,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking(),
+                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2790,7 +2893,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9,
-                            req.enable_thinking(),
+                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2826,7 +2929,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking(),
+                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2867,7 +2970,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.enable_thinking(),
+                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {

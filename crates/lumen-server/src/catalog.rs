@@ -102,56 +102,34 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 24,
         notes: "MoE flagship. 35B params, ~3B active per token. Best speed/quality on M3 Max.",
     },
+    // Gemma 4 lineup — two-tier, workload-anchored:
+    //   • Chat (mlx-community 4-bit) — general-purpose Korean chat / direct Q&A;
+    //     weak channel-token weights, can't reliably enter thinking mode.
+    //   • Agent Lite (hsng95 imatrix3plus-awq HIGH=4) — Korean agentic loops
+    //     (tool calls, multi-step reasoning); imatrix-AWQ amplifies channel
+    //     tokens so client must opt into thinking explicitly.
+    // Both ship are Korean-first specialty — English fact / math / code are
+    // weak across the family; recommend Qwen 3 family for those workloads.
     RecommendedModel {
-        id: "mlx-community/gemma-4-26b-a4b-4bit",
+        // CRITICAL: `-it-` (instruction-tuned) variant. The non-`it` repo
+        // `mlx-community/gemma-4-26b-a4b-4bit` is the BASE pretrain model —
+        // it has no instruction-following ability and produces self-completion
+        // loops on chat-template prompts (next-token LM behavior, not assistant
+        // behavior). Always pick the `-it-` repo for chat use.
+        id: "mlx-community/gemma-4-26b-a4b-it-4bit",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B (4-bit, LM Studio community)",
+        label: "Gemma 4 — Chat (Community IT 4-bit)",
         approx_size_gb: 14,
         min_ram_gb: 20,
-        notes: "Gemma 4 26B MoE, ~4B active per token. 4-bit quant — balanced quality. Community build by LM Studio.",
+        notes: "**Chat tier** — uniform 4-bit community build of Gemma 4's instruction-tuned (`it`) variant. Best for: Korean general chat, FAQ, simple Q&A. Not for: tool calling, multi-step reasoning, long agentic loops (channel-token weights too weak to enter thinking mode reliably). English / math / code: weak across all Gemma 4 ships — consider Qwen 3.6 instead.",
     },
-    // Lumen Gemma 4 26B-A4B 3-tier family — pick the tier matching the host RAM and
-    // workload. Multi-angle eval (PPL × 4 corpora + 7 downstream tasks: MMLU, ARC,
-    // HellaSwag, TruthfulQA, GSM8K, KMMLU, HAERAE) confirms each tier has a distinct
-    // specialty: Standard wins English narrative + factual + CoT-math, Quality wins
-    // broad knowledge + balanced, Flagship-KR wins Korean chat + lowest tulu PPL.
     RecommendedModel {
         id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B Standard (HIGH=4, hsng95)",
+        label: "Gemma 4 — Agent Lite (12 GB)",
         approx_size_gb: 12,
         min_ram_gb: 16,
-        notes: "Standard tier — 12 GB, 3.916 bpw. Mixed 4/3-bit AFFINE imatrix + AWQ Option B (mean_sq), mlp_down groups dropped, embed_tokens at AFFINE 8-bit. Best for 24 GB Macs. Wins multi-angle eval on wikitext / TruthfulQA / GSM8K chain-of-thought. 11K Korean long-context CLEAN.",
-    },
-    RecommendedModel {
-        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6",
-        family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B Quality (HIGH=6, hsng95)",
-        approx_size_gb: 14,
-        min_ram_gb: 24,
-        notes: "Quality tier — 14 GB, 4.674 bpw. Top sensitivity tier elevated to 6-bit AFFINE on top of Standard recipe (Standard 3.916 bpw → +0.76 bpw for top-35% tensors). 3-seed mean Tulu PPL 62.68 (vs Standard 66.86, Δ −4.18). Wins multi-angle eval on MMLU / ARC / KMMLU — most balanced knowledge model. Recommended default for 32 GB+ Macs.",
-    },
-    RecommendedModel {
-        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq-high6-top40",
-        family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B Flagship-KR (HIGH=6 + top4=0.40, hsng95)",
-        approx_size_gb: 15,
-        min_ram_gb: 32,
-        notes: "Flagship Korean tier — 15 GB, 5.057 bpw. HIGH=6 with top4_fraction=0.40 (40% tensors at 6-bit). 3-seed mean Tulu PPL 57.85 (vs Standard 66.86, Δ −9.01) — lowest-PPL MLX-loadable Gemma 4 26B-A4B build available. Wins HAERAE Korean knowledge (0.752) + tulu PPL. Korean chat flagship. Requires 36 GB+ for ≥8K context.",
-    },
-    // Custom Korean-tuned build — Flagship-KR with 961 dormant MoE experts (25% of
-    // 3840 total cells) pruned via workload-specific imatrix routing analysis.
-    // Per-layer variable expert count (79~117) — requires lumen-mlx native loader
-    // (auto-handled here) or the mlx_lm DecoderLayer patch. Korean axes preserved
-    // within stderr (HAERAE 0.683 vs Flagship 0.687); English fact / math degraded
-    // (TruthfulQA −13%, GSM8K −80%) — Korean-first trade-off.
-    RecommendedModel {
-        id: "hsng95/gemma-4-26b-a4b-mlx-fit-korean",
-        family: ModelFamily::Gemma4,
-        label: "Gemma 4 — 26B A4B Fit-Korean (custom, hsng95)",
-        approx_size_gb: 11,
-        min_ram_gb: 24,
-        notes: "**Custom Korean-tuned build** — Flagship-KR with 961 dormant MoE experts pruned (25% of cells). 11 GB / 5.057 bpw base. Korean axes preserved (HAERAE 0.683 within stderr of Flagship 0.687), English commonsense within stderr (HellaSwag-norm 0.395). Mac mini 24 GB stable. Trade-off: English ARC/TruthfulQA −13~14%, math CoT (GSM8K) −80%. HF model card: https://huggingface.co/hsng95/gemma-4-26b-a4b-mlx-fit-korean",
+        notes: "**Agent tier** — 12 GB, 3.916 bpw mixed 4/3-bit AFFINE imatrix + AWQ. Best for: Korean agentic workloads (tool calls, multi-step reasoning, structured outputs). Always defaults to thinking-mode generation — client must send `chat_template_kwargs.enable_thinking=true` (or `reasoning_effort` / `thinking: true`) to activate. Not for: casual chat (overkill), English fact-checking, math CoT — Korean-first specialty. Best for 24 GB Macs.",
     },
 ];
 

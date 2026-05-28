@@ -152,6 +152,19 @@ async fn handle_streaming(
                 }
                 tcp.write_all(&buf).await?;
             }
+            StreamEvent::ReasoningDelta(_text) => {
+                // Anthropic Messages API has a dedicated `thinking`
+                // content block type for extended reasoning, distinct
+                // from the OpenAI `delta.reasoning` field. Proper
+                // wiring (start `content_block_start` with
+                // `{"type":"thinking"}`, emit `thinking_delta` chunks,
+                // close with `content_block_stop`) is deferred — for
+                // now we silently discard reasoning tokens on the
+                // Anthropic SSE path so the model output still
+                // terminates cleanly without leaking reasoning into
+                // the visible text block. OpenAI clients still get
+                // the full reasoning via `/v1/chat/completions`.
+            }
             StreamEvent::ToolCallStart { id, name, .. } => {
                 if text_block_open {
                     tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;

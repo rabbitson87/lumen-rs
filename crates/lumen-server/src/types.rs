@@ -70,13 +70,35 @@ pub struct ChatTemplateKwargs {
 
 impl ChatCompletionRequest {
     /// Resolve the effective thinking flag from all supported input shapes.
-    /// Precedence (highest first):
+    ///
+    /// **imatrix-AWQ family override** — these builds have channel-open token
+    /// over-amplification (calibration corpus lacks reasoning samples,
+    /// see memory note `gemma4_imatrix_awq_channel_token_loss_2026_05_27`).
+    /// Forcing thinking ON triggers infinite-reasoning runaway, so the
+    /// answer is hard-coded `false` regardless of client signals.
+    ///
+    /// For non-imatrix-AWQ models, precedence (highest first):
     ///   1. `chat_template_kwargs.enable_thinking` — vLLM / SGLang convention,
     ///      explicit per-request override.
     ///   2. `reasoning_effort` — OpenAI o-series / GPT-5 convention.
     ///      `"minimal"` / `"none"` → off; any other recognized value → on.
     ///   3. `thinking` — Lumen extension flat bool.
+    ///   4. **Tools-present auto-thinking** — when `tools.len() > 0` and no
+    ///      explicit signal is given, default to `true`. Mirrors llama.cpp's
+    ///      observed behavior: agentic clients with tools attached need the
+    ///      thought channel active so the model can decide which tool to call
+    ///      (Gemma 4 IT's training distribution emits `<|tool_call>` tokens
+    ///      almost exclusively from inside the thinking channel).
+    ///   5. Default `false` when no explicit signal and no tools.
     pub fn enable_thinking(&self) -> bool {
+        self.enable_thinking_with_backend_default(false)
+    }
+
+    /// Kept for API stability — `backend_default_on` is currently ignored.
+    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
+        if is_imatrix_awq_family(&self.model) {
+            return false;
+        }
         if let Some(kw) = self.chat_template_kwargs.as_ref() {
             if let Some(v) = kw.enable_thinking {
                 return v;
@@ -90,6 +112,14 @@ impl ChatCompletionRequest {
         }
         self.thinking
     }
+}
+
+/// Detect imatrix-AWQ-quantized builds by id substring. The Lumen-shipped
+/// `hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq*` family matches; community
+/// uniform quants (`mlx-community/...-it-4bit` etc.) do not.
+fn is_imatrix_awq_family(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    lower.contains("imatrix") || lower.contains("-awq")
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -290,6 +320,14 @@ pub struct ChatStreamDelta {
     /// non-tool turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Incremental reasoning delta — streamed equivalent of the
+    /// non-streaming `ChatMessageResponse.reasoning` field. Mirrors the
+    /// vLLM / OpenAI o-series convention. Clients that don't recognize
+    /// this can fall back to parsing `<think>…</think>` inside `content`
+    /// (the same reasoning text is also emitted there for backward
+    /// compatibility).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Streaming variant of `ToolCall`: index-keyed; `id` / `function.name`
@@ -340,10 +378,23 @@ pub struct ChatMessageResponse {
     /// carry `tool_calls`. We emit it as an empty string in the common
     /// (text-only) case and `null` only when tool_calls are present and
     /// the model emitted no visible text alongside them.
+    ///
+    /// When the model produced reasoning (e.g. Gemma 4 `<|channel>thought\n…`),
+    /// the reasoning is also prepended to this field wrapped in
+    /// `<think>…</think>` tags so clients that parse text-tag thinking
+    /// (e.g. Ayla) display it inline. OpenAI-spec-following clients should
+    /// prefer the separate `reasoning` field below.
     #[serde(serialize_with = "serialize_nullable_string")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Model chain-of-thought / reasoning output (Gemma 4
+    /// `<|channel>thought\n…<channel|>` block, OpenAI o-series reasoning,
+    /// etc.). Mirrors the vLLM / OpenAI o-series response shape — clients
+    /// that recognize this field should prefer it over the `<think>…</think>`
+    /// envelope inside `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 fn serialize_nullable_string<S: serde::Serializer>(
@@ -515,11 +566,29 @@ impl AnthropicRequest {
     /// Anthropic API: object-form requires `type == "enabled"`, anything
     /// else (including the bool shorthand `false` and unknown `type` values)
     /// is off.
+    ///
+    /// **imatrix-AWQ family override** — same safety net as the OpenAI path
+    /// (see [`ChatCompletionRequest::enable_thinking`]). Force `false` even
+    /// when the client opts in, to avoid channel-open runaway on builds whose
+    /// calibration corpus lacks reasoning samples.
     pub fn enable_thinking(&self) -> bool {
+        if is_imatrix_awq_family(&self.model) {
+            return false;
+        }
         match &self.thinking {
             AnthropicThinking::Bool(b) => *b,
             AnthropicThinking::Object(cfg) => cfg.r#type.eq_ignore_ascii_case("enabled"),
         }
+    }
+
+    /// Parallel signature to [`ChatCompletionRequest::
+    /// enable_thinking_with_backend_default`] so the engine can call
+    /// both via a uniform pattern. Anthropic clients always send the
+    /// `thinking` field explicitly (it's part of the API contract), so
+    /// the backend hint never overrides — included only for API
+    /// consistency.
+    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
+        self.enable_thinking()
     }
 }
 
@@ -942,6 +1011,7 @@ mod tool_calling_serde {
                     arguments: "{\"location\":\"Seoul\"}".into(),
                 },
             }]),
+            reasoning: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert!(
@@ -959,6 +1029,7 @@ mod tool_calling_serde {
             role: "assistant".into(),
             content: Some("Seoul is sunny".into()),
             tool_calls: None,
+            reasoning: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["content"], "Seoul is sunny");
@@ -974,6 +1045,7 @@ mod tool_calling_serde {
         let delta = ChatStreamDelta {
             role: None,
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![ToolCallDelta {
                 index: 0,
                 id: Some("call_abc".into()),

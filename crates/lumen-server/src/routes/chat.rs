@@ -11,12 +11,107 @@ use crate::types::{
     FunctionCallDelta, ToolCallDelta, Usage,
 };
 
+/// Cap absurd `max_tokens` values to a sane ceiling. Agentic clients
+/// (Ayla, …) routinely hard-code the model's full context window as
+/// `max_tokens` (e.g. 204_800 for a 256K-ctx Gemma 4), which combined
+/// with quantization-induced CoT runaway on imatrix-AWQ builds can
+/// trap the engine in a multi-hour decode loop the user perceives as
+/// a freeze. Cap to `LUMEN_MAX_TOKENS_CAP` (default 2048) so the
+/// model has a hard kill-switch; explicit smaller values from the
+/// client pass through unchanged.
+///
+/// 2048 is tight enough that a runaway CoT terminates within ~60-90s
+/// on M3 Max (~30 tok/s decode), but still leaves room for legitimate
+/// long-form answers (a typical agentic step rarely exceeds 1K tokens).
+/// Override with `LUMEN_MAX_TOKENS_CAP=N` (e.g. 8192 for code review).
+/// Set `LUMEN_MAX_TOKENS_CAP=0` to disable the cap entirely.
+fn apply_max_tokens_cap(req: &mut ChatCompletionRequest) {
+    let cap: usize = std::env::var("LUMEN_MAX_TOKENS_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048);
+    if cap == 0 {
+        return;
+    }
+    if req.max_tokens > cap {
+        eprintln!(
+            "[chat] max_tokens cap: client={} → capped={} (LUMEN_MAX_TOKENS_CAP)",
+            req.max_tokens, cap
+        );
+        req.max_tokens = cap;
+    }
+}
+
+/// Diagnostic log of an incoming `/v1/chat/completions` request. Emits a
+/// single multi-line block that exposes the fields most often broken in
+/// agentic-client integrations (Ayla, Moltis, …): exact tool names as
+/// received, message roles + content lengths, `tool_choice`, thinking-
+/// signal triple, and `session_id`. Gate with `LUMEN_LOG_REQUEST_BODY=1`
+/// (default off) since `messages` content can include user-private text.
+fn log_request_diag(req: &ChatCompletionRequest) {
+    if std::env::var_os("LUMEN_LOG_REQUEST_BODY").is_none() {
+        return;
+    }
+    eprintln!("──────── [diag] POST /v1/chat/completions ────────");
+    eprintln!("  model            = {:?}", req.model);
+    eprintln!("  max_tokens       = {}", req.max_tokens);
+    eprintln!("  temperature      = {}", req.temperature);
+    eprintln!("  top_p            = {}", req.top_p);
+    eprintln!("  stream           = {}", req.stream);
+    eprintln!("  session_id       = {:?}", req.session_id);
+    eprintln!(
+        "  thinking_signal  = thinking={} reasoning_effort={:?} chat_template_kwargs.enable_thinking={:?}",
+        req.thinking,
+        req.reasoning_effort,
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|kw| kw.enable_thinking),
+    );
+    eprintln!(
+        "  enable_thinking()→ {} (model-id default only — engine adds backend hint)",
+        req.enable_thinking()
+    );
+    eprintln!("  tool_choice      = {:?}", req.tool_choice);
+    eprintln!("  tools            = {} items", req.tools.as_deref().map(|v| v.len()).unwrap_or(0));
+    if let Some(tools) = req.tools.as_deref() {
+        for (i, t) in tools.iter().enumerate() {
+            let crate::types::Tool::Function { function } = t;
+            eprintln!(
+                "    [{}] kind=function name={:?} desc_len={} params_keys={:?}",
+                i,
+                function.name,
+                function.description.as_deref().map(|d| d.len()).unwrap_or(0),
+                function
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().collect::<Vec<_>>()),
+            );
+        }
+    }
+    eprintln!("  messages         = {} items", req.messages.len());
+    for (i, m) in req.messages.iter().enumerate() {
+        let tc_count = m.tool_calls.as_deref().map(|v| v.len()).unwrap_or(0);
+        let content_preview: String = m.content.chars().take(80).collect();
+        eprintln!(
+            "    [{}] role={:?} content_len={} tool_call_id={:?} tool_calls={} preview={:?}",
+            i,
+            m.role,
+            m.content.len(),
+            m.tool_call_id,
+            tc_count,
+            content_preview,
+        );
+    }
+    eprintln!("───────────────────────────────────────────────────");
+}
+
 pub async fn handle(
     request: Request<ArenaBody>,
     mut response: Response<ArenaWriter>,
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
-    let req: ChatCompletionRequest = match request.get_json_arena() {
+    let mut req: ChatCompletionRequest = match request.get_json_arena() {
         Ok(r) => r,
         Err(e) => {
             let err = ErrorResponse::new(format!("invalid request: {e}"), 400);
@@ -26,6 +121,9 @@ pub async fn handle(
             return Ok(());
         }
     };
+
+    log_request_diag(&req);
+    apply_max_tokens_cap(&mut req);
 
     if req.stream {
         return handle_streaming(req, response, handle).await;
@@ -104,6 +202,7 @@ async fn handle_streaming(
                 role: Some("assistant".into()),
                 content: None,
                 tool_calls: None,
+                reasoning: None,
             },
             finish_reason: None,
         }],
@@ -168,6 +267,23 @@ async fn handle_streaming(
         s.into_bytes()
     };
     let mut carry: Option<StreamEvent> = None;
+    // Tracks whether we've sent an open `<think>` tag in the content
+    // stream that hasn't been closed yet. Set when the first
+    // `ReasoningDelta` is forwarded, cleared (with a `</think>` emit)
+    // when the first non-reasoning event arrives — see the visible
+    // `Delta`, `ToolCallStart`, and `Done` arms below.
+    let mut reasoning_open = false;
+
+    // Diagnostic counters — always on so we can see where the model
+    // spends its budget without needing LUMEN_LOG_REQUEST_BODY. Most
+    // useful signal: `reasoning_tokens` ratio. If reasoning hits the
+    // max_tokens cap before any visible token, that's the classic
+    // "thinking never ends" symptom on broken-CoT models.
+    let mut n_reasoning_chunks: usize = 0;
+    let mut n_visible_chunks: usize = 0;
+    let mut n_tool_chunks: usize = 0;
+    let stream_start = std::time::Instant::now();
+    let mut last_progress_log = stream_start;
     loop {
         let event_opt: Option<StreamEvent> = match carry.take() {
             Some(e) => Some(e),
@@ -198,6 +314,16 @@ async fn handle_streaming(
                     t_last_recv = Some(now);
                     n_deltas += 1;
                 }
+                // Close the open `<think>` envelope before the first
+                // visible-text token arrives so the Ayla UI text-tag
+                // parser sees a complete `<think>…</think>` block.
+                let text = if reasoning_open {
+                    reasoning_open = false;
+                    format!("\n</think>\n\n{text}")
+                } else {
+                    text
+                };
+                n_visible_chunks += 1;
                 buf.clear();
                 append_delta(&mut buf, &delta_prefix, delta_suffix, &text);
                 // Coalesce: drain any additional ready deltas into the same buffer
@@ -213,6 +339,7 @@ async fn handle_streaming(
                                 t_last_recv = Some(now);
                                 n_deltas += 1;
                             }
+                            n_visible_chunks += 1;
                             append_delta(&mut buf, &delta_prefix, delta_suffix, &more);
                         }
                         Ok(other) => {
@@ -223,15 +350,92 @@ async fn handle_streaming(
                     }
                 }
                 tcp.write_all(&buf).await?;
+                log_stream_progress(
+                    stream_start,
+                    &mut last_progress_log,
+                    n_reasoning_chunks,
+                    n_visible_chunks,
+                    n_tool_chunks,
+                );
                 if stream_timing {
                     t_last_write = Some(std::time::Instant::now());
                 }
+            }
+            StreamEvent::ReasoningDelta(text) => {
+                // Dual emission to maximize client compatibility:
+                //   - `delta.reasoning` field (OpenAI o-series / vLLM spec)
+                //   - `delta.content` carrying the same text — Ayla UI
+                //     parses `<think>…</think>` text tags in content, so we
+                //     emit raw reasoning chars here without wrapping. The
+                //     final non-streaming response wraps the whole
+                //     reasoning block; streaming sends fragments live so
+                //     the UI can show progress immediately. (Ayla's
+                //     ChatWindow.tsx tolerates partial/unclosed `<think>`.)
+                //   The very first reasoning fragment is prefixed with the
+                //   `<think>\n` open tag, and the close tag is appended on
+                //   the first non-reasoning Delta — handled below by
+                //   tracking a `reasoning_open` flag in the loop scope.
+                let chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatStreamChoice {
+                        index: 0,
+                        delta: ChatStreamDelta {
+                            role: None,
+                            content: Some(if !reasoning_open {
+                                reasoning_open = true;
+                                format!("<think>\n{text}")
+                            } else {
+                                text.clone()
+                            }),
+                            tool_calls: None,
+                            reasoning: Some(text.clone()),
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                write_sse(&mut tcp, &chunk).await?;
+                n_reasoning_chunks += 1;
+                log_stream_progress(
+                    stream_start,
+                    &mut last_progress_log,
+                    n_reasoning_chunks,
+                    n_visible_chunks,
+                    n_tool_chunks,
+                );
             }
             StreamEvent::ToolCallStart {
                 index,
                 id: call_id,
                 name,
             } => {
+                // Close the `<think>` envelope before the tool-call
+                // chunk so the Ayla UI text-tag parser doesn't see an
+                // unclosed reasoning block straddling the tool envelope.
+                if reasoning_open {
+                    reasoning_open = false;
+                    let close_chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![ChatStreamChoice {
+                            index: 0,
+                            delta: ChatStreamDelta {
+                                role: None,
+                                content: Some("\n</think>\n\n".into()),
+                                tool_calls: None,
+                                reasoning: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    write_sse(&mut tcp, &close_chunk).await?;
+                }
                 // Phase 1.5: OpenAI tool_calls start chunk. Carries
                 // `index`, `id`, `type:"function"`, and `function.name`
                 // exactly once; subsequent argument chunks reference
@@ -255,12 +459,14 @@ async fn handle_streaming(
                                     arguments: Some(String::new()),
                                 }),
                             }]),
+                            reasoning: None,
                         },
                         finish_reason: None,
                     }],
                     usage: None,
                 };
                 write_sse(&mut tcp, &chunk).await?;
+                n_tool_chunks += 1;
             }
             StreamEvent::ToolCallArgumentsDelta {
                 index,
@@ -285,6 +491,7 @@ async fn handle_streaming(
                                     arguments: Some(partial_json),
                                 }),
                             }]),
+                            reasoning: None,
                         },
                         finish_reason: None,
                     }],
@@ -302,6 +509,66 @@ async fn handle_streaming(
                 completion_tokens,
                 finish_reason,
             } => {
+                let elapsed = stream_start.elapsed().as_secs_f64();
+                let total_chunks = n_reasoning_chunks + n_visible_chunks + n_tool_chunks;
+                let reasoning_pct = if total_chunks > 0 {
+                    100.0 * n_reasoning_chunks as f64 / total_chunks as f64
+                } else {
+                    0.0
+                };
+                let rate = if elapsed > 0.0 {
+                    completion_tokens as f64 / elapsed
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[chat-stream] done: finish={} completion={} reasoning_chunks={} visible_chunks={} tool_chunks={} reasoning_pct={:.0}% rate={:.1}tok/s elapsed={:.1}s",
+                    finish_reason.openai_str(),
+                    completion_tokens,
+                    n_reasoning_chunks,
+                    n_visible_chunks,
+                    n_tool_chunks,
+                    reasoning_pct,
+                    rate,
+                    elapsed,
+                );
+                if matches!(finish_reason, FinishReason::Length)
+                    && n_visible_chunks == 0
+                    && n_reasoning_chunks > 0
+                {
+                    eprintln!(
+                        "[chat-stream] ⚠ runaway-CoT detected: hit max_tokens with reasoning only \
+                         (no visible output). Lower LUMEN_MAX_TOKENS_CAP or pick a model with \
+                         stronger CoT termination."
+                    );
+                }
+                // Close any unclosed `<think>` envelope so the Ayla UI's
+                // text-tag parser doesn't see a dangling open tag at
+                // end-of-stream. Happens when the model emitted only
+                // reasoning + EOS (no visible content) — a known
+                // failure mode on quantized variants whose CoT path is
+                // degraded (channel-token amplification on imatrix-AWQ).
+                if reasoning_open {
+                    reasoning_open = false;
+                    let close_chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![ChatStreamChoice {
+                            index: 0,
+                            delta: ChatStreamDelta {
+                                role: None,
+                                content: Some("\n</think>\n\n".into()),
+                                tool_calls: None,
+                                reasoning: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    write_sse(&mut tcp, &close_chunk).await?;
+                }
                 // Final content chunk with finish_reason. Per OpenAI spec, this
                 // chunk's `usage` is null even when include_usage=true; the
                 // usage payload arrives in a follow-up chunk with empty choices.
@@ -316,6 +583,7 @@ async fn handle_streaming(
                             role: None,
                             content: None,
                             tool_calls: None,
+                            reasoning: None,
                         },
                         finish_reason: Some(finish_reason.openai_str().into()),
                     }],
@@ -370,6 +638,34 @@ async fn handle_streaming(
     Ok(())
 }
 
+/// Emit a `[chat-stream] progress: …` line every ~2s while the stream
+/// is in flight. The visible/reasoning/tool split makes it obvious when
+/// the model is stuck in a CoT loop (`visible=0` for tens of seconds)
+/// vs. genuinely producing output. Free signal — no behavior impact.
+fn log_stream_progress(
+    start: std::time::Instant,
+    last_log: &mut std::time::Instant,
+    reasoning: usize,
+    visible: usize,
+    tools: usize,
+) {
+    let now = std::time::Instant::now();
+    if now.duration_since(*last_log) < std::time::Duration::from_secs(2) {
+        return;
+    }
+    *last_log = now;
+    let elapsed = now.duration_since(start).as_secs_f64();
+    let total = reasoning + visible + tools;
+    let rate = if elapsed > 0.0 {
+        total as f64 / elapsed
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[chat-stream] progress: total={total} (reasoning={reasoning} visible={visible} tool={tools}) rate={rate:.1}chunks/s elapsed={elapsed:.1}s"
+    );
+}
+
 /// Append one SSE delta envelope to `buf`. The text is JSON-string-escaped via
 /// `serde_json::to_writer` directly into the buffer — no intermediate String alloc.
 fn append_delta(buf: &mut Vec<u8>, prefix: &str, suffix: &[u8], text: &str) {
@@ -380,10 +676,11 @@ fn append_delta(buf: &mut Vec<u8>, prefix: &str, suffix: &[u8], text: &str) {
     buf.extend_from_slice(suffix);
 }
 
-async fn write_sse<T: serde::Serialize>(
-    tcp: &mut tokio::net::TcpStream,
-    data: &T,
-) -> Result<(), SendableError> {
+async fn write_sse<W, T>(tcp: &mut W, data: &T) -> Result<(), SendableError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
     let json = serde_json::to_string(data).map_err(|e| SendableError::from(e.to_string()))?;
     let msg = format!("data: {json}\n\n");
     tcp.write_all(msg.as_bytes()).await?;
@@ -483,6 +780,7 @@ mod tests {
                     role: None,
                     content: Some(text.to_string()),
                     tool_calls: None,
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],
