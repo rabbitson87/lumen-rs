@@ -43,6 +43,7 @@ mod gemma4_response;
 mod gemma4_sampling;
 mod gemma4_thinking;
 mod gemma4_tools;
+pub mod grammar;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).

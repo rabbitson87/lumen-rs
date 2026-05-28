@@ -2004,7 +2004,7 @@ fn resolve_openai_tool_choice<'a>(
     tool_choice: Option<&'a ToolChoice>,
     has_tools: bool,
 ) -> ResolvedToolChoice<'a> {
-    match tool_choice {
+    let resolved = match tool_choice {
         None => ResolvedToolChoice::Auto,
         Some(ToolChoice::Mode(m)) => match m.as_str() {
             "none" => ResolvedToolChoice::None,
@@ -2015,6 +2015,45 @@ fn resolve_openai_tool_choice<'a>(
             ResolvedToolChoice::Tool(function.name.as_str())
         }
         Some(ToolChoice::Named { .. }) => ResolvedToolChoice::Auto,
+    };
+    auto_to_required_when_env_set(resolved, has_tools)
+}
+
+/// When `LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED` is truthy AND the request
+/// supplies tools, upgrade `Auto` → `Required` so the chat-template
+/// prefill kicks in (Phase 2 grammar then sees the prefilled
+/// `<|tool_call>` and the model emits `call:NAME{…}` natively from
+/// training). Used by deployments where the client (e.g. Ayla) emits
+/// `tool_choice="auto"` but the model has weak self-emission of
+/// `<|tool_call>` (id 48) under uniform-4bit quants
+/// (`mlx-community/gemma-4-26b-a4b-it-4bit` etc.). Tools-bearing
+/// requests in those deployments effectively always want a tool call —
+/// the "final answer" tool's `summary` field carries the user-visible
+/// text.
+///
+/// Conservative default OFF preserves OpenAI-spec semantics for mixed
+/// chat/agent clients (Claude Code, Cursor) that depend on `auto`
+/// meaning "model decides".
+///
+/// No-op when the request explicitly chose `None` / `Required` / `Tool`
+/// — only the implicit `Auto` is touched.
+fn auto_to_required_when_env_set<'a>(
+    choice: ResolvedToolChoice<'a>,
+    has_tools: bool,
+) -> ResolvedToolChoice<'a> {
+    if !has_tools || !matches!(choice, ResolvedToolChoice::Auto) {
+        return choice;
+    }
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *CACHED.get_or_init(|| {
+        std::env::var("LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED")
+            .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    });
+    if enabled {
+        ResolvedToolChoice::Required
+    } else {
+        choice
     }
 }
 
@@ -2025,7 +2064,7 @@ fn resolve_anthropic_tool_choice<'a>(
     tool_choice: Option<&'a AnthropicToolChoice>,
     has_tools: bool,
 ) -> ResolvedToolChoice<'a> {
-    match tool_choice {
+    let resolved = match tool_choice {
         None => ResolvedToolChoice::Auto,
         Some(AnthropicToolChoice::Auto) => ResolvedToolChoice::Auto,
         Some(AnthropicToolChoice::Any) if has_tools => ResolvedToolChoice::Required,
@@ -2034,7 +2073,8 @@ fn resolve_anthropic_tool_choice<'a>(
             ResolvedToolChoice::Tool(name.as_str())
         }
         Some(AnthropicToolChoice::Tool { .. }) => ResolvedToolChoice::Auto,
-    }
+    };
+    auto_to_required_when_env_set(resolved, has_tools)
 }
 
 fn openai_tools_to_defs(tools: Option<&[Tool]>) -> Vec<ToolDef<'_>> {

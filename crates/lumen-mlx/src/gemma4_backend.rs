@@ -23,11 +23,72 @@
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, OnceLock};
     use std::time::Instant;
 
     use crate::chat_io::BackendStreamEvent;
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
+    use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
+    use llguidance::ParserFactory;
+
+    /// Dump rendered prompt to stderr when `LUMEN_DUMP_PROMPT` is set.
+    /// Set to `1` / `true` for compact dump (decoded text + length), set to
+    /// `full` for verbose dump (token IDs + decoded text, no truncation).
+    ///
+    /// Useful for diagnosing chat-template rendering bugs without rebuilding
+    /// the model — the dump shows exactly what the model sees, including all
+    /// special tokens (`<|turn>`, `<|tool_call>`, `<|tool_response>`, etc.)
+    /// in their human-readable form.
+    fn maybe_dump_prompt(chat: &Gemma4ChatTemplate, ids: &[u32], origin: &'static str) {
+        let mode = match std::env::var("LUMEN_DUMP_PROMPT").ok() {
+            Some(s) if !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false") => s,
+            _ => return,
+        };
+        let full = mode.eq_ignore_ascii_case("full");
+        let decoded = chat
+            .decode(ids, /* skip_special_tokens = */ false)
+            .unwrap_or_else(|e| format!("<decode error: {e:#}>"));
+        eprintln!(
+            "[dump-prompt:{origin}] n_tokens={} text_bytes={}{}",
+            ids.len(),
+            decoded.len(),
+            if full || decoded.len() <= 4096 {
+                ""
+            } else {
+                " (truncated — set LUMEN_DUMP_PROMPT=full for verbose)"
+            }
+        );
+        eprintln!("[dump-prompt:{origin}] ---BEGIN---");
+        if full || decoded.len() <= 4096 {
+            eprintln!("{decoded}");
+        } else {
+            // UTF-8 safe truncation: snap byte offsets down/up to the
+            // nearest `char_boundary` so we never slice mid-character
+            // (Korean / Japanese / emoji are multi-byte). Without this
+            // the worker panics with "byte index N is not a char
+            // boundary" and the request fails with empty response.
+            let mut head_end = 2048usize.min(decoded.len());
+            while head_end > 0 && !decoded.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            let mut tail_start = decoded.len().saturating_sub(2048);
+            while tail_start < decoded.len() && !decoded.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            eprintln!("{}", &decoded[..head_end]);
+            eprintln!(
+                "...<{} bytes elided>...",
+                tail_start.saturating_sub(head_end)
+            );
+            eprintln!("{}", &decoded[tail_start..]);
+        }
+        eprintln!("[dump-prompt:{origin}] ---END---");
+        if full {
+            eprintln!("[dump-prompt:{origin}] token_ids = {ids:?}");
+        }
+    }
+
     use crate::gemma4_moe::imp::{GenerateConfig, NativeGemma4Model, NativeGemma4PromptCache};
     use crate::gemma4_response::imp::{ParseState, ParsedResponse, ResponseParser};
     use crate::gemma4_sampling::imp::SamplingConfig;
@@ -112,6 +173,7 @@ pub(crate) mod imp {
             repeat_penalty,
             repeat_penalty_last_n,
             seed,
+            dry: lumen_core::dry::dry_config_from_env(),
         };
         if cfg.is_greedy() { None } else { Some(cfg) }
     }
@@ -145,6 +207,24 @@ pub(crate) mod imp {
     ///      `ArgumentsDelta` chunk at `<tool_call|>` close.)
     ///   3. Boundary tokens (`<|tool_call>` open / `<tool_call|>`
     ///      close). Suppressed — no event fires.
+    /// Per-token stderr trace. Enabled when `LUMEN_GEMMA4_TOKEN_TRACE` is
+    /// set to a non-empty / non-`0` / non-`false` value. Prints one line
+    /// per sampled token with id + decoded text (special tokens visible)
+    /// + parser state transition. Use for debugging reasoning runaway,
+    /// tool-call structure, or channel close failures.
+    ///
+    /// Cheap when off (single env lookup per call, cached on first hit
+    /// via a `OnceLock`). Bounded cost when on (one decode per token,
+    /// ~50 µs at vocab 262144).
+    fn gemma4_token_trace_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("LUMEN_GEMMA4_TOKEN_TRACE")
+                .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+        })
+    }
+
     fn emit_token_event(
         chat: &Gemma4ChatTemplate,
         parser: &mut ResponseParser<'_>,
@@ -153,13 +233,46 @@ pub(crate) mod imp {
         on_event: &mut impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
     ) -> Result<()> {
         let state_after = parser.state();
+        if gemma4_token_trace_enabled() {
+            // Decode WITH specials so `<|channel>` / `<turn|>` / `<|tool_call>`
+            // boundary markers stay visible — that's the whole point of a
+            // trace dump, you want to see exactly when the model switched
+            // channels.
+            let text = chat
+                .decode(&[token], /* skip_special */ false)
+                .unwrap_or_else(|_| String::from("<decode-err>"));
+            eprintln!(
+                "[token-trace] id={token:>6} {state_before:?}→{state_after:?} text={text:?}"
+            );
+        }
         let in_tool_call_span = matches!(state_before, ParseState::ToolCall)
             || matches!(state_after, ParseState::ToolCall);
-        if !in_tool_call_span {
+        let in_reasoning_span = matches!(state_before, ParseState::Reasoning)
+            || matches!(state_after, ParseState::Reasoning);
+        if !in_tool_call_span && !in_reasoning_span {
             // Pure visible-channel token.
             let chunk = chat.decode(&[token], true)?;
             if !chunk.is_empty() {
                 on_event(BackendStreamEvent::Text(&chunk))?;
+            }
+            return Ok(());
+        }
+        // Reasoning-channel token. Emit as `Reasoning` so the HTTP layer
+        // can wrap with `<think>…</think>` envelope AND populate the
+        // OpenAI `delta.reasoning` field — clients (Ayla UI text-tag
+        // parser, vLLM-spec OpenAI clients) see thinking progress in
+        // real time instead of an apparently-stuck stream.
+        if in_reasoning_span && !in_tool_call_span {
+            // Skip the boundary tokens themselves (channel open/close)
+            // — they decode to the empty string under skip_special=true
+            // but emitting an empty Reasoning event would be noise.
+            if matches!(state_before, ParseState::Reasoning)
+                && matches!(state_after, ParseState::Reasoning)
+            {
+                let chunk = chat.decode(&[token], /* skip_special */ true)?;
+                if !chunk.is_empty() {
+                    on_event(BackendStreamEvent::Reasoning(&chunk))?;
+                }
             }
             return Ok(());
         }
@@ -197,6 +310,31 @@ pub(crate) mod imp {
     ///
     /// Each `generate*` call allocates a fresh `NativeGemma4PromptCache`
     /// **unless** the prefix-cache path (`chat_with_prefix_cache`) is used.
+    /// Opt-in flag for the Lark-format Gemma 4 tool-call grammar. Default
+    /// OFF. When set (`1` / truthy), [`Gemma4Backend::build_grammar_state`]
+    /// constructs an active matcher that constrains tool-call bodies to
+    /// the native `call:NAME{key:value,…}` format with per-tool schema
+    /// enforcement. Cached on first read.
+    fn gemma4_grammar_lark_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("LUMEN_GEMMA4_GRAMMAR_LARK")
+                .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// True for model ids the operator has flagged as instruction-tuned
+    /// via imatrix-AWQ calibration. These builds produce degenerate
+    /// tool-call outputs (channel logits suppressed by quantization) and
+    /// should sample freely regardless of `tool_choice`. Mirrors the
+    /// server-side check in `lumen-server::types::is_imatrix_awq_family`
+    /// so backend + server agree on the gate.
+    fn is_imatrix_awq_family(model_id: &str) -> bool {
+        let lower = model_id.to_ascii_lowercase();
+        lower.contains("imatrix") || lower.contains("-awq")
+    }
+
     pub struct Gemma4Backend {
         model: NativeGemma4Model,
         chat: Gemma4ChatTemplate,
@@ -204,6 +342,17 @@ pub(crate) mod imp {
         /// Per-key prefix caches. Keyed by caller-supplied string (e.g. the
         /// system message hash from the Moltis side, or a batch id).
         prefix_caches: HashMap<String, Gemma4PrefixCacheEntry>,
+        /// Directory the model was loaded from (holds `tokenizer.json`).
+        /// Retained so the llguidance `ParserFactory` can be lazily built
+        /// the first time a tools-bearing request arrives.
+        model_dir: PathBuf,
+        /// Cached llguidance factory keyed by this backend's tokenizer.
+        /// Built once per backend instance (~10–50 ms slicer init); per-
+        /// request `create_parser` calls are cheap. Stays `Err` if the
+        /// tokenizer.json failed to parse so subsequent tool-bearing
+        /// requests degrade gracefully (sample without grammar) rather
+        /// than fail outright.
+        grammar_factory: OnceLock<Option<Arc<ParserFactory>>>,
     }
 
     impl Gemma4Backend {
@@ -223,7 +372,141 @@ pub(crate) mod imp {
                 chat,
                 model_id: model_id.into(),
                 prefix_caches: HashMap::new(),
+                model_dir: dir.to_path_buf(),
+                grammar_factory: OnceLock::new(),
             })
+        }
+
+        /// Lazily build (or return the cached) llguidance `ParserFactory`
+        /// bound to this backend's `tokenizer.json`. Returns `None` when
+        /// either:
+        ///   - tokenizer.json parsing failed (logged once at first call);
+        ///   - the backend's `model_id` belongs to the imatrix-AWQ family,
+        ///     which the operator runs with tool-calling disabled.
+        ///
+        /// Callers that get `None` should skip grammar wiring and sample
+        /// freely; that's the graceful-degrade path for misconfiguration.
+        fn grammar_factory(&self) -> Option<Arc<ParserFactory>> {
+            if is_imatrix_awq_family(&self.model_id) {
+                return None;
+            }
+            self.grammar_factory
+                .get_or_init(|| {
+                    let path = self.model_dir.join("tokenizer.json");
+                    match shared_factory_from_tokenizer(&path) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            eprintln!(
+                                "[gemma4-backend] grammar factory unavailable \
+                                 (tools will sample without grammar mask): {e:#}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .clone()
+        }
+
+        /// Build a per-request grammar state from the parsed tool defs +
+        /// resolved tool_choice. Returns `None` unless the operator opts
+        /// in via `LUMEN_GEMMA4_GRAMMAR_LARK=1` AND the request actually
+        /// expresses a tool intent.
+        ///
+        /// Background: the JSON Schema path produces JSON output
+        /// (`{"name":"X","arguments":{...}}`) which Gemma 4's response
+        /// parser ([`crate::gemma4_response::imp::parse_tool_call_body`])
+        /// can't read — it expects the native pseudo-JSON format
+        /// `call:NAME{key:value,…}` emitted from training. The Lark
+        /// generator in [`crate::grammar::build_tool_grammar_lark`] (gated
+        /// via `Gemma4GrammarState::new_lark`) emits the right format.
+        ///
+        /// Default OFF preserves the proven native-only path (no schema
+        /// validation, model emits canonical format from training). Opt
+        /// in when:
+        ///   - operating on models that drift off-format under quant;
+        ///   - serving clients that demand strict schema enforcement;
+        ///   - debugging grammar issues against the curl smoke fixture.
+        ///
+        /// `imatrix-AWQ` family is still skipped via
+        /// [`grammar_factory`] regardless of env (those builds force
+        /// thinking off and don't exercise tool calling).
+        fn build_grammar_state(
+            &self,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Option<Gemma4GrammarState> {
+            use crate::chat_io::ResolvedToolChoice;
+            if !gemma4_grammar_lark_enabled() {
+                return None;
+            }
+            // env is ON — any further skip is unexpected during agentic flows,
+            // so log the reason so the operator can diagnose.
+            if tools.is_empty() {
+                eprintln!("[gemma4-backend] Lark grammar skipped: tools empty");
+                return None;
+            }
+            // Always Lazy (never Eager) regardless of `tool_choice`.
+            // Reasoning: empirically the Eager + agentic-loop combination
+            // sends the model into an n-gram cycle on the 3rd-or-later
+            // turn — the grammar over-permits duplicate fields
+            // (`tc_field ("," tc_field)*`) so the model can't commit to
+            // closing the body. Lazy mode dodges this entirely: grammar
+            // only activates AFTER the model self-emits `<|tool_call>`
+            // (id 48), which means
+            //   - `Required` / `Tool(_)` runs use the chat-template
+            //     prefill to inject id 48 — prefill goes through
+            //     `parser.push()`, NOT through `state.observe()`, so the
+            //     Lazy matcher stays inactive and the model emits the
+            //     body freely from training distribution (the pre-Lark
+            //     behaviour, proven to work end-to-end).
+            //   - `Auto` runs still get the schema safety net when the
+            //     model decides on its own to emit `<|tool_call>` —
+            //     observe(48) flips the matcher on and the args body is
+            //     schema-constrained.
+            // Future Eager re-enable should pair with a permutation-
+            // ordered, no-duplicate body grammar (see
+            // `build_tool_grammar_lark` doc).
+            if matches!(choice, ResolvedToolChoice::None) {
+                eprintln!("[gemma4-backend] Lark grammar skipped: tool_choice=None");
+                return None;
+            }
+            let mode = GrammarMode::Lazy;
+            let Some(factory) = self.grammar_factory() else {
+                eprintln!(
+                    "[gemma4-backend] Lark grammar skipped: factory unavailable \
+                     (imatrix-AWQ family or tokenizer.json load error)"
+                );
+                return None;
+            };
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    let mut function = serde_json::json!({ "name": t.name });
+                    if let Some(d) = t.description {
+                        function["description"] = serde_json::Value::String(d.to_string());
+                    }
+                    if let Some(p) = t.parameters {
+                        function["parameters"] = p.clone();
+                    }
+                    serde_json::json!({ "type": "function", "function": function })
+                })
+                .collect();
+            match Gemma4GrammarState::new_lark(factory, &tools_json, mode) {
+                Ok(s) => {
+                    eprintln!(
+                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?})",
+                        tools.len()
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gemma4-backend] Lark grammar state build failed \
+                         (falling back to free sampling): {e:#}"
+                    );
+                    None
+                }
+            }
         }
 
         pub fn model_id(&self) -> &str {
@@ -234,36 +517,67 @@ pub(crate) mod imp {
             &self.model
         }
 
+        /// Allocate a fresh cache with the per-request adaptive decision
+        /// for both TQ and simple Q4. `prompt_len` is this request's
+        /// prompt-token count; auto-mode env vars compare it against
+        /// their respective thresholds. `On` / `Off` modes ignore the
+        /// length (binary decision). Use this everywhere a cache is
+        /// built without prefix-cache reuse so the adaptive mode actually
+        /// fires on long-context requests.
+        fn make_cache_for_prompt_len(
+            &self,
+            prompt_len: usize,
+        ) -> crate::gemma4_moe::imp::NativeGemma4PromptCache {
+            use crate::gemma4_moe::imp::{
+                Gemma4QuantKvMode, Gemma4TqMode, gemma4_quant_kv_auto_threshold,
+                gemma4_quant_kv_mode, gemma4_tq_auto_threshold, gemma4_tq_mode,
+                resolve_quant_kv_for_request, resolve_tq_for_request,
+            };
+            let force_tq = resolve_tq_for_request(prompt_len);
+            let force_quant_kv = resolve_quant_kv_for_request(prompt_len);
+            if gemma4_tq_mode() == Gemma4TqMode::Auto {
+                eprintln!(
+                    "[gemma4-backend] tq_auto: prompt_tokens={prompt_len} \
+                     threshold={} → tq={}",
+                    gemma4_tq_auto_threshold(),
+                    if force_tq { "ON" } else { "OFF" }
+                );
+            }
+            if gemma4_quant_kv_mode() == Gemma4QuantKvMode::Auto {
+                eprintln!(
+                    "[gemma4-backend] quant_kv_auto: prompt_tokens={prompt_len} \
+                     threshold={} → q4={}",
+                    gemma4_quant_kv_auto_threshold(),
+                    if force_quant_kv { "ON" } else { "OFF" }
+                );
+            }
+            self.model
+                .make_cache_with_tq(Some(force_tq), Some(force_quant_kv))
+        }
+
         /// One-line runtime config summary for startup logging. Captures
         /// the effective values AFTER all env overrides (LUMEN_MAX_CTX,
         /// LUMEN_SLIDING_WINDOW, LUMEN_GEMMA4_TOP_K, etc.) have been
         /// applied — what the model actually runs with, not what the on-
         /// disk config.json claims.
         pub fn runtime_config_summary(&self) -> String {
+            // TurboQuant infra remains in-tree (env-gated default OFF) for
+            // future CUDA / PagedAttention work — see CLAUDE.md Phase 2/3.
+            // It is not surfaced here because empirical sweeps showed TQ is
+            // net-negative on Apple Silicon batch=1; users should not need
+            // to reason about it. Q4 simple quantization is the supported
+            // memory-saving lever and is exposed below.
             let cfg = &self.model.config().text_config;
-            let tq_mode = match crate::gemma4_moe::imp::gemma4_tq_mode() {
-                crate::gemma4_moe::imp::Gemma4TqMode::Off => "off",
-                crate::gemma4_moe::imp::Gemma4TqMode::On => "on",
-                crate::gemma4_moe::imp::Gemma4TqMode::Auto => "auto",
+            let q4_mode = match crate::gemma4_moe::imp::gemma4_quant_kv_mode() {
+                crate::gemma4_moe::imp::Gemma4QuantKvMode::Off => "off",
+                crate::gemma4_moe::imp::Gemma4QuantKvMode::On => "on",
+                crate::gemma4_moe::imp::Gemma4QuantKvMode::Auto => "auto",
             };
-            let tq_threshold = crate::gemma4_moe::imp::gemma4_tq_auto_threshold();
-            let (bake_v, bake_o) = self.model.tq_bake_state();
-            let fused_vrot = std::env::var("LUMEN_GEMMA4_TQ_FUSED_VROT")
-                .map(|s| s == "1")
-                .unwrap_or(false);
-            let fused_krot = std::env::var("LUMEN_GEMMA4_TQ_FUSED_KROT")
-                .map(|s| s == "1")
-                .unwrap_or(false);
-            let qjl = std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL")
-                .map(|s| s == "1")
-                .unwrap_or(false);
-            let tq_full_attn = crate::gemma4_moe::imp::gemma4_tq_full_attn_enabled();
+            let q4_threshold = crate::gemma4_moe::imp::gemma4_quant_kv_auto_threshold();
+            let q4_bits = crate::gemma4_moe::imp::gemma4_quant_kv_bits();
             format!(
                 "max_ctx={} sliding_window={} top_k_experts={}/{} layers={} vocab={} mtp={} \
-                 tq_mode={tq_mode} tq_auto_threshold={tq_threshold} \
-                 tq_full_attn={tq_full_attn} \
-                 tq_bake_v={bake_v} tq_bake_o={bake_o} \
-                 tq_fused_krot={fused_krot} tq_fused_vrot={fused_vrot} tq_qjl={qjl}",
+                 quant_kv={q4_mode} quant_kv_threshold={q4_threshold} quant_kv_bits={q4_bits}",
                 cfg.max_position_embeddings,
                 cfg.sliding_window,
                 cfg.top_k_experts,
@@ -335,14 +649,16 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            self.chat.render_chat_history(
+            let ids = self.chat.render_chat_history(
                 turns,
                 &RenderOptions {
                     enable_thinking: thinking,
                     add_generation_prompt: true,
                 },
                 tools,
-            )
+            )?;
+            maybe_dump_prompt(&self.chat, &ids, "from_history");
+            Ok(ids)
         }
 
         fn build_chat_input_from_history_no_gen(
@@ -351,14 +667,16 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            self.chat.render_chat_history(
+            let ids = self.chat.render_chat_history(
                 turns,
                 &RenderOptions {
                     enable_thinking: thinking,
                     add_generation_prompt: false,
                 },
                 tools,
-            )
+            )?;
+            maybe_dump_prompt(&self.chat, &ids, "from_history_no_gen");
+            Ok(ids)
         }
 
         /// Tool-aware variant of `build_chat_input`. Empty `tools` slice
@@ -372,14 +690,16 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
             let parsed = Self::parse_role_pairs(messages)?;
-            self.chat.render_to_ids_with_tools(
+            let ids = self.chat.render_to_ids_with_tools(
                 &parsed,
                 &RenderOptions {
                     enable_thinking: thinking,
                     add_generation_prompt: true,
                 },
                 tools,
-            )
+            )?;
+            maybe_dump_prompt(&self.chat, &ids, "with_tools");
+            Ok(ids)
         }
 
         /// Like `build_chat_input_with_tools` but without the trailing
@@ -636,10 +956,10 @@ pub(crate) mod imp {
                         }
                         (cache, "hit", lcp)
                     } else {
-                        (self.model.make_cache(), "miss-no-overlap", 0)
+                        (self.make_cache_for_prompt_len(prompt.len()), "miss-no-overlap", 0)
                     }
                 }
-                None => (self.model.make_cache(), "miss-no-entry", 0),
+                None => (self.make_cache_for_prompt_len(prompt.len()), "miss-no-entry", 0),
             };
 
             // Update hit stats
@@ -783,15 +1103,15 @@ pub(crate) mod imp {
                                 eprintln!(
                                     "[gemma4-backend] prefix-cache truncate failed (lcp={lcp}): {e:#}, falling back to cold prefill"
                                 );
-                                return (self.model.make_cache(), "miss-truncate-fail", 0);
+                                return (self.make_cache_for_prompt_len(prompt.len()), "miss-truncate-fail", 0);
                             }
                         }
                         (cache, "hit", lcp)
                     } else {
-                        (self.model.make_cache(), "miss-no-overlap", 0)
+                        (self.make_cache_for_prompt_len(prompt.len()), "miss-no-overlap", 0)
                     }
                 }
-                None => (self.model.make_cache(), "miss-no-entry", 0),
+                None => (self.make_cache_for_prompt_len(prompt.len()), "miss-no-entry", 0),
             }
         }
 
@@ -886,12 +1206,14 @@ pub(crate) mod imp {
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
                  result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len}"
             );
+            let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
+                grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
                 on_event,
@@ -942,12 +1264,14 @@ pub(crate) mod imp {
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
                  result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)"
             );
+            let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
+                grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
                 on_event,
@@ -1064,12 +1388,14 @@ pub(crate) mod imp {
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+            let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
+                grammar,
                 None,
                 None,
                 on_event,
@@ -1096,12 +1422,14 @@ pub(crate) mod imp {
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
                 max_new_tokens,
                 temperature,
                 top_p,
+                grammar,
                 None,
                 None,
                 on_event,
@@ -1115,6 +1443,14 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            // Phase 2.5: grammar-constrained tool calling. `None` for the
+            // default text path; `Some(state)` engages the llguidance mask
+            // during the sampled decode branch (no-op on greedy / MTP — those
+            // paths don't sample multinomially and would need different
+            // wiring). The state is observed every sampled step so the
+            // lazy trigger fires on `<|tool_call>` even when grammar
+            // started inactive.
+            grammar: Option<Gemma4GrammarState>,
             // Pre-built cache from a prefix-cache lookup. When `Some`, its
             // `offset()` tells the chunked prefill where the new suffix
             // begins — only `&prompt[offset..]` gets prefilled. When `None`,
@@ -1152,8 +1488,15 @@ pub(crate) mod imp {
             // and lets the MLX backend keep a tighter Metal command queue
             // for the decode pipeline.
             let gen_stream = mlx_rs::Stream::gpu();
+            // Per-request adaptive cache: when MODE=auto for TQ or simple Q4,
+            // the resolution depends on this prompt's length, not the global
+            // env at server launch. Pre-built caches (from prefix-cache hits)
+            // keep whatever choice they were built with.
+            let prompt_len = prompt.len();
             mlx_rs::with_new_default_stream(gen_stream, || -> Result<ParsedResponse> {
-                let mut cache = pre_built_cache.unwrap_or_else(|| self.model.make_cache());
+                let mut cache = pre_built_cache.unwrap_or_else(|| {
+                    self.make_cache_for_prompt_len(prompt_len)
+                });
 
                 // DISABLED 2026-05-14 (debt #X):
                 // The mlx_lm-style chunked prefill broke for Gemma 4's
@@ -1505,13 +1848,55 @@ pub(crate) mod imp {
                 // impact is < 5%. The greedy path below stays bit-
                 // identical when sampling is disabled.
                 if let Some(sampling) = sampling_cfg {
-                    use crate::gemma4_sampling::imp::{Xorshift64, sample_next_token};
+                    use crate::gemma4_sampling::imp::{
+                        Xorshift64, sample_next_token_with_eos_guard_and_grammar,
+                    };
                     let mut rng = Xorshift64::new(sampling.seed);
                     let mut all_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
                     let t_decode = std::time::Instant::now();
+                    // Phase 2.5: grammar wired into the sampled-decode path.
+                    // `None` here = no tools → bit-identical to pre-grammar
+                    // behaviour. Caller passes `Some(state)` when the
+                    // request offered tools AND `tool_choice` is non-`None`.
+                    let mut grammar = grammar;
 
-                    let first_tok = sample_next_token(&logits, &all_tokens, &sampling, &mut rng)
-                        .context("chat_streaming(sampled): sample prefill token")?;
+                    // Env-gated soft-EOS suppression — see
+                    // `sample_next_token_with_eos_guard`. Two guards:
+                    //   LUMEN_MIN_TOKENS_BEFORE_EOS=N — hard mask of
+                    //     `<turn|>` (id 106) for the first N tokens.
+                    //   LUMEN_EOS_TOP_K_GUARD=K — at every step, soft
+                    //     mask `<turn|>` when its rank in raw logits is
+                    //     below top-K (outlier rejection). Active also
+                    //     after the min_tokens window has elapsed.
+                    // Both default 0 (off) — bit-identical to no-guard
+                    // sampling when unset.
+                    let min_tokens_before_eos: usize =
+                        std::env::var("LUMEN_MIN_TOKENS_BEFORE_EOS")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                    let eos_top_k_guard: usize = std::env::var("LUMEN_EOS_TOP_K_GUARD")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let eos_min_logit_margin: f32 =
+                        std::env::var("LUMEN_EOS_MIN_LOGIT_MARGIN")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f32>().ok())
+                            .unwrap_or(0.0);
+
+                    let first_tok = sample_next_token_with_eos_guard_and_grammar(
+                        &logits,
+                        &all_tokens,
+                        &sampling,
+                        &mut rng,
+                        min_tokens_before_eos,
+                        eos_top_k_guard,
+                        eos_min_logit_margin,
+                        &eos,
+                        grammar.as_mut(),
+                    )
+                    .context("chat_streaming(sampled): sample prefill token")?;
                     all_tokens.push(first_tok);
                     let state_before = parser.state();
                     parser.push(first_tok)?;
@@ -1524,6 +1909,10 @@ pub(crate) mod imp {
                     )?;
 
                     if !eos.contains(&first_tok) {
+                        let runaway = lumen_core::runaway::RunawayDetector::from_env();
+                        let mut thinking_budget =
+                            crate::gemma4_thinking::ChannelBudget::from_env();
+                        thinking_budget.observe(first_tok);
                         let mut current_u32 = first_tok;
                         while all_tokens.len() < max_new_tokens {
                             let input = mlx_rs::Array::from_slice(&[current_u32 as i32], &[1, 1])
@@ -1533,9 +1922,39 @@ pub(crate) mod imp {
                                 .model
                                 .forward_array_last_token(&input, &mut cache)
                                 .context("chat_streaming(sampled): decode forward")?;
-                            let next_tok =
-                                sample_next_token(&step_logits, &all_tokens, &sampling, &mut rng)
-                                    .context("chat_streaming(sampled): sample step")?;
+                            let sampled = sample_next_token_with_eos_guard_and_grammar(
+                                &step_logits,
+                                &all_tokens,
+                                &sampling,
+                                &mut rng,
+                                min_tokens_before_eos,
+                                eos_top_k_guard,
+                                eos_min_logit_margin,
+                                &eos,
+                                grammar.as_mut(),
+                            )
+                            .context("chat_streaming(sampled): sample step")?;
+                            thinking_budget.observe(sampled);
+                            let next_tok = if let Some(forced) =
+                                thinking_budget.try_force_close()
+                            {
+                                eprintln!(
+                                    "[thinking-budget] forcing channel close at {} tokens (count={})",
+                                    all_tokens.len(),
+                                    thinking_budget.max_thinking_tokens,
+                                );
+                                forced
+                            } else if thinking_budget.should_block_channel_open()
+                                && sampled == crate::gemma4_thinking::TOK_CHANNEL_OPEN
+                            {
+                                eprintln!(
+                                    "[thinking-budget] blocking channel re-open at {} tokens; emitting <turn|>",
+                                    all_tokens.len()
+                                );
+                                crate::gemma4_thinking::TOK_TURN_CLOSE
+                            } else {
+                                sampled
+                            };
                             all_tokens.push(next_tok);
                             let state_before = parser.state();
                             parser.push(next_tok)?;
@@ -1547,6 +1966,20 @@ pub(crate) mod imp {
                                 &mut on_event,
                             )?;
                             if eos.contains(&next_tok) {
+                                break;
+                            }
+                            if let Some(reason) = runaway.check(&all_tokens) {
+                                eprintln!(
+                                    "[runaway] chat_streaming sampled decode aborted at {} tokens: {reason}",
+                                    all_tokens.len()
+                                );
+                                break;
+                            }
+                            if thinking_budget.should_hard_break() {
+                                eprintln!(
+                                    "[thinking-budget] hard break at {} tokens — force-close did not help",
+                                    all_tokens.len()
+                                );
                                 break;
                             }
                             current_u32 = next_tok;

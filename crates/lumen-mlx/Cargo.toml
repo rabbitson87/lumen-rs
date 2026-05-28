@@ -10,6 +10,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokenizers = "0.23.1"
 hf-hub = "0.5.0"
+# Phase 2 — grammar-constrained tool calling. JSON Schema → token mask
+# converter used by Gemma 4 lazy-trigger tool calling (mirrors
+# llama.cpp's peg-gemma4 lazy GBNF mechanism). Optional `jsonschema`
+# feature pulls in ~2.5 MB of validation code — kept ON because we
+# accept arbitrary tool argument schemas from OpenAI-spec clients.
+# Pure Rust, no native deps.
+llguidance = { version = "1.7", features = ["jsonschema_validation"] }
 # TurboQuant primitives — Haar rotation matrix generator for KV pre-quant
 # Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
 # sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).
