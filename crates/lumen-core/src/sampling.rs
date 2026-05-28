@@ -34,6 +34,10 @@ pub struct SamplingConfig {
     pub repeat_penalty_last_n: usize,
     /// PRNG seed. Same prompt + seed → bit-identical output.
     pub seed: u64,
+    /// DRY (Don't Repeat Yourself) penalty config. `multiplier=0.0`
+    /// (default) disables DRY. Applied after the classic repeat
+    /// penalty, before temperature.
+    pub dry: crate::dry::DryConfig,
 }
 
 impl Default for SamplingConfig {
@@ -44,13 +48,16 @@ impl Default for SamplingConfig {
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 64,
             seed: 0,
+            dry: crate::dry::DryConfig::default(),
         }
     }
 }
 
 impl SamplingConfig {
     pub fn is_greedy(&self) -> bool {
-        self.temperature <= 0.0 && (self.repeat_penalty - 1.0).abs() < 1e-6
+        self.temperature <= 0.0
+            && (self.repeat_penalty - 1.0).abs() < 1e-6
+            && self.dry.is_disabled()
     }
 }
 
@@ -209,6 +216,10 @@ pub fn sample_from_logits(
         apply_repeat_penalty(logits, window, cfg.repeat_penalty);
     }
 
+    // DRY (Don't Repeat Yourself): catches n-gram cycles the classic
+    // repeat penalty's single-token view misses. No-op when disabled.
+    crate::dry::apply_dry_penalty(logits, recent_tokens, &cfg.dry);
+
     // Temperature scaling before softmax. `<=0` would mean greedy but
     // the caller is responsible for routing greedy elsewhere; clamp to
     // a tiny epsilon as a safety net.
@@ -290,6 +301,7 @@ mod tests {
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 0,
             seed: 12345,
+            dry: crate::dry::DryConfig::default(),
         };
         let mut rng1 = Xorshift64::new(cfg.seed);
         let t1 = sample_from_logits(&mut probs.clone(), &[], &cfg, &mut rng1);
