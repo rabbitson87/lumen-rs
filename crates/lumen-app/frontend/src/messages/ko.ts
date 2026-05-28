@@ -90,23 +90,21 @@ export const ko: Record<string, string> = {
   "context.sliding": "슬라이딩",
   "context.prefill": "프리필",
   "context.defaultMaxTokens": "기본 max_tokens",
-  "context.turboquant.on": "TurboQuant:",
-  "context.turboquant.off": "· 기본 KV 메모리 (압축 없음)",
+  "context.kvQuant.label": "캐시 모드:",
+  "context.kvQuant.offHint": "· 기본 KV 메모리 (압축 없음)",
   "context.recommended": "이 Mac 권장 최대",
   "context.recommended.suffix": "토큰",
-  "context.warn.turnOnTurboquant":
-    "— 더 긴 컨텍스트는 TurboQuant를 켜야 안전합니다",
+  "context.warn.turnOnKvQuant":
+    "— 더 긴 컨텍스트는 캐시 양자화를 켜야 안전합니다",
 
   // ── 양자화 (튜닝 탭) ────────────────────────────────────────────
-  "quant.title": "QUANT",
-  "quant.titleHint": "(TurboQuant KV 캐시)",
-  "quant.master": "TurboQuant",
-  "quant.mode": "TurboQuant 모드",
+  "quant.title": "캐시",
+  "quant.titleHint": "(KV 캐시 양자화)",
+  "quant.mode": "캐시 모드",
   "quant.mode.off": "끔",
   "quant.mode.on": "켬",
   "quant.mode.auto": "자동",
   "quant.autoThreshold": "자동 임계값 (토큰)",
-  "quant.qjl": "QJL 잔차 (Stage 2)",
   "quant.bits": "비트",
   "quant.on": "켜짐",
   "quant.off": "꺼짐",
@@ -149,37 +147,32 @@ export const ko: Record<string, string> = {
   "footer.logs.empty":
     "아직 로그 출력이 없습니다. 서버를 시작하면 디코드/인코드 추적이 표시됩니다.",
 
-  // ── QUANT 카드 툴팁 ─────────────────────────────────────────────
-  "quant.tooltip.master":
-    "KV 캐시 양자화의 마스터 스위치 (Lloyd-Max + Haar 회전, Stage 1). 켜면 정확도 손실이 적은 대신 KV 메모리를 약 4–8× 절감합니다. 끄면 KV가 bf16으로 유지됩니다 — 긴 컨텍스트에서 품질 문제가 보이는 경우에만 권장합니다.",
+  // ── 캐시(KV 양자화) 카드 툴팁 ───────────────────────────────────
   "quant.tooltip.mode":
-    "끔: KV를 절대 압축하지 않음 (짧은 prompt 디코드가 가장 빠름). 켬: 항상 압축 (긴 컨텍스트 메모리 절감 최대, 디코드 약 20–56% 느림). 자동: 이번 요청의 prompt 가 아래 임계값 이상일 때만 압축 — 짧은 대화는 빠르게, 긴 컨텍스트는 메모리 절감. 요청별 결정은 `[gemma4] tq_auto: ...` 로 로그에 기록됩니다.",
+    "끔: KV를 절대 압축하지 않음 (모든 디코드가 가장 빠름, 메모리는 가장 큼). 켬: 항상 압축 (KV 메모리 4–5× 절감, 디코드 ≈ 같음 ±5%). 자동: 이번 요청의 prompt가 아래 임계값 이상일 때만 압축 — 짧은 대화는 풀 속도, 긴 컨텍스트만 메모리 절감. 요청별 결정은 `[gemma4-backend] quant_kv_auto: ...` 로 로그에 기록됩니다.",
   "quant.tooltip.autoThreshold":
-    "자동 모드가 TurboQuant 를 켜는 prompt 토큰 수. 기본 4096 — 이하에서는 bf16 슬라이딩 캐시가 충분히 작아서 풀 속도 디코드가 이득이고, 이상에서는 TQ 의 step 당 오버헤드가 KV 대역폭 절감으로 상쇄됩니다.",
-  "quant.tooltip.qjl":
-    "Stage 1 잔차에 대한 비편향 1비트 보정. (원본 − 복원)을 m차원 가우시안 공간에 투영하고 부호만 패킹합니다. 약간의 추가 비용(K/V 벡터당 m/8 바이트, Gemma 4 슬라이딩 윈도우 m=1024 기준 약 25 MB)으로 Top-5 약 2–3% / 코사인 +0.003을 회복합니다. Stage 1이 켜져 있어야 합니다.",
+    "자동 모드가 KV 양자화를 켜는 prompt 토큰 수. 기본 131072 (128K) — Apple Silicon 통합 메모리가 bf16 KV를 충분히 담을 수 있는 범위 (M3 Max 36 GB에서 64K bf16 KV ≈ 16 GB) 아래에서는 압축 없이 풀 속도, 이를 넘으면 메모리 천장에 닿기 전에 압축으로 전환합니다.",
   "quant.tooltip.bits":
-    "KV 채널당 Lloyd-Max 비트 수. 4: 최고 품질, FP16 대비 약 4× 축소. 3: 균형 — 권장 기본값. 2: 최대 압축 (약 8× 축소), 품질 소폭 저하. Gemma 4의 슬라이딩 윈도우 KV에 적용됩니다.",
+    "KV 채널당 양자화 비트 수. 8: 최고 품질, bf16 대비 2× 축소. 6: 균형 ≈ 2.7× 축소. 4: 권장 기본값, 4× 축소. 3: 최대 압축 약 5.3×, 미세한 품질 저하. mlx affine 양자화 (group_size=64) 를 사용하므로 별도의 회전/잔차 보정이 없습니다.",
 
   // ── CONTEXT 카드 설명 ───────────────────────────────────────────
   "context.hint.max.prefix":
     "최대 시퀀스 길이 (토큰). 호스트 RAM이 모델의 네이티브 한계를 감당할 수 없을 때 모델의 max_position_embeddings를 제한합니다 (Gemma 4는 128K를 표방).",
-  "context.hint.max.tqOn":
-    "현재 TurboQuant 설정으로 대략 위에 표시된 KV 압축률 적용",
-  "context.hint.max.tqOnRealistic": "— 이 Mac에서의 실질 한계:",
-  "context.hint.max.tqOff":
-    "TurboQuant 꺼짐 — KV는 bf16 유지, 이 Mac에서의 실질 한계는",
-  "context.hint.max.tqOffRealistic": "현재",
-  "context.hint.max.tqOffFallback": "모델 네이티브 최대치보다 훨씬 낮습니다",
+  "context.hint.max.kvOn":
+    "현재 캐시 양자화 설정으로 대략 위에 표시된 KV 압축률 적용",
+  "context.hint.max.kvOnRealistic": "— 이 Mac에서의 실질 한계:",
+  "context.hint.max.kvOff":
+    "캐시 양자화 꺼짐 — KV는 bf16 유지, 이 Mac에서의 실질 한계는",
+  "context.hint.max.kvOffFallback": "모델 네이티브 최대치보다 훨씬 낮습니다",
   "context.hint.max.env": "환경 변수:",
   "context.hint.sliding":
     "슬라이딩 윈도우 어텐션 크기. 일부 레이어 (Gemma 4: 30개 중 25개)는 전체 시퀀스 대신 최근 N개 토큰에만 어텐션을 적용합니다 → 긴 컨텍스트에서 KV 메모리가 유한. 0 = 모델 내장 기본값 사용, N>0이면 오버라이드 (작을수록 KV 절감, 장거리 회상 약화).",
-  "context.hint.sliding.stacks":
-    "TurboQuant와 함께 적용됩니다 — 슬라이딩은 어떤 토큰을 유지할지 결정, TurboQuant는 어떻게 저장할지 결정.",
+  "context.hint.sliding.kvStacks":
+    "캐시 양자화와 함께 적용됩니다 — 슬라이딩은 어떤 토큰을 유지할지 결정, 양자화는 어떻게 저장할지 결정.",
   "context.hint.prefill":
     "프롬프트 처리 청크 상한. 이 값보다 긴 프롬프트는 \"prompt too large\" 오류로 거부됩니다. 클수록 긴 프롬프트를 받지만 프리필 동안 피크 메모리도 증가 (어텐션 QK·T = 청크 × KV",
   "context.hint.defaultMaxTokens":
-    "OpenAI 호환 chat/completion 요청에서 `max_tokens`가 빠졌을 때 서버가 적용하는 생성 토큰 예산. 요청 본문에 `max_tokens`가 명시되어 있으면 그 값이 항상 우선합니다 — 이 값은 서버 측 폴백일 뿐입니다.",
+    "OpenAI 호환 chat/completion 요청에서 `max_tokens`가 빠졌을 때 서버가 적용하는 생성 토큰 예산 + 클라이언트가 `max_tokens`를 명시한 경우의 상한선. 예: 8192로 설정하면 클라이언트가 더 큰 값(204800 등)을 보내도 8192로 cap됩니다. `0`은 상한 없음 (EOS/컨텍스트까지 무제한 — runaway CoT 주의). 환경 변수 `LUMEN_DEFAULT_MAX_TOKENS`와 `LUMEN_MAX_TOKENS_CAP` 양쪽으로 emit됩니다.",
 
   // ── SERVER 메모리 설명 ──────────────────────────────────────────
   "server.memory.explainer.intro":
@@ -233,15 +226,14 @@ export const ko: Record<string, string> = {
   "api.embedding.download.placeholder": "— 다운로드할 항목 선택 —",
   "api.embedding.endpointRequiresEmbedding": "(임베딩 모델 필요)",
 
-  // ── QUANT 비트 비교 설명 ────────────────────────────────────────
-  "quant.hint.tqOff":
-    "TurboQuant 꺼짐 — KV 캐시는 bf16 유지 (Gemma 4 11K 한국어 컨텍스트 기준 약 5 GB)",
-  "quant.hint.smallerVsFp16": "× FP16 대비 축소",
-  "quant.hint.cosine": "코사인",
-  "quant.hint.top5": "Top-5",
-  "quant.hint.vs4bit": "4비트 기준 대비:",
-  "quant.hint.kvMemory": "KV 메모리",
-  "quant.hint.baseline": "기준 (최고 품질)",
+  // ── 캐시 비트 비교 설명 ─────────────────────────────────────────
+  "quant.hint.kvOff":
+    "캐시 양자화 꺼짐 — KV는 bf16 유지 (최고 속도, 최대 메모리 사용)",
+  "quant.hint.smallerVsFp16": "× bf16 대비 축소",
+  "quant.hint.lowestMemory": "최저 메모리 사용, 미세한 품질 저하",
+  "quant.hint.balancedQuality": "메모리/품질 균형",
+  "quant.hint.highestQuality": "bf16에 가장 가까운 품질",
+  "quant.hint.baseline": "권장 기본값 (4× 메모리 절감)",
 
   // ── CONTEXT 배너 ────────────────────────────────────────────────
   "context.banner.smallerThanBf16": "× bf16 대비 축소",
@@ -269,7 +261,7 @@ export const ko: Record<string, string> = {
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
-  // (TurboQuant, KV quant, ctx caps 등) 는 재시작 시점에만 반영됨.
+  // (캐시 모드/비트, ctx caps 등) 는 재시작 시점에만 반영됨.
   "config.savedRestartHint": "저장됨. 적용하려면 서버 재시작 (중지 → 시작).",
   "config.saved": "저장됨.",
   // savedToast 옆 인라인 액션 버튼 — 헤더의 토글을 찾지 않아도
@@ -377,7 +369,7 @@ export const ko: Record<string, string> = {
   "doctor.hint.ram.warnLow":
     "16 GB는 1.5–7B 모델에 충분합니다. 13B 이상이나 Mixture-of-Experts 모델은 24 GB 이상 권장합니다.",
   "doctor.hint.ram.tight":
-    "8–16 GB는 빠듯합니다. 2B 미만 파라미터 모델만 사용하세요. OOM 발생 시 3비트 TurboQuant를 사용하고 wired 메모리 캡을 비활성화 (서버 카드 → 모든 캡 무시)하세요.",
+    "8–16 GB는 빠듯합니다. 2B 미만 파라미터 모델만 사용하세요. OOM 발생 시 3-bit 캐시 양자화를 켜고 wired 메모리 캡을 비활성화 (서버 카드 → 모든 캡 무시)하세요.",
   "doctor.hint.ram.fail":
     "RAM 8 GB 미만 — 거의 모든 모델에서 OOM이 발생합니다. RAM을 확보하거나 더 큰 머신을 사용하세요.",
   "doctor.hint.disk_free.warn":

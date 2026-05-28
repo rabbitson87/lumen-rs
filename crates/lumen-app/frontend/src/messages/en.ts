@@ -4,7 +4,7 @@
  *
  * Coverage policy: top-level navigation, card headings, action buttons,
  * status banners, and the language picker itself are fully translated.
- * Long-form descriptive hints (TurboQuant explainers, etc.) remain in
+ * Long-form descriptive hints (cache quantization explainers, etc.) remain in
  * the templates and can be migrated incrementally as needed.
  */
 export const en: Record<string, string> = {
@@ -95,23 +95,21 @@ export const en: Record<string, string> = {
   "context.sliding": "Sliding",
   "context.prefill": "Prefill",
   "context.defaultMaxTokens": "Default max_tokens",
-  "context.turboquant.on": "TurboQuant:",
-  "context.turboquant.off": "· baseline KV memory (no compression)",
+  "context.kvQuant.label": "Cache mode:",
+  "context.kvQuant.offHint": "· baseline KV memory (no compression)",
   "context.recommended": "Recommended max on this Mac",
   "context.recommended.suffix": "tokens",
-  "context.warn.turnOnTurboquant":
-    "— turn TurboQuant ON to handle longer contexts safely",
+  "context.warn.turnOnKvQuant":
+    "— turn cache quantization ON to handle longer contexts safely",
 
-  // ── QUANT (Tuning tab) ──────────────────────────────────────────
-  "quant.title": "QUANT",
-  "quant.titleHint": "(TurboQuant KV cache)",
-  "quant.master": "TurboQuant",
-  "quant.mode": "TurboQuant mode",
+  // ── CACHE / KV-quant (Tuning tab) ───────────────────────────────
+  "quant.title": "CACHE",
+  "quant.titleHint": "(KV cache quantization)",
+  "quant.mode": "Cache mode",
   "quant.mode.off": "Off",
   "quant.mode.on": "On",
   "quant.mode.auto": "Auto",
   "quant.autoThreshold": "Auto threshold (tokens)",
-  "quant.qjl": "QJL residual (Stage 2)",
   "quant.bits": "Bits",
   "quant.on": "ON",
   "quant.off": "OFF",
@@ -155,37 +153,32 @@ export const en: Record<string, string> = {
   "footer.logs.empty":
     "No log output yet. Start the server to see decode/encode traces.",
 
-  // ── QUANT card tooltips ─────────────────────────────────────────
-  "quant.tooltip.master":
-    "Master switch for KV-cache quantization (Lloyd-Max + Haar rotation, Stage 1). ON saves ~4–8× KV memory at small accuracy cost. OFF keeps KV in bf16 — recommended only if you see quality issues at long context.",
+  // ── CACHE / KV-quant tooltips ───────────────────────────────────
   "quant.tooltip.mode":
-    "Off: never compress KV (fastest short-prompt decode). On: always compress (max long-context memory savings, ~20–56% slower decode). Auto: compress only when this request's prompt is at or above the threshold below — short chats stay fast, long context still saves memory. Per-request decision logged as `[gemma4] tq_auto: ...`.",
+    "Off: never compress KV (fastest decode at any context, largest memory). On: always compress (4–5× KV memory savings, decode ≈ same ±5%). Auto: compress only when this request's prompt is at or above the threshold below — short chats stay at full speed, only long-context requests pay the quant trade-off. Per-request decision logged as `[gemma4-backend] quant_kv_auto: ...`.",
   "quant.tooltip.autoThreshold":
-    "Prompt-token count at which Auto mode flips TurboQuant ON for the request. Default 4096 — below this, the bf16 sliding cache fits comfortably and full-speed decode wins; above it, TQ's per-step overhead is amortised by the KV bandwidth savings.",
-  "quant.tooltip.qjl":
-    "Stage-2 unbiased 1-bit correction for the Stage-1 residual: projects (original − reconstructed) into m-dim Gaussian space and packs only the sign. Recovers ~2–3% Top-5 / +0.003 cosine at small extra cost (~m/8 bytes per K/V vector; ~25 MB for Gemma 4 sliding window at m=1024). Requires Stage 1 ON.",
+    "Prompt-token count at which Auto mode flips KV quantization ON for the request. Default 131072 (128K) — below this, Apple Silicon unified memory comfortably holds the bf16 KV cache (M3 Max 36 GB fits ≈64K bf16 KV in ~16 GB), so full-speed decode wins; above it, compression keeps memory bounded before the platform ceiling.",
   "quant.tooltip.bits":
-    "Lloyd-Max bits per KV channel. 4: highest quality, ~4× smaller than FP16. 3: balanced — recommended default. 2: max compression (~8× smaller), small quality drop. Applies to the sliding-window KV on Gemma 4.",
+    "Quantization bits per KV channel. 8: highest quality, 2× smaller than bf16. 6: balanced ≈ 2.7× smaller. 4: recommended default, 4× smaller. 3: max compression ≈ 5.3×, small quality drop. Uses mlx affine quantization (group_size=64) — no rotation or residual correction stage.",
 
   // ── CONTEXT card hints ──────────────────────────────────────────
   "context.hint.max.prefix":
     "Max sequence length (tokens). Caps the model's max_position_embeddings when host RAM can't hold the model's native limit (Gemma 4 claims 128K).",
-  "context.hint.max.tqOn":
-    "Current TurboQuant gives roughly the listed KV compression",
-  "context.hint.max.tqOnRealistic": "— realistic on this Mac:",
-  "context.hint.max.tqOff":
-    "TurboQuant OFF — KV stays bf16, so practical limit on this Mac",
-  "context.hint.max.tqOffRealistic": "is",
-  "context.hint.max.tqOffFallback": "is much lower than the model's native max",
+  "context.hint.max.kvOn":
+    "Current cache quantization gives roughly the listed KV compression",
+  "context.hint.max.kvOnRealistic": "— realistic on this Mac:",
+  "context.hint.max.kvOff":
+    "Cache quantization OFF — KV stays bf16, so practical limit on this Mac",
+  "context.hint.max.kvOffFallback": "is much lower than the model's native max",
   "context.hint.max.env": "Env:",
   "context.hint.sliding":
     "Sliding-window attention size. Some layers (Gemma 4: 25 of 30) only attend to the last N tokens instead of the full sequence → bounded KV memory for long contexts. 0 = use the model's built-in default; N>0 overrides it (smaller = less KV, weaker long-range recall).",
-  "context.hint.sliding.stacks":
-    "Stacks with TurboQuant — sliding bounds which tokens are kept, TurboQuant compresses how they're stored.",
+  "context.hint.sliding.kvStacks":
+    "Stacks with cache quantization — sliding bounds which tokens are kept, quantization controls how they're stored.",
   "context.hint.prefill":
     "Prompt-processing chunk cap. Server rejects prompts longer than this with a \"prompt too large\" error. Larger = accepts long prompts but more peak memory during prefill (attention QK·T = chunk × KV",
   "context.hint.defaultMaxTokens":
-    "Generation budget applied to OpenAI-compatible chat / completion requests that omit `max_tokens`. Request bodies that explicitly set `max_tokens` always win — this is only the server-side fallback.",
+    "Generation budget applied when an OpenAI-compatible chat/completion request omits `max_tokens` + ceiling for clients that send an explicit `max_tokens`. E.g. set to 8192 and a client sending 204800 will be capped to 8192. `0` disables the cap (unbounded until EOS / context — beware of runaway CoT). Emitted as both `LUMEN_DEFAULT_MAX_TOKENS` and `LUMEN_MAX_TOKENS_CAP`.",
 
   // ── SERVER memory explainer ─────────────────────────────────────
   "server.memory.explainer.intro":
@@ -241,15 +234,14 @@ export const en: Record<string, string> = {
   "api.embedding.download.placeholder": "— pick to download —",
   "api.embedding.endpointRequiresEmbedding": "(requires Embedding model)",
 
-  // ── QUANT bits comparison hints ─────────────────────────────────
-  "quant.hint.tqOff":
-    "TurboQuant OFF — KV cache stays bf16 (~5 GB at 11K Korean context on Gemma 4)",
-  "quant.hint.smallerVsFp16": "× smaller vs FP16",
-  "quant.hint.cosine": "cosine",
-  "quant.hint.top5": "Top-5",
-  "quant.hint.vs4bit": "vs 4-bit baseline:",
-  "quant.hint.kvMemory": "KV memory",
-  "quant.hint.baseline": "baseline (highest quality)",
+  // ── CACHE bits comparison hints ─────────────────────────────────
+  "quant.hint.kvOff":
+    "Cache quantization OFF — KV stays bf16 (max speed, max memory)",
+  "quant.hint.smallerVsFp16": "× smaller vs bf16",
+  "quant.hint.lowestMemory": "lowest memory, small quality drop",
+  "quant.hint.balancedQuality": "balanced memory / quality",
+  "quant.hint.highestQuality": "closest to bf16 quality",
+  "quant.hint.baseline": "recommended default (4× KV savings)",
 
   // ── CONTEXT banner ──────────────────────────────────────────────
   "context.banner.smallerThanBf16": "× smaller than bf16",
@@ -278,7 +270,7 @@ export const en: Record<string, string> = {
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
-  // server needs a restart for env-derived knobs (TurboQuant, KV quant, ctx
+  // server needs a restart for env-derived knobs (cache mode/bits, ctx
   // caps, etc.) to take effect.
   "config.savedRestartHint": "Saved. Restart the server to apply (Stop → Start).",
   "config.saved": "Saved.",
@@ -387,7 +379,7 @@ export const en: Record<string, string> = {
   "doctor.hint.ram.warnLow":
     "16 GB is enough for 1.5-7B models. For 13B+ or Mixture-of-Experts models, 24 GB+ is recommended.",
   "doctor.hint.ram.tight":
-    "8-16 GB is tight. Stick to <2B parameter models. Use 3-bit TurboQuant and disable the wired memory caps (Server card → Disable caps) if you OOM.",
+    "8-16 GB is tight. Stick to <2B parameter models. Turn on 3-bit cache quantization and disable the wired memory caps (Server card → Disable caps) if you OOM.",
   "doctor.hint.ram.fail":
     "Less than 8 GB RAM — lumen will OOM on almost any model. Free RAM or use a larger machine.",
   "doctor.hint.disk_free.warn":

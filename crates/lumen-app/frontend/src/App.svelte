@@ -188,38 +188,24 @@
     return Math.max(0, ctxMax / 8192);
   }
 
-  // KV compression ratio under the current TurboQuant config.
-  // Stage-1 ratio at head_dim=256 (Gemma 4 sliding):
-  //   4-bit: ~4.0x, 3-bit: ~5.3x, 2-bit: ~8.0x
-  // QJL Stage-2 at default m=1024 adds ~128 B/vector, which dilutes Stage-1
-  // ratio roughly: total = bf16/(stage1_bytes + qjl_bytes).
-  let turboquantKvRatio = $derived.by(() => {
-    // Treat Off as 1.0 (no compression); On / Auto both compress when
-    // the request lands on the TQ path. The estimate here is the
-    // best-case potential, not a per-request guarantee.
-    if (config?.quant.turboquant_mode === "off") return 1.0;
-    const bits = config!.quant.bits;
-    // bf16 = 16 bits/scalar; head_dim=256 → 4096 bits/vector
-    const stage1Bits = bits * 256;
-    // QJL Stage-2 projection dimension is now a server-side constant
-    // (`D · 4 = 1024` for Gemma 4 head_dim=256). Used to be configurable
-    // via DEBUG → "QJL m" but was benchmark-only — see server.rs constants.
-    const QJL_M = 1024;
-    const qjlBits = config!.quant.turboquant_qjl_enabled ? QJL_M : 0;
-    const totalBits = stage1Bits + qjlBits;
-    return totalBits > 0 ? 4096 / totalBits : 1.0;
+  // KV compression ratio under the current simple-Q4 config. bf16=16 bits,
+  // quantized = `bits` bits/scalar (group_size=64 has negligible overhead
+  // for this ratio estimate). Off → 1.0 (no compression).
+  let kvCompressRatio = $derived.by(() => {
+    if (!config || config.quant.kv_mode === "off") return 1.0;
+    const bits = config.quant.bits;
+    return bits > 0 ? 16 / bits : 1.0;
   });
 
-  let turboquantStateLabel = $derived.by(() => {
+  let kvQuantStateLabel = $derived.by(() => {
     if (!config) return "—";
-    const mode = config.quant.turboquant_mode;
+    const mode = config.quant.kv_mode;
     if (mode === "off") return "OFF (bf16 KV)";
     const stage = `${config.quant.bits}-bit`;
-    const qjl = config.quant.turboquant_qjl_enabled ? " + QJL" : "";
     const suffix = mode === "auto"
-      ? ` (auto ≥${config.quant.turboquant_auto_threshold_tokens}t)`
+      ? ` (auto ≥${config.quant.kv_auto_threshold_tokens}t)`
       : "";
-    return `${stage}${qjl}${suffix}`;
+    return `${stage}${suffix}`;
   });
 
   // Realistic max-context budget. Assumes ~2 GB free for KV after model +
@@ -231,7 +217,7 @@
     const overheadGb = 3; // server + tokenizer + activations
     const freeForKv = Math.max(0.5, systemInfo.ram_gb - modelGb - overheadGb);
     const bf16TokensPerGb = 8192; // baseline: ~1 GB / 8K tokens at bf16
-    const realisticTokens = freeForKv * bf16TokensPerGb * turboquantKvRatio;
+    const realisticTokens = freeForKv * bf16TokensPerGb * kvCompressRatio;
     return Math.round(realisticTokens / 1024);
   });
   // Precise float used for display (3 decimal places); the persisted
@@ -820,20 +806,17 @@
         <div class="flex gap-1">
           {#each [["off","quant.mode.off"],["on","quant.mode.on"],["auto","quant.mode.auto"]] as [v, key]}
             <button
-              class={`px-2.5 py-1 min-w-12 ${config.quant.turboquant_mode === v ? "primary" : ""}`}
+              class={`px-2.5 py-1 min-w-12 ${config.quant.kv_mode === v ? "primary" : ""}`}
               onclick={() => {
                 if (!config) return;
-                config.quant.turboquant_mode = v as "off" | "on" | "auto";
-                // Mirror to legacy boolean so any code still reading
-                // `turboquant_enabled` sees a sensible value.
-                config.quant.turboquant_enabled = v !== "off";
+                config.quant.kv_mode = v as "off" | "on" | "auto";
                 saveQuant();
               }}
             >{t(key)}</button>
           {/each}
         </div>
       </div>
-      {#if config.quant.turboquant_mode === "auto"}
+      {#if config.quant.kv_mode === "auto"}
         <div class={kvRow}>
           <span class="dim">
             {t("quant.autoThreshold")}
@@ -847,44 +830,20 @@
             class="mono w-24 text-right"
             type="number"
             min="1"
-            max="200000"
-            step="256"
-            value={config.quant.turboquant_auto_threshold_tokens}
+            max="1000000"
+            step="1024"
+            value={config.quant.kv_auto_threshold_tokens}
             onchange={(e) => {
               if (!config) return;
               const v = parseInt((e.currentTarget as HTMLInputElement).value, 10);
               if (!isNaN(v) && v >= 1) {
-                config.quant.turboquant_auto_threshold_tokens = v;
+                config.quant.kv_auto_threshold_tokens = v;
                 saveQuant();
               }
             }}
           />
         </div>
       {/if}
-      <div class={kvRow}>
-        <span class="dim">
-          {t("quant.qjl")}
-          <span
-            class={helpIcon}
-            use:tooltip
-            data-tooltip={t("quant.tooltip.qjl")}
-          >?</span>
-        </span>
-        <label class={toggleLabel}>
-          <input
-            class="w-3.5 h-3.5 m-0 accent-accent"
-            type="checkbox"
-            checked={config.quant.turboquant_qjl_enabled}
-            disabled={!config.quant.turboquant_enabled}
-            onchange={(e) => {
-              if (!config) return;
-              config.quant.turboquant_qjl_enabled = (e.currentTarget as HTMLInputElement).checked;
-              saveQuant();
-            }}
-          />
-          <span>{config.quant.turboquant_qjl_enabled ? t("quant.on") : t("quant.off")}</span>
-        </label>
-      </div>
       <div class={kvRow}>
         <span class="dim">
           {t("quant.bits")}
@@ -895,10 +854,10 @@
           >?</span>
         </span>
         <div class="flex gap-1">
-          {#each [2, 3, 4] as b}
+          {#each [3, 4, 6, 8] as b}
             <button
               class={`px-2.5 py-1 min-w-9 ${config.quant.bits === b ? "primary" : ""}`}
-              disabled={!config.quant.turboquant_enabled}
+              disabled={config.quant.kv_mode === "off"}
               onclick={() => {
                 if (!config) return;
                 config.quant.bits = b;
@@ -909,17 +868,20 @@
         </div>
       </div>
       <div class="dim flex flex-col gap-0.5 mt-1 ml-32.5 text-[11px] leading-normal">
-        {#if !config.quant.turboquant_enabled}
-          <span class="text-warn">{t("quant.hint.tqOff")}</span>
-        {:else if config.quant.bits === 2}
-          <span><b class="text-text">2-bit</b> · ~8{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9851</b> · {t("quant.hint.top5")} <b class="text-text">89%</b></span>
-          <span class="text-text-dim">{t("quant.hint.vs4bit")} <b class="text-ok">−50% {t("quant.hint.kvMemory")}</b> · {t("quant.hint.cosine")} <b class="text-warn">−1.3%</b></span>
+        {#if config.quant.kv_mode === "off"}
+          <span class="text-warn">{t("quant.hint.kvOff")}</span>
         {:else if config.quant.bits === 3}
-          <span><b class="text-text">3-bit</b> · ~5{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9945</b> · {t("quant.hint.top5")} <b class="text-text">94%</b></span>
-          <span class="text-text-dim">{t("quant.hint.vs4bit")} <b class="text-ok">−25% {t("quant.hint.kvMemory")}</b> · {t("quant.hint.cosine")} <b class="text-text">−0.4%</b></span>
+          <span><b class="text-text">3-bit</b> · ~5.3{t("quant.hint.smallerVsFp16")}</span>
+          <span class="text-text-dim">{t("quant.hint.lowestMemory")}</span>
         {:else if config.quant.bits === 4}
-          <span><b class="text-text">4-bit</b> · ~4{t("quant.hint.smallerVsFp16")} · {t("quant.hint.cosine")} <b class="text-text">0.9983</b> · {t("quant.hint.top5")} <b class="text-text">96%</b></span>
+          <span><b class="text-text">4-bit</b> · ~4{t("quant.hint.smallerVsFp16")}</span>
           <span class="text-text-dim">{t("quant.hint.baseline")}</span>
+        {:else if config.quant.bits === 6}
+          <span><b class="text-text">6-bit</b> · ~2.7{t("quant.hint.smallerVsFp16")}</span>
+          <span class="text-text-dim">{t("quant.hint.balancedQuality")}</span>
+        {:else if config.quant.bits === 8}
+          <span><b class="text-text">8-bit</b> · 2{t("quant.hint.smallerVsFp16")}</span>
+          <span class="text-text-dim">{t("quant.hint.highestQuality")}</span>
         {/if}
       </div>
     {/if}
@@ -951,23 +913,23 @@
     <h2 class={cardH2}>{t("context.title")} <span class="dim">{t("context.titleHint")}</span></h2>
     {#if config}
       <div class={`-mt-1 mb-3 px-2.5 py-2 bg-panel-2 border border-border border-l-[3px] rounded text-xs leading-[1.55] flex flex-col gap-0.5 ${
-        config.quant.turboquant_enabled ? "border-l-accent" : "border-l-warn"
+        config.quant.kv_mode !== "off" ? "border-l-accent" : "border-l-warn"
       }`}>
         <div>
-          <span class="dim">{t("context.turboquant.on")}</span>
-          <b class="text-text">{turboquantStateLabel}</b>
-          {#if config.quant.turboquant_enabled}
-            <span class="dim">· {t("context.banner.kvCache")}{turboquantKvRatio.toFixed(1)}{t("context.banner.smallerThanBf16")}</span>
+          <span class="dim">{t("context.kvQuant.label")}</span>
+          <b class="text-text">{kvQuantStateLabel}</b>
+          {#if config.quant.kv_mode !== "off"}
+            <span class="dim">· {t("context.banner.kvCache")}{kvCompressRatio.toFixed(1)}{t("context.banner.smallerThanBf16")}</span>
           {:else}
-            <span class="dim">{t("context.turboquant.off")}</span>
+            <span class="dim">{t("context.kvQuant.offHint")}</span>
           {/if}
         </div>
         {#if realisticMaxCtxK != null}
           <div class="dim">
             {t("context.recommended")} ({systemInfo?.ram_gb} GB):
             <b class="text-text">~{realisticMaxCtxK}K {t("context.recommended.suffix")}</b>
-            {#if !config.quant.turboquant_enabled}
-              <span class="text-warn">{t("context.warn.turnOnTurboquant")}</span>
+            {#if config.quant.kv_mode === "off"}
+              <span class="text-warn">{t("context.warn.turnOnKvQuant")}</span>
             {/if}
           </div>
         {/if}
@@ -985,14 +947,14 @@
       </div>
       <div class={ctxHint}>
         {t("context.hint.max.prefix")}
-        {#if config.quant.turboquant_enabled}
-          {t("context.hint.max.tqOn")}
+        {#if config.quant.kv_mode !== "off"}
+          {t("context.hint.max.kvOn")}
           {#if realisticMaxCtxK != null}
-            {t("context.hint.max.tqOnRealistic")} <b class="text-text">~{realisticMaxCtxK}K</b>.
+            {t("context.hint.max.kvOnRealistic")} <b class="text-text">~{realisticMaxCtxK}K</b>.
           {:else}.{/if}
         {:else}
-          {t("context.hint.max.tqOff")}
-          {#if realisticMaxCtxK != null}<b class="text-text">~{realisticMaxCtxK}K</b>{:else}{t("context.hint.max.tqOffFallback")}{/if}.
+          {t("context.hint.max.kvOff")}
+          {#if realisticMaxCtxK != null}<b class="text-text">~{realisticMaxCtxK}K</b>{:else}{t("context.hint.max.kvOffFallback")}{/if}.
         {/if}
         {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_MAX_CTX</code>.
       </div>
@@ -1009,8 +971,8 @@
       </div>
       <div class={ctxHint}>
         {t("context.hint.sliding")}
-        {#if config.quant.turboquant_enabled}
-          {t("context.hint.sliding.stacks")}
+        {#if config.quant.kv_mode !== "off"}
+          {t("context.hint.sliding.kvStacks")}
         {/if}
         {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_SLIDING_WINDOW</code>.
       </div>
@@ -1026,7 +988,7 @@
         />
       </div>
       <div class={ctxHint}>
-        {t("context.hint.prefill")}{#if config.quant.turboquant_enabled}, ~{turboquantKvRatio.toFixed(1)}×{/if}).
+        {t("context.hint.prefill")}{#if config.quant.kv_mode !== "off"}, ~{kvCompressRatio.toFixed(1)}×{/if}).
         {t("context.hint.max.env")} <code class={inlineCode}>LUMEN_PREFILL_CHUNK</code>.
       </div>
 

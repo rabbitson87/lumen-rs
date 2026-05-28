@@ -68,10 +68,10 @@ safetensors = "0.7.0"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 
 # HTTP server
-atomic_http = { version = "0.13.0", features = ["arena", "router"] }
+atomic_http = { version = "0.14.0", features = ["arena", "router"] }
 
 # Async runtime
 tokio = { version = "1.52.3", features = ["full"] }

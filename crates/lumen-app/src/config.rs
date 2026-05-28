@@ -82,79 +82,68 @@ pub enum CorsMode {
     All,
 }
 
+/// KV-cache quantization controls. The card drives the simple 4/8-bit
+/// affine quantization path (`LUMEN_GEMMA4_QUANT_KV*` env vars). The
+/// TurboQuant Stage-1/2 lever has been retired from the user-facing
+/// surface — empirical sweeps on Apple Silicon (2026-05-26) showed it is
+/// net-negative across all tested context sizes (4K → 32K, gap widens
+/// from −9% to −20%). The TQ kernel/primitive code remains in-tree behind
+/// dev-only env vars so future CUDA / PagedAttention work can re-evaluate
+/// it. See `CLAUDE.md` Phase 2/3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantConfig {
-    /// TurboQuant Lloyd-Max scalar bits (2/3/4).  Lower = more memory
-    /// savings on KV cache, more quantization error.  Emitted as both
-    /// `TQ_BITS` (legacy turboquant-cache path) and
-    /// `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS` (Gemma 4 native
-    /// runner) so the same slider drives both backends.
+    /// KV-cache quantization bits (3 / 4 / 6 / 8). Default 4 (gives 4×
+    /// compression). 8-bit gives 2× compression with closer-to-bf16
+    /// quality. Emitted as `LUMEN_GEMMA4_QUANT_KV_BITS` (also kept as
+    /// `TQ_BITS` for legacy Candle backends still on the
+    /// turboquant-cache crate path).
     pub bits: u8,
-    /// Turn TurboQuant Stage 1 (Lloyd-Max + rotation) on for the sliding
-    /// KV cache.  Default ON — measured safe across the same 11K Korean
-    /// context that the model rebuild was validated against, and the
-    /// KV cache memory delta vs bf16 is the primary win at long context.
-    /// Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT` (legacy gate).
+
+    /// Three-way KV quantization mode.
+    ///   * `Off`  — never quantize; KV stays in bf16 (fastest, most memory).
+    ///   * `On`   — always quantize at `bits`; saves memory on every request.
+    ///   * `Auto` — quantize only when a request's `prompt_tokens` reaches
+    ///              `kv_auto_threshold_tokens`. Default — gives short chats
+    ///              full bf16 speed and only pays the per-step quant
+    ///              dispatch cost when the memory matters.
     ///
-    /// Superseded by `turboquant_mode` in schema v6 — kept on the struct so
-    /// downgrades / external tools that read this field still see a value
-    /// matching the current mode (mirrored in `apply_env`).
-    #[serde(default = "default_turboquant_enabled")]
-    pub turboquant_enabled: bool,
-    /// Add the QJL 1-bit residual correction layer on top of Stage 1.
-    /// Default ON when `turboquant_enabled = true` — closes the small
-    /// inner-product reconstruction gap left by pure Lloyd-Max nearest-
-    /// centroid.  Emits `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL`.
-    #[serde(default = "default_turboquant_qjl_enabled")]
-    pub turboquant_qjl_enabled: bool,
+    /// Emits `LUMEN_GEMMA4_QUANT_KV_MODE`.
+    #[serde(default = "default_kv_mode")]
+    pub kv_mode: QuantKvMode,
 
-    /// Three-way TurboQuant control (v6+). `Auto` enables TQ only when a
-    /// request's `prompt_tokens` ≥ `turboquant_auto_threshold_tokens`,
-    /// giving full-bf16 decode speed for short chats while keeping the
-    /// long-context memory savings.  Emits `LUMEN_GEMMA4_TQ_MODE`.
-    #[serde(default = "default_turboquant_mode")]
-    pub turboquant_mode: TurboquantMode,
-
-    /// Prompt-length threshold (in tokens) at which `TurboquantMode::Auto`
-    /// switches TQ ON for a request. Default 4096 (empirically the regime
-    /// where TQ's per-step overhead is amortised by KV bandwidth savings).
-    /// Ignored unless `turboquant_mode = Auto`.
-    /// Emits `LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS`.
-    #[serde(default = "default_turboquant_auto_threshold_tokens")]
-    pub turboquant_auto_threshold_tokens: u32,
+    /// Prompt-length threshold (in tokens) at which `QuantKvMode::Auto`
+    /// switches quantization ON for a request. Default 131072 (128K) —
+    /// matches the regime where bf16 KV approaches Apple Silicon unified-
+    /// memory ceiling. Smaller deployments (M2/M3 Air 16-18 GB) may want
+    /// to lower this to 32K or 64K. Ignored unless `kv_mode = Auto`.
+    /// Emits `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`.
+    #[serde(default = "default_kv_auto_threshold_tokens")]
+    pub kv_auto_threshold_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum TurboquantMode {
-    /// Never apply TurboQuant on the sliding KV cache. Best for short-
-    /// prompt conversational workloads (full-bf16 decode is ~20-56%
-    /// faster than TQ ON; no memory savings).
+pub enum QuantKvMode {
+    /// Never quantize the KV cache. bf16 everywhere. Best for normal
+    /// usage on machines with ample unified memory (M3 Max 36+ GB at
+    /// ≤64K context bf16 KV ≈ 16 GB — no memory pressure).
     Off,
-    /// Always apply TurboQuant on the sliding KV cache. Saves KV memory
-    /// at long context at the cost of per-step compute on every request.
+    /// Always quantize the KV cache at `bits`. Saves memory on every
+    /// request at a small (<5%) decode cost.
     On,
-    /// Apply TurboQuant only when a request's `prompt_tokens` meets or
-    /// exceeds `turboquant_auto_threshold_tokens`. Default — gives short
-    /// chats their full decode speed and only pays TQ overhead when the
-    /// memory savings matter.
+    /// Quantize only when a request's `prompt_tokens` meets or exceeds
+    /// `kv_auto_threshold_tokens`. Default — short chats stay at full
+    /// bf16 speed; only long-context requests pay the quant trade-off
+    /// in exchange for keeping memory bounded.
     Auto,
 }
 
-fn default_turboquant_enabled() -> bool {
-    true
+fn default_kv_mode() -> QuantKvMode {
+    QuantKvMode::Off
 }
 
-fn default_turboquant_qjl_enabled() -> bool {
-    true
-}
-
-fn default_turboquant_mode() -> TurboquantMode {
-    TurboquantMode::Auto
-}
-
-fn default_turboquant_auto_threshold_tokens() -> u32 {
-    4096
+fn default_kv_auto_threshold_tokens() -> u32 {
+    131072
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,11 +242,9 @@ impl Default for PersistentConfig {
                 skip_warmup: false,
             },
             quant: QuantConfig {
-                bits: 3,
-                turboquant_enabled: true,
-                turboquant_qjl_enabled: true,
-                turboquant_mode: TurboquantMode::Auto,
-                turboquant_auto_threshold_tokens: 4096,
+                bits: 4,
+                kv_mode: QuantKvMode::Off,
+                kv_auto_threshold_tokens: 131072,
             },
             context: ContextConfig {
                 // Bumped 10× over the initial 8192 / 4096 defaults at
@@ -402,24 +389,10 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
     if cfg.schema_version < 5 {
         cfg.schema_version = 5;
     }
-    // v5 -> v6: introduced `quant.turboquant_mode` (Off / On / Auto) and
-    // `quant.turboquant_auto_threshold_tokens`. Existing configs are
-    // mapped so behaviour is preserved unless the user opts in to Auto:
-    //   - `turboquant_enabled = true`  → `Mode::On` (legacy behaviour)
-    //   - `turboquant_enabled = false` → `Mode::Off`
-    // serde already filled `turboquant_mode` with the v6 default (Auto)
-    // because the deserializer ran first. We overwrite it here to honour
-    // the user's existing v5 choice — Auto is opt-in via UI/env once they
-    // know what it means.
+    // v5 -> v6: introduced `quant.turboquant_mode` (Off / On / Auto). The
+    // TurboQuant fields were retired in v8 — see below — so this step is
+    // now a no-op apart from the version stamp.
     if cfg.schema_version < 6 {
-        cfg.quant.turboquant_mode = if cfg.quant.turboquant_enabled {
-            TurboquantMode::On
-        } else {
-            TurboquantMode::Off
-        };
-        if cfg.quant.turboquant_auto_threshold_tokens == 0 {
-            cfg.quant.turboquant_auto_threshold_tokens = 4096;
-        }
         cfg.schema_version = 6;
     }
     // v6 -> v7: introduced `context.default_max_tokens` so the OpenAI-compat
@@ -434,6 +407,29 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
             cfg.context.default_max_tokens = 2048;
         }
         cfg.schema_version = 7;
+    }
+    // v7 -> v8: retired the TurboQuant UI surface. The `QuantConfig` schema
+    // now holds simple-Q4 controls (`kv_mode`, `kv_auto_threshold_tokens`,
+    // `bits`) instead of the TQ Stage-1/2 fields. Old fields
+    // (`turboquant_enabled`, `turboquant_qjl_enabled`, `turboquant_mode`,
+    // `turboquant_auto_threshold_tokens`) are dropped at deserialization
+    // — serde silently ignores unknown fields. New fields land at their
+    // safe defaults via `#[serde(default)]`. The TQ kernel/primitive
+    // code path stays in-tree behind dev-only env vars; only the user-
+    // facing config surface is reset. See `CLAUDE.md` Phase 2/3 plan.
+    if cfg.schema_version < 8 {
+        // Force the safe new defaults — older configs deserialized into
+        // the new struct with serde defaults already, so this is a stamp
+        // operation only. (If a v6 user opted into Auto + 4K threshold we
+        // honour their intent indirectly: they opt back into Auto via UI
+        // once they read the new help text. Past TQ measurements showed
+        // Auto-at-4K was usually a perf regression anyway.)
+        cfg.quant.kv_mode = QuantKvMode::Off;
+        cfg.quant.kv_auto_threshold_tokens = 131072;
+        if !(matches!(cfg.quant.bits, 3 | 4 | 6 | 8)) {
+            cfg.quant.bits = 4;
+        }
+        cfg.schema_version = 8;
     }
     // Future migrations append here.
 }

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::config::{BackendMode, CorsMode, PersistentConfig, SpecKind, TurboquantMode};
+use crate::config::{BackendMode, CorsMode, PersistentConfig, QuantKvMode, SpecKind};
 
 /// Tauri event name for streaming server log lines.
 pub const EVENT_LOG: &str = "lumen://log";
@@ -682,53 +682,31 @@ fn apply_env(
 
     // ── Quantization (TurboQuant) ──────────────────────────────────
     // QJL Stage-2 projection dimension is fixed to D·4 = 1024 (Gemma 4
-    // head_dim=256) — the regime where QJL reliably beats Stage 1 alone.
-    // RNG seed is fixed to 42 — different seeds are statistically
-    // equivalent for the rotation matrix. Both used to be configurable
-    // via the DEBUG tab but were benchmark-only knobs; the env vars stay
-    // settable via the Env Overrides tab for ablation runs.
-    const TQ_QJL_M: &str = "1024";
-    const TQ_SEED: &str = "42";
-    // Legacy turboquant-cache crate path (Candle backends, MoE 1.5B etc.):
-    cmd.env("TQ_BITS", cfg.quant.bits.to_string());
-    cmd.env("TQ_QJL_M", TQ_QJL_M);
-    cmd.env("TQ_SEED", TQ_SEED);
-    // Gemma 4 native MLX runner reads its own env namespace — the same
-    // QUANT card slider drives both backends so users see one mental model.
-    //
-    // TQ mode is the v6+ source of truth (Off/On/Auto). We also write the
-    // legacy `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=0/1` flag so any
-    // tooling or pre-v6 server build still sees a sensible value.
-    let tq_mode_str = match cfg.quant.turboquant_mode {
-        TurboquantMode::Off => "off",
-        TurboquantMode::On => "on",
-        TurboquantMode::Auto => "auto",
+    // KV-cache simple quantization (Q3/Q4/Q6/Q8). The TurboQuant lever was
+    // retired from the user-facing surface in schema v8 — empirical sweeps
+    // (2026-05-26) showed TQ is net-negative on Apple Silicon batch=1 at
+    // every context length tested. TQ env vars are no longer emitted; the
+    // kernel code remains in-tree behind dev-only `LUMEN_GEMMA4_TQ_*` env
+    // vars that users can still set manually through the Env Overrides tab
+    // for ablation / CUDA Phase 2 work.
+    let kv_mode_str = match cfg.quant.kv_mode {
+        QuantKvMode::Off => "off",
+        QuantKvMode::On => "on",
+        QuantKvMode::Auto => "auto",
     };
-    cmd.env("LUMEN_GEMMA4_TQ_MODE", tq_mode_str);
-    if matches!(cfg.quant.turboquant_mode, TurboquantMode::Auto) {
+    cmd.env("LUMEN_GEMMA4_QUANT_KV_MODE", kv_mode_str);
+    cmd.env("LUMEN_GEMMA4_QUANT_KV_BITS", cfg.quant.bits.to_string());
+    if matches!(cfg.quant.kv_mode, QuantKvMode::Auto) {
         cmd.env(
-            "LUMEN_GEMMA4_TQ_AUTO_THRESHOLD_TOKENS",
-            cfg.quant.turboquant_auto_threshold_tokens.to_string(),
+            "LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS",
+            cfg.quant.kv_auto_threshold_tokens.to_string(),
         );
     }
-    // Legacy shim — On + Auto both surface as "1" so the bake-R load-time
-    // gate triggers (Auto mode reuses bake harmlessly when runtime TQ is
-    // OFF, because R · Rᵀ = I cancels the bake in the non-TQ matmul).
-    let tq_on_for_bake = !matches!(cfg.quant.turboquant_mode, TurboquantMode::Off);
-    if tq_on_for_bake {
-        cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT", "1");
-        cmd.env(
-            "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
-            cfg.quant.bits.to_string(),
-        );
-        // Stage 2 (QJL 1-bit residual correction over Stage 1). Only takes
-        // effect on requests where the per-request TQ resolution turns out
-        // ON; the env flag here is the static gate read at cache build.
-        if cfg.quant.turboquant_qjl_enabled {
-            cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL", "1");
-            cmd.env("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M", TQ_QJL_M);
-        }
-    }
+    // Legacy `TQ_BITS` for the older turboquant-cache crate path used by
+    // Candle backends / smaller MoE models. Mirror the same bit width so
+    // a future re-enablement uses the same compression level the user
+    // picked here. (No-op when those backends aren't loaded.)
+    cmd.env("TQ_BITS", cfg.quant.bits.to_string());
 
     // ── Context ────────────────────────────────────────────────────
     // Three knobs from the CONTEXT card; each maps to a single env var the
@@ -742,8 +720,19 @@ fn apply_env(
     // Default `max_tokens` budget when the API client omits the field on
     // /v1/chat/completions or /v1/completions. `0` is forwarded as "unbounded
     // — generate until EOS / stop / context budget".
+    //
+    // The same value is also emitted as `LUMEN_MAX_TOKENS_CAP` so the
+    // UI knob acts as a single ceiling: clients that send an explicit
+    // `max_tokens` (e.g. Ayla hard-coding the full 256K ctx window) are
+    // capped to the same value, instead of falling through to the
+    // server's compiled-in 2048 default. `0` keeps the cap disabled,
+    // matching the "unbounded" semantics of `LUMEN_DEFAULT_MAX_TOKENS=0`.
     cmd.env(
         "LUMEN_DEFAULT_MAX_TOKENS",
+        cfg.context.default_max_tokens.to_string(),
+    );
+    cmd.env(
+        "LUMEN_MAX_TOKENS_CAP",
         cfg.context.default_max_tokens.to_string(),
     );
 
@@ -841,6 +830,7 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_SLIDING_WINDOW",
     "LUMEN_PREFILL_CHUNK",
     "LUMEN_DEFAULT_MAX_TOKENS",
+    "LUMEN_MAX_TOKENS_CAP",
     "LUMEN_WIRED_LIMIT_BYTES",
     "LUMEN_MLX_BACKEND",
     "LUMEN_SPEC",
