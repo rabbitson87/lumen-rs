@@ -83,15 +83,19 @@ impl ChatCompletionRequest {
     ///   2. `reasoning_effort` — OpenAI o-series / GPT-5 convention.
     ///      `"minimal"` / `"none"` → off; any other recognized value → on.
     ///   3. `thinking` — Lumen extension flat bool.
-    ///   4. Default `false`.
-    ///
-    /// Matches llama.cpp's policy: reasoning is opt-in per request. The
-    /// backend never forces ON, even for reasoning-first families
-    /// (Gemma 4). Same family ships variants whose thinking distribution
-    /// is degraded (quantized 26B-A4B IT chat template emits stray
-    /// `<|think|>` and degenerates into n-gram cycles when forced on,
-    /// ref: feedback memory `feedback_gemma4_26b_enable_thinking_broken`).
+    ///   4. **Tools-present auto-thinking** — when `tools.len() > 0` and no
+    ///      explicit signal is given, default to `true`. Mirrors llama.cpp's
+    ///      observed behavior: agentic clients with tools attached need the
+    ///      thought channel active so the model can decide which tool to call
+    ///      (Gemma 4 IT's training distribution emits `<|tool_call>` tokens
+    ///      almost exclusively from inside the thinking channel).
+    ///   5. Default `false` when no explicit signal and no tools.
     pub fn enable_thinking(&self) -> bool {
+        self.enable_thinking_with_backend_default(false)
+    }
+
+    /// Kept for API stability — `backend_default_on` is currently ignored.
+    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
         if is_imatrix_awq_family(&self.model) {
             return false;
         }
@@ -575,6 +579,16 @@ impl AnthropicRequest {
             AnthropicThinking::Bool(b) => *b,
             AnthropicThinking::Object(cfg) => cfg.r#type.eq_ignore_ascii_case("enabled"),
         }
+    }
+
+    /// Parallel signature to [`ChatCompletionRequest::
+    /// enable_thinking_with_backend_default`] so the engine can call
+    /// both via a uniform pattern. Anthropic clients always send the
+    /// `thinking` field explicitly (it's part of the API contract), so
+    /// the backend hint never overrides — included only for API
+    /// consistency.
+    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
+        self.enable_thinking()
     }
 }
 
