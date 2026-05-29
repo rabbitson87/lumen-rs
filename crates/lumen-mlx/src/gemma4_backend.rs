@@ -29,8 +29,26 @@ pub(crate) mod imp {
 
     use crate::chat_io::BackendStreamEvent;
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
+    use crate::gemma4_critical_correction::CorrectionTable;
     use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
     use llguidance::ParserFactory;
+
+    /// Phase B (v0.6.0) — env gate for the runtime logit-correction kernel.
+    ///
+    /// Off by default. When set to a truthy value AND the model directory
+    /// has a valid `logit_corrections.bin` sidecar, the backend captures
+    /// `h_for_lm_head` at each decode step and applies per-critical-token
+    /// corrections immediately after the CPU pull, before any masks
+    /// (grammar, EOS guard, DRY) modify the logit buffer.
+    ///
+    /// Falsy values (`0`, `false`, empty): no capture, no correction —
+    /// bit-identical to v0.5.x decode.
+    fn gemma4_critical_logit_correction_enabled() -> bool {
+        match std::env::var("LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION").ok() {
+            Some(s) => !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"),
+            None => false,
+        }
+    }
 
     /// Dump rendered prompt to stderr when `LUMEN_DUMP_PROMPT` is set.
     /// Set to `1` / `true` for compact dump (decoded text + length), set to
@@ -353,6 +371,11 @@ pub(crate) mod imp {
         /// requests degrade gracefully (sample without grammar) rather
         /// than fail outright.
         grammar_factory: OnceLock<Option<Arc<ParserFactory>>>,
+        /// Phase B (v0.6.0) — cached per-critical-token logit correction
+        /// table loaded from `<model_dir>/logit_corrections.bin`. Lazy-
+        /// initialized on first decode step; stays `None` when the
+        /// sidecar is missing or the env gate is off.
+        correction_table: OnceLock<Option<Arc<CorrectionTable>>>,
     }
 
     impl Gemma4Backend {
@@ -374,7 +397,82 @@ pub(crate) mod imp {
                 prefix_caches: HashMap::new(),
                 model_dir: dir.to_path_buf(),
                 grammar_factory: OnceLock::new(),
+                correction_table: OnceLock::new(),
             })
+        }
+
+        /// Lazily load the per-critical-token logit correction sidecar from
+        /// `<model_dir>/logit_corrections.bin`. Returns `None` (graceful
+        /// degrade) when:
+        ///   - `LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION=0` (default), OR
+        ///   - the sidecar file is absent, OR
+        ///   - the sidecar fails to parse (logged once at first call).
+        ///
+        /// Also flips the model's correction-capture flag on the first
+        /// successful load so the very next `forward_array_*` stashes
+        /// `h_for_lm_head` for the correction step.
+        fn correction_table(&self) -> Option<Arc<CorrectionTable>> {
+            if !gemma4_critical_logit_correction_enabled() {
+                return None;
+            }
+            let cached = self
+                .correction_table
+                .get_or_init(|| {
+                    match CorrectionTable::load_from_model_dir(&self.model_dir) {
+                        Ok(Some(t)) => {
+                            eprintln!(
+                                "[gemma4-backend] logit-correction sidecar loaded: \
+                                 {} critical ids, hidden={}",
+                                t.critical_ids.len(),
+                                t.hidden
+                            );
+                            Some(Arc::new(t))
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "[gemma4-backend] LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION=1 \
+                                 but `{}/logit_corrections.bin` missing — running uncorrected",
+                                self.model_dir.display()
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[gemma4-backend] logit-correction sidecar failed to load \
+                                 (decoding uncorrected): {e:#}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .clone();
+            if cached.is_some() {
+                self.model.set_correction_capture_enabled(true);
+            }
+            cached
+        }
+
+        /// Phase B helper — pull the model's captured `h_for_lm_head` to a
+        /// CPU f32 buffer for the logit-correction kernel. Returns `None`
+        /// when nothing was captured (capture disabled, already consumed,
+        /// or forward not yet called). Failures during the MLX→CPU eval
+        /// are logged and swallowed so a sidecar bug never breaks decode.
+        fn take_captured_correction_h_as_f32(&self) -> Option<Vec<f32>> {
+            let h = self.model.take_captured_correction_h()?;
+            let h_f32 = match h.as_dtype(mlx_rs::Dtype::Float32) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[gemma4-backend] correction h dtype cast failed: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = h_f32.eval() {
+                eprintln!("[gemma4-backend] correction h eval failed: {e}");
+                return None;
+            }
+            // h shape is [1, 1, hidden]. as_slice() flattens; that's
+            // exactly what the correction kernel expects.
+            Some(h_f32.as_slice::<f32>().to_vec())
         }
 
         /// Lazily build (or return the cached) llguidance `ParserFactory`
@@ -1849,7 +1947,8 @@ pub(crate) mod imp {
                 // identical when sampling is disabled.
                 if let Some(sampling) = sampling_cfg {
                     use crate::gemma4_sampling::imp::{
-                        Xorshift64, sample_next_token_with_eos_guard_and_grammar,
+                        LogitCorrectionCtx, Xorshift64,
+                        sample_next_token_with_eos_guard_and_grammar,
                     };
                     let mut rng = Xorshift64::new(sampling.seed);
                     let mut all_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
@@ -1859,6 +1958,19 @@ pub(crate) mod imp {
                     // behaviour. Caller passes `Some(state)` when the
                     // request offered tools AND `tool_choice` is non-`None`.
                     let mut grammar = grammar;
+
+                    // Phase B (v0.6.0) — runtime logit correction for
+                    // critical tool/channel/turn tokens on quantized
+                    // variants. First call to `correction_table()` also
+                    // flips the model's correction-capture flag, so every
+                    // subsequent `forward_array_*` stashes `h_for_lm_head`.
+                    // The prefill above already ran without capture (we
+                    // discard its h) — first_tok is sampled uncorrected,
+                    // streaming steps below get the correction. Gate B
+                    // verification shows this is sufficient (first_tok is
+                    // usually a turn/role boundary, not the tool-decision
+                    // step).
+                    let correction_table = self.correction_table();
 
                     // Env-gated soft-EOS suppression — see
                     // `sample_next_token_with_eos_guard`. Two guards:
@@ -1895,6 +2007,7 @@ pub(crate) mod imp {
                         eos_min_logit_margin,
                         &eos,
                         grammar.as_mut(),
+                        None,
                     )
                     .context("chat_streaming(sampled): sample prefill token")?;
                     all_tokens.push(first_tok);
@@ -1922,6 +2035,26 @@ pub(crate) mod imp {
                                 .model
                                 .forward_array_last_token(&input, &mut cache)
                                 .context("chat_streaming(sampled): decode forward")?;
+                            // Phase B: build per-step correction context
+                            // from the just-captured `h_for_lm_head`. h
+                            // ownership transfers via take_*, so a forward
+                            // without a paired sample-step would leak the
+                            // captured clone (acceptable — never happens
+                            // in the streaming loop).
+                            let h_buf =
+                                if correction_table.is_some() {
+                                    self.take_captured_correction_h_as_f32()
+                                } else {
+                                    None
+                                };
+                            let correction_ctx = match (&correction_table, &h_buf) {
+                                (Some(tbl), Some(h)) => Some(LogitCorrectionCtx {
+                                    table: tbl,
+                                    hidden_f32: h,
+                                    softcap: 30.0,
+                                }),
+                                _ => None,
+                            };
                             let sampled = sample_next_token_with_eos_guard_and_grammar(
                                 &step_logits,
                                 &all_tokens,
@@ -1932,6 +2065,7 @@ pub(crate) mod imp {
                                 eos_min_logit_margin,
                                 &eos,
                                 grammar.as_mut(),
+                                correction_ctx.as_ref(),
                             )
                             .context("chat_streaming(sampled): sample step")?;
                             thinking_budget.observe(sampled);

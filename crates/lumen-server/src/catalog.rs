@@ -131,6 +131,52 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 16,
         notes: "**Agent tier** — 12 GB, 3.916 bpw mixed 4/3-bit AFFINE imatrix + AWQ. Best for: Korean agentic workloads (tool calls, multi-step reasoning, structured outputs). Always defaults to thinking-mode generation — client must send `chat_template_kwargs.enable_thinking=true` (or `reasoning_effort` / `thinking: true`) to activate. Not for: casual chat (overkill), English fact-checking, math CoT — Korean-first specialty. Best for 24 GB Macs.",
     },
+    RecommendedModel {
+        // Hybrid-precision experimental variant: 4-bit Community IT base
+        // with `embed_tokens` (tied to lm_head) re-quantized at 8-bit from
+        // the bf16 reference. Phase B (v0.6.0 tool-call robustness) lever
+        // — restores critical-token (id 48, 100, 101, 105, 106) emission
+        // ranking without the imatrix calibration corpus the Agent tier
+        // needs. Empirical Δ vs base IT 4-bit on the 30-prompt probe:
+        // tool_call (id 48) median rank 4860 → 2788 (-43%), discrimination
+        // tool < chat restored (base was inverted). +370 MB disk for the
+        // 8-bit embed triplet.
+        id: "hsng95/gemma-4-26b-a4b-mlx-hybrid-embed8",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — Hybrid Embed8 (Experimental)",
+        approx_size_gb: 16,
+        min_ram_gb: 22,
+        notes: "**Experimental tier (v0.6.0 preview)** — 4-bit Community IT base + 8-bit tied embed_tokens. Targets clients that need reliable tool calling on Gemma 4 without the imatrix-AWQ Agent tier overhead. Tool_call (id 48) emission rank improves ~43% vs base Chat tier; tool vs chat discrimination restored. Pair with `LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED=1` or `LUMEN_GEMMA4_GRAMMAR_LARK=1` for reliable natural emission on `tool_choice=\"auto\"`. +2 GB disk vs Chat tier for the precision restoration.",
+    },
+    RecommendedModel {
+        // Hybrid Embed8 base + 8-bit affine attention (q/k/v/o) for the
+        // last 13 decoder layers (L17-L29). Per-layer hidden-state
+        // divergence diagnostic showed late layers dominate the 4-bit
+        // damage (shape ratio Q3/Q1 = 3.05x), with biggest jumps at L26
+        // / L24 / L18 — restoring those layers' attention to 8-bit
+        // recovers most of the bf16 gain at ~17% of the disk cost.
+        //
+        // Empirically the 8-bit attention variant outperforms the bf16
+        // attention variant on the 30-prompt probe: similar absolute
+        // tool_call rank (504 vs 531), but **3.2x stronger** chat-vs-
+        // tool discrimination (+221 vs +68 with the bf16 attention
+        // restoration). 8-bit affine appears to break low-confidence
+        // ties in chat contexts that the bf16 path leaves ambiguous.
+        // Bonus: server-loadable as-is (the bf16 attention path requires
+        // a quantization-override deserializer change we haven't landed).
+        //
+        // Empirical Δ vs base IT 4-bit baseline (4860 median rank):
+        //   tool_call (id 48) median rank → 504 (-90%)
+        //   discrimination chat - tool = +221 (correct direction, strong)
+        // bf16 26B baseline = 412 — within 1.22x. +250 MB disk vs the
+        // Hybrid Embed8 variant (~16.2 GB total).
+        id: "hsng95/gemma-4-26b-a4b-mlx-hybrid-embed8-last13attn8",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — Tool-Call Optimized (v0.6.0)",
+        approx_size_gb: 17,
+        min_ram_gb: 22,
+        notes: "**Tool-call tier (v0.6.0)** — Hybrid Embed8 base + 8-bit affine attention on the last 13 layers (L17-L29). Targets natural tool emission on `tool_choice=\"auto\"` without forcing required-mode or grammar gating. Tool_call (id 48) emission rank improves ~90% vs base Chat tier (4860 → 504; bf16 26B baseline = 412). Critically, restores tool vs chat discrimination direction with +221 chat-vs-tool rank gap (base was inverted at -596). Pair with `LUMEN_GEMMA4_GRAMMAR_LARK=1` for additional structural enforcement on the generated tool-call body. Best Gemma 4 tier for agentic loops on 22 GB+ Macs.",
+    },
 ];
 
 /// Recommended embedding models. Curated list of Qwen3-Embedding family —

@@ -100,18 +100,28 @@ enum ModelBackend {
 }
 
 impl ModelBackend {
-    /// Kept for API stability — always returns `false`.
+    /// Returns true when the backend should default `enable_thinking=true`
+    /// for OpenAI-compat clients that don't send a thinking signal.
     ///
-    /// Previously this returned `true` for Gemma 4 backends so the server
-    /// could default `enable_thinking=true` for OpenAI-compat clients that
-    /// don't send a thinking signal. That default destabilized both
-    /// imatrix-AWQ builds (channel-open over-amplified → infinite reasoning)
-    /// and mlx-community uniform 4bit (channel weights too weak → degenerate
-    /// system-prompt cycling). Clients must now opt in explicitly via
+    /// Default is `false`. Previously hardcoded `true` for Gemma 4
+    /// destabilized both imatrix-AWQ builds (channel-open over-amplified →
+    /// infinite reasoning) and mlx-community uniform 4bit (channel weights
+    /// too weak → degenerate system-prompt cycling). The opt-in env
+    /// `LUMEN_BACKEND_THINKING_DEFAULT={on,1,true}` re-enables the default
+    /// for operators running newer hybrid variants (e.g. v0.6.0
+    /// `embed8-last13attn8`) whose channel weights are strong enough to
+    /// tolerate it — and where the tool_call rank improves significantly
+    /// when sampled from the thought-channel-open position rather than the
+    /// empty-channel-close one. Clients can still override per-request via
     /// `chat_template_kwargs.enable_thinking`, `reasoning_effort`, or
     /// `thinking: true`.
     fn is_reasoning_first_family(&self) -> bool {
-        false
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| {
+            std::env::var("LUMEN_BACKEND_THINKING_DEFAULT")
+                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {

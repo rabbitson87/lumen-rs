@@ -3368,6 +3368,15 @@ pub(crate) mod imp {
         /// when the trunk is called from anywhere outside `mtp_step()` —
         /// e.g. the standard OFF decode path retains the custom-FA-2 win.
         mtp_active: std::sync::atomic::AtomicBool,
+        /// Phase B (v0.6.0 tool-calling robustness) — capture slot for the
+        /// lm_head input `h_for_lm_head` that the backend's logit-correction
+        /// kernel needs to compute `delta_k = h · Δ[k, :]`. Mirrors the MTP
+        /// capture mechanism: enabled via a separate atomic so the standard
+        /// decode path stays zero-overhead when correction is off. Active
+        /// when `LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION=1` and the model
+        /// directory has a `logit_corrections.bin` sidecar.
+        correction_capture_slot: std::sync::Mutex<Option<Array>>,
+        correction_capture_enabled: std::sync::atomic::AtomicBool,
     }
 
     impl NativeGemma4Model {
@@ -3565,6 +3574,8 @@ pub(crate) mod imp {
                 last_sliding_attn_idx,
                 mtp_capture_slot: std::sync::Mutex::new(None),
                 mtp_capture_enabled: std::sync::atomic::AtomicBool::new(false),
+                correction_capture_slot: std::sync::Mutex::new(None),
+                correction_capture_enabled: std::sync::atomic::AtomicBool::new(false),
                 mtp_active: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -3632,6 +3643,34 @@ pub(crate) mod imp {
         /// hidden was captured (capture disabled, or already consumed).
         pub fn take_captured_last_h(&self) -> Option<Array> {
             self.mtp_capture_slot.lock().ok().and_then(|mut s| s.take())
+        }
+
+        /// Phase B (v0.6.0 tool-call robustness) — enable capture of the
+        /// `h_for_lm_head` (post-final-norm, post-last-slice) hidden vector
+        /// that feeds the lm_head matmul. Backend uses this to compute the
+        /// per-critical-token logit correction `h · Δ[k, :]`.
+        ///
+        /// Default off — zero overhead when not engaged. Backend turns this
+        /// on only when both:
+        ///   - `LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION=1` env, and
+        ///   - the model directory has a valid `logit_corrections.bin`.
+        pub fn set_correction_capture_enabled(&self, enabled: bool) {
+            self.correction_capture_enabled
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// Take the captured `h_for_lm_head` from the most recent forward
+        /// pass under `set_correction_capture_enabled(true)`. Returns
+        /// `None` if no capture occurred (capture disabled, already taken,
+        /// or forward not yet called).
+        ///
+        /// The returned Array still references the lazy MLX graph — callers
+        /// must `mx.eval` it (or pull to CPU) before reading values.
+        pub fn take_captured_correction_h(&self) -> Option<Array> {
+            self.correction_capture_slot
+                .lock()
+                .ok()
+                .and_then(|mut s| s.take())
         }
 
         /// Index of the trunk's last full-attention layer (drafter's full
@@ -6192,6 +6231,19 @@ pub(crate) mod imp {
                 h
             };
 
+            // Phase B (v0.6.0 tool-call robustness) — stash a clone of
+            // `h_for_lm_head` for the backend's logit-correction kernel.
+            // Same lazy-graph refcount-bump semantics as the MTP capture
+            // above; no overhead when capture is off.
+            if self
+                .correction_capture_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Ok(mut slot) = self.correction_capture_slot.lock() {
+                    *slot = Some(h_for_lm_head.clone());
+                }
+            }
+
             // (5+6) Tied lm_head + softcap.
             let logits = self.tied_lm_head_plus_softcap(&h_for_lm_head)?;
 
@@ -6454,6 +6506,7 @@ pub(crate) mod imp {
                     eos_top_k_guard,
                     eos_min_logit_margin,
                     &eos,
+                    None,
                 )
                 .context("generate(sampled): sample prefill token")?;
                 generated.push(first_tok);
@@ -6477,6 +6530,7 @@ pub(crate) mod imp {
                         eos_top_k_guard,
                         eos_min_logit_margin,
                         &eos,
+                        None,
                     )
                     .context("generate(sampled): sample step")?;
                     thinking_budget.observe(sampled);

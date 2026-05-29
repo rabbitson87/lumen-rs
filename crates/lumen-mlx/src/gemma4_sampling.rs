@@ -13,7 +13,48 @@ pub(crate) mod imp {
 
     pub use lumen_core::sampling::{SamplingConfig, Xorshift64, sample_from_logits};
 
+    use crate::gemma4_critical_correction::CorrectionTable;
     use crate::grammar::Gemma4GrammarState;
+
+    /// Phase B (v0.6.0 tool-call robustness) — context for the optional
+    /// per-token logit correction step that runs immediately after the
+    /// CPU pull, before any masks (grammar, EOS guard, DRY) modify the
+    /// CPU logit buffer. See
+    /// [`crate::gemma4_critical_correction::CorrectionTable`] for the
+    /// math and binary format.
+    ///
+    /// Caller pre-builds this once per decode step (after the model's
+    /// forward returns) by:
+    ///   1. Taking the captured `h_for_lm_head` via
+    ///      `NativeGemma4Model::take_captured_correction_h()`.
+    ///   2. Pulling it to CPU as an f32 slice.
+    ///   3. Borrowing the cached `CorrectionTable` from the backend's
+    ///      OnceLock.
+    ///
+    /// `softcap` is the Gemma 4 `final_logit_softcapping` value (30.0 in
+    /// every shipped variant), passed in so the sampler doesn't need to
+    /// know about model-side config.
+    pub struct LogitCorrectionCtx<'a> {
+        pub table: &'a CorrectionTable,
+        pub hidden_f32: &'a [f32],
+        pub softcap: f32,
+    }
+
+    /// Apply `LogitCorrectionCtx` to a CPU-pulled logit buffer in-place.
+    /// No-op when `ctx` is `None`. Errors propagate from
+    /// `CorrectionTable::apply_to_logits` (mainly hidden-dim mismatch).
+    #[inline]
+    fn apply_optional_correction(
+        buf: &mut [f32],
+        ctx: Option<&LogitCorrectionCtx<'_>>,
+    ) -> Result<()> {
+        if let Some(c) = ctx {
+            c.table
+                .apply_to_logits(buf, c.hidden_f32, c.softcap)
+                .context("sample: apply logit correction")?;
+        }
+        Ok(())
+    }
 
     /// Pull the last-position logits out of a `[1, L, V]` Array as a CPU
     /// `Vec<f32>`. Caller takes ownership so subsequent mutations
@@ -42,8 +83,10 @@ pub(crate) mod imp {
         recent_tokens: &[u32],
         cfg: &SamplingConfig,
         rng: &mut Xorshift64,
+        correction: Option<&LogitCorrectionCtx<'_>>,
     ) -> Result<u32> {
         let mut buf = last_logits_to_cpu_f32(logits)?;
+        apply_optional_correction(&mut buf, correction)?;
         Ok(sample_from_logits(&mut buf, recent_tokens, cfg, rng))
     }
 
@@ -67,8 +110,10 @@ pub(crate) mod imp {
         cfg: &SamplingConfig,
         rng: &mut Xorshift64,
         grammar: Option<&mut Gemma4GrammarState>,
+        correction: Option<&LogitCorrectionCtx<'_>>,
     ) -> Result<u32> {
         let mut buf = last_logits_to_cpu_f32(logits)?;
+        apply_optional_correction(&mut buf, correction)?;
         let next = match grammar {
             Some(state) => {
                 if state.is_active() {
@@ -121,8 +166,10 @@ pub(crate) mod imp {
         eos_top_k_guard: usize,
         eos_min_logit_margin: f32,
         eos_tokens: &[u32],
+        correction: Option<&LogitCorrectionCtx<'_>>,
     ) -> Result<u32> {
         let mut buf = last_logits_to_cpu_f32(logits)?;
+        apply_optional_correction(&mut buf, correction)?;
         let vocab = buf.len();
 
         // Filter caller-supplied EOS ids to in-vocab positions. Empty set
@@ -260,10 +307,12 @@ pub(crate) mod imp {
         eos_min_logit_margin: f32,
         eos_tokens: &[u32],
         mut grammar: Option<&mut Gemma4GrammarState>,
+        correction: Option<&LogitCorrectionCtx<'_>>,
     ) -> Result<u32> {
         let grammar_active = grammar.as_ref().is_some_and(|g| g.is_active());
         if grammar_active {
             let mut buf = last_logits_to_cpu_f32(logits)?;
+            apply_optional_correction(&mut buf, correction)?;
             if let Some(state) = grammar.as_mut() {
                 let _ = state.apply_mask_to_logits(&mut buf)?;
             }
@@ -285,6 +334,7 @@ pub(crate) mod imp {
             eos_top_k_guard,
             eos_min_logit_margin,
             eos_tokens,
+            correction,
         )?;
         if let Some(state) = grammar.as_mut() {
             state.observe(next)?;

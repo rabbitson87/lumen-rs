@@ -3341,6 +3341,7 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 0.23.1",
  "tokio",
 ]
@@ -3542,7 +3543,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -3554,7 +3555,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3565,7 +3566,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -3590,7 +3591,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=4db2402d105ac25f0379134aa2dd8fa9ad52671d#4db2402d105ac25f0379134aa2dd8fa9ad52671d"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
 dependencies = [
  "bindgen",
  "cc",
