@@ -42,7 +42,7 @@ export type EnvEntry = {
  *   3. Server-side reader already exists or is added in the same PR.
  */
 export const ENV_SCHEMA: EnvEntry[] = [
-  // ── Thinking (Gemma 4 reasoning behavior) ──────────────────────────
+  // ── Reasoning (per-request opt-in default) ────────────────────────
   {
     key: "LUMEN_BACKEND_THINKING_DEFAULT",
     labelKey: "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.label",

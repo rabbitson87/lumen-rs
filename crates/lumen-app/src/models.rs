@@ -102,7 +102,109 @@ fn is_hf_segment(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
+/// HuggingFace's default on-disk cache layout, where `hf-hub` (and the
+/// `huggingface-cli download` CLI without `--local-dir`) writes downloads.
+/// Honours `HF_HOME` if set, falling back to the platform cache dir.
+/// Returns `None` only when the platform doesn't expose a cache dir at all,
+/// which is exceedingly rare on macOS / Linux.
+fn hf_hub_cache_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HF_HOME") {
+        return Some(PathBuf::from(home).join("hub"));
+    }
+    directories::BaseDirs::new().map(|d| d.cache_dir().join("huggingface").join("hub"))
+}
+
+/// Scan the hf-hub cache directory for entries whose id matches any model
+/// in the catalog (chat families OR embeddings). Catalog-bound on purpose:
+/// the cache also accumulates unrelated downloads from other tools, and
+/// surfacing them in the UI would be noise.
+///
+/// Returns one [`ModelEntry`] per matched cache entry. Cache layout:
+/// `models--<org>--<repo>/snapshots/<sha>/<files>`.
+fn scan_hf_hub_cache(catalog: &Catalog) -> Result<Vec<ModelEntry>> {
+    let Some(cache_dir) = hf_hub_cache_dir() else {
+        return Ok(Vec::new());
+    };
+    if !cache_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Build the set of catalog ids we'll surface. Empty catalog = nothing
+    // to surface; that's still a valid call (e.g. before the catalog has
+    // been refreshed) so we just return early.
+    let known_ids: std::collections::HashSet<String> = catalog
+        .recommended
+        .iter()
+        .map(|r| r.id.clone())
+        .chain(catalog.embeddings.iter().map(|e| e.id.clone()))
+        .collect();
+    if known_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&cache_dir)
+        .with_context(|| format!("read_dir {}", cache_dir.display()))?
+    {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("models--") else {
+            continue;
+        };
+        let id = rest.replacen("--", "/", 1);
+        if !is_valid_hf_repo_id(&id) || !known_ids.contains(&id) {
+            continue;
+        }
+        let Some(snap) = resolve_hf_snapshot(&path) else {
+            continue;
+        };
+        let config_present = snap.join("config.json").exists();
+        let weight_present = WalkDir::new(&snap)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|ext| ext == "safetensors" || ext == "gguf")
+                    .unwrap_or(false)
+            });
+        let shards_complete = verify_shards_complete(&snap);
+        let size_bytes: u64 = WalkDir::new(&path)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let rec = catalog.find_recommended(&id);
+        let local_sha = read_sha_marker(&snap);
+        out.push(ModelEntry {
+            id,
+            path,
+            size_bytes,
+            ready: config_present && weight_present && shards_complete,
+            supported: rec.is_some(),
+            label: rec.map(|r| r.label.clone()),
+            local_sha,
+        });
+    }
+    Ok(out)
+}
+
 /// `catalog` is consulted to set the `supported` / `label` flags.
+///
+/// Also scans the hf-hub cache directory (`HF_HOME/hub` or platform default)
+/// for entries whose id matches the catalog. Without this, models that were
+/// auto-fetched by the server (e.g. the embedding model whose
+/// `EMBEDDING_MODEL_ID` is read by `hf-hub`) would never appear in the
+/// "downloaded" UI even though they're sitting on disk and live in use.
 pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry>> {
     if !models_dir.exists() {
         return Ok(Vec::new());
@@ -199,6 +301,17 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
             label: rec.map(|r| r.label.clone()),
             local_sha,
         });
+    }
+    // Merge in hf-hub cache entries that aren't already represented under
+    // `models_dir`. id-collisions (rare — would require both layouts to
+    // store the same repo) prefer the flat-layout copy because that's
+    // what the user explicitly fetched via the UI.
+    let seen_ids: std::collections::HashSet<String> =
+        out.iter().map(|e| e.id.clone()).collect();
+    for cached in scan_hf_hub_cache(catalog)? {
+        if !seen_ids.contains(&cached.id) {
+            out.push(cached);
+        }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)

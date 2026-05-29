@@ -1151,6 +1151,24 @@
         {/each}
       </div>
     {/if}
+    {#if catalog && catalog.embeddings.length > 0}
+      {@const activeEmb = config?.server.embedding_model_id ?? null}
+      {@const embDownloaded = activeEmb ? models.some((m) => m.id === activeEmb) : false}
+      <div class="mt-3 pt-2.5 border-t border-border flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        <span class="dim">{t("models.embedding.label")}</span>
+        {#if !activeEmb}
+          <span class="dim">{t("models.embedding.disabled")}</span>
+        {:else if embDownloaded}
+          <span class="mono text-ok">✓</span>
+          <span class="mono">{activeEmb}</span>
+        {:else}
+          <span class="mono text-warn">⚠</span>
+          <span class="mono">{activeEmb}</span>
+          <span class="text-warn text-[11px]">{t("models.embedding.autoFetched")}</span>
+        {/if}
+        <span class="dim ml-auto text-[11px]">{t("models.embedding.pickHint")}</span>
+      </div>
+    {/if}
   </section>
 
   <!-- SERVER -->

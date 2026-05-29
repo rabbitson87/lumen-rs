@@ -247,6 +247,12 @@ export const en: Record<string, string> = {
   "context.banner.smallerThanBf16": "× smaller than bf16",
   "context.banner.kvCache": "KV cache ~",
 
+  // ── MODELS card embedding mini-row ─────────────────────────────
+  "models.embedding.label": "Embedding:",
+  "models.embedding.disabled": "(disabled)",
+  "models.embedding.autoFetched": "(server auto-fetched from cache)",
+  "models.embedding.pickHint": "Pick / change in the API tab",
+
   // ── EnvOverrides panel ──────────────────────────────────────────
   "env.title": "Environment overrides",
   "env.intro":
@@ -269,7 +275,7 @@ export const en: Record<string, string> = {
   "env.empty2": "No overrides set.",
 
   // ── Section groupings ────────────────────────────────────────────
-  "env.section.thinking": "Thinking (Gemma 4 reasoning)",
+  "env.section.thinking": "Reasoning",
   "env.section.safety": "Safety net",
   "env.section.advanced": "Advanced",
   "env.section.debug": "Debug / triage",

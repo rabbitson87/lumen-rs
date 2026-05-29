@@ -239,6 +239,12 @@ export const ko: Record<string, string> = {
   "context.banner.smallerThanBf16": "× bf16 대비 축소",
   "context.banner.kvCache": "KV 캐시 약 ",
 
+  // ── 모델 카드 임베딩 미니행 ─────────────────────────────────
+  "models.embedding.label": "임베딩:",
+  "models.embedding.disabled": "(비활성)",
+  "models.embedding.autoFetched": "(서버가 캐시에서 자동 로드)",
+  "models.embedding.pickHint": "API 탭에서 선택 / 변경",
+
   // ── 환경 변수 패널 ──────────────────────────────────────────────
   "env.title": "환경 변수 오버라이드",
   "env.intro":
@@ -260,7 +266,7 @@ export const ko: Record<string, string> = {
   "env.empty2": "설정된 오버라이드가 없습니다.",
 
   // ── 섹션 그루핑 ────────────────────────────────────────────
-  "env.section.thinking": "씽킹 (Gemma 4 추론)",
+  "env.section.thinking": "추론",
   "env.section.safety": "안전망",
   "env.section.advanced": "고급",
   "env.section.debug": "디버그 / 진단",
