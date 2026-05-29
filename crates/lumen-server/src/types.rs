@@ -94,8 +94,20 @@ impl ChatCompletionRequest {
         self.enable_thinking_with_backend_default(false)
     }
 
-    /// Kept for API stability — `backend_default_on` is currently ignored.
-    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
+    /// Resolve `enable_thinking` for this request. Precedence (highest first):
+    ///   1. imatrix-AWQ family → forced `false` (channel-open over-amplified).
+    ///   2. explicit `chat_template_kwargs.enable_thinking` → as given.
+    ///   3. explicit `reasoning_effort` → on unless `"minimal"|"none"|"off"`.
+    ///   4. flat `thinking: true` → `true` (user explicit opt-in).
+    ///   5. `backend_default_on` (operator opt-in via
+    ///      `LUMEN_BACKEND_THINKING_DEFAULT`) → `true`.
+    ///   6. Tools present (`tools.len() > 0`) → `true`. Mirrors llama.cpp's
+    ///      observed behavior: Gemma 4 IT's training distribution emits
+    ///      `<|tool_call>` almost exclusively from inside the thinking
+    ///      channel, so agentic clients with tools attached need the
+    ///      thought channel active to make natural tool decisions.
+    ///   7. Otherwise → `false`.
+    pub fn enable_thinking_with_backend_default(&self, backend_default_on: bool) -> bool {
         if is_imatrix_awq_family(&self.model) {
             return false;
         }
@@ -110,7 +122,13 @@ impl ChatCompletionRequest {
                 "minimal" | "none" | "off" | "disabled" | ""
             );
         }
-        self.thinking
+        if self.thinking {
+            return true;
+        }
+        if backend_default_on {
+            return true;
+        }
+        self.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
     }
 }
 
@@ -1367,5 +1385,64 @@ mod tool_calling_serde {
         });
         let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
         assert!(!req.enable_thinking());
+    }
+
+    #[test]
+    fn openai_tools_present_enables_thinking_by_default() {
+        // No explicit thinking signal + tools attached → auto-thinking on.
+        // Mirrors llama.cpp behavior + Gemma 4 IT training distribution
+        // (tool_call tokens emit almost exclusively from inside the
+        // thinking channel).
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "search", "parameters": {} }
+            }],
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking());
+
+        // Explicit `enable_thinking=false` still wins over tools-present.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "search", "parameters": {} }
+            }],
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+
+        // No tools + no signal → false.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking());
+    }
+
+    #[test]
+    fn openai_backend_default_kicks_in_without_explicit_signal() {
+        // No explicit signal + no tools, but backend default on → true.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.enable_thinking_with_backend_default(true));
+
+        // Explicit `enable_thinking=false` still wins over backend default.
+        let raw = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(raw).unwrap();
+        assert!(!req.enable_thinking_with_backend_default(true));
     }
 }
