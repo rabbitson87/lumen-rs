@@ -94,8 +94,17 @@ impl ChatCompletionRequest {
         self.enable_thinking_with_backend_default(false)
     }
 
-    /// Kept for API stability — `backend_default_on` is currently ignored.
-    pub fn enable_thinking_with_backend_default(&self, _backend_default_on: bool) -> bool {
+    /// Resolve `enable_thinking` with an operator-supplied backend default.
+    /// Precedence (highest first):
+    ///   1. imatrix-AWQ family override → forced `false`.
+    ///   2. explicit `chat_template_kwargs.enable_thinking` → as given.
+    ///   3. explicit `reasoning_effort` → on unless `"minimal"|"none"|"off"`.
+    ///   4. flat `thinking: true` → user explicit opt-in.
+    ///   5. `backend_default_on` (operator opt-in via
+    ///      `LUMEN_BACKEND_THINKING_DEFAULT`) → backend's default when
+    ///      no per-request signal is given.
+    ///   6. otherwise `false`.
+    pub fn enable_thinking_with_backend_default(&self, backend_default_on: bool) -> bool {
         if is_imatrix_awq_family(&self.model) {
             return false;
         }
@@ -110,7 +119,10 @@ impl ChatCompletionRequest {
                 "minimal" | "none" | "off" | "disabled" | ""
             );
         }
-        self.thinking
+        if self.thinking {
+            return true;
+        }
+        backend_default_on
     }
 }
 
