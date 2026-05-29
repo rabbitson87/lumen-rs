@@ -100,30 +100,6 @@ enum ModelBackend {
 }
 
 impl ModelBackend {
-    /// Returns true when the backend should default `enable_thinking=true`
-    /// for OpenAI-compat clients that don't send a thinking signal.
-    ///
-    /// Default is `false`. Previously hardcoded `true` for Gemma 4
-    /// destabilized both imatrix-AWQ builds (channel-open over-amplified →
-    /// infinite reasoning) and mlx-community uniform 4bit (channel weights
-    /// too weak → degenerate system-prompt cycling). The opt-in env
-    /// `LUMEN_BACKEND_THINKING_DEFAULT={on,1,true}` re-enables the default
-    /// for operators running newer hybrid variants (e.g. v0.6.0
-    /// `embed8-last13attn8`) whose channel weights are strong enough to
-    /// tolerate it — and where the tool_call rank improves significantly
-    /// when sampled from the thought-channel-open position rather than the
-    /// empty-channel-close one. Clients can still override per-request via
-    /// `chat_template_kwargs.enable_thinking`, `reasoning_effort`, or
-    /// `thinking: true`.
-    fn is_reasoning_first_family(&self) -> bool {
-        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *FLAG.get_or_init(|| {
-            std::env::var("LUMEN_BACKEND_THINKING_DEFAULT")
-                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
-                .unwrap_or(false)
-        })
-    }
-
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Qwen(m) => m.encode(text),
@@ -801,7 +777,7 @@ impl InferenceEngine {
             req.messages.len(),
             prompt_bytes,
             req.max_tokens,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            req.enable_thinking(),
             req.stream,
             tools_owned.len(),
             needs_structured,
@@ -876,7 +852,7 @@ impl InferenceEngine {
         // common case where OpenAI-compat clients send placeholder model
         // ids ("gpt-3.5-turbo") that hide the actual loaded family.
         let thinking_on =
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+            req.enable_thinking();
         let parsed = if needs_structured {
             let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
@@ -1240,7 +1216,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1253,7 +1229,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1262,7 +1238,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1351,7 +1327,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
 
         let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
@@ -1361,7 +1337,7 @@ impl InferenceEngine {
             prompt_bytes,
             prompt_tokens,
             req.max_tokens,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            req.enable_thinking(),
             needs_structured,
         );
 
@@ -1468,7 +1444,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1502,7 +1478,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1627,7 +1603,7 @@ impl InferenceEngine {
 
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+            .count_chat_prompt_tokens(&messages, req.enable_thinking());
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
@@ -1775,7 +1751,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -1809,7 +1785,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.enable_thinking(),
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
@@ -2469,7 +2445,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2508,7 +2484,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9, // AnthropicRequest has no top_p; use default
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2547,7 +2523,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2588,7 +2564,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2904,7 +2880,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2943,7 +2919,7 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.9,
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking(),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2979,7 +2955,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -3020,7 +2996,7 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.9,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking(),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
