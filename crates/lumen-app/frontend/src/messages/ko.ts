@@ -251,13 +251,68 @@ export const ko: Record<string, string> = {
   "env.savedHint": "저장됨. 적용하려면 서버 재시작 (중지 → 시작).",
   "env.knownKeysTitle": "알려진 키 (자동완성):",
   "env.intro2":
-    "lumen-server 하위 프로세스에 전달되는 원시 환경 변수 오버라이드. UI에 노출되지 않은 일회성 노브에 유용합니다 (예: LUMEN_GEMMA4_FUSE_EXPERTS, LUMEN_AFFINE4_FORCE_CPU). 타입화된 UI 필드와 동일한 키는 강조 표시됩니다.",
+    "lumen-server 하위 프로세스에 전달되는 타입화된 노브. 토글하거나 값을 선택하거나, × 로 지우면 기본값으로 복구됩니다. UI 필드와 동일한 키는 강조 표시됩니다.",
   "env.row.remove": "제거",
   "env.row.shadowsPrefix": "⚠ 다음 UI 필드를 가립니다:",
   "env.add2": "+ 추가",
   "env.revert": "되돌리기",
   "env.applyHint": "변경 사항은 다음 서버 시작 시 적용됩니다.",
   "env.empty2": "설정된 오버라이드가 없습니다.",
+
+  // ── 섹션 그루핑 ────────────────────────────────────────────
+  "env.section.thinking": "씽킹 (Gemma 4 추론)",
+  "env.section.safety": "안전망",
+  "env.section.advanced": "고급",
+  "env.section.debug": "디버그 / 진단",
+
+  // ── 항목별 라벨 (key = env 변수명) ──────────────────────
+  "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.label": "백엔드 씽킹 기본값",
+  "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.help":
+    "ON 일 때 OpenAI 호환 클라이언트가 per-request 씽킹 신호 안 보내면 기본으로 씽킹 활성화. per-request 신호가 우선합니다.",
+
+  "env.entry.LUMEN_MAX_THINKING_TOKENS.label": "최대 씽킹 토큰 (하드캡)",
+  "env.entry.LUMEN_MAX_THINKING_TOKENS.help":
+    "N 토큰 이상 추론 시 채널 종료 강제. 0 = 비활성화. Gemma 4 권장 600.",
+
+  "env.entry.LUMEN_MAX_FORCE_CLOSE_ATTEMPTS.label": "강제 종료 시도 횟수",
+  "env.entry.LUMEN_MAX_FORCE_CLOSE_ATTEMPTS.help":
+    "턴 종료 전 채널 종료 토큰을 강제하는 횟수. 기본 1.",
+
+  "env.entry.LUMEN_RUNAWAY_DETECT.label": "N-gram 폭주 감지기",
+  "env.entry.LUMEN_RUNAWAY_DETECT.help":
+    "n-gram 사이클 감지 시 응답 자동 절단. 기본 ON.",
+
+  "env.entry.LUMEN_RUNAWAY_NGRAM.label": "폭주 n-gram 크기",
+  "env.entry.LUMEN_RUNAWAY_NGRAM.help":
+    "감지기가 반복 검사하는 n-gram 길이. 기본 4.",
+
+  "env.entry.LUMEN_RUNAWAY_NGRAM_MAX_REPEATS.label": "폭주 최대 반복",
+  "env.entry.LUMEN_RUNAWAY_NGRAM_MAX_REPEATS.help":
+    "절단 전 허용되는 동일 n-gram 반복 횟수. 기본 8.",
+
+  "env.entry.LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION.label": "Phase B 로짓 보정 (Gemma 4)",
+  "env.entry.LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION.help":
+    "사이드카 Δ 를 7 개 핵심 토큰 (채널/턴/툴 경계) 에 적용. 기본 ON.",
+
+  "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark 문법 (Gemma 4 툴콜)",
+  "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
+    "Lark 문법으로 툴콜 출력 제약. 구조적 출력 신뢰도 향상.",
+
+  "env.entry.LUMEN_DUMP_PROMPT.label": "프롬프트 덤프",
+  "env.entry.LUMEN_DUMP_PROMPT.help":
+    "모델에 보내는 chat template 적용 프롬프트 출력. off / preview / full.",
+
+  "env.entry.LUMEN_LOG_REQUEST_BODY.label": "요청 본문 로깅",
+  "env.entry.LUMEN_LOG_REQUEST_BODY.help":
+    "/v1/chat/completions 요청마다 [diag] 한 줄 요약 출력.",
+
+  "env.entry.LUMEN_GEMMA4_TOKEN_TRACE.label": "토큰별 트레이스 (Gemma 4)",
+  "env.entry.LUMEN_GEMMA4_TOKEN_TRACE.help":
+    "샘플링된 토큰마다 [token-trace] 한 줄 출력. 출력량 큼 — 디버그 전용.",
+
+  "env.entry.LUMEN_EOS_GUARD_VERBOSE.label": "EOS 가드 상세 로그",
+  "env.entry.LUMEN_EOS_GUARD_VERBOSE.help":
+    "샘플링 파이프라인에서 발생하는 모든 EOS 가드 억제 이벤트 로깅.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브

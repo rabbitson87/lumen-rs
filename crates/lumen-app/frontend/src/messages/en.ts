@@ -260,13 +260,68 @@ export const en: Record<string, string> = {
     "Saved. Restart the server to apply (Stop → Start).",
   "env.knownKeysTitle": "Typed keys (auto-completed):",
   "env.intro2":
-    "Raw env-var overrides passed to the lumen-server subprocess. Useful for one-off knobs not surfaced in the UI (e.g. LUMEN_GEMMA4_FUSE_EXPERTS, LUMEN_AFFINE4_FORCE_CPU). Keys that shadow a typed UI field are highlighted.",
+    "Typed knobs passed to the lumen-server subprocess. Toggle, pick a value, or clear (×) to revert to default. Keys that shadow a typed UI field are highlighted.",
   "env.row.remove": "Remove",
   "env.row.shadowsPrefix": "⚠ shadows the UI field for",
   "env.add2": "+ Add",
   "env.revert": "Revert",
   "env.applyHint": "Changes apply on next server start.",
   "env.empty2": "No overrides set.",
+
+  // ── Section groupings ────────────────────────────────────────────
+  "env.section.thinking": "Thinking (Gemma 4 reasoning)",
+  "env.section.safety": "Safety net",
+  "env.section.advanced": "Advanced",
+  "env.section.debug": "Debug / triage",
+
+  // ── Per-entry labels (key = env var name) ──────────────────────
+  "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.label": "Backend thinking default",
+  "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.help":
+    "When ON, OpenAI-compat clients with no per-request thinking signal get thinking enabled by default. Per-request signals still override.",
+
+  "env.entry.LUMEN_MAX_THINKING_TOKENS.label": "Max thinking tokens (hard cap)",
+  "env.entry.LUMEN_MAX_THINKING_TOKENS.help":
+    "Force-emit channel-close after N reasoning tokens. 0 disables. Recommended 600 for Gemma 4.",
+
+  "env.entry.LUMEN_MAX_FORCE_CLOSE_ATTEMPTS.label": "Force-close attempts",
+  "env.entry.LUMEN_MAX_FORCE_CLOSE_ATTEMPTS.help":
+    "Number of times to force the channel-close token before terminating the turn. Default 1.",
+
+  "env.entry.LUMEN_RUNAWAY_DETECT.label": "N-gram runaway detector",
+  "env.entry.LUMEN_RUNAWAY_DETECT.help":
+    "Automatically truncate the response when an n-gram cycle is detected. Default ON.",
+
+  "env.entry.LUMEN_RUNAWAY_NGRAM.label": "Runaway n-gram size",
+  "env.entry.LUMEN_RUNAWAY_NGRAM.help":
+    "N-gram length the detector watches for cyclic repetition. Default 4.",
+
+  "env.entry.LUMEN_RUNAWAY_NGRAM_MAX_REPEATS.label": "Runaway max repeats",
+  "env.entry.LUMEN_RUNAWAY_NGRAM_MAX_REPEATS.help":
+    "Tolerated repeats of the same n-gram before truncation. Default 8.",
+
+  "env.entry.LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION.label": "Phase B logit correction (Gemma 4)",
+  "env.entry.LUMEN_GEMMA4_CRITICAL_LOGIT_CORRECTION.help":
+    "Apply the sidecar Δ to 7 critical token ids (channel/turn/tool boundaries). Default ON.",
+
+  "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark grammar (Gemma 4 tool calls)",
+  "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
+    "Constrain tool-call output with a Lark grammar. Improves structured output reliability.",
+
+  "env.entry.LUMEN_DUMP_PROMPT.label": "Dump prompt",
+  "env.entry.LUMEN_DUMP_PROMPT.help":
+    "Print the chat-templated prompt sent to the model. off / preview / full.",
+
+  "env.entry.LUMEN_LOG_REQUEST_BODY.label": "Log request body",
+  "env.entry.LUMEN_LOG_REQUEST_BODY.help":
+    "Print a one-line [diag] summary of each /v1/chat/completions request.",
+
+  "env.entry.LUMEN_GEMMA4_TOKEN_TRACE.label": "Per-token trace (Gemma 4)",
+  "env.entry.LUMEN_GEMMA4_TOKEN_TRACE.help":
+    "Print one [token-trace] line per sampled token. High volume — debug only.",
+
+  "env.entry.LUMEN_EOS_GUARD_VERBOSE.label": "EOS guard verbose log",
+  "env.entry.LUMEN_EOS_GUARD_VERBOSE.help":
+    "Log every EOS-guard suppression event in the sampling pipeline.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
