@@ -96,6 +96,15 @@
   });
   let logs = $state<LogLine[]>([]);
   let logsOpen = $state(false);
+  // Container ref + sticky-bottom state for the log viewer.
+  // Auto-scrolls to the latest line unless the user has scrolled up to
+  // read older entries (then we leave the scroll alone until they reach
+  // the bottom again). Threshold = 30 px below the bottom counts as "at
+  // the bottom".
+  let logsContainer = $state<HTMLDivElement | undefined>(undefined);
+  let logsStickToBottom = $state(true);
+  const LOG_STICK_THRESHOLD_PX = 30;
+  const LOG_MAX_LINES = 2000;
   let envOpen = $state(false);
   let doctorOpen = $state(false);
   let doctorReport = $state<DoctorReport | null>(null);
@@ -317,7 +326,7 @@
     await syncTunedMemoryCaps();
 
     unlistenLog = await onLog((l) => {
-      logs = [...logs.slice(-499), l];
+      logs = [...logs.slice(-(LOG_MAX_LINES - 1)), l];
     });
     unlistenStatus = await onStatus((s) => {
       status = s;
@@ -379,6 +388,34 @@
     unlistenStatus?.();
     unlistenDownload?.();
     if (pollHandle) clearInterval(pollHandle);
+  });
+
+  // Track scroll position so auto-scroll only fires when the user is
+  // already at (or near) the bottom. Detached from the DOM until the
+  // logs panel is opened — `logsContainer` is `undefined` while
+  // `logsOpen=false`.
+  function onLogsScroll() {
+    if (!logsContainer) return;
+    const el = logsContainer;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    logsStickToBottom = distanceFromBottom < LOG_STICK_THRESHOLD_PX;
+  }
+
+  // Auto-scroll to bottom when new logs arrive, but only if the user
+  // hasn't scrolled up. `requestAnimationFrame` defers until after the
+  // DOM has been updated with the new line. Also fires when the panel
+  // re-opens so the user lands at the latest entry rather than wherever
+  // the scrollTop was last frame.
+  $effect(() => {
+    // Reactive deps: re-run whenever a log is appended OR the panel
+    // opens.
+    logs.length;
+    logsOpen;
+    if (!logsOpen || !logsStickToBottom || !logsContainer) return;
+    const el = logsContainer;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
   });
 
   // ── Mutators ─────────────────────────────────────────────────────
@@ -1410,9 +1447,22 @@
 <!-- ── Footer panel: logs + env overrides ──────────────────────── -->
 <footer class="border-t border-border bg-panel flex flex-col fixed left-0 right-0 bottom-0 z-8">
   {#if logsOpen}
-    <div class="{panelScroll} mono px-4 py-1.5 pb-2.5 text-xs">
+    <div
+      bind:this={logsContainer}
+      onscroll={onLogsScroll}
+      class="{panelScroll} mono px-4 py-1.5 pb-2.5 text-xs"
+    >
+      <!-- Virtualization via `content-visibility: auto`: the browser
+           skips layout + paint for off-screen entries even though all
+           ${LOG_MAX_LINES} live in the DOM. `contain-intrinsic-size`
+           gives a per-line estimate so scrollbar height stays stable
+           before items are first measured. Combined with the 2000-line
+           cap this keeps the panel responsive on multi-hour sessions. -->
       {#each logs as l}
-        <div class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}>{l.line}</div>
+        <div
+          class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}
+          style="content-visibility: auto; contain-intrinsic-size: auto 18px;"
+        >{l.line}</div>
       {/each}
       {#if logs.length === 0}
         <div class="dim">{t("footer.logs.empty")}</div>
