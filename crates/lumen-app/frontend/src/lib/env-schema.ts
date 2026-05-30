@@ -121,7 +121,7 @@ export const ENV_SCHEMA: EnvEntry[] = [
     labelKey: "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label",
     helpKey: "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help",
     kind: "bool",
-    defaultValue: "0",
+    defaultValue: "1",
     section: "advanced",
   },
   {

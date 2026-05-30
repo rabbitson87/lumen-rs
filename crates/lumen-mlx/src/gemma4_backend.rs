@@ -329,17 +329,26 @@ pub(crate) mod imp {
     ///
     /// Each `generate*` call allocates a fresh `NativeGemma4PromptCache`
     /// **unless** the prefix-cache path (`chat_with_prefix_cache`) is used.
-    /// Opt-in flag for the Lark-format Gemma 4 tool-call grammar. Default
-    /// OFF. When set (`1` / truthy), [`Gemma4Backend::build_grammar_state`]
-    /// constructs an active matcher that constrains tool-call bodies to
-    /// the native `call:NAME{key:value,…}` format with per-tool schema
-    /// enforcement. Cached on first read.
+    /// Flag for the Lark-format Gemma 4 tool-call grammar. **Default ON**
+    /// (v0.7.0+). When active (env unset or truthy),
+    /// [`Gemma4Backend::build_grammar_state`] constructs a matcher that
+    /// constrains tool-call bodies to the native
+    /// `call:NAME{key:value,…}` format with per-tool schema enforcement.
+    /// Disable with `LUMEN_GEMMA4_GRAMMAR_LARK=0` (or `false`).
+    ///
+    /// Rationale for ON-by-default: the grammar adds negligible CPU per
+    /// sampled token but eliminates the most common tool-call format
+    /// failure mode on the imatrix-AWQ family (channel boundary logit
+    /// suppression produces structurally invalid `call:…{…}` bodies
+    /// downstream clients reject). For agentic clients (Moltis-style
+    /// matchers, OpenAI-spec tool callers) ON is the safer production
+    /// default. Cached on first read.
     fn gemma4_grammar_lark_enabled() -> bool {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
             std::env::var("LUMEN_GEMMA4_GRAMMAR_LARK")
                 .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(false)
+                .unwrap_or(true)
         })
     }
 

@@ -302,7 +302,7 @@ export const ko: Record<string, string> = {
 
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark 문법 (Gemma 4 툴콜)",
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
-    "Lark 문법으로 툴콜 출력 제약. 구조적 출력 신뢰도 향상.",
+    "Lark 문법으로 툴콜 출력 강제 — call:NAME{...} 구조 무조건 보장. 기본 ON; free-form 툴콜 emission 필요 시에만 OFF.",
 
   "env.entry.LUMEN_USE_JINJA_RENDERER.label": "minijinja 렌더러 사용 (Gemma 4)",
   "env.entry.LUMEN_USE_JINJA_RENDERER.help":

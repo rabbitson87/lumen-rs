@@ -311,7 +311,7 @@ export const en: Record<string, string> = {
 
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark grammar (Gemma 4 tool calls)",
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
-    "Constrain tool-call output with a Lark grammar. Improves structured output reliability.",
+    "Constrain tool-call output with a Lark grammar -- guarantees structurally valid call:NAME{...} bodies. Default ON; disable only if you need free-form tool-call emission.",
 
   "env.entry.LUMEN_USE_JINJA_RENDERER.label": "Use minijinja renderer (Gemma 4)",
   "env.entry.LUMEN_USE_JINJA_RENDERER.help":
