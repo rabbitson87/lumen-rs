@@ -124,6 +124,14 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "advanced",
   },
+  {
+    key: "LUMEN_USE_JINJA_RENDERER",
+    labelKey: "env.entry.LUMEN_USE_JINJA_RENDERER.label",
+    helpKey: "env.entry.LUMEN_USE_JINJA_RENDERER.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
 
   // ── Debug (developer / triage) ─────────────────────────────────────
   {

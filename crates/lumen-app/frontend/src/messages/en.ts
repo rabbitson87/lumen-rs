@@ -313,6 +313,10 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
     "Constrain tool-call output with a Lark grammar. Improves structured output reliability.",
 
+  "env.entry.LUMEN_USE_JINJA_RENDERER.label": "Use minijinja renderer (Gemma 4)",
+  "env.entry.LUMEN_USE_JINJA_RENDERER.help":
+    "Render the chat template via minijinja against the model's chat_template.jinja, instead of the Rust hand-port. Byte-identical on golden vectors; flip ON to opt into the upstream-authoritative path.",
+
   "env.entry.LUMEN_DUMP_PROMPT.label": "Dump prompt",
   "env.entry.LUMEN_DUMP_PROMPT.help":
     "Print the chat-templated prompt sent to the model. off / preview / full.",

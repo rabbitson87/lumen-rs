@@ -29,6 +29,7 @@ pub(crate) mod imp {
 
     use crate::chat_io::BackendStreamEvent;
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
+    use crate::jinja_chat::imp::{JinjaChatTemplate, JinjaRenderOptions};
     use crate::gemma4_critical_correction::CorrectionTable;
     use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
     use llguidance::ParserFactory;
@@ -353,9 +354,56 @@ pub(crate) mod imp {
         lower.contains("imatrix") || lower.contains("-awq")
     }
 
+    /// Read the `LUMEN_USE_JINJA_RENDERER` env once at backend creation.
+    /// Truthy values: `1`, `true`, `on`, `yes` (case-insensitive).
+    fn env_jinja_renderer_on() -> bool {
+        match std::env::var("LUMEN_USE_JINJA_RENDERER") {
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// Convert the engine's `(role, content)` pair shape into ChatTurns
+    /// so the jinja renderer can consume them. Mirrors the role-string
+    /// matching of `Gemma4Backend::parse_role_pairs`.
+    fn pairs_to_turns(messages: &[(String, String)]) -> Result<Vec<crate::chat_io::ChatTurn<'_>>> {
+        use crate::chat_io::ChatTurn;
+        messages
+            .iter()
+            .map(|(role, content)| {
+                let r = role.as_str();
+                match r {
+                    "system" | "System" | "SYSTEM" => Ok(ChatTurn::System(content.as_str())),
+                    "user" | "User" | "USER" => Ok(ChatTurn::User(content.as_str())),
+                    "assistant" | "Assistant" | "ASSISTANT" | "model" => Ok(ChatTurn::Assistant {
+                        text: content.as_str(),
+                        tool_calls: &[],
+                    }),
+                    other => Err(anyhow!(
+                        "Gemma4Backend::pairs_to_turns: unknown role {other:?}"
+                    )),
+                }
+            })
+            .collect()
+    }
+
     pub struct Gemma4Backend {
         model: NativeGemma4Model,
         chat: Gemma4ChatTemplate,
+        /// Minijinja-based renderer that evaluates the model's upstream
+        /// `chat_template.jinja` directly. Initialized only when
+        /// `LUMEN_USE_JINJA_RENDERER` is on at backend-creation time;
+        /// otherwise the hand-port in `chat` is the sole render path.
+        /// Default OFF in v0.7.0 — opt-in production validation; the
+        /// hand-port and jinja paths are byte-identical for the cases
+        /// covered by `jinja_chat::imp::tests` (parity vs
+        /// `transformers.AutoTokenizer.apply_chat_template` golden
+        /// vectors), so flipping this on should be safe for most
+        /// agentic workloads.
+        jinja_chat: Option<JinjaChatTemplate>,
         model_id: String,
         /// Per-key prefix caches. Keyed by caller-supplied string (e.g. the
         /// system message hash from the Moltis side, or a batch id).
@@ -390,9 +438,28 @@ pub(crate) mod imp {
                 .with_context(|| format!("Gemma4Backend::from_dir({dir:?}): model load"))?;
             let chat = Gemma4ChatTemplate::from_dir(dir)
                 .with_context(|| format!("Gemma4Backend::from_dir({dir:?}): tokenizer load"))?;
+            let jinja_chat = if env_jinja_renderer_on() {
+                match JinjaChatTemplate::from_dir(dir) {
+                    Ok(j) => {
+                        eprintln!(
+                            "[gemma4] minijinja renderer ACTIVE (LUMEN_USE_JINJA_RENDERER=1)"
+                        );
+                        Some(j)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[gemma4] jinja renderer init failed ({e:?}); falling back to hand-port"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             Ok(Self {
                 model,
                 chat,
+                jinja_chat,
                 model_id: model_id.into(),
                 prefix_caches: HashMap::new(),
                 model_dir: dir.to_path_buf(),
@@ -747,14 +814,25 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            let ids = self.chat.render_chat_history(
-                turns,
-                &RenderOptions {
-                    enable_thinking: thinking,
-                    add_generation_prompt: true,
-                },
-                tools,
-            )?;
+            let ids = if let Some(j) = &self.jinja_chat {
+                j.render_to_ids(
+                    turns,
+                    &JinjaRenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                    },
+                    if tools.is_empty() { None } else { Some(tools) },
+                )?
+            } else {
+                self.chat.render_chat_history(
+                    turns,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                    },
+                    tools,
+                )?
+            };
             maybe_dump_prompt(&self.chat, &ids, "from_history");
             Ok(ids)
         }
@@ -765,14 +843,25 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            let ids = self.chat.render_chat_history(
-                turns,
-                &RenderOptions {
-                    enable_thinking: thinking,
-                    add_generation_prompt: false,
-                },
-                tools,
-            )?;
+            let ids = if let Some(j) = &self.jinja_chat {
+                j.render_to_ids(
+                    turns,
+                    &JinjaRenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: false,
+                    },
+                    if tools.is_empty() { None } else { Some(tools) },
+                )?
+            } else {
+                self.chat.render_chat_history(
+                    turns,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: false,
+                    },
+                    tools,
+                )?
+            };
             maybe_dump_prompt(&self.chat, &ids, "from_history_no_gen");
             Ok(ids)
         }
@@ -787,15 +876,27 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            let parsed = Self::parse_role_pairs(messages)?;
-            let ids = self.chat.render_to_ids_with_tools(
-                &parsed,
-                &RenderOptions {
-                    enable_thinking: thinking,
-                    add_generation_prompt: true,
-                },
-                tools,
-            )?;
+            let ids = if let Some(j) = &self.jinja_chat {
+                let turns = pairs_to_turns(messages)?;
+                j.render_to_ids(
+                    &turns,
+                    &JinjaRenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                    },
+                    if tools.is_empty() { None } else { Some(tools) },
+                )?
+            } else {
+                let parsed = Self::parse_role_pairs(messages)?;
+                self.chat.render_to_ids_with_tools(
+                    &parsed,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                    },
+                    tools,
+                )?
+            };
             maybe_dump_prompt(&self.chat, &ids, "with_tools");
             Ok(ids)
         }
@@ -814,15 +915,27 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
-            let parsed = Self::parse_role_pairs(messages)?;
-            self.chat.render_to_ids_with_tools(
-                &parsed,
-                &RenderOptions {
-                    enable_thinking: thinking,
-                    add_generation_prompt: false,
-                },
-                tools,
-            )
+            if let Some(j) = &self.jinja_chat {
+                let turns = pairs_to_turns(messages)?;
+                j.render_to_ids(
+                    &turns,
+                    &JinjaRenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: false,
+                    },
+                    if tools.is_empty() { None } else { Some(tools) },
+                )
+            } else {
+                let parsed = Self::parse_role_pairs(messages)?;
+                self.chat.render_to_ids_with_tools(
+                    &parsed,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: false,
+                    },
+                    tools,
+                )
+            }
         }
 
         fn parse_role_pairs(messages: &[(String, String)]) -> Result<Vec<ChatMessage<'_>>> {

@@ -38,6 +38,7 @@ pub mod chat_io;
 mod gemma4_backend;
 mod gemma4_chat;
 mod gemma4_critical_correction;
+mod jinja_chat;
 mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;

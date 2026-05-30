@@ -17,6 +17,25 @@ hf-hub = "0.5.0"
 # accept arbitrary tool argument schemas from OpenAI-spec clients.
 # Pure Rust, no native deps.
 llguidance = { version = "1.7", features = ["jsonschema_validation"] }
+# Jinja2-compatible template interpreter. Replaces the hand-ported Rust
+# render logic in `gemma4_chat.rs` with direct evaluation of the model's
+# upstream `chat_template.jinja`, guaranteeing byte-identical parity with
+# `transformers.AutoTokenizer.apply_chat_template` and removing the
+# maintenance burden of mirroring jinja semantics in Rust. Pure Rust,
+# ~250 KB, no native deps.
+minijinja = { version = "2.13", default-features = false, features = [
+    "builtins",
+    "macros",
+    "loop_controls",
+    "preserve_order",
+    "json",
+] }
+# Python-compat handler for `.get()`, `.split()`, `.startswith()`, etc.
+# The upstream chat_template.jinja files emit Python idioms that vanilla
+# Jinja2 supports because Python is the host language; minijinja, being
+# Rust-native, needs this companion crate to register a fallback method
+# resolver. Pure Rust, ~70 KB.
+minijinja-contrib = { version = "2.13", features = ["pycompat"] }
 # TurboQuant primitives — Haar rotation matrix generator for KV pre-quant
 # Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
 # sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).

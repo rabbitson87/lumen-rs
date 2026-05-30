@@ -304,6 +304,10 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
     "Lark 문법으로 툴콜 출력 제약. 구조적 출력 신뢰도 향상.",
 
+  "env.entry.LUMEN_USE_JINJA_RENDERER.label": "minijinja 렌더러 사용 (Gemma 4)",
+  "env.entry.LUMEN_USE_JINJA_RENDERER.help":
+    "모델의 chat_template.jinja 를 minijinja 로 직접 렌더링 (Rust hand-port 대신). 골든 벡터에서 byte-identical 검증 완료 — 원본 jinja 가 정답인 path 로 전환하려면 ON.",
+
   "env.entry.LUMEN_DUMP_PROMPT.label": "프롬프트 덤프",
   "env.entry.LUMEN_DUMP_PROMPT.help":
     "모델에 보내는 chat template 적용 프롬프트 출력. off / preview / full.",
