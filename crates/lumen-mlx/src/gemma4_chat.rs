@@ -40,6 +40,24 @@ pub(crate) mod imp {
     pub const TOK_TURN_OPEN: u32 = 105; // <|turn>
     pub const TOK_TURN_CLOSE: u32 = 106; // <turn|>
 
+    /// Whether to pre-fill the empty `<|channel>thought\n<channel|>` block on
+    /// the generation prompt when thinking is OFF.
+    ///
+    /// Ollama's standard `gemma4` renderer sets `emptyBlockOnNothink=false` and
+    /// does NOT inject this block — and that is what lets Gemma 4 answer fully
+    /// and call tools. The shipped `chat_template.jinja` DOES inject it (its
+    /// `add_generation_prompt` branch), which pushes the quantized model
+    /// off-distribution: mid-sentence `<turn|>` and no `task_complete`. Proven
+    /// by an A/B against `gemma4:26b-mlx` (identical nvfp4 weights) where Ollama
+    /// succeeded and Lumen failed solely on this block. Default OFF to match
+    /// Ollama; set `LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK=1` to restore the
+    /// jinja-faithful injection.
+    pub fn empty_thought_on_nothink() -> bool {
+        std::env::var("LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
     /// Chat role projected onto the wire-level Gemma 4 role string.
     ///
     /// `Assistant` maps to `"model"` (Google's terminology) when rendered,
@@ -311,9 +329,11 @@ pub(crate) mod imp {
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking {
+                if !opts.enable_thinking && empty_thought_on_nothink() {
                     // Pre-fill empty thought channel so the model jumps
-                    // straight to the visible answer.
+                    // straight to the visible answer. OFF by default to match
+                    // Ollama's native gemma4 renderer (emptyBlockOnNothink=false);
+                    // the block otherwise causes premature `<turn|>` + no tools.
                     out.push(TOK_CHANNEL_OPEN);
                     out.extend(
                         self.encode_plain("thought\n")
@@ -498,7 +518,9 @@ pub(crate) mod imp {
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking {
+                if !opts.enable_thinking && empty_thought_on_nothink() {
+                    // Match Ollama's native gemma4 renderer: no empty thought
+                    // block on nothink (see `empty_thought_on_nothink`).
                     out.push(TOK_CHANNEL_OPEN);
                     out.extend(
                         self.encode_plain("thought\n")
@@ -814,7 +836,10 @@ pub(crate) mod imp {
                 .expect("render");
             // Expected backbone (special-token only):
             //   BOS, <|turn>, "user\n", "Hello", <turn|>, "\n",
-            //   <|turn>, "model\n", <|channel>, "thought\n", <channel|>
+            //   <|turn>, "model\n"
+            // No empty thought channel by default — matches Ollama's native
+            // gemma4 renderer (emptyBlockOnNothink=false). See
+            // `empty_thought_on_nothink`.
             assert_eq!(ids[0], TOK_BOS, "starts with <bos>");
             assert!(
                 ids.contains(&TOK_TURN_OPEN),
@@ -824,10 +849,9 @@ pub(crate) mod imp {
                 ids.contains(&TOK_TURN_CLOSE),
                 "contains at least one <turn|> closer"
             );
-            assert_eq!(
-                *ids.last().unwrap(),
-                TOK_CHANNEL_CLOSE,
-                "non-thinking gen prompt ends with <channel|>"
+            assert!(
+                !ids.contains(&TOK_CHANNEL_OPEN),
+                "non-thinking gen prompt must NOT pre-fill <|channel> by default"
             );
             // No <|think|> when thinking disabled.
             assert!(

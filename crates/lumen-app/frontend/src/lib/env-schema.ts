@@ -30,7 +30,7 @@ export type EnvEntry = {
   /** stringified default — used as placeholder & "is set to default" check */
   defaultValue: string;
   /** UI section grouping */
-  section: "thinking" | "safety" | "debug" | "advanced";
+  section: "thinking" | "sampling" | "safety" | "debug" | "advanced";
 };
 
 /**
@@ -51,6 +51,63 @@ export const ENV_SCHEMA: EnvEntry[] = [
     options: ["off", "on"],
     defaultValue: "off",
     section: "thinking",
+  },
+
+  // ── Sampling (Gemma 4 ↔ Ollama parity rails) ───────────────────────
+  {
+    key: "LUMEN_TEMPERATURE",
+    labelKey: "env.entry.LUMEN_TEMPERATURE.label",
+    helpKey: "env.entry.LUMEN_TEMPERATURE.help",
+    kind: "number",
+    min: 0,
+    max: 2,
+    step: 0.05,
+    defaultValue: "1",
+    section: "sampling",
+  },
+  {
+    key: "LUMEN_TOP_P",
+    labelKey: "env.entry.LUMEN_TOP_P.label",
+    helpKey: "env.entry.LUMEN_TOP_P.help",
+    kind: "number",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    defaultValue: "0.95",
+    section: "sampling",
+  },
+  {
+    key: "LUMEN_TOP_K",
+    labelKey: "env.entry.LUMEN_TOP_K.label",
+    helpKey: "env.entry.LUMEN_TOP_K.help",
+    kind: "number",
+    min: 0,
+    max: 200,
+    step: 1,
+    defaultValue: "64",
+    section: "sampling",
+  },
+  {
+    key: "REPEAT_PENALTY",
+    labelKey: "env.entry.REPEAT_PENALTY.label",
+    helpKey: "env.entry.REPEAT_PENALTY.help",
+    kind: "number",
+    min: 1,
+    max: 2,
+    step: 0.05,
+    defaultValue: "1.1",
+    section: "sampling",
+  },
+  {
+    key: "LUMEN_DRY_MULTIPLIER",
+    labelKey: "env.entry.LUMEN_DRY_MULTIPLIER.label",
+    helpKey: "env.entry.LUMEN_DRY_MULTIPLIER.help",
+    kind: "number",
+    min: 0,
+    max: 4,
+    step: 0.1,
+    defaultValue: "0",
+    section: "sampling",
   },
 
   // ── Safety net (runaway / channel close) ───────────────────────────
@@ -89,7 +146,7 @@ export const ENV_SCHEMA: EnvEntry[] = [
     labelKey: "env.entry.LUMEN_RUNAWAY_NGRAM.label",
     helpKey: "env.entry.LUMEN_RUNAWAY_NGRAM.help",
     kind: "number",
-    min: 4,
+    min: 2,
     max: 12,
     step: 1,
     defaultValue: "4",
@@ -122,6 +179,22 @@ export const ENV_SCHEMA: EnvEntry[] = [
     helpKey: "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help",
     kind: "bool",
     defaultValue: "1",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED",
+    labelKey: "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.label",
+    helpKey: "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK",
+    labelKey: "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.label",
+    helpKey: "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.help",
+    kind: "bool",
+    defaultValue: "0",
     section: "advanced",
   },
   {
@@ -175,6 +248,7 @@ export type EnvSection = EnvEntry["section"];
 
 export const ENV_SECTIONS: { id: EnvSection; labelKey: string }[] = [
   { id: "thinking", labelKey: "env.section.thinking" },
+  { id: "sampling", labelKey: "env.section.sampling" },
   { id: "safety", labelKey: "env.section.safety" },
   { id: "advanced", labelKey: "env.section.advanced" },
   { id: "debug", labelKey: "env.section.debug" },

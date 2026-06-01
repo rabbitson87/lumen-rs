@@ -276,6 +276,7 @@ export const en: Record<string, string> = {
 
   // ── Section groupings ────────────────────────────────────────────
   "env.section.thinking": "Reasoning",
+  "env.section.sampling": "Sampling",
   "env.section.safety": "Safety net",
   "env.section.advanced": "Advanced",
   "env.section.debug": "Debug / triage",
@@ -284,6 +285,26 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.label": "Backend thinking default",
   "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.help":
     "When ON, OpenAI-compat clients with no per-request thinking signal get thinking enabled by default. Per-request signals still override.",
+
+  "env.entry.LUMEN_TEMPERATURE.label": "Temperature",
+  "env.entry.LUMEN_TEMPERATURE.help":
+    "Gemma 4 sampling temperature. Substituted when the client omits it (server default 0.7); an explicit request value is honored. Ollama gemma4 = 1.0. Gemma 4 only.",
+
+  "env.entry.LUMEN_TOP_P.label": "Top-p (nucleus)",
+  "env.entry.LUMEN_TOP_P.help":
+    "Cumulative-probability cutoff. Applied when the client omits top_p. Ollama gemma4 = 0.95.",
+
+  "env.entry.LUMEN_TOP_K.label": "Top-k",
+  "env.entry.LUMEN_TOP_K.help":
+    "Restrict candidates to the top k tokens. 0 disables. Ollama gemma4 = 64. Too low fails to escape repetition cycles.",
+
+  "env.entry.REPEAT_PENALTY.label": "Repeat penalty",
+  "env.entry.REPEAT_PENALTY.help":
+    "Penalize recently emitted tokens. 1.0 = off. Ollama = 1.1.",
+
+  "env.entry.LUMEN_DRY_MULTIPLIER.label": "DRY repetition suppression",
+  "env.entry.LUMEN_DRY_MULTIPLIER.help":
+    "DRY (Don't Repeat Yourself) strength. 0 = off. 0.8 recommended — directly suppresses mixed degenerate runaways like }}}}/~~~~ (multi-turn stability).",
 
   "env.entry.LUMEN_MAX_THINKING_TOKENS.label": "Max thinking tokens (hard cap)",
   "env.entry.LUMEN_MAX_THINKING_TOKENS.help":
@@ -312,6 +333,13 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark grammar (Gemma 4 tool calls)",
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
     "Constrain tool-call output with a Lark grammar -- guarantees structurally valid call:NAME{...} bodies. Default ON; disable only if you need free-form tool-call emission.",
+
+  "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.label": "Promote tool_choice auto -> required",
+  "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.help":
+    "When the client sends tool_choice=\"auto\", upgrade it to required so every turn forces a tool call. Turn ON for agentic loops (e.g. Ayla) where the model emits task_complete weakly and the loop repeats across multiple responses. The answer text rides in the tool's summary field. Default OFF.",
+  "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.label": "Inject empty thought channel on nothink",
+  "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.help":
+    "Whether to pre-fill an empty <|channel>thought<channel|> block on the generation prompt when thinking is OFF. The jinja template injects it, but Ollama's native gemma4 renderer does not (emptyBlockOnNothink=false). Injecting it makes the quantized model bail mid-sentence with <turn|> and never call task_complete. Default OFF (= Ollama behavior, recommended). Turn ON to restore the old jinja-faithful behavior.",
 
   "env.entry.LUMEN_USE_JINJA_RENDERER.label": "Use minijinja renderer (Gemma 4)",
   "env.entry.LUMEN_USE_JINJA_RENDERER.help":

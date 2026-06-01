@@ -267,6 +267,7 @@ export const ko: Record<string, string> = {
 
   // ── 섹션 그루핑 ────────────────────────────────────────────
   "env.section.thinking": "추론",
+  "env.section.sampling": "샘플링",
   "env.section.safety": "안전망",
   "env.section.advanced": "고급",
   "env.section.debug": "디버그 / 진단",
@@ -275,6 +276,26 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.label": "백엔드 씽킹 기본값",
   "env.entry.LUMEN_BACKEND_THINKING_DEFAULT.help":
     "ON 일 때 OpenAI 호환 클라이언트가 per-request 씽킹 신호 안 보내면 기본으로 씽킹 활성화. per-request 신호가 우선합니다.",
+
+  "env.entry.LUMEN_TEMPERATURE.label": "온도 (Temperature)",
+  "env.entry.LUMEN_TEMPERATURE.help":
+    "Gemma 4 샘플링 온도. 클라이언트가 미지정(서버 기본 0.7)이면 이 값으로 치환, 명시하면 그 값 존중. Ollama gemma4 = 1.0. gemma4 한정.",
+
+  "env.entry.LUMEN_TOP_P.label": "Top-p (nucleus)",
+  "env.entry.LUMEN_TOP_P.help":
+    "누적 확률 컷오프. 클라이언트 미지정 시 적용되는 기본값. Ollama gemma4 = 0.95.",
+
+  "env.entry.LUMEN_TOP_K.label": "Top-k",
+  "env.entry.LUMEN_TOP_K.help":
+    "상위 k 개 토큰만 후보로 제한. 0 = 비활성화. Ollama gemma4 = 64. 너무 낮으면 반복 사이클 탈출 실패.",
+
+  "env.entry.REPEAT_PENALTY.label": "반복 페널티",
+  "env.entry.REPEAT_PENALTY.help":
+    "최근 토큰 재등장에 페널티. 1.0 = off. Ollama = 1.1.",
+
+  "env.entry.LUMEN_DRY_MULTIPLIER.label": "DRY 반복 억제",
+  "env.entry.LUMEN_DRY_MULTIPLIER.help":
+    "DRY(Don't Repeat Yourself) 강도. 0 = off. 0.8 권장 — }}}}/~~~~ 같은 섞인 degenerate 폭주를 직접 억제 (멀티턴 안정성).",
 
   "env.entry.LUMEN_MAX_THINKING_TOKENS.label": "최대 씽킹 토큰 (하드캡)",
   "env.entry.LUMEN_MAX_THINKING_TOKENS.help":
@@ -303,6 +324,13 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.label": "Lark 문법 (Gemma 4 툴콜)",
   "env.entry.LUMEN_GEMMA4_GRAMMAR_LARK.help":
     "Lark 문법으로 툴콜 출력 강제 — call:NAME{...} 구조 무조건 보장. 기본 ON; free-form 툴콜 emission 필요 시에만 OFF.",
+
+  "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.label": "tool_choice auto → required 승격",
+  "env.entry.LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED.help":
+    "클라이언트가 tool_choice=\"auto\" 를 보낼 때 required 로 승격 → 매 턴 tool call 강제. Ayla 등 agentic 루프에서 모델이 task_complete 를 약하게 emit 해 응답이 여러 번 반복될 때 ON. 답변 텍스트는 tool 의 summary 필드에 담김. 기본 OFF.",
+  "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.label": "thinking OFF 시 빈 thought 채널 주입",
+  "env.entry.LUMEN_GEMMA4_EMPTY_THOUGHT_ON_NOTHINK.help":
+    "thinking OFF 일 때 생성 프롬프트에 빈 <|channel>thought<channel|> 블록을 주입할지. jinja 템플릿은 주입하지만 Ollama 의 native gemma4 렌더러는 주입 안 함(emptyBlockOnNothink=false). 주입하면 양자화 모델이 문장 도중 <turn|> 로 조기 종료하고 task_complete 를 안 부름. 기본 OFF(=Ollama 동작, 권장). 옛 jinja 동작 복원하려면 ON.",
 
   "env.entry.LUMEN_USE_JINJA_RENDERER.label": "minijinja 렌더러 사용 (Gemma 4)",
   "env.entry.LUMEN_USE_JINJA_RENDERER.help":

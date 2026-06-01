@@ -570,6 +570,11 @@
   async function saveEnvOverrides(next: Record<string, string>) {
     if (!config) return;
     config = await api.updateEnvOverrides(next);
+    // Same restart semantics as the QUANT / CONTEXT / SERVER cards: env
+    // overrides are read once at server spawn, so a running process keeps the
+    // OLD values until Stop → Start. Surface the actionable "Restart now"
+    // toast instead of saving silently (which reads as "nothing happened").
+    savedToast();
   }
 
   async function startDownload() {
