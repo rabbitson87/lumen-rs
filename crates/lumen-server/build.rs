@@ -110,6 +110,19 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
         if path.is_dir() {
             walk(&path, best, depth_budget - 1);
         } else if path.file_name().and_then(|s| s.to_str()) == Some("mlx.metallib") {
+            // GUARD: only ever embed mlx-sys's *own* build output. Never a
+            // colocated copy such as `target/<profile>/mlx.metallib`, which
+            // `ensure_metallib_colocated` writes next to the binary at runtime.
+            // That copy is always the newest file after any run, so without
+            // this filter `find_metallib` (newest-mtime wins) would re-embed
+            // it on the next build — a feedback loop that perpetuates any
+            // stale or incomplete metallib (e.g. one assembled during nvfp4
+            // GPU-kernel dev that dropped mlx's full steel_attention set,
+            // breaking Gemma 4 prefill with "function … not found in library").
+            // mlx-sys's real artifacts always live under `…/mlx-sys-<hash>/out/…`.
+            if !path.to_string_lossy().contains("mlx-sys-") {
+                continue;
+            }
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
                     let candidate = (mtime, path.clone());
