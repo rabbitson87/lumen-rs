@@ -49,3 +49,10 @@ worker-hang-investigation.html
 # ── Personal benchmarking + dev scripts (kept local; not part of the
 #    public project). ──
 scripts/
+
+# ── Moltis 협조 데이터 (외부 프로젝트 reference data + raw 입력 로그).
+#    Personal eval / pruning ground truth 용도. Public repo 업로드 금지. ──
+raw_inputs_domestic/
+raw_inputs_foreign/
+standard_names/
+moltis_data/
