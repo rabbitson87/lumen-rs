@@ -30,6 +30,8 @@ pub mod mxfp4_linear;
 pub mod mxfp8_gpu;
 #[cfg(feature = "model-integration")]
 pub mod mxfp8_linear;
+pub mod nvfp4;
+pub mod nvfp4_gpu;
 pub mod pipeline;
 #[cfg(feature = "model-integration")]
 pub mod rms_norm;

@@ -25,8 +25,8 @@ pub(crate) mod imp {
     };
     use crate::native_norm::rms_norm;
     use crate::native_quant::{
-        MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, dequantize_with_mode, gather_qmm_with_mode,
-        quantize_with_mode, quantized_matmul_with_mode,
+        MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, MODE_NVFP4, dequantize_with_mode,
+        gather_qmm_with_mode, quantize_with_mode, quantized_matmul_with_mode,
     };
     use crate::native_rope::{rope, rope_with_freqs};
     use mlx_rs::error::Exception;
@@ -1504,11 +1504,11 @@ pub(crate) mod imp {
             }
             self.text_config.validate()?;
             if let Some(quant) = self.effective_quantization() {
-                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8")
+                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8" | "nvfp4")
                     || quant.group_size == 0
                 {
                     return Err(anyhow!(
-                        "quantization default must be mode∈{{affine, mxfp4, mxfp8}} with non-zero group, got mode='{}' bits={} group={}",
+                        "quantization default must be mode∈{{affine, mxfp4, mxfp8, nvfp4}} with non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
                         quant.bits,
                         quant.group_size
@@ -2766,9 +2766,19 @@ pub(crate) mod imp {
                     }
                     return Ok((ov.group_size as i32, ov.bits as i32, MODE_MXFP8));
                 }
+                "nvfp4" => {
+                    if ov.bits != 4 || ov.group_size != 16 {
+                        return Err(anyhow!(
+                            "quant_params_for({base_key}): nvfp4 override requires bits=4 group_size=16, got bits={} group={}",
+                            ov.bits,
+                            ov.group_size
+                        ));
+                    }
+                    return Ok((ov.group_size as i32, ov.bits as i32, MODE_NVFP4));
+                }
                 other => {
                     return Err(anyhow!(
-                        "quant_params_for({base_key}): override has unsupported mode {other:?} (supported: affine, mxfp4, mxfp8)"
+                        "quant_params_for({base_key}): override has unsupported mode {other:?} (supported: affine, mxfp4, mxfp8, nvfp4)"
                     ));
                 }
             }
@@ -2803,9 +2813,19 @@ pub(crate) mod imp {
                 }
                 MODE_MXFP8
             }
+            "nvfp4" => {
+                if quant.bits != 4 || quant.group_size != 16 {
+                    return Err(anyhow!(
+                        "quant_params_for({base_key}): nvfp4 requires bits=4 group_size=16, got bits={} group={}",
+                        quant.bits,
+                        quant.group_size
+                    ));
+                }
+                MODE_NVFP4
+            }
             other => {
                 return Err(anyhow!(
-                    "quant_params_for({base_key}): unsupported quantization mode {other:?} (supported: affine, mxfp4, mxfp8)"
+                    "quant_params_for({base_key}): unsupported quantization mode {other:?} (supported: affine, mxfp4, mxfp8, nvfp4)"
                 ));
             }
         };

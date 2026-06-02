@@ -85,3 +85,6 @@ mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
+# A/B benchmark only: compares the custom Nvfp4 Metal kernel against the mlx FFI
+# quantized_matmul(NVFP4) path. Not a production dependency of lumen-mlx.
+lumen-metal = { path = "../lumen-metal" }
