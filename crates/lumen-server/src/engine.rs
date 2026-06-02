@@ -956,13 +956,15 @@ impl InferenceEngine {
         } else {
             (Some(parsed.visible.clone()), None)
         };
-        // Dual emission: populate the OpenAI-spec `reasoning` field AND
-        // prepend a `<think>…</think>` envelope to `content` for clients
-        // that parse text-tag thinking (Ayla UI ChatWindow.tsx). The two
-        // representations carry the same bytes so a client only ever
-        // displays one (whichever it recognizes first; OpenAI-spec
-        // clients should prefer the `reasoning` field).
-        let content = if has_reasoning {
+        // Reasoning placement. Default mirrors Ollama's OpenAI-compat layer
+        // (`ollama/openai/openai.go`): thinking goes ONLY into the `reasoning`
+        // field and `content` carries the visible answer alone — no
+        // `<think>…</think>` envelope. This keeps Lumen byte-compatible with
+        // Ollama so clients (Ayla) render identically against either backend.
+        // Set `LUMEN_REASONING_IN_CONTENT=1` to restore the legacy dual
+        // emission (also prepend a `<think>…</think>` envelope to content for
+        // text-tag-only clients).
+        let content = if has_reasoning && reasoning_in_content() {
             let envelope = format!("<think>\n{reasoning_trimmed}\n</think>\n\n");
             Some(match content {
                 Some(c) if !c.is_empty() => format!("{envelope}{c}"),
@@ -1922,6 +1924,20 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Whether reasoning/thinking should also be mirrored into `content` wrapped
+/// in a `<think>…</think>` envelope (legacy dual emission). Default `false`,
+/// matching Ollama's OpenAI-compat layer (thinking lives only in the
+/// `reasoning` field; `content` is the visible answer alone). Opt back in with
+/// `LUMEN_REASONING_IN_CONTENT=1` for text-tag-only clients.
+pub(crate) fn reasoning_in_content() -> bool {
+    std::env::var("LUMEN_REASONING_IN_CONTENT")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
 /// Exact token count via the backend tokenizer. Falls back to a char/4
 /// heuristic if encoding fails (and bottoms at 1 for any non-empty text so
 /// `usage.completion_tokens` is never silently zero on short responses).
@@ -2507,7 +2523,7 @@ impl InferenceEngine {
                             &messages,
                             req.max_tokens,
                             req.temperature,
-                            0.9, // AnthropicRequest has no top_p; use default
+                            0.95, // AnthropicRequest has no top_p; use Gemma 4 default (matches default_top_p)
                             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
@@ -2587,7 +2603,7 @@ impl InferenceEngine {
                                         &messages,
                                         req.max_tokens,
                                         req.temperature,
-                                        0.9,
+                                        0.95, // Gemma 4 default top_p (matches default_top_p)
                                         req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
@@ -2942,7 +2958,7 @@ impl InferenceEngine {
                             &messages,
                             req.max_tokens,
                             req.temperature,
-                            0.9,
+                            0.95, // Gemma 4 default top_p (matches default_top_p)
                             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                             token_tx.clone(),
                         ) {
@@ -3019,7 +3035,7 @@ impl InferenceEngine {
                                         &messages,
                                         req.max_tokens,
                                         req.temperature,
-                                        0.9,
+                                        0.95, // Gemma 4 default top_p (matches default_top_p)
                                         req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                                         token_tx.clone(),
                                     ) {
@@ -3325,7 +3341,7 @@ impl InferenceEngine {
             prompt_tokens,
             decode_start: std::time::Instant::now(),
             temperature,
-            top_p: if top_p <= 0.0 { 0.9 } else { top_p },
+            top_p: if top_p <= 0.0 { 0.95 } else { top_p },
             repeat_penalty,
             eos_tokens,
         })
@@ -3402,7 +3418,7 @@ impl InferenceEngine {
             prompt_tokens,
             decode_start: std::time::Instant::now(),
             temperature,
-            top_p: if top_p <= 0.0 { 0.9 } else { top_p },
+            top_p: if top_p <= 0.0 { 0.95 } else { top_p },
             repeat_penalty,
             eos_tokens: vec![1, 106], // Gemma: <eos>=1, <end_of_turn>=106
         })

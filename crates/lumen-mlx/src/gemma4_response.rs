@@ -35,6 +35,25 @@ pub(crate) mod imp {
     pub const TOK_TOOL_CALL_OPEN: u32 = 48;
     pub const TOK_TOOL_CALL_CLOSE: u32 = 49;
 
+    // NOTE — plain-text `<think>…</think>` is deliberately NOT demuxed.
+    //
+    // Some Gemma 4 `it` builds (e.g. `mlx-community/gemma-4-26b-a4b-it-nvfp4`,
+    // the weights Ollama serves) wrap chain-of-thought in the literal text
+    // markers `<think>…</think>` rather than the `<|channel>`(100)/`<channel|>`(101)
+    // special tokens. We intentionally let those flow through as **visible
+    // content**, byte-for-byte matching Ollama's gemma4 parser (which only
+    // recognizes the `<|channel>` special tokens — see
+    // `ollama/model/parsers/gemma4.go`). Reasons:
+    //   1. Streaming parity — Ollama streams `<think>…` as content deltas;
+    //      demuxing it into a separate `reasoning` field diverges from what
+    //      text-tag clients (Ayla `ChatWindow.tsx`) parse out of content.
+    //   2. Robustness — when the model rambles and hits EOS *before* emitting
+    //      a closing `</think>`, demuxing strands the whole reply in
+    //      `reasoning` (empty visible → blank bubble). Leaving it in content
+    //      means the user always sees the model's output, exactly like Ollama.
+    // The `<|channel>`/`<channel|>` special-token convention IS still demuxed
+    // below (Ollama demuxes that too).
+
     /// Parser state — exposed for diagnostics / tests.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ParseState {
@@ -123,6 +142,9 @@ pub(crate) mod imp {
                 }
 
                 // ── Accumulate content tokens ─────────────────────────
+                // Plain-text `<think>` is left in content (Ollama parity — see
+                // the note near TOK_TOOL_CALL_*). Only `<|channel>` special
+                // tokens (handled above) switch to Reasoning.
                 (ParseState::Visible, _) => self.visible_tokens.push(token),
                 (ParseState::Reasoning, _) => self.reasoning_tokens.push(token),
                 (ParseState::ToolCall, _) => self.tool_tokens.push(token),
@@ -534,15 +556,26 @@ pub(crate) mod imp {
         use crate::gemma4_chat::imp::Gemma4ChatTemplate;
         use std::path::Path;
 
-        const LMSTUDIO_TOKENIZER_PATH: &str =
-            "/path/to/models/gemma-4-26b-a4b-mlx-4bit/tokenizer.json";
+        // Generic fallback locations. For local dev, point at any Gemma 4
+        // `tokenizer.json` via the `LUMEN_TEST_GEMMA4_TOKENIZER` env var —
+        // these `#[ignore]`d tests then run against it.
+        const CANDIDATE_TOKENIZER_PATHS: &[&str] = &[
+            "models/gemma-4-26b-a4b/tokenizer.json",
+            "models/gemma-4-26b-a4b-mlx-4bit/tokenizer.json",
+        ];
 
         fn load_or_skip() -> Option<Gemma4ChatTemplate> {
-            let p = Path::new(LMSTUDIO_TOKENIZER_PATH);
-            if !p.exists() {
-                eprintln!("skip: tokenizer not present");
-                return None;
-            }
+            let env_path = std::env::var("LUMEN_TEST_GEMMA4_TOKENIZER").ok();
+            let p = env_path
+                .as_deref()
+                .map(Path::new)
+                .filter(|p| p.exists())
+                .or_else(|| {
+                    CANDIDATE_TOKENIZER_PATHS
+                        .iter()
+                        .map(Path::new)
+                        .find(|p| p.exists())
+                })?;
             Some(Gemma4ChatTemplate::from_file(p).expect("load tokenizer"))
         }
 
@@ -593,6 +626,34 @@ pub(crate) mod imp {
             );
             assert!(resp.visible.contains("Blue"), "visible={:?}", resp.visible);
             assert!(resp.tool_calls.is_empty());
+        }
+
+        /// Ollama parity: plain-text `<think>…</think>` is NOT demuxed — it
+        /// flows through verbatim as visible content (Ollama's gemma4 parser
+        /// only recognizes the `<|channel>` special tokens). The `reasoning`
+        /// field stays empty for this convention. This guards against
+        /// re-introducing the text-tag demux that strands the reply in
+        /// `reasoning` (blank bubble) when the model never closes `</think>`.
+        #[test]
+        #[ignore = "requires a Gemma 4 tokenizer.json (~5 MB)"]
+        fn parser_keeps_text_think_in_content() {
+            let Some(tpl) = load_or_skip() else { return };
+            let stream = tpl
+                .encode_plain("<think>\nbecause the sky scatters blue light\n</think>\nBlue.")
+                .expect("encode");
+            let mut p = ResponseParser::new(&tpl);
+            for id in &stream {
+                p.push(*id).expect("push");
+            }
+            let resp = p.finalize().expect("finalize");
+            // Everything stays in visible content — markers included.
+            assert!(resp.visible.contains("<think"), "visible={:?}", resp.visible);
+            assert!(
+                resp.visible.contains("scatters") && resp.visible.contains("Blue"),
+                "visible={:?}",
+                resp.visible
+            );
+            assert!(resp.reasoning.is_empty(), "reasoning={:?}", resp.reasoning);
         }
 
         #[test]

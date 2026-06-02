@@ -70,7 +70,7 @@ mod imp {
         SwitchGluWeights, moe_block_forward,
     };
     use crate::native_norm::rms_norm;
-    use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, quantized_matmul_with_mode};
+    use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, quantized_matmul_with_mode};
     use crate::native_rope::{precompute_rope_freqs, rope, rope_with_freqs};
     use crate::native_snapshot::PromptCacheSnapshot;
     use crate::native_ssm::{compute_g, gated_delta_step_kernel, rms_norm_gated};
@@ -254,10 +254,11 @@ mod imp {
                 // 35B-A3B-mxfp4 ships `mxfp4`; 27B Dense MLX-4bit ships `affine`.
                 // Both at 4-bit, both with non-zero group_size — the per-tensor dispatch
                 // (mxfp4 kernel vs affine kernel) is selected later from `mode`.
-                let mode_ok = quant.mode == "mxfp4" || quant.mode == "affine";
+                let mode_ok =
+                    quant.mode == "mxfp4" || quant.mode == "affine" || quant.mode == "nvfp4";
                 if !mode_ok || quant.bits != 4 || quant.group_size == 0 {
                     return Err(anyhow!(
-                        "quantization_config must default to (mxfp4|affine)/4-bit/non-zero group, got mode='{}' bits={} group={}",
+                        "quantization_config must default to (mxfp4|affine|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
                         quant.bits,
                         quant.group_size
@@ -279,9 +280,12 @@ mod imp {
             }
             self.text_config.validate()?;
             if let Some(quant) = &self.quantization_config {
-                if quant.mode != "mxfp4" || quant.bits != 4 || quant.group_size == 0 {
+                if (quant.mode != "mxfp4" && quant.mode != "nvfp4")
+                    || quant.bits != 4
+                    || quant.group_size == 0
+                {
                     return Err(anyhow!(
-                        "quantization_config must default to mxfp4/4-bit/non-zero group, got mode='{}' bits={} group={}",
+                        "quantization_config must default to (mxfp4|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
                         quant.bits,
                         quant.group_size
@@ -682,8 +686,20 @@ mod imp {
         {
             return (o.group_size as i32, o.bits as i32, MODE_AFFINE);
         }
-        cfg.map(|q| (q.group_size as i32, q.bits as i32, MODE_MXFP4))
-            .unwrap_or((32, 4, MODE_MXFP4))
+        cfg.map(|q| {
+            // Default (non-override) tensors follow the global mode. mxfp4 and
+            // nvfp4 are both E2M1 4-bit formats differing only in block-scale
+            // precision (E8M0 pow2 group-32 vs E4M3 group-16); the FFI selects
+            // the matching Metal kernel from this CStr. affine handled for the
+            // 27B-dense MLX-4bit checkpoint that ships a global affine mode.
+            let mode = match q.mode.as_str() {
+                "nvfp4" => MODE_NVFP4,
+                "affine" => MODE_AFFINE,
+                _ => MODE_MXFP4,
+            };
+            (q.group_size as i32, q.bits as i32, mode)
+        })
+        .unwrap_or((32, 4, MODE_MXFP4))
     }
 
     /// Build a `ResolvedLinear` by cloning (refcount-bump) the underlying

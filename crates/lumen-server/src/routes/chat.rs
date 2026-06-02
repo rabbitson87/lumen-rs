@@ -267,11 +267,14 @@ async fn handle_streaming(
         s.into_bytes()
     };
     let mut carry: Option<StreamEvent> = None;
+    // Reasoning placement (see `engine::reasoning_in_content`). Default false
+    // → match Ollama: stream thinking ONLY in `delta.reasoning`, never mirror
+    // it into `delta.content` as `<think>…</think>`. Legacy dual emission is
+    // restored with `LUMEN_REASONING_IN_CONTENT=1`.
+    let reasoning_in_content = crate::engine::reasoning_in_content();
     // Tracks whether we've sent an open `<think>` tag in the content
-    // stream that hasn't been closed yet. Set when the first
-    // `ReasoningDelta` is forwarded, cleared (with a `</think>` emit)
-    // when the first non-reasoning event arrives — see the visible
-    // `Delta`, `ToolCallStart`, and `Done` arms below.
+    // stream that hasn't been closed yet. Only ever set in the legacy
+    // dual-emission path; stays false (close is a no-op) by default.
     let mut reasoning_open = false;
 
     // Diagnostic counters — always on so we can see where the model
@@ -384,12 +387,16 @@ async fn handle_streaming(
                         index: 0,
                         delta: ChatStreamDelta {
                             role: None,
-                            content: Some(if !reasoning_open {
-                                reasoning_open = true;
-                                format!("<think>\n{text}")
+                            content: if reasoning_in_content {
+                                Some(if !reasoning_open {
+                                    reasoning_open = true;
+                                    format!("<think>\n{text}")
+                                } else {
+                                    text.clone()
+                                })
                             } else {
-                                text.clone()
-                            }),
+                                None
+                            },
                             tool_calls: None,
                             reasoning: Some(text.clone()),
                         },

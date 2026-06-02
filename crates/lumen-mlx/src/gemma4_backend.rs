@@ -114,15 +114,19 @@ pub(crate) mod imp {
 
     /// Builds a `SamplingConfig` from request-supplied `temperature`/`top_p`
     /// plus operator-supplied env (`REPEAT_PENALTY`, `LUMEN_REPEAT_LAST_N`,
-    /// `LUMEN_SAMPLE_SEED`). Returns `None` when the result is greedy
+    /// `LUMEN_TOP_K`, `LUMEN_SAMPLE_SEED`). Returns `None` when the result
+    /// is greedy
     /// (temperature ≤ 0 AND repeat_penalty == 1) so the decode loop can
     /// take the existing fast path.
     ///
     /// Defaults reflect the OpenAI request defaults (`0.7` / `0.9`) when
-    /// the request didn't set them; `REPEAT_PENALTY=1.0` (no penalty)
-    /// preserves existing behavior. Operators flip `REPEAT_PENALTY` to
-    /// ~1.1 in the app's SERVER card to suppress degenerate loops on
-    /// aggressively quantized models (3-bit MXFP4 etc.).
+    /// the request didn't set them; `REPEAT_PENALTY` defaults to `1.1`
+    /// (matching Ollama's gemma4 default) to suppress degenerate
+    /// repetition loops on 4-bit quantized weights. Operators can set
+    /// `REPEAT_PENALTY=1.0` in the app's SERVER card to restore the
+    /// no-penalty behavior. NOTE: a non-1.0 penalty makes `is_greedy()`
+    /// false, so even `temperature=0` requests route through the CPU
+    /// sampling pipeline (near-greedy, but with the penalty applied).
     /// Emit the canonical `[gemma4] chat done:` log split into prefill
     /// (prompt-processing), decode (per-step generation), and the
     /// composite end-to-end rate.
@@ -168,14 +172,47 @@ pub(crate) mod imp {
     }
 
     fn build_sampling_config(temperature: f32, top_p: f32) -> Option<SamplingConfig> {
+        // Temperature parity with Ollama `gemma4:26b-mlx` (Modelfile sets
+        // `temperature 1`). The server's serde default is 0.7 (see
+        // `default_temperature()` in lumen-server). When a request arrives with
+        // *exactly* that value the client almost certainly omitted the field,
+        // so we substitute the Gemma 4 default (1.0). An explicit non-default
+        // temperature — including `0.0` for greedy/grammar/structured paths — is
+        // always honored. temp=0.7 was too peaky: on hard reasoning prompts the
+        // model failed to escape an n-gram cycle / never sampled `<channel|>`
+        // (101) to close thinking, where Ollama (temp=1.0) converged. Override
+        // the Gemma 4 default via `LUMEN_TEMPERATURE`. Gemma 4-scoped only —
+        // 1.0 is too hot for Qwen, so the global serde default stays 0.7.
+        let gemma4_default_temp: f32 = std::env::var("LUMEN_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f32| *v >= 0.0)
+            .unwrap_or(1.0);
+        let temperature = if (temperature - 0.7).abs() < 1e-6 {
+            gemma4_default_temp
+        } else {
+            temperature
+        };
         let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|v: &f32| *v > 0.0)
-            .unwrap_or(1.0);
+            .unwrap_or(1.1);
         let repeat_penalty_last_n: usize = std::env::var("LUMEN_REPEAT_LAST_N")
             .ok()
             .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        // Top-k sampling clamp — default 64 to match the published Gemma 4
+        // model params (Ollama `gemma4:26b-mlx` Modelfile sets `top_k 64`;
+        // 40 is only Ollama's *global* default, which that Modelfile
+        // overrides). top_k=40 was too tight: on hard prompts it left too few
+        // candidates to escape an n-gram repetition cycle, so agentic+thinking
+        // generations degenerated where Ollama (top_k=64) converged. Verified
+        // by reading Ollama's renderer (identical prompt) + `ollama show
+        // gemma4:26b-mlx`. Set `LUMEN_TOP_K=0` to disable, or override freely.
+        let top_k: usize = std::env::var("LUMEN_TOP_K")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
             .unwrap_or(64);
         let seed: u64 = std::env::var("LUMEN_SAMPLE_SEED")
             .ok()
@@ -189,6 +226,7 @@ pub(crate) mod imp {
         let cfg = SamplingConfig {
             temperature,
             top_p,
+            top_k,
             repeat_penalty,
             repeat_penalty_last_n,
             seed,
@@ -2102,8 +2140,13 @@ pub(crate) mod imp {
                     //     mask `<turn|>` when its rank in raw logits is
                     //     below top-K (outlier rejection). Active also
                     //     after the min_tokens window has elapsed.
-                    // Both default 0 (off) — bit-identical to no-guard
-                    // sampling when unset.
+                    // Both default 0 (off). Ollama has NO separate EOS
+                    // guard — its implicit EOS clamp IS top_k (64 for this
+                    // model), which we now apply globally in
+                    // `sample_from_logits` (see LUMEN_TOP_K). Keeping these off avoids double-
+                    // suppressing `<turn|>` and the non-termination runaway
+                    // that causes (model can't end its turn). Set either
+                    // env >0 to re-enable as a targeted guard.
                     let min_tokens_before_eos: usize =
                         std::env::var("LUMEN_MIN_TOKENS_BEFORE_EOS")
                             .ok()

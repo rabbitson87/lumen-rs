@@ -298,7 +298,15 @@ fn default_temperature() -> f32 {
     0.7
 }
 fn default_top_p() -> f32 {
-    0.9
+    // 0.95 matches the published Gemma 4 model params (Ollama
+    // `gemma4:26b-mlx` Modelfile sets `top_p 0.95`). Applied only when the
+    // client omits `top_p`; an explicit request value is always honored.
+    // Override via `LUMEN_TOP_P`.
+    std::env::var("LUMEN_TOP_P")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.95)
 }
 
 // === Streaming SSE types ===

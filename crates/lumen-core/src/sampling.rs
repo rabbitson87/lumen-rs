@@ -27,6 +27,11 @@ pub struct SamplingConfig {
     /// Nucleus sampling cutoff in `(0, 1]`. `>= 1.0` disables top-p
     /// (full distribution).
     pub top_p: f32,
+    /// Top-k cutoff: keep only the `k` highest-logit tokens before
+    /// top-p / sampling. `0` (or `>= vocab`) disables. Mirrors Ollama's
+    /// always-on `top_k=40` — bounds the candidate set so low-rank tail
+    /// tokens can't be drawn on quantized weights.
+    pub top_k: usize,
     /// HF / llama.cpp-style repeat penalty applied to the last
     /// `repeat_penalty_last_n` tokens. `1.0` = no penalty.
     pub repeat_penalty: f32,
@@ -45,6 +50,7 @@ impl Default for SamplingConfig {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 64,
             seed: 0,
@@ -106,6 +112,33 @@ pub fn apply_repeat_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
         }
         let v = logits[i];
         logits[i] = if v >= 0.0 { v / penalty } else { v * penalty };
+    }
+}
+
+/// Top-k logit clamp: keep the `k` highest logits, set the rest to
+/// `f32::NEG_INFINITY` (softmax later zeroes them). `k == 0` or
+/// `k >= len` is a no-op. Uses an O(n) quickselect to find the keep
+/// threshold rather than a full sort. Ties at the threshold are all
+/// kept, so the surviving set may slightly exceed `k` — the same
+/// lenient behavior as llama.cpp / Ollama.
+pub fn apply_top_k(logits: &mut [f32], k: usize) {
+    let n = logits.len();
+    if k == 0 || k >= n {
+        return;
+    }
+    // Copy values for partial selection — we must not reorder `logits`
+    // itself, since positions ARE token ids. Ascending select: the
+    // element at index `n - k` is the k-th largest = keep threshold.
+    let mut vals: Vec<f32> = logits.to_vec();
+    let idx = n - k;
+    vals.select_nth_unstable_by(idx, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = vals[idx];
+    for v in logits.iter_mut() {
+        if *v < threshold {
+            *v = f32::NEG_INFINITY;
+        }
     }
 }
 
@@ -220,6 +253,11 @@ pub fn sample_from_logits(
     // repeat penalty's single-token view misses. No-op when disabled.
     crate::dry::apply_dry_penalty(logits, recent_tokens, &cfg.dry);
 
+    // Top-k clamp BEFORE temperature/top-p so the nucleus is drawn from
+    // a bounded candidate set (matches Ollama's always-on top_k=40 and
+    // stops low-rank tail-token drift on quantized weights). No-op at 0.
+    apply_top_k(logits, cfg.top_k);
+
     // Temperature scaling before softmax. `<=0` would mean greedy but
     // the caller is responsible for routing greedy elsewhere; clamp to
     // a tiny epsilon as a safety net.
@@ -282,6 +320,29 @@ mod tests {
     }
 
     #[test]
+    fn top_k_keeps_only_k_highest() {
+        let mut logits = vec![1.0_f32, 5.0, 3.0, 2.0, 4.0];
+        apply_top_k(&mut logits, 2);
+        // Top-2 are 5.0 (idx 1) and 4.0 (idx 4); the rest become -inf.
+        assert_eq!(logits[1], 5.0);
+        assert_eq!(logits[4], 4.0);
+        assert!(logits[0] == f32::NEG_INFINITY);
+        assert!(logits[2] == f32::NEG_INFINITY);
+        assert!(logits[3] == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn top_k_disabled_is_noop() {
+        let orig = vec![1.0_f32, 2.0, 3.0];
+        let mut a = orig.clone();
+        apply_top_k(&mut a, 0); // 0 = disabled
+        assert_eq!(a, orig);
+        let mut b = orig.clone();
+        apply_top_k(&mut b, 99); // k >= len = disabled
+        assert_eq!(b, orig);
+    }
+
+    #[test]
     fn greedy_flag() {
         let g = SamplingConfig::default();
         assert!(g.is_greedy());
@@ -298,6 +359,7 @@ mod tests {
         let cfg = SamplingConfig {
             temperature: 0.7,
             top_p: 0.9,
+            top_k: 0,
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 0,
             seed: 12345,

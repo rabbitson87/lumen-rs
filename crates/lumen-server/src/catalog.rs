@@ -102,80 +102,51 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 24,
         notes: "MoE flagship. 35B params, ~3B active per token. Best speed/quality on M3 Max.",
     },
-    // Gemma 4 lineup — two-tier, workload-anchored:
-    //   • Chat (mlx-community 4-bit) — general-purpose Korean chat / direct Q&A;
-    //     weak channel-token weights, can't reliably enter thinking mode.
-    //   • Agent Lite (hsng95 imatrix3plus-awq HIGH=4) — Korean agentic loops
-    //     (tool calls, multi-step reasoning); imatrix-AWQ amplifies channel
-    //     tokens so client must opt into thinking explicitly.
-    // Both ship are Korean-first specialty — English fact / math / code are
-    // weak across the family; recommend Qwen 3 family for those workloads.
+    // Gemma 4 lineup — the NVFP4 base + two derived hybrids that share its fast
+    // NVFP4 expert core. Built + measured 2026-06-02 (see the hsng95
+    // `…-nvfp4-{smin,qmax}-mlx` model cards). NVFP4's finer per-group scales
+    // preserve the channel-close token (id 101) so the whole trio reliably
+    // enters AND exits thinking mode — unlike uniform affine 4-bit. Korean-first
+    // specialty; for English fact / math / heavy code prefer the Qwen 3.6 entry.
     RecommendedModel {
-        // CRITICAL: `-it-` (instruction-tuned) variant. The non-`it` repo
-        // `mlx-community/gemma-4-26b-a4b-4bit` is the BASE pretrain model —
-        // it has no instruction-following ability and produces self-completion
-        // loops on chat-template prompts (next-token LM behavior, not assistant
-        // behavior). Always pick the `-it-` repo for chat use.
-        id: "mlx-community/gemma-4-26b-a4b-it-4bit",
+        // The shared NVFP4 base (4-bit, group-16, E4M3 per-group scales),
+        // instruction-tuned. The smin / qmax variants below derive from this by
+        // re-quantizing select tensors. Fastest decode + best clean/Korean
+        // perplexity of the family; same weights Ollama's `gemma4:26b-mlx` serves.
+        id: "mlx-community/gemma-4-26b-a4b-it-nvfp4",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — Chat (Community IT 4-bit)",
-        approx_size_gb: 14,
-        min_ram_gb: 20,
-        notes: "**Chat tier** — uniform 4-bit community build of Gemma 4's instruction-tuned (`it`) variant. Best for: Korean general chat, FAQ, simple Q&A. Not for: tool calling, multi-step reasoning, long agentic loops (channel-token weights too weak to enter thinking mode reliably). English / math / code: weak across all Gemma 4 ships — consider Qwen 3.6 instead.",
-    },
-    RecommendedModel {
-        id: "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq",
-        family: ModelFamily::Gemma4,
-        label: "Gemma 4 — Agent Lite (12 GB)",
-        approx_size_gb: 12,
-        min_ram_gb: 16,
-        notes: "**Agent tier** — 12 GB, 3.916 bpw mixed 4/3-bit AFFINE imatrix + AWQ. Best for: Korean agentic workloads (tool calls, multi-step reasoning, structured outputs). Always defaults to thinking-mode generation — client must send `chat_template_kwargs.enable_thinking=true` (or `reasoning_effort` / `thinking: true`) to activate. Not for: casual chat (overkill), English fact-checking, math CoT — Korean-first specialty. Best for 24 GB Macs.",
-    },
-    RecommendedModel {
-        // Hybrid-precision experimental variant: 4-bit Community IT base
-        // with `embed_tokens` (tied to lm_head) re-quantized at 8-bit from
-        // the bf16 reference. Phase B (v0.6.0 tool-call robustness) lever
-        // — restores critical-token (id 48, 100, 101, 105, 106) emission
-        // ranking without the imatrix calibration corpus the Agent tier
-        // needs. Empirical Δ vs base IT 4-bit on the 30-prompt probe:
-        // tool_call (id 48) median rank 4860 → 2788 (-43%), discrimination
-        // tool < chat restored (base was inverted). +370 MB disk for the
-        // 8-bit embed triplet.
-        id: "hsng95/gemma-4-26b-a4b-mlx-hybrid-embed8",
-        family: ModelFamily::Gemma4,
-        label: "Gemma 4 — Hybrid Embed8 (Experimental)",
+        label: "Gemma 4 — Basic (Community NVFP4)",
         approx_size_gb: 16,
         min_ram_gb: 22,
-        notes: "**Experimental tier (v0.6.0 preview)** — 4-bit Community IT base + 8-bit tied embed_tokens. Targets clients that need reliable tool calling on Gemma 4 without the imatrix-AWQ Agent tier overhead. Tool_call (id 48) emission rank improves ~43% vs base Chat tier; tool vs chat discrimination restored. Pair with `LUMEN_TOOL_CHOICE_AUTO_AS_REQUIRED=1` or `LUMEN_GEMMA4_GRAMMAR_LARK=1` for reliable natural emission on `tool_choice=\"auto\"`. +2 GB disk vs Chat tier for the precision restoration.",
+        notes: "**Basic tier — base of the trio.** NVFP4 (4-bit, group-16, E4M3 scales) instruction-tuned build. Finer per-group scales preserve the thinking channel-close token, so it reliably enters *and exits* thinking mode (no affine-4bit infinite-reasoning failure). Fastest decode + best clean/Korean perplexity of the Gemma 4 family. Same weights Ollama serves for `gemma4:26b-mlx`. Pick this for a balanced default; pick Quality-Max or Size-Min below to trade toward output quality or footprint. English / math / heavy code remain weak across Gemma 4 — consider Qwen 3.6.",
     },
     RecommendedModel {
-        // Hybrid Embed8 base + 8-bit affine attention (q/k/v/o) for the
-        // last 13 decoder layers (L17-L29). Per-layer hidden-state
-        // divergence diagnostic showed late layers dominate the 4-bit
-        // damage (shape ratio Q3/Q1 = 3.05x), with biggest jumps at L26
-        // / L24 / L18 — restoring those layers' attention to 8-bit
-        // recovers most of the bf16 gain at ~17% of the disk cost.
-        //
-        // Empirically the 8-bit attention variant outperforms the bf16
-        // attention variant on the 30-prompt probe: similar absolute
-        // tool_call rank (504 vs 531), but **3.2x stronger** chat-vs-
-        // tool discrimination (+221 vs +68 with the bf16 attention
-        // restoration). 8-bit affine appears to break low-confidence
-        // ties in chat contexts that the bf16 path leaves ambiguous.
-        // Bonus: server-loadable as-is (the bf16 attention path requires
-        // a quantization-override deserializer change we haven't landed).
-        //
-        // Empirical Δ vs base IT 4-bit baseline (4860 median rank):
-        //   tool_call (id 48) median rank → 504 (-90%)
-        //   discrimination chat - tool = +221 (correct direction, strong)
-        // bf16 26B baseline = 412 — within 1.22x. +250 MB disk vs the
-        // Hybrid Embed8 variant (~16.2 GB total).
-        id: "hsng95/gemma-4-26b-a4b-mlx-hybrid-embed8-last13attn8",
+        // Quality-max derivation of the NVFP4 base: tied embed_tokens + the last
+        // 13 layers' attention (q/k/v/o) re-quantized to 8-bit affine. Restores
+        // input+output precision on the tied embed and late-layer hidden state.
+        // Measured: perplexity 53.9 (vs base 56.5 — better) and the closest token
+        // agreement of any variant (KL 0.96 / top-1 72.7% vs base). Decode 59.7
+        // tok/s — far faster than the retired full-affine hybrid route (52.9).
+        id: "hsng95/gemma-4-26b-a4b-nvfp4-qmax-mlx",
         family: ModelFamily::Gemma4,
-        label: "Gemma 4 — Tool-Call Optimized (v0.6.0)",
-        approx_size_gb: 17,
+        label: "Gemma 4 — Quality-Max (NVFP4 hybrid)",
+        approx_size_gb: 16,
         min_ram_gb: 22,
-        notes: "**Tool-call tier (v0.6.0)** — Hybrid Embed8 base + 8-bit affine attention on the last 13 layers (L17-L29). Targets natural tool emission on `tool_choice=\"auto\"` without forcing required-mode or grammar gating. Tool_call (id 48) emission rank improves ~90% vs base Chat tier (4860 → 504; bf16 26B baseline = 412). Critically, restores tool vs chat discrimination direction with +221 chat-vs-tool rank gap (base was inverted at -596). Pair with `LUMEN_GEMMA4_GRAMMAR_LARK=1` for additional structural enforcement on the generated tool-call body. Best Gemma 4 tier for agentic loops on 22 GB+ Macs.",
+        notes: "**Quality tier** — NVFP4 base + 8-bit tied embed_tokens + 8-bit attention on the last 13 layers. Lower perplexity than the base (53.9 vs 56.5) and the closest token agreement of any variant — a refined NVFP4. Best for: output quality, tool-calling / agentic robustness, thinking-mode tasks. GSM8K 84% (base 88%, within noise). ~16 GB, ~60 tok/s decode. Pair with `LUMEN_GEMMA4_GRAMMAR_LARK=1` for structural tool-call enforcement.",
+    },
+    RecommendedModel {
+        // Size-min derivation: the MoE experts (the size bulk) re-quantized to
+        // 3-bit affine + dense MLP to 4-bit. 12.5 GB (−20% vs base). Decode 77.9
+        // tok/s — FASTER than the base (3-bit affine has no NVFP4 per-group
+        // fp-scale matmul overhead). GSM8K 84% ≈ base 88%: the MoE top-8 routing
+        // average absorbs the 3-bit expert reconstruction noise. Closer to the
+        // base (KL 1.42) than stock affine it-4bit (1.95) despite being smaller.
+        id: "hsng95/gemma-4-26b-a4b-nvfp4-smin-mlx",
+        family: ModelFamily::Gemma4,
+        label: "Gemma 4 — Size-Min (NVFP4 hybrid)",
+        approx_size_gb: 12,
+        min_ram_gb: 16,
+        notes: "**Size / speed tier** — NVFP4 base with 3-bit MoE experts + 4-bit dense MLP. 12.5 GB and the fastest decode of the family (~78 tok/s, even faster than the base). GSM8K 84% (base 88%, within noise) — 3-bit expert noise absorbed by MoE top-8 routing; closer to the base than stock it-4bit despite 3 GB smaller. Best for: 16 GB Macs, max throughput, or running alongside other models. Korean + thinking-mode retained from the NVFP4 base.",
     },
 ];
 
