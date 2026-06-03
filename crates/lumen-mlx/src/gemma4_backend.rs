@@ -1159,6 +1159,146 @@ pub(crate) mod imp {
             Ok((prompt, prefill))
         }
 
+        /// Longest shared-prefix token length for **batch fan-out** caching:
+        /// the render of every message except the final (per-item, varying)
+        /// turn, taken as a strict prefix of `full_prompt`. This is the
+        /// boundary to snapshot so sibling requests sharing the leading
+        /// messages (e.g. a stable system prompt) fork from it and prefill
+        /// only their own suffix.
+        ///
+        /// Unlike the legacy "snapshot the whole prompt + `truncate_to(lcp)` on
+        /// reuse" path, forking from this boundary never rolls the rotating
+        /// sliding cache back, so it works even when the shared prefix exceeds
+        /// the sliding window (`> 1024` tok) — exactly the production
+        /// sports-matching case where every item shares a >1k-token system
+        /// prompt. Returns 0 (no caching) when there's no worthwhile shared
+        /// prefix (single message, or the head render isn't a clean prefix).
+        fn batch_fanout_boundary(
+            &self,
+            messages: &[(String, String)],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            full_prompt: &[u32],
+        ) -> usize {
+            if messages.len() < 2 {
+                return 0;
+            }
+            let head = &messages[..messages.len() - 1];
+            let head_ids = match self.build_chat_input_no_gen(head, thinking, tools) {
+                Ok(v) => v,
+                Err(_) => return 0,
+            };
+            full_prompt
+                .iter()
+                .zip(head_ids.iter())
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(full_prompt.len().saturating_sub(1))
+        }
+
+        /// `batch_fanout_boundary` for the structured-`ChatTurn` entry points
+        /// (tool-aware follow-ups). Same semantics: render all turns except the
+        /// final one as the shared-prefix boundary.
+        fn batch_fanout_boundary_from_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            full_prompt: &[u32],
+        ) -> usize {
+            if turns.len() < 2 {
+                return 0;
+            }
+            let head = &turns[..turns.len() - 1];
+            let head_ids = match self.build_chat_input_from_history_no_gen(head, thinking, tools) {
+                Ok(v) => v,
+                Err(_) => return 0,
+            };
+            full_prompt
+                .iter()
+                .zip(head_ids.iter())
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(full_prompt.len().saturating_sub(1))
+        }
+
+        /// Sub-key under which the **system-boundary** (batch fan-out) snapshot
+        /// lives, distinct from `key` which holds the **full-prompt**
+        /// (multi-turn extend) snapshot. Two snapshots per logical key let one
+        /// cache serve both reuse patterns optimally — see `prefix_fork`. The
+        /// NUL separator can't collide with a caller-supplied key.
+        fn sys_key(key: &str) -> String {
+            format!("{key}\u{0}sys")
+        }
+
+        /// Fork a cache for `prompt` from the best snapshot under `key`: the
+        /// full-prompt snapshot (`key`, for multi-turn extends) or the
+        /// system-boundary snapshot (`sys_key(key)`, for batch fan-out
+        /// siblings). A snapshot is reusable only when its saved tokens are a
+        /// **strict prefix** of `prompt` (`lcp == saved_len < prompt.len`), so
+        /// the clone is forked at `offset == lcp` with NO `truncate_to`
+        /// rollback — correct even for >sliding_window prefixes. Picks the
+        /// longer match. No match → fresh cache + `"miss"`.
+        fn prefix_fork(
+            &mut self,
+            prompt: &[u32],
+            key: &str,
+        ) -> (NativeGemma4PromptCache, &'static str) {
+            let strict = |e: &Gemma4PrefixCacheEntry| -> Option<usize> {
+                let lcp = e
+                    .prefix_tokens
+                    .iter()
+                    .zip(prompt.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                (lcp == e.prefix_tokens.len() && lcp < prompt.len()).then_some(lcp)
+            };
+            let sys_k = Self::sys_key(key);
+            let full_lcp = self.prefix_caches.get(key).and_then(&strict);
+            let sys_lcp = self.prefix_caches.get(&sys_k).and_then(&strict);
+            let pick = match (full_lcp, sys_lcp) {
+                (Some(f), Some(s)) if s > f => Some((sys_k, s, "hit-sys")),
+                (Some(f), _) => Some((key.to_string(), f, "hit-full")),
+                (None, Some(s)) => Some((sys_k, s, "hit-sys")),
+                (None, None) => None,
+            };
+            match pick {
+                Some((k, lcp, kind)) => {
+                    let entry = self.prefix_caches.get_mut(&k).unwrap();
+                    entry.last_access = Instant::now();
+                    entry.hits += 1;
+                    let cache = entry.master.clone();
+                    debug_assert_eq!(cache.offset(), lcp);
+                    (cache, kind)
+                }
+                None => (self.make_cache_for_prompt_len(prompt.len()), "miss"),
+            }
+        }
+
+        /// On a `prefix_fork` miss, prime the system-boundary snapshot for
+        /// `key` (under `sys_key`) so sibling requests fork from it. Prefills
+        /// `prompt[..boundary]` only (no decode → `offset == boundary`), clones
+        /// it as the snapshot, and leaves `cache` advanced to `boundary` so the
+        /// caller continues with the suffix on the same cache. No-op when
+        /// `boundary == 0` (nothing worth caching).
+        fn prime_system_snapshot(
+            &mut self,
+            cache: &mut NativeGemma4PromptCache,
+            prompt: &[u32],
+            key: &str,
+            boundary: usize,
+            ctx: &'static str,
+        ) -> Result<()> {
+            if boundary == 0 {
+                return Ok(());
+            }
+            self.model
+                .forward_last_token(&prompt[..boundary], cache)
+                .context(ctx)?;
+            self.save_prefix_snapshot(&Self::sys_key(key), cache, &prompt[..boundary]);
+            Ok(())
+        }
+
         /// Prefix-cache-aware `chat()` variant for the Moltis batch workload.
         ///
         /// **When to use**: caller has a batch of requests that share a
@@ -1196,46 +1336,47 @@ pub(crate) mod imp {
                 return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
             }
 
-            // ── Lookup + cache fork ──
-            let (mut cache, hit_kind, lcp) = match self.prefix_caches.get(prefix_cache_key) {
-                Some(entry) => {
-                    let lcp = entry
-                        .prefix_tokens
-                        .iter()
-                        .zip(prompt.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    if lcp > 0 && lcp <= entry.prefix_tokens.len() {
-                        let mut cache = entry.master.clone();
-                        if lcp < cache.offset() {
-                            cache
-                                .truncate_to(lcp)
-                                .context("chat_with_prefix_cache: truncate cloned master to LCP")?;
-                        }
-                        (cache, "hit", lcp)
-                    } else {
-                        (self.make_cache_for_prompt_len(prompt.len()), "miss-no-overlap", 0)
-                    }
-                }
-                None => (self.make_cache_for_prompt_len(prompt.len()), "miss-no-entry", 0),
-            };
-
-            // Update hit stats
-            if hit_kind == "hit" {
-                if let Some(entry) = self.prefix_caches.get_mut(prefix_cache_key) {
-                    entry.last_access = Instant::now();
-                    entry.hits += 1;
-                }
+            // ── Lookup + cache fork (dual-snapshot strategy) ──
+            // `prefix_fork` reuses the full-prompt or system-boundary snapshot
+            // (whichever is the longer strict prefix) with NO `truncate_to`
+            // rollback. On a miss we prime the system-boundary snapshot so
+            // sibling requests (same system prompt, varying query) fork from
+            // it — works even for >sliding_window prefixes.
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools_for_boundary: &[crate::gemma4_tools::imp::ToolDef<'_>] =
+                match tool_choice {
+                    ResolvedToolChoice::None => &[],
+                    _ => tools,
+                };
+            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
+            if hit_kind == "miss" {
+                let boundary = self.batch_fanout_boundary(
+                    messages,
+                    thinking,
+                    effective_tools_for_boundary,
+                    &prompt,
+                );
+                self.prime_system_snapshot(
+                    &mut cache,
+                    &prompt,
+                    prefix_cache_key,
+                    boundary,
+                    "chat_with_prefix_cache: prime boundary prefill",
+                )?;
             }
 
-            let suffix_len = prompt.len().saturating_sub(cache.offset());
+            let prefilled = cache.offset();
+            let suffix_len = prompt.len().saturating_sub(prefilled);
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} lcp={lcp} suffix_len={suffix_len}"
+                 result={hit_kind} prefilled={prefilled} suffix_len={suffix_len}"
             );
 
             // ── Generate (suffix prefill + decode) ──
-            let suffix = &prompt[cache.offset()..];
+            // No post-decode snapshot: the boundary snapshot saved on the miss
+            // path is stable across sibling requests and needs no rollback to
+            // reuse, so we keep it as-is.
+            let suffix = &prompt[prefilled..];
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -1251,50 +1392,6 @@ pub(crate) mod imp {
                 stats.decode_steps,
                 stats.decode_ms,
             );
-
-            // ── Snapshot post-prompt state as the new master ──
-            // After generate, `cache.offset()` is well past `prompt.len()`
-            // (advanced by decoded tokens). Truncate back to prompt.len()
-            // so the master snapshot represents only the prompt prefix —
-            // this is what subsequent requests with the same system prompt
-            // want to fork from.
-            //
-            // NOTE: this non-streaming path uses `generate_with_cache`
-            // (bundled prefill+decode), so we can't snapshot pre-decode
-            // like the streaming path does. truncate_to MAY fail for
-            // rotating sliding caches when prompt > sliding_window (KV
-            // for early positions has been overwritten by post-rotation
-            // ring writes). Treat the failure as non-fatal: skip the
-            // cache write and let the next request cold-prefill.
-            // Long-prompt callers should prefer the streaming path which
-            // snapshots pre-decode and avoids this failure mode entirely.
-            let target_offset = prompt.len();
-            let mut master_snapshot = cache.clone();
-            let truncate_ok = if master_snapshot.offset() > target_offset {
-                match master_snapshot.truncate_to(target_offset) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!(
-                            "[gemma4-backend] chat_with_prefix_cache snapshot skipped \
-                             (truncate failed, key={prefix_cache_key:?}): {e:#}"
-                        );
-                        false
-                    }
-                }
-            } else {
-                true
-            };
-            if truncate_ok {
-                self.prefix_caches.insert(
-                    prefix_cache_key.to_string(),
-                    Gemma4PrefixCacheEntry {
-                        master: master_snapshot,
-                        prefix_tokens: prompt.clone(),
-                        last_access: Instant::now(),
-                        hits: 0,
-                    },
-                );
-            }
 
             // ── Parse decoded tokens into ParsedResponse ──
             let mut parser = ResponseParser::new(&self.chat);
@@ -1322,55 +1419,6 @@ pub(crate) mod imp {
         /// Number of live prefix-cache entries.
         pub fn prefix_cache_count(&self) -> usize {
             self.prefix_caches.len()
-        }
-
-        /// Lookup-or-make helper shared by all `*_with_prefix_cache` entry
-        /// points. Returns the cache to feed to the chunked prefill (already
-        /// truncated to the longest common prefix with `prompt`), the human-
-        /// readable hit kind for logging, and the LCP length.
-        ///
-        /// Edge case: an exact match (LCP == prompt.len()) would leave an
-        /// empty suffix and skip the prefill loop entirely, but the decode
-        /// loop still needs fresh next-token logits to start. We clamp
-        /// `lcp <= prompt.len() - 1` so there's always at least one suffix
-        /// token to forward through the model.
-        fn lookup_or_make_cache_for_prompt(
-            &mut self,
-            prompt: &[u32],
-            key: &str,
-        ) -> (NativeGemma4PromptCache, &'static str, usize) {
-            let prompt_max = prompt.len().saturating_sub(1);
-            match self.prefix_caches.get_mut(key) {
-                Some(entry) => {
-                    let raw_lcp = entry
-                        .prefix_tokens
-                        .iter()
-                        .zip(prompt.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    let lcp = raw_lcp.min(prompt_max);
-                    if lcp > 0 && lcp <= entry.prefix_tokens.len() {
-                        entry.last_access = Instant::now();
-                        entry.hits += 1;
-                        let mut cache = entry.master.clone();
-                        if lcp < cache.offset() {
-                            // Truncate failures are recoverable: drop the
-                            // cache and fall through to a cold start so the
-                            // request still succeeds.
-                            if let Err(e) = cache.truncate_to(lcp) {
-                                eprintln!(
-                                    "[gemma4-backend] prefix-cache truncate failed (lcp={lcp}): {e:#}, falling back to cold prefill"
-                                );
-                                return (self.make_cache_for_prompt_len(prompt.len()), "miss-truncate-fail", 0);
-                            }
-                        }
-                        (cache, "hit", lcp)
-                    } else {
-                        (self.make_cache_for_prompt_len(prompt.len()), "miss-no-overlap", 0)
-                    }
-                }
-                None => (self.make_cache_for_prompt_len(prompt.len()), "miss-no-entry", 0),
-            }
         }
 
         /// Snapshot the post-prefill cache under `key` for future requests
@@ -1403,6 +1451,64 @@ pub(crate) mod imp {
                     hits: 0,
                 },
             );
+            // Every snapshot insert funnels through here, so bounding the map
+            // here keeps `prefix_caches` from growing without limit across a
+            // long-lived server (each entry pins a full KV snapshot — hundreds
+            // of MB for a multi-k-token prefix).
+            self.evict_prefix_cache();
+        }
+
+        /// Max live prefix-cache entries before LRU eviction (`LUMEN_PREFIX_CACHE_MAX_ENTRIES`,
+        /// default 16). Note dual-snapshot uses up to 2 entries per logical key
+        /// (`key` + `sys_key`), so 16 ≈ 8 distinct system prompts. Cached on first read.
+        fn prefix_cache_max_entries() -> usize {
+            static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *CACHED.get_or_init(|| {
+                std::env::var("LUMEN_PREFIX_CACHE_MAX_ENTRIES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &usize| n > 0)
+                    .unwrap_or(16)
+            })
+        }
+
+        /// Time-to-live for prefix-cache entries in seconds
+        /// (`LUMEN_PREFIX_CACHE_TTL_SECS`, default 0 = disabled — rely on LRU).
+        /// Entries not accessed within the TTL are dropped on the next insert.
+        /// Cached on first read.
+        fn prefix_cache_ttl_secs() -> u64 {
+            static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *CACHED.get_or_init(|| {
+                std::env::var("LUMEN_PREFIX_CACHE_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            })
+        }
+
+        /// Enforce the prefix-cache bounds: drop TTL-stale entries, then evict
+        /// least-recently-used entries until at most `max_entries` remain.
+        /// `last_access` (updated on every `prefix_fork` hit) is the recency
+        /// key. Cheap: O(n) per call, n bounded by `max_entries`.
+        fn evict_prefix_cache(&mut self) {
+            let ttl = Self::prefix_cache_ttl_secs();
+            if ttl > 0 {
+                let now = Instant::now();
+                self.prefix_caches
+                    .retain(|_, e| now.duration_since(e.last_access).as_secs() < ttl);
+            }
+            let max = Self::prefix_cache_max_entries();
+            while self.prefix_caches.len() > max {
+                let Some(lru) = self
+                    .prefix_caches
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_access)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.prefix_caches.remove(&lru);
+            }
         }
 
         /// Streaming variant of `chat_with_prefix_cache`. Mirrors the same
@@ -1457,12 +1563,33 @@ pub(crate) mod imp {
                 .build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
                 .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
                 .unwrap_or(0);
-            let (cache, hit_kind, lcp) =
-                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
+            // Dual-snapshot: fork the longest strict-prefix snapshot (full or
+            // system) with no rollback; on a miss prime the system-boundary
+            // snapshot. `decode_streaming_with_prompt` separately records the
+            // full-prompt snapshot under `key` (pre-decode, at
+            // `prompt.len() - trailing_header_len`) for multi-turn extends — so
+            // one streaming call maintains BOTH snapshots.
+            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
+            if hit_kind == "miss" {
+                let boundary = self.batch_fanout_boundary(
+                    messages,
+                    thinking,
+                    effective_tools_for_no_gen,
+                    &prompt,
+                );
+                self.prime_system_snapshot(
+                    &mut cache,
+                    &prompt,
+                    prefix_cache_key,
+                    boundary,
+                    "chat_streaming_with_prefix_cache: prime boundary prefill",
+                )?;
+            }
             let suffix_len = prompt.len().saturating_sub(cache.offset());
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len}"
+                 result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}",
+                cache.offset()
             );
             let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
@@ -1515,12 +1642,27 @@ pub(crate) mod imp {
                 .build_chat_input_from_history_no_gen(turns, thinking, effective_tools_for_no_gen)
                 .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
                 .unwrap_or(0);
-            let (cache, hit_kind, lcp) =
-                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
+            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
+            if hit_kind == "miss" {
+                let boundary = self.batch_fanout_boundary_from_history(
+                    turns,
+                    thinking,
+                    effective_tools_for_no_gen,
+                    &prompt,
+                );
+                self.prime_system_snapshot(
+                    &mut cache,
+                    &prompt,
+                    prefix_cache_key,
+                    boundary,
+                    "chat_streaming_from_history_with_prefix_cache: prime boundary prefill",
+                )?;
+            }
             let suffix_len = prompt.len().saturating_sub(cache.offset());
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)"
+                 result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)",
+                cache.offset()
             );
             let grammar = self.build_grammar_state(tools, tool_choice);
             self.decode_streaming_with_prompt(
@@ -1559,15 +1701,41 @@ pub(crate) mod imp {
                     "chat_from_history_with_prefix_cache: empty prompt"
                 ));
             }
-            let (mut cache, hit_kind, lcp) =
-                self.lookup_or_make_cache_for_prompt(&prompt, prefix_cache_key);
-            let suffix_len = prompt.len().saturating_sub(cache.offset());
+            // Dual-snapshot strategy (see `chat_with_prefix_cache`): fork the
+            // longest strict-prefix snapshot (no rollback), prime the
+            // system-boundary snapshot on a miss.
+            use crate::chat_io::ResolvedToolChoice;
+            let effective_tools_for_boundary: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
+                ResolvedToolChoice::None => &[],
+                _ => tools,
+            };
+            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
+            if hit_kind == "miss" {
+                let boundary = self.batch_fanout_boundary_from_history(
+                    turns,
+                    thinking,
+                    effective_tools_for_boundary,
+                    &prompt,
+                );
+                self.prime_system_snapshot(
+                    &mut cache,
+                    &prompt,
+                    prefix_cache_key,
+                    boundary,
+                    "chat_from_history_with_prefix_cache: prime boundary prefill",
+                )?;
+            }
+
+            let prefilled = cache.offset();
+            let suffix_len = prompt.len().saturating_sub(prefilled);
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} lcp={lcp} suffix_len={suffix_len} (from-history non-streaming)"
+                 result={hit_kind} prefilled={prefilled} suffix_len={suffix_len} (from-history non-streaming)"
             );
 
-            let suffix = &prompt[cache.offset()..];
+            // No post-decode snapshot — the boundary snapshot above is reused
+            // without rollback by subsequent requests.
+            let suffix = &prompt[prefilled..];
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -1583,37 +1751,6 @@ pub(crate) mod imp {
                 stats.decode_steps,
                 stats.decode_ms,
             );
-
-            // Snapshot post-prompt master for subsequent forks.
-            let target_offset = prompt.len();
-            let mut master_snapshot = cache.clone();
-            if master_snapshot.offset() > target_offset {
-                if let Err(e) = master_snapshot.truncate_to(target_offset) {
-                    eprintln!(
-                        "[gemma4-backend] prefix-cache snapshot skipped (truncate failed): {e:#}"
-                    );
-                } else {
-                    self.prefix_caches.insert(
-                        prefix_cache_key.to_string(),
-                        Gemma4PrefixCacheEntry {
-                            master: master_snapshot,
-                            prefix_tokens: prompt.clone(),
-                            last_access: Instant::now(),
-                            hits: 0,
-                        },
-                    );
-                }
-            } else {
-                self.prefix_caches.insert(
-                    prefix_cache_key.to_string(),
-                    Gemma4PrefixCacheEntry {
-                        master: master_snapshot,
-                        prefix_tokens: prompt.clone(),
-                        last_access: Instant::now(),
-                        hits: 0,
-                    },
-                );
-            }
 
             let mut parser = ResponseParser::new(&self.chat);
             for tok in &prefill_tokens {
