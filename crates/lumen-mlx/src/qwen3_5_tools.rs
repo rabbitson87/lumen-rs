@@ -239,13 +239,28 @@ pub fn format_qwen3_chat_with_tools(
     }
 
     // Generation prompt
-    s.push_str("<|im_start|>assistant\n");
-    if thinking {
-        s.push_str("<think>\n");
-    } else {
-        s.push_str("<think>\n\n</think>\n\n");
-    }
+    s.push_str(qwen3_generation_header(thinking));
     s
+}
+
+/// The trailing **generation header** that `format_qwen3_chat_with_tools`
+/// (and the `_from_history` variant) append after the last rendered message.
+///
+/// This is the part the NEXT turn replaces with the assistant's actual
+/// response, so a conversation-boundary prefix-cache snapshot must stop
+/// BEFORE it. Exposing it lets the generic prefix cache compute the reusable
+/// boundary as `full_ids.len() - tokenize(header).len()` (verified by
+/// `full_ids.ends_with(header_ids)`) — no model-specific token counting.
+///
+/// Reusable pattern: every chat family exposes its own `*_generation_header`
+/// so the shared conversation-boundary prefix-cache works for any model that
+/// renders `<stable conversation>` + `<generation header>`.
+pub fn qwen3_generation_header(thinking: bool) -> &'static str {
+    if thinking {
+        "<|im_start|>assistant\n<think>\n"
+    } else {
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
 }
 
 /// Build the full chat prompt from structured `ChatTurn[]` history with
@@ -332,12 +347,7 @@ pub fn format_qwen3_chat_with_tools_from_history(
     }
 
     // Generation prompt
-    s.push_str("<|im_start|>assistant\n");
-    if thinking {
-        s.push_str("<think>\n");
-    } else {
-        s.push_str("<think>\n\n</think>\n\n");
-    }
+    s.push_str(qwen3_generation_header(thinking));
     s
 }
 

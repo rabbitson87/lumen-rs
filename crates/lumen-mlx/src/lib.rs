@@ -605,6 +605,14 @@ struct PrefixCacheEntry {
     prefix_tokens: Vec<u32>,
     last_access: Instant,
     hits: u64,
+    /// Argmax token predicted at the end of `prefix_tokens` (i.e. the first
+    /// decode token for a prompt equal to `prefix_tokens`). `Some` only when
+    /// the snapshot was taken at the *full* prompt end with logits available
+    /// (the tools cold-prefill / advance paths). `None` for boundary snapshots
+    /// (streaming path), which always re-extend a trailing header to obtain
+    /// fresh logits and so never need this. Lets an identical-prompt retry HIT
+    /// (empty suffix) reuse the completed snapshot instead of re-prefilling.
+    last_token: Option<u32>,
 }
 
 /// Read session-eviction limits from env. Both default to "no limit".
@@ -2104,22 +2112,82 @@ impl MlxQwen35Backend {
         let cached = self
             .prefix_caches
             .get(key)
-            .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone()));
+            .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone(), e.last_token));
 
-        if let Some((master, prefix)) = cached.filter(|(_, p)| {
-            !p.is_empty() && prompt_ids.len() > p.len() && prompt_ids.starts_with(p)
+        // HIT when the new prompt *extends* the cached prefix, OR is byte-for-byte
+        // identical to it (empty suffix) AND we captured that prefix's argmax
+        // token. The identical case is the retry loop: a client whose
+        // time-to-first-token timeout (omp default 100s) fires mid cold-prefill
+        // drops the socket and resends the SAME request. Without the `==` arm it
+        // MISSes and re-runs the full ~145s prefill on every retry — an infinite
+        // loop. With the stored argmax we fork the completed snapshot and start
+        // decoding immediately.
+        if let Some((master, prefix, cached_last)) = cached.filter(|(_, p, last)| {
+            !p.is_empty()
+                && prompt_ids.starts_with(p)
+                && (prompt_ids.len() > p.len() || last.is_some())
         }) {
             let suffix = &prompt_ids[prefix.len()..];
             let t = std::time::Instant::now();
             let _ = self.runner.fork_from_snapshot(master, seq_id)?;
-            let (last, pos) = self.runner.extend(seq_id, suffix)?;
+            let (last, pos) = if suffix.is_empty() {
+                // Exact-prompt retry: the snapshot's KV already covers the whole
+                // prompt, so there is nothing to extend. `cached_last` is `Some`
+                // here (guaranteed by the filter), and equals what a cold prefill
+                // of this prompt would have returned (argmax of the final logits).
+                (cached_last.expect("filter guarantees Some on empty suffix"), prefix.len())
+            } else {
+                self.runner.extend(seq_id, suffix)?
+            };
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            if let Some(entry) = self.prefix_caches.get_mut(key) {
-                entry.last_access = Instant::now();
-                entry.hits += 1;
+            // ADVANCE the snapshot to THIS turn's full prompt so the NEXT turn
+            // forks from here and re-prefills only its own new tokens. Without
+            // this the snapshot stays frozen at the first turn's prompt and the
+            // reused `prefix` never grows — so every turn re-prefills the whole
+            // (growing) conversation suffix (observed: suffix 39→1265→9327→…).
+            // The trailing generation header is a clean prefix of the next turn
+            // because a completed assistant turn re-renders with the same
+            // `<think>\n\n</think>\n\n` block, so storing the full prompt is safe.
+            // Skipped on an empty suffix: the forked state already equals the
+            // stored snapshot, so re-snapshotting would only churn ~3GB of KV.
+            let prev_hits = self.prefix_caches.get(key).map(|e| e.hits).unwrap_or(0);
+            let mut advanced_to = prefix.len();
+            if suffix.is_empty() {
+                if let Some(entry) = self.prefix_caches.get_mut(key) {
+                    entry.last_access = Instant::now();
+                    entry.hits += 1;
+                }
+            } else {
+                match self.runner.snapshot_state_deep(seq_id) {
+                    Ok((snap_id, _)) => {
+                        if let Some(old) = self.prefix_caches.insert(
+                            key.to_string(),
+                            PrefixCacheEntry {
+                                master_snapshot_id: snap_id,
+                                prefix_tokens: prompt_ids.to_vec(),
+                                last_access: Instant::now(),
+                                hits: prev_hits + 1,
+                                last_token: Some(last),
+                            },
+                        ) {
+                            let _ = self.runner.release_snapshot(old.master_snapshot_id);
+                        }
+                        self.evict_stale_prefix_caches();
+                        advanced_to = prompt_ids.len();
+                    }
+                    Err(e) => {
+                        // Snapshot failed — keep the old (frozen) entry, just bump.
+                        if let Some(entry) = self.prefix_caches.get_mut(key) {
+                            entry.last_access = Instant::now();
+                            entry.hits += 1;
+                        }
+                        eprintln!("[mlx] prefix-cache: HIT snapshot-advance failed ({e:#})");
+                    }
+                }
             }
             eprintln!(
-                "[mlx] prefix-cache HIT (tools) key={key:?} prefix={} suffix={} fork+extend={ms:.0}ms",
+                "[mlx] prefix-cache HIT (tools) key={key:?} prefix={} suffix={} \
+                 fork+extend={ms:.0}ms (advanced→{advanced_to})",
                 prefix.len(),
                 suffix.len()
             );
@@ -2141,6 +2209,7 @@ impl MlxQwen35Backend {
                         prefix_tokens: prompt_ids.to_vec(),
                         last_access: Instant::now(),
                         hits: 0,
+                        last_token: Some(last),
                     },
                 );
                 self.evict_stale_prefix_caches();
@@ -2302,110 +2371,121 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
 
-        self.evict_stale_prefix_caches();
-
-        // ── Cache lookup ──
-        let cached = self
-            .prefix_caches
-            .get(prefix_cache_key)
-            .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone(), e.last_access));
-
-        let (mut last, mut pos) = match cached {
-            Some((master, ref prefix, _))
-                if !prefix.is_empty()
-                    && prompt_ids.len() > prefix.len()
-                    && prompt_ids.starts_with(prefix) =>
-            {
-                // ── Cache HIT: fork master → seq, extend suffix ──
-                let suffix = &prompt_ids[prefix.len()..];
-                let t = std::time::Instant::now();
-                let fork_pos = self.runner.fork_from_snapshot(master, seq_id)?;
-                let (last, pos) = self.runner.extend(seq_id, suffix)?;
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                if let Some(entry) = self.prefix_caches.get_mut(prefix_cache_key) {
-                    entry.last_access = Instant::now();
-                    entry.hits += 1;
-                }
-                eprintln!(
-                    "[mlx] prefix-cache HIT key={prefix_cache_key:?} \
-                     prefix={} suffix={} fork+extend={ms:.0}ms (fork_pos={fork_pos})",
-                    prefix.len(),
-                    suffix.len()
-                );
-                (last, pos)
-            }
-            _ => {
-                // ── Cache MISS: cold prefill (with optional snapshot capture) ──
-                let prefix_len = self.detect_system_prefix_len(messages)?;
-                let usable_prefix = prefix_len > 0
-                    && prefix_len < prompt_ids.len()
-                    && prompt_ids[..prefix_len] == prompt_ids[..prefix_len]
-                    && prompt_ids.starts_with(&prompt_ids[..prefix_len]);
-
-                if usable_prefix {
-                    // Two-stage prefill: prefix → snapshot → suffix.
-                    let prefix = prompt_ids[..prefix_len].to_vec();
-                    let suffix = &prompt_ids[prefix_len..];
-
-                    let t = std::time::Instant::now();
-                    let _ = self.runner.prefill(seq_id, &prefix)?;
-                    let prefix_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-                    let snap_result = self.runner.snapshot_state_deep(seq_id);
-                    match snap_result {
-                        Ok((snap_id, _snap_pos)) => {
-                            // Drop any prior entry for this key (free its snapshot).
-                            if let Some(old) = self.prefix_caches.remove(prefix_cache_key) {
-                                let _ = self.runner.release_snapshot(old.master_snapshot_id);
-                            }
-                            self.prefix_caches.insert(
-                                prefix_cache_key.to_string(),
-                                PrefixCacheEntry {
-                                    master_snapshot_id: snap_id,
-                                    prefix_tokens: prefix.clone(),
-                                    last_access: Instant::now(),
-                                    hits: 0,
-                                },
-                            );
-                            self.evict_stale_prefix_caches();
-                            eprintln!(
-                                "[mlx] prefix-cache MISS key={prefix_cache_key:?} \
-                                 prefilled prefix={} in {prefix_ms:.0}ms, \
-                                 stored snapshot={snap_id}",
-                                prefix.len()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[mlx] prefix-cache MISS key={prefix_cache_key:?} \
-                                 snapshot_state_deep failed ({e}); falling through \
-                                 without caching"
-                            );
-                        }
-                    }
-
-                    let t = std::time::Instant::now();
-                    let (last, pos) = self.runner.extend(seq_id, suffix)?;
-                    let suffix_ms = t.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[mlx] seq {seq_id} suffix extend: {} tokens in {suffix_ms:.0}ms",
-                        suffix.len()
-                    );
-                    (last, pos)
-                } else {
-                    // No usable system prefix — plain cold prefill, no cache write.
-                    let t = std::time::Instant::now();
-                    let (last, pos) = self.runner.prefill(seq_id, &prompt_ids)?;
-                    let ms = t.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[mlx] prefix-cache MISS key={prefix_cache_key:?} \
-                         no isolatable prefix; cold prefill {} tokens in {ms:.0}ms",
-                        prompt_ids.len()
-                    );
-                    (last, pos)
-                }
+        // ── Conversation-boundary snapshot point (model-agnostic) ──
+        // The reusable boundary is the full prompt MINUS the trailing
+        // generation header (`<|im_start|>assistant\n…`) — the part the NEXT
+        // turn replaces with the assistant's actual response. Snapshotting
+        // here lets turn N+1 reuse turn N's WHOLE conversation and prefill
+        // only its new tokens (warm-turn cost ≈ new-message length, not the
+        // whole growing conversation). If the header doesn't tokenize to a
+        // clean suffix, fall back to the old system-message boundary; if even
+        // that isn't isolatable, cold-prefill without caching.
+        let header_ids = self
+            .encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
+            .unwrap_or_default();
+        let boundary = if !header_ids.is_empty()
+            && prompt_ids.len() > header_ids.len()
+            && prompt_ids.ends_with(&header_ids)
+        {
+            prompt_ids.len() - header_ids.len()
+        } else {
+            let sys = self.detect_system_prefix_len(messages).unwrap_or(0);
+            if sys > 0 && sys < prompt_ids.len() {
+                sys
+            } else {
+                0
             }
         };
+
+        self.evict_stale_prefix_caches();
+
+        let (mut last, mut pos);
+        if boundary == 0 {
+            // No isolatable prefix — plain cold prefill, no cache write.
+            let t = std::time::Instant::now();
+            let (l, p) = self.runner.prefill(seq_id, &prompt_ids)?;
+            last = l;
+            pos = p;
+            eprintln!(
+                "[mlx] prefix-cache MISS key={prefix_cache_key:?} \
+                 no isolatable prefix; cold prefill {} tokens in {:.0}ms",
+                prompt_ids.len(),
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        } else {
+            // Stage 1: position seq_id's cache exactly at `boundary` — fork a
+            // cached prefix and extend up to the boundary when one is a strict
+            // prefix, else cold-prefill up to the boundary.
+            let cached = self
+                .prefix_caches
+                .get(prefix_cache_key)
+                .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone()));
+            let t = std::time::Instant::now();
+            let reused = match cached {
+                Some((master, prefix))
+                    if !prefix.is_empty()
+                        && prefix.len() <= boundary
+                        && prompt_ids.starts_with(&prefix) =>
+                {
+                    let _ = self.runner.fork_from_snapshot(master, seq_id)?;
+                    if boundary > prefix.len() {
+                        let _ = self
+                            .runner
+                            .extend(seq_id, &prompt_ids[prefix.len()..boundary])?;
+                    }
+                    Some(prefix.len())
+                }
+                _ => {
+                    let _ = self.runner.prefill(seq_id, &prompt_ids[..boundary])?;
+                    None
+                }
+            };
+
+            // Snapshot at the conversation boundary and (re)store it for this
+            // key so the NEXT turn forks from here. Replaces any prior entry.
+            match self.runner.snapshot_state_deep(seq_id) {
+                Ok((snap_id, _)) => {
+                    if let Some(old) = self.prefix_caches.remove(prefix_cache_key) {
+                        let _ = self.runner.release_snapshot(old.master_snapshot_id);
+                    }
+                    self.prefix_caches.insert(
+                        prefix_cache_key.to_string(),
+                        PrefixCacheEntry {
+                            master_snapshot_id: snap_id,
+                            prefix_tokens: prompt_ids[..boundary].to_vec(),
+                            last_access: Instant::now(),
+                            hits: 0,
+                            // Boundary snapshot — the trailing header is always
+                            // re-extended below for fresh logits, so no stored
+                            // argmax is needed (and an exact-prefix HIT would
+                            // re-extend the header rather than reuse this).
+                            last_token: None,
+                        },
+                    );
+                    self.evict_stale_prefix_caches();
+                }
+                Err(e) => eprintln!(
+                    "[mlx] prefix-cache: boundary snapshot failed ({e}); not cached this turn"
+                ),
+            }
+
+            // Stage 2: extend the trailing generation header, then decode.
+            let (l, p) = self.runner.extend(seq_id, &prompt_ids[boundary..])?;
+            last = l;
+            pos = p;
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            let header_len = prompt_ids.len() - boundary;
+            match reused {
+                Some(reused_len) => eprintln!(
+                    "[mlx] prefix-cache HIT key={prefix_cache_key:?} reused={reused_len} \
+                     boundary={boundary} header={header_len} fork+extend={ms:.0}ms"
+                ),
+                None => eprintln!(
+                    "[mlx] prefix-cache MISS key={prefix_cache_key:?} \
+                     cold-to-boundary={boundary} header={header_len} prefill={ms:.0}ms"
+                ),
+            }
+        }
 
         // ── Decode loop (parallel to chat_streaming) ──
         let mut generated: Vec<u32> = vec![last];
@@ -3603,6 +3683,7 @@ mod tests {
             prefix_tokens: vec![1, 2, 3],
             last_access,
             hits: 0,
+            last_token: None,
         }
     }
 
