@@ -929,6 +929,113 @@ mod imp {
         Ok(snapshot_dir)
     }
 
+    /// Chunk size (in tokens) for the long-prompt prefill/extend loop.
+    /// `LUMEN_QWEN35_PREFILL_CHUNK` overrides; default 2048 mirrors the
+    /// Gemma 4 backend. A zero / unparseable value falls back to the default;
+    /// set it larger than any prompt to force the legacy single-pass path for
+    /// A/B benchmarking.
+    fn qwen35_prefill_chunk() -> usize {
+        std::env::var("LUMEN_QWEN35_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2048)
+    }
+
+    /// Run `tokens` through the trunk in query-windowed chunks, accumulating
+    /// KV / linear-attn recurrent state in `cache`, and return the FINAL
+    /// chunk's logits (`[1, 1, vocab]` when `last_only`).
+    ///
+    /// Why chunk: a single `forward` over a very long prompt (agentic system
+    /// prompts can be 20k+ tokens) makes the per-position attention/MoE
+    /// intermediates scale with the full sequence length, overflowing Metal's
+    /// single-buffer limit on unified-memory Macs (observed: a ~130 GB
+    /// allocation attempt for a 21k-token prompt → `argmax_last_token`
+    /// scalar-read failure). Bounding the query window to `chunk` caps those
+    /// intermediates regardless of total prompt length.
+    ///
+    /// Correctness — chunking is equivalent to single-pass here because:
+    ///  * RoPE positions and the causal-sentinel SDPA both key off
+    ///    `cache.offset()`, which advances by each chunk's length, so chunk N's
+    ///    queries land at the right absolute positions and attend bottom-right
+    ///    across the full accumulated KV. Full-attn caches never rotate, so the
+    ///    sentinel's `kv_actual == kv_offset + l` invariant (what makes it
+    ///    valid for q_len &lt; k_len) always holds.
+    ///  * The linear-attn layers carry their conv/SSM recurrent state through
+    ///    the cache (`state_in` ← `cache.get(1)`, `cache.set(1, new_state)`),
+    ///    exactly as decode's incremental recurrence does — a gated-delta scan
+    ///    over a chunk starting from the prior chunk's state is identical to
+    ///    scanning the concatenation.
+    ///
+    /// Each chunk is `eval`'d before the next so MLX materializes the chunk's
+    /// KV/state and frees its transient graph; skipping the per-chunk eval
+    /// would collapse the loop into one giant lazy graph evaluated at once —
+    /// i.e. the exact OOM we are avoiding.
+    fn forward_chunked(
+        model: &NativeQwen3_5MoeModel,
+        tokens: &[u32],
+        cache: &mut NativePromptCache,
+        last_only: bool,
+        label: &str,
+    ) -> Result<Array> {
+        let chunk = qwen35_prefill_chunk();
+        let n = tokens.len();
+        if n <= chunk {
+            return model
+                .forward_with_opts(tokens, cache, last_only)
+                .with_context(|| format!("{label}: forward ({n} tokens)"));
+        }
+        let n_chunks = n.div_ceil(chunk);
+        let report = std::env::var("LUMEN_QWEN35_PREFILL_CHUNK_LOG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut logits_opt: Option<Array> = None;
+        let mut start = 0usize;
+        let mut idx = 0usize;
+        while start < n {
+            let end = (start + chunk).min(n);
+            let is_last = end == n;
+            // Intermediate chunks only need to grow the cache; force `last_only`
+            // so their lm_head stays `[1, 1, vocab]` (cheap) — their logits are
+            // discarded. The final chunk honours the caller's `last_only`.
+            let lo = if is_last { last_only } else { true };
+            let t0 = report.then(std::time::Instant::now);
+            let out = model
+                .forward_with_opts(&tokens[start..end], cache, lo)
+                .with_context(|| {
+                    format!(
+                        "{label}: chunk {}/{} ({} tokens)",
+                        idx + 1,
+                        n_chunks,
+                        end - start
+                    )
+                })?;
+            // CRITICAL: force evaluation so the chunk's transient graph is freed
+            // before the next chunk (see fn doc). Bit-identical to single-pass.
+            out.eval()
+                .with_context(|| format!("{label}: chunk {}/{} eval", idx + 1, n_chunks))?;
+            if let Some(t0) = t0 {
+                let active = crate::metal_memory::get_active_memory().unwrap_or(0);
+                let peak = crate::metal_memory::get_peak_memory().unwrap_or(0);
+                eprintln!(
+                    "[{label}] chunk {}/{} ({} tok) {:.0}ms  mlx-mem active={:.1}GB peak={:.1}GB",
+                    idx + 1,
+                    n_chunks,
+                    end - start,
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    active as f64 / 1e9,
+                    peak as f64 / 1e9,
+                );
+            }
+            if is_last {
+                logits_opt = Some(out);
+            }
+            start = end;
+            idx += 1;
+        }
+        logits_opt.ok_or_else(|| anyhow!("{label}: chunked forward produced no logits"))
+    }
+
     impl NativeMlxRunner {
         pub(crate) fn new() -> Result<Self> {
             let timing_enabled = std::env::var("LUMEN_NATIVE_TIMING")
@@ -1011,8 +1118,7 @@ mod imp {
             // bench. Default: optimization ON.
             let last_only = std::env::var("LUMEN_NATIVE_LM_HEAD_FULL").is_err();
             let t_start = timing_on.then(Instant::now);
-            let logits = model
-                .forward_with_opts(tokens, &mut cache, last_only)
+            let logits = forward_chunked(model, tokens, &mut cache, last_only, "native-prefill")
                 .with_context(|| {
                     format!("native mlx-rs runner: prefill forward (seq_id={seq_id})")
                 })?;
@@ -1344,8 +1450,7 @@ mod imp {
             let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: extend on unknown seq_id {seq_id}")
             })?;
-            let logits = model
-                .forward_with_opts(tokens, &mut state.cache, /* last_only */ true)
+            let logits = forward_chunked(model, tokens, &mut state.cache, true, "native-extend")
                 .with_context(|| {
                     format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
                 })?;
