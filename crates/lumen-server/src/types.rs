@@ -138,8 +138,11 @@ fn is_imatrix_awq_family(model_id: &str) -> bool {
 pub struct ChatMessage {
     pub role: String,
     /// Spec: `content` is `string` for system/user/tool roles, `string | null`
-    /// for assistant when `tool_calls` is present. We accept any of
-    /// `"text"` / `null` / missing and flatten to empty string so existing
+    /// for assistant when `tool_calls` is present. The OpenAI spec *also*
+    /// allows the structured array form
+    /// `[{ "type":"text", "text":"…" }, …]` — clients like Oh My Pi (omp)
+    /// always send the user turn that way. We accept `string` / `null` /
+    /// missing / array-of-parts and flatten to a single string so existing
     /// call sites that consume `&str` still work without `.unwrap_or_default()`
     /// scattered everywhere.
     #[serde(default, deserialize_with = "deserialize_content_lenient")]
@@ -162,7 +165,32 @@ pub struct ChatMessage {
 }
 
 fn deserialize_content_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Option::<String>::deserialize(d).map(|o| o.unwrap_or_default())
+    use serde::de::Error as _;
+    // Accept the four shapes a spec-conformant client may send for `content`:
+    //   "text"  |  null  |  (missing -> handled by serde(default))  |
+    //   [{ "type":"text", "text":"…" }, …]   (OpenAI structured content)
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Array(parts) => {
+            // Flatten the text parts; ignore non-text parts (e.g. image_url) so
+            // a text-only model still receives the prompt. omp sends a single
+            // text part per turn; multiple parts are joined with newlines.
+            let mut out = String::new();
+            for p in &parts {
+                if let Some(t) = p.get("text").and_then(serde_json::Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+            Ok(out)
+        }
+        other => Err(D::Error::custom(format!(
+            "message content must be a string, null, or array of content parts, got {other}"
+        ))),
+    }
 }
 
 impl ChatMessage {
@@ -1003,6 +1031,36 @@ mod tool_calling_serde {
         assert_eq!(calls[0].function.name, "get_weather");
         // arguments is the JSON-encoded *string*, not a parsed object — critical.
         assert_eq!(calls[0].function.arguments, "{\"location\":\"Seoul\"}");
+    }
+
+    #[test]
+    fn openai_array_content_flattens_to_text() {
+        // omp (Oh My Pi) and other spec-conformant clients send the user turn
+        // as a structured content array, not a bare string.
+        let raw = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "현재 프로젝트를 파악해줄래?" }
+            ]
+        });
+        let msg: ChatMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "현재 프로젝트를 파악해줄래?");
+    }
+
+    #[test]
+    fn openai_array_content_multi_part_joined_and_nontext_ignored() {
+        let raw = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "line one" },
+                { "type": "image_url", "image_url": { "url": "data:..." } },
+                { "type": "text", "text": "line two" }
+            ]
+        });
+        let msg: ChatMessage = serde_json::from_value(raw).unwrap();
+        // text parts joined with newline; the image part is dropped.
+        assert_eq!(msg.content, "line one\nline two");
     }
 
     #[test]
