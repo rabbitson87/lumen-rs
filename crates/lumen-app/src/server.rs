@@ -554,6 +554,42 @@ impl ServerSupervisor {
     }
 }
 
+/// Max lines coalesced into one `EVENT_LOG` emit, and the idle window after
+/// which a partial batch is flushed.
+const LOG_BATCH_MAX: usize = 512;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Drain the batch: observe stderr metrics under ONE lock, then emit the whole
+/// `Vec<LogLine>` as a single IPC event. `batch` is left empty (capacity reset).
+async fn flush_log_batch(
+    app: &AppHandle,
+    sup: &Arc<ServerSupervisor>,
+    is_stderr: bool,
+    batch: &mut Vec<LogLine>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    if is_stderr {
+        let mut g = sup.inner.lock().await;
+        for l in batch.iter() {
+            g.metrics.observe(&l.line);
+        }
+    }
+    let _ = app.emit(EVENT_LOG, std::mem::take(batch));
+}
+
+/// Read the child's stdout/stderr line-by-line and forward it to the webview.
+///
+/// Lines are **batched** (size + time window) into a single `EVENT_LOG` carrying
+/// a `Vec<LogLine>` rather than one IPC event per line. Under a log flood (an
+/// agentic client with verbose env can emit 10k+ lines/s) per-line emits would
+/// saturate the Tauri main loop (which also drives the UI) and, because the read
+/// loop and emit shared a task, back-pressure could fill the OS pipe and stall
+/// the server's `eprintln!` → freeze the inference engine. Batching cuts IPC
+/// events ~512× and collapses the frontend's per-line O(n) state update to one
+/// per batch, so the read side keeps draining the pipe and the engine never
+/// blocks on logging.
 async fn pipe_to_event<R: tokio::io::AsyncRead + Unpin>(
     app: AppHandle,
     sup: Arc<ServerSupervisor>,
@@ -561,22 +597,38 @@ async fn pipe_to_event<R: tokio::io::AsyncRead + Unpin>(
     stream: &str,
 ) {
     let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        // Feed metrics first — we only need a shallow scan, and skipping it on
-        // shutdown isn't worth special-casing. Stderr-only because the timing
-        // lines only come from there in lumen-server.
-        if stream == "stderr" {
-            let mut g = sup.inner.lock().await;
-            g.metrics.observe(&line);
-        }
-        let _ = app.emit(
-            EVENT_LOG,
-            LogLine {
-                stream: stream.into(),
-                line,
-                ts_unix_ms: now_ms(),
+    let is_stderr = stream == "stderr";
+    let mut batch: Vec<LogLine> = Vec::with_capacity(LOG_BATCH_MAX);
+    loop {
+        let mut flush = false;
+        tokio::select! {
+            res = lines.next_line() => match res {
+                Ok(Some(line)) => {
+                    batch.push(LogLine {
+                        stream: stream.into(),
+                        line,
+                        ts_unix_ms: now_ms(),
+                    });
+                    if batch.len() >= LOG_BATCH_MAX {
+                        flush = true;
+                    }
+                }
+                // EOF or read error — flush what we have and exit.
+                _ => {
+                    flush_log_batch(&app, &sup, is_stderr, &mut batch).await;
+                    return;
+                }
             },
-        );
+            // Idle flush: the sleep is recreated each iteration, so a sustained
+            // flood keeps resetting it and only the size cap fires (max batching);
+            // when input goes quiet a partial batch ships within the window.
+            _ = tokio::time::sleep(LOG_FLUSH_INTERVAL), if !batch.is_empty() => {
+                flush = true;
+            }
+        }
+        if flush {
+            flush_log_batch(&app, &sup, is_stderr, &mut batch).await;
+        }
     }
 }
 

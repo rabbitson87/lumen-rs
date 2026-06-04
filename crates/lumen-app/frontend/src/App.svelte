@@ -325,8 +325,9 @@
     // tuned recommendation or no model is active.
     await syncTunedMemoryCaps();
 
-    unlistenLog = await onLog((l) => {
-      logs = [...logs.slice(-(LOG_MAX_LINES - 1)), l];
+    unlistenLog = await onLog((lines) => {
+      // One reactive update per batch (not per line): trim once after appending.
+      logs = [...logs, ...lines].slice(-LOG_MAX_LINES);
     });
     unlistenStatus = await onStatus((s) => {
       status = s;

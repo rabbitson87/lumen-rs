@@ -272,8 +272,10 @@ export function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<Unlis
 
 // ── Events ───────────────────────────────────────────────────────────
 
-export function onLog(cb: (l: LogLine) => void): Promise<UnlistenFn> {
-  return listen<LogLine>("lumen://log", (e) => cb(e.payload));
+// Backend coalesces log lines and emits a batch (Vec<LogLine>) per event to
+// avoid per-line IPC flooding the main loop under heavy logging.
+export function onLog(cb: (lines: LogLine[]) => void): Promise<UnlistenFn> {
+  return listen<LogLine[]>("lumen://log", (e) => cb(e.payload));
 }
 
 export function onStatus(cb: (s: ServerStatus) => void): Promise<UnlistenFn> {
