@@ -240,6 +240,33 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "debug",
   },
+  {
+    key: "LUMEN_QWEN35_PREFILL_CHUNK",
+    labelKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label",
+    helpKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help",
+    kind: "number",
+    min: 256,
+    max: 32768,
+    step: 256,
+    defaultValue: "2048",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_QWEN35_PREFILL_CHUNK_LOG",
+    labelKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label",
+    helpKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "debug",
+  },
+  {
+    key: "LUMEN_NATIVE_TIMING",
+    labelKey: "env.entry.LUMEN_NATIVE_TIMING.label",
+    helpKey: "env.entry.LUMEN_NATIVE_TIMING.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "debug",
+  },
 ];
 
 export const ENV_SCHEMA_KEYS = new Set(ENV_SCHEMA.map((e) => e.key));

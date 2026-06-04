@@ -361,6 +361,16 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_EOS_GUARD_VERBOSE.help":
     "Log every EOS-guard suppression event in the sampling pipeline.",
 
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill chunk size",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
+    "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048.",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
+    "Print per-chunk prefill timing and peak Metal memory. Debug only.",
+  "env.entry.LUMEN_NATIVE_TIMING.label": "Native stage timing",
+  "env.entry.LUMEN_NATIVE_TIMING.help":
+    "Log per-stage forward timing (embed / attention / linear-attn / MoE / lm_head ms) for the native MLX runner. Use to find prefill/decode bottlenecks. Debug only.",
+
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
   // server needs a restart for env-derived knobs (cache mode/bits, ctx

@@ -352,6 +352,16 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_EOS_GUARD_VERBOSE.help":
     "샘플링 파이프라인에서 발생하는 모든 EOS 가드 억제 이벤트 로깅.",
 
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill 청크 크기",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
+    "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048.",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
+  "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
+    "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
+  "env.entry.LUMEN_NATIVE_TIMING.label": "네이티브 단계 타이밍",
+  "env.entry.LUMEN_NATIVE_TIMING.help":
+    "네이티브 MLX 러너의 단계별 forward 시간(embed / attention / linear-attn / MoE / lm_head ms) 출력. prefill/decode 병목 탐색용. 디버그 전용.",
+
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
   // (캐시 모드/비트, ctx caps 등) 는 재시작 시점에만 반영됨.
