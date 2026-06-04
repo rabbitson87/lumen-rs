@@ -73,20 +73,37 @@ fn log_request_diag(req: &ChatCompletionRequest) {
     );
     eprintln!("  tool_choice      = {:?}", req.tool_choice);
     eprintln!("  tools            = {} items", req.tools.as_deref().map(|v| v.len()).unwrap_or(0));
+    // Tool list as a SINGLE summary line (names only). A 47-tool agentic
+    // client (e.g. omp) otherwise emits ~50 stderr lines PER TURN; since
+    // `eprintln!` is synchronous, a console that cannot drain that fast fills
+    // the stderr pipe and back-pressures the engine thread → inference stalls
+    // ("frozen screen"). Per-tool desc_len/params detail is available with
+    // `LUMEN_LOG_REQUEST_BODY=full`.
     if let Some(tools) = req.tools.as_deref() {
-        for (i, t) in tools.iter().enumerate() {
-            let crate::types::Tool::Function { function } = t;
-            eprintln!(
-                "    [{}] kind=function name={:?} desc_len={} params_keys={:?}",
-                i,
-                function.name,
-                function.description.as_deref().map(|d| d.len()).unwrap_or(0),
-                function
-                    .parameters
-                    .as_ref()
-                    .and_then(|p| p.as_object())
-                    .map(|o| o.keys().collect::<Vec<_>>()),
-            );
+        let verbose = std::env::var("LUMEN_LOG_REQUEST_BODY")
+            .map(|v| v == "full" || v == "2")
+            .unwrap_or(false);
+        if verbose {
+            for (i, t) in tools.iter().enumerate() {
+                let crate::types::Tool::Function { function } = t;
+                eprintln!(
+                    "    [{}] kind=function name={:?} desc_len={} params_keys={:?}",
+                    i,
+                    function.name,
+                    function.description.as_deref().map(|d| d.len()).unwrap_or(0),
+                    function
+                        .parameters
+                        .as_ref()
+                        .and_then(|p| p.as_object())
+                        .map(|o| o.keys().collect::<Vec<_>>()),
+                );
+            }
+        } else {
+            let names: Vec<&str> = tools
+                .iter()
+                .map(|crate::types::Tool::Function { function }| function.name.as_str())
+                .collect();
+            eprintln!("    names            = [{}]", names.join(", "));
         }
     }
     eprintln!("  messages         = {} items", req.messages.len());
