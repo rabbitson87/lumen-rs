@@ -76,6 +76,18 @@ impl PrefixCacheStore {
         }
     }
 
+    /// Construct with an explicit policy (test-only — production uses
+    /// [`PrefixCacheStore::from_env`]).
+    #[cfg(test)]
+    fn with_policy(enabled: bool, ttl: Option<Duration>, max: Option<usize>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            enabled,
+            ttl,
+            max,
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -383,6 +395,141 @@ fn pick_eviction_victims(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records the exact runner calls the driver makes so tests can assert the
+    /// HIT / MISS / exact-retry control flow without a real model. `prefill`
+    /// and `extend` return distinct sentinel argmax tokens so the returned
+    /// token pins down which branch produced it.
+    #[derive(Default)]
+    struct MockRunner {
+        log: Vec<String>,
+        next_snap: u64,
+    }
+    const PREFILL_TOK: u32 = 100;
+    const EXTEND_TOK: u32 = 200;
+
+    impl SnapshotRunner for MockRunner {
+        fn prefill(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("prefill({})", tokens.len()));
+            Ok((PREFILL_TOK, tokens.len()))
+        }
+        fn extend(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("extend({})", tokens.len()));
+            Ok((EXTEND_TOK, tokens.len()))
+        }
+        fn snapshot_state_deep(&mut self, _seq: u64) -> Result<(u64, usize)> {
+            let id = self.next_snap;
+            self.next_snap += 1;
+            self.log.push(format!("snapshot->{id}"));
+            Ok((id, 0))
+        }
+        fn fork_from_snapshot(&mut self, snapshot_id: u64, _dst: u64) -> Result<usize> {
+            self.log.push(format!("fork({snapshot_id})"));
+            Ok(0)
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            self.log.push(format!("release({snapshot_id})"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_key_is_plain_prefill_without_caching() {
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = MockRunner::default();
+        let (tok, pos) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], None)
+            .unwrap();
+        assert_eq!((tok, pos), (PREFILL_TOK, 3));
+        // No key → just a prefill, no snapshot, nothing stored.
+        assert_eq!(m.log, vec!["prefill(3)"]);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn disabled_store_never_snapshots_even_with_key() {
+        let mut store = PrefixCacheStore::with_policy(false, None, None);
+        let mut m = MockRunner::default();
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .unwrap();
+        assert_eq!(tok, PREFILL_TOK);
+        assert_eq!(m.log, vec!["prefill(3)"]);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn miss_stores_snapshot_then_extend_hit_advances() {
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = MockRunner::default();
+
+        // Cold MISS: full prefill + snapshot stored under "k".
+        let (tok, pos) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .unwrap();
+        assert_eq!((tok, pos), (PREFILL_TOK, 3));
+        assert_eq!(m.log, vec!["prefill(3)", "snapshot->0"]);
+        assert_eq!(store.len(), 1);
+
+        // Extending HIT: prompt starts with the cached [1,2,3] → fork the
+        // snapshot, extend only the [4,5] suffix, then advance the snapshot to
+        // the full prompt (releasing the superseded snap 0).
+        m.log.clear();
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"))
+            .unwrap();
+        assert_eq!(tok, EXTEND_TOK);
+        assert_eq!(
+            m.log,
+            vec!["fork(0)", "extend(2)", "snapshot->1", "release(0)"]
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn exact_retry_hit_forks_without_re_extending() {
+        // This is the omp retry-loop fix: an identical prompt resend must HIT
+        // (fork the completed snapshot, return its stored argmax) instead of
+        // re-running the full prefill.
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = MockRunner::default();
+
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .unwrap();
+        m.log.clear();
+
+        // Byte-identical resend → empty suffix HIT.
+        let (tok, pos) = store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3], Some("k"))
+            .unwrap();
+        // Returns the snapshot's stored argmax (what a cold prefill produced),
+        // and the prefix length as position.
+        assert_eq!((tok, pos), (PREFILL_TOK, 3));
+        // Forked, but NO extend and NO new snapshot (empty suffix is skipped).
+        assert_eq!(m.log, vec!["fork(0)"]);
+    }
+
+    #[test]
+    fn lru_cap_evicts_and_releases_oldest_snapshot() {
+        let mut store = PrefixCacheStore::with_policy(true, None, Some(1));
+        let mut m = MockRunner::default();
+
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("a"))
+            .unwrap();
+        m.log.clear();
+        // Second distinct key overflows the cap=1 → "a"'s snapshot is released.
+        store
+            .prefill_optionally_cached(&mut m, 2, &[9, 9, 9], Some("b"))
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(
+            m.log.contains(&"release(0)".to_string()),
+            "evicted entry's snapshot must be released, got {:?}",
+            m.log
+        );
+    }
 
     fn fake_prefix_entry(snapshot_id: u64, last_access: Instant) -> PrefixCacheEntry {
         PrefixCacheEntry {
