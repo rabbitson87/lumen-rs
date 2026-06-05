@@ -205,6 +205,14 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "advanced",
   },
+  {
+    key: "LUMEN_QWEN35_FORCE_REQUIRED_PARAMS",
+    labelKey: "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label",
+    helpKey: "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
 
   // ── Debug (developer / triage) ─────────────────────────────────────
   {
@@ -263,6 +271,14 @@ export const ENV_SCHEMA: EnvEntry[] = [
     key: "LUMEN_NATIVE_TIMING",
     labelKey: "env.entry.LUMEN_NATIVE_TIMING.label",
     helpKey: "env.entry.LUMEN_NATIVE_TIMING.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "debug",
+  },
+  {
+    key: "LUMEN_QWEN35_TOOL_DEBUG",
+    labelKey: "env.entry.LUMEN_QWEN35_TOOL_DEBUG.label",
+    helpKey: "env.entry.LUMEN_QWEN35_TOOL_DEBUG.help",
     kind: "bool",
     defaultValue: "0",
     section: "debug",

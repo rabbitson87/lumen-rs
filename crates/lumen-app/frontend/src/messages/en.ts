@@ -370,6 +370,12 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_NATIVE_TIMING.label": "Native stage timing",
   "env.entry.LUMEN_NATIVE_TIMING.help":
     "Log per-stage forward timing (embed / attention / linear-attn / MoE / lm_head ms) for the native MLX runner. Use to find prefill/decode bottlenecks. Debug only.",
+  "env.entry.LUMEN_QWEN35_TOOL_DEBUG.label": "Qwen tool-call raw dump",
+  "env.entry.LUMEN_QWEN35_TOOL_DEBUG.help":
+    "Log the raw decoded model output for Qwen3.6 tool-call turns (full <tool_call>…</tool_call> text). Use to diagnose missing/dropped tool arguments. Verbose — debug only.",
+  "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "Force required tool params",
+  "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
+    "For Qwen3.6 tool calls, inject a <parameter=KEY> opener before the model can close a function with a required parameter missing — preventing empty calls like read() with no path. The model still writes the value. Helps weak/quantized models with many tools; off by default.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running

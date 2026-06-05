@@ -361,6 +361,12 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_NATIVE_TIMING.label": "네이티브 단계 타이밍",
   "env.entry.LUMEN_NATIVE_TIMING.help":
     "네이티브 MLX 러너의 단계별 forward 시간(embed / attention / linear-attn / MoE / lm_head ms) 출력. prefill/decode 병목 탐색용. 디버그 전용.",
+  "env.entry.LUMEN_QWEN35_TOOL_DEBUG.label": "Qwen 툴콜 raw 덤프",
+  "env.entry.LUMEN_QWEN35_TOOL_DEBUG.help":
+    "Qwen3.6 툴콜 턴의 모델 raw 출력 전체(<tool_call>…</tool_call> 원문) 출력. 누락/유실된 툴 인자 진단용. 장황함 — 디버그 전용.",
+  "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "필수 툴 파라미터 강제",
+  "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
+    "Qwen3.6 툴콜에서 required 파라미터가 빠진 채 함수를 닫기 전에 <parameter=KEY> opener를 주입 — path 없는 read() 같은 빈 호출 방지. 값은 모델이 직접 작성. 툴 많고 약한/양자화 모델에 유효; 기본 꺼짐.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
