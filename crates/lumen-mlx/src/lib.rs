@@ -118,6 +118,7 @@ mod native_router;
 mod native_runtime;
 mod native_snapshot;
 pub mod native_ssm;
+mod prefix_cache;
 mod qwen3_5_moe;
 mod qwen3_5_mtp;
 mod qwen3_5_tools;
@@ -179,6 +180,7 @@ trait Runner {
     /// the position of the new seq.
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
 }
+
 
 impl Runner for SubprocessRunner {
     fn name(&self) -> &'static str {
@@ -522,6 +524,28 @@ impl RunnerImpl {
     }
 }
 
+/// `RunnerImpl` exposes the narrow `SnapshotRunner` surface the prefix cache
+/// needs, delegating to the active variant's `Runner` impl. Keeps `prefix_cache`
+/// decoupled from the runner enum — the store works against these five methods.
+impl prefix_cache::SnapshotRunner for RunnerImpl {
+    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.as_runner_mut().prefill(seq_id, tokens)
+    }
+    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.as_runner_mut().extend(seq_id, tokens)
+    }
+    fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {
+        self.as_runner_mut().snapshot_state_deep(seq_id)
+    }
+    fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
+        self.as_runner_mut()
+            .fork_from_snapshot(snapshot_id, dst_seq_id)
+    }
+    fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+        self.as_runner_mut().release_snapshot(snapshot_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunnerKind {
     Pyo3,
@@ -592,29 +616,6 @@ struct SessionState {
     last_access: Instant,
 }
 
-/// A1 prefix-cache master snapshot entry. Holds a deep snapshot of the per-
-/// layer cache state taken at the end of a *shared* prefix (typically the
-/// system-prompt block). Multiple incoming requests whose prompt starts with
-/// `prefix_tokens` reuse this snapshot via `fork_from_snapshot`, paying only
-/// the suffix prefill instead of the full prefix prefill.
-///
-/// Master is reusable; `release_snapshot` is only called on cache eviction
-/// (LRU / TTL / explicit drop).
-struct PrefixCacheEntry {
-    master_snapshot_id: u64,
-    prefix_tokens: Vec<u32>,
-    last_access: Instant,
-    hits: u64,
-    /// Argmax token predicted at the end of `prefix_tokens` (i.e. the first
-    /// decode token for a prompt equal to `prefix_tokens`). `Some` only when
-    /// the snapshot was taken at the *full* prompt end with logits available
-    /// (the tools cold-prefill / advance paths). `None` for boundary snapshots
-    /// (streaming path), which always re-extend a trailing header to obtain
-    /// fresh logits and so never need this. Lets an identical-prompt retry HIT
-    /// (empty suffix) reuse the completed snapshot instead of re-prefilling.
-    last_token: Option<u32>,
-}
-
 /// Read session-eviction limits from env. Both default to "no limit".
 ///
 /// - `LUMEN_MLX_SESSION_TTL_SECS=N` — drop sessions idle > N seconds.
@@ -631,40 +632,6 @@ fn read_session_limits() -> (Option<Duration>, Option<usize>) {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0);
     (ttl, max)
-}
-
-/// Read A1 prefix-cache config from env.
-///
-/// - `LUMEN_MLX_PREFIX_CACHE=0`         — opt OUT (default ON since v0.4.7).
-/// - `LUMEN_MLX_PREFIX_CACHE_TTL_SECS=N` — drop entries idle > N seconds.
-/// - `LUMEN_MLX_PREFIX_CACHE_MAX=N`      — keep at most N entries, LRU-evict.
-///
-/// Default flipped from OFF → ON: the feature has been validated since
-/// 2026-05-18 and provides the 5-6× speedup users expect for repeated
-/// chat turns with a shared system prompt. Anyone running the feature
-/// in production wants it on; the env var is now the escape hatch for
-/// debugging, not the gate.
-fn read_prefix_cache_limits() -> (bool, Option<Duration>, Option<usize>) {
-    // Default ON: anything other than an explicit "0" / "false" / "no" /
-    // "off" stays enabled. Empty string + unset both yield ON.
-    let enabled = match std::env::var("LUMEN_MLX_PREFIX_CACHE")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-    {
-        None => true,
-        Some(v) if v.is_empty() => true,
-        Some(v) => !matches!(v.as_str(), "0" | "false" | "no" | "off"),
-    };
-    let ttl = std::env::var("LUMEN_MLX_PREFIX_CACHE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(Duration::from_secs);
-    let max = std::env::var("LUMEN_MLX_PREFIX_CACHE_MAX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0);
-    (enabled, ttl, max)
 }
 
 /// Compute a process-stable cache key for a chat request based on the system
@@ -1381,10 +1348,7 @@ pub struct MlxQwen35Backend {
     sessions: std::collections::HashMap<String, SessionState>,
     session_ttl: Option<Duration>,
     session_max: Option<usize>,
-    prefix_caches: std::collections::HashMap<String, PrefixCacheEntry>,
-    prefix_cache_enabled: bool,
-    prefix_cache_ttl: Option<Duration>,
-    prefix_cache_max: Option<usize>,
+    prefix_store: prefix_cache::PrefixCacheStore,
 }
 
 impl MlxQwen35Backend {
@@ -1454,13 +1418,13 @@ impl MlxQwen35Backend {
             eprintln!("[mlx] session LRU cap = {max}");
         }
 
-        let (prefix_cache_enabled, prefix_cache_ttl, prefix_cache_max) = read_prefix_cache_limits();
-        if prefix_cache_enabled {
+        let prefix_store = prefix_cache::PrefixCacheStore::from_env();
+        if prefix_store.enabled() {
             eprintln!("[mlx] prefix cache ENABLED (auto-keyed by system message hash)");
-            if let Some(ttl) = prefix_cache_ttl {
+            if let Some(ttl) = prefix_store.ttl() {
                 eprintln!("[mlx] prefix cache TTL = {}s", ttl.as_secs());
             }
-            if let Some(max) = prefix_cache_max {
+            if let Some(max) = prefix_store.max() {
                 eprintln!("[mlx] prefix cache LRU cap = {max}");
             }
         }
@@ -1475,10 +1439,7 @@ impl MlxQwen35Backend {
             sessions: std::collections::HashMap::new(),
             session_ttl,
             session_max,
-            prefix_caches: std::collections::HashMap::new(),
-            prefix_cache_enabled,
-            prefix_cache_ttl,
-            prefix_cache_max,
+            prefix_store,
         };
         // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
         // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
@@ -1872,7 +1833,7 @@ impl MlxQwen35Backend {
             );
         }
 
-        if self.prefix_cache_enabled {
+        if self.prefix_store.enabled() {
             if let Some(key) = auto_prefix_key(messages) {
                 return self.chat_streaming_prefix_cache(
                     messages,
@@ -2156,146 +2117,6 @@ impl MlxQwen35Backend {
         )
     }
 
-    /// Prefill helper that consults `self.prefix_caches` when a key is
-    /// provided and the feature is enabled. On cache hit, forks from the
-    /// stored snapshot and extends by the suffix (skips re-processing the
-    /// common prefix). On miss, runs a normal prefill and snapshots the
-    /// result under `key` so the next request can fork from it.
-    ///
-    /// Falls through to plain `runner.prefill` when `prefix_cache_key` is
-    /// `None` or when `LUMEN_MLX_PREFIX_CACHE=0` is set (escape hatch for
-    /// debugging). Snapshot failures are logged but non-fatal — the
-    /// request completes, just without populating the cache.
-    fn prefill_optionally_cached(
-        &mut self,
-        seq_id: u64,
-        prompt_ids: &[u32],
-        prefix_cache_key: Option<&str>,
-    ) -> Result<(u32, usize)> {
-        let key = match prefix_cache_key.filter(|_| self.prefix_cache_enabled) {
-            Some(k) => k,
-            None => return self.runner.prefill(seq_id, prompt_ids),
-        };
-        self.evict_stale_prefix_caches();
-
-        let cached = self
-            .prefix_caches
-            .get(key)
-            .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone(), e.last_token));
-
-        // HIT when the new prompt *extends* the cached prefix, OR is byte-for-byte
-        // identical to it (empty suffix) AND we captured that prefix's argmax
-        // token. The identical case is the retry loop: a client whose
-        // time-to-first-token timeout (omp default 100s) fires mid cold-prefill
-        // drops the socket and resends the SAME request. Without the `==` arm it
-        // MISSes and re-runs the full ~145s prefill on every retry — an infinite
-        // loop. With the stored argmax we fork the completed snapshot and start
-        // decoding immediately.
-        if let Some((master, prefix, cached_last)) = cached.filter(|(_, p, last)| {
-            !p.is_empty()
-                && prompt_ids.starts_with(p)
-                && (prompt_ids.len() > p.len() || last.is_some())
-        }) {
-            let suffix = &prompt_ids[prefix.len()..];
-            let t = std::time::Instant::now();
-            let _ = self.runner.fork_from_snapshot(master, seq_id)?;
-            let (last, pos) = if suffix.is_empty() {
-                // Exact-prompt retry: the snapshot's KV already covers the whole
-                // prompt, so there is nothing to extend. `cached_last` is `Some`
-                // here (guaranteed by the filter), and equals what a cold prefill
-                // of this prompt would have returned (argmax of the final logits).
-                (cached_last.expect("filter guarantees Some on empty suffix"), prefix.len())
-            } else {
-                self.runner.extend(seq_id, suffix)?
-            };
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            // ADVANCE the snapshot to THIS turn's full prompt so the NEXT turn
-            // forks from here and re-prefills only its own new tokens. Without
-            // this the snapshot stays frozen at the first turn's prompt and the
-            // reused `prefix` never grows — so every turn re-prefills the whole
-            // (growing) conversation suffix (observed: suffix 39→1265→9327→…).
-            // The trailing generation header is a clean prefix of the next turn
-            // because a completed assistant turn re-renders with the same
-            // `<think>\n\n</think>\n\n` block, so storing the full prompt is safe.
-            // Skipped on an empty suffix: the forked state already equals the
-            // stored snapshot, so re-snapshotting would only churn ~3GB of KV.
-            let prev_hits = self.prefix_caches.get(key).map(|e| e.hits).unwrap_or(0);
-            let mut advanced_to = prefix.len();
-            if suffix.is_empty() {
-                if let Some(entry) = self.prefix_caches.get_mut(key) {
-                    entry.last_access = Instant::now();
-                    entry.hits += 1;
-                }
-            } else {
-                match self.runner.snapshot_state_deep(seq_id) {
-                    Ok((snap_id, _)) => {
-                        if let Some(old) = self.prefix_caches.insert(
-                            key.to_string(),
-                            PrefixCacheEntry {
-                                master_snapshot_id: snap_id,
-                                prefix_tokens: prompt_ids.to_vec(),
-                                last_access: Instant::now(),
-                                hits: prev_hits + 1,
-                                last_token: Some(last),
-                            },
-                        ) {
-                            let _ = self.runner.release_snapshot(old.master_snapshot_id);
-                        }
-                        self.evict_stale_prefix_caches();
-                        advanced_to = prompt_ids.len();
-                    }
-                    Err(e) => {
-                        // Snapshot failed — keep the old (frozen) entry, just bump.
-                        if let Some(entry) = self.prefix_caches.get_mut(key) {
-                            entry.last_access = Instant::now();
-                            entry.hits += 1;
-                        }
-                        eprintln!("[mlx] prefix-cache: HIT snapshot-advance failed ({e:#})");
-                    }
-                }
-            }
-            eprintln!(
-                "[mlx] prefix-cache HIT (tools) key={key:?} prefix={} suffix={} \
-                 fork+extend={ms:.0}ms (advanced→{advanced_to})",
-                prefix.len(),
-                suffix.len()
-            );
-            return Ok((last, pos));
-        }
-
-        // Cold prefill, then snapshot under `key` so the next request with
-        // the same key + extended prompt can fork from here.
-        let (last, pos) = self.runner.prefill(seq_id, prompt_ids)?;
-        match self.runner.snapshot_state_deep(seq_id) {
-            Ok((snap_id, _snap_pos)) => {
-                if let Some(old) = self.prefix_caches.remove(key) {
-                    let _ = self.runner.release_snapshot(old.master_snapshot_id);
-                }
-                self.prefix_caches.insert(
-                    key.to_string(),
-                    PrefixCacheEntry {
-                        master_snapshot_id: snap_id,
-                        prefix_tokens: prompt_ids.to_vec(),
-                        last_access: Instant::now(),
-                        hits: 0,
-                        last_token: Some(last),
-                    },
-                );
-                self.evict_stale_prefix_caches();
-                eprintln!(
-                    "[mlx] prefix-cache MISS (tools) key={key:?} stored snapshot={snap_id} prefix_len={}",
-                    prompt_ids.len()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "[mlx] prefix-cache snapshot skipped (tools, key={key:?}): {e:#}"
-                );
-            }
-        }
-        Ok((last, pos))
-    }
-
     /// Shared decode loop for the four tool-aware entry points. Prefill
     /// the prompt (including any tool_choice prefill suffix), feed the
     /// prefill string into the parser so its state machine starts at
@@ -2345,7 +2166,12 @@ impl MlxQwen35Backend {
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
         let t_prefill = std::time::Instant::now();
         let (mut last, mut pos) =
-            self.prefill_optionally_cached(seq_id, &prompt_ids, prefix_cache_key)?;
+            self.prefix_store.prefill_optionally_cached(
+                &mut self.runner,
+                seq_id,
+                &prompt_ids,
+                prefix_cache_key,
+            )?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
@@ -2520,7 +2346,7 @@ impl MlxQwen35Backend {
             }
         };
 
-        self.evict_stale_prefix_caches();
+        self.prefix_store.evict_stale(&mut self.runner);
 
         let (mut last, mut pos);
         if boundary == 0 {
@@ -2539,10 +2365,7 @@ impl MlxQwen35Backend {
             // Stage 1: position seq_id's cache exactly at `boundary` — fork a
             // cached prefix and extend up to the boundary when one is a strict
             // prefix, else cold-prefill up to the boundary.
-            let cached = self
-                .prefix_caches
-                .get(prefix_cache_key)
-                .map(|e| (e.master_snapshot_id, e.prefix_tokens.clone()));
+            let cached = self.prefix_store.get_master(prefix_cache_key);
             let t = std::time::Instant::now();
             let reused = match cached {
                 Some((master, prefix))
@@ -2568,24 +2391,17 @@ impl MlxQwen35Backend {
             // key so the NEXT turn forks from here. Replaces any prior entry.
             match self.runner.snapshot_state_deep(seq_id) {
                 Ok((snap_id, _)) => {
-                    if let Some(old) = self.prefix_caches.remove(prefix_cache_key) {
-                        let _ = self.runner.release_snapshot(old.master_snapshot_id);
-                    }
-                    self.prefix_caches.insert(
-                        prefix_cache_key.to_string(),
-                        PrefixCacheEntry {
-                            master_snapshot_id: snap_id,
-                            prefix_tokens: prompt_ids[..boundary].to_vec(),
-                            last_access: Instant::now(),
-                            hits: 0,
-                            // Boundary snapshot — the trailing header is always
-                            // re-extended below for fresh logits, so no stored
-                            // argmax is needed (and an exact-prefix HIT would
-                            // re-extend the header rather than reuse this).
-                            last_token: None,
-                        },
+                    // Boundary snapshot — the trailing header is always re-extended
+                    // below for fresh logits, so no stored argmax is needed (and an
+                    // exact-prefix HIT would re-extend the header rather than reuse
+                    // this), hence `last_token = None`.
+                    self.prefix_store.store_master(
+                        &mut self.runner,
+                        prefix_cache_key,
+                        snap_id,
+                        prompt_ids[..boundary].to_vec(),
+                        None,
                     );
-                    self.evict_stale_prefix_caches();
                 }
                 Err(e) => eprintln!(
                     "[mlx] prefix-cache: boundary snapshot failed ({e}); not cached this turn"
@@ -2676,25 +2492,18 @@ impl MlxQwen35Backend {
     /// Drop a prefix-cache entry by key, releasing its master snapshot.
     /// Returns true if the entry existed.
     pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
-        if let Some(entry) = self.prefix_caches.remove(key) {
-            let _ = self.runner.release_snapshot(entry.master_snapshot_id);
-            eprintln!(
-                "[mlx] prefix-cache key={key:?} dropped (hits={})",
-                entry.hits
-            );
-            true
-        } else {
-            false
+        match self.prefix_store.drop_entry(&mut self.runner, key) {
+            Some(hits) => {
+                eprintln!("[mlx] prefix-cache key={key:?} dropped (hits={hits})");
+                true
+            }
+            None => false,
         }
     }
 
     /// Drop all prefix-cache entries; returns the number released.
     pub fn clear_prefix_cache(&mut self) -> usize {
-        let n = self.prefix_caches.len();
-        let entries: Vec<_> = self.prefix_caches.drain().collect();
-        for (_, entry) in entries {
-            let _ = self.runner.release_snapshot(entry.master_snapshot_id);
-        }
+        let n = self.prefix_store.clear(&mut self.runner);
         if n > 0 {
             eprintln!("[mlx] prefix-cache cleared ({n} entries)");
         }
@@ -2702,25 +2511,7 @@ impl MlxQwen35Backend {
     }
 
     pub fn prefix_cache_count(&self) -> usize {
-        self.prefix_caches.len()
-    }
-
-    /// Drop entries idle past TTL, then enforce LRU cap. No-op when both are
-    /// unset.
-    fn evict_stale_prefix_caches(&mut self) {
-        let now = Instant::now();
-        let victims = pick_prefix_eviction_victims(
-            &self.prefix_caches,
-            now,
-            self.prefix_cache_ttl,
-            self.prefix_cache_max,
-        );
-        for (key, reason) in victims {
-            if let Some(entry) = self.prefix_caches.remove(&key) {
-                let _ = self.runner.release_snapshot(entry.master_snapshot_id);
-                eprintln!("[mlx] prefix-cache key={key:?} evicted ({reason})");
-            }
-        }
+        self.prefix_store.len()
     }
 
     /// N-gram K=2 speculative decode variant of `chat_streaming`. Drift-aware:
@@ -3358,53 +3149,6 @@ fn pick_eviction_victims(
     out
 }
 
-/// Pure helper for `evict_stale_prefix_caches`: picks (key, human_reason)
-/// pairs for every prefix-cache entry that should be dropped at this moment.
-/// TTL victims first, then LRU until `max` is satisfied. Pulled out so the
-/// policy is unit-testable without spinning up a real runner.
-fn pick_prefix_eviction_victims(
-    entries: &std::collections::HashMap<String, PrefixCacheEntry>,
-    now: Instant,
-    ttl: Option<Duration>,
-    max: Option<usize>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut alive: std::collections::HashMap<String, Instant> = entries
-        .iter()
-        .map(|(k, e)| (k.clone(), e.last_access))
-        .collect();
-
-    if let Some(ttl) = ttl {
-        let stale: Vec<String> = alive
-            .iter()
-            .filter(|&(_, t)| now.duration_since(*t) > ttl)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in stale {
-            alive.remove(&k);
-            out.push((k, format!("TTL > {}s", ttl.as_secs())));
-        }
-    }
-
-    if let Some(max) = max {
-        while alive.len() > max {
-            let victim = alive
-                .iter()
-                .min_by_key(|&(_, t)| *t)
-                .map(|(k, _)| k.clone());
-            match victim {
-                Some(k) => {
-                    alive.remove(&k);
-                    out.push((k, format!("LRU cap {max}")));
-                }
-                None => break,
-            }
-        }
-    }
-
-    out
-}
-
 /// Phase 2: bridges Qwen35ResponseParser events to the generic
 /// `BackendStreamEvent` shape the engine consumes. Mirrors the
 /// Gemma 4 `emit_token_event` adapter.
@@ -3798,56 +3542,6 @@ mod tests {
         let reasons: Vec<&str> = victims.iter().map(|(_, r)| r.as_str()).collect();
         assert!(reasons.iter().any(|r| r.contains("TTL")));
         assert!(reasons.iter().any(|r| r.contains("LRU")));
-    }
-
-    fn fake_prefix_entry(snapshot_id: u64, last_access: Instant) -> PrefixCacheEntry {
-        PrefixCacheEntry {
-            master_snapshot_id: snapshot_id,
-            prefix_tokens: vec![1, 2, 3],
-            last_access,
-            hits: 0,
-            last_token: None,
-        }
-    }
-
-    #[test]
-    fn pick_prefix_eviction_no_limits_keeps_all() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert("a".to_string(), fake_prefix_entry(11, now));
-        map.insert("b".to_string(), fake_prefix_entry(12, now));
-        let victims = pick_prefix_eviction_victims(&map, now, None, None);
-        assert!(victims.is_empty());
-    }
-
-    #[test]
-    fn pick_prefix_eviction_lru_drops_oldest_until_cap() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert(
-            "old".to_string(),
-            fake_prefix_entry(1, now - Duration::from_secs(30)),
-        );
-        map.insert("new".to_string(), fake_prefix_entry(2, now));
-        let victims = pick_prefix_eviction_victims(&map, now, None, Some(1));
-        let keys: Vec<&str> = victims.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["old"]);
-        assert!(victims[0].1.contains("LRU"));
-    }
-
-    #[test]
-    fn pick_prefix_eviction_ttl_drops_stale_only() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert("fresh".to_string(), fake_prefix_entry(1, now));
-        map.insert(
-            "stale".to_string(),
-            fake_prefix_entry(2, now - Duration::from_secs(120)),
-        );
-        let victims = pick_prefix_eviction_victims(&map, now, Some(Duration::from_secs(60)), None);
-        let keys: Vec<&str> = victims.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["stale"]);
-        assert!(victims[0].1.contains("TTL"));
     }
 
     #[test]
