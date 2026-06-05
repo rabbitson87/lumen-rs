@@ -23,7 +23,9 @@ mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
 
-    use crate::native_cache::{NativeLayerCache, NativePromptCache};
+    use crate::native_cache::{
+        NativeLayerCache, NativePromptCache, NativeRotatingKvCacheTurboQuant,
+    };
 
     /// Per-layer captured state. Both Full and Linear variants hold the
     /// captured Arrays directly; the `is_deep` flag on the enclosing
@@ -41,6 +43,9 @@ mod imp {
             lengths: Option<Array>,
             left_padding: Option<Array>,
         },
+        /// TurboQuant-compressed full-attn layer — the whole compressed cache
+        /// is captured (shallow = refcount clone, deep = `deep_clone`).
+        FullTurboquant(NativeRotatingKvCacheTurboQuant),
     }
 
     /// Captured prompt-cache state. Construct via `capture_shallow` or
@@ -126,6 +131,9 @@ mod imp {
                             lengths: c.lengths().cloned(),
                             left_padding: c.left_padding().cloned(),
                         }),
+                        NativeLayerCache::FullTurboquant(c) => {
+                            Ok(LayerSnapshot::FullTurboquant(c.clone()))
+                        }
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -160,6 +168,9 @@ mod imp {
                                 lengths: deep_clone_option(c.lengths())?,
                                 left_padding: deep_clone_option(c.left_padding())?,
                             })
+                        }
+                        NativeLayerCache::FullTurboquant(c) => {
+                            Ok(LayerSnapshot::FullTurboquant(c.deep_clone()?))
                         }
                     }
                 })
@@ -287,8 +298,13 @@ mod imp {
                 c.set_left_padding(lp);
                 Ok(())
             }
-            (NativeLayerCache::Full(_), LayerSnapshot::Linear { .. })
-            | (NativeLayerCache::Linear(_), LayerSnapshot::Full { .. }) => Err(anyhow!(
+            (NativeLayerCache::FullTurboquant(dst), LayerSnapshot::FullTurboquant(snap)) => {
+                // Install the captured compressed cache. Fork re-materializes
+                // independent buffers for sibling isolation; rollback can share.
+                *dst = if fork { snap.deep_clone()? } else { snap.clone() };
+                Ok(())
+            }
+            _ => Err(anyhow!(
                 "PromptCacheSnapshot apply_layer: layer kind mismatch at {layer_idx}"
             )),
         }

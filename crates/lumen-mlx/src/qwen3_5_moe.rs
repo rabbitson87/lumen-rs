@@ -61,7 +61,10 @@ mod imp {
     };
 
     use crate::native_attention::sdpa;
-    use crate::native_cache::{NativeArraysCache, NativeKvCache, NativePromptCache};
+    use crate::native_cache::{
+        NativeArraysCache, NativeKvCache, NativeLayerCache, NativePromptCache,
+        NativeRotatingKvCacheTurboQuant,
+    };
     use crate::native_conv1d::conv1d;
     use crate::native_embedding::quantized_embedding_lookup_with_mode;
     use crate::native_kernels::{sigmoid_mul_fuse_enabled, sigmoid_mul_fused};
@@ -1042,6 +1045,20 @@ mod imp {
         mtp_capture_enabled: AtomicBool,
     }
 
+    /// Post-projection / post-RoPE intermediates shared by the plain and
+    /// TurboQuant full-attention cores (`full_attn_qkv_rope` output).
+    struct FullAttnQkv {
+        q_rope: Array,
+        k_rope: Array,
+        v_t: Array,
+        gate: Array,
+        scale: f32,
+        b: i32,
+        l: i32,
+        num_heads: i32,
+        head_dim: i32,
+    }
+
     impl NativeQwen3_5MoeModel {
         /// Load + validate a checkpoint laid out as a directory containing
         /// `config.json` and one or more `*.safetensors` shards.
@@ -1145,7 +1162,34 @@ mod imp {
         /// layer layout. SSM slot count for Qwen3.5-MoE is 2 (`[conv_state,
         /// ssm_state]`).
         pub fn make_cache(&self) -> NativePromptCache {
-            NativePromptCache::new(&self.is_linear_per_layer, /* ssm_slots */ 2)
+            // Opt-in TurboQuant KV compression for the full-attention layers
+            // (`LUMEN_QWEN35_TQ_KV=1`). Bits via `LUMEN_QWEN35_TQ_KV_BITS`
+            // (default 8 = near-lossless; 6 = lowest-clean; 4 = aggressive).
+            // Linear-attn layers keep their compact SSM state unchanged.
+            let tq_enabled = std::env::var("LUMEN_QWEN35_TQ_KV")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false);
+            if !tq_enabled {
+                return NativePromptCache::new(&self.is_linear_per_layer, /* ssm_slots */ 2);
+            }
+            let bits: u32 = std::env::var("LUMEN_QWEN35_TQ_KV_BITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&b| (2..=8).contains(&b))
+                .unwrap_or(8);
+            let max_pos = self.text_config().max_position_embeddings;
+            eprintln!(
+                "[mlx] Qwen35 TurboQuant KV ENABLED (bits={bits}, max_ctx={max_pos}) — \
+                 full-attn KV compressed ~{:.1}× vs bf16",
+                16.0 / bits as f32
+            );
+            NativePromptCache::new_with_tq(
+                &self.is_linear_per_layer,
+                /* ssm_slots */ 2,
+                true,
+                max_pos,
+                bits,
+            )
         }
 
         /// Resolve `(group_size, bits)` for a quantized linear layer.
@@ -1247,6 +1291,78 @@ mod imp {
             causal: bool,
             cache: &mut NativeKvCache,
         ) -> Result<Array> {
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
+            // (5) Append to KV cache and fetch full history.
+            let (k_full, v_full) = cache.update_and_fetch(&p.k_rope, &p.v_t)?;
+            // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
+            let attn_out = sdpa(&p.q_rope, &k_full, &v_full, p.scale, causal)?;
+            self.full_attn_finish(&attn_out, &p.gate, p.b, p.l, p.num_heads, p.head_dim, layer_idx)
+        }
+
+        /// TurboQuant-compressed variant of [`Self::layer_full_attn_forward`].
+        /// Projections + RoPE are identical (shared `full_attn_qkv_rope`); only
+        /// the KV store + attention core differ: K/Q are rotated by a fixed
+        /// Haar-orthogonal R (preserving Q·Kᵀ since R Rᵀ = I), K (rotated) and V
+        /// are Lloyd-Max scalar-quantized into the compressed cache, then
+        /// dequantized on the fly for a standard SDPA. The cache holds uint8
+        /// codes + f32 σ instead of bf16 K/V — ~2-4× smaller for the growing
+        /// full-attn history. Stage-1 only (no QJL) for this first cut.
+        pub(crate) fn layer_full_attn_forward_tq(
+            &self,
+            x: &Array,
+            layer_idx: usize,
+            causal: bool,
+            cache: &mut NativeRotatingKvCacheTurboQuant,
+        ) -> Result<Array> {
+            use crate::turboquant::{
+                TURBOQUANT_SEED, lloyd_max_centroids, lloyd_max_dequantize_scaled,
+                lloyd_max_quantize_stage1, rotate_last_axis, rotation_matrix_f32,
+            };
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
+
+            let centroids = lloyd_max_centroids(cache.bits())
+                .context("layer_full_attn_forward_tq: Lloyd-Max centroids")?;
+            let r = rotation_matrix_f32(p.head_dim as usize, TURBOQUANT_SEED)
+                .context("layer_full_attn_forward_tq: rotation matrix")?;
+
+            // Rotate K + Q (score-preserving), quantize rotated K. Q stays in
+            // the rotated frame to pair with the rotated/dequantized K.
+            let k_rot = rotate_last_axis(&p.k_rope, &r)?;
+            let q_rot = rotate_last_axis(&p.q_rope, &r)?;
+            let (k_codes, k_sigma) = lloyd_max_quantize_stage1(&k_rot, &centroids)
+                .context("layer_full_attn_forward_tq: quantize K")?;
+            // V is quantized un-rotated: O = S·V is correct with V_dq ≈ V, so no
+            // un-rotation step is needed on read.
+            let v_bf16 = p
+                .v_t
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .context("layer_full_attn_forward_tq: cast V to bf16")?;
+            let (v_codes, v_sigma) = lloyd_max_quantize_stage1(&v_bf16, &centroids)
+                .context("layer_full_attn_forward_tq: quantize V")?;
+
+            let ((kc, ks), (vc, vs)) = cache
+                .update_and_fetch(&k_codes, &k_sigma, &v_codes, &v_sigma)
+                .context("layer_full_attn_forward_tq: cache update_and_fetch")?;
+
+            let k_dq = lloyd_max_dequantize_scaled(&kc, &ks, &centroids)
+                .context("layer_full_attn_forward_tq: dequantize K")?;
+            let v_dq = lloyd_max_dequantize_scaled(&vc, &vs, &centroids)
+                .context("layer_full_attn_forward_tq: dequantize V")?;
+
+            let attn_out = sdpa(&q_rot, &k_dq, &v_dq, p.scale, causal)?;
+            self.full_attn_finish(&attn_out, &p.gate, p.b, p.l, p.num_heads, p.head_dim, layer_idx)
+        }
+
+        /// Shared projections + per-head norm + partial-rotary RoPE for the
+        /// full-attention layers. Returns the post-RoPE Q/K, the values, and the
+        /// gate — everything the plain and TurboQuant attention cores consume.
+        /// `offset` is the cache token offset (RoPE position base).
+        fn full_attn_qkv_rope(
+            &self,
+            x: &Array,
+            layer_idx: usize,
+            offset: i32,
+        ) -> Result<FullAttnQkv> {
             if x.ndim() != 3 {
                 return Err(anyhow!(
                     "layer_full_attn_forward: expected x of rank 3 [B, L, hidden], got ndim={}",
@@ -1334,7 +1450,6 @@ mod imp {
             // Default-off opt-in; Gemma 4 A/B at 4K was WASH (MLX dedup),
             // kept available for future verification and parity with
             // mlx-lm shader trace.
-            let offset = cache.offset() as i32;
             let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -1349,22 +1464,48 @@ mod imp {
                 (q, k)
             };
 
-            // (5) Append to KV cache and fetch full history.
-            let (k_full, v_full) = cache.update_and_fetch(&k_rope, &v_t)?;
+            Ok(FullAttnQkv {
+                q_rope,
+                k_rope,
+                v_t,
+                gate,
+                scale,
+                b,
+                l,
+                num_heads,
+                head_dim,
+            })
+        }
 
-            // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
-            let attn_out = sdpa(&q_rope, &k_full, &v_full, scale, causal)?;
-
+        /// Tail shared by the plain and TurboQuant full-attn cores: gate the
+        /// attention output by the sigmoid gate and project back to hidden size
+        /// (steps 7-8 of the original `layer_full_attn_forward`).
+        fn full_attn_finish(
+            &self,
+            attn_out: &Array,
+            gate: &Array,
+            b: i32,
+            l: i32,
+            num_heads: i32,
+            head_dim: i32,
+            layer_idx: usize,
+        ) -> Result<Array> {
+            let lw = match &self.layer_weights[layer_idx].attn {
+                AttnLayerWeights::Full(f) => f,
+                AttnLayerWeights::Linear(_) => {
+                    return Err(anyhow!("full_attn_finish: layer {layer_idx} is linear-attn"));
+                }
+            };
             // (7) Reshape attention output back to [B, L, hidden] and gate.
-            let attn_t = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3])
+            let attn_t = mlx_rs::ops::transpose_axes(attn_out, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose attn_out failed")?;
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, num_heads * head_dim])
                 .context("layer_full_attn_forward: reshape attn_out failed")?;
             let gated = if sigmoid_mul_fuse_enabled_pub() {
-                sigmoid_mul_fused(&gate, &attn_flat)
+                sigmoid_mul_fused(gate, &attn_flat)
                     .context("layer_full_attn_forward: fused sigmoid_mul failed")?
             } else {
-                let gate_sig = mlx_rs::ops::sigmoid(&gate)
+                let gate_sig = mlx_rs::ops::sigmoid(gate)
                     .context("layer_full_attn_forward: sigmoid(gate) failed")?;
                 mlx_rs::ops::multiply(&attn_flat, &gate_sig)
                     .context("layer_full_attn_forward: gated multiply failed")?
@@ -1940,6 +2081,9 @@ mod imp {
                 let attn = if is_linear {
                     let lin = layer_cache.as_linear_mut()?;
                     self.layer_linear_attn_forward(&normed, layer_idx, lin)?
+                } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
+                    let tq = layer_cache.as_full_turboquant_mut()?;
+                    self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq)?
                 } else {
                     let kv = layer_cache.as_full_mut()?;
                     self.layer_full_attn_forward(&normed, layer_idx, causal, kv)?

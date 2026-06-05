@@ -376,6 +376,12 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "Force required tool params",
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
     "For Qwen3.6 tool calls, inject a <parameter=KEY> opener before the model can close a function with a required parameter missing — preventing empty calls like read() with no path. The model still writes the value. Helps weak/quantized models with many tools; off by default.",
+  "env.entry.LUMEN_QWEN35_TQ_KV.label": "TurboQuant KV cache",
+  "env.entry.LUMEN_QWEN35_TQ_KV.help":
+    "Compress the Qwen3.6 full-attention KV cache with TurboQuant (rotation + Lloyd-Max scalar quant), cutting the growing KV memory ~2-4× so longer contexts fit before OOM. Trades a small dequant-on-read cost; at long context the memory saved can outweigh it. Linear-attention layers are unaffected. Experimental — measure quality (cosine/top-1) before relying on it. Off by default.",
+  "env.entry.LUMEN_QWEN35_TQ_KV_BITS.label": "TurboQuant KV bits",
+  "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help":
+    "Lloyd-Max bit width for TurboQuant KV (2-8). 8 = near-lossless (start here), 6 = lowest clean, 4 = aggressive/lossy. Only used when TurboQuant KV cache is enabled. Lower bits = more memory saved but more quality loss.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running

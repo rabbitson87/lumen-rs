@@ -367,6 +367,12 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "필수 툴 파라미터 강제",
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
     "Qwen3.6 툴콜에서 required 파라미터가 빠진 채 함수를 닫기 전에 <parameter=KEY> opener를 주입 — path 없는 read() 같은 빈 호출 방지. 값은 모델이 직접 작성. 툴 많고 약한/양자화 모델에 유효; 기본 꺼짐.",
+  "env.entry.LUMEN_QWEN35_TQ_KV.label": "TurboQuant KV 캐시",
+  "env.entry.LUMEN_QWEN35_TQ_KV.help":
+    "Qwen3.6 full-attention KV 캐시를 TurboQuant(회전 + Lloyd-Max 스칼라 양자화)으로 압축 — 커지는 KV 메모리를 ~2-4× 줄여 더 긴 컨텍스트를 OOM 전에 수용. dequant-on-read 비용이 약간 있지만, 장문에선 절감 메모리가 이를 상쇄할 수 있음. linear-attention 레이어는 영향 없음. 실험적 — 의존 전 품질(cosine/top-1) 측정 권장. 기본 꺼짐.",
+  "env.entry.LUMEN_QWEN35_TQ_KV_BITS.label": "TurboQuant KV 비트",
+  "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help":
+    "TurboQuant KV의 Lloyd-Max 비트 폭(2-8). 8 = 거의 무손실(여기서 시작), 6 = 최저 clean, 4 = 공격적/손실. TurboQuant KV 캐시 활성 시에만 사용. 비트 낮을수록 메모리 절감 크지만 품질 손실 증가.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브

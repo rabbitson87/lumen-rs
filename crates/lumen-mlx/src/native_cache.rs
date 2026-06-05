@@ -1478,6 +1478,52 @@ mod imp {
             self
         }
 
+        /// Deep-clone every backing Array into independent buffers — required
+        /// for fork-to-new-seq (Track A1 prefix cache). Mirrors
+        /// `native_snapshot::deep_clone_array`: `add(a, 0) + eval` forces a
+        /// fresh contiguous materialization (avoids mlx-rs `deep_clone`'s
+        /// stride bug). Scalar bookkeeping is copied verbatim.
+        pub fn deep_clone(&self) -> Result<Self> {
+            fn dc(a: &Option<Array>) -> Result<Option<Array>> {
+                match a {
+                    Some(arr) => {
+                        let zero = Array::from_f32(0.0)
+                            .as_dtype(arr.dtype())
+                            .context("TurboQuant deep_clone: cast zero scalar")?;
+                        let cloned = mlx_rs::ops::add(arr, &zero)
+                            .context("TurboQuant deep_clone: add(a, 0)")?;
+                        cloned.eval().context("TurboQuant deep_clone: eval")?;
+                        Ok(Some(cloned))
+                    }
+                    None => Ok(None),
+                }
+            }
+            Ok(Self {
+                keys_codes: dc(&self.keys_codes)?,
+                keys_sigma: dc(&self.keys_sigma)?,
+                values_codes: dc(&self.values_codes)?,
+                values_sigma: dc(&self.values_sigma)?,
+                keys_signs: dc(&self.keys_signs)?,
+                keys_residual_norm: dc(&self.keys_residual_norm)?,
+                offset: self.offset,
+                max_size: self.max_size,
+                keep: self.keep,
+                idx: self.idx,
+                bits: self.bits,
+                qjl_m: self.qjl_m,
+            })
+        }
+
+        /// Fresh empty cache with identical geometry (max_size / keep / bits /
+        /// QJL width) but no stored tokens — used by snapshot fork structure.
+        pub fn structure_clone(&self) -> Self {
+            let fresh = Self::new(self.max_size, self.keep, self.bits);
+            match self.qjl_m {
+                Some(m) => fresh.with_qjl(m),
+                None => fresh,
+            }
+        }
+
         pub fn qjl_m(&self) -> Option<usize> {
             self.qjl_m
         }
@@ -2289,6 +2335,13 @@ mod imp {
     pub enum NativeLayerCache {
         Full(NativeKvCache),
         Linear(NativeArraysCache),
+        /// Full-attention layer whose KV is TurboQuant-compressed (Lloyd-Max
+        /// Stage-1, optional QJL Stage-2). Reuses the rotating cache with
+        /// `keep == 0` + `max_size == max_position_embeddings`, so rotation
+        /// never fires and it behaves as a compressed append-only buffer.
+        /// Opt-in via `LUMEN_QWEN35_TQ_KV` — cuts the growing full-attn KV
+        /// footprint ~2-4× at the cost of dequant-on-read.
+        FullTurboquant(NativeRotatingKvCacheTurboQuant),
     }
 
     impl NativeLayerCache {
@@ -2299,14 +2352,15 @@ mod imp {
             match self {
                 NativeLayerCache::Full(c) => c.offset(),
                 NativeLayerCache::Linear(c) => c.offset(),
+                NativeLayerCache::FullTurboquant(c) => c.offset(),
             }
         }
 
         pub fn as_full_mut(&mut self) -> Result<&mut NativeKvCache> {
             match self {
                 NativeLayerCache::Full(c) => Ok(c),
-                NativeLayerCache::Linear(_) => Err(anyhow!(
-                    "NativeLayerCache::as_full_mut called on a Linear layer"
+                _ => Err(anyhow!(
+                    "NativeLayerCache::as_full_mut called on a non-Full layer"
                 )),
             }
         }
@@ -2314,8 +2368,20 @@ mod imp {
         pub fn as_linear_mut(&mut self) -> Result<&mut NativeArraysCache> {
             match self {
                 NativeLayerCache::Linear(c) => Ok(c),
-                NativeLayerCache::Full(_) => Err(anyhow!(
-                    "NativeLayerCache::as_linear_mut called on a Full layer"
+                _ => Err(anyhow!(
+                    "NativeLayerCache::as_linear_mut called on a non-Linear layer"
+                )),
+            }
+        }
+
+        /// Mutable access to the TurboQuant-compressed full-attn cache.
+        pub fn as_full_turboquant_mut(
+            &mut self,
+        ) -> Result<&mut NativeRotatingKvCacheTurboQuant> {
+            match self {
+                NativeLayerCache::FullTurboquant(c) => Ok(c),
+                _ => Err(anyhow!(
+                    "NativeLayerCache::as_full_turboquant_mut called on a non-FullTurboquant layer"
                 )),
             }
         }
@@ -2323,14 +2389,14 @@ mod imp {
         pub fn as_full(&self) -> Option<&NativeKvCache> {
             match self {
                 NativeLayerCache::Full(c) => Some(c),
-                NativeLayerCache::Linear(_) => None,
+                _ => None,
             }
         }
 
         pub fn as_linear(&self) -> Option<&NativeArraysCache> {
             match self {
                 NativeLayerCache::Linear(c) => Some(c),
-                NativeLayerCache::Full(_) => None,
+                _ => None,
             }
         }
 
@@ -2338,6 +2404,7 @@ mod imp {
             match self {
                 NativeLayerCache::Full(c) => c.clear(),
                 NativeLayerCache::Linear(c) => c.clear(),
+                NativeLayerCache::FullTurboquant(c) => c.clear(),
             }
         }
     }
@@ -2359,6 +2426,38 @@ mod imp {
                         NativeLayerCache::Linear(NativeArraysCache::new(ssm_slots))
                     } else {
                         NativeLayerCache::Full(NativeKvCache::new())
+                    }
+                })
+                .collect();
+            Self { layers }
+        }
+
+        /// Like [`NativePromptCache::new`] but full-attention layers are
+        /// TurboQuant-compressed when `tq_enabled`. Linear-attn layers are
+        /// unaffected (their SSM state is already compact). The TQ cache uses
+        /// `keep = 0` + `max_size = max_position_embeddings` so it never rotates
+        /// — a compressed append-only buffer. `tq_bits` is the Lloyd-Max bit
+        /// width (8 = sanity, 6 = lowest-clean, 4 = aggressive/lossy).
+        pub fn new_with_tq(
+            is_linear_per_layer: &[bool],
+            ssm_slots: usize,
+            tq_enabled: bool,
+            max_position_embeddings: usize,
+            tq_bits: u32,
+        ) -> Self {
+            if !tq_enabled {
+                return Self::new(is_linear_per_layer, ssm_slots);
+            }
+            let max_ctx = max_position_embeddings.max(1);
+            let layers = is_linear_per_layer
+                .iter()
+                .map(|&is_linear| {
+                    if is_linear {
+                        NativeLayerCache::Linear(NativeArraysCache::new(ssm_slots))
+                    } else {
+                        NativeLayerCache::FullTurboquant(NativeRotatingKvCacheTurboQuant::new(
+                            max_ctx, 0, tq_bits,
+                        ))
                     }
                 })
                 .collect();
@@ -2417,6 +2516,9 @@ mod imp {
                     NativeLayerCache::Full(_) => NativeLayerCache::Full(NativeKvCache::new()),
                     NativeLayerCache::Linear(c) => {
                         NativeLayerCache::Linear(NativeArraysCache::new(c.len()))
+                    }
+                    NativeLayerCache::FullTurboquant(c) => {
+                        NativeLayerCache::FullTurboquant(c.structure_clone())
                     }
                 })
                 .collect();

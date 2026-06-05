@@ -213,6 +213,25 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "advanced",
   },
+  {
+    key: "LUMEN_QWEN35_TQ_KV",
+    labelKey: "env.entry.LUMEN_QWEN35_TQ_KV.label",
+    helpKey: "env.entry.LUMEN_QWEN35_TQ_KV.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_QWEN35_TQ_KV_BITS",
+    labelKey: "env.entry.LUMEN_QWEN35_TQ_KV_BITS.label",
+    helpKey: "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help",
+    kind: "number",
+    min: 2,
+    max: 8,
+    step: 1,
+    defaultValue: "8",
+    section: "advanced",
+  },
 
   // ── Debug (developer / triage) ─────────────────────────────────────
   {
