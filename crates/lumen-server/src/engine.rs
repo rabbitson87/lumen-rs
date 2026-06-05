@@ -877,7 +877,7 @@ impl InferenceEngine {
         // ids ("gpt-3.5-turbo") that hide the actual loaded family.
         let thinking_on =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let parsed = if needs_structured {
+        let mut parsed = if needs_structured {
             let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
                 .iter()
@@ -923,6 +923,8 @@ impl InferenceEngine {
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, thinking_on);
+        // Bug A: resolve abbreviated tool names by unique suffix match.
+        remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1070,7 +1072,7 @@ impl InferenceEngine {
         }
         lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
-        let parsed = if needs_structured {
+        let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
             // Anthropic ships `tool_use.input` as a real JSON Value, so we
             // don't need to parse strings (vs OpenAI's JSON-encoded
@@ -1265,6 +1267,8 @@ impl InferenceEngine {
         let prompt_tokens = self
             .backend
             .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+        // Bug A: resolve abbreviated tool names by unique suffix match.
+        remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1404,8 +1408,10 @@ impl InferenceEngine {
         // mid-decode via `BackendStreamEvent::ToolCallStart`. Lives
         // outside both branches so the post-decode emission loop can
         // skip Start chunks already on the wire.
-        let mut early_tc: Vec<(String, u32, String)> = Vec::new();
-        let mut next_index: u32 = 0;
+        // Kept (always empty) so the reconciliation loop's `early_tc.get(i)`
+        // falls through to a fresh, sequential per-call emission. Early
+        // per-call Starts are intentionally NOT emitted (see closures below).
+        let early_tc: Vec<(String, u32, String)> = Vec::new();
         let result = if needs_structured {
             let arg_values: Vec<serde_json::Value> = req
                 .messages
@@ -1484,15 +1490,14 @@ impl InferenceEngine {
                                 .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
-                            let idx = next_index;
-                            next_index += 1;
-                            let id = format!("call_{}", gen_id());
-                            early_tc.push((name.to_string(), idx, id.clone()));
-                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                                index: idx,
-                                id,
-                                name: name.to_string(),
-                            });
+                            // Early per-call Start suppressed. Args are not known
+                            // until a call closes, so emitting Start0,Start1,Start2
+                            // up front (then Args0,Args1,Args2 in a batch) made
+                            // clients fold every later parallel call's arguments
+                            // onto index 0 — only the first tool call kept its args.
+                            // The reconciliation loop below now emits each call as a
+                            // sequential Start_i → Args_i → Stop_i unit.
+                            let _ = name;
                         }
                     }
                     Ok(())
@@ -1518,15 +1523,14 @@ impl InferenceEngine {
                                 .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
-                            let idx = next_index;
-                            next_index += 1;
-                            let id = format!("call_{}", gen_id());
-                            early_tc.push((name.to_string(), idx, id.clone()));
-                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                                index: idx,
-                                id,
-                                name: name.to_string(),
-                            });
+                            // Early per-call Start suppressed. Args are not known
+                            // until a call closes, so emitting Start0,Start1,Start2
+                            // up front (then Args0,Args1,Args2 in a batch) made
+                            // clients fold every later parallel call's arguments
+                            // onto index 0 — only the first tool call kept its args.
+                            // The reconciliation loop below now emits each call as a
+                            // sequential Start_i → Args_i → Stop_i unit.
+                            let _ = name;
                         }
                     }
                     Ok(())
@@ -1535,7 +1539,10 @@ impl InferenceEngine {
         };
 
         match result {
-            Ok(parsed) => {
+            Ok(mut parsed) => {
+                // Bug A: resolve abbreviated tool names (e.g. the model dropped
+                // an MCP namespace) by unique suffix match before emitting.
+                remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
                 // Phase 1.5: emit each parsed tool_call as the
                 // start / arguments / stop trio so the SSE layer can
                 // synthesize OpenAI `delta.tool_calls` chunks. Phase
@@ -1643,8 +1650,10 @@ impl InferenceEngine {
         //
         // Phase 1.6c: tracks tool_calls the backend announced mid-decode
         // so the post-decode loop skips redundant Start chunks.
-        let mut early_tc: Vec<(String, u32, String)> = Vec::new();
-        let mut next_index: u32 = 0;
+        // Kept (always empty) so the reconciliation loop's `early_tc.get(i)`
+        // falls through to a fresh, sequential per-call emission. Early
+        // per-call Starts are intentionally NOT emitted (see closures below).
+        let early_tc: Vec<(String, u32, String)> = Vec::new();
         let result = if needs_structured {
             let assistant_text_buf: Vec<String> = req
                 .messages
@@ -1791,15 +1800,12 @@ impl InferenceEngine {
                                 .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
-                            let idx = next_index;
-                            next_index += 1;
-                            let id = format!("toolu_{}", gen_id());
-                            early_tc.push((name.to_string(), idx, id.clone()));
-                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                                index: idx,
-                                id,
-                                name: name.to_string(),
-                            });
+                            // Early per-call Start suppressed — see the call-1
+                            // closure above and the reconciliation loop below.
+                            // Sequential Start_i → Args_i → Stop_i per call is the
+                            // standard order; batched up-front Starts dropped args
+                            // for parallel calls after index 0.
+                            let _ = name;
                         }
                     }
                     Ok(())
@@ -1825,15 +1831,12 @@ impl InferenceEngine {
                                 .try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
-                            let idx = next_index;
-                            next_index += 1;
-                            let id = format!("toolu_{}", gen_id());
-                            early_tc.push((name.to_string(), idx, id.clone()));
-                            let _ = token_tx.try_send(StreamEvent::ToolCallStart {
-                                index: idx,
-                                id,
-                                name: name.to_string(),
-                            });
+                            // Early per-call Start suppressed — see the call-1
+                            // closure above and the reconciliation loop below.
+                            // Sequential Start_i → Args_i → Stop_i per call is the
+                            // standard order; batched up-front Starts dropped args
+                            // for parallel calls after index 0.
+                            let _ = name;
                         }
                     }
                     Ok(())
@@ -1842,7 +1845,10 @@ impl InferenceEngine {
         };
 
         match result {
-            Ok(parsed) => {
+            Ok(mut parsed) => {
+                // Bug A: resolve abbreviated tool names (e.g. the model dropped
+                // an MCP namespace) by unique suffix match before emitting.
+                remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
                 let has_tool_calls = !parsed.tool_calls.is_empty();
                 for (i, call) in parsed.tool_calls.iter().enumerate() {
                     let (index, already_started) = match early_tc.get(i) {
@@ -2140,6 +2146,53 @@ fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> 
 /// `id` is generated server-side; clients echo it on the next turn as
 /// `tool_call_id`. `function.arguments` is JSON-encoded into a string per
 /// OpenAI spec (the client `JSON.parse`'s it themselves).
+/// Bug A mitigation: resolve a tool name the model abbreviated.
+///
+/// Weak/quantized models sometimes emit a tool's *documented* short name
+/// (`ctx_read`) instead of its *callable* namespaced name
+/// (`mcp__lean_ctx_ctx_read`) — the MCP `mcp__<server>_<tool>` prefix appears
+/// in the schema but the prose docs use the short form, and the model follows
+/// the prose. When an emitted name matches NO tool exactly but UNIQUELY matches
+/// one tool by suffix at a separator boundary (the char before the suffix is
+/// non-alphanumeric, so `read` can't grab `thread`), remap it to the full name.
+/// Ambiguous or absent matches are left untouched. Keeps stock omp working
+/// without renaming tools.
+fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
+    if calls.is_empty() || tools.is_empty() {
+        return;
+    }
+    for c in calls.iter_mut() {
+        if tools.iter().any(|t| t.name == c.name) {
+            continue; // already a valid, exact name
+        }
+        let emitted = c.name.as_str();
+        let mut hit: Option<&str> = None;
+        let mut ambiguous = false;
+        for t in tools {
+            let n = t.name;
+            if n.len() <= emitted.len() || !n.ends_with(emitted) {
+                continue;
+            }
+            let before = n.as_bytes()[n.len() - emitted.len() - 1];
+            if before.is_ascii_alphanumeric() {
+                continue; // suffix must start at a separator boundary
+            }
+            if hit.is_some() {
+                ambiguous = true;
+                break;
+            }
+            hit = Some(n);
+        }
+        if ambiguous {
+            continue;
+        }
+        if let Some(full) = hit {
+            eprintln!("[mlx] tool-name resolved {:?} -> {:?} (suffix match)", c.name, full);
+            c.name = full.to_string();
+        }
+    }
+}
+
 fn parsed_to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<ToolCall> {
     calls
         .iter()
@@ -3422,6 +3475,72 @@ impl InferenceEngine {
             repeat_penalty,
             eos_tokens: vec![1, 106], // Gemma: <eos>=1, <end_of_turn>=106
         })
+    }
+}
+
+#[cfg(test)]
+mod tool_name_resolve_tests {
+    use super::remap_tool_call_names;
+    use lumen_mlx::chat_io::{ParsedToolCall, ToolDef};
+    use serde_json::Value as JsonValue;
+
+    fn td(name: &str) -> ToolDef<'_> {
+        ToolDef {
+            name,
+            description: None,
+            parameters: None,
+            response: None,
+        }
+    }
+    fn tc(name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments: JsonValue::Null,
+        }
+    }
+
+    #[test]
+    fn resolves_dropped_mcp_namespace_by_unique_suffix() {
+        let tools = [
+            td("read"),
+            td("mcp__lean_ctx_ctx_read"),
+            td("mcp__lean_ctx_ctx_tree"),
+            td("bash"),
+        ];
+        // Exact native name is kept (exact match wins over suffix).
+        let mut a = [tc("read")];
+        remap_tool_call_names(&mut a, &tools);
+        assert_eq!(a[0].name, "read");
+        // Abbreviated MCP names → full namespaced names.
+        let mut b = [tc("ctx_read")];
+        remap_tool_call_names(&mut b, &tools);
+        assert_eq!(b[0].name, "mcp__lean_ctx_ctx_read");
+        let mut c = [tc("ctx_tree")];
+        remap_tool_call_names(&mut c, &tools);
+        assert_eq!(c[0].name, "mcp__lean_ctx_ctx_tree");
+    }
+
+    #[test]
+    fn leaves_unknown_and_ambiguous_untouched() {
+        let tools = [td("mcp__a_get"), td("mcp__b_get")];
+        // Ambiguous suffix `get` matches two tools → unchanged.
+        let mut a = [tc("get")];
+        remap_tool_call_names(&mut a, &tools);
+        assert_eq!(a[0].name, "get");
+        // No suffix match at all → unchanged.
+        let mut b = [tc("nonexistent")];
+        remap_tool_call_names(&mut b, &tools);
+        assert_eq!(b[0].name, "nonexistent");
+    }
+
+    #[test]
+    fn requires_separator_boundary() {
+        // `read` must NOT be rewritten to `thread` — the suffix has no
+        // separator before it.
+        let tools = [td("thread")];
+        let mut a = [tc("read")];
+        remap_tool_call_names(&mut a, &tools);
+        assert_eq!(a[0].name, "read");
     }
 }
 
