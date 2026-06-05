@@ -374,6 +374,28 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help":
     "TurboQuant KV의 Lloyd-Max 비트 폭(2-8). 8 = 거의 무손실(여기서 시작), 6 = 최저 clean, 4 = 공격적/손실. TurboQuant KV 캐시 활성 시에만 사용. 비트 낮을수록 메모리 절감 크지만 품질 손실 증가.",
 
+  // 메모리 계산기 (context / chunk / KV 모드별 peak 메모리 예측).
+  "memcalc.title": "메모리 계산기",
+  "memcalc.noGeometry":
+    "모델 '{model}'의 메모리 프로파일이 없습니다. 카탈로그의 네이티브 MLX 모델(예: Qwen3.6-35B)을 지원합니다.",
+  "memcalc.budget": "예산",
+  "memcalc.budget.hint":
+    "MLX 메모리 예산 ≈ 머신 RAM − OS 여유분. 정확한 값은 시작 로그 [mlx-mem] memory_limit set to N GB 에서 확인.",
+  "memcalc.kv": "KV",
+  "memcalc.bits": "bits",
+  "memcalc.bits.hint":
+    "bits = 품질만 (LUMEN_QWEN35_TQ_KV_BITS). 코드를 unpacked(uint8)로 저장해 어떤 bits든 메모리는 ~2×. 8 = 거의 무손실, 6 = 최저 clean, 4 = 손실. 4-bit에서 'uint4 packed' 체크 시 진짜 ~4× 미리보기 (패킹 미연결).",
+  "memcalc.packed": "uint4 packed*",
+  "memcalc.peak": "peak / 예산",
+  "memcalc.chunk": "청크",
+  "memcalc.prefix": "prefix 캐시",
+  "memcalc.context": "컨텍스트",
+  "memcalc.over": "예산 초과",
+  "memcalc.maxAtConfig": "이 설정의 최대 컨텍스트:",
+  "memcalc.table.title": "최대 컨텍스트 (토큰) — 예산 {budget} GB",
+  "memcalc.table.note":
+    "청크 축소가 가장 큰 레버(attention score가 청크×컨텍스트로 증가). TQ는 persistent KV를 줄임. *TQ4 = uint4 패킹, 미연결(미리보기). 추정치 — 본인 peak= 로그로 보정 권장.",
+
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
   // (캐시 모드/비트, ctx caps 등) 는 재시작 시점에만 반영됨.

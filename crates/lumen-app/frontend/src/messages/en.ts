@@ -383,6 +383,28 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help":
     "Lloyd-Max bit width for TurboQuant KV (2-8). 8 = near-lossless (start here), 6 = lowest clean, 4 = aggressive/lossy. Only used when TurboQuant KV cache is enabled. Lower bits = more memory saved but more quality loss.",
 
+  // Memory calculator (predict peak memory vs context / chunk / KV mode).
+  "memcalc.title": "Memory calculator",
+  "memcalc.noGeometry":
+    "No memory profile for model '{model}'. The calculator supports the catalog's native MLX models (e.g. Qwen3.6-35B).",
+  "memcalc.budget": "Budget",
+  "memcalc.budget.hint":
+    "MLX memory budget ≈ machine RAM minus OS headroom. Check the startup log line [mlx-mem] memory_limit set to N GB for the exact value.",
+  "memcalc.kv": "KV",
+  "memcalc.bits": "bits",
+  "memcalc.bits.hint":
+    "bits = quality only (LUMEN_QWEN35_TQ_KV_BITS). Storage is ~2× for ANY bits because codes are stored unpacked (uint8). 8 = near-lossless, 6 = lowest clean, 4 = lossy. Tick 'uint4 packed' at 4-bit to preview true ~4× (packing not yet wired).",
+  "memcalc.packed": "uint4 packed*",
+  "memcalc.peak": "peak / budget",
+  "memcalc.chunk": "Chunk",
+  "memcalc.prefix": "prefix cache",
+  "memcalc.context": "Context",
+  "memcalc.over": "over budget",
+  "memcalc.maxAtConfig": "Max context at this config:",
+  "memcalc.table.title": "Max context (tokens) — budget {budget} GB",
+  "memcalc.table.note":
+    "Shrinking the chunk is the biggest lever (attention scores scale with chunk × context). TQ trims persistent KV. *TQ4 = uint4 packing, not yet wired (preview). Estimates — calibrate against your peak= logs.",
+
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
   // server needs a restart for env-derived knobs (cache mode/bits, ctx

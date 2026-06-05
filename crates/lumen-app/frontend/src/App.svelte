@@ -20,6 +20,7 @@
     type CorsMode,
   } from "./lib/api";
   import EnvOverrides from "./lib/EnvOverrides.svelte";
+  import MemoryCalculator from "./lib/MemoryCalculator.svelte";
   import DoctorPanel from "./lib/DoctorPanel.svelte";
   import UpdatePanel from "./lib/UpdatePanel.svelte";
   import ApiTabs from "./lib/ApiTabs.svelte";
@@ -112,6 +113,8 @@
 
   type TopTab = "main" | "tuning" | "api" | "debug" | "language";
   let activeTab = $state<TopTab>("main");
+  // Memory calculator card (Tuning tab) — collapsed by default.
+  let calcOpen = $state(false);
   // SvelteMap (not plain Map) so `.set()`/`.delete()` mutations trigger UI
   // updates without manual reassignment — fixes the case where completed
   // download lines wouldn't disappear after the 3s auto-dismiss timer.
@@ -954,6 +957,24 @@
   <!-- CONTEXT -->
   <section class="{cardBase} col-span-6">
     <h2 class={cardH2}>{t("context.title")} <span class="dim">{t("context.titleHint")}</span></h2>
+
+    <!-- Memory calculator: borderless disclosure at the top of the context card -->
+    <button
+      class="flex items-center gap-2 w-full text-left bg-transparent p-0 m-0 mb-2 pb-2 border-b border-border hover:text-text"
+      onclick={() => (calcOpen = !calcOpen)}
+    >
+      <span class="dim text-[11px] font-semibold tracking-[0.06em] uppercase">{t("memcalc.title")}</span>
+      <span class="dim ml-auto text-[11px]">{calcOpen ? "▾" : "▸"}</span>
+    </button>
+    {#if calcOpen}
+      <div class="mb-3.5">
+        <MemoryCalculator
+          modelId={config?.active_model ?? null}
+          env={config?.env_overrides ?? {}}
+        />
+      </div>
+    {/if}
+
     {#if config}
       <div class={`-mt-1 mb-3 px-2.5 py-2 bg-panel-2 border border-border border-l-[3px] rounded text-xs leading-[1.55] flex flex-col gap-0.5 ${
         config.quant.kv_mode !== "off" ? "border-l-accent" : "border-l-warn"
