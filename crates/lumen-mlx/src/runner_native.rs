@@ -1051,6 +1051,10 @@ mod imp {
                 eprintln!(
                     "[mlx-native] timing instrumentation ENABLED (forward/tail + layer-kind breakdown)"
                 );
+                eprintln!(
+                    "[mlx-native] ⚠️  LUMEN_NATIVE_TIMING inserts per-layer GPU sync barriers — \
+                     profiling ONLY, cuts throughput ~8× (~70→~8 tok/s). Unset for normal serving."
+                );
             } else if stage_only {
                 eprintln!(
                     "[mlx-native] stage timing ENABLED (forward+eval/tail only; no layer probes)"

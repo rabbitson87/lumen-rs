@@ -360,7 +360,7 @@ export const ko: Record<string, string> = {
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
   "env.entry.LUMEN_NATIVE_TIMING.label": "네이티브 단계 타이밍",
   "env.entry.LUMEN_NATIVE_TIMING.help":
-    "네이티브 MLX 러너의 단계별 forward 시간(embed / attention / linear-attn / MoE / lm_head ms) 출력. prefill/decode 병목 탐색용. 디버그 전용.",
+    "네이티브 MLX 러너의 단계별 forward 시간(embed / attention / linear-attn / MoE / lm_head ms) 출력. prefill/decode 병목 탐색용. ⚠️ 프로파일링 전용 — 레이어마다 GPU 동기화 배리어를 삽입해 MLX 파이프라이닝을 깨고 처리량을 ~8배 떨어뜨림(예: ~70→~8 tok/s). 평상시엔 반드시 OFF.",
   "env.entry.LUMEN_QWEN35_TOOL_DEBUG.label": "Qwen 툴콜 raw 덤프",
   "env.entry.LUMEN_QWEN35_TOOL_DEBUG.help":
     "Qwen3.6 툴콜 턴의 모델 raw 출력 전체(<tool_call>…</tool_call> 원문) 출력. 누락/유실된 툴 인자 진단용. 장황함 — 디버그 전용.",

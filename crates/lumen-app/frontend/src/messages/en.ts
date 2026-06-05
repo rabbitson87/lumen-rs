@@ -369,7 +369,7 @@ export const en: Record<string, string> = {
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",
   "env.entry.LUMEN_NATIVE_TIMING.label": "Native stage timing",
   "env.entry.LUMEN_NATIVE_TIMING.help":
-    "Log per-stage forward timing (embed / attention / linear-attn / MoE / lm_head ms) for the native MLX runner. Use to find prefill/decode bottlenecks. Debug only.",
+    "Log per-stage forward timing (embed / attention / linear-attn / MoE / lm_head ms) for the native MLX runner. Use to find prefill/decode bottlenecks. ⚠️ Profiling only — inserts GPU sync barriers per layer that break MLX pipelining and cut throughput ~8× (e.g. ~70→~8 tok/s). Turn OFF for normal use.",
   "env.entry.LUMEN_QWEN35_TOOL_DEBUG.label": "Qwen tool-call raw dump",
   "env.entry.LUMEN_QWEN35_TOOL_DEBUG.help":
     "Log the raw decoded model output for Qwen3.6 tool-call turns (full <tool_call>…</tool_call> text). Use to diagnose missing/dropped tool arguments. Verbose — debug only.",
