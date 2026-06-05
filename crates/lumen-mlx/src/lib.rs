@@ -718,6 +718,41 @@ fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<
     Some(format!("auto-{:016x}", h.finish()))
 }
 
+/// Whether force-required-params injection is enabled (default off). When on,
+/// the Qwen3.6 tool decode loop injects a `<parameter=KEY>\n` opener whenever
+/// the model is about to close a `<function=NAME>` block with a REQUIRED param
+/// still missing — turning the model's empty `<function=read></function>`
+/// (→ "path is required") into a structurally valid call whose value the model
+/// still writes itself. See [`MlxBackend::chat_with_tools_impl`].
+fn force_required_params_enabled() -> bool {
+    std::env::var("LUMEN_QWEN35_FORCE_REQUIRED_PARAMS")
+        .map(|v| v == "1" || v == "on" || v == "true")
+        .unwrap_or(false)
+}
+
+/// Build the force-required map (tool name → required param keys, schema order)
+/// from the request's tool defs. Only the `required` array of each tool's JSON
+/// Schema is used; tools with no required params are omitted.
+fn force_required_params_map(
+    tools: &[crate::chat_io::ToolDef<'_>],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    for t in tools {
+        let Some(params) = t.parameters else { continue };
+        let Some(req) = params.get("required").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let keys: Vec<String> = req
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !keys.is_empty() {
+            map.insert(t.name.to_string(), keys);
+        }
+    }
+    map
+}
+
 /// Render the chat-template system-prompt block alone (no trailing assistant
 /// header). Tokenizing this produces the prefix tokens we expect to find at
 /// the start of the full chat-input tokenization.
@@ -1708,6 +1743,20 @@ impl MlxQwen35Backend {
         Ok(enc.get_ids().to_vec())
     }
 
+    /// Encode WITHOUT special tokens — for injecting literal control text
+    /// (e.g. forced `<parameter=KEY>` openers) into the decode stream, where
+    /// an auto-prepended BOS/EOS would corrupt the running KV sequence.
+    fn encode_raw(&self, text: &str) -> Result<Vec<u32>> {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
+        let enc = tok
+            .encode(text, false)
+            .map_err(|e| anyhow!("tokenizer encode_raw: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    }
+
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
         let tok = self
             .tokenizer
@@ -2003,6 +2052,11 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
             |_ev| Ok(()),
         )
     }
@@ -2033,6 +2087,11 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
             on_event,
         )
     }
@@ -2056,6 +2115,11 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
             |_ev| Ok(()),
         )
     }
@@ -2083,6 +2147,11 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
             on_event,
         )
     }
@@ -2244,6 +2313,11 @@ impl MlxQwen35Backend {
         // this request even when the feature is enabled — useful for ad-hoc
         // benchmarks that want clean cold-prefill timing.
         prefix_cache_key: Option<&str>,
+        // Tool name → required param keys. Empty unless
+        // `LUMEN_QWEN35_FORCE_REQUIRED_PARAMS` is on; when non-empty the decode
+        // loop injects a `<parameter=KEY>\n` opener before the model can close
+        // a `<function=NAME>` block with a required param still missing.
+        force_required: std::collections::HashMap<String, Vec<String>>,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -2251,6 +2325,8 @@ impl MlxQwen35Backend {
     {
         use crate::chat_io::BackendStreamEvent;
         use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
+
+        let force_active = !force_required.is_empty();
 
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
@@ -2298,6 +2374,53 @@ impl MlxQwen35Backend {
 
         let t_decode = std::time::Instant::now();
         for step in 1..max_new_tokens {
+            // Force-required-params injection (opt-in). If the previous feed
+            // left the parser at a clean tool-call-body boundary with a
+            // REQUIRED param still missing, inject `<parameter=KEY>\n` so the
+            // model writes the value instead of closing an empty call
+            // (`<function=read></function>` → "path is required"). The value
+            // is still model-generated — only the opener is forced.
+            if force_active {
+                if let Some(key) = parser.next_required_param_to_force(&force_required) {
+                    let inj = format!("<parameter={key}>\n");
+                    let inj_tokens = self.encode_raw(&inj)?;
+                    if !inj_tokens.is_empty() {
+                        // Forward the still-unforwarded `last` plus the opener
+                        // in one extend; `last` is consumed (already pushed +
+                        // fed in the prior step).
+                        let mut combined = Vec::with_capacity(1 + inj_tokens.len());
+                        combined.push(last);
+                        combined.extend_from_slice(&inj_tokens);
+                        let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
+                        generated.extend_from_slice(&inj_tokens);
+                        emitted_idx = generated.len();
+                        for ev in parser.feed(&inj) {
+                            forward_parse_event(ev, &mut on_event)?;
+                        }
+                        if debug_qwen_tools {
+                            eprintln!("[qwen35-tools] forced required param {key:?}");
+                        }
+                        // `next2` is produced-but-unforwarded — it becomes the
+                        // new `last`; push + feed it to restore the loop's
+                        // top-of-iteration invariant, then re-evaluate.
+                        last = next2;
+                        pos = pos2;
+                        generated.push(last);
+                        if let Ok(text) = self.decode(&generated[emitted_idx..]) {
+                            if !text.is_empty() && !text.contains('\u{FFFD}') {
+                                for ev in parser.feed(&text) {
+                                    forward_parse_event(ev, &mut on_event)?;
+                                }
+                                emitted_idx = generated.len();
+                            }
+                        }
+                        if self.eos_tokens.contains(&last) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
             last = next;
             pos = new_pos;

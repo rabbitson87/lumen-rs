@@ -482,6 +482,37 @@ impl Qwen35ResponseParser {
         &self.visible
     }
 
+    /// Force-required-params hook (opt-in via the decode loop).
+    ///
+    /// When the parser is sitting at a CLEAN decision point inside a
+    /// tool-call body — i.e. right after the `<function=NAME>` opener or a
+    /// just-closed `</parameter>`, with no partial delimiter buffered — and
+    /// the current function `NAME` has a REQUIRED parameter that has not yet
+    /// been emitted, return the first such missing key (schema order). The
+    /// decode loop injects `<parameter=KEY>\n`, forcing the model to supply
+    /// the value rather than close the call with missing required args
+    /// (`<function=read></function>` → "path is required").
+    ///
+    /// Returns `None` when not in a body, when a partial token is buffered
+    /// (the model is mid-emitting and must not be pre-empted), or when every
+    /// required param for the current call is already present.
+    pub fn next_required_param_to_force(
+        &self,
+        required: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Option<String> {
+        if !matches!(self.state, State::InToolCallBody) {
+            return None;
+        }
+        if !self.buffer.trim().is_empty() {
+            return None;
+        }
+        let pending = self.pending.as_ref()?;
+        let reqs = required.get(&pending.name)?;
+        reqs.iter()
+            .find(|k| !pending.args.contains_key(k.as_str()))
+            .cloned()
+    }
+
     fn try_advance_visible(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
         // Look for the next interesting delimiter: <tool_call> or <think>
         // or </think>. Whatever comes first wins.
@@ -848,6 +879,34 @@ mod tests {
         assert!(s.contains("<IMPORTANT>"));
         assert!(s.contains("<|im_start|>user\nwhat is the weather?<|im_end|>"));
         assert!(s.ends_with("<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn force_required_param_detects_missing_then_clears() {
+        let mut required = std::collections::HashMap::new();
+        required.insert("read".to_string(), vec!["path".to_string()]);
+
+        // Model opens the function but emits NO parameter → force `path`.
+        let mut p = Qwen35ResponseParser::new();
+        let _ = p.feed("<tool_call>\n<function=read>\n");
+        assert_eq!(
+            p.next_required_param_to_force(&required).as_deref(),
+            Some("path")
+        );
+
+        // Once the param is supplied, nothing left to force.
+        let _ = p.feed("<parameter=path>\nCargo.toml\n</parameter>\n");
+        assert_eq!(p.next_required_param_to_force(&required), None);
+
+        // Mid-emitting a partial `<parameter=` → do NOT pre-empt the model.
+        let mut p2 = Qwen35ResponseParser::new();
+        let _ = p2.feed("<tool_call>\n<function=read>\n<param");
+        assert_eq!(p2.next_required_param_to_force(&required), None);
+
+        // A tool with no required entry is never forced.
+        let mut p3 = Qwen35ResponseParser::new();
+        let _ = p3.feed("<tool_call>\n<function=todo_write>\n");
+        assert_eq!(p3.next_required_param_to_force(&required), None);
     }
 
     #[test]
