@@ -571,6 +571,34 @@
     setTimeout(() => (statusMessage = null), 2000);
   }
 
+  // Apply the memory calculator's previewed config to the real tuning state.
+  // KV mode + bits land on the *structured* quant config so the QUANT card
+  // reflects them; chunk / prefix / the Qwen3.6 TQ-KV activation live only as
+  // env overrides (no dedicated card). Both persist via their own command and a
+  // single restart toast — env is read once at spawn, so Stop → Start applies.
+  async function applyCalcSelection(sel: {
+    kvOn: boolean;
+    bits: number;
+    chunk: number;
+    prefix: boolean;
+  }) {
+    if (!config) return;
+    let next = await api.updateQuantConfig({
+      ...config.quant,
+      kv_mode: sel.kvOn ? "on" : "off",
+      bits: sel.bits,
+    });
+    const envPatch: Record<string, string> = {
+      LUMEN_QWEN35_TQ_KV: sel.kvOn ? "1" : "0",
+      LUMEN_QWEN35_PREFILL_CHUNK: String(sel.chunk),
+      LUMEN_MLX_PREFIX_CACHE: sel.prefix ? "1" : "0",
+    };
+    if (sel.kvOn) envPatch.LUMEN_QWEN35_TQ_KV_BITS = String(sel.bits);
+    next = await api.updateEnvOverrides({ ...next.env_overrides, ...envPatch });
+    config = next;
+    savedToast();
+  }
+
   async function saveEnvOverrides(next: Record<string, string>) {
     if (!config) return;
     config = await api.updateEnvOverrides(next);
@@ -971,6 +999,7 @@
         <MemoryCalculator
           modelId={config?.active_model ?? null}
           env={config?.env_overrides ?? {}}
+          onApply={applyCalcSelection}
         />
       </div>
     {/if}

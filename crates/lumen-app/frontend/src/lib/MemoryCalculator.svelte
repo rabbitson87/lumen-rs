@@ -13,8 +13,19 @@
     modelId: string | null;
     /** Current env overrides — used to seed KV mode / chunk / prefix defaults. */
     env: Record<string, string>;
+    /**
+     * Push the previewed config into the live tuning state. Receives the
+     * semantic knobs; the parent maps them onto the structured quant config
+     * (so the QUANT card updates) plus the Qwen3.6 env overrides.
+     */
+    onApply?: (sel: {
+      kvOn: boolean;
+      bits: number;
+      chunk: number;
+      prefix: boolean;
+    }) => void;
   }
-  let { modelId, env }: Props = $props();
+  let { modelId, env, onApply }: Props = $props();
 
   const geom = $derived(geometryForModel(modelId ?? ""));
 
@@ -98,6 +109,17 @@
           ? "bg-warn"
           : "bg-ok",
   );
+
+  // Push the previewed knobs into the live tuning state. The parent maps them
+  // onto the structured quant config (QUANT card) + Qwen3.6 env overrides, and a
+  // Stop → Start applies them. `packed` is a memory *preview* (uint4 not yet
+  // wired), so it is intentionally not exported.
+  let applied = $state(false);
+  function apply() {
+    onApply?.({ kvOn: kvMode === "tq", bits, chunk, prefix: prefixCache });
+    applied = true;
+    setTimeout(() => (applied = false), 1800);
+  }
 </script>
 
 <div class="text-xs">
@@ -249,5 +271,19 @@
       </table>
     </div>
     <div class="dim text-[10px] mt-1 leading-snug">{t("memcalc.table.note")}</div>
+
+    {#if onApply}
+      <div class="flex items-center gap-2 mt-3 pt-2.5 border-t border-border">
+        <button
+          class="px-2.5 py-1 text-[11px] mono bg-panel-2 text-text border border-border rounded hover:border-accent disabled:opacity-50"
+          onclick={apply}
+        >{t("memcalc.apply")}</button>
+        {#if applied}
+          <span class="text-[10.5px] text-ok">{t("memcalc.applied")}</span>
+        {:else}
+          <span class="dim text-[10px] leading-snug">{t("memcalc.apply.hint")}</span>
+        {/if}
+      </div>
+    {/if}
   {/if}
 </div>

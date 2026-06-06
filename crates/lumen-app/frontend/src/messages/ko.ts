@@ -395,6 +395,10 @@ export const ko: Record<string, string> = {
   "memcalc.table.title": "최대 컨텍스트 (토큰) — 예산 {budget} GB",
   "memcalc.table.note":
     "청크 축소가 가장 큰 레버(attention score가 청크×컨텍스트로 증가). TQ는 persistent KV를 줄임. *TQ4 = uint4 패킹, 미연결(미리보기). 추정치 — 본인 peak= 로그로 보정 권장.",
+  "memcalc.apply": "튜닝에 적용",
+  "memcalc.applied": "적용됨 ✓ — Stop → Start 해야 반영",
+  "memcalc.apply.hint":
+    "QUANT 카드(KV 모드/비트) + env override(청크/prefix)를 갱신. 재시작 시 반영.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브

@@ -404,6 +404,10 @@ export const en: Record<string, string> = {
   "memcalc.table.title": "Max context (tokens) — budget {budget} GB",
   "memcalc.table.note":
     "Shrinking the chunk is the biggest lever (attention scores scale with chunk × context). TQ trims persistent KV. *TQ4 = uint4 packing, not yet wired (preview). Estimates — calibrate against your peak= logs.",
+  "memcalc.apply": "Apply to tuning",
+  "memcalc.applied": "Applied ✓ — Stop → Start to take effect",
+  "memcalc.apply.hint":
+    "Updates the QUANT card (KV mode / bits) + env overrides (chunk / prefix). Restart to apply.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
