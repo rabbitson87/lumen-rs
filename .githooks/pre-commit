@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Keep `main` permanently `cargo fmt`-clean without having to remember.
+#
+# Fast path: if the workspace is already formatted, this does nothing and adds
+# no measurable latency (rustfmt only parses, never compiles). When a staged
+# Rust change introduces drift, it auto-formats and re-stages exactly the files
+# that were already staged, so the commit lands clean on the first try.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+# Only act when Rust files are part of this commit.
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' || true)
+[ -z "$staged_rs" ] && exit 0
+
+# Don't block commits in environments without the toolchain (docs-only, CI image).
+command -v cargo >/dev/null 2>&1 || {
+  echo "pre-commit: cargo not found — skipping fmt check" >&2
+  exit 0
+}
+
+# Already clean → nothing to do (the common case).
+if cargo fmt --check >/dev/null 2>&1; then
+  exit 0
+fi
+
+echo "pre-commit: drift detected → running cargo fmt" >&2
+cargo fmt
+
+# Re-stage only the files that were already staged, preserving commit scope.
+while IFS= read -r f; do
+  [ -n "$f" ] && [ -f "$f" ] && git add -- "$f"
+done <<< "$staged_rs"
+
+echo "pre-commit: formatted & re-staged $(printf '%s\n' "$staged_rs" | grep -c .) file(s)." >&2
