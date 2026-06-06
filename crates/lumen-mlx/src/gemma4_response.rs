@@ -191,8 +191,7 @@ pub(crate) mod imp {
             // Scan until '{' or newline (which acts as a hard boundary
             // so a stray `call:` token on its own line can't swallow
             // following text).
-            let Some(stop_offset) = after.find(|c: char| c == '{' || c == '\n' || c == '\r')
-            else {
+            let Some(stop_offset) = after.find(|c: char| c == '{' || c == '\n' || c == '\r') else {
                 return None;
             };
             if after.as_bytes().get(stop_offset) != Some(&b'{') {
@@ -511,7 +510,8 @@ pub(crate) mod imp {
         fn body_parser_accepts_spaces_and_parens_in_name() {
             // Ayla MCP server prefix has spaces+parens — must round-trip
             // without 500 error. Mirrors `getAllTools()` output shape.
-            let body = r#"call:Playwright (Stealth)__browser_navigate{url:<|"|>https://example.com<|"|>}"#;
+            let body =
+                r#"call:Playwright (Stealth)__browser_navigate{url:<|"|>https://example.com<|"|>}"#;
             let calls = parse_tool_call_body(body).expect("parse permissive name");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "Playwright (Stealth)__browser_navigate");
@@ -647,7 +647,11 @@ pub(crate) mod imp {
             }
             let resp = p.finalize().expect("finalize");
             // Everything stays in visible content — markers included.
-            assert!(resp.visible.contains("<think"), "visible={:?}", resp.visible);
+            assert!(
+                resp.visible.contains("<think"),
+                "visible={:?}",
+                resp.visible
+            );
             assert!(
                 resp.visible.contains("scatters") && resp.visible.contains("Blue"),
                 "visible={:?}",

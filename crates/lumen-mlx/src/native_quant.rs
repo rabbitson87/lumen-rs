@@ -491,12 +491,16 @@ mod nvfp4_ffi_smoke {
         // (1) quantize(mode=nvfp4) — does the backend accept the mode at all?
         let (packed, scales, biases) = match quantize_with_mode(&w, 16, 4, MODE_NVFP4) {
             Ok(t) => t,
-            Err(e) => panic!(
-                "mlx FFI quantize(mode=nvfp4) FAILED — backend does not support nvfp4: {e}"
-            ),
+            Err(e) => {
+                panic!("mlx FFI quantize(mode=nvfp4) FAILED — backend does not support nvfp4: {e}")
+            }
         };
         assert_eq!(packed.shape(), &[rows, cols / 8], "nvfp4 packed shape");
-        assert_eq!(scales.shape(), &[rows, cols / 16], "nvfp4 scales (group 16)");
+        assert_eq!(
+            scales.shape(),
+            &[rows, cols / 16],
+            "nvfp4 scales (group 16)"
+        );
         assert!(biases.is_none(), "nvfp4 is single-level — no biases");
 
         // (2) dequantize(mode=nvfp4) — reconstruction sanity.
@@ -514,7 +518,10 @@ mod nvfp4_ffi_smoke {
             den += b.abs();
         }
         let rel = num / den;
-        assert!(rel < 0.25, "nvfp4 reconstruction rel-MAE {rel} too high (~0.1 expected)");
+        assert!(
+            rel < 0.25,
+            "nvfp4 reconstruction rel-MAE {rel} too high (~0.1 expected)"
+        );
 
         // (3) quantized_matmul(mode=nvfp4) — the EXACT op gemma4 attention/lm_head dispatches.
         // y[b, o] = sum_k dequant(W)[o, k] * x[b, k]  (transpose=true). batch=2.
@@ -540,7 +547,10 @@ mod nvfp4_ffi_smoke {
             }
         }
         eprintln!("nvfp4 FFI OK — dequant rel-MAE {rel:.4}, matmul max-rel {max_rel:.4}");
-        assert!(max_rel < 0.05, "nvfp4 quantized_matmul diverged from reference: {max_rel}");
+        assert!(
+            max_rel < 0.05,
+            "nvfp4 quantized_matmul diverged from reference: {max_rel}"
+        );
     }
 }
 
@@ -564,7 +574,13 @@ mod nvfp4_kernel_vs_ffi_ab {
 
     /// Run one (out, in) shape: quantize once, then time mlx FFI matmul vs the custom kernel,
     /// both with device-resident weights. Returns (mlx_ms, custom_ms).
-    fn ab_one(ctx: &Nvfp4Context, out: usize, in_f: usize, warmup: usize, iters: usize) -> (f64, f64) {
+    fn ab_one(
+        ctx: &Nvfp4Context,
+        out: usize,
+        in_f: usize,
+        warmup: usize,
+        iters: usize,
+    ) -> (f64, f64) {
         assert_eq!(in_f % 16, 0, "in must be group-aligned");
         // Deterministic pseudo-random weight in row-major [out, in].
         let wdata: Vec<f32> = (0..out * in_f)
@@ -580,7 +596,9 @@ mod nvfp4_kernel_vs_ffi_ab {
         let scales_host: Vec<u8> = scales.as_slice::<u8>().to_vec();
 
         // Shared decode-time activation: batch=1.
-        let xdata: Vec<f32> = (0..in_f).map(|i| ((i as f32) * 0.013).cos() * 0.8).collect();
+        let xdata: Vec<f32> = (0..in_f)
+            .map(|i| ((i as f32) * 0.013).cos() * 0.8)
+            .collect();
 
         // --- mlx FFI path (weights resident as Arrays after first eval) ---
         let x = Array::from_slice(&xdata, &[1, in_f as i32]);
@@ -648,7 +666,13 @@ mod nvfp4_kernel_vs_ffi_ab {
         //   gate/up: out=704  in=2816   |   down: out=2816 in=704
         // Plus the dense MLP (intermediate=4304) and a square baseline for context.
         eprintln!("NVFP4 custom-kernel vs mlx-FFI quantized_matmul, batch=1 decode:");
-        let shapes = [(704usize, 2816usize), (2816, 704), (4304, 2816), (2816, 4304), (2816, 2816)];
+        let shapes = [
+            (704usize, 2816usize),
+            (2816, 704),
+            (4304, 2816),
+            (2816, 4304),
+            (2816, 2816),
+        ];
         let mut tot_mlx = 0.0;
         let mut tot_custom = 0.0;
         for (o, i) in shapes {

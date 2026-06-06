@@ -48,8 +48,8 @@ fn main() -> Result<()> {
         (
             "Bayern Munich",
             &[
-                2, 105, 2364, 107, 218437, 46566, 107561, 225183, 236881, 106, 107, 105, 4368,
-                107, 100, 45518, 107, 101,
+                2, 105, 2364, 107, 218437, 46566, 107561, 225183, 236881, 106, 107, 105, 4368, 107,
+                100, 45518, 107, 101,
             ],
         ),
     ];
@@ -73,7 +73,10 @@ fn main() -> Result<()> {
 
     for (label, prompt) in queries {
         let stats = model.generate(prompt, &cfg).context("gen")?;
-        println!("=== query={label} ({} tok generated) ===", stats.generated_tokens.len());
+        println!(
+            "=== query={label} ({} tok generated) ===",
+            stats.generated_tokens.len()
+        );
         for (i, t) in stats.generated_tokens.iter().enumerate() {
             print!("{t}");
             if i + 1 < stats.generated_tokens.len() {

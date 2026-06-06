@@ -38,7 +38,6 @@ pub mod chat_io;
 mod gemma4_backend;
 mod gemma4_chat;
 mod gemma4_critical_correction;
-mod jinja_chat;
 mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;
@@ -46,6 +45,7 @@ mod gemma4_sampling;
 mod gemma4_thinking;
 mod gemma4_tools;
 pub mod grammar;
+mod jinja_chat;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).
@@ -180,7 +180,6 @@ trait Runner {
     /// the position of the new seq.
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
 }
-
 
 impl Runner for SubprocessRunner {
     fn name(&self) -> &'static str {
@@ -2165,13 +2164,12 @@ impl MlxQwen35Backend {
 
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
         let t_prefill = std::time::Instant::now();
-        let (mut last, mut pos) =
-            self.prefix_store.prefill_optionally_cached(
-                &mut self.runner,
-                seq_id,
-                &prompt_ids,
-                prefix_cache_key,
-            )?;
+        let (mut last, mut pos) = self.prefix_store.prefill_optionally_cached(
+            &mut self.runner,
+            seq_id,
+            &prompt_ids,
+            prefix_cache_key,
+        )?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",

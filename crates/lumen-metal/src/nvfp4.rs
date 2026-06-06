@@ -122,7 +122,10 @@ pub enum NvFp4Error {
         expected_groups: usize,
         actual_groups: usize,
     },
-    #[error("element count {n} is not a multiple of NVFP4 group size {}", NVFP4_GROUP_SIZE)]
+    #[error(
+        "element count {n} is not a multiple of NVFP4 group size {}",
+        NVFP4_GROUP_SIZE
+    )]
     NotAligned { n: usize },
 }
 

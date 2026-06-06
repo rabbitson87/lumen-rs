@@ -338,8 +338,12 @@ mod meta_wrapper_tests {
 
     #[test]
     fn does_not_match_legit_user_prose() {
-        assert!(!is_client_meta_wrapper("If you have time, please review my PR"));
-        assert!(!is_client_meta_wrapper("Once you have finished, let me know"));
+        assert!(!is_client_meta_wrapper(
+            "If you have time, please review my PR"
+        ));
+        assert!(!is_client_meta_wrapper(
+            "Once you have finished, let me know"
+        ));
         assert!(!is_client_meta_wrapper("How do I call the API?"));
         assert!(!is_client_meta_wrapper("What is 2+2?"));
         // Too short to be a wrapper (under 30 chars).

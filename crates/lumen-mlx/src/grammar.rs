@@ -92,11 +92,7 @@ impl Gemma4GrammarState {
     ///
     /// `tools` is the OpenAI-spec `tools` array (each entry has the shape
     /// `{"type":"function","function":{"name":...,"parameters":...}}`).
-    pub fn new(
-        factory: Arc<ParserFactory>,
-        tools: &[Value],
-        mode: GrammarMode,
-    ) -> Result<Self> {
+    pub fn new(factory: Arc<ParserFactory>, tools: &[Value], mode: GrammarMode) -> Result<Self> {
         if tools.is_empty() {
             return Err(anyhow!(
                 "Gemma4GrammarState::new called with empty tools — caller should skip grammar"
@@ -401,7 +397,9 @@ fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
 /// emitted as Lark literals.
 fn is_safe_ident(s: &str) -> bool {
     let mut chars = s.chars();
-    let Some(first) = chars.next() else { return false; };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
@@ -418,10 +416,7 @@ fn is_safe_ident(s: &str) -> bool {
 ///   - `<[^125]>*` (any token except `}`) when properties is empty —
 ///     trades schema enforcement for completeness on tools whose schema
 ///     we don't fully understand.
-fn lark_body_for_object_schema(
-    schema: &Value,
-    extra_rules: &mut Vec<String>,
-) -> Result<String> {
+fn lark_body_for_object_schema(schema: &Value, extra_rules: &mut Vec<String>) -> Result<String> {
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
         return Ok("<[^125]>*".to_string());
     };
@@ -449,10 +444,7 @@ fn lark_body_for_object_schema(
 /// boolean / array / object / enum / const). Falls back to
 /// `<[^44,125]>*` (anything except `,` or `}`) for unsupported shapes
 /// so the rest of the body still validates.
-fn lark_value_for_schema(
-    schema: &Value,
-    extra_rules: &mut Vec<String>,
-) -> Result<String> {
+fn lark_value_for_schema(schema: &Value, extra_rules: &mut Vec<String>) -> Result<String> {
     if let Some(c) = schema.get("const") {
         return Ok(lark_const_literal(c));
     }
@@ -509,8 +501,8 @@ pub fn build_tok_env_from_tokenizer_json<P: AsRef<Path>>(path: P) -> Result<TokE
     let raw = std::fs::read_to_string(path.as_ref())
         .with_context(|| format!("read tokenizer.json: {:?}", path.as_ref()))?;
     let tj: Value = serde_json::from_str(&raw).context("parse tokenizer.json")?;
-    let token_bytes = token_bytes_from_tokenizer_json(&tj)
-        .context("token_bytes_from_tokenizer_json")?;
+    let token_bytes =
+        token_bytes_from_tokenizer_json(&tj).context("token_bytes_from_tokenizer_json")?;
     if token_bytes.is_empty() {
         return Err(anyhow!("tokenizer.json produced empty token table"));
     }
@@ -651,11 +643,14 @@ mod tests {
             .expect("build lazy state");
         // Synthetic logits buffer sized to the placeholder vocab.
         let mut logits = vec![1.0_f32; 262];
-        let masked = state.apply_mask_to_logits(&mut logits)
+        let masked = state
+            .apply_mask_to_logits(&mut logits)
             .expect("apply_mask noop");
         assert_eq!(masked, 0, "inactive grammar should not mask any logit");
         assert!(
-            logits.iter().all(|v| v.is_finite() && (*v - 1.0).abs() < 1e-6),
+            logits
+                .iter()
+                .all(|v| v.is_finite() && (*v - 1.0).abs() < 1e-6),
             "logits buffer must be untouched when grammar is inactive"
         );
     }
@@ -667,8 +662,14 @@ mod tests {
         assert!(s.contains("task_complete"), "task_complete name in grammar");
         assert!(s.contains("ask_to_user"), "ask_to_user name in grammar");
         assert!(s.contains("call:"), "native opener present");
-        assert!(s.contains("string_val"), "primitive string_val rule present");
-        assert!(s.contains("<[52]>") || s.contains("[52]"), "quote token reference");
+        assert!(
+            s.contains("string_val"),
+            "primitive string_val rule present"
+        );
+        assert!(
+            s.contains("<[52]>") || s.contains("[52]"),
+            "quote token reference"
+        );
     }
 
     #[test]
@@ -724,7 +725,10 @@ mod tests {
         let factory = shared_factory_placeholder();
         let state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Eager)
             .expect("build eager lark state");
-        assert!(state.is_active(), "eager Lark grammar constrains from step 0");
+        assert!(
+            state.is_active(),
+            "eager Lark grammar constrains from step 0"
+        );
     }
 
     #[test]

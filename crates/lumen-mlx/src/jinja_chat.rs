@@ -91,9 +91,7 @@ pub(crate) mod imp {
             // `.startswith()` etc. — Python idioms that real Jinja2
             // inherits from its host language but minijinja doesn't
             // expose by default.
-            env.set_unknown_method_callback(
-                minijinja_contrib::pycompat::unknown_method_callback,
-            );
+            env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
             env.add_template("chat", leaked)
                 .map_err(|e| anyhow!("parse chat_template.jinja: {e}"))?;
 
@@ -123,8 +121,7 @@ pub(crate) mod imp {
                 .env
                 .get_template("chat")
                 .map_err(|e| anyhow!("get template: {e}"))?;
-            tmpl.render(context)
-                .map_err(|e| anyhow!("render: {e}"))
+            tmpl.render(context).map_err(|e| anyhow!("render: {e}"))
         }
 
         /// Render conversation → flat token-id list. Equivalent in
@@ -322,7 +319,10 @@ pub(crate) mod imp {
             let expected: Vec<u32> = vec![
                 2, 105, 2364, 107, 10979, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
             ];
-            assert_eq!(ids, expected, "rendered ids must match HF apply_chat_template");
+            assert_eq!(
+                ids, expected,
+                "rendered ids must match HF apply_chat_template"
+            );
         }
 
         /// Golden parity: User "Hello" + thinking=false + add_gen=true.
@@ -363,10 +363,7 @@ pub(crate) mod imp {
                 None => return,
             };
             let tmpl = JinjaChatTemplate::from_dir(&dir).expect("load template");
-            let turns = vec![
-                ChatTurn::System("Be concise."),
-                ChatTurn::User("Hi"),
-            ];
+            let turns = vec![ChatTurn::System("Be concise."), ChatTurn::User("Hi")];
             let ids = tmpl
                 .render_to_ids(
                     &turns,
@@ -461,8 +458,10 @@ pub(crate) mod imp {
 
             assert!(s.starts_with("<bos><|turn>system\n"));
             assert!(s.contains("<|tool>declaration:get_weather"));
-            assert!(s.contains("<|\"|>The current weather for a city.<|\"|>")
-                || s.contains("<|\"|>Get the current weather for a city.<|\"|>"));
+            assert!(
+                s.contains("<|\"|>The current weather for a city.<|\"|>")
+                    || s.contains("<|\"|>Get the current weather for a city.<|\"|>")
+            );
             assert!(s.contains("<|turn>user\nWeather in Tokyo?<turn|>"));
             assert!(s.trim_end().ends_with("<channel|>"));
         }
@@ -482,10 +481,7 @@ pub(crate) mod imp {
             };
             let tmpl = JinjaChatTemplate::from_dir(&dir).expect("load template");
 
-            let turns = vec![
-                ChatTurn::System("You are helpful."),
-                ChatTurn::User("Hi"),
-            ];
+            let turns = vec![ChatTurn::System("You are helpful."), ChatTurn::User("Hi")];
             let opts = JinjaRenderOptions {
                 enable_thinking: true,
                 add_generation_prompt: true,

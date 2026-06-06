@@ -2375,9 +2375,7 @@ mod imp {
         }
 
         /// Mutable access to the TurboQuant-compressed full-attn cache.
-        pub fn as_full_turboquant_mut(
-            &mut self,
-        ) -> Result<&mut NativeRotatingKvCacheTurboQuant> {
+        pub fn as_full_turboquant_mut(&mut self) -> Result<&mut NativeRotatingKvCacheTurboQuant> {
             match self {
                 NativeLayerCache::FullTurboquant(c) => Ok(c),
                 _ => Err(anyhow!(

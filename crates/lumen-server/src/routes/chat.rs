@@ -72,7 +72,10 @@ fn log_request_diag(req: &ChatCompletionRequest) {
         req.enable_thinking()
     );
     eprintln!("  tool_choice      = {:?}", req.tool_choice);
-    eprintln!("  tools            = {} items", req.tools.as_deref().map(|v| v.len()).unwrap_or(0));
+    eprintln!(
+        "  tools            = {} items",
+        req.tools.as_deref().map(|v| v.len()).unwrap_or(0)
+    );
     // Tool list as a SINGLE summary line (names only). A 47-tool agentic
     // client (e.g. omp) otherwise emits ~50 stderr lines PER TURN; since
     // `eprintln!` is synchronous, a console that cannot drain that fast fills
@@ -90,7 +93,11 @@ fn log_request_diag(req: &ChatCompletionRequest) {
                     "    [{}] kind=function name={:?} desc_len={} params_keys={:?}",
                     i,
                     function.name,
-                    function.description.as_deref().map(|d| d.len()).unwrap_or(0),
+                    function
+                        .description
+                        .as_deref()
+                        .map(|d| d.len())
+                        .unwrap_or(0),
                     function
                         .parameters
                         .as_ref()

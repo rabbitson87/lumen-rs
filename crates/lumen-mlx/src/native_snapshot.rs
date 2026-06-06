@@ -301,7 +301,11 @@ mod imp {
             (NativeLayerCache::FullTurboquant(dst), LayerSnapshot::FullTurboquant(snap)) => {
                 // Install the captured compressed cache. Fork re-materializes
                 // independent buffers for sibling isolation; rollback can share.
-                *dst = if fork { snap.deep_clone()? } else { snap.clone() };
+                *dst = if fork {
+                    snap.deep_clone()?
+                } else {
+                    snap.clone()
+                };
                 Ok(())
             }
             _ => Err(anyhow!(

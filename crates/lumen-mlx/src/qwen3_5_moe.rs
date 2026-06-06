@@ -1296,7 +1296,15 @@ mod imp {
             let (k_full, v_full) = cache.update_and_fetch(&p.k_rope, &p.v_t)?;
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
             let attn_out = sdpa(&p.q_rope, &k_full, &v_full, p.scale, causal)?;
-            self.full_attn_finish(&attn_out, &p.gate, p.b, p.l, p.num_heads, p.head_dim, layer_idx)
+            self.full_attn_finish(
+                &attn_out,
+                &p.gate,
+                p.b,
+                p.l,
+                p.num_heads,
+                p.head_dim,
+                layer_idx,
+            )
         }
 
         /// TurboQuant-compressed variant of [`Self::layer_full_attn_forward`].
@@ -1350,7 +1358,15 @@ mod imp {
                 .context("layer_full_attn_forward_tq: dequantize V")?;
 
             let attn_out = sdpa(&q_rot, &k_dq, &v_dq, p.scale, causal)?;
-            self.full_attn_finish(&attn_out, &p.gate, p.b, p.l, p.num_heads, p.head_dim, layer_idx)
+            self.full_attn_finish(
+                &attn_out,
+                &p.gate,
+                p.b,
+                p.l,
+                p.num_heads,
+                p.head_dim,
+                layer_idx,
+            )
         }
 
         /// Shared projections + per-head norm + partial-rotary RoPE for the
@@ -1493,7 +1509,9 @@ mod imp {
             let lw = match &self.layer_weights[layer_idx].attn {
                 AttnLayerWeights::Full(f) => f,
                 AttnLayerWeights::Linear(_) => {
-                    return Err(anyhow!("full_attn_finish: layer {layer_idx} is linear-attn"));
+                    return Err(anyhow!(
+                        "full_attn_finish: layer {layer_idx} is linear-attn"
+                    ));
                 }
             };
             // (7) Reshape attention output back to [B, L, hidden] and gate.

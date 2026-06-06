@@ -306,8 +306,7 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
     // `models_dir`. id-collisions (rare — would require both layouts to
     // store the same repo) prefer the flat-layout copy because that's
     // what the user explicitly fetched via the UI.
-    let seen_ids: std::collections::HashSet<String> =
-        out.iter().map(|e| e.id.clone()).collect();
+    let seen_ids: std::collections::HashSet<String> = out.iter().map(|e| e.id.clone()).collect();
     for cached in scan_hf_hub_cache(catalog)? {
         if !seen_ids.contains(&cached.id) {
             out.push(cached);

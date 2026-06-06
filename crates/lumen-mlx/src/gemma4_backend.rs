@@ -29,9 +29,9 @@ pub(crate) mod imp {
 
     use crate::chat_io::BackendStreamEvent;
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
-    use crate::jinja_chat::imp::{JinjaChatTemplate, JinjaRenderOptions};
     use crate::gemma4_critical_correction::CorrectionTable;
     use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
+    use crate::jinja_chat::imp::{JinjaChatTemplate, JinjaRenderOptions};
     use llguidance::ParserFactory;
 
     /// Phase B (v0.6.0) — env gate for the runtime logit-correction kernel.
@@ -298,9 +298,7 @@ pub(crate) mod imp {
             let text = chat
                 .decode(&[token], /* skip_special */ false)
                 .unwrap_or_else(|_| String::from("<decode-err>"));
-            eprintln!(
-                "[token-trace] id={token:>6} {state_before:?}→{state_after:?} text={text:?}"
-            );
+            eprintln!("[token-trace] id={token:>6} {state_before:?}→{state_after:?} text={text:?}");
         }
         let in_tool_call_span = matches!(state_before, ParseState::ToolCall)
             || matches!(state_after, ParseState::ToolCall);
@@ -531,8 +529,8 @@ pub(crate) mod imp {
             }
             let cached = self
                 .correction_table
-                .get_or_init(|| {
-                    match CorrectionTable::load_from_model_dir(&self.model_dir) {
+                .get_or_init(
+                    || match CorrectionTable::load_from_model_dir(&self.model_dir) {
                         Ok(Some(t)) => {
                             eprintln!(
                                 "[gemma4-backend] logit-correction sidecar loaded: \
@@ -557,8 +555,8 @@ pub(crate) mod imp {
                             );
                             None
                         }
-                    }
-                })
+                    },
+                )
                 .clone();
             if cached.is_some() {
                 self.model.set_correction_capture_enabled(true);
@@ -1697,9 +1695,7 @@ pub(crate) mod imp {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
             if prompt.is_empty() {
-                return Err(anyhow!(
-                    "chat_from_history_with_prefix_cache: empty prompt"
-                ));
+                return Err(anyhow!("chat_from_history_with_prefix_cache: empty prompt"));
             }
             // Dual-snapshot strategy (see `chat_with_prefix_cache`): fork the
             // longest strict-prefix snapshot (no rollback), prime the
@@ -1889,9 +1885,8 @@ pub(crate) mod imp {
             // keep whatever choice they were built with.
             let prompt_len = prompt.len();
             mlx_rs::with_new_default_stream(gen_stream, || -> Result<ParsedResponse> {
-                let mut cache = pre_built_cache.unwrap_or_else(|| {
-                    self.make_cache_for_prompt_len(prompt_len)
-                });
+                let mut cache =
+                    pre_built_cache.unwrap_or_else(|| self.make_cache_for_prompt_len(prompt_len));
 
                 // DISABLED 2026-05-14 (debt #X):
                 // The mlx_lm-style chunked prefill broke for Gemma 4's
@@ -1978,7 +1973,11 @@ pub(crate) mod imp {
                         chunk_size,
                         prompt.len(),
                         if let Some(s) = snapshot_split {
-                            format!(" [split at {} for prefix-cache snapshot, trailing {} tokens]", s, prompt.len() - s)
+                            format!(
+                                " [split at {} for prefix-cache snapshot, trailing {} tokens]",
+                                s,
+                                prompt.len() - s
+                            )
                         } else {
                             String::new()
                         }
@@ -2284,20 +2283,18 @@ pub(crate) mod imp {
                     // suppressing `<turn|>` and the non-termination runaway
                     // that causes (model can't end its turn). Set either
                     // env >0 to re-enable as a targeted guard.
-                    let min_tokens_before_eos: usize =
-                        std::env::var("LUMEN_MIN_TOKENS_BEFORE_EOS")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
+                    let min_tokens_before_eos: usize = std::env::var("LUMEN_MIN_TOKENS_BEFORE_EOS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
                     let eos_top_k_guard: usize = std::env::var("LUMEN_EOS_TOP_K_GUARD")
                         .ok()
                         .and_then(|s| s.trim().parse::<usize>().ok())
                         .unwrap_or(0);
-                    let eos_min_logit_margin: f32 =
-                        std::env::var("LUMEN_EOS_MIN_LOGIT_MARGIN")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<f32>().ok())
-                            .unwrap_or(0.0);
+                    let eos_min_logit_margin: f32 = std::env::var("LUMEN_EOS_MIN_LOGIT_MARGIN")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                        .unwrap_or(0.0);
 
                     let first_tok = sample_next_token_with_eos_guard_and_grammar(
                         &logits,
@@ -2325,8 +2322,7 @@ pub(crate) mod imp {
 
                     if !eos.contains(&first_tok) {
                         let runaway = lumen_core::runaway::RunawayDetector::from_env();
-                        let mut thinking_budget =
-                            crate::gemma4_thinking::ChannelBudget::from_env();
+                        let mut thinking_budget = crate::gemma4_thinking::ChannelBudget::from_env();
                         thinking_budget.observe(first_tok);
                         let mut current_u32 = first_tok;
                         while all_tokens.len() < max_new_tokens {
@@ -2343,12 +2339,11 @@ pub(crate) mod imp {
                             // without a paired sample-step would leak the
                             // captured clone (acceptable — never happens
                             // in the streaming loop).
-                            let h_buf =
-                                if correction_table.is_some() {
-                                    self.take_captured_correction_h_as_f32()
-                                } else {
-                                    None
-                                };
+                            let h_buf = if correction_table.is_some() {
+                                self.take_captured_correction_h_as_f32()
+                            } else {
+                                None
+                            };
                             let correction_ctx = match (&correction_table, &h_buf) {
                                 (Some(tbl), Some(h)) => Some(LogitCorrectionCtx {
                                     table: tbl,
@@ -2371,9 +2366,7 @@ pub(crate) mod imp {
                             )
                             .context("chat_streaming(sampled): sample step")?;
                             thinking_budget.observe(sampled);
-                            let next_tok = if let Some(forced) =
-                                thinking_budget.try_force_close()
-                            {
+                            let next_tok = if let Some(forced) = thinking_budget.try_force_close() {
                                 eprintln!(
                                     "[thinking-budget] forcing channel close at {} tokens (count={})",
                                     all_tokens.len(),

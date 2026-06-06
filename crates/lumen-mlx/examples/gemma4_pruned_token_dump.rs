@@ -75,7 +75,11 @@ fn main() -> Result<()> {
         let _warm = model.generate(prompt, &cfg).context("warmup")?;
         let stats = model.generate(prompt, &cfg).context("timed")?;
         let toks = &stats.generated_tokens;
-        println!("=== {kind} ({} tokens, {:.1} tok/s) ===", toks.len(), stats.decode_tok_per_sec);
+        println!(
+            "=== {kind} ({} tokens, {:.1} tok/s) ===",
+            toks.len(),
+            stats.decode_tok_per_sec
+        );
         for (i, t) in toks.iter().enumerate() {
             print!("{t}");
             if i + 1 < toks.len() {

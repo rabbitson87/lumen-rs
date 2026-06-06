@@ -2318,12 +2318,10 @@ pub(crate) mod imp {
             // Simple Q4 decision: caller's explicit override wins. Without
             // override, read mode env (Auto without prompt-length info →
             // Off, same conservative fallback as TQ).
-            let quant_kv = force_quant_kv.unwrap_or_else(|| {
-                match gemma4_quant_kv_mode() {
-                    Gemma4QuantKvMode::Off => false,
-                    Gemma4QuantKvMode::On => true,
-                    Gemma4QuantKvMode::Auto => false,
-                }
+            let quant_kv = force_quant_kv.unwrap_or_else(|| match gemma4_quant_kv_mode() {
+                Gemma4QuantKvMode::Off => false,
+                Gemma4QuantKvMode::On => true,
+                Gemma4QuantKvMode::Auto => false,
             });
             let quant_kv_sliding = gemma4_quant_kv_sliding_enabled();
             // TQ decision: caller's explicit override wins. Otherwise read
@@ -2357,8 +2355,7 @@ pub(crate) mod imp {
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(4);
                             let max_ctx = cfg.max_position_embeddings.max(1);
-                            let cache =
-                                NativeRotatingKvCacheTurboQuant::new(max_ctx, 0, bits);
+                            let cache = NativeRotatingKvCacheTurboQuant::new(max_ctx, 0, bits);
                             let cache = if gemma4_quant_kv_sliding_turboquant_qjl_enabled() {
                                 let qjl_m = gemma4_quant_kv_sliding_turboquant_qjl_m(cfg.head_dim);
                                 cache.with_qjl(qjl_m)
@@ -4621,8 +4618,8 @@ pub(crate) mod imp {
                 //   full-attn layers when tq_bake_o_full_attn_active (opt-in,
                 //     default OFF). Both require tq_bake_o_active (the runtime
                 //     state machine that consumes baked-Wo is shared logic).
-                let bake_o = self.tq_bake_o_active
-                    && (is_sliding_layer || self.tq_bake_o_full_attn_active);
+                let bake_o =
+                    self.tq_bake_o_active && (is_sliding_layer || self.tq_bake_o_full_attn_active);
                 let rotate_v = !skip_v_rotate && !bake_v;
                 let unrotate_v_dq = !skip_v_rotate && !bake_o;
 
@@ -4979,10 +4976,7 @@ pub(crate) mod imp {
                     let fused_attn_enabled = std::env::var("LUMEN_GEMMA4_TQ_FUSED_ATTN")
                         .map(|s| s == "1")
                         .unwrap_or(false);
-                    if fused_attn_enabled
-                        && !use_ref
-                        && vc_inline.is_some()
-                        && vs_inline.is_some()
+                    if fused_attn_enabled && !use_ref && vc_inline.is_some() && vs_inline.is_some()
                     {
                         // Q in head_dim space already (q_rot is Q after RoPE +
                         // R rotation, same input the qk_inline kernel takes).
@@ -5000,62 +4994,68 @@ pub(crate) mod imp {
                             &q_rot, kc, ks, vc, vs, &centroids, 1.0,
                         )?
                     } else {
-
-                    let scores = if use_ref {
-                        let k_dq_dbg =
-                            crate::turboquant::lloyd_max_dequantize_scaled(kc, ks, &centroids)?;
-                        let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq_dbg, &[0, 1, 3, 2])?;
-                        let group_d = n_heads / n_kv;
-                        let kv_i = kc.shape()[2];
-                        let k_t_r = mlx_rs::ops::reshape(&k_dq_t, &[b, n_kv, 1, head_dim, kv_i])?;
-                        let k_t_bcast =
-                            mlx_rs::ops::broadcast_to(&k_t_r, &[b, n_kv, group_d, head_dim, kv_i])?;
-                        let k_t_full =
-                            mlx_rs::ops::reshape(&k_t_bcast, &[b, n_heads, head_dim, kv_i])?;
-                        mlx_rs::ops::matmul(&q_rot, &k_t_full)?
-                    } else {
-                        crate::turboquant::turboquant_qk_inline(&q_rot, kc, ks, &centroids)?
-                    };
-                    let last_axis = (scores.ndim() as i32) - 1;
-                    let attn_w = mlx_rs::ops::softmax_axis(
-                        &scores,
-                        last_axis,
-                        /* precise */ Some(true),
-                    )
-                    .context("tq_sliding inline: softmax over scores")?;
-                    // Stage 3 inline: when V codes are plumbed
-                    // (`do_sv_inline` was true), call the custom
-                    // `lumen_tq_sv_inline` kernel — one dispatch, no
-                    // V_dq materialization, no GQA reshape dance. Kernel
-                    // handles GQA internally via `h_kv = h * H_kv / H`.
-                    //
-                    // Fallback: when Stage 3 is disabled or bake_o=OFF
-                    // (V_dq needed in original head_dim space), do the
-                    // GQA reshape matmul against materialized V_dq.
-                    if let (Some(vc), Some(vs)) = (vc_inline.as_ref(), vs_inline.as_ref()) {
-                        crate::turboquant::turboquant_sv_inline(&attn_w, vc, vs, &centroids)?
-                    } else {
-                        // GQA matmul: attn_w [B, H, 1, N] @ v_dq
-                        // [B, H_kv, N, D]. Reshape to broadcast along the
-                        // group axis, matmul, then collapse back.
-                        let v_dq = v_dq_opt
-                            .as_ref()
-                            .expect("tq_sliding inline-fallback requires V_dq");
-                        let n_kv_local = n_kv;
-                        let kv_actual_i = kv_actual_tq as i32;
-                        let group = n_heads / n_kv_local;
-                        let attn_w_r =
-                            mlx_rs::ops::reshape(&attn_w, &[b, n_kv_local, group, 1, kv_actual_i])
-                                .context("tq_sliding inline: reshape attn_w for GQA")?;
-                        let v_dq_r =
-                            mlx_rs::ops::reshape(v_dq, &[b, n_kv_local, 1, kv_actual_i, head_dim])
-                                .context("tq_sliding inline: reshape v_dq for GQA")?;
-                        let attn_out_r = mlx_rs::ops::matmul(&attn_w_r, &v_dq_r)
-                            .context("tq_sliding inline: GQA matmul attn_w @ V")?;
-                        mlx_rs::ops::reshape(&attn_out_r, &[b, n_heads, 1, head_dim])
-                            .context("tq_sliding inline: collapse GQA matmul output")?
-                    }
-                    }  // end of `else` for fused_attn_enabled branch
+                        let scores = if use_ref {
+                            let k_dq_dbg =
+                                crate::turboquant::lloyd_max_dequantize_scaled(kc, ks, &centroids)?;
+                            let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq_dbg, &[0, 1, 3, 2])?;
+                            let group_d = n_heads / n_kv;
+                            let kv_i = kc.shape()[2];
+                            let k_t_r =
+                                mlx_rs::ops::reshape(&k_dq_t, &[b, n_kv, 1, head_dim, kv_i])?;
+                            let k_t_bcast = mlx_rs::ops::broadcast_to(
+                                &k_t_r,
+                                &[b, n_kv, group_d, head_dim, kv_i],
+                            )?;
+                            let k_t_full =
+                                mlx_rs::ops::reshape(&k_t_bcast, &[b, n_heads, head_dim, kv_i])?;
+                            mlx_rs::ops::matmul(&q_rot, &k_t_full)?
+                        } else {
+                            crate::turboquant::turboquant_qk_inline(&q_rot, kc, ks, &centroids)?
+                        };
+                        let last_axis = (scores.ndim() as i32) - 1;
+                        let attn_w = mlx_rs::ops::softmax_axis(
+                            &scores,
+                            last_axis,
+                            /* precise */ Some(true),
+                        )
+                        .context("tq_sliding inline: softmax over scores")?;
+                        // Stage 3 inline: when V codes are plumbed
+                        // (`do_sv_inline` was true), call the custom
+                        // `lumen_tq_sv_inline` kernel — one dispatch, no
+                        // V_dq materialization, no GQA reshape dance. Kernel
+                        // handles GQA internally via `h_kv = h * H_kv / H`.
+                        //
+                        // Fallback: when Stage 3 is disabled or bake_o=OFF
+                        // (V_dq needed in original head_dim space), do the
+                        // GQA reshape matmul against materialized V_dq.
+                        if let (Some(vc), Some(vs)) = (vc_inline.as_ref(), vs_inline.as_ref()) {
+                            crate::turboquant::turboquant_sv_inline(&attn_w, vc, vs, &centroids)?
+                        } else {
+                            // GQA matmul: attn_w [B, H, 1, N] @ v_dq
+                            // [B, H_kv, N, D]. Reshape to broadcast along the
+                            // group axis, matmul, then collapse back.
+                            let v_dq = v_dq_opt
+                                .as_ref()
+                                .expect("tq_sliding inline-fallback requires V_dq");
+                            let n_kv_local = n_kv;
+                            let kv_actual_i = kv_actual_tq as i32;
+                            let group = n_heads / n_kv_local;
+                            let attn_w_r = mlx_rs::ops::reshape(
+                                &attn_w,
+                                &[b, n_kv_local, group, 1, kv_actual_i],
+                            )
+                            .context("tq_sliding inline: reshape attn_w for GQA")?;
+                            let v_dq_r = mlx_rs::ops::reshape(
+                                v_dq,
+                                &[b, n_kv_local, 1, kv_actual_i, head_dim],
+                            )
+                            .context("tq_sliding inline: reshape v_dq for GQA")?;
+                            let attn_out_r = mlx_rs::ops::matmul(&attn_w_r, &v_dq_r)
+                                .context("tq_sliding inline: GQA matmul attn_w @ V")?;
+                            mlx_rs::ops::reshape(&attn_out_r, &[b, n_heads, 1, head_dim])
+                                .context("tq_sliding inline: collapse GQA matmul output")?
+                        }
+                    } // end of `else` for fused_attn_enabled branch
                 } else {
                     // Decode L=1, bf16 path: no mask needed (sliding window
                     // enforced by ring already; SDPA over the ring's K is
@@ -6416,8 +6416,7 @@ pub(crate) mod imp {
                             if force_quant_kv { "ON" } else { "OFF" }
                         );
                     }
-                    owned_cache =
-                        self.make_cache_with_tq(Some(force_tq), Some(force_quant_kv));
+                    owned_cache = self.make_cache_with_tq(Some(force_tq), Some(force_quant_kv));
                     &mut owned_cache
                 }
             };
@@ -6554,9 +6553,7 @@ pub(crate) mod imp {
                     )
                     .context("generate(sampled): sample step")?;
                     thinking_budget.observe(sampled);
-                    let next_tok = if let Some(forced) =
-                        thinking_budget.try_force_close()
-                    {
+                    let next_tok = if let Some(forced) = thinking_budget.try_force_close() {
                         eprintln!(
                             "[thinking-budget] forcing channel close at step {decode_steps_s} ({} tokens)",
                             generated.len()

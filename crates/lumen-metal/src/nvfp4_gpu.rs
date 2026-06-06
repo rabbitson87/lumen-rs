@@ -185,7 +185,9 @@ impl Nvfp4Context {
             in_features: in_features as u32,
         };
         let dims_buf = self.ctx.buffer_with_data(std::slice::from_ref(&dims));
-        let batch_buf = self.ctx.buffer_with_data(std::slice::from_ref(&(batch as u32)));
+        let batch_buf = self
+            .ctx
+            .buffer_with_data(std::slice::from_ref(&(batch as u32)));
 
         let encoder = crate::metal::process_commands()
             .command_encoder()
@@ -287,7 +289,9 @@ impl Nvfp4Context {
         crate::metal::process_commands()
             .flush_and_wait()
             .expect("flush");
-        Ok(self.ctx.read_buffer::<f32>(&y_buf, k * batch * out_features))
+        Ok(self
+            .ctx
+            .read_buffer::<f32>(&y_buf, k * batch * out_features))
     }
 
     /// Benchmark the matvec kernel with **device-resident weights** (upload `packed`/`scales`/`x`
@@ -321,7 +325,11 @@ impl Nvfp4Context {
             scales.len(),
             out_features * in_features / 16
         );
-        anyhow::ensure!(x.len() == in_features, "x length {} != {in_features}", x.len());
+        anyhow::ensure!(
+            x.len() == in_features,
+            "x length {} != {in_features}",
+            x.len()
+        );
 
         let packed_buf = self.ctx.buffer_with_data(packed);
         let scales_buf = self.ctx.buffer_with_data(scales);
@@ -441,9 +449,7 @@ mod tests {
         let (packed, scales) = golden();
         let w = golden_w();
         let batch = 3usize;
-        let x: Vec<f32> = (0..batch * IN)
-            .map(|i| 0.05 * (i as f32) - 0.7)
-            .collect();
+        let x: Vec<f32> = (0..batch * IN).map(|i| 0.05 * (i as f32) - 0.7).collect();
         let mut want = vec![0.0f32; batch * OUT];
         for b in 0..batch {
             for r in 0..OUT {
@@ -484,7 +490,15 @@ mod tests {
 
         let Some(ctx) = try_ctx() else { return };
         let got = ctx
-            .matmul_moe_f32(&packed_all, &scales_all, &expert_indices, &x, OUT, IN, batch)
+            .matmul_moe_f32(
+                &packed_all,
+                &scales_all,
+                &expert_indices,
+                &x,
+                OUT,
+                IN,
+                batch,
+            )
             .unwrap();
         assert_close(&got, &want);
     }

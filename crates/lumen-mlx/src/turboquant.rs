@@ -1506,7 +1506,7 @@ mod qjl_correctness_tests {
         use mlx_rs::random;
         let bits = 4u32;
         let b: i32 = 1;
-        let h: i32 = 32;  // Gemma 4 full-attn H
+        let h: i32 = 32; // Gemma 4 full-attn H
         let h_kv: i32 = 2; // Gemma 4 full-attn H_kv (GQA group=16)
         let t: i32 = 1;
         let n: i32 = 64;
@@ -1673,8 +1673,7 @@ mod qjl_correctness_tests {
         let scores_ref =
             super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
         let last_axis = (scores_ref.ndim() as i32) - 1;
-        let attn_w_ref =
-            mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
+        let attn_w_ref = mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
         let out_ref =
             super::turboquant_sv_inline(&attn_w_ref, &v_codes, &v_sigma, &centroids).unwrap();
 
@@ -1715,7 +1714,7 @@ mod qjl_correctness_tests {
         use mlx_rs::random;
         let bits = 4u32;
         let b: i32 = 1;
-        let h: i32 = 32;  // Gemma 4 sliding H
+        let h: i32 = 32; // Gemma 4 sliding H
         let h_kv: i32 = 8; // sliding H_kv (group=4)
         let t: i32 = 1;
         let n: i32 = 128;
@@ -1746,8 +1745,7 @@ mod qjl_correctness_tests {
         let scores_ref =
             super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
         let last_axis = (scores_ref.ndim() as i32) - 1;
-        let attn_w_ref =
-            mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
+        let attn_w_ref = mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
         let out_ref =
             super::turboquant_sv_inline(&attn_w_ref, &v_codes, &v_sigma, &centroids).unwrap();
 
@@ -1781,7 +1779,7 @@ mod qjl_correctness_tests {
         use mlx_rs::random;
         let bits = 4u32;
         let b: i32 = 1;
-        let h: i32 = 32;  // Gemma 4 full-attn H
+        let h: i32 = 32; // Gemma 4 full-attn H
         let h_kv: i32 = 2; // full-attn H_kv (group=16)
         let t: i32 = 1;
         let n: i32 = 64;
@@ -1810,8 +1808,7 @@ mod qjl_correctness_tests {
         let scores_ref =
             super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
         let last_axis = (scores_ref.ndim() as i32) - 1;
-        let attn_w_ref =
-            mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
+        let attn_w_ref = mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
         let out_ref =
             super::turboquant_sv_inline(&attn_w_ref, &v_codes, &v_sigma, &centroids).unwrap();
 
@@ -1835,7 +1832,11 @@ mod qjl_correctness_tests {
             "fused_attn (D=512 GQA H=32 H_kv=2): MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
             mse_val, r_var, rel
         );
-        assert!(rel < 1e-3, "fused_attn D=512 GQA rel MSE too large: rel={}", rel);
+        assert!(
+            rel < 1e-3,
+            "fused_attn D=512 GQA rel MSE too large: rel={}",
+            rel
+        );
     }
 
     /// Bit-packed 4-bit encode + packed qk_inline must produce results

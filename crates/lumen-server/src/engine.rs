@@ -119,7 +119,12 @@ impl ModelBackend {
         static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *FLAG.get_or_init(|| {
             std::env::var("LUMEN_BACKEND_THINKING_DEFAULT")
-                .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+                .map(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "1" | "on" | "true" | "yes"
+                    )
+                })
                 .unwrap_or(false)
         })
     }
@@ -1264,9 +1269,10 @@ impl InferenceEngine {
             )?
         };
 
-        let prompt_tokens = self
-            .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+        let prompt_tokens = self.backend.count_chat_prompt_tokens(
+            &messages,
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+        );
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         let output_tokens =
@@ -1355,9 +1361,10 @@ impl InferenceEngine {
                 .unwrap_or(0)
         );
 
-        let prompt_tokens = self
-            .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+        let prompt_tokens = self.backend.count_chat_prompt_tokens(
+            &messages,
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+        );
 
         let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
@@ -1486,8 +1493,7 @@ impl InferenceEngine {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                         }
                         BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx
-                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             // Early per-call Start suppressed. Args are not known
@@ -1519,8 +1525,7 @@ impl InferenceEngine {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                         }
                         BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx
-                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             // Early per-call Start suppressed. Args are not known
@@ -1634,9 +1639,10 @@ impl InferenceEngine {
         }
         lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
-        let prompt_tokens = self
-            .backend
-            .count_chat_prompt_tokens(&messages, req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()));
+        let prompt_tokens = self.backend.count_chat_prompt_tokens(
+            &messages,
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+        );
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
@@ -1796,8 +1802,7 @@ impl InferenceEngine {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                         }
                         BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx
-                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             // Early per-call Start suppressed — see the call-1
@@ -1827,8 +1832,7 @@ impl InferenceEngine {
                             let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                         }
                         BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx
-                                .try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
                         }
                         BackendStreamEvent::ToolCallStart { name } => {
                             // Early per-call Start suppressed — see the call-1
@@ -2187,7 +2191,10 @@ fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
             continue;
         }
         if let Some(full) = hit {
-            eprintln!("[mlx] tool-name resolved {:?} -> {:?} (suffix match)", c.name, full);
+            eprintln!(
+                "[mlx] tool-name resolved {:?} -> {:?} (suffix match)",
+                c.name, full
+            );
             c.name = full.to_string();
         }
     }
@@ -2538,7 +2545,9 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking_with_backend_default(
+                                self.backend.is_reasoning_first_family(),
+                            ),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2577,7 +2586,9 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.95, // AnthropicRequest has no top_p; use Gemma 4 default (matches default_top_p)
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking_with_backend_default(
+                                self.backend.is_reasoning_first_family(),
+                            ),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -2616,7 +2627,9 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking_with_backend_default(
+                                            self.backend.is_reasoning_first_family(),
+                                        ),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2657,7 +2670,9 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.95, // Gemma 4 default top_p (matches default_top_p)
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking_with_backend_default(
+                                            self.backend.is_reasoning_first_family(),
+                                        ),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -2973,7 +2988,9 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             req.top_p,
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking_with_backend_default(
+                                self.backend.is_reasoning_first_family(),
+                            ),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -3012,7 +3029,9 @@ impl InferenceEngine {
                             req.max_tokens,
                             req.temperature,
                             0.95, // Gemma 4 default top_p (matches default_top_p)
-                            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                            req.enable_thinking_with_backend_default(
+                                self.backend.is_reasoning_first_family(),
+                            ),
                             token_tx.clone(),
                         ) {
                             Ok(seq) => {
@@ -3048,7 +3067,9 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         req.top_p,
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking_with_backend_default(
+                                            self.backend.is_reasoning_first_family(),
+                                        ),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {
@@ -3089,7 +3110,9 @@ impl InferenceEngine {
                                         req.max_tokens,
                                         req.temperature,
                                         0.95, // Gemma 4 default top_p (matches default_top_p)
-                                        req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                                        req.enable_thinking_with_backend_default(
+                                            self.backend.is_reasoning_first_family(),
+                                        ),
                                         token_tx.clone(),
                                     ) {
                                         Ok(seq) => {

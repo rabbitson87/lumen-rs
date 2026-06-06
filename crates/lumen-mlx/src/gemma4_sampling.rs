@@ -199,8 +199,7 @@ pub(crate) mod imp {
 
         // Compute `max_non_eos` (highest logit OUTSIDE the EOS set) once.
         // Needed by both the margin guard and the verbose logger.
-        let need_max_non_eos =
-            eos_top_k_guard > 0 || eos_min_logit_margin > 0.0 || verbose;
+        let need_max_non_eos = eos_top_k_guard > 0 || eos_min_logit_margin > 0.0 || verbose;
         let max_non_eos: f32 = if need_max_non_eos {
             buf.iter()
                 .enumerate()
@@ -243,8 +242,8 @@ pub(crate) mod imp {
                 } else {
                     false
                 };
-                let fails_margin = eos_min_logit_margin > 0.0
-                    && (eos_logit - max_non_eos) < eos_min_logit_margin;
+                let fails_margin =
+                    eos_min_logit_margin > 0.0 && (eos_logit - max_non_eos) < eos_min_logit_margin;
                 if fails_top_k || fails_margin {
                     buf[id] = f32::NEG_INFINITY;
                 }
@@ -273,7 +272,11 @@ pub(crate) mod imp {
                 let masked = !final_logit.is_finite();
                 eprintln!(
                     "  eos[id={id}] orig_logit={logit:.3} margin={margin:.3} masked={masked}{}",
-                    if id == next as usize { " <-- SAMPLED" } else { "" }
+                    if id == next as usize {
+                        " <-- SAMPLED"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
