@@ -37,6 +37,7 @@ export const ko: Record<string, string> = {
   "action.use": "사용",
   "action.update": "업데이트",
   "action.redownload": "재다운로드",
+  "action.downloading": "다운로드 중…",
   "action.reset": "초기화",
   "action.cancel": "취소",
   "action.confirm": "확인",
@@ -54,6 +55,7 @@ export const ko: Record<string, string> = {
   "models.picker.placeholder": "— 추천 모델 선택 —",
   "models.picker.allDownloaded": "추천 모델 모두 다운로드 완료",
   "models.broken.label": "⚠ 다운로드 미완료 — 사용 전 재다운로드 필요",
+  "models.downloading.label": "⬇ 다운로드 중…",
   "models.outdated.label": "⚠ Hub에 최신 가중치 있음 — 사용 전 업데이트 필요",
   "models.unsupported.label": "지원 카탈로그 외 모델",
 

@@ -139,6 +139,25 @@
 
   let visibleModels = $derived(models.filter((m) => m.supported));
 
+  // Aggregate the per-FILE download events into per-MODEL progress (the
+  // `downloads` map is keyed `repo_id/file`, so a 4-shard model has 4 lines).
+  // `total` sums only the shards seen so far — it self-corrects upward as the
+  // backend probes each file, so the bar starts conservative and fills in.
+  let downloadByRepo = $derived.by(() => {
+    const agg = new Map<
+      string,
+      { downloaded: number; total: number; active: boolean }
+    >();
+    for (const p of downloads.values()) {
+      const a = agg.get(p.repo_id) ?? { downloaded: 0, total: 0, active: false };
+      a.downloaded += p.downloaded_bytes;
+      a.total += p.total_bytes ?? 0;
+      if (!p.done) a.active = true;
+      agg.set(p.repo_id, a);
+    }
+    return agg;
+  });
+
   let activeOutdated = $derived(
     config?.active_model != null && outdatedModels.has(config.active_model)
   );
@@ -1112,11 +1131,16 @@
       {#each visibleModels as m}
         {@const needsUpdate = outdatedModels.has(m.id)}
         {@const isActive = config?.active_model === m.id}
-        {@const isBroken = !m.ready}
+        {@const dl = downloadByRepo.get(m.id)}
+        {@const isDownloading = !!dl && dl.active}
+        {@const dlTotal = (catalog.recommended.find((x) => x.id === m.id)?.approx_size_gb ?? 0) * 1024 ** 3 || (dl?.total ?? 0)}
+        {@const dlPct = dl && dlTotal > 0 ? Math.min(100, (dl.downloaded / dlTotal) * 100) : 0}
+        {@const isBroken = !m.ready && !isDownloading}
         <div
           class={`grid grid-cols-[18px_minmax(0,1fr)_90px_auto_auto] items-center gap-3 px-2.5 py-2 rounded-md bg-panel-2 border hover:border-border ${
             !m.supported ? "opacity-55" : ""
           } ${
+            isDownloading ? "border-accent shadow-[0_0_0_1px_var(--color-accent)_inset] bg-accent/[0.06]" :
             isBroken ? "border-err shadow-[0_0_0_1px_var(--color-err)_inset] bg-err/10" :
             needsUpdate && isActive ? "border-warn shadow-[0_0_0_1px_var(--color-warn)_inset] bg-warn/15" :
             needsUpdate ? "border-warn bg-warn/10" :
@@ -1127,7 +1151,14 @@
           <span class="mono text-ok font-bold">{isActive ? "✓" : ""}</span>
           <div class="min-w-0 flex flex-col gap-0.5">
             <div class="mono overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">{m.id}</div>
-            {#if isBroken}
+            {#if isDownloading}
+              <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-accent">
+                {t("models.downloading.label")}{#if dl && dlTotal > 0} {dlPct.toFixed(0)}% · {bytes(dl.downloaded)} / {bytes(dlTotal)}{:else if dl} {bytes(dl.downloaded)}…{/if}
+              </div>
+              <div class="h-1 w-full bg-panel rounded-sm overflow-hidden mt-0.5">
+                <div class="h-full bg-accent transition-[width] duration-300" style={`width: ${dlPct}%`}></div>
+              </div>
+            {:else if isBroken}
               <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-err">{t("models.broken.label")}</div>
             {:else if needsUpdate}
               <div class="text-[11px] overflow-hidden text-ellipsis whitespace-nowrap text-warn">{t("models.outdated.label")}</div>
@@ -1138,7 +1169,10 @@
             {/if}
           </div>
           <span class="mono text-text-dim text-right text-xs">{bytes(m.size_bytes)}</span>
-          {#if isBroken}
+          {#if isDownloading}
+            <button disabled title={t("models.downloading.label")}
+            >{dl && dlTotal > 0 ? `${dlPct.toFixed(0)}%` : t("action.downloading")}</button>
+          {:else if isBroken}
             <button
               class="primary"
               onclick={() => repairModel(m.id)}
@@ -1197,12 +1231,21 @@
       {/if}
     {/if}
     {#if downloads.size > 0}
-      <div class="mt-2 flex flex-col gap-0.5">
+      <div class="mt-2 flex flex-col gap-1">
         {#each [...downloads.entries()] as [key, p]}
-          <div class="mono grid grid-cols-[16px_1fr_80px] text-xs gap-1.5">
-            <span class={p.done ? "text-ok" : "text-text-dim"}>{p.done ? "✓" : "…"}</span>
-            <span>{key}</span>
-            <span class="dim">{bytes(p.downloaded_bytes)}</span>
+          {@const pct = p.total_bytes && p.total_bytes > 0 ? Math.min(100, (p.downloaded_bytes / p.total_bytes) * 100) : 0}
+          {@const fname = key.split("/").pop()}
+          <div class="flex flex-col gap-0.5">
+            <div class="mono grid grid-cols-[16px_minmax(0,1fr)_auto] text-[11px] gap-1.5 items-baseline">
+              <span class={p.done ? "text-ok" : "text-accent"}>{p.done ? "✓" : "…"}</span>
+              <span class="overflow-hidden text-ellipsis whitespace-nowrap" title={key}>{fname}</span>
+              <span class="dim whitespace-nowrap">{p.total_bytes && p.total_bytes > 0 ? `${bytes(p.downloaded_bytes)} / ${bytes(p.total_bytes)} · ${pct.toFixed(0)}%` : bytes(p.downloaded_bytes)}</span>
+            </div>
+            {#if !p.done && p.total_bytes && p.total_bytes > 0}
+              <div class="h-1 w-full bg-panel rounded-sm overflow-hidden">
+                <div class="h-full bg-accent transition-[width] duration-300" style={`width: ${pct}%`}></div>
+              </div>
+            {/if}
           </div>
         {/each}
       </div>

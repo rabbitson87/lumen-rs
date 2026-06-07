@@ -42,6 +42,7 @@ export const en: Record<string, string> = {
   "action.use": "Use",
   "action.update": "Update",
   "action.redownload": "Re-download",
+  "action.downloading": "Downloading…",
   "action.reset": "Reset",
   "action.cancel": "Cancel",
   "action.confirm": "Confirm",
@@ -59,6 +60,7 @@ export const en: Record<string, string> = {
   "models.picker.placeholder": "— pick a recommended model —",
   "models.picker.allDownloaded": "all recommended already downloaded",
   "models.broken.label": "⚠ Incomplete download — re-download required before use",
+  "models.downloading.label": "⬇ Downloading…",
   "models.outdated.label": "⚠ Newer weights available on Hub — update required before use",
   "models.unsupported.label": "not in supported catalog",
 
