@@ -1470,17 +1470,26 @@ impl InferenceEngine {
         // runaway KV growth from misbehaving clients while letting normal
         // long-context (≤32K) requests flow.
         //
-        // Override via `LUMEN_PREFILL_CHUNK` (driven by the CONTEXT card in the
-        // desktop app). Server falls back to the safe 32K default if unset or
-        // unparseable.
-        let prefill_token_cap: u32 = std::env::var("LUMEN_PREFILL_CHUNK")
+        // Prompt-size REJECTION cap (distinct from the per-step *chunk size*).
+        // Chunked prefill (`forward_chunked`) bounds activation memory, so this
+        // is a safety rail against runaway prompts, NOT a hard chunking limit —
+        // raise it to serve longer contexts. Precedence:
+        //   `LUMEN_MAX_PROMPT_TOKENS` (clear name) → `LUMEN_PREFILL_CHUNK`
+        //   (legacy; the desktop CONTEXT card still emits it) → 32K default.
+        // NOTE: this is a *reject* cap, not a sliding context window. Dropping
+        // old turns to fit (true context-shift) needs token access inside the
+        // backend (the engine only has a token *count* here) — tracked
+        // separately; for now an over-cap prompt is rejected with guidance.
+        let prefill_token_cap: u32 = std::env::var("LUMEN_MAX_PROMPT_TOKENS")
+            .or_else(|_| std::env::var("LUMEN_PREFILL_CHUNK"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(32_768);
         if prompt_tokens > prefill_token_cap {
             let msg = format!(
                 "prompt too large: {prompt_tokens} tokens > server cap {prefill_token_cap}. \
-                 Reduce system prompt / message history, or wait for chunked prefill support."
+                 Raise LUMEN_MAX_PROMPT_TOKENS (chunked prefill handles the memory — \
+                 check the Tuning memory calculator first) or trim the history."
             );
             eprintln!("[chat-stream] REJECTED ({msg})");
             let _ = token_tx.try_send(StreamEvent::Error(msg));
