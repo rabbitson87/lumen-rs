@@ -1,5 +1,39 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
+use lumen_mlx::SamplingOverrides;
+
+/// OpenAI `stop`: accepts either a single string or an array of strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StopField {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopField {
+    /// Flatten to a list, dropping empties (an empty stop never matches).
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopField::One(s) => {
+                if s.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![s]
+                }
+            }
+            StopField::Many(v) => v.into_iter().filter(|s| !s.is_empty()).collect(),
+        }
+    }
+}
+
+fn stop_field_vec(stop: &Option<StopField>) -> Vec<String> {
+    match stop {
+        Some(StopField::One(s)) if !s.is_empty() => vec![s.clone()],
+        Some(StopField::Many(v)) => v.iter().filter(|s| !s.is_empty()).cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
 // === Request types ===
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +56,16 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI `stop`: a single string or an array of strings. Generation
+    /// halts when any is produced (the stop text is trimmed from the output).
+    #[serde(default)]
+    pub stop: Option<StopField>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -79,6 +123,19 @@ pub struct ChatTemplateKwargs {
 }
 
 impl ChatCompletionRequest {
+    /// Per-request sampling overrides for the backend (Gemma 4 sampler).
+    pub fn sampling_overrides(&self) -> SamplingOverrides {
+        SamplingOverrides {
+            top_k: self.top_k,
+            seed: self.seed,
+            repeat_penalty: self.repeat_penalty,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            stop: stop_field_vec(&self.stop),
+        }
+    }
+
     /// Resolve the effective thinking flag from all supported input shapes.
     ///
     /// **imatrix-AWQ family override** — these builds have channel-open token
@@ -299,6 +356,14 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub stop: Option<StopField>,
     #[serde(default)]
     pub stream: bool,
     /// Optional client-supplied session id (MLX backend only). When the cached
@@ -632,6 +697,38 @@ pub struct AnthropicThinkingConfig {
 impl Default for AnthropicThinking {
     fn default() -> Self {
         Self::Bool(false)
+    }
+}
+
+impl CompletionRequest {
+    /// Per-request sampling overrides for the backend (Gemma 4 sampler).
+    pub fn sampling_overrides(&self) -> SamplingOverrides {
+        SamplingOverrides {
+            top_k: self.top_k,
+            seed: self.seed,
+            repeat_penalty: self.repeat_penalty,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            stop: stop_field_vec(&self.stop),
+        }
+    }
+}
+
+impl AnthropicRequest {
+    /// Per-request sampling overrides for the backend (Gemma 4 sampler).
+    /// Anthropic carries `stop_sequences`; min_p/penalties aren't part of its
+    /// API, so they fall back to env/family default.
+    pub fn sampling_overrides(&self) -> SamplingOverrides {
+        SamplingOverrides {
+            top_k: self.top_k,
+            seed: self.seed,
+            repeat_penalty: self.repeat_penalty,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            stop: self.stop_sequences.clone().unwrap_or_default(),
+        }
     }
 }
 

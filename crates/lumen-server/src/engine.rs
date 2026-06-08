@@ -903,11 +903,7 @@ impl InferenceEngine {
         // ids ("gpt-3.5-turbo") that hide the actual loaded family.
         let thinking_on =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let ov = SamplingOverrides {
-            top_k: req.top_k,
-            seed: req.seed,
-            repeat_penalty: req.repeat_penalty,
-        };
+        let ov = req.sampling_overrides();
         let mut parsed = if needs_structured {
             let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
@@ -1043,11 +1039,7 @@ impl InferenceEngine {
         let input_ids = self.backend.encode(&req.prompt)?;
         let prompt_tokens = input_ids.len() as u32;
 
-        let ov = SamplingOverrides {
-            top_k: req.top_k,
-            seed: req.seed,
-            repeat_penalty: req.repeat_penalty,
-        };
+        let ov = req.sampling_overrides();
         let output_ids = self.backend.generate(
             &input_ids,
             req.max_tokens,
@@ -1081,11 +1073,7 @@ impl InferenceEngine {
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let needs_structured = anthropic_needs_structured_history(&req.messages);
-        let ov = SamplingOverrides {
-            top_k: req.top_k,
-            seed: req.seed,
-            repeat_penalty: req.repeat_penalty,
-        };
+        let ov = req.sampling_overrides();
         let tool_choice =
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
 
@@ -1374,11 +1362,7 @@ impl InferenceEngine {
         req: &ChatCompletionRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
-        let ov = SamplingOverrides {
-            top_k: req.top_k,
-            seed: req.seed,
-            repeat_penalty: req.repeat_penalty,
-        };
+        let ov = req.sampling_overrides();
         let mut messages: Vec<(String, String)> = req
             .messages
             .iter()
@@ -1666,11 +1650,7 @@ impl InferenceEngine {
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
         let needs_structured = anthropic_needs_structured_history(&req.messages);
-        let ov = SamplingOverrides {
-            top_k: req.top_k,
-            seed: req.seed,
-            repeat_penalty: req.repeat_penalty,
-        };
+        let ov = req.sampling_overrides();
 
         let system_text: Option<String> = req.system.as_ref().map(|sys| match sys {
             AnthropicSystem::Text(s) => s.clone(),

@@ -37,6 +37,18 @@ pub struct SamplingConfig {
     pub repeat_penalty: f32,
     /// Sliding-window length the penalty applies to. `0` disables.
     pub repeat_penalty_last_n: usize,
+    /// OpenAI presence penalty: subtract this flat amount from any token
+    /// seen in the window at least once. `0.0` disables. Applied alongside
+    /// the classic repeat penalty over the same window.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty: subtract `count * frequency_penalty` from
+    /// each token by its occurrence count in the window. `0.0` disables.
+    pub frequency_penalty: f32,
+    /// Min-p cutoff: keep only tokens with `prob >= min_p * max_prob`
+    /// (i.e. `logit >= max_logit + ln(min_p)`). `0.0` disables. Applied
+    /// after top-k, before temperature. The argmax always survives, so this
+    /// never changes greedy output.
+    pub min_p: f32,
     /// PRNG seed. Same prompt + seed → bit-identical output.
     pub seed: u64,
     /// DRY (Don't Repeat Yourself) penalty config. `multiplier=0.0`
@@ -53,6 +65,9 @@ impl Default for SamplingConfig {
             top_k: 0,
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 64,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
             seed: 0,
             dry: crate::dry::DryConfig::default(),
         }
@@ -61,8 +76,11 @@ impl Default for SamplingConfig {
 
 impl SamplingConfig {
     pub fn is_greedy(&self) -> bool {
+        // min_p never changes the argmax, so it is intentionally excluded.
         self.temperature <= 0.0
             && (self.repeat_penalty - 1.0).abs() < 1e-6
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
             && self.dry.is_disabled()
     }
 }
@@ -112,6 +130,50 @@ pub fn apply_repeat_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
         }
         let v = logits[i];
         logits[i] = if v >= 0.0 { v / penalty } else { v * penalty };
+    }
+}
+
+/// OpenAI presence/frequency penalties over a token window, applied in
+/// place: `logit -= count * frequency + (count > 0) * presence`. Mirrors
+/// llama.cpp's penalty sampler. No-op when both are 0.
+pub fn apply_presence_frequency_penalty(
+    logits: &mut [f32],
+    window: &[u32],
+    presence: f32,
+    frequency: f32,
+) {
+    if presence == 0.0 && frequency == 0.0 {
+        return;
+    }
+    let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for &tok in window {
+        *counts.entry(tok).or_insert(0) += 1;
+    }
+    for (tok, c) in counts {
+        let i = tok as usize;
+        if i < logits.len() {
+            logits[i] -= frequency * c as f32 + presence;
+        }
+    }
+}
+
+/// Min-p filter applied in place: drop tokens whose logit is below
+/// `max_logit + ln(min_p)` (equivalently `prob < min_p * max_prob`) by
+/// setting them to `-inf`. `min_p <= 0` is a no-op. The peak token always
+/// survives, so this never alters greedy/argmax output.
+pub fn apply_min_p(logits: &mut [f32], min_p: f32) {
+    if min_p <= 0.0 {
+        return;
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return;
+    }
+    let thresh = max + min_p.ln();
+    for v in logits.iter_mut() {
+        if *v < thresh {
+            *v = f32::NEG_INFINITY;
+        }
     }
 }
 
@@ -241,12 +303,23 @@ pub fn sample_from_logits(
     cfg: &SamplingConfig,
     rng: &mut Xorshift64,
 ) -> u32 {
-    // Repeat penalty restricted to the trailing window — older context
-    // shouldn't dampen tokens we naturally want to emit again.
+    // Penalties restricted to the trailing window — older context shouldn't
+    // dampen tokens we naturally want to emit again. Repeat (sign-aware) +
+    // OpenAI presence/frequency share the same window.
     let n = cfg.repeat_penalty_last_n.min(recent_tokens.len());
-    if cfg.repeat_penalty != 1.0 && n > 0 {
+    if n > 0 {
         let window = &recent_tokens[recent_tokens.len() - n..];
-        apply_repeat_penalty(logits, window, cfg.repeat_penalty);
+        if cfg.repeat_penalty != 1.0 {
+            apply_repeat_penalty(logits, window, cfg.repeat_penalty);
+        }
+        if cfg.presence_penalty != 0.0 || cfg.frequency_penalty != 0.0 {
+            apply_presence_frequency_penalty(
+                logits,
+                window,
+                cfg.presence_penalty,
+                cfg.frequency_penalty,
+            );
+        }
     }
 
     // DRY (Don't Repeat Yourself): catches n-gram cycles the classic
@@ -257,6 +330,10 @@ pub fn sample_from_logits(
     // a bounded candidate set (matches Ollama's always-on top_k=40 and
     // stops low-rank tail-token drift on quantized weights). No-op at 0.
     apply_top_k(logits, cfg.top_k);
+
+    // Min-p: drop tokens far below the peak. No-op at 0; never removes the
+    // argmax, so greedy output is unaffected.
+    apply_min_p(logits, cfg.min_p);
 
     // Temperature scaling before softmax. `<=0` would mean greedy but
     // the caller is responsible for routing greedy elsewhere; clamp to
@@ -362,6 +439,9 @@ mod tests {
             top_k: 0,
             repeat_penalty: 1.0,
             repeat_penalty_last_n: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
             seed: 12345,
             dry: crate::dry::DryConfig::default(),
         };
@@ -370,5 +450,33 @@ mod tests {
         let mut rng2 = Xorshift64::new(cfg.seed);
         let t2 = sample_from_logits(&mut probs, &[], &cfg, &mut rng2);
         assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn min_p_keeps_peak_prunes_tail() {
+        // logits: peak at idx 3. min_p=0.5 → threshold = max + ln(0.5).
+        let mut l = vec![0.0_f32, 1.0, 2.0, 5.0];
+        apply_min_p(&mut l, 0.5);
+        assert!(l[3].is_finite(), "argmax must always survive min_p");
+        // ln(0.5) ≈ -0.693, threshold ≈ 4.307 → only idx 3 survives.
+        assert_eq!(l[0], f32::NEG_INFINITY);
+        assert_eq!(l[2], f32::NEG_INFINITY);
+        // min_p = 0 is a no-op.
+        let mut l2 = vec![0.0_f32, 1.0];
+        apply_min_p(&mut l2, 0.0);
+        assert_eq!(l2, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn presence_frequency_penalty_counts() {
+        // token 1 appears twice, token 2 once.
+        let window = [1u32, 1, 2];
+        let mut l = vec![0.0_f32; 4];
+        apply_presence_frequency_penalty(&mut l, &window, 0.5, 0.1);
+        // token 1: -(0.1*2 + 0.5) = -0.7 ; token 2: -(0.1*1 + 0.5) = -0.6
+        assert!((l[1] - (-0.7)).abs() < 1e-5);
+        assert!((l[2] - (-0.6)).abs() < 1e-5);
+        assert_eq!(l[0], 0.0); // untouched
+        assert_eq!(l[3], 0.0);
     }
 }

@@ -239,6 +239,9 @@ pub(crate) mod imp {
             top_k,
             repeat_penalty,
             repeat_penalty_last_n,
+            presence_penalty: ov.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: ov.frequency_penalty.unwrap_or(0.0),
+            min_p: ov.min_p.unwrap_or(0.0),
             seed,
             dry: lumen_core::dry::dry_config_from_env(),
         };

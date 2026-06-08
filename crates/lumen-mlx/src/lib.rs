@@ -155,6 +155,12 @@ pub struct SamplingOverrides {
     pub top_k: Option<usize>,
     pub seed: Option<u64>,
     pub repeat_penalty: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    /// Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Matched
+    /// incrementally in the streaming loop, not in `build_sampling_config`.
+    pub stop: Vec<String>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
