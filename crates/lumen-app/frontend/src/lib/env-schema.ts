@@ -318,6 +318,17 @@ export const ENV_SCHEMA: EnvEntry[] = [
     section: "advanced",
   },
   {
+    key: "LUMEN_BATCHED_PREFILL_CHUNK",
+    labelKey: "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label",
+    helpKey: "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help",
+    kind: "number",
+    min: 128,
+    max: 8192,
+    step: 128,
+    defaultValue: "512",
+    section: "advanced",
+  },
+  {
     key: "LUMEN_QWEN35_PREFILL_CHUNK_LOG",
     labelKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label",
     helpKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help",

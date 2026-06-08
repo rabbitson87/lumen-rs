@@ -366,6 +366,9 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill chunk size",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
     "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048.",
+  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "Batched prefill chunk size (experimental)",
+  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
+    "Experimental: tokens per prefill chunk for the batched engine (BATCHED_ENGINE=1, Gemma GGUF only). Chunking a long prompt's prefill stops one sequence from monopolizing a single giant forward and stalling other batched sequences. Only prompts longer than this are chunked; shorter prompts are unaffected. Default 512.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",

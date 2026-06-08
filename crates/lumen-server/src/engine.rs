@@ -46,6 +46,21 @@ fn resolve_backend_mode() -> BackendMode {
     resolve_backend_mode_from(|name| std::env::var(name).ok())
 }
 
+/// Token-chunk size for the experimental batched engine's eager prefill.
+///
+/// Only consulted on the `BATCHED_ENGINE=1` + GemmaGguf path. Prompts whose
+/// prefix is `<= chunk` keep the single-forward path unchanged; longer prompts
+/// are forwarded in chunks of this size so one sequence's long prefill does not
+/// monopolize a single giant forward and stall other batched sequences.
+/// `0` or an unparseable value falls back to the default. Default: 512.
+fn batched_prefill_chunk() -> usize {
+    std::env::var("LUMEN_BATCHED_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(512)
+}
+
 /// Default backend when no env is set. mlx-native build → Mlx, otherwise Candle.
 #[inline]
 fn default_backend_mode() -> BackendMode {
@@ -3636,11 +3651,35 @@ impl InferenceEngine {
         gem.model_mut().set_paged_store_enabled(true);
 
         // Prefill: feed prompt[..len-1], sample first token from logits[len-1].
+        //
+        // OPT-IN chunked prefill (BATCHED_ENGINE=1 only): rather than one giant
+        // forward over the whole prompt — which monopolizes a single forward and
+        // stalls every other batched sequence at head-of-line — split the prefix
+        // into fixed token chunks and forward each at its running position offset.
+        // The GGUF model is stateful: forwarding prefix[start..end] at index_pos
+        // = start grows the KV cache exactly as a single forward would, so the
+        // final KV state (and thus the seeded first token) is bit-identical.
+        // Earlier chunks' logits are discarded; the prefill logits are unused
+        // here regardless (last_token comes from prompt_ids.last()), so no
+        // logits need to be returned from the loop.
         let t_prefill = std::time::Instant::now();
         let prefix = &prompt_ids[..prompt_ids.len() - 1];
         if !prefix.is_empty() {
-            let t = Tensor::new(prefix, &device)?.unsqueeze(0)?;
-            let _ = gem.model_mut().forward(&t, 0)?;
+            let chunk = batched_prefill_chunk();
+            if prefix.len() > chunk {
+                // Long prompt: chunk to bound per-forward attention cost.
+                let mut start = 0usize;
+                while start < prefix.len() {
+                    let end = (start + chunk).min(prefix.len());
+                    let t = Tensor::new(&prefix[start..end], &device)?.unsqueeze(0)?;
+                    let _ = gem.model_mut().forward(&t, start)?;
+                    start = end;
+                }
+            } else {
+                // Short prompt: EXACT current single-forward path (byte-identical).
+                let t = Tensor::new(prefix, &device)?.unsqueeze(0)?;
+                let _ = gem.model_mut().forward(&t, 0)?;
+            }
         }
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         let position = prefix.len();

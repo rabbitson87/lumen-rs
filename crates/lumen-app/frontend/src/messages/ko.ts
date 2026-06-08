@@ -357,6 +357,9 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill 청크 크기",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
     "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048.",
+  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "배치 엔진 prefill 청크 크기 (실험적)",
+  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
+    "실험적: 배치 엔진(BATCHED_ENGINE=1, Gemma GGUF 전용)의 prefill 청크당 토큰 수. 장문 프롬프트의 prefill을 청크로 나누면 한 시퀀스가 거대한 단일 forward를 독점해 다른 배치 시퀀스를 head-of-line 정체시키는 것을 막습니다. 이 값보다 긴 프롬프트만 청킹되며, 짧은 프롬프트는 영향받지 않습니다. 기본 512.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
