@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use lumen_mlx::SamplingOverrides;
 use lumen_mlx::chat_io::{
     AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
     ResolvedToolChoice, ToolDef,
@@ -177,6 +178,7 @@ impl ModelBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &SamplingOverrides,
         session_id: Option<&str>,
     ) -> Result<Vec<u32>> {
         // Speculative decoding for GGUF models when SPEC_DRAFT_LAYERS is set
@@ -210,7 +212,14 @@ impl ModelBackend {
             Self::GemmaGguf(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
-            Self::Mlx(m) => m.generate(input_ids, max_new_tokens, temperature, top_p, session_id),
+            Self::Mlx(m) => m.generate(
+                input_ids,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                session_id,
+            ),
         }
     }
 
@@ -247,6 +256,7 @@ impl ModelBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
@@ -280,6 +290,7 @@ impl ModelBackend {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 thinking,
                 session_id,
                 tools,
@@ -294,6 +305,7 @@ impl ModelBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
@@ -351,6 +363,7 @@ impl ModelBackend {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 thinking,
                 session_id,
                 tools,
@@ -388,6 +401,7 @@ impl ModelBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
@@ -399,6 +413,7 @@ impl ModelBackend {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 thinking,
                 session_id,
                 tools,
@@ -412,6 +427,7 @@ impl ModelBackend {
             max_new_tokens,
             temperature,
             top_p,
+            ov,
             thinking,
             session_id,
             tools,
@@ -429,6 +445,7 @@ impl ModelBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
@@ -444,6 +461,7 @@ impl ModelBackend {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 thinking,
                 session_id,
                 tools,
@@ -457,6 +475,7 @@ impl ModelBackend {
             max_new_tokens,
             temperature,
             top_p,
+            ov,
             thinking,
             session_id,
             tools,
@@ -756,6 +775,7 @@ impl InferenceEngine {
             3,
             0.0,
             1.0,
+            &SamplingOverrides::default(),
             false,
             None,
             &[],
@@ -773,6 +793,7 @@ impl InferenceEngine {
             2,
             0.0,
             1.0,
+            &SamplingOverrides::default(),
             false,
             None,
             &[],
@@ -882,6 +903,11 @@ impl InferenceEngine {
         // ids ("gpt-3.5-turbo") that hide the actual loaded family.
         let thinking_on =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let ov = SamplingOverrides {
+            top_k: req.top_k,
+            seed: req.seed,
+            repeat_penalty: req.repeat_penalty,
+        };
         let mut parsed = if needs_structured {
             let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
@@ -907,6 +933,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 thinking_on,
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -918,6 +945,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 thinking_on,
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1015,11 +1043,17 @@ impl InferenceEngine {
         let input_ids = self.backend.encode(&req.prompt)?;
         let prompt_tokens = input_ids.len() as u32;
 
+        let ov = SamplingOverrides {
+            top_k: req.top_k,
+            seed: req.seed,
+            repeat_penalty: req.repeat_penalty,
+        };
         let output_ids = self.backend.generate(
             &input_ids,
             req.max_tokens,
             req.temperature,
             req.top_p,
+            &ov,
             req.session_id.as_deref(),
         )?;
         let completion_tokens = output_ids.len() as u32;
@@ -1047,6 +1081,11 @@ impl InferenceEngine {
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let needs_structured = anthropic_needs_structured_history(&req.messages);
+        let ov = SamplingOverrides {
+            top_k: req.top_k,
+            seed: req.seed,
+            repeat_penalty: req.repeat_penalty,
+        };
         let tool_choice =
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
 
@@ -1249,6 +1288,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1262,6 +1302,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1333,6 +1374,11 @@ impl InferenceEngine {
         req: &ChatCompletionRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
+        let ov = SamplingOverrides {
+            top_k: req.top_k,
+            seed: req.seed,
+            repeat_penalty: req.repeat_penalty,
+        };
         let mut messages: Vec<(String, String)> = req
             .messages
             .iter()
@@ -1483,6 +1529,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1515,6 +1562,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1618,6 +1666,11 @@ impl InferenceEngine {
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
         let needs_structured = anthropic_needs_structured_history(&req.messages);
+        let ov = SamplingOverrides {
+            top_k: req.top_k,
+            seed: req.seed,
+            repeat_penalty: req.repeat_penalty,
+        };
 
         let system_text: Option<String> = req.system.as_ref().map(|sys| match sys {
             AnthropicSystem::Text(s) => s.clone(),
@@ -1792,6 +1845,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,
@@ -1822,6 +1876,7 @@ impl InferenceEngine {
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                &ov,
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
                 req.session_id.as_deref(),
                 &tools_owned,

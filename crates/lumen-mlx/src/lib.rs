@@ -147,6 +147,16 @@ pub use native_runtime::FineTimings;
 use runner_pyo3::Pyo3Runner;
 use runner_subprocess::SubprocessRunner;
 
+/// Per-request sampling overrides. `None` = fall back to env/family default.
+/// Extend with new fields (min_p, penalties, stop, logit_bias) without
+/// re-threading — only `build_sampling_config` reads them.
+#[derive(Clone, Default, Debug)]
+pub struct SamplingOverrides {
+    pub top_k: Option<usize>,
+    pub seed: Option<u64>,
+    pub repeat_penalty: Option<f32>,
+}
+
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
 /// position. Used by Track A2 drift baseline + spec-decode verify-loop.
 #[derive(Clone, Debug)]
@@ -918,6 +928,7 @@ impl MlxBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &crate::SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
@@ -926,7 +937,7 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature);
+                let _ = (top_p, temperature, ov);
                 // Phase 2: when tools are provided, route through the
                 // Qwen 3.6 nested-XML tool template + parser. No-tools
                 // path keeps the existing fast lane (MTP / spec /
@@ -974,6 +985,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         &k,
                         tools,
@@ -985,6 +997,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         tools,
                         tool_choice,
@@ -1005,6 +1018,7 @@ impl MlxBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &crate::SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
@@ -1021,7 +1035,7 @@ impl MlxBackend {
                 // that case the renderer omits the system `<tools>`
                 // block but still emits the assistant tool_calls and
                 // tool_response blocks correctly.
-                let _ = (top_p, temperature, session_id);
+                let _ = (top_p, temperature, ov, session_id);
                 let seq_id = m.alloc_seq_id();
                 m.chat_with_tools_from_history(
                     turns,
@@ -1049,6 +1063,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         &k,
                         tools,
@@ -1060,6 +1075,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         tools,
                         tool_choice,
@@ -1081,6 +1097,7 @@ impl MlxBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &crate::SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
@@ -1093,7 +1110,7 @@ impl MlxBackend {
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature);
+                let _ = (top_p, temperature, ov);
                 // Phase 2: with tools provided, route through tool-aware
                 // streaming path so `<tool_call>` blocks demux into
                 // `BackendStreamEvent::ToolCallStart` + `parsed.tool_calls`.
@@ -1158,6 +1175,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         &k,
                         tools,
@@ -1170,6 +1188,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         tools,
                         tool_choice,
@@ -1191,6 +1210,7 @@ impl MlxBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &crate::SamplingOverrides,
         thinking: bool,
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
@@ -1206,7 +1226,7 @@ impl MlxBackend {
                 // Phase 2: structured-history streaming ALWAYS routes
                 // through the tool-aware path — same rationale as the
                 // non-streaming `chat_from_history` branch above.
-                let _ = (top_p, temperature, session_id);
+                let _ = (top_p, temperature, ov, session_id);
                 let seq_id = m.alloc_seq_id();
                 m.chat_streaming_with_tools_from_history(
                     turns,
@@ -1234,6 +1254,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         &k,
                         tools,
@@ -1246,6 +1267,7 @@ impl MlxBackend {
                         max_new_tokens,
                         temperature,
                         top_p,
+                        ov,
                         thinking,
                         tools,
                         tool_choice,
@@ -1264,11 +1286,12 @@ impl MlxBackend {
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
+        ov: &crate::SamplingOverrides,
         session_id: Option<&str>,
     ) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p);
+                let _ = (temperature, top_p, ov);
                 if let Some(sid) = session_id {
                     return m.completion_session(input_ids, max_new_tokens, sid);
                 }
@@ -1293,7 +1316,7 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                m.generate(input_ids, max_new_tokens, temperature, top_p)
+                m.generate(input_ids, max_new_tokens, temperature, top_p, ov)
             }
         }
     }

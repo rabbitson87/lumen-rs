@@ -189,7 +189,13 @@ fn gemma4_parity_teacher_forced_argmax_match() {
         // ── 3. Free-running argmax (informational) ────────────────────────
         let free_max = ref_tokens.len();
         let free_out = backend
-            .generate(&case.prompt_token_ids, free_max, 0.0, 1.0)
+            .generate(
+                &case.prompt_token_ids,
+                free_max,
+                0.0,
+                1.0,
+                &lumen_mlx::SamplingOverrides::default(),
+            )
             .expect("free generate");
         // Prefix match length (consecutive matching tokens from position 0).
         let free_prefix = free_out

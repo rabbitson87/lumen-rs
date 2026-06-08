@@ -12,6 +12,16 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
+    /// Per-request sampling overrides (Gemma 4 sampler only; other families
+    /// ignore). When omitted, the backend falls back to env / family default.
+    /// OpenAI chat doesn't standardize `top_k`/`seed`/`repeat_penalty`, but we
+    /// accept them leniently so clients can tune the local sampler.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -281,6 +291,14 @@ pub struct CompletionRequest {
     pub temperature: f32,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
+    /// Per-request sampling overrides (Gemma 4 sampler only). See
+    /// `ChatCompletionRequest` for semantics.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub stream: bool,
     /// Optional client-supplied session id (MLX backend only). When the cached
@@ -530,6 +548,14 @@ pub struct AnthropicRequest {
     pub temperature: f32,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
+    /// Anthropic natively supports `top_k`. `seed` / `repeat_penalty` are
+    /// Lumen extensions for the local Gemma 4 sampler (other families ignore).
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -1307,6 +1333,9 @@ mod tool_calling_serde {
             max_tokens: 16,
             temperature: 0.7,
             top_p: 0.9,
+            top_k: None,
+            seed: None,
+            repeat_penalty: None,
             stream: false,
             stream_options: None,
             thinking: false,

@@ -171,7 +171,11 @@ pub(crate) mod imp {
         );
     }
 
-    fn build_sampling_config(temperature: f32, top_p: f32) -> Option<SamplingConfig> {
+    fn build_sampling_config(
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+    ) -> Option<SamplingConfig> {
         // Temperature parity with Ollama `gemma4:26b-mlx` (Modelfile sets
         // `temperature 1`). The server's serde default is 0.7 (see
         // `default_temperature()` in lumen-server). When a request arrives with
@@ -193,11 +197,13 @@ pub(crate) mod imp {
         } else {
             temperature
         };
-        let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f32| *v > 0.0)
-            .unwrap_or(1.1);
+        let repeat_penalty: f32 = ov.repeat_penalty.unwrap_or_else(|| {
+            std::env::var("REPEAT_PENALTY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|v: &f32| *v > 0.0)
+                .unwrap_or(1.1)
+        });
         let repeat_penalty_last_n: usize = std::env::var("LUMEN_REPEAT_LAST_N")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -210,19 +216,23 @@ pub(crate) mod imp {
         // generations degenerated where Ollama (top_k=64) converged. Verified
         // by reading Ollama's renderer (identical prompt) + `ollama show
         // gemma4:26b-mlx`. Set `LUMEN_TOP_K=0` to disable, or override freely.
-        let top_k: usize = std::env::var("LUMEN_TOP_K")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(64);
-        let seed: u64 = std::env::var("LUMEN_SAMPLE_SEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0x9E3779B97F4A7C15)
-            });
+        let top_k: usize = ov.top_k.unwrap_or_else(|| {
+            std::env::var("LUMEN_TOP_K")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(64)
+        });
+        let seed: u64 = ov.seed.unwrap_or_else(|| {
+            std::env::var("LUMEN_SAMPLE_SEED")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0x9E3779B97F4A7C15)
+                })
+        });
         let cfg = SamplingConfig {
             temperature,
             top_p,
@@ -1014,11 +1024,12 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
         ) -> Result<Vec<u32>> {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p),
+                sampling: build_sampling_config(temperature, top_p, ov),
             };
             let stats = self.model.generate(input_ids, &cfg)?;
             eprintln!(
@@ -1043,6 +1054,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
@@ -1052,7 +1064,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p),
+                sampling: build_sampling_config(temperature, top_p, ov),
             };
             let stats = self.model.generate(&prompt, &cfg)?;
             eprintln!(
@@ -1076,6 +1088,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
@@ -1085,7 +1098,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p),
+                sampling: build_sampling_config(temperature, top_p, ov),
             };
             let stats = self.model.generate(&prompt, &cfg)?;
             log_chat_done(
@@ -1323,6 +1336,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
@@ -1378,7 +1392,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p),
+                sampling: build_sampling_config(temperature, top_p, ov),
             };
             let stats = self
                 .model
@@ -1521,6 +1535,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
@@ -1596,6 +1611,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
@@ -1614,6 +1630,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
@@ -1669,6 +1686,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
@@ -1687,6 +1705,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             prefix_cache_key: &str,
             tools: &[crate::chat_io::ToolDef<'_>],
@@ -1735,7 +1754,7 @@ pub(crate) mod imp {
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p),
+                sampling: build_sampling_config(temperature, top_p, ov),
             };
             let stats = self
                 .model
@@ -1772,6 +1791,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
@@ -1786,6 +1806,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 grammar,
                 None,
                 None,
@@ -1806,6 +1827,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
@@ -1820,6 +1842,7 @@ pub(crate) mod imp {
                 max_new_tokens,
                 temperature,
                 top_p,
+                ov,
                 grammar,
                 None,
                 None,
@@ -1834,6 +1857,7 @@ pub(crate) mod imp {
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
+            ov: &crate::SamplingOverrides,
             // Phase 2.5: grammar-constrained tool calling. `None` for the
             // default text path; `Some(state)` engages the llguidance mask
             // during the sampled decode branch (no-op on greedy / MTP — those
@@ -2112,7 +2136,7 @@ pub(crate) mod imp {
                 }
                 let eos = self.model.eos_tokens().to_vec();
 
-                let sampling_cfg = build_sampling_config(temperature, top_p);
+                let sampling_cfg = build_sampling_config(temperature, top_p, ov);
 
                 // ── MTP decode branch (DEFAULT OFF — opt-in only) ──
                 //
@@ -2832,6 +2856,7 @@ pub(crate) mod imp {
                     8,
                     0.0,
                     1.0,
+                    &crate::SamplingOverrides::default(),
                     false,
                     &[],
                     &crate::chat_io::ResolvedToolChoice::Auto,
@@ -2867,6 +2892,7 @@ pub(crate) mod imp {
                     8,
                     0.0,
                     1.0,
+                    &crate::SamplingOverrides::default(),
                     false,
                     &[],
                     &crate::chat_io::ResolvedToolChoice::Auto,
