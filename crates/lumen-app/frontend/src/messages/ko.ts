@@ -378,6 +378,15 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.label": "tool_choice 강제 (Gemma 4)",
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.help":
     "tool_choice가 `required`이거나 특정 함수를 지정할 때, Eager grammar(첫 토큰부터 활성)로 디코딩을 제약해 호출 인자를 스키마에 맞춥니다. 기본 꺼짐: 기본 Lazy grammar는 모델이 tool-call opener를 낸 뒤에만 활성화되므로, 강제된 호출의 body가 현재 무제약입니다. Eager + 장기 agentic 루프는 일부 양자화 빌드를 반복 사이클에 빠뜨린 사례가 있으니 모델에서 검증 후 사용하세요. tool_choice=auto에는 영향 없음.",
+  "env.entry.LUMEN_MLX_DRAFT_MODEL.label": "드래프트 모델 (투기 디코딩) — 실험적",
+  "env.entry.LUMEN_MLX_DRAFT_MODEL.help":
+    "실험적. Qwen3.5/3.6 네이티브 경로의 greedy 드래프트-모델 투기 디코딩용 소형 드래프트 모델의 경로 또는 HF id. 드래프트가 토큰을 제안하면 타깃이 단일 배치 forward로 검증해 일치하는 최장 prefix를 수락 — greedy 대비 무손실(타깃 argmax가 항상 정답). 네이티브 러너 필요 + 드래프트 vocab이 타깃과 일치해야 함(불일치 시 자동 비활성). greedy 요청에만 적용. 빈 값 = 꺼짐(기본; 기존 디코딩 그대로).",
+  "env.entry.LUMEN_MLX_DRAFT_NMAX.label": "스텝당 드래프트 토큰 수",
+  "env.entry.LUMEN_MLX_DRAFT_NMAX.help":
+    "드래프트 모델이 검증 시도당 제안하는 토큰 수(1-16, 기본 4). 클수록 드래프트가 타깃과 일치할 때 잠재 가속이 크지만, 거부 시 낭비되는 드래프트 연산도 증가. 드래프트 모델 설정 시에만 사용.",
+  "env.entry.LUMEN_MLX_DRAFT_PMIN.label": "드래프트 최소 top-1 확률",
+  "env.entry.LUMEN_MLX_DRAFT_PMIN.help":
+    "제안을 계속 확장하기 위한 드래프트 top-1 최소 확률(0-1, 기본 0 = 비활성). 현재는 no-op 플레이스홀더: 드래프트가 확률 출력 없는 argmax-only 스텝으로 제안하므로 확률 게이팅은 하드웨어 검증 대기 중. 0으로 두세요.",
 
   // 메모리 계산기 (context / chunk / KV 모드별 peak 메모리 예측).
   "memcalc.title": "메모리 계산기",

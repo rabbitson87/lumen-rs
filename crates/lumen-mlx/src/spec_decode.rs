@@ -171,6 +171,55 @@ pub(crate) fn read_spec_config() -> Option<SpecConfig> {
     })
 }
 
+/// Config for the OPT-IN draft-model speculative decode path (mirrors the
+/// llama.cpp greedy draft-model spec). Returned by [`read_draft_config`] only
+/// when `LUMEN_MLX_DRAFT_MODEL` is set; otherwise `None` and the entire draft
+/// code path is dormant (existing decode is used unchanged).
+///
+/// Env vars:
+///   LUMEN_MLX_DRAFT_MODEL=<id|path>   (REQUIRED — unset → feature disabled)
+///   LUMEN_MLX_DRAFT_NMAX=4            number of tokens the draft proposes/step
+///   LUMEN_MLX_DRAFT_PMIN=0.0          min draft top-1 prob to keep proposing
+#[derive(Clone, Debug)]
+pub(crate) struct DraftConfig {
+    /// Model id or local directory path for the draft (small) model.
+    pub model: String,
+    /// Max tokens the draft proposes per verify attempt.
+    pub n_max: usize,
+    /// Minimum draft top-1 probability to keep extending a proposal. `0.0`
+    /// (default) disables probability gating — the draft always proposes the
+    /// full `n_max`. See `spec_decode_draft` for why `p_min` > 0 is currently a
+    /// no-op (the autoregressive propose uses argmax-only `decode_step`).
+    pub p_min: f32,
+}
+
+/// Resolve the draft-model spec config. Returns `None` (feature OFF) whenever
+/// `LUMEN_MLX_DRAFT_MODEL` is unset or empty — the default path. When set,
+/// `LUMEN_MLX_DRAFT_NMAX` (default 4, clamped ≥1) and `LUMEN_MLX_DRAFT_PMIN`
+/// (default 0.0, clamped to [0,1]) tune the loop.
+pub(crate) fn read_draft_config() -> Option<DraftConfig> {
+    let model = std::env::var("LUMEN_MLX_DRAFT_MODEL").ok()?;
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
+    let n_max: usize = std::env::var("LUMEN_MLX_DRAFT_NMAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .max(1);
+    let p_min: f32 = std::env::var("LUMEN_MLX_DRAFT_PMIN")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0f32)
+        .clamp(0.0f32, 1.0f32);
+    Some(DraftConfig {
+        model,
+        n_max,
+        p_min,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +270,14 @@ mod tests {
         // logic when LUMEN_MLX_SPEC happens to be unset in this run.
         if std::env::var("LUMEN_MLX_SPEC").is_err() {
             assert!(read_spec_config().is_none());
+        }
+    }
+
+    #[test]
+    fn draft_config_defaults_off() {
+        // When LUMEN_MLX_DRAFT_MODEL is unset, the draft path must be disabled.
+        if std::env::var("LUMEN_MLX_DRAFT_MODEL").is_err() {
+            assert!(read_draft_config().is_none());
         }
     }
 }

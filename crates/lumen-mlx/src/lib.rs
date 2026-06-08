@@ -1387,6 +1387,21 @@ pub struct MlxQwen35Backend {
     session_ttl: Option<Duration>,
     session_max: Option<usize>,
     prefix_store: prefix_cache::PrefixCacheStore,
+    /// OPT-IN draft-model speculative decode (default OFF). `Some` only when
+    /// `LUMEN_MLX_DRAFT_MODEL` is set AND the draft loaded with a vocab size
+    /// matching the target. `None` → the entire draft path is dormant and the
+    /// baseline decode runs byte-identically. Held as its own isolated
+    /// `NativeMlxRunner` (second model + its own seq/KV state).
+    #[cfg(feature = "mlx-native")]
+    draft: Option<DraftRunner>,
+}
+
+/// Isolated draft model + its resolved config for greedy spec decode.
+#[cfg(feature = "mlx-native")]
+struct DraftRunner {
+    runner: NativeMlxRunner,
+    cfg: spec_decode::DraftConfig,
+    eos_tokens: Vec<u32>,
 }
 
 impl MlxQwen35Backend {
@@ -1478,6 +1493,8 @@ impl MlxQwen35Backend {
             session_ttl,
             session_max,
             prefix_store,
+            #[cfg(feature = "mlx-native")]
+            draft: None,
         };
         // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
         // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
@@ -1485,6 +1502,15 @@ impl MlxQwen35Backend {
         #[cfg(feature = "mlx-native")]
         if let Err(err) = me.try_enable_qwen35_mtp_from_env() {
             eprintln!("[mlx] qwen3.5 MTP auto-enable skipped: {err}");
+        }
+        // OPT-IN draft-model speculative decode auto-load. Honored only on the
+        // native runner with `LUMEN_MLX_DRAFT_MODEL` set. Any failure (load /
+        // vocab-mismatch) is non-fatal: we log + leave `draft = None` so the
+        // baseline decode path runs unchanged.
+        #[cfg(feature = "mlx-native")]
+        {
+            let target_vocab = me.vocab_size;
+            me.try_load_draft_model_from_env(target_vocab);
         }
         Ok(me)
     }
@@ -1694,6 +1720,318 @@ impl MlxQwen35Backend {
         Ok(())
     }
 
+    /// OPT-IN draft-model speculative decode auto-load. No-op unless
+    /// `LUMEN_MLX_DRAFT_MODEL` is set. Loads a *separate* `NativeMlxRunner`
+    /// holding the draft model + its own seq/KV state, then verifies the draft
+    /// tokenizer vocab matches the target. On any failure or mismatch we log
+    /// and leave `self.draft = None` (baseline decode runs unchanged — never
+    /// crash). Honored only when the target itself runs on the native runner;
+    /// the draft loop reuses native-only primitives (`forward_probe`,
+    /// `snapshot_state`, `restore_state`).
+    ///
+    /// `target_vocab` is the already-loaded target's vocab size.
+    #[cfg(feature = "mlx-native")]
+    fn try_load_draft_model_from_env(&mut self, target_vocab: usize) {
+        let Some(cfg) = spec_decode::read_draft_config() else {
+            return; // LUMEN_MLX_DRAFT_MODEL unset → feature OFF.
+        };
+        if !matches!(self.runner, RunnerImpl::Native(_)) {
+            eprintln!(
+                "[mlx-draft] LUMEN_MLX_DRAFT_MODEL set but target runner is not native — \
+                 draft spec-decode DISABLED (set LUMEN_MLX_BACKEND=native to use it)"
+            );
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let mut runner = match NativeMlxRunner::new() {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("[mlx-draft] draft runner init failed: {err} — draft DISABLED");
+                return;
+            }
+        };
+        let info = match runner.load(&cfg.model) {
+            Ok(info) => info,
+            Err(err) => {
+                eprintln!(
+                    "[mlx-draft] draft model `{}` load failed: {err} — draft DISABLED",
+                    cfg.model
+                );
+                return;
+            }
+        };
+        // VERIFY vocab compatibility: argmax-only verify compares token ids
+        // across the two models, so their vocabularies MUST line up.
+        if info.vocab_size != target_vocab {
+            eprintln!(
+                "[mlx-draft] draft vocab {} != target vocab {} — draft DISABLED \
+                 (incompatible tokenizers)",
+                info.vocab_size, target_vocab
+            );
+            return;
+        }
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx-draft] draft model `{}` loaded (vocab={} n_max={} p_min={:.3}) in {dt:.0}ms — \
+             greedy spec-decode ENABLED",
+            cfg.model, info.vocab_size, cfg.n_max, cfg.p_min
+        );
+        self.draft = Some(DraftRunner {
+            runner,
+            cfg,
+            eos_tokens: info.eos_tokens,
+        });
+    }
+
+    /// True when the OPT-IN draft-model spec path is loaded and usable.
+    #[cfg(feature = "mlx-native")]
+    fn draft_enabled(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// OPT-IN greedy draft-model speculative decode (mirrors the llama.cpp
+    /// greedy draft-model spec). ARGMAX-ONLY verify — engaged only for greedy
+    /// requests (the Qwen3.5 family streaming path is greedy by construction;
+    /// the dispatcher discards `temperature`/`top_p` before reaching here, so
+    /// every call on this path is greedy). If a sampled request ever reaches
+    /// this function it would still be greedy here, but the wiring gates on the
+    /// greedy precondition explicitly.
+    ///
+    /// Per step:
+    ///   PROPOSE: greedy-roll the draft `n_max` tokens via `draft.decode_step`
+    ///            (autoregressive). `p_min` gating is a documented no-op for
+    ///            now (see `DraftConfig::p_min`).
+    ///   VERIFY:  `target.forward_probe(seq, &draft_tokens)` → K argmax rows in
+    ///            ONE target forward.
+    ///   ACCEPT:  longest prefix where `probe.row_argmaxes[i] == draft[i]`.
+    ///            On full match, append the bonus `row_argmaxes[n]`. On partial,
+    ///            `restore_state` the target to before the verify forward and
+    ///            commit only the accepted prefix + the corrective
+    ///            `row_argmaxes[n_acc]`. The draft KV is kept in lockstep by
+    ///            re-anchoring it to the accepted tokens via `extend`.
+    #[cfg(feature = "mlx-native")]
+    fn chat_streaming_spec_draft<F>(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let (n_max, draft_eos) = {
+            let d = self
+                .draft
+                .as_ref()
+                .ok_or_else(|| anyhow!("chat_streaming_spec_draft: draft not loaded"))?;
+            (d.cfg.n_max, d.eos_tokens.clone())
+        };
+
+        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        if prompt_ids.is_empty() {
+            return Err(anyhow!("empty prompt after tokenization"));
+        }
+
+        // Prefill BOTH models with the same prompt. Use a dedicated seq id for
+        // the draft so its KV state is fully isolated from the target's.
+        let draft_seq_id: u64 = seq_id;
+        let t_prefill = std::time::Instant::now();
+        let (mut t_pred, mut pos) = self.prefill(seq_id, &prompt_ids)?;
+        // Draft prefill — its predicted next token is ignored; the draft is
+        // re-driven from the committed tokens each step.
+        {
+            let d = self.draft.as_mut().expect("draft present");
+            d.runner.prefill(draft_seq_id, &prompt_ids)?;
+        }
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx-draft] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms (n_max={n_max}) -> tok={t_pred}",
+            prompt_ids.len(),
+        );
+
+        let mut generated: Vec<u32> = Vec::new();
+        let mut prev_text = String::new();
+        let mut n_attempts: u64 = 0;
+        let mut n_accept_tokens: u64 = 0;
+        let mut n_verify_tokens: u64 = 0;
+
+        let t_decode = std::time::Instant::now();
+        // `step` counts emitted tokens against `max_new_tokens`. Helper macro
+        // emits a committed token (decode + on_token) and checks EOS / budget.
+        // Returns true when the loop should terminate.
+        let mut step: usize = 0;
+        let mut should_stop = false;
+
+        // Commit-and-emit closure-free helper kept inline to satisfy the
+        // borrow checker (mutably borrows self for `decode`).
+        macro_rules! emit_committed {
+            ($tok:expr) => {{
+                let tok = $tok;
+                generated.push(tok);
+                if let Ok(text) = self.decode(&generated) {
+                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
+                        on_token(&text[prev_text.len()..]);
+                        prev_text = text;
+                    }
+                }
+                step += 1;
+                if self.eos_tokens.contains(&tok) || step >= max_new_tokens {
+                    should_stop = true;
+                }
+            }};
+        }
+
+        while step < max_new_tokens && !should_stop {
+            // ── PROPOSE: roll the draft n_max tokens. The draft must FIRST
+            // consume the target's committed token (`t_pred`) so its KV is at
+            // the same logical offset as the target before it predicts. We feed
+            // `t_pred` then take the draft's own argmax chain.
+            n_attempts += 1;
+            let mut draft_tokens: Vec<u32> = Vec::with_capacity(n_max);
+            {
+                let d = self.draft.as_mut().expect("draft present");
+                // Step the draft on the just-committed target token to align
+                // its KV, getting the draft's first proposal d_0.
+                let (mut d_next, _dpos) = d.runner.decode_step(draft_seq_id, t_pred, 0)?;
+                draft_tokens.push(d_next);
+                // Continue greedily for the remaining n_max-1 tokens.
+                for _ in 1..n_max {
+                    // p_min gating (LUMEN_MLX_DRAFT_PMIN): decode_step returns
+                    // argmax-only (no probability), so probability-based early
+                    // stop is a TODO(hardware-verify). With the default
+                    // p_min=0.0 the full n_max chain is proposed.
+                    if draft_eos.contains(&d_next) {
+                        break; // draft hit its own EOS — stop proposing.
+                    }
+                    let (n, _p) = d.runner.decode_step(draft_seq_id, d_next, 0)?;
+                    d_next = n;
+                    draft_tokens.push(d_next);
+                }
+            }
+
+            if draft_tokens.is_empty() {
+                // Degenerate: no proposal. Fall back to a single target step.
+                emit_committed!(t_pred);
+                if should_stop {
+                    break;
+                }
+                let (next, new_pos) = self.decode_step(seq_id, t_pred, pos)?;
+                t_pred = next;
+                pos = new_pos;
+                continue;
+            }
+
+            // ── VERIFY: snapshot the target, then run ONE batched forward over
+            // the draft tokens. row_argmaxes[i] = the target's greedy next
+            // token *conditioned on the cache + draft[0..=i]*.
+            let snap = self.snapshot_state(seq_id)?;
+            let probe = self.forward_probe(seq_id, &draft_tokens)?;
+            n_verify_tokens += draft_tokens.len() as u64;
+            let rows = &probe.row_argmaxes;
+            if rows.len() != draft_tokens.len() {
+                self.restore_state(seq_id, snap).ok();
+                return Err(anyhow!(
+                    "draft verify returned {} rows for {} draft tokens",
+                    rows.len(),
+                    draft_tokens.len()
+                ));
+            }
+
+            // ── ACCEPT: the target's true next token at offset M is `t_pred`
+            // (known from the prior step). Accept draft[i] iff it equals the
+            // target's prediction at that position. Position 0's target pred is
+            // `t_pred`; position i>0's is rows[i-1].
+            let mut n_acc = 0usize;
+            while n_acc < draft_tokens.len() {
+                let target_pred = if n_acc == 0 { t_pred } else { rows[n_acc - 1] };
+                if draft_tokens[n_acc] == target_pred {
+                    n_acc += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Corrective token = the target's prediction at the first rejected
+            // position (= t_pred when n_acc==0, else rows[n_acc-1]). On full
+            // accept this is rows[len-1] = the bonus token.
+            let corrective = if n_acc == 0 { t_pred } else { rows[n_acc - 1] };
+            n_accept_tokens += n_acc as u64;
+
+            // Roll the TARGET cache to exactly `n_acc` accepted draft tokens.
+            // forward_probe advanced the cache by the full draft length; restore
+            // then re-feed only the accepted prefix.
+            pos = self.restore_state(seq_id, snap)?;
+            if n_acc > 0 {
+                // extend re-consumes the accepted draft tokens into the cache;
+                // its returned next-token prediction is the target's pred after
+                // the accepted prefix == `corrective` (rows[n_acc-1]) and we
+                // commit that as the corrective.
+                let (_n, new_pos) = self.runner.extend(seq_id, &draft_tokens[..n_acc])?;
+                pos = new_pos;
+            }
+
+            // Commit accepted draft prefix + the corrective token.
+            for i in 0..n_acc {
+                emit_committed!(draft_tokens[i]);
+                if should_stop {
+                    break;
+                }
+            }
+            if should_stop {
+                break;
+            }
+            emit_committed!(corrective);
+            if should_stop {
+                break;
+            }
+
+            // Re-anchor the DRAFT KV to the committed tokens. The draft already
+            // consumed `t_pred` + its own proposed chain during PROPOSE; that
+            // chain diverged past `n_acc`. Simplest correct fix: roll the draft
+            // forward over the corrective token so both models share the same
+            // logical suffix for the next round. Because the draft consumed the
+            // *full* proposed chain (not just the accepted prefix), we re-prime
+            // it from the corrective token; the next PROPOSE will feed it the
+            // next committed `t_pred`. Mild KV drift on the draft is acceptable
+            // (the draft is only a speculator; the target verify is the source
+            // of truth). TODO(hardware-verify): tighten draft KV rollback to
+            // exactly the accepted prefix if accept-rate suffers.
+            {
+                let d = self.draft.as_mut().expect("draft present");
+                let _ = d.runner.decode_step(draft_seq_id, corrective, 0)?;
+            }
+
+            // Advance the target to get the next `t_pred` after the corrective.
+            // The target cache is currently at M + n_acc (extend) and has NOT
+            // consumed `corrective`. Feed it via decode_step.
+            let (next, new_pos) = self.decode_step(seq_id, corrective, pos)?;
+            t_pred = next;
+            pos = new_pos;
+        }
+
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let n_gen = generated.len();
+        let accept_rate = if n_verify_tokens > 0 {
+            n_accept_tokens as f64 / n_verify_tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[mlx-draft] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s) \
+             attempts={n_attempts} accepted={n_accept_tokens}/{n_verify_tokens} (rate={accept_rate:.2})",
+            n_gen as f64 / (decode_ms / 1000.0)
+        );
+        let out = self.decode(&generated).unwrap_or_default();
+        self.remove_seq(seq_id).ok();
+        // Free the draft's seq/KV state too.
+        if let Some(d) = self.draft.as_mut() {
+            d.runner.remove_seq(draft_seq_id).ok();
+        }
+        Ok(out)
+    }
+
     /// Capture the seq's per-layer cache state. Returns an opaque snapshot id.
     /// Snapshot is consumed by `restore_state` (one-shot) or freed by
     /// `release_snapshot`. Used by spec-decode partial-accept rollback.
@@ -1858,6 +2196,24 @@ impl MlxQwen35Backend {
                     on_token,
                 );
             }
+        }
+
+        // OPT-IN draft-model speculative decode. Engaged only when (1) a draft
+        // model was loaded from `LUMEN_MLX_DRAFT_MODEL` AND (2) the request is
+        // greedy. This inner Qwen3.5-family path is greedy by construction (the
+        // dispatcher in `MlxBackend::chat_streaming` discards temperature/top_p
+        // before calling here), so reaching this branch implies greedy. Default
+        // OFF: when no draft is loaded, this is a no-op and the existing path
+        // below runs byte-identically.
+        #[cfg(feature = "mlx-native")]
+        if self.draft_enabled() {
+            return self.chat_streaming_spec_draft(
+                messages,
+                max_new_tokens,
+                thinking,
+                seq_id,
+                on_token,
+            );
         }
 
         if let Some(cfg) = spec_decode::read_spec_config() {
