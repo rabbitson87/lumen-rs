@@ -112,11 +112,12 @@ pub struct QuantConfig {
     pub kv_mode: QuantKvMode,
 
     /// Prompt-length threshold (in tokens) at which `QuantKvMode::Auto`
-    /// switches quantization ON for a request. Default 131072 (128K) —
-    /// matches the regime where bf16 KV approaches Apple Silicon unified-
-    /// memory ceiling. Smaller deployments (M2/M3 Air 16-18 GB) may want
-    /// to lower this to 32K or 64K. Ignored unless `kv_mode = Auto`.
-    /// Emits `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`.
+    /// switches quantization ON for a request. Default 16384 (16K) — tuned
+    /// for the 24 GB Mac mini target where bf16 KV pressure starts to bind;
+    /// quantized-KV sliding-window wins are verified from ~16K up. A 128K
+    /// threshold made Auto a near no-op (most prompts never crossed it).
+    /// Big-memory machines (64 GB+) can raise this or use `Off`. Ignored
+    /// unless `kv_mode = Auto`. Emits `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`.
     #[serde(default = "default_kv_auto_threshold_tokens")]
     pub kv_auto_threshold_tokens: u32,
 }
@@ -143,7 +144,7 @@ fn default_kv_mode() -> QuantKvMode {
 }
 
 fn default_kv_auto_threshold_tokens() -> u32 {
-    131072
+    16384
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,7 +245,7 @@ impl Default for PersistentConfig {
             quant: QuantConfig {
                 bits: 4,
                 kv_mode: QuantKvMode::Off,
-                kv_auto_threshold_tokens: 131072,
+                kv_auto_threshold_tokens: 16384,
             },
             context: ContextConfig {
                 // Bumped 10× over the initial 8192 / 4096 defaults at
@@ -425,7 +426,7 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
         // once they read the new help text. Past TQ measurements showed
         // Auto-at-4K was usually a perf regression anyway.)
         cfg.quant.kv_mode = QuantKvMode::Off;
-        cfg.quant.kv_auto_threshold_tokens = 131072;
+        cfg.quant.kv_auto_threshold_tokens = 16384;
         if !(matches!(cfg.quant.bits, 3 | 4 | 6 | 8)) {
             cfg.quant.bits = 4;
         }

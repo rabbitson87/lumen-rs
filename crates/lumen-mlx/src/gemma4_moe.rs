@@ -2177,18 +2177,20 @@ pub(crate) mod imp {
     }
 
     /// Auto-mode prompt-length threshold (in tokens) at which Q4 kicks in.
-    /// `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`, default 131072 (128K).
+    /// `LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS`, default 16384 (16K).
     ///
     /// Rationale (2026-05-26 3-way sweep on M3 Max): Q4 is ≈ neutral vs bf16
     /// for decode at 8K-32K (within ±5%), so users only see memory benefit
-    /// without throughput cost. 128K default is conservative — only kicks in
-    /// when bf16 KV approaches platform memory ceiling (≈32 GB at 128K on
-    /// Gemma 4 26B-A4B), preserving full speed for normal usage.
+    /// without throughput cost. The default is the 24 GB Mac mini target —
+    /// 16K is where bf16 KV pressure starts to bind and quantized sliding-
+    /// window wins are verified. (A 128K default made Auto a near no-op.)
+    /// This fallback only applies for standalone runs; the desktop app emits
+    /// the env var from `kv_auto_threshold_tokens` (default 16384).
     pub fn gemma4_quant_kv_auto_threshold() -> usize {
         std::env::var("LUMEN_GEMMA4_QUANT_KV_AUTO_THRESHOLD_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(131072usize)
+            .unwrap_or(16384usize)
             .max(1)
     }
 

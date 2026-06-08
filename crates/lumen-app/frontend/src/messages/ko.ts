@@ -153,7 +153,7 @@ export const ko: Record<string, string> = {
   "quant.tooltip.mode":
     "끔: KV를 절대 압축하지 않음 (모든 디코드가 가장 빠름, 메모리는 가장 큼). 켬: 항상 압축 (KV 메모리 4–5× 절감, 디코드 ≈ 같음 ±5%). 자동: 이번 요청의 prompt가 아래 임계값 이상일 때만 압축 — 짧은 대화는 풀 속도, 긴 컨텍스트만 메모리 절감. 요청별 결정은 `[gemma4-backend] quant_kv_auto: ...` 로 로그에 기록됩니다.",
   "quant.tooltip.autoThreshold":
-    "자동 모드가 KV 양자화를 켜는 prompt 토큰 수. 기본 131072 (128K) — Apple Silicon 통합 메모리가 bf16 KV를 충분히 담을 수 있는 범위 (M3 Max 36 GB에서 64K bf16 KV ≈ 16 GB) 아래에서는 압축 없이 풀 속도, 이를 넘으면 메모리 천장에 닿기 전에 압축으로 전환합니다.",
+    "자동 모드가 KV 양자화를 켜는 prompt 토큰 수. 기본 16384 (16K) — 24 GB Mac mini 기준으로 bf16 KV 압박이 시작되고 양자화 sliding-window 이득이 검증되는 ~16K부터 켜집니다. 그 아래는 bf16 풀 속도. 대용량 머신 (64 GB+)은 값을 올리거나 끔을 쓰세요. (128K 기본은 자동을 사실상 무력화했습니다.)",
   "quant.tooltip.bits":
     "KV 채널당 양자화 비트 수. 8: 최고 품질, bf16 대비 2× 축소. 6: 균형 ≈ 2.7× 축소. 4: 권장 기본값, 4× 축소. 3: 최대 압축 약 5.3×, 미세한 품질 저하. mlx affine 양자화 (group_size=64) 를 사용하므로 별도의 회전/잔차 보정이 없습니다.",
 

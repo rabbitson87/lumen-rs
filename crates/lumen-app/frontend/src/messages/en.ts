@@ -159,7 +159,7 @@ export const en: Record<string, string> = {
   "quant.tooltip.mode":
     "Off: never compress KV (fastest decode at any context, largest memory). On: always compress (4–5× KV memory savings, decode ≈ same ±5%). Auto: compress only when this request's prompt is at or above the threshold below — short chats stay at full speed, only long-context requests pay the quant trade-off. Per-request decision logged as `[gemma4-backend] quant_kv_auto: ...`.",
   "quant.tooltip.autoThreshold":
-    "Prompt-token count at which Auto mode flips KV quantization ON for the request. Default 131072 (128K) — below this, Apple Silicon unified memory comfortably holds the bf16 KV cache (M3 Max 36 GB fits ≈64K bf16 KV in ~16 GB), so full-speed decode wins; above it, compression keeps memory bounded before the platform ceiling.",
+    "Prompt-token count at which Auto mode flips KV quantization ON for the request. Default 16384 (16K) — tuned for the 24 GB Mac mini, where bf16 KV pressure starts to bind and quantized sliding-window wins are verified from ~16K up; below it full-speed bf16 decode wins. Big-memory machines (64 GB+) can raise this or use Off. (A 128K default made Auto a near no-op.)",
   "quant.tooltip.bits":
     "Quantization bits per KV channel. 8: highest quality, 2× smaller than bf16. 6: balanced ≈ 2.7× smaller. 4: recommended default, 4× smaller. 3: max compression ≈ 5.3×, small quality drop. Uses mlx affine quantization (group_size=64) — no rotation or residual correction stage.",
 

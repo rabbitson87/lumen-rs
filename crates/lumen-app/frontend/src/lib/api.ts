@@ -32,7 +32,7 @@ export interface QuantConfig {
    *              quant trade-off to keep memory bounded. */
   kv_mode: "off" | "on" | "auto";
   /** Prompt-length threshold (tokens) at which `auto` mode turns quantization
-   *  ON. Default 131072 (128K). Ignored unless mode = auto. */
+   *  ON. Default 16384 (16K). Ignored unless mode = auto. */
   kv_auto_threshold_tokens: number;
 }
 
