@@ -384,6 +384,9 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_TQ_KV_BITS.label": "TurboQuant KV bits",
   "env.entry.LUMEN_QWEN35_TQ_KV_BITS.help":
     "Lloyd-Max bit width for TurboQuant KV (2-8). 8 = near-lossless (start here), 6 = lowest clean, 4 = aggressive/lossy. Only used when TurboQuant KV cache is enabled. Lower bits = more memory saved but more quality loss.",
+  "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.label": "Enforce tool_choice (Gemma 4)",
+  "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.help":
+    "When tool_choice is `required` or names a function, constrain decoding with an Eager grammar (active from the first token) so the call's arguments are schema-valid. Off by default: the default Lazy grammar only activates after the model emits the tool-call opener, so a forced call's body is currently unconstrained. Eager + long agentic loops drove some quantized builds into a repetition cycle — verify on your model before relying on it. Does not affect tool_choice=auto.",
 
   // Memory calculator (predict peak memory vs context / chunk / KV mode).
   "memcalc.title": "Memory calculator",

@@ -398,6 +398,23 @@ pub(crate) mod imp {
         })
     }
 
+    /// Opt-in: enforce `tool_choice=required`/named with an **Eager** grammar
+    /// (active from token 0) instead of the default Lazy grammar (which only
+    /// activates after the model self-emits `<|tool_call>` and thus does not
+    /// constrain a prefill-forced call). Default OFF: Eager + agentic loops
+    /// were observed to drive some quantized builds into an n-gram cycle on
+    /// later turns (see `build_grammar_state`), and that interaction is not
+    /// yet re-verified — so strict enforcement stays operator-gated until
+    /// A/B'd on the target model. Does not affect `tool_choice=auto`.
+    fn gemma4_tool_grammar_eager() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER")
+                .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+        })
+    }
+
     /// True for model ids the operator has flagged as instruction-tuned
     /// via imatrix-AWQ calibration. These builds produce degenerate
     /// tool-call outputs (channel logits suppressed by quantization) and
@@ -665,32 +682,61 @@ pub(crate) mod imp {
                 eprintln!("[gemma4-backend] Lark grammar skipped: tools empty");
                 return None;
             }
-            // Always Lazy (never Eager) regardless of `tool_choice`.
+            // Default is Lazy regardless of `tool_choice`; Eager for
+            // `Required`/`Tool(_)` is opt-in via
+            // `LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER` (see `gemma4_tool_grammar_eager`).
             // Reasoning: empirically the Eager + agentic-loop combination
-            // sends the model into an n-gram cycle on the 3rd-or-later
-            // turn — the grammar over-permits duplicate fields
+            // sent some quantized builds into an n-gram cycle on the
+            // 3rd-or-later turn — the grammar over-permits duplicate fields
             // (`tc_field ("," tc_field)*`) so the model can't commit to
-            // closing the body. Lazy mode dodges this entirely: grammar
-            // only activates AFTER the model self-emits `<|tool_call>`
-            // (id 48), which means
-            //   - `Required` / `Tool(_)` runs use the chat-template
-            //     prefill to inject id 48 — prefill goes through
-            //     `parser.push()`, NOT through `state.observe()`, so the
-            //     Lazy matcher stays inactive and the model emits the
-            //     body freely from training distribution (the pre-Lark
-            //     behaviour, proven to work end-to-end).
-            //   - `Auto` runs still get the schema safety net when the
-            //     model decides on its own to emit `<|tool_call>` —
-            //     observe(48) flips the matcher on and the args body is
-            //     schema-constrained.
-            // Future Eager re-enable should pair with a permutation-
-            // ordered, no-duplicate body grammar (see
-            // `build_tool_grammar_lark` doc).
+            // closing the body. Lazy dodges this: the grammar only activates
+            // AFTER the model self-emits `<|tool_call>` (id 48), which means
+            //   - `Required` / `Tool(_)` runs use the chat-template prefill to
+            //     inject id 48 — prefill goes through `parser.push()`, NOT
+            //     `state.observe()`, so the Lazy matcher stays inactive and the
+            //     body is emitted freely from the training distribution (the
+            //     pre-Lark behaviour, proven end-to-end). Hence a forced call's
+            //     ARGUMENTS are unconstrained under Lazy — turn Eager on to
+            //     enforce them, once verified on the target model.
+            //   - `Auto` runs still get the schema safety net when the model
+            //     decides on its own to emit `<|tool_call>` — observe(48) flips
+            //     the matcher on and the args body is schema-constrained.
+            // Future default-Eager should pair with a permutation-ordered,
+            // no-duplicate body grammar (see `build_tool_grammar_lark` doc).
             if matches!(choice, ResolvedToolChoice::None) {
                 eprintln!("[gemma4-backend] Lark grammar skipped: tool_choice=None");
                 return None;
             }
-            let mode = GrammarMode::Lazy;
+            // Mode + tool subset by choice:
+            //   - Auto: Lazy over all tools (the proven default — activates
+            //     only when the model self-emits `<|tool_call>`).
+            //   - Required: Eager over all tools IFF the opt-in env is set,
+            //     else Lazy (default-preserving).
+            //   - Tool(name): constrain to that one tool (correct in BOTH
+            //     modes — a named choice must not allow other functions);
+            //     Eager IFF the opt-in env is set, else Lazy.
+            let eager = gemma4_tool_grammar_eager();
+            let (mode, name_filter): (GrammarMode, Option<&str>) = match choice {
+                ResolvedToolChoice::Auto => (GrammarMode::Lazy, None),
+                ResolvedToolChoice::Required => (
+                    if eager {
+                        GrammarMode::Eager
+                    } else {
+                        GrammarMode::Lazy
+                    },
+                    None,
+                ),
+                ResolvedToolChoice::Tool(name) => (
+                    if eager {
+                        GrammarMode::Eager
+                    } else {
+                        GrammarMode::Lazy
+                    },
+                    Some(*name),
+                ),
+                // None handled above.
+                ResolvedToolChoice::None => return None,
+            };
             let Some(factory) = self.grammar_factory() else {
                 eprintln!(
                     "[gemma4-backend] Lark grammar skipped: factory unavailable \
@@ -700,6 +746,7 @@ pub(crate) mod imp {
             };
             let tools_json: Vec<serde_json::Value> = tools
                 .iter()
+                .filter(|t| name_filter.is_none_or(|n| t.name == n))
                 .map(|t| {
                     let mut function = serde_json::json!({ "name": t.name });
                     if let Some(d) = t.description {
@@ -711,6 +758,12 @@ pub(crate) mod imp {
                     serde_json::json!({ "type": "function", "function": function })
                 })
                 .collect();
+            if tools_json.is_empty() {
+                eprintln!(
+                    "[gemma4-backend] Lark grammar skipped: tool_choice names an unknown tool"
+                );
+                return None;
+            }
             match Gemma4GrammarState::new_lark(factory, &tools_json, mode) {
                 Ok(s) => {
                     eprintln!(

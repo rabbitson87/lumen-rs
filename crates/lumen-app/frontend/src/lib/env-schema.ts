@@ -232,6 +232,14 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "8",
     section: "advanced",
   },
+  {
+    key: "LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER",
+    labelKey: "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.label",
+    helpKey: "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
 
   // ── Debug (developer / triage) ─────────────────────────────────────
   {
