@@ -954,6 +954,21 @@ impl InferenceEngine {
             .count_chat_prompt_tokens(&messages, thinking_on);
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
+        // Stop sequences: truncate the visible text at the earliest match so
+        // token counts and the returned content both reflect the trim. No-op
+        // when no stops were requested. finish_reason stays "stop" (the
+        // no-tool-call default below).
+        if !ov.stop.is_empty() {
+            let mut earliest = None;
+            for s in &ov.stop {
+                if let Some(i) = parsed.visible.find(s.as_str()) {
+                    earliest = Some(earliest.map_or(i, |e: usize| e.min(i)));
+                }
+            }
+            if let Some(i) = earliest {
+                parsed.visible.truncate(i);
+            }
+        }
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1049,7 +1064,20 @@ impl InferenceEngine {
             req.session_id.as_deref(),
         )?;
         let completion_tokens = output_ids.len() as u32;
-        let text = self.backend.decode(&output_ids)?;
+        let mut text = self.backend.decode(&output_ids)?;
+        // Stop sequences: truncate the decoded text at the earliest match.
+        // No-op when no stops were requested. finish_reason stays "stop".
+        if !ov.stop.is_empty() {
+            let mut earliest = None;
+            for s in &ov.stop {
+                if let Some(i) = text.find(s.as_str()) {
+                    earliest = Some(earliest.map_or(i, |e: usize| e.min(i)));
+                }
+            }
+            if let Some(i) = earliest {
+                text.truncate(i);
+            }
+        }
 
         Ok(CompletionResponse {
             id: format!("cmpl-{}", gen_id()),
@@ -1304,6 +1332,24 @@ impl InferenceEngine {
         );
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
+        // Stop sequences: truncate the visible text at the earliest match and
+        // record which sequence fired (Anthropic reports it in `stop_sequence`
+        // with stop_reason="stop_sequence"). No-op when no stops were requested.
+        let mut matched_stop: Option<String> = None;
+        if !ov.stop.is_empty() {
+            let mut earliest: Option<usize> = None;
+            for s in &ov.stop {
+                if let Some(i) = parsed.visible.find(s.as_str()) {
+                    if earliest.map_or(true, |e| i < e) {
+                        earliest = Some(i);
+                        matched_stop = Some(s.clone());
+                    }
+                }
+            }
+            if let Some(i) = earliest {
+                parsed.visible.truncate(i);
+            }
+        }
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1335,8 +1381,13 @@ impl InferenceEngine {
                 text: String::new(),
             });
         }
+        // A matched stop sequence (only meaningful without tool calls) maps to
+        // Anthropic's stop_reason="stop_sequence" + the matched string.
+        let stop_seq_hit = if has_tool_calls { None } else { matched_stop };
         let stop_reason = if has_tool_calls {
             "tool_use"
+        } else if stop_seq_hit.is_some() {
+            "stop_sequence"
         } else {
             "end_turn"
         };
@@ -1348,7 +1399,7 @@ impl InferenceEngine {
             model: req.model.clone(),
             content,
             stop_reason: stop_reason.into(),
-            stop_sequence: None,
+            stop_sequence: stop_seq_hit,
             usage: AnthropicUsage {
                 input_tokens: prompt_tokens,
                 output_tokens,
@@ -1449,6 +1500,13 @@ impl InferenceEngine {
         // falls through to a fresh, sequential per-call emission. Early
         // per-call Starts are intentionally NOT emitted (see closures below).
         let early_tc: Vec<(String, u32, String)> = Vec::new();
+        // Stop-sequence filtering shared by both stream closures. The matcher
+        // holds back text that might be the prefix of a stop string, emits only
+        // safe-to-stream text, and trims at a full match. `stopped_by_seq`
+        // distinguishes the early decode-loop break below from a real error.
+        let stop_matcher =
+            std::cell::RefCell::new(lumen_core::stop::StopMatcher::new(ov.stop.clone()));
+        let stopped_by_seq = std::cell::Cell::new(false);
         let result = if needs_structured {
             let arg_values: Vec<serde_json::Value> = req
                 .messages
@@ -1521,7 +1579,23 @@ impl InferenceEngine {
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
-                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                            let mut sm = stop_matcher.borrow_mut();
+                            if sm.is_inert() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                            } else {
+                                let step = sm.push(t);
+                                if !step.emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                }
+                                if step.stopped {
+                                    stopped_by_seq.set(true);
+                                    drop(sm);
+                                    // Break the backend decode loop early. The
+                                    // `stopped_by_seq` flag distinguishes this
+                                    // from a real error in the match below.
+                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                }
+                            }
                         }
                         BackendStreamEvent::Reasoning(t) => {
                             let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
@@ -1554,7 +1628,23 @@ impl InferenceEngine {
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
-                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                            let mut sm = stop_matcher.borrow_mut();
+                            if sm.is_inert() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                            } else {
+                                let step = sm.push(t);
+                                if !step.emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                }
+                                if step.stopped {
+                                    stopped_by_seq.set(true);
+                                    drop(sm);
+                                    // Break the backend decode loop early. The
+                                    // `stopped_by_seq` flag distinguishes this
+                                    // from a real error in the match below.
+                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                }
+                            }
                         }
                         BackendStreamEvent::Reasoning(t) => {
                             let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
@@ -1577,6 +1667,13 @@ impl InferenceEngine {
 
         match result {
             Ok(mut parsed) => {
+                // Release any partial tail the stop matcher was holding back
+                // (a fragment that could have been the prefix of a stop string
+                // but never completed) so it still streams to the client.
+                let tail = stop_matcher.borrow_mut().flush();
+                if !tail.is_empty() {
+                    let _ = token_tx.try_send(StreamEvent::Delta(tail));
+                }
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
                 remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
@@ -1634,6 +1731,21 @@ impl InferenceEngine {
                     prompt_tokens,
                     completion_tokens,
                     finish_reason,
+                });
+            }
+            Err(_) if stopped_by_seq.get() => {
+                // Stopped by a client stop sequence. The visible text up to the
+                // stop was already streamed (already trimmed by the matcher),
+                // and any held tail beyond the stop is intentionally dropped —
+                // do NOT flush here. No tool calls are possible mid-text, so we
+                // finish exactly like the Ok arm's no-tool-call terminal chunk:
+                // a `Done` with `FinishReason::Stop`. `completion_tokens` is a
+                // best-effort 0 since the parsed visible text is unavailable on
+                // this early-break path.
+                let _ = token_tx.try_send(StreamEvent::Done {
+                    prompt_tokens,
+                    completion_tokens: 0,
+                    finish_reason: FinishReason::Stop,
                 });
             }
             Err(e) => {
