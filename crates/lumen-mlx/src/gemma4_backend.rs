@@ -3023,6 +3023,7 @@ pub(crate) mod imp {
                     false,
                     &[],
                     &crate::chat_io::ResolvedToolChoice::Auto,
+                    None,
                     |ev| {
                         if let crate::chat_io::BackendStreamEvent::Text(t) = ev {
                             chunks.push(t.to_string());
