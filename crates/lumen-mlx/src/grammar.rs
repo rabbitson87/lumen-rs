@@ -112,6 +112,37 @@ impl Gemma4GrammarState {
         Ok(state)
     }
 
+    /// Response-format variant — constrains the **visible** output to
+    /// valid JSON matching an arbitrary JSON Schema, from token 0.
+    ///
+    /// Unlike [`new`] / [`new_lark`] (which target the tool-call body and
+    /// derive an internal schema from the OpenAI `tools` array), this
+    /// builds the top-level grammar directly from the caller's schema via
+    /// [`TopLevelGrammar::from_json_schema`]. Intended for OpenAI
+    /// `response_format` (`json_object` / `json_schema`), where the entire
+    /// assistant message must be a single JSON value. Always built in the
+    /// requested `mode`; pass [`GrammarMode::Eager`] so the constraint is
+    /// live from the first decode step (there is no lazy trigger token for
+    /// free-form JSON output).
+    pub fn new_json_schema(
+        factory: Arc<ParserFactory>,
+        schema: &Value,
+        mode: GrammarMode,
+    ) -> Result<Self> {
+        let schema = TopLevelGrammar::from_json_schema(schema.clone());
+        let mut state = Self {
+            factory,
+            schema,
+            matcher: None,
+            mode,
+            finished: false,
+        };
+        if matches!(mode, GrammarMode::Eager) {
+            state.activate()?;
+        }
+        Ok(state)
+    }
+
     /// Lark-syntax variant — emits the Gemma 4 native `call:NAME{…}`
     /// format so the response parser ([`crate::gemma4_response`])
     /// accepts the output directly. Prefer this over [`new`] for

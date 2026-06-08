@@ -105,6 +105,37 @@ pub struct ChatCompletionRequest {
     /// Qwen 3.6 has a native `required` mode in its template. Wire-up TBD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+
+    // ── OpenAI structured outputs ──────────────────────────────────
+    /// OpenAI `response_format`. When `json_object` / `json_schema`, the
+    /// Gemma 4 backend builds an **Eager** grammar (active from token 0)
+    /// that constrains the visible output to valid JSON matching the
+    /// schema. Absent / `text` → no constraint (current behavior).
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// OpenAI `response_format` discriminated union. `text` is the implicit
+/// default (no constraint); `json_object` forces any valid JSON object;
+/// `json_schema` forces JSON matching the supplied schema.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema { json_schema: JsonSchemaSpec },
+}
+
+/// `response_format.json_schema` payload. Only `schema` is load-bearing
+/// for grammar construction; `name` / `strict` are accepted for OpenAI
+/// wire compatibility and currently advisory.
+#[derive(Debug, Deserialize)]
+pub struct JsonSchemaSpec {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -133,6 +164,21 @@ impl ChatCompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+        }
+    }
+
+    /// Resolve the JSON schema to constrain decoding against, derived from
+    /// `response_format`:
+    ///   - `json_schema` → the user-supplied `.schema`;
+    ///   - `json_object` → a permissive any-object schema (`{"type":"object"}`);
+    ///   - `text` / absent → `None` (no constraint — current behavior).
+    ///
+    /// Opt-in: returning `None` preserves the exact existing decode path.
+    pub fn response_json_schema(&self) -> Option<serde_json::Value> {
+        match self.response_format.as_ref()? {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(serde_json::json!({ "type": "object" })),
+            ResponseFormat::JsonSchema { json_schema } => Some(json_schema.schema.clone()),
         }
     }
 

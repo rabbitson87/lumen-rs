@@ -1108,6 +1108,7 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -1116,7 +1117,10 @@ impl MlxBackend {
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov);
+                // response_format / JSON-schema constrained decoding is a
+                // Gemma 4 backend capability; the Qwen 3.5 family path
+                // ignores it for now (no grammar wiring).
+                let _ = (top_p, temperature, ov, response_schema);
                 // Phase 2: with tools provided, route through tool-aware
                 // streaming path so `<tool_call>` blocks demux into
                 // `BackendStreamEvent::ToolCallStart` + `parsed.tool_calls`.
@@ -1186,6 +1190,7 @@ impl MlxBackend {
                         &k,
                         tools,
                         tool_choice,
+                        response_schema,
                         on_event,
                     )
                 } else {
@@ -1198,6 +1203,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
+                        response_schema,
                         on_event,
                     )
                 }
@@ -1221,6 +1227,7 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -1232,7 +1239,8 @@ impl MlxBackend {
                 // Phase 2: structured-history streaming ALWAYS routes
                 // through the tool-aware path — same rationale as the
                 // non-streaming `chat_from_history` branch above.
-                let _ = (top_p, temperature, ov, session_id);
+                // response_schema is Gemma 4-only (no grammar on Qwen path).
+                let _ = (top_p, temperature, ov, session_id, response_schema);
                 let seq_id = m.alloc_seq_id();
                 m.chat_streaming_with_tools_from_history(
                     turns,
@@ -1265,6 +1273,7 @@ impl MlxBackend {
                         &k,
                         tools,
                         tool_choice,
+                        response_schema,
                         on_event,
                     )
                 } else {
@@ -1277,6 +1286,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
+                        response_schema,
                         on_event,
                     )
                 }

@@ -785,6 +785,73 @@ pub(crate) mod imp {
             }
         }
 
+        /// Build a per-request grammar state that constrains the **visible**
+        /// output to valid JSON matching `schema` (OpenAI `response_format`
+        /// → `json_object` / `json_schema`). Returns `None` — sampling
+        /// proceeds unconstrained — when the grammar factory is unavailable
+        /// (imatrix-AWQ family or a tokenizer.json load error), mirroring
+        /// [`Gemma4Backend::build_grammar_state`]'s factory check.
+        ///
+        /// Always **Eager** ([`GrammarMode::Eager`]): there is no lazy
+        /// trigger token for free-form JSON, so the constraint must be live
+        /// from token 0. Unlike the tool grammar, this is independent of
+        /// `tool_choice` / `LUMEN_GEMMA4_GRAMMAR_LARK` — it activates
+        /// solely from the presence of `response_format` in the request.
+        fn build_response_format_grammar(
+            &self,
+            schema: &serde_json::Value,
+        ) -> Option<Gemma4GrammarState> {
+            let Some(factory) = self.grammar_factory() else {
+                eprintln!(
+                    "[gemma4-backend] response_format grammar skipped: factory \
+                     unavailable (imatrix-AWQ family or tokenizer.json load error)"
+                );
+                return None;
+            };
+            match Gemma4GrammarState::new_json_schema(factory, schema, GrammarMode::Eager) {
+                Ok(s) => {
+                    eprintln!(
+                        "[gemma4-backend] response_format grammar active (Eager JSON schema)"
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gemma4-backend] response_format grammar build failed \
+                         (falling back to free sampling): {e:#}"
+                    );
+                    None
+                }
+            }
+        }
+
+        /// Select the per-request grammar: when `response_schema` is
+        /// `Some`, build the response-format grammar and **skip the tool
+        /// grammar** (response_format + tools together is unusual; OpenAI
+        /// semantics give the response_format precedence). Otherwise fall
+        /// back to the existing tool-grammar path. Centralizes the
+        /// precedence so every streaming entrypoint behaves identically.
+        ///
+        /// Absent `response_schema` ⇒ byte-for-byte the prior
+        /// `build_grammar_state(tools, choice)` behavior.
+        fn select_grammar_state(
+            &self,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+        ) -> Option<Gemma4GrammarState> {
+            if let Some(schema) = response_schema {
+                if !tools.is_empty() {
+                    eprintln!(
+                        "[gemma4-backend] response_format present with tools — \
+                         preferring response_format grammar, skipping tool grammar"
+                    );
+                }
+                return self.build_response_format_grammar(schema);
+            }
+            self.build_grammar_state(tools, choice)
+        }
+
         pub fn model_id(&self) -> &str {
             &self.model_id
         }
@@ -1596,6 +1663,7 @@ pub(crate) mod imp {
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
@@ -1660,7 +1728,7 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}",
                 cache.offset()
             );
-            let grammar = self.build_grammar_state(tools, tool_choice);
+            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -1691,6 +1759,7 @@ pub(crate) mod imp {
             prefix_cache_key: &str,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
@@ -1735,7 +1804,7 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)",
                 cache.offset()
             );
-            let grammar = self.build_grammar_state(tools, tool_choice);
+            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -1851,11 +1920,12 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
-            let grammar = self.build_grammar_state(tools, tool_choice);
+            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -1887,11 +1957,12 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
                 self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
-            let grammar = self.build_grammar_state(tools, tool_choice);
+            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,

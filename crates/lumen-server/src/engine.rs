@@ -310,6 +310,7 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
         mut on_event: F,
     ) -> Result<ParsedResponse>
     where
@@ -317,7 +318,7 @@ impl ModelBackend {
     {
         match self {
             Self::GemmaGguf(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let mut adapter = |chunk: &str| {
                     let _ = on_event(BackendStreamEvent::Text(chunk));
                 };
@@ -332,20 +333,20 @@ impl ModelBackend {
             }
             // Fallback: generate all, send as one chunk
             Self::Qwen(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 on_event(BackendStreamEvent::Text(&text))?;
                 Ok(text_only_response(text))
             }
             Self::Gemma(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let text = m.chat(messages, max_new_tokens, temperature)?;
                 on_event(BackendStreamEvent::Text(&text))?;
                 Ok(text_only_response(text))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let mut adapter = |chunk: &str| {
                     let _ = on_event(BackendStreamEvent::Text(chunk));
                 };
@@ -368,6 +369,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
+                response_schema,
                 on_event,
             ),
         }
@@ -450,6 +452,7 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
         on_event: F,
     ) -> Result<ParsedResponse>
     where
@@ -466,6 +469,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
+                response_schema,
                 on_event,
             );
         }
@@ -480,6 +484,7 @@ impl ModelBackend {
             session_id,
             tools,
             tool_choice,
+            response_schema,
             on_event,
         )
     }
@@ -1485,6 +1490,9 @@ impl InferenceEngine {
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        // OpenAI `response_format` → JSON-schema constrained decoding
+        // (Gemma 4 only). `None` when absent / `text` → exact existing path.
+        let response_schema = req.response_json_schema();
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -1576,6 +1584,7 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                response_schema.as_ref(),
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
@@ -1625,6 +1634,7 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                response_schema.as_ref(),
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
@@ -1942,6 +1952,8 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                // Anthropic Messages API has no `response_format` field.
+                None,
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
@@ -1973,6 +1985,8 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                // Anthropic Messages API has no `response_format` field.
+                None,
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
