@@ -285,6 +285,7 @@ async fn handle_connection(
         ("POST", "/v1/embeddings") => {
             routes::embeddings::handle(request, response, embedding).await
         }
+        ("GET", "/health") => routes::health::handle(response).await,
         ("GET", "/v1/models") => routes::models::handle(request, response, handle).await,
         ("DELETE", p) if p.starts_with("/v1/sessions/") => {
             routes::sessions::handle(request, response, handle).await
