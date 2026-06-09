@@ -931,9 +931,11 @@ mod imp {
 
     /// Chunk size (in tokens) for the long-prompt prefill/extend loop.
     /// `LUMEN_QWEN35_PREFILL_CHUNK` overrides; default 2048 mirrors the
-    /// Gemma 4 backend. A zero / unparseable value falls back to the default;
-    /// set it larger than any prompt to force the legacy single-pass path for
-    /// A/B benchmarking.
+    /// Gemma 4 backend. A zero / unparseable value falls back to the default.
+    /// NOTE: `forward_chunked` clamps this DOWN to keep one chunk's full-attn
+    /// scores under a byte budget, so a value larger than the prompt no longer
+    /// forces single-pass on its own — for the legacy single-pass A/B path also
+    /// raise `LUMEN_QWEN35_PREFILL_SCORES_GB` to a huge value.
     fn qwen35_prefill_chunk() -> usize {
         std::env::var("LUMEN_QWEN35_PREFILL_CHUNK")
             .ok()
@@ -978,8 +980,46 @@ mod imp {
         last_only: bool,
         label: &str,
     ) -> Result<Array> {
-        let chunk = qwen35_prefill_chunk();
+        let requested_chunk = qwen35_prefill_chunk();
         let n = tokens.len();
+        // ── Always-chunk invariant: bound full-attn scores per chunk ──
+        // Qwen3.x is hybrid: linear-attn layers are O(seq) (cheap), but the
+        // full-attention layers (every `full_attention_interval`) form a
+        // [heads, q_len, kv_len] scores buffer just like Gemma. A single
+        // un-chunked pass over a long prompt makes kv_len == q_len == prompt
+        // length, and that buffer can exceed Metal's per-buffer cap (observed:
+        // a ~130 GB allocation attempt for a 21k-token single pass). Clamp the
+        // chunk DOWN so one chunk's full-attn scores stay under a byte budget
+        // given the worst-case kv_len (= prompt length). Short prompts are
+        // unaffected (the cap is large); an over-large
+        // `LUMEN_QWEN35_PREFILL_CHUNK` is clamped, never honored — chunking is
+        // mandatory. The legacy single-pass A/B path now also requires raising
+        // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
+        // chunk override.
+        let chunk = {
+            let scores_budget_bytes: u64 = std::env::var("LUMEN_QWEN35_PREFILL_SCORES_GB")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|&g| g > 0.0)
+                .map(|g| (g * 1e9) as u64)
+                .unwrap_or(8_000_000_000);
+            // f32 worst case for the scores accumulator (bf16 only halves it).
+            const SCORES_BYTES_PER_ELEM: u64 = 4;
+            let heads = model.config().text_config.num_attention_heads.max(1) as u64;
+            let kv_upper = (n as u64).max(1);
+            let max_safe_chunk = (scores_budget_bytes / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
+                .max(256) as usize;
+            let clamped = requested_chunk.min(max_safe_chunk);
+            if clamped < requested_chunk {
+                eprintln!(
+                    "[prefill] qwen chunk clamped {requested_chunk} → {clamped} \
+                     (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                     keeps single-chunk full-attn scores under the Metal buffer cap",
+                    scores_budget_bytes as f64 / 1e9
+                );
+            }
+            clamped
+        };
         if n <= chunk {
             return model
                 .forward_with_opts(tokens, cache, last_only)
