@@ -2074,11 +2074,51 @@ pub(crate) mod imp {
                 // grown to ~10K KV. The attention QxK^T graph for a 4096-token
                 // chunk over a 10K KV is too large for one command buffer;
                 // halving the chunk keeps per-CB work bounded.
-                let chunk_size: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
+                let requested_chunk: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|&n: &usize| n > 0)
                     .unwrap_or(2048);
+                // ── Always-chunk invariant: single-pass OOM guard ──
+                // The quantized-KV / TurboQuant attention path materializes the
+                // full [heads, q_len, kv_len] scores array — fused flash-SDPA
+                // (`mlx::fast::sdpa`, O(block) memory) is unavailable when K/V are
+                // stored quantized, so Q@K^T is an explicit `quantized_matmul`
+                // whose output lives in one Metal buffer. A single un-chunked pass
+                // over a long prompt then allocates a scores array that exceeds
+                // Metal's per-buffer cap (observed: 72 GB > 38.9 GB at q=k≈47K).
+                // Bound q_len so one chunk's scores stay under a safe byte budget
+                // given the worst-case kv_len (== full prompt length). This makes
+                // chunking mandatory: an over-large env/config chunk is clamped
+                // DOWN, never up. Default 8 GB fits any box that can host a 26B
+                // model (Metal maxBufferLength ≥ ~16 GB there); kv-quant off uses
+                // flash-SDPA and is unaffected by the materialization, but the
+                // clamp also keeps the per-command-buffer intermediate graph
+                // bounded, so it is applied uniformly. Override the budget with
+                // `LUMEN_GEMMA4_PREFILL_SCORES_GB`.
+                let scores_budget_bytes: u64 = std::env::var("LUMEN_GEMMA4_PREFILL_SCORES_GB")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|&g| g > 0.0)
+                    .map(|g| (g * 1e9) as u64)
+                    .unwrap_or(8_000_000_000);
+                // f32 worst case for the scores accumulator (bf16 only halves it,
+                // so 4 keeps the bound conservative regardless of dtype).
+                const SCORES_BYTES_PER_ELEM: u64 = 4;
+                let heads = self.model.config().text_config.num_attention_heads.max(1) as u64;
+                let kv_upper = (prompt.len() as u64).max(1);
+                let max_safe_chunk = (scores_budget_bytes
+                    / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
+                    .max(256) as usize;
+                let chunk_size = requested_chunk.min(max_safe_chunk);
+                if chunk_size < requested_chunk {
+                    eprintln!(
+                        "[prefill] chunk clamped {requested_chunk} → {chunk_size} \
+                         (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                         keeps single-chunk scores under the Metal buffer cap",
+                        scores_budget_bytes as f64 / 1e9
+                    );
+                }
                 // Chunked prefill re-enabled (2026-05-14, take 2): the mask
                 // builder now reads kv_actual from k_full.shape, so rotated
                 // sliding caches no longer trigger broadcast mismatches.
