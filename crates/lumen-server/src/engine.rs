@@ -63,6 +63,18 @@ fn batched_prefill_chunk() -> usize {
         .unwrap_or(512)
 }
 
+/// Iteration-level chunked prefill gate (WS-E Lever 1 — head-of-line removal).
+///
+/// When set (`LUMEN_PAGED_BATCH_DECODE=1`), `start_streaming_seq` defers a
+/// long prompt's prefill into the main batched loop: one chunk per iteration,
+/// so already-decoding sequences keep advancing between chunks instead of
+/// stalling for the full prefill. Default OFF → prefill runs synchronously
+/// inside `start_streaming_seq` exactly as before (decode loop byte-identical).
+#[inline]
+fn iter_level_prefill_enabled() -> bool {
+    std::env::var("LUMEN_PAGED_BATCH_DECODE").ok().as_deref() == Some("1")
+}
+
 /// Default backend when no env is set. mlx-native build → Mlx, otherwise Candle.
 #[inline]
 fn default_backend_mode() -> BackendMode {
@@ -2959,9 +2971,99 @@ impl InferenceEngine {
                 continue;
             }
 
+            // 1b. WS-E Lever 1: advance iteration-level prefill by ONE chunk for
+            //     ONE prefilling seq, then FALL THROUGH to decode the ready
+            //     seqs. This interleaves a new (possibly very long) prompt's
+            //     prefill with the ongoing decode of established sequences:
+            //     each loop turn does (≤1 prefill chunk) + (decode of ready
+            //     seqs) instead of monopolizing the engine for an entire
+            //     multi-second prefill. A seq whose prefix completes this turn
+            //     is seeded and joins the decode batch from the next turn (its
+            //     first decode token comes from the standard decode path, so
+            //     seeding semantics match the synchronous-prefill case).
+            //
+            //     Only reachable when LUMEN_PAGED_BATCH_DECODE=1 (else
+            //     `prefill_remaining` is always None → this block is skipped and
+            //     the decode path below is byte-identical to today).
+            if iter_level_prefill_enabled() {
+                // Round-robin: pick the lowest-id prefilling seq this turn so
+                // multiple concurrent prefills make steady, fair progress.
+                let next_prefill: Option<u64> = active
+                    .iter()
+                    .filter(|(_, s)| s.prefill_remaining.is_some())
+                    .map(|(id, _)| *id)
+                    .min();
+                if let Some(id) = next_prefill {
+                    let chunk = batched_prefill_chunk();
+                    let device = match &self.backend {
+                        ModelBackend::GemmaGguf(g) => g.device().clone(),
+                        _ => {
+                            eprintln!("[batched engine] non-Gemma backend unreachable (prefill)");
+                            return;
+                        }
+                    };
+                    // Take cursor out so no borrow of `active` is held across
+                    // the model forward.
+                    let (prompt_ids, cursor) = active
+                        .get_mut(&id)
+                        .and_then(|s| s.prefill_remaining.take())
+                        .expect("prefilling seq has cursor");
+                    let prefix_len = prompt_ids.len() - 1;
+                    let start = cursor;
+                    let end = (start + chunk).min(prefix_len);
+
+                    let gem = match &mut self.backend {
+                        ModelBackend::GemmaGguf(g) => g,
+                        _ => return,
+                    };
+                    gem.model_mut().set_current_seq_id(id);
+                    gem.model_mut().set_paged_store_enabled(true);
+                    let chunk_ok = match Tensor::new(&prompt_ids[start..end], &device)
+                        .and_then(|t| t.unsqueeze(0))
+                    {
+                        Ok(t) => gem.model_mut().forward(&t, start).map(|_| ()),
+                        Err(e) => Err(e),
+                    };
+                    match chunk_ok {
+                        Ok(()) => {
+                            if let Some(s) = active.get_mut(&id) {
+                                if end >= prefix_len {
+                                    s.position = prefix_len;
+                                    s.last_token = *prompt_ids.last().unwrap();
+                                    s.prefill_remaining = None;
+                                    eprintln!(
+                                        "[batched engine] seq {id} prefill complete: {} tokens (iter-chunked)",
+                                        prompt_ids.len(),
+                                    );
+                                } else {
+                                    s.prefill_remaining = Some((prompt_ids, end));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[batched engine] prefill chunk err seq {id}: {e}");
+                            if let Some(s) = active.remove(&id) {
+                                let _ = s.token_tx.try_send(StreamEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    // Fall through to decode the ready seqs this same turn.
+                }
+            }
+
             // 2. Decode step. N=1 → single-seq SDPA path (faster at short ctx).
             //    N≥2 → batched paged kernel.
-            let ids: Vec<u64> = active.keys().copied().collect();
+            //    Prefilling seqs are excluded (handled in 1b above); when the
+            //    flag is off, no seq is ever prefilling so `ids` == all active.
+            let ids: Vec<u64> = active
+                .iter()
+                .filter(|(_, s)| s.prefill_remaining.is_none())
+                .map(|(id, _)| *id)
+                .collect();
+            if ids.is_empty() {
+                // Every active seq is still prefilling — loop back to 1b.
+                continue;
+            }
             let last_tokens: Vec<u32> = ids.iter().map(|id| active[id].last_token).collect();
             let positions: Vec<usize> = ids.iter().map(|id| active[id].position).collect();
 
@@ -3731,6 +3833,8 @@ impl InferenceEngine {
             repeat_penalty,
             eos_tokens,
             pending_emit: None,
+            // Qwen35 has no paged backend; prefill is always synchronous here.
+            prefill_remaining: None,
         })
     }
 
@@ -3788,34 +3892,51 @@ impl InferenceEngine {
         // Earlier chunks' logits are discarded; the prefill logits are unused
         // here regardless (last_token comes from prompt_ids.last()), so no
         // logits need to be returned from the loop.
-        let t_prefill = std::time::Instant::now();
-        let prefix = &prompt_ids[..prompt_ids.len() - 1];
-        if !prefix.is_empty() {
-            let chunk = batched_prefill_chunk();
-            if prefix.len() > chunk {
-                // Long prompt: chunk to bound per-forward attention cost.
-                let mut start = 0usize;
-                while start < prefix.len() {
-                    let end = (start + chunk).min(prefix.len());
-                    let t = Tensor::new(&prefix[start..end], &device)?.unsqueeze(0)?;
-                    let _ = gem.model_mut().forward(&t, start)?;
-                    start = end;
-                }
-            } else {
-                // Short prompt: EXACT current single-forward path (byte-identical).
-                let t = Tensor::new(prefix, &device)?.unsqueeze(0)?;
-                let _ = gem.model_mut().forward(&t, 0)?;
-            }
-        }
-        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        let position = prefix.len();
-        let last_token = *prompt_ids.last().unwrap();
+        let prefix_len = prompt_ids.len() - 1;
 
-        eprintln!(
-            "[batched engine] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s)",
-            prompt_ids.len(),
-            prompt_ids.len() as f64 / (prefill_ms / 1000.0),
-        );
+        // WS-E Lever 1: when iteration-level prefill is enabled AND the prompt
+        // is long enough to actually stall the batch, defer prefill into the
+        // main loop. The seq is admitted with a `prefill_remaining` cursor; the
+        // loop forwards one chunk per iteration so other active seqs keep
+        // decoding. The KV cache is grown identically chunk-by-chunk (the GGUF
+        // model is stateful: forwarding prefix[start..end] at index_pos=start
+        // produces a bit-identical final KV state vs a single forward), so the
+        // seeded first token is unchanged. Short prompts and the flag-off case
+        // fall through to the original synchronous path below (byte-identical).
+        let chunk = batched_prefill_chunk();
+        let defer_prefill = iter_level_prefill_enabled() && prefix_len > chunk;
+
+        let (position, last_token, prefill_remaining) = if defer_prefill {
+            // Admit immediately; the loop advances the cursor. position is the
+            // *committed* prefill length (0 until the first chunk runs).
+            (0usize, prompt_ids[0], Some((prompt_ids.clone(), 0usize)))
+        } else {
+            let t_prefill = std::time::Instant::now();
+            let prefix = &prompt_ids[..prefix_len];
+            if !prefix.is_empty() {
+                if prefix.len() > chunk {
+                    // Long prompt: chunk to bound per-forward attention cost.
+                    let mut start = 0usize;
+                    while start < prefix.len() {
+                        let end = (start + chunk).min(prefix.len());
+                        let t = Tensor::new(&prefix[start..end], &device)?.unsqueeze(0)?;
+                        let _ = gem.model_mut().forward(&t, start)?;
+                        start = end;
+                    }
+                } else {
+                    // Short prompt: EXACT current single-forward path (byte-identical).
+                    let t = Tensor::new(prefix, &device)?.unsqueeze(0)?;
+                    let _ = gem.model_mut().forward(&t, 0)?;
+                }
+            }
+            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[batched engine] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s)",
+                prompt_ids.len(),
+                prompt_ids.len() as f64 / (prefill_ms / 1000.0),
+            );
+            (prefix.len(), *prompt_ids.last().unwrap(), None)
+        };
 
         Ok(ActiveSeqState {
             seq_id,
@@ -3833,6 +3954,7 @@ impl InferenceEngine {
             repeat_penalty,
             eos_tokens: vec![1, 106], // Gemma: <eos>=1, <end_of_turn>=106
             pending_emit: None,
+            prefill_remaining,
         })
     }
 }
@@ -4114,6 +4236,20 @@ pub(crate) struct ActiveSeqState {
     /// cost. `None` until the seq has produced at least one token (or after a
     /// flush). Per-seq FIFO of size 1 → strict token order is preserved.
     pub pending_emit: Option<u32>,
+    /// Iteration-level chunked prefill cursor (Lever 1 — head-of-line removal).
+    ///
+    /// When `Some((prompt_ids, cursor))`, this sequence has NOT finished its
+    /// prefill: the main loop forwards one chunk (`min(remaining, chunk)`
+    /// tokens of `prompt_ids[..len-1]`) per iteration at running position
+    /// `cursor`, so already-decoding sequences keep advancing between this
+    /// seq's prefill chunks instead of stalling behind a single monolithic
+    /// prefill forward. When the cursor reaches `len-1`, `last_token`/`position`
+    /// are seeded and this field is set to `None` (seq becomes decode-ready).
+    ///
+    /// Only populated when `LUMEN_PAGED_BATCH_DECODE=1` (default OFF). With the
+    /// flag off, prefill completes synchronously in `start_streaming_seq` and
+    /// this stays `None`, so the decode loop is byte-identical to today.
+    pub prefill_remaining: Option<(Vec<u32>, usize)>,
 }
 
 /// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
