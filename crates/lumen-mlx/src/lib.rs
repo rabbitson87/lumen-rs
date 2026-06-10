@@ -939,10 +939,14 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
+                // Qwen 3.6 has no grammar wiring yet (WS-C #2) — a
+                // response_format on this family is silently ignored.
+                let _ = response_schema;
                 let _ = (top_p, temperature, ov);
                 // Phase 2: when tools are provided, route through the
                 // Qwen 3.6 nested-XML tool template + parser. No-tools
@@ -975,6 +979,28 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
+                // response_format wiring (WS-F #1): the batched `generate()`
+                // path below applies no grammar. When a JSON schema is
+                // present, route through the streaming decode — which DOES
+                // apply the response-format grammar — with a no-op sink and
+                // collect its ParsedResponse. Rare path; it forgoes the
+                // prefix cache, trading a cold prefill for a correct
+                // (schema-constrained) non-streaming answer instead of
+                // silently emitting free text.
+                if let Some(schema) = response_schema {
+                    return m.chat_streaming(
+                        messages,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        Some(schema),
+                        |_| Ok(()),
+                    );
+                }
                 // Resolve prefix-cache key. Priority:
                 //   1. Explicit `session_id` from the request (deterministic
                 //      across clients that opt in).
@@ -1029,10 +1055,13 @@ impl MlxBackend {
         session_id: Option<&str>,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         use crate::chat_io::{ChatTurn, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
+                // Qwen 3.6 has no grammar wiring yet (WS-C #2).
+                let _ = response_schema;
                 // Phase 2: structured-history paths ALWAYS go through
                 // the tool-aware renderer — the legacy IM-only template
                 // cannot represent `<tool_call>` blocks or
@@ -1060,6 +1089,26 @@ impl MlxBackend {
                 // turn content. Falls through to the no-prefix-cache path
                 // when neither yields a key (e.g. user-first chat with no
                 // system turn).
+                // response_format wiring (WS-F #1): mirror the flat `chat`
+                // path — when a JSON schema is present, route through the
+                // grammar-aware streaming decode with a no-op sink so the
+                // non-streaming structured-history answer is actually
+                // schema-constrained (the cache/`generate` path applies no
+                // grammar). Rare path; forgoes the prefix cache.
+                if let Some(schema) = response_schema {
+                    return m.chat_streaming_from_history(
+                        turns,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        Some(schema),
+                        |_| Ok(()),
+                    );
+                }
                 let key = session_id
                     .map(String::from)
                     .or_else(|| auto_prefix_key_from_turns(turns));

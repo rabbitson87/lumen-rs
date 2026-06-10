@@ -276,27 +276,28 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
     ) -> Result<ParsedResponse> {
         match self {
             Self::Qwen(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let visible = m.chat(messages, max_new_tokens, temperature)?;
                 Ok(text_only_response(visible))
             }
             Self::Gemma(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let visible = m.chat(messages, max_new_tokens, temperature)?;
                 Ok(text_only_response(visible))
             }
             Self::GemmaGguf(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let visible =
                     m.chat_with_options(messages, max_new_tokens, temperature, thinking)?;
                 Ok(text_only_response(visible))
             }
             #[cfg(feature = "qwen3_5_moe")]
             Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools, tool_choice);
+                let _ = (top_p, tools, tool_choice, response_schema);
                 let visible = m.chat(messages, max_new_tokens, temperature, thinking)?;
                 Ok(text_only_response(visible))
             }
@@ -310,6 +311,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
+                response_schema,
             ),
         }
     }
@@ -423,6 +425,7 @@ impl ModelBackend {
         session_id: Option<&str>,
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
     ) -> Result<ParsedResponse> {
         if let Self::Mlx(m) = self {
             return m.chat_from_history(
@@ -435,6 +438,7 @@ impl ModelBackend {
                 session_id,
                 tools,
                 tool_choice,
+                response_schema,
             );
         }
         // Legacy backends: flatten + delegate to plain chat.
@@ -449,6 +453,7 @@ impl ModelBackend {
             session_id,
             tools,
             tool_choice,
+            response_schema,
         )
     }
 
@@ -800,6 +805,7 @@ impl InferenceEngine {
             None,
             &[],
             &ResolvedToolChoice::Auto,
+            None,
         )?;
         eprintln!(
             "  pass 1 done ({:.0}ms)",
@@ -818,6 +824,7 @@ impl InferenceEngine {
             None,
             &[],
             &ResolvedToolChoice::Auto,
+            None,
         )?;
 
         eprintln!(
@@ -954,6 +961,7 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                req.response_json_schema().as_ref(),
             )?
         } else {
             self.backend.chat(
@@ -966,6 +974,7 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                req.response_json_schema().as_ref(),
             )?
         };
 
@@ -1329,6 +1338,8 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                // Anthropic /v1/messages has no `response_format`.
+                None,
             )?
         } else {
             // Plain path — uses the flat messages built above. Matches
@@ -1343,6 +1354,7 @@ impl InferenceEngine {
                 req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
+                None,
             )?
         };
 
