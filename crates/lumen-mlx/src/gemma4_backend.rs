@@ -2542,15 +2542,92 @@ pub(crate) mod imp {
                         let runaway = lumen_core::runaway::RunawayDetector::from_env();
                         let mut thinking_budget = crate::gemma4_thinking::ChannelBudget::from_env();
                         thinking_budget.observe(first_tok);
+
+                        // ── WS-B Lever 1: overlap scheduling (SGLang MLX
+                        // `event_loop_overlap_mlx` 1:1 port for the sampled
+                        // decode path) ────────────────────────────────────
+                        //
+                        // Default ON; `LUMEN_MLX_NO_OVERLAP=1` restores the
+                        // exact original synchronous path.
+                        //
+                        // Per step we (a) sample token N (blocks on this
+                        // step's logits via `last_logits_to_cpu_f32`'s eval),
+                        // (b) build the next input + issue forward(N+1) and
+                        // `async_eval` its logits to kick the GPU NOW, then
+                        // (c) run the deferred `parser.push + emit_token_event`
+                        // of token N-1 on the CPU while the GPU computes the
+                        // N+1 logits. A size-1 FIFO (`pending`) holds exactly
+                        // one (token, state_before) per step, so emitting one
+                        // step late yields a byte-identical token stream: the
+                        // parser still receives tokens in strict order, and
+                        // sampling/stop/grammar/thinking-budget all read
+                        // `all_tokens` (never the parser), so deferring the
+                        // parser advance does not affect any control decision.
+                        //
+                        // Everything that affects correctness — sampling,
+                        // `all_tokens.push`, thinking-budget force-close /
+                        // channel-block, eos check, runaway check, hard-break
+                        // — stays FULLY SYNCHRONOUS and in the original order.
+                        // Only the parser advance + detok + SSE send is
+                        // deferred (the parser is consumed solely by
+                        // `emit_token_event` and `finalize`).
+                        let overlap_enabled = std::env::var("LUMEN_MLX_NO_OVERLAP").is_err();
+                        // size-1 FIFO: the previous step's (token, state_before)
+                        // whose parser.push + emit was deferred.
+                        let mut pending: Option<(u32, ParseState)> = None;
+
+                        // Flush the deferred (token, state_before): advance the
+                        // parser and run the detok + SSE emit. Kept here as a
+                        // closure so prefill-handoff, the loop body, and the
+                        // post-loop flush share one definition.
+                        macro_rules! flush_pending {
+                            () => {
+                                if let Some((tok, st_before)) = pending.take() {
+                                    parser.push(tok)?;
+                                    emit_token_event(
+                                        &self.chat,
+                                        &mut parser,
+                                        tok,
+                                        st_before,
+                                        &mut on_event,
+                                    )?;
+                                }
+                            };
+                        }
+
+                        // `step_logits` always holds the logits for the NEXT
+                        // token to sample. Seed it with the forward over
+                        // `first_tok` (the prefill already produced
+                        // `first_tok`; the cache offset points just past it).
+                        //
+                        // INVARIANT: exactly ONE `forward_array_last_token`
+                        // per generated token — the cache is mutated in place,
+                        // so a second forward over the same token would
+                        // double-advance KV. The overlap path therefore does
+                        // NOT re-forward; it carries the lazy logits array it
+                        // already issued into the next iteration.
                         let mut current_u32 = first_tok;
-                        while all_tokens.len() < max_new_tokens {
-                            let input = mlx_rs::Array::from_slice(&[current_u32 as i32], &[1, 1])
+                        let issue_forward = |model: &NativeGemma4Model,
+                                             current: u32,
+                                             cache: &mut NativeGemma4PromptCache|
+                         -> Result<mlx_rs::Array> {
+                            let input = mlx_rs::Array::from_slice(&[current as i32], &[1, 1])
                                 .as_dtype(mlx_rs::Dtype::Int32)
                                 .context("chat_streaming(sampled): build input array")?;
-                            let step_logits = self
-                                .model
-                                .forward_array_last_token(&input, &mut cache)
-                                .context("chat_streaming(sampled): decode forward")?;
+                            model
+                                .forward_array_last_token(&input, cache)
+                                .context("chat_streaming(sampled): decode forward")
+                        };
+                        let mut step_logits = issue_forward(&self.model, current_u32, &mut cache)?;
+                        if overlap_enabled {
+                            // Kick the GPU for the very first decode step so the
+                            // first sample's host pull does not stall on a cold
+                            // GPU.
+                            mlx_rs::transforms::async_eval([&step_logits])
+                                .context("chat_streaming(sampled): seed async_eval")?;
+                        }
+
+                        while all_tokens.len() < max_new_tokens {
                             // Phase B: build per-step correction context
                             // from the just-captured `h_for_lm_head`. h
                             // ownership transfers via take_*, so a forward
@@ -2570,6 +2647,11 @@ pub(crate) mod imp {
                                 }),
                                 _ => None,
                             };
+                            // Sample token N. `sample_next_token_with_eos_guard_and_grammar`
+                            // pulls last-position logits to host (forces eval),
+                            // so the forward issued in the *previous* iteration
+                            // (already async_eval'd) has completed by the time
+                            // this returns.
                             let sampled = sample_next_token_with_eos_guard_and_grammar(
                                 &step_logits,
                                 &all_tokens,
@@ -2603,34 +2685,76 @@ pub(crate) mod imp {
                                 sampled
                             };
                             all_tokens.push(next_tok);
-                            let state_before = parser.state();
-                            parser.push(next_tok)?;
-                            emit_token_event(
-                                &self.chat,
-                                &mut parser,
-                                next_tok,
-                                state_before,
-                                &mut on_event,
-                            )?;
-                            if eos.contains(&next_tok) {
+                            current_u32 = next_tok;
+
+                            // Stop conditions are evaluated synchronously from
+                            // `all_tokens`; if we stop, no further forward is
+                            // issued.
+                            let stop_eos = eos.contains(&next_tok);
+                            let stop_runaway = runaway.check(&all_tokens);
+                            let stop_hard_break = thinking_budget.should_hard_break();
+                            let stopping = stop_eos || stop_runaway.is_some() || stop_hard_break;
+                            let at_budget = all_tokens.len() >= max_new_tokens;
+
+                            if overlap_enabled && !stopping && !at_budget {
+                                // OVERLAP PATH:
+                                //   1. issue forward(N+1) (the ONLY forward for
+                                //      token N+1) + async_eval to kick the GPU;
+                                //   2. flush the deferred emit of token N-1
+                                //      (parser advance + detok + SSE) while the
+                                //      GPU computes the N+1 logits;
+                                //   3. stash token N for next iteration's flush.
+                                step_logits = issue_forward(&self.model, current_u32, &mut cache)?;
+                                mlx_rs::transforms::async_eval([&step_logits])
+                                    .context("chat_streaming(sampled): overlap async_eval")?;
+
+                                // CPU work overlaps the in-flight GPU forward.
+                                flush_pending!();
+                                let state_before = parser.state();
+                                pending = Some((next_tok, state_before));
+                            } else {
+                                // SYNCHRONOUS PATH (overlap off, stopping, or at
+                                // budget): flush any deferred token first to
+                                // preserve order, emit token N inline, then —
+                                // only if we will iterate again — issue the next
+                                // forward synchronously.
+                                flush_pending!();
+                                let state_before = parser.state();
+                                parser.push(next_tok)?;
+                                emit_token_event(
+                                    &self.chat,
+                                    &mut parser,
+                                    next_tok,
+                                    state_before,
+                                    &mut on_event,
+                                )?;
+                                if !stopping && !at_budget {
+                                    step_logits =
+                                        issue_forward(&self.model, current_u32, &mut cache)?;
+                                }
+                            }
+
+                            if stop_eos {
                                 break;
                             }
-                            if let Some(reason) = runaway.check(&all_tokens) {
+                            if let Some(reason) = stop_runaway {
                                 eprintln!(
                                     "[runaway] chat_streaming sampled decode aborted at {} tokens: {reason}",
                                     all_tokens.len()
                                 );
                                 break;
                             }
-                            if thinking_budget.should_hard_break() {
+                            if stop_hard_break {
                                 eprintln!(
                                     "[thinking-budget] hard break at {} tokens — force-close did not help",
                                     all_tokens.len()
                                 );
                                 break;
                             }
-                            current_u32 = next_tok;
                         }
+                        // Flush the final deferred token before finalize so the
+                        // streamed text is complete and in order.
+                        flush_pending!();
                     }
                     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
                     let count = all_tokens.len();

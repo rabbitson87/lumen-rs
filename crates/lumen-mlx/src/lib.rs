@@ -2967,6 +2967,29 @@ impl MlxQwen35Backend {
         }
 
         let t_decode = std::time::Instant::now();
+        // WS-B Lever 1 (overlap scheduling) is NOT applied to this Qwen3.6
+        // loop — intentionally left synchronous. The Gemma4 sampled path
+        // (`gemma4_backend::decode_streaming_with_prompt`) gets the overlap;
+        // here the structure does not cleanly admit a "issue next forward
+        // before CPU work" deferral:
+        //   1. `decode_step` / `decode_step_masked` are a FUSED black box
+        //      across the `MlxRunner` trait (Subprocess / PyO3 / Native):
+        //      they forward, host-sync, argmax, and return only the *token*
+        //      (`(u32, usize)`), not the lazy logits array. Overlapping the
+        //      next forward would require returning lazy logits and splitting
+        //      sampling out across all four backends — an invasive trait
+        //      refactor out of scope here.
+        //   2. The grammar-masked path applies its mask BETWEEN forward and
+        //      argmax on a host copy, so the chosen token isn't known until
+        //      after the host sync — there is nothing to pipeline ahead of it.
+        //   3. The force-required-param injection below issues a variable-
+        //      length mid-loop `extend`, breaking any fixed one-forward-per-
+        //      step pipeline.
+        //   4. ~75% of Qwen3.6 layers are linear-attn: `decode_step` advances
+        //      conv/SSM recurrent state in place per call, so a speculative
+        //      next forward issued before the current token is committed would
+        //      have to be rolled back on the injection/grammar-desync paths.
+        // Correctness first: Qwen3.6 stays on the exact synchronous path.
         for step in 1..max_new_tokens {
             // Force-required-params injection (opt-in). If the previous feed
             // left the parser at a clean tool-call-body boundary with a
