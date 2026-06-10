@@ -2729,7 +2729,18 @@ impl InferenceEngine {
         // migrated into paged before joining a batched (N>=2) decode step.
         let mut dirty_paged: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        eprintln!("[batched engine] active scheduler (max_batch={max_batch})");
+        // Overlap scheduling (default ON): defer each token's detokenize +
+        // channel-send by one decode step so the main loop can issue the next
+        // forward (enqueue GPU work) before paying the CPU post-processing
+        // cost. `LUMEN_BATCHED_NO_OVERLAP=1` falls back to the original fully
+        // synchronous detok-in-place behavior — a field kill-switch for
+        // regressions, no rebuild required.
+        let overlap_enabled = std::env::var("LUMEN_BATCHED_NO_OVERLAP").is_err();
+
+        eprintln!(
+            "[batched engine] active scheduler (max_batch={max_batch}, overlap={})",
+            if overlap_enabled { "on" } else { "off" },
+        );
 
         loop {
             // 1. Admit new streaming requests non-blockingly, up to max_batch.
@@ -2919,13 +2930,25 @@ impl InferenceEngine {
                 gem.model_mut().set_use_compressed_for_attn(false);
                 gem.model_mut().set_paged_store_enabled(false);
                 dirty_paged.insert(ids[0]);
-                let seq = active.get(&ids[0]).unwrap();
+                // Snapshot sampling params before the forward so we don't hold
+                // an immutable borrow of `active` across the forward + the
+                // overlap flush (which needs a mutable borrow). `generated` is
+                // cloned for the GPU repeat-penalty / CPU sampler input.
+                let (s_top_p, s_temperature, s_repeat_penalty, s_generated) = {
+                    let seq = active.get(&ids[0]).unwrap();
+                    (
+                        seq.top_p,
+                        seq.temperature,
+                        seq.repeat_penalty,
+                        seq.generated.clone(),
+                    )
+                };
                 // GPU sampler skips top-p and n-gram penalty. Default behavior
                 // is to use it whenever top_p>=1 (no nucleus filter needed).
                 // `FORCE_GPU_SAMPLE=1` forces it on even when top_p<1 (slight
                 // quality trade-off: nucleus filter skipped).
                 let force_gpu = std::env::var("FORCE_GPU_SAMPLE").is_ok();
-                let gpu_ok = force_gpu || seq.top_p >= 1.0;
+                let gpu_ok = force_gpu || s_top_p >= 1.0;
                 let t_tok = std::time::Instant::now();
                 let tok = match Tensor::new(&[last_tokens[0]], &device).and_then(|t| t.unsqueeze(0))
                 {
@@ -2946,6 +2969,15 @@ impl InferenceEngine {
                         continue;
                     }
                 };
+                // Overlap: `forward` has enqueued this step's GPU kernels but the
+                // device→host sync only happens at sampling time below. Detok +
+                // emit the *previous* step's deferred token now so that CPU work
+                // hides behind the in-flight GPU forward.
+                if overlap_enabled {
+                    if let Some(seq) = active.get_mut(&ids[0]) {
+                        flush_pending_emit(gem, seq);
+                    }
+                }
                 if gpu_ok {
                     let t_sample = std::time::Instant::now();
                     let logits1d = match logits.squeeze(0) {
@@ -2957,9 +2989,9 @@ impl InferenceEngine {
                     };
                     let sampled = lumen_model::sampling::sample_token_gpu(
                         &logits1d,
-                        seq.temperature,
-                        seq.repeat_penalty,
-                        &seq.generated,
+                        s_temperature,
+                        s_repeat_penalty,
+                        &s_generated,
                     );
                     match sampled {
                         Ok(t) => {
@@ -3008,10 +3040,10 @@ impl InferenceEngine {
                     // sampler inline here and skip the shared path.
                     let next_tok = match lumen_model::sampling::sample_token_cpu(
                         &_out,
-                        seq.temperature,
-                        seq.top_p,
-                        seq.repeat_penalty,
-                        &seq.generated,
+                        s_temperature,
+                        s_top_p,
+                        s_repeat_penalty,
+                        &s_generated,
                     ) {
                         Ok(t) => t,
                         Err(e) => {
@@ -3066,6 +3098,18 @@ impl InferenceEngine {
                         continue;
                     }
                 };
+                // Overlap: the batched forward has enqueued this step's GPU
+                // kernels; the device→host sync happens at `to_vec1` below.
+                // Detok + emit every seq's previous-step deferred token now so
+                // the CPU work overlaps the in-flight GPU forward. FIFO per seq
+                // (size-1 pending) preserves exact token order.
+                if overlap_enabled {
+                    for id in &ids {
+                        if let Some(seq) = active.get_mut(id) {
+                            flush_pending_emit(gem, seq);
+                        }
+                    }
+                }
                 match logits
                     .to_dtype(DType::F32)
                     .and_then(|t| t.flatten_all())
@@ -3112,8 +3156,17 @@ impl InferenceEngine {
                 seq.last_token = next_tok;
                 seq.position += 1;
 
-                // Detokenize + emit incremental text delta.
-                if let Ok(text) = gem.decode(&seq.generated) {
+                // Sampling + state advance + stop-check stay fully synchronous.
+                // Only the expensive detokenize + channel-send is deferred:
+                //   - overlap ON: stash `next_tok` in `pending_emit`; it is
+                //     flushed at the top of the NEXT decode step (after that
+                //     step's forward is issued) so the detok hides behind the
+                //     in-flight GPU forward. On completion we flush it
+                //     synchronously below so the final text precedes `Done`.
+                //   - overlap OFF: detok + emit inline, exactly as before.
+                if overlap_enabled {
+                    seq.pending_emit = Some(next_tok);
+                } else if let Ok(text) = gem.decode(&seq.generated) {
                     if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
                         let delta = text[seq.prev_text.len()..].to_string();
                         if !delta.is_empty() {
@@ -3124,6 +3177,11 @@ impl InferenceEngine {
                 }
 
                 if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
+                    // Flush any deferred text before `Done` so the stream is
+                    // complete and correctly truncated at the stop token (no
+                    // token sampled after the stop is ever emitted — we stop
+                    // sampling here). No-op when overlap is off.
+                    flush_pending_emit(gem, seq);
                     let decode_ms = seq.decode_start.elapsed().as_secs_f64() * 1000.0;
                     let n_gen = seq.generated.len();
                     let per_seq_tps = n_gen as f64 / (decode_ms / 1000.0);
@@ -3617,6 +3675,7 @@ impl InferenceEngine {
             top_p: if top_p <= 0.0 { 0.95 } else { top_p },
             repeat_penalty,
             eos_tokens,
+            pending_emit: None,
         })
     }
 
@@ -3718,6 +3777,7 @@ impl InferenceEngine {
             top_p: if top_p <= 0.0 { 0.95 } else { top_p },
             repeat_penalty,
             eos_tokens: vec![1, 106], // Gemma: <eos>=1, <end_of_turn>=106
+            pending_emit: None,
         })
     }
 }
@@ -3992,6 +4052,40 @@ pub(crate) struct ActiveSeqState {
     pub repeat_penalty: f32,
     /// EOS token IDs used by the batched decode loop for this sequence's backend.
     pub eos_tokens: Vec<u32>,
+    /// Overlap scheduling: a token that has been sampled, appended to
+    /// `generated`, and stop-checked in a *previous* decode step, but whose
+    /// detokenize + channel-send was deferred by one iteration so the main
+    /// loop could issue the next forward before paying the CPU post-processing
+    /// cost. `None` until the seq has produced at least one token (or after a
+    /// flush). Per-seq FIFO of size 1 → strict token order is preserved.
+    pub pending_emit: Option<u32>,
+}
+
+/// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
+/// emit the incremental text delta vs `prev_text`, then clear `pending_emit`.
+///
+/// This is intentionally *cumulative* (decode the whole prefix, diff against
+/// `prev_text`) rather than per-token: the diff `text[prev_text.len()..]`
+/// guarantees that emitting "one decode step late" produces a byte-for-byte
+/// identical stream to emitting eagerly — no byte is ever dropped or
+/// duplicated, regardless of how many tokens accumulated since the last flush.
+/// Multi-byte UTF-8 boundaries are handled by the replacement-char guard
+/// exactly as the original synchronous path did.
+#[inline]
+fn flush_pending_emit(gem: &GemmaGgufModel, seq: &mut ActiveSeqState) {
+    if seq.pending_emit.is_none() {
+        return;
+    }
+    if let Ok(text) = gem.decode(&seq.generated) {
+        if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
+            let delta = text[seq.prev_text.len()..].to_string();
+            if !delta.is_empty() {
+                let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
+                seq.prev_text = text;
+            }
+        }
+    }
+    seq.pending_emit = None;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
