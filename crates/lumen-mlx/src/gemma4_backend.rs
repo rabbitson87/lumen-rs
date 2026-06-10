@@ -685,60 +685,52 @@ pub(crate) mod imp {
                 eprintln!("[gemma4-backend] Lark grammar skipped: tools empty");
                 return None;
             }
-            // Default is Lazy regardless of `tool_choice`; Eager for
-            // `Required`/`Tool(_)` is opt-in via
-            // `LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER` (see `gemma4_tool_grammar_eager`).
-            // Reasoning: empirically the Eager + agentic-loop combination
-            // sent some quantized builds into an n-gram cycle on the
-            // 3rd-or-later turn — the grammar over-permits duplicate fields
-            // (`tc_field ("," tc_field)*`) so the model can't commit to
-            // closing the body. Lazy dodges this: the grammar only activates
-            // AFTER the model self-emits `<|tool_call>` (id 48), which means
-            //   - `Required` / `Tool(_)` runs use the chat-template prefill to
-            //     inject id 48 — prefill goes through `parser.push()`, NOT
-            //     `state.observe()`, so the Lazy matcher stays inactive and the
-            //     body is emitted freely from the training distribution (the
-            //     pre-Lark behaviour, proven end-to-end). Hence a forced call's
-            //     ARGUMENTS are unconstrained under Lazy — turn Eager on to
-            //     enforce them, once verified on the target model.
-            //   - `Auto` runs still get the schema safety net when the model
-            //     decides on its own to emit `<|tool_call>` — observe(48) flips
-            //     the matcher on and the args body is schema-constrained.
-            // Future default-Eager should pair with a permutation-ordered,
-            // no-duplicate body grammar (see `build_tool_grammar_lark` doc).
-            if matches!(choice, ResolvedToolChoice::None) {
-                eprintln!("[gemma4-backend] Lark grammar skipped: tool_choice=None");
-                return None;
-            }
-            // Mode + tool subset by choice:
-            //   - Auto: Lazy over all tools (the proven default — activates
-            //     only when the model self-emits `<|tool_call>`).
-            //   - Required: Eager over all tools IFF the opt-in env is set,
-            //     else Lazy (default-preserving).
-            //   - Tool(name): constrain to that one tool (correct in BOTH
-            //     modes — a named choice must not allow other functions);
-            //     Eager IFF the opt-in env is set, else Lazy.
-            let eager = gemma4_tool_grammar_eager();
-            let (mode, name_filter): (GrammarMode, Option<&str>) = match choice {
-                ResolvedToolChoice::Auto => (GrammarMode::Lazy, None),
-                ResolvedToolChoice::Required => (
-                    if eager {
-                        GrammarMode::Eager
+            // Mode + grammar shape per `tool_choice` (WS-C #1 fix):
+            //
+            //   - `Auto` → **Lazy + permissive** Lark over all tools. The
+            //     proven default: the matcher activates only when the model
+            //     self-emits `<|tool_call>` (id 48), then schema-constrains
+            //     the body. Byte-identical to the pre-fix path. The
+            //     `LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER` opt-in additionally flips
+            //     `Auto` to Eager+strict for operators who want every turn
+            //     forced.
+            //
+            //   - `Required` / `Tool(name)` → **Eager + STRICT (dup-free)**
+            //     Lark, UNCONDITIONALLY. This is the actual bug: required/named
+            //     prefill the `<|tool_call>` opener via `parser.push()` (never
+            //     sampled), so a *Lazy* matcher never activates and the args
+            //     body is generated UNCONSTRAINED — which lets quantized
+            //     35B/26B builds emit `call:read{}` with empty params and spin
+            //     in an 845+-message loop. The Eager path was previously gated
+            //     off because the *permissive* Lark body
+            //     (`field ("," field)*`) over-permits duplicate fields and
+            //     drove an n-gram cycle. The strict body
+            //     ([`build_tool_grammar_lark_strict`]) emits required fields
+            //     once each in fixed order then optional fields at most once —
+            //     no Kleene-star over fields, so there is no duplicate-field
+            //     cycle. This is the native-format analogue of SGLang's JSON
+            //     `required` + `minItems:1` enforcement. The prefilled opener
+            //     is replayed into the Eager matcher via
+            //     [`Gemma4GrammarState::observe_prefill`] in
+            //     `decode_streaming_with_prompt` so the matcher's parse
+            //     position matches the model's context.
+            //
+            // `tool_choice=None` => no grammar (model must not call a tool).
+            let eager_auto = gemma4_tool_grammar_eager();
+            let (mode, strict, name_filter): (GrammarMode, bool, Option<&str>) = match choice {
+                ResolvedToolChoice::Auto => {
+                    if eager_auto {
+                        (GrammarMode::Eager, true, None)
                     } else {
-                        GrammarMode::Lazy
-                    },
-                    None,
-                ),
-                ResolvedToolChoice::Tool(name) => (
-                    if eager {
-                        GrammarMode::Eager
-                    } else {
-                        GrammarMode::Lazy
-                    },
-                    Some(*name),
-                ),
-                // None handled above.
-                ResolvedToolChoice::None => return None,
+                        (GrammarMode::Lazy, false, None)
+                    }
+                }
+                ResolvedToolChoice::Required => (GrammarMode::Eager, true, None),
+                ResolvedToolChoice::Tool(name) => (GrammarMode::Eager, true, Some(*name)),
+                ResolvedToolChoice::None => {
+                    eprintln!("[gemma4-backend] Lark grammar skipped: tool_choice=None");
+                    return None;
+                }
             };
             let Some(factory) = self.grammar_factory() else {
                 eprintln!(
@@ -767,10 +759,15 @@ pub(crate) mod imp {
                 );
                 return None;
             }
-            match Gemma4GrammarState::new_lark(factory, &tools_json, mode) {
+            let built = if strict {
+                Gemma4GrammarState::new_lark_strict(factory, &tools_json, mode)
+            } else {
+                Gemma4GrammarState::new_lark(factory, &tools_json, mode)
+            };
+            match built {
                 Ok(s) => {
                     eprintln!(
-                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?})",
+                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?}, strict={strict})",
                         tools.len()
                     );
                     Some(s)
@@ -1992,7 +1989,7 @@ pub(crate) mod imp {
             // wiring). The state is observed every sampled step so the
             // lazy trigger fires on `<|tool_call>` even when grammar
             // started inactive.
-            grammar: Option<Gemma4GrammarState>,
+            mut grammar: Option<Gemma4GrammarState>,
             // Pre-built cache from a prefix-cache lookup. When `Some`, its
             // `offset()` tells the chunked prefill where the new suffix
             // begins — only `&prompt[offset..]` gets prefilled. When `None`,
@@ -2300,6 +2297,36 @@ pub(crate) mod imp {
                 // saw (e.g. enters ToolCall on token 48 for Required).
                 for tok in &prefill_tokens {
                     parser.push(*tok)?;
+                }
+                // WS-C #1: for the Eager required/named grammar, the
+                // `<|tool_call>` opener (+ `call:NAME{` for a named choice) was
+                // prefilled into the prompt via the tokens above — it was never
+                // *sampled*, so an Eager matcher has not advanced past it. Replay
+                // those same tokens through the matcher so its parse position
+                // matches the model's context; otherwise the very first mask
+                // would re-force the opener and corrupt the body. No-op for the
+                // Lazy `auto` path (matcher inactive ⇒ `observe_prefill` returns
+                // early) and when there are no prefill tokens. If replay desyncs
+                // (a prefilled token the grammar doesn't accept at that
+                // position), drop the grammar and sample freely rather than
+                // decode against a corrupt matcher.
+                if grammar.as_ref().is_some_and(|g| g.is_active()) && !prefill_tokens.is_empty() {
+                    let mut desync: Option<String> = None;
+                    if let Some(g) = grammar.as_mut() {
+                        for tok in &prefill_tokens {
+                            if let Err(e) = g.observe_prefill(*tok) {
+                                desync = Some(format!("{e:#}"));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = desync {
+                        eprintln!(
+                            "[gemma4-backend] grammar prefill replay desynced \
+                             (falling back to free sampling): {e}"
+                        );
+                        grammar = None;
+                    }
                 }
                 let eos = self.model.eos_tokens().to_vec();
 

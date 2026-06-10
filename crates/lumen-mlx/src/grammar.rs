@@ -153,12 +153,47 @@ impl Gemma4GrammarState {
         tools: &[Value],
         mode: GrammarMode,
     ) -> Result<Self> {
+        Self::new_lark_inner(factory, tools, mode, false)
+    }
+
+    /// Strict, dup-free Lark variant — same native `call:NAME{…}` output as
+    /// [`new_lark`] (so [`crate::gemma4_response`] parses it unchanged) but
+    /// the body grammar enforces `required` fields and forbids
+    /// duplicate/repeated fields. Pair with [`GrammarMode::Eager`] for
+    /// `tool_choice=required`/named so a prefill-forced `<|tool_call>` opener
+    /// can't yield an empty-param body.
+    ///
+    /// When Eager, the prefilled opener tokens (`<|tool_call>` and, for a
+    /// named choice, `call:NAME{`) were injected into the model's context via
+    /// `parser.push()` and never *sampled*, so the matcher has not seen them.
+    /// The caller MUST replay them through [`observe_prefill`] before the
+    /// first decode step so the Eager matcher's state lines up with what the
+    /// model already has in context; otherwise the mask would re-force the
+    /// opener and corrupt the body.
+    pub fn new_lark_strict(
+        factory: Arc<ParserFactory>,
+        tools: &[Value],
+        mode: GrammarMode,
+    ) -> Result<Self> {
+        Self::new_lark_inner(factory, tools, mode, true)
+    }
+
+    fn new_lark_inner(
+        factory: Arc<ParserFactory>,
+        tools: &[Value],
+        mode: GrammarMode,
+        strict: bool,
+    ) -> Result<Self> {
         if tools.is_empty() {
             return Err(anyhow!(
                 "Gemma4GrammarState::new_lark called with empty tools"
             ));
         }
-        let schema = build_tool_grammar_lark(tools)?;
+        let schema = if strict {
+            build_tool_grammar_lark_strict(tools)?
+        } else {
+            build_tool_grammar_lark(tools)?
+        };
         let mut state = Self {
             factory,
             schema,
@@ -238,6 +273,35 @@ impl Gemma4GrammarState {
             if m.is_stopped() {
                 self.finished = true;
             }
+        }
+        Ok(())
+    }
+
+    /// Replay tokens the model received via prompt **prefill** (not via
+    /// sampling) into the matcher so its parse position matches the model's
+    /// context. Used for the Eager required/named path, where the chat
+    /// template prefills the `<|tool_call>` opener (and, for a named choice,
+    /// `call:NAME{`) — those tokens were pushed into the prompt, never
+    /// sampled, so the matcher never saw them.
+    ///
+    /// Unlike [`observe`], this does NOT run the lazy-activation transition
+    /// (the matcher is already active in Eager mode) and is a no-op in Lazy
+    /// mode or once finished. Each token must be one the grammar accepts at
+    /// the current position (the prefilled `call:NAME{` prefix is exactly the
+    /// grammar's deterministic opener), so `consume_token` should not error;
+    /// if it does, the error is surfaced so the caller can fall back to free
+    /// sampling rather than decode against a desynced matcher.
+    pub fn observe_prefill(&mut self, token: u32) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        let Some(m) = self.matcher.as_mut() else {
+            return Ok(());
+        };
+        m.consume_token(token)
+            .map_err(|e| anyhow!("Matcher::consume_token(prefill {token}): {e}"))?;
+        if m.is_stopped() {
+            self.finished = true;
         }
         Ok(())
     }
@@ -346,6 +410,31 @@ fn build_tool_grammar(tools: &[Value]) -> Result<TopLevelGrammar> {
 /// unconstrained body `<[^125]>*` (anything except `}` id 125) so the
 /// matcher still terminates correctly.
 fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
+    build_tool_grammar_lark_with_mode(tools, false)
+}
+
+/// Strict, dup-free variant of [`build_tool_grammar_lark`]: emits the same
+/// native `call:NAME{…}` format (so [`crate::gemma4_response`] parses it
+/// unchanged) but the per-tool body enforces `required` fields and forbids
+/// duplicate/repeated fields. Used for `tool_choice=required`/named in
+/// **Eager** mode, where a prefill-forced `<|tool_call>` would otherwise
+/// leave the args body unconstrained (the empty-param defect). See
+/// [`lark_body_for_object_schema`] for the `strict` body shape.
+fn build_tool_grammar_lark_strict(tools: &[Value]) -> Result<TopLevelGrammar> {
+    build_tool_grammar_lark_with_mode(tools, true)
+}
+
+fn build_tool_grammar_lark_with_mode(tools: &[Value], strict: bool) -> Result<TopLevelGrammar> {
+    Ok(TopLevelGrammar::from_lark(lark_grammar_string(
+        tools, strict,
+    )?))
+}
+
+/// Render the raw Lark grammar text for `tools` in the given mode. Split out
+/// of [`build_tool_grammar_lark_with_mode`] so tests can assert on the
+/// unescaped grammar string (the `TopLevelGrammar` wrapper serializes the
+/// Lark text with JSON escaping, which is awkward to substring-match).
+fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
     if tools.is_empty() {
         return Err(anyhow!("build_tool_grammar_lark: empty tools"));
     }
@@ -372,7 +461,7 @@ fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
             "properties": {},
         }));
         let body_rule_name = format!("tool_{}_body", name);
-        let body_rule_body = lark_body_for_object_schema(&parameters, &mut extra_rules)?;
+        let body_rule_body = lark_body_for_object_schema(&parameters, &mut extra_rules, strict)?;
         tool_names.push(name.to_string());
         tool_body_rules.push((body_rule_name, body_rule_body));
     }
@@ -420,7 +509,7 @@ fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
     grammar.push_str("number_val: /-?[0-9]+(\\.[0-9]+)?/\n");
     grammar.push_str("bool_val: \"true\" | \"false\"\n");
 
-    Ok(TopLevelGrammar::from_lark(grammar))
+    Ok(grammar)
 }
 
 /// True when the string is a safe `[a-zA-Z_][a-zA-Z0-9_]*` identifier —
@@ -442,40 +531,120 @@ fn is_safe_ident(s: &str) -> bool {
 /// `{"type":"object"}` fields. Pushes any helper rules into
 /// `extra_rules`.
 ///
-/// The body shape is one of:
-///   - `field_a ("," field_b)*` when there are properties;
-///   - `<[^125]>*` (any token except `}`) when properties is empty —
-///     trades schema enforcement for completeness on tools whose schema
-///     we don't fully understand.
-fn lark_body_for_object_schema(schema: &Value, extra_rules: &mut Vec<String>) -> Result<String> {
+/// `strict` selects the body shape:
+///   - **`false` (permissive, Lazy/auto default)** → `field_a ("," field_b)*`:
+///     ANY subset of fields in ANY order, with repetition allowed. Proven
+///     for the `auto` path where the model self-emits `<|tool_call>` and
+///     reliably closes the body from its training distribution.
+///   - **`true` (dup-free, Eager required/named)** → required fields in a
+///     fixed canonical order each emitted EXACTLY once, followed by each
+///     optional field at most once in canonical order. No Kleene-star over
+///     fields ⇒ no duplicate-field n-gram cycle (the failure mode that kept
+///     Eager disabled — see [`Gemma4Backend::build_grammar_state`]). This is
+///     the native-`call:NAME{…}` analogue of SGLang's JSON `required` +
+///     `minItems:1` enforcement: it forces at-least the required keys, so a
+///     quantized model can no longer emit `call:read{}` with empty params.
+///
+/// In both modes, the body collapses to `<[^125]>*` (any token except `}`)
+/// when the schema isn't in the supported subset, and to `""` when there
+/// are no properties.
+fn lark_body_for_object_schema(
+    schema: &Value,
+    extra_rules: &mut Vec<String>,
+    strict: bool,
+) -> Result<String> {
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
         return Ok("<[^125]>*".to_string());
     };
     if properties.is_empty() {
         return Ok("\"\"".to_string());
     }
-    let mut field_alternatives: Vec<String> = Vec::with_capacity(properties.len());
+    // Per-field rendered alternative `("prop:" value_rule)`, keyed by name so
+    // the strict path can pick required vs optional in canonical order.
+    let mut rendered: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for (prop_name, prop_schema) in properties {
         if !is_safe_ident(prop_name) {
             // Unsupported key shape — fall back to permissive body.
             return Ok("<[^125]>*".to_string());
         }
-        let value_rule = lark_value_for_schema(prop_schema, extra_rules)?;
-        field_alternatives.push(format!("(\"{prop_name}:\" {value_rule})"));
+        let value_rule = lark_value_for_schema(prop_schema, extra_rules, strict)?;
+        rendered.insert(
+            prop_name.clone(),
+            format!("(\"{prop_name}:\" {value_rule})"),
+        );
     }
-    let field_rule = field_alternatives.join(" | ");
-    // Allow the model to emit ANY subset of fields in ANY order. Schema
-    // `required` is intentionally NOT enforced at the grammar level —
-    // future tightening could enumerate permutations of required
-    // fields, but that's exponential in the field count.
-    Ok(format!("({field_rule}) (\",\" ({field_rule}))*"))
+    if !strict {
+        // Permissive: any subset in any order, repetition allowed.
+        let field_rule = rendered.values().cloned().collect::<Vec<_>>().join(" | ");
+        return Ok(format!("({field_rule}) (\",\" ({field_rule}))*"));
+    }
+
+    // Strict (dup-free): required fields first (canonical order, each once),
+    // then optional fields (canonical order, each at most once via `?`).
+    // `,` separators are folded into each segment so the body never has a
+    // dangling/leading comma regardless of which optionals appear.
+    let required: std::collections::BTreeSet<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Only required fields we actually know how to render (subset of
+    // `properties`); unknown required keys can't be enforced.
+    let req_fields: Vec<&String> = rendered.keys().filter(|k| required.contains(*k)).collect();
+    let opt_fields: Vec<&String> = rendered.keys().filter(|k| !required.contains(*k)).collect();
+
+    let mut segments: Vec<String> = Vec::with_capacity(rendered.len());
+    if req_fields.is_empty() {
+        // No (renderable) required fields. Keep dup-free but allow an empty
+        // body: first optional standalone-or-absent, each later optional
+        // comma-prefixed and `?`-gated. `(a)? (","b)? (","c)?` would permit a
+        // leading comma if `a` is skipped, so make the first optional carry
+        // no comma and gate the *rest* on a comma.
+        let mut iter = opt_fields.iter();
+        if let Some(first) = iter.next() {
+            segments.push(format!("({})?", rendered[*first]));
+            for f in iter {
+                segments.push(format!("(\",\" {})?", rendered[*f]));
+            }
+        }
+    } else {
+        // Required fields: first standalone, the rest comma-prefixed —
+        // all mandatory (no `?`). Optionals follow, each comma-prefixed
+        // and `?`-gated (a comma is always legal here because at least one
+        // required field precedes them).
+        let mut req_iter = req_fields.iter();
+        let first_req = req_iter.next().expect("req_fields non-empty");
+        segments.push(rendered[*first_req].clone());
+        for f in req_iter {
+            segments.push(format!("\",\" {}", rendered[*f]));
+        }
+        for f in &opt_fields {
+            segments.push(format!("(\",\" {})?", rendered[*f]));
+        }
+    }
+    if segments.is_empty() {
+        // Defensive: properties non-empty but nothing rendered (shouldn't
+        // happen). Permissive fallback keeps the matcher terminating.
+        return Ok("<[^125]>*".to_string());
+    }
+    Ok(segments.join(" "))
 }
 
 /// Render a Lark RHS for a single JSON Schema value (string / number /
 /// boolean / array / object / enum / const). Falls back to
 /// `<[^44,125]>*` (anything except `,` or `}`) for unsupported shapes
 /// so the rest of the body still validates.
-fn lark_value_for_schema(schema: &Value, extra_rules: &mut Vec<String>) -> Result<String> {
+fn lark_value_for_schema(
+    schema: &Value,
+    extra_rules: &mut Vec<String>,
+    strict: bool,
+) -> Result<String> {
     if let Some(c) = schema.get("const") {
         return Ok(lark_const_literal(c));
     }
@@ -490,11 +659,11 @@ fn lark_value_for_schema(schema: &Value, extra_rules: &mut Vec<String>) -> Resul
         "boolean" => Ok("bool_val".to_string()),
         "array" => {
             let items = schema.get("items").cloned().unwrap_or(json!({}));
-            let item_rule = lark_value_for_schema(&items, extra_rules)?;
+            let item_rule = lark_value_for_schema(&items, extra_rules, strict)?;
             Ok(format!("(\"[\" ({item_rule} (\",\" {item_rule})*)? \"]\")"))
         }
         "object" => {
-            let body = lark_body_for_object_schema(schema, extra_rules)?;
+            let body = lark_body_for_object_schema(schema, extra_rules, strict)?;
             Ok(format!("(\"{{\" {body} \"}}\")"))
         }
         // Unknown / mixed type → permissive non-greedy "anything until
@@ -786,5 +955,148 @@ mod tests {
         let mut logits = vec![1.0_f32; 8]; // far smaller than placeholder vocab
         let r = state.apply_mask_to_logits(&mut logits);
         assert!(r.is_err(), "vocab mismatch must error");
+    }
+
+    // ── WS-C #1: strict (dup-free, required-enforcing) Lark path ──
+
+    #[test]
+    fn strict_lark_builds_same_native_format() {
+        // Strict still emits the native `call:NAME{…}` format the Gemma
+        // response parser understands — NOT JSON. This is the load-bearing
+        // invariant: switching to JSON-union would break the parser.
+        let s = lark_grammar_string(&sample_tools(), true).expect("build strict lark");
+        assert!(
+            s.contains("call:"),
+            "native opener preserved in strict mode"
+        );
+        assert!(s.contains("task_complete"));
+        assert!(s.contains("ask_to_user"));
+        // `summary` is required on task_complete; `question` required on
+        // ask_to_user — both must appear in their body rules.
+        assert!(s.contains("summary:"));
+        assert!(s.contains("question:"));
+    }
+
+    #[test]
+    fn strict_lark_body_is_dup_free() {
+        // The n-gram cycle that kept Eager disabled came from the permissive
+        // body `(field) ("," (field))*` — a Kleene star over the field
+        // alternation, which lets the model repeat `summary:…,summary:…`
+        // forever. The strict body must NOT contain that field-repeat.
+        let permissive = lark_grammar_string(&sample_tools(), false).unwrap();
+        let strict = lark_grammar_string(&sample_tools(), true).unwrap();
+        // Permissive: body is `(...) ("," (...))*` — the `))*` field-repeat.
+        assert!(
+            permissive.contains("))*"),
+            "permissive body uses a Kleene star over the field alternation"
+        );
+        // Strict: required fields are a fixed sequence, optionals are
+        // `(\",\" field)?` — never a `*`-repeat of the field alternation. No
+        // body line may contain the `))*` field-repeat marker.
+        for line in strict.lines() {
+            if line.starts_with("tool_") && line.contains("_body:") {
+                assert!(
+                    !line.contains("))*"),
+                    "strict body line must not repeat fields with a Kleene star: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_lark_enforces_required_field_no_optional_gate() {
+        // A tool whose only property is required must emit that field
+        // unconditionally (no `?` gate around it) so an empty `call:read{}`
+        // is grammatically impossible — the empty-param defect fix.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        })];
+        let s = lark_grammar_string(&tools, true).unwrap();
+        // The sole required field is emitted as a bare (non-`?`) body, so the
+        // body cannot be empty. Locate the body rule line and assert it is
+        // exactly the required field with no `?` gate.
+        let body_line = s
+            .lines()
+            .find(|l| l.starts_with("tool_read_body:"))
+            .expect("read body rule present");
+        assert!(
+            body_line.contains("\"path:\" string_val"),
+            "required field present: {body_line}"
+        );
+        assert!(
+            !body_line.contains(")?"),
+            "required-only field must not be optional-gated: {body_line}"
+        );
+    }
+
+    #[test]
+    fn permissive_lark_unchanged_for_auto_path() {
+        // Guard: the auto/Lazy path must be byte-identical to the pre-fix
+        // grammar. The permissive body keeps the `(field) ("," (field))*`
+        // shape with the field alternation and the Kleene star.
+        let s = lark_grammar_string(&sample_tools(), false).unwrap();
+        assert!(s.contains("call:"));
+        // task_complete has a single property `summary`, so its body is
+        // `(("summary:" string_val)) ("," (("summary:" string_val)))*`.
+        let body_line = s
+            .lines()
+            .find(|l| l.starts_with("tool_task_complete_body:"))
+            .expect("task_complete body present");
+        assert!(
+            body_line.contains("))*"),
+            "permissive body retains the field Kleene star: {body_line}"
+        );
+    }
+
+    #[test]
+    fn strict_lark_state_starts_active_in_eager() {
+        let factory = shared_factory_placeholder();
+        let state =
+            Gemma4GrammarState::new_lark_strict(factory, &sample_tools(), GrammarMode::Eager)
+                .expect("build eager strict lark state");
+        assert!(
+            state.is_active(),
+            "eager strict Lark grammar constrains from step 0 (required tool_choice path)"
+        );
+    }
+
+    #[test]
+    fn strict_lark_handles_no_required_fields() {
+        // A schema with only optional properties must still build (dup-free,
+        // every field `?`-gated, empty body allowed) — no panic, no Kleene
+        // star over fields.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer" }
+                    }
+                    // no "required"
+                }
+            }
+        })];
+        let s = lark_grammar_string(&tools, true).expect("build no-required strict lark");
+        assert!(s.contains("query:"));
+        assert!(s.contains("limit:"));
+        let body_line = s
+            .lines()
+            .find(|l| l.starts_with("tool_search_body:"))
+            .expect("search body present");
+        assert!(
+            !body_line.contains("))*"),
+            "no-required strict body must still be dup-free: {body_line}"
+        );
     }
 }
