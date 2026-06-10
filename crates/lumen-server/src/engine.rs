@@ -1606,6 +1606,14 @@ impl InferenceEngine {
         let stop_matcher =
             std::cell::RefCell::new(lumen_core::stop::StopMatcher::new(ov.stop.clone()));
         let stopped_by_seq = std::cell::Cell::new(false);
+        // response_format streaming: when a JSON schema constrains the output,
+        // end the stream at the first complete JSON value (llguidance shapes
+        // the value but doesn't force EOS at its close, so the model would
+        // otherwise free-run trailing prose). `None` for non-response_format
+        // requests, leaving the normal stop-matcher path untouched.
+        let json_stop = response_schema
+            .as_ref()
+            .map(|_| std::cell::RefCell::new(JsonValueStop::default()));
         // Wall-clock around the streaming generation for the `/v1/loads`
         // last tok/s gauge (recorded at the `Done` terminal below).
         let gen_started = Instant::now();
@@ -1682,21 +1690,35 @@ impl InferenceEngine {
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
-                            let mut sm = stop_matcher.borrow_mut();
-                            if sm.is_inert() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                            } else {
-                                let step = sm.push(t);
-                                if !step.emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                            if let Some(js) = json_stop.as_ref() {
+                                // response_format: stream up to the first
+                                // complete JSON value, then end the decode loop
+                                // (reuses the stopped_by_seq early-break path).
+                                let (emit, stopped) = js.borrow_mut().push(t);
+                                if !emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(emit));
                                 }
-                                if step.stopped {
+                                if stopped {
                                     stopped_by_seq.set(true);
-                                    drop(sm);
-                                    // Break the backend decode loop early. The
-                                    // `stopped_by_seq` flag distinguishes this
-                                    // from a real error in the match below.
                                     return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                }
+                            } else {
+                                let mut sm = stop_matcher.borrow_mut();
+                                if sm.is_inert() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                                } else {
+                                    let step = sm.push(t);
+                                    if !step.emit.is_empty() {
+                                        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                    }
+                                    if step.stopped {
+                                        stopped_by_seq.set(true);
+                                        drop(sm);
+                                        // Break the backend decode loop early. The
+                                        // `stopped_by_seq` flag distinguishes this
+                                        // from a real error in the match below.
+                                        return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                    }
                                 }
                             }
                         }
@@ -1732,21 +1754,35 @@ impl InferenceEngine {
                 |ev: BackendStreamEvent<'_>| -> Result<()> {
                     match ev {
                         BackendStreamEvent::Text(t) => {
-                            let mut sm = stop_matcher.borrow_mut();
-                            if sm.is_inert() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                            } else {
-                                let step = sm.push(t);
-                                if !step.emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                            if let Some(js) = json_stop.as_ref() {
+                                // response_format: stream up to the first
+                                // complete JSON value, then end the decode loop
+                                // (reuses the stopped_by_seq early-break path).
+                                let (emit, stopped) = js.borrow_mut().push(t);
+                                if !emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(emit));
                                 }
-                                if step.stopped {
+                                if stopped {
                                     stopped_by_seq.set(true);
-                                    drop(sm);
-                                    // Break the backend decode loop early. The
-                                    // `stopped_by_seq` flag distinguishes this
-                                    // from a real error in the match below.
                                     return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                }
+                            } else {
+                                let mut sm = stop_matcher.borrow_mut();
+                                if sm.is_inert() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
+                                } else {
+                                    let step = sm.push(t);
+                                    if !step.emit.is_empty() {
+                                        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                    }
+                                    if step.stopped {
+                                        stopped_by_seq.set(true);
+                                        drop(sm);
+                                        // Break the backend decode loop early. The
+                                        // `stopped_by_seq` flag distinguishes this
+                                        // from a real error in the match below.
+                                        return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                    }
                                 }
                             }
                         }
@@ -2242,6 +2278,62 @@ fn count_tokens(backend: &ModelBackend, text: &str) -> u32 {
 /// (the JSON-schema grammar shapes the value but doesn't force EOS at its
 /// close). The returned index lands on a `}`/`]` (ASCII) so it is always a
 /// valid UTF-8 char boundary for `String::truncate`.
+/// Streaming analogue of [`first_json_value_end`]: a stateful tracker fed the
+/// decoded text chunks of a `response_format` stream. It emits text up to and
+/// including the first complete balanced JSON value, then signals `stopped` so
+/// the decode loop ends — trimming the trailing prose that llguidance's
+/// JSON-schema grammar permits after the closing `}` (it never forces EOS at
+/// completion). String- and escape-aware so braces inside strings don't count.
+#[derive(Default)]
+struct JsonValueStop {
+    started: bool,
+    depth: i32,
+    in_str: bool,
+    escaped: bool,
+    done: bool,
+}
+
+impl JsonValueStop {
+    /// Feed one decoded text chunk. Returns `(emit, stopped)` — `emit` is the
+    /// portion of `t` to stream (truncated at the JSON close on completion),
+    /// `stopped` is true once the first complete value has closed.
+    fn push(&mut self, t: &str) -> (String, bool) {
+        if self.done {
+            return (String::new(), true);
+        }
+        for (i, &c) in t.as_bytes().iter().enumerate() {
+            if self.in_str {
+                if self.escaped {
+                    self.escaped = false;
+                } else if c == b'\\' {
+                    self.escaped = true;
+                } else if c == b'"' {
+                    self.in_str = false;
+                }
+                continue;
+            }
+            match c {
+                b'"' => self.in_str = true,
+                b'{' | b'[' => {
+                    self.started = true;
+                    self.depth += 1;
+                }
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.started && self.depth == 0 {
+                        self.done = true;
+                        // `i` lands on a `}`/`]` (ASCII) so `i + 1` is a char
+                        // boundary.
+                        return (t[..i + 1].to_string(), true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (t.to_string(), false)
+    }
+}
+
 fn first_json_value_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
