@@ -2807,7 +2807,9 @@ impl MlxQwen35Backend {
             // Stage 1: position seq_id's cache exactly at `boundary` — fork a
             // cached prefix and extend up to the boundary when one is a strict
             // prefix, else cold-prefill up to the boundary.
-            let cached = self.prefix_store.get_master(prefix_cache_key);
+            let cached = self
+                .prefix_store
+                .get_master_for(prefix_cache_key, &prompt_ids);
             let t = std::time::Instant::now();
             let reused = match cached {
                 Some((master, prefix))
