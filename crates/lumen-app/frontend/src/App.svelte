@@ -21,6 +21,7 @@
   } from "./lib/api";
   import EnvOverrides from "./lib/EnvOverrides.svelte";
   import MemoryCalculator from "./lib/MemoryCalculator.svelte";
+  import type { ModelFamily } from "./lib/memory-estimate";
   import DoctorPanel from "./lib/DoctorPanel.svelte";
   import UpdatePanel from "./lib/UpdatePanel.svelte";
   import ApiTabs from "./lib/ApiTabs.svelte";
@@ -199,6 +200,33 @@
   let activeModel = $derived.by(() => {
     if (!config?.active_model) return null;
     return models.find((m) => m.id === config!.active_model) ?? null;
+  });
+
+  // Memory the model can realistically claim, reclaim-aware. macOS evicts /
+  // swap-compresses inactive + compressor + other apps' active pages when a big
+  // MLX allocation arrives, so the only genuinely-unavailable memory is WIRED
+  // (kernel-locked). Budget ≈ total − wired(of OTHER processes) − headroom.
+  // When the server is up the model is itself wired, so subtract its resident
+  // footprint from `wired` to isolate the OS/other-app wired floor. Capped at
+  // 92% of RAM. This is why the live "free" (total − used) badly undercounts:
+  // it treats reclaimable compressed/cache as used.
+  let availableGb = $derived.by(() => {
+    if (!memoryUsage) return undefined;
+    const GB = 1024 ** 3;
+    const totalGb = memoryUsage.total_bytes / GB;
+    // Backend that predates `wired_bytes` → fall back to the 85%-of-RAM
+    // convention the SERVER card already uses for the recommended cap.
+    if (!memoryUsage.wired_bytes)
+      return Math.max(4, Math.round(totalGb * 0.85));
+    const wiredGb = memoryUsage.wired_bytes / GB;
+    const running =
+      status.state === "running" || status.state === "starting";
+    const modelResidentGb =
+      running && activeModel ? (activeModel.size_bytes / GB) * 1.13 : 0;
+    // Wired held by everything EXCEPT our model (floor ~3 GB for the OS).
+    const otherWiredGb = Math.max(3, wiredGb - modelResidentGb);
+    const avail = totalGb - otherWiredGb - 2;
+    return Math.max(4, Math.min(Math.round(avail), Math.round(totalGb * 0.92)));
   });
 
   // Bit-width detected from the active model id. The base model determines its
@@ -590,29 +618,69 @@
     setTimeout(() => (statusMessage = null), 2000);
   }
 
-  // Apply the memory calculator's previewed config to the real tuning state.
-  // KV mode + bits land on the *structured* quant config so the QUANT card
-  // reflects them; chunk / prefix / the Qwen3.6 TQ-KV activation live only as
-  // env overrides (no dedicated card). Both persist via their own command and a
-  // single restart toast — env is read once at spawn, so Stop → Start applies.
+  // Apply the memory calculator's previewed config to the real tuning state,
+  // model-aware (Qwen3.6 vs Gemma 4 — the calculator resolves the family from
+  // the loaded model). Three structured/env hops, each persisted; env is read
+  // once at spawn, so the single restart toast tells the user to Stop → Start.
+  //
+  //  1. QUANT card  — kv_mode + bits land on the structured quant config. For
+  //     Gemma 4 this also auto-emits LUMEN_GEMMA4_QUANT_KV_MODE/BITS via
+  //     apply_env, so that family needs NO KV env override (avoids the
+  //     "shadowed by override" warning on the same key).
+  //  2. CONTEXT card — the chosen context cap lands on context.max
+  //     (→ LUMEN_MAX_CTX); the chunk mirrors into context.prefill so the card
+  //     stays coherent with the calculator.
+  //  3. Env overrides — prefix cache (shared) + the family's own prefill-chunk
+  //     knob, plus Qwen3.6's TQ-KV activation (its structured config does not
+  //     emit LUMEN_QWEN35_* keys, unlike Gemma 4's).
   async function applyCalcSelection(sel: {
+    family: ModelFamily;
     kvOn: boolean;
     bits: number;
     chunk: number;
     prefix: boolean;
+    ctx: number;
+    prefillLimit: number;
+    outMaxTokens: number;
+    budgetGB: number | null;
   }) {
     if (!config) return;
+    // Opt-in: also write the budget to the server's hard MLX memory cap (the
+    // same field the "tune memory" button drives). Off by default so the
+    // calculator stays a planning tool unless the user ticks the box.
+    if (sel.budgetGB != null) {
+      config = await api.updateServerConfig({
+        ...config.server,
+        memory_limit_gb: sel.budgetGB,
+      });
+    }
     let next = await api.updateQuantConfig({
       ...config.quant,
       kv_mode: sel.kvOn ? "on" : "off",
       bits: sel.bits,
     });
+    // CONTEXT card. NOTE: `context.prefill` (→ LUMEN_PREFILL_CHUNK /
+    // LUMEN_MAX_PROMPT_TOKENS) is the prompt-size REJECT cap, NOT the per-step
+    // OOM chunk (`sel.chunk` → LUMEN_<FAMILY>_PREFILL_CHUNK). They are distinct
+    // knobs — conflating them caps prompts at the tiny chunk size and rejects
+    // big prompts (e.g. omp's system prompt). `max` ≥ prompt cap + output.
+    next = await api.updateContextConfig({
+      ...next.context,
+      max: sel.ctx,
+      prefill: sel.prefillLimit,
+      default_max_tokens: sel.outMaxTokens,
+    });
     const envPatch: Record<string, string> = {
-      LUMEN_QWEN35_TQ_KV: sel.kvOn ? "1" : "0",
-      LUMEN_QWEN35_PREFILL_CHUNK: String(sel.chunk),
       LUMEN_MLX_PREFIX_CACHE: sel.prefix ? "1" : "0",
     };
-    if (sel.kvOn) envPatch.LUMEN_QWEN35_TQ_KV_BITS = String(sel.bits);
+    if (sel.family === "qwen35") {
+      envPatch.LUMEN_QWEN35_TQ_KV = sel.kvOn ? "1" : "0";
+      envPatch.LUMEN_QWEN35_PREFILL_CHUNK = String(sel.chunk);
+      if (sel.kvOn) envPatch.LUMEN_QWEN35_TQ_KV_BITS = String(sel.bits);
+    } else {
+      // gemma4: KV is driven by the structured quant config above.
+      envPatch.LUMEN_GEMMA4_PREFILL_CHUNK = String(sel.chunk);
+    }
     next = await api.updateEnvOverrides({ ...next.env_overrides, ...envPatch });
     config = next;
     savedToast();
@@ -1018,6 +1086,13 @@
         <MemoryCalculator
           modelId={config?.active_model ?? null}
           env={config?.env_overrides ?? {}}
+          contextMax={config?.context.max}
+          contextPrefill={config?.context.prefill}
+          defaultMaxTokens={config?.context.default_max_tokens}
+          ramGb={systemInfo?.ram_gb}
+          budgetDefault={config?.server.memory_limit_gb ?? undefined}
+          availableGb={availableGb}
+          activeModelBytes={activeModel?.size_bytes}
           onApply={applyCalcSelection}
         />
       </div>

@@ -369,6 +369,9 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "Batched prefill chunk size (experimental)",
   "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
     "Experimental: tokens per prefill chunk for the batched engine (BATCHED_ENGINE=1, Gemma GGUF only). Chunking a long prompt's prefill stops one sequence from monopolizing a single giant forward and stalling other batched sequences. Only prompts longer than this are chunked; shorter prompts are unaffected. Default 512.",
+  "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "Max prompt tokens (reject cap)",
+  "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
+    "Hard ceiling on prompt length: requests longer than this are rejected before prefill. Decoupled from the prefill chunk size, so you can keep small chunks (low peak memory) while still accepting very long prompts. Falls back to LUMEN_PREFILL_CHUNK, then 32768. Raise to admit longer contexts; chunked prefill handles the memory.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",
@@ -403,10 +406,27 @@ export const en: Record<string, string> = {
   // Memory calculator (predict peak memory vs context / chunk / KV mode).
   "memcalc.title": "Memory calculator",
   "memcalc.noGeometry":
-    "No memory profile for model '{model}'. The calculator supports the catalog's native MLX models (e.g. Qwen3.6-35B).",
+    "No memory profile for model '{model}'. The calculator supports the catalog's native MLX models (e.g. Qwen3.6-35B, Gemma 4 26B-A4B).",
+  "memcalc.active": "Weights / active",
+  "memcalc.active.hint":
+    "Resident weight memory at a small prefill — the estimate's anchor. Pre-filled from the model's measured value; correct it to your own startup log line [mlx-mem] ... active=N GB for an exact, machine-specific estimate.",
   "memcalc.budget": "Budget",
+  "memcalc.budget.available": "📊 {n} usable",
+  "memcalc.budget.availableHint":
+    "Snap the budget to the memory the model can realistically claim and re-optimize. Reclaim-aware: only WIRED memory is truly unavailable — macOS swap-compresses/evicts other apps' inactive + compressed pages when the model allocates, so this is far higher than the top-right 'used' gauge (which counts that reclaimable memory as used). Updates live.",
+  "memcalc.budget.overRam":
+    "Budget {budget} GB exceeds this machine's {ram} GB RAM — a limit above physical RAM just thrashes (swap). Lower it to ≤ {ram}.",
   "memcalc.budget.hint":
     "MLX memory budget ≈ machine RAM minus OS headroom. Check the startup log line [mlx-mem] memory_limit set to N GB for the exact value.",
+  "memcalc.optimize": "✨ Optimize",
+  "memcalc.optimize.hint":
+    "Auto-fill every knob with the best config that fits this RAM budget (maximizes prompt + output context, conceding KV quality / prefill speed only as the budget tightens). Review, then Apply.",
+  "memcalc.reco.ok":
+    "Recommended (agentic): full quality (bf16) + prefix cache, ample context fits {budget} GB with headroom.",
+  "memcalc.reco.aggressive":
+    "Recommended: {budget} GB is tight, so quality/prefix were traded down to keep a usable context. Raise the budget for bf16 + prefix cache.",
+  "memcalc.reco.tooSmall":
+    "{budget} GB is below this model's load floor (weights + overhead). Raise the budget or pick a smaller model.",
   "memcalc.kv": "KV",
   "memcalc.bits": "bits",
   "memcalc.bits.hint":
@@ -415,6 +435,10 @@ export const en: Record<string, string> = {
   "memcalc.peak": "peak / budget",
   "memcalc.chunk": "Chunk",
   "memcalc.prefix": "prefix cache",
+  "memcalc.maxPrompt": "Max prompt",
+  "memcalc.outMax": "Output max",
+  "memcalc.workingSet":
+    "Working set: prompt {prompt} + out {out} = {total} tok → peak {peak} GB",
   "memcalc.context": "Context",
   "memcalc.over": "over budget",
   "memcalc.maxAtConfig": "Max context at this config:",
@@ -424,7 +448,10 @@ export const en: Record<string, string> = {
   "memcalc.apply": "Apply to tuning",
   "memcalc.applied": "Applied ✓ — Stop → Start to take effect",
   "memcalc.apply.hint":
-    "Updates the QUANT card (KV mode / bits) + env overrides (chunk / prefix). Restart to apply.",
+    "Updates the QUANT card (KV mode / bits), the CONTEXT card (max ctx / max prompt / output) + env overrides (chunk / prefix), model-aware. Restart to apply.",
+  "memcalc.applyBudget": "set as memory limit",
+  "memcalc.applyBudget.hint":
+    "Also write this budget to the server's MLX memory_limit_gb (the hard cap). Off = budget is a planning input only.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running

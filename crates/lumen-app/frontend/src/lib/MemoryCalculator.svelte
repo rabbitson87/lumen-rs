@@ -4,30 +4,84 @@
     geometryForModel,
     estimateAt,
     maxContextTokens,
+    recommendForBudget,
     bytesToGB,
+    envKeysForFamily,
     type KvMode,
     type MemoryConfig,
+    type ModelFamily,
   } from "./memory-estimate";
 
   interface Props {
     modelId: string | null;
     /** Current env overrides — used to seed KV mode / chunk / prefix defaults. */
     env: Record<string, string>;
+    /** Current structured `context.max` — seeds the context slider. */
+    contextMax?: number;
+    /** Current `context.prefill` (prompt-reject cap) — seeds "max prompt". */
+    contextPrefill?: number;
+    /** Current `context.default_max_tokens` — seeds "output max". */
+    defaultMaxTokens?: number;
+    /** Machine RAM (GB) — caps the budget and warns on over-allocation. */
+    ramGb?: number;
+    /** Current server `memory_limit_gb` — seeds the budget (clamped to RAM). */
+    budgetDefault?: number;
+    /** Live memory free for the model = RAM − other processes (from the poll). */
+    availableGb?: number;
+    /** Active model on-disk size (bytes) — sanity-anchors the weights estimate. */
+    activeModelBytes?: number;
     /**
      * Push the previewed config into the live tuning state. Receives the
-     * semantic knobs; the parent maps them onto the structured quant config
-     * (so the QUANT card updates) plus the Qwen3.6 env overrides.
+     * semantic knobs (incl. the resolved model `family` so the parent writes
+     * the right `LUMEN_<FAMILY>_*` env namespace) plus the chosen context cap,
+     * the prompt-reject cap, and the output-token budget.
      */
     onApply?: (sel: {
+      family: ModelFamily;
       kvOn: boolean;
       bits: number;
       chunk: number;
       prefix: boolean;
+      ctx: number;
+      /** Prompt-size reject cap → context.prefill (LUMEN_MAX_PROMPT_TOKENS). */
+      prefillLimit: number;
+      /** Output budget → context.default_max_tokens. */
+      outMaxTokens: number;
+      /** When non-null, also write this as the server's MLX memory limit. */
+      budgetGB: number | null;
     }) => void;
   }
-  let { modelId, env, onApply }: Props = $props();
+  let {
+    modelId,
+    env,
+    contextMax,
+    contextPrefill,
+    defaultMaxTokens,
+    ramGb,
+    budgetDefault,
+    availableGb,
+    activeModelBytes,
+    onApply,
+  }: Props = $props();
+
+  const GB = 1024 * 1024 * 1024;
 
   const geom = $derived(geometryForModel(modelId ?? ""));
+
+  let weightsGb = $state(0); // calibratable resident weights (0 ⇒ model anchor)
+
+  // Resident weights ("active" at small prefill) used by every estimate. The
+  // model anchor is a real measurement, but the operator can override it with
+  // their own startup `[mlx-mem] ... active=` reading for an exact, machine- and
+  // quant-specific figure (different nvfp4/mxfp4 variants differ ±2 GiB).
+  const effGeom = $derived(
+    geom
+      ? {
+          ...geom,
+          weightsBytes: weightsGb > 0 ? weightsGb * GB : geom.weightsBytes,
+        }
+      : null,
+  );
 
   // Seed controls from the live env so the calculator opens on the *current*
   // serving config, then let the user explore alternatives locally.
@@ -41,18 +95,62 @@
   let chunk = $state(2048);
   let prefixCache = $state(true);
   let ctxK = $state(50); // context in thousands of tokens (slider)
+  let prefillLimit = $state(40960); // max prompt tokens (reject cap) → context.prefill
+  let outMaxTokens = $state(2048); // output budget → context.default_max_tokens
+  let applyBudget = $state(false); // also write budget → server memory_limit_gb
 
-  // One-shot seed from env when the model/env first resolves.
+  // One-shot seed from env when the model/env first resolves. Reads the env
+  // namespace for the *resolved* family so the calculator opens on whatever the
+  // currently-loaded backend is actually serving (Qwen3.6 vs Gemma 4).
   let seeded = false;
   $effect(() => {
     if (seeded || !geom) return;
     seeded = true;
-    kvMode = truthy(env["LUMEN_QWEN35_TQ_KV"]) ? "tq" : "bf16";
-    const bb = Number(env["LUMEN_QWEN35_TQ_KV_BITS"]);
+    const k = envKeysForFamily(geom.family);
+    const kvRaw = env[k.kv]?.trim().toLowerCase();
+    kvMode =
+      k.kvKind === "bool"
+        ? truthy(env[k.kv])
+          ? "tq"
+          : "bf16"
+        : kvRaw && kvRaw !== "off"
+          ? "tq"
+          : "bf16";
+    const bb = Number(env[k.kvBits]);
     if (Number.isFinite(bb) && bb >= 2 && bb <= 8) bits = bb;
-    const c = Number(env["LUMEN_QWEN35_PREFILL_CHUNK"]);
+    const c = Number(env[k.prefillChunk]);
     if (Number.isFinite(c) && c > 0) chunk = c;
     prefixCache = env["LUMEN_MLX_PREFIX_CACHE"]?.trim() !== "0";
+    // Calibrate weights to the model's measured anchor (operator-overridable).
+    if (weightsGb <= 0)
+      weightsGb = Math.round((geom.weightsBytes / GB) * 10) / 10;
+    // Budget: prefer the LIVE memory actually free for the model (RAM − other
+    // processes); the machine rarely has all its RAM spare. Fall back to the
+    // configured MLX limit, then ~85% of RAM. Never seed above physical RAM (a
+    // limit over RAM just thrashes — the user's 79 GB limit on a 36 GB Mac).
+    const ram = ramGb && ramGb > 0 ? ramGb : undefined;
+    let b =
+      availableGb && availableGb > 0
+        ? availableGb
+        : budgetDefault && budgetDefault > 0
+          ? budgetDefault
+          : ram
+            ? Math.round(ram * 0.85)
+            : 31;
+    if (ram && b > ram) b = Math.round(ram * 0.85);
+    budgetGB = b;
+    // Seed the prompt-reject cap + output budget from the structured context.
+    if (contextPrefill && contextPrefill > 0) prefillLimit = contextPrefill;
+    if (defaultMaxTokens && defaultMaxTokens > 0) outMaxTokens = defaultMaxTokens;
+    // Seed the slider at the worst-case working set (prompt cap + output) so
+    // the breakdown opens on the memory the server must actually hold, falling
+    // back to context.max. Clamped to the model's hard context ceiling.
+    const ws = prefillLimit + outMaxTokens;
+    const seedCtx = ws > 0 ? ws : (contextMax ?? 50_000);
+    ctxK = Math.min(
+      Math.round(geom.maxContext / 1000),
+      Math.max(1, Math.round(seedCtx / 1000)),
+    );
   });
 
   // Effective storage mode: TurboQuant stores uint8 codes UNPACKED, so memory
@@ -66,10 +164,10 @@
   const CHUNK_PRESETS = [2048, 1024, 512, 256];
 
   const cfg = $derived<MemoryConfig | null>(
-    geom
+    effGeom
       ? {
-          geometry: geom,
-          budgetBytes: budgetGB * 1024 * 1024 * 1024,
+          geometry: effGeom,
+          budgetBytes: budgetGB * GB,
           kvMode: effMode,
           chunkTokens: chunk,
           prefixCache,
@@ -80,6 +178,14 @@
   const ctxTokens = $derived(Math.round(ctxK * 1000));
   const breakdown = $derived(cfg ? estimateAt(cfg, ctxTokens) : null);
   const maxCtx = $derived(cfg ? maxContextTokens(cfg) : 0);
+
+  // Worst-case working set the server must hold = prompt-reject cap + output
+  // budget. This is the number that determines whether a big-prompt client
+  // (e.g. omp) fits; surfaced as its own peak so raising the prompt cap shows
+  // its memory cost immediately.
+  const wsTokens = $derived(prefillLimit + outMaxTokens);
+  const wsBreakdown = $derived(cfg ? estimateAt(cfg, wsTokens) : null);
+  const wsOverContext = $derived(wsTokens > (geom?.maxContext ?? Infinity));
 
   const fmt = (b: number) => bytesToGB(b).toFixed(2);
   const fmtTok = (n: number) => n.toLocaleString("en-US");
@@ -110,13 +216,49 @@
           : "bg-ok",
   );
 
+  // "Optimize for this machine": fill every knob with a budget-fitted config
+  // derived from the chosen RAM budget. The user reviews the result, then
+  // Apply → Stop → Start. Maximizes the working set (prompt cap + output) under
+  // budget, conceding KV quality / prefill speed only as the budget tightens.
+  let recoNote = $state<"" | "ok" | "aggressive" | "tooSmall">("");
+  function optimize() {
+    if (!effGeom) return;
+    const r = recommendForBudget(effGeom, budgetGB * GB);
+    kvMode = r.kvMode;
+    bits = r.bits;
+    packed = false;
+    chunk = r.chunk;
+    prefixCache = r.prefix;
+    prefillLimit = r.prefillLimit;
+    outMaxTokens = r.outMaxTokens;
+    ctxK = Math.max(1, Math.round(r.ctxMax / 1000));
+    recoNote = r.note;
+  }
+
   // Push the previewed knobs into the live tuning state. The parent maps them
-  // onto the structured quant config (QUANT card) + Qwen3.6 env overrides, and a
-  // Stop → Start applies them. `packed` is a memory *preview* (uint4 not yet
-  // wired), so it is intentionally not exported.
+  // onto the structured quant config (QUANT card) + the family's env overrides +
+  // the structured `context.max`, and a Stop → Start applies them. `packed` is a
+  // memory *preview* (uint4 not yet wired), so it is intentionally not exported.
   let applied = $state(false);
   function apply() {
-    onApply?.({ kvOn: kvMode === "tq", bits, chunk, prefix: prefixCache });
+    if (!geom) return;
+    // context.max must cover both the explored slider context AND the
+    // worst-case working set (prompt cap + output); clamp to the model ceiling.
+    const ctx = Math.min(
+      geom.maxContext,
+      Math.max(ctxTokens, prefillLimit + outMaxTokens),
+    );
+    onApply?.({
+      family: geom.family,
+      kvOn: kvMode === "tq",
+      bits,
+      chunk,
+      prefix: prefixCache,
+      ctx,
+      prefillLimit,
+      outMaxTokens,
+      budgetGB: applyBudget ? budgetGB : null,
+    });
     applied = true;
     setTimeout(() => (applied = false), 1800);
   }
@@ -128,8 +270,28 @@
       {t("memcalc.noGeometry").replace("{model}", modelId ?? "—")}
     </div>
   {:else}
-    <div class="dim text-[10.5px] mb-2">
+    <div class="dim text-[10.5px] mb-1.5">
       {geom.label} · {geom.fullAttnLayers} full-attn · {geom.nKvHeads} KV-head · head_dim {geom.headDim}
+    </div>
+
+    <!-- Weights calibration: grounds the whole estimate in the operator's own
+         startup measurement instead of the catalog anchor. -->
+    <div class="flex items-center gap-1.5 mb-2" title={t("memcalc.active.hint")}>
+      <span class="dim text-[10px]">{t("memcalc.active")}</span>
+      <input
+        class="mono text-right w-14 text-[11px]"
+        type="number"
+        min="1"
+        max="512"
+        step="0.1"
+        bind:value={weightsGb}
+      />
+      <span class="dim text-[10px]">GB</span>
+      {#if activeModelBytes}
+        <span class="dim text-[10px]"
+          >· disk {(activeModelBytes / GB).toFixed(1)}</span
+        >
+      {/if}
     </div>
 
     <!-- Budget -->
@@ -145,15 +307,50 @@
       />
       <span class="dim">GB</span>
       <div class="flex gap-1 flex-wrap ml-1">
+        {#if availableGb && availableGb > 0}
+          <button
+            class={`px-1.5 py-0.5 text-[10px] mono border ${budgetGB === availableGb ? "bg-panel-2 text-text border-border" : "bg-transparent text-ok border-ok/40 hover:bg-panel-2"}`}
+            onclick={() => {
+              budgetGB = availableGb ?? budgetGB;
+              optimize();
+            }}
+            title={t("memcalc.budget.availableHint")}
+          >{t("memcalc.budget.available").replace("{n}", String(availableGb))}</button>
+        {/if}
         {#each BUDGET_PRESETS as p}
           <button
             class={`px-1.5 py-0.5 text-[10px] mono ${budgetGB === p ? "bg-panel-2 text-text" : "bg-transparent text-text-dim hover:bg-panel-2"}`}
-            onclick={() => (budgetGB = p)}
+            onclick={() => {
+              budgetGB = p;
+              optimize();
+            }}
           >{p}</button>
         {/each}
       </div>
+      <button
+        class="px-2 py-0.5 text-[10px] mono bg-accent/10 text-accent border border-accent/40 rounded hover:bg-accent/20 ml-auto whitespace-nowrap"
+        onclick={optimize}
+        title={t("memcalc.optimize.hint")}
+      >{t("memcalc.optimize")}</button>
     </div>
     <div class="dim text-[10px] mb-2 leading-snug">{t("memcalc.budget.hint")}</div>
+    {#if ramGb && budgetGB > ramGb}
+      <div class="text-err text-[10px] mb-2 leading-snug">
+        {t("memcalc.budget.overRam")
+          .replace("{budget}", String(budgetGB))
+          .replace("{ram}", String(ramGb))}
+      </div>
+    {/if}
+    {#if recoNote}
+      <div
+        class="text-[10px] mb-2 leading-snug"
+        class:text-ok={recoNote === "ok"}
+        class:text-warn={recoNote === "aggressive"}
+        class:text-err={recoNote === "tooSmall"}
+      >
+        {t(`memcalc.reco.${recoNote}`).replace("{budget}", String(budgetGB))}
+      </div>
+    {/if}
 
     <!-- KV mode + bits + chunk + prefix -->
     <div class="flex items-center gap-x-3 gap-y-1.5 mb-1 flex-wrap">
@@ -197,6 +394,48 @@
       <div class="dim text-[10px] mb-2 leading-snug">{t("memcalc.bits.hint")}</div>
     {:else}
       <div class="mb-1"></div>
+    {/if}
+
+    <!-- Prompt-reject cap + output budget (the omp "prefill limit" lives here) -->
+    <div class="flex items-center gap-x-3 gap-y-1.5 mb-1 flex-wrap">
+      <div class="flex items-center gap-1.5">
+        <span class="dim">{t("memcalc.maxPrompt")}</span>
+        <input
+          class="mono text-right w-20"
+          type="number"
+          min="256"
+          max={geom.maxContext}
+          step="1024"
+          bind:value={prefillLimit}
+        />
+      </div>
+      <div class="flex items-center gap-1.5">
+        <span class="dim">{t("memcalc.outMax")}</span>
+        <input
+          class="mono text-right w-16"
+          type="number"
+          min="0"
+          max={geom.maxContext}
+          step="256"
+          bind:value={outMaxTokens}
+        />
+      </div>
+    </div>
+    {#if wsBreakdown}
+      <div
+        class="dim text-[10px] mb-2 leading-snug"
+        class:text-err={!wsBreakdown.fits || wsOverContext}
+      >
+        {t("memcalc.workingSet")
+          .replace("{prompt}", fmtTok(prefillLimit))
+          .replace("{out}", fmtTok(outMaxTokens))
+          .replace("{total}", fmtTok(wsTokens))
+          .replace("{peak}", fmt(wsBreakdown.peakBytes))}{wsOverContext
+          ? ` ⚠ > ${fmtTok(geom.maxContext)}`
+          : wsBreakdown.fits
+            ? ""
+            : " ⚠"}
+      </div>
     {/if}
 
     <!-- Context slider -->
@@ -284,6 +523,13 @@
           <span class="dim text-[10px] leading-snug">{t("memcalc.apply.hint")}</span>
         {/if}
       </div>
+      <label
+        class="inline-flex items-center gap-1.5 mt-1.5 cursor-pointer"
+        title={t("memcalc.applyBudget.hint")}
+      >
+        <input type="checkbox" bind:checked={applyBudget} />
+        <span class="dim text-[10px]">{t("memcalc.applyBudget")} ({budgetGB} GB)</span>
+      </label>
     {/if}
   {/if}
 </div>

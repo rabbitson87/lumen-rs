@@ -26,8 +26,17 @@
 
 const GB = 1024 * 1024 * 1024;
 
+/**
+ * Model family — selects which env-var namespace the "Apply" action writes
+ * (each backend reads its own `LUMEN_<FAMILY>_*` knobs) and how the KV is
+ * stored. Extend alongside `MODEL_GEOMETRY` when a new backend lands.
+ */
+export type ModelFamily = "qwen35" | "gemma4";
+
 /** Per-model geometry needed to size the KV cache and attention transients. */
 export type ModelGeometry = {
+  /** Backend family — drives the env namespace written on Apply. */
+  family: ModelFamily;
   /** Human label for the picker. */
   label: string;
   /** In-memory weight bytes ≈ on-disk safetensors total. */
@@ -51,6 +60,7 @@ export type ModelGeometry = {
  */
 export const MODEL_GEOMETRY: Record<string, ModelGeometry> = {
   "qwen3.6-35b": {
+    family: "qwen35",
     label: "Qwen3.6-35B-A3B mxfp4",
     // MLX-RESIDENT footprint, not the 19.32 GB on-disk safetensors size:
     // observed `active=20.7GB` at a 2k-token prefill (weights + runtime). Anchor
@@ -59,6 +69,21 @@ export const MODEL_GEOMETRY: Record<string, ModelGeometry> = {
     weightsBytes: 21_900_000_000, // ~20.4 GiB resident
     fullAttnLayers: 10, // 40 layers, full_attention_interval=4
     nKvHeads: 2,
+    nHeads: 16,
+    headDim: 256,
+    maxContext: 262_144,
+  },
+  "gemma-4-26b": {
+    family: "gemma4",
+    label: "Gemma 4 26B-A4B (4-bit)",
+    // Resident ≈ 4-bit checkpoint + runtime. Anchor to the operator's own
+    // startup `active=` log for exactness (nvfp4/mxfp4 variants differ ±2 GiB).
+    weightsBytes: 15_800_000_000, // ~14.7 GiB resident (it-4bit class)
+    // 30 layers, layer_types has 5 full-attention; the other 25 are
+    // sliding-window (1024) → their KV is BOUNDED and does not scale with
+    // context, so only the 5 full-attn layers drive the context-growth term.
+    fullAttnLayers: 5,
+    nKvHeads: 8,
     nHeads: 16,
     headDim: 256,
     maxContext: 262_144,
@@ -193,6 +218,184 @@ export function maxContextTokens(cfg: MemoryConfig): number {
 
   const c = Math.floor((cfg.budgetBytes - fixed) / slope);
   return Math.max(0, Math.min(c, g.maxContext));
+}
+
+/**
+ * A budget-optimized config: the knob set the calculator fills when the
+ * operator picks a machine RAM budget. Maximizes the usable working set
+ * (prompt cap + output) under the budget, conceding KV quality / prefill speed
+ * only as the budget tightens.
+ */
+export type Recommendation = {
+  kvMode: KvMode; // "bf16" | "tq" (packed not auto-recommended — not wired)
+  bits: number; // 8 | 6 | 4 — meaningful only when kvMode = "tq"
+  chunk: number; // per-step prefill chunk (OOM lever)
+  prefix: boolean; // prefix-cache snapshot (+1 KV copy; agentic speed)
+  prefillLimit: number; // max prompt tokens (reject cap) → context.prefill
+  outMaxTokens: number; // output budget → context.default_max_tokens
+  ctxMax: number; // context.max to set (= working set)
+  /** prefillLimit + outMaxTokens — the peak-sizing sequence length. */
+  workingSet: number;
+  /**
+   * "ok"          — fits the model's full context window with headroom.
+   * "aggressive"  — budget-bound; this is the most context it can hold.
+   * "tooSmall"    — budget below the model's load floor (weights+overhead).
+   */
+  note: "ok" | "aggressive" | "tooSmall";
+};
+
+const RECO_SAFETY = 0.9; // leave 10% headroom over the predicted peak
+const RECO_OUT_RESERVE = 8192; // default output-token budget carved from WS
+const RECO_USABLE_CTX = 8192; // min context to call a prefix-on config "usable"
+const RECO_AMPLE_CTX = 32768; // context above which the config is "ample" (ok)
+const RECO_BAL_CHUNK = 512; // balanced prefill chunk (speed vs attn-score peak)
+// KV ladder: least-aggressive (best quality/decode) → most. bf16 first so we
+// only quantize when the budget can't otherwise hold a usable context.
+const RECO_KV_LADDER: { kvMode: KvMode; bits: number }[] = [
+  { kvMode: "bf16", bits: 8 },
+  { kvMode: "tq", bits: 8 },
+  { kvMode: "tq", bits: 6 },
+  { kvMode: "tq", bits: 4 },
+];
+// Chunk ladder: largest (fastest prefill) → smallest (lowest attn-score peak).
+const RECO_CHUNKS = [2048, 1024, 512, 256];
+
+/**
+ * Recommend a memory-fitted config for `budgetBytes` on this model — **balanced
+ * for agentic/omp use**: keep the prefix cache ON (the dominant warm-turn lever)
+ * and full bf16 quality whenever the budget can still hold a usable context;
+ * trade those down only when it can't. Strategy:
+ *  1. Phase A (preferred): least-aggressive KV whose prefix-ON context at the
+ *     balanced chunk is ≥ usable. bf16 first → only quantize if bf16 prefix-on
+ *     can't reach a usable context.
+ *  2. Phase B (tight budget): if no KV gives a usable prefix-on context, drop
+ *     the prefix cache (frees one KV copy) to salvage context.
+ *  3. Pick the largest chunk that still fits the chosen context (prefill speed).
+ *  4. Reserve an output budget; the rest is the prompt-reject cap.
+ */
+export function recommendForBudget(
+  g: ModelGeometry,
+  budgetBytes: number,
+): Recommendation {
+  const E = budgetBytes * RECO_SAFETY;
+  const fixed = g.weightsBytes + DEFAULT_OVERHEAD;
+  if (fixed >= E) {
+    return {
+      kvMode: "tq",
+      bits: 4,
+      chunk: 256,
+      prefix: false,
+      prefillLimit: 0,
+      outMaxTokens: RECO_OUT_RESERVE,
+      ctxMax: 0,
+      workingSet: 0,
+      note: "tooSmall",
+    };
+  }
+
+  const peakAt = (
+    kvMode: KvMode,
+    chunk: number,
+    prefix: boolean,
+    ctx: number,
+  ): number =>
+    estimateAt(
+      { geometry: g, budgetBytes, kvMode, chunkTokens: chunk, prefixCache: prefix },
+      ctx,
+    ).peakBytes;
+  const maxCtxOf = (kvMode: KvMode, chunk: number, prefix: boolean): number =>
+    Math.min(
+      g.maxContext,
+      maxContextTokens({
+        geometry: g,
+        budgetBytes: E,
+        kvMode,
+        chunkTokens: chunk,
+        prefixCache: prefix,
+      }),
+    );
+  const largestChunk = (kvMode: KvMode, prefix: boolean, ctx: number): number => {
+    for (const ch of RECO_CHUNKS) if (peakAt(kvMode, ch, prefix, ctx) <= E) return ch;
+    return 256;
+  };
+  const build = (
+    kv: { kvMode: KvMode; bits: number },
+    prefix: boolean,
+    ws: number,
+  ): Recommendation => {
+    const chunk = largestChunk(kv.kvMode, prefix, ws);
+    const out = Math.min(RECO_OUT_RESERVE, Math.max(256, Math.floor(ws * 0.1)));
+    const prefillLimit = Math.max(256, ws - out);
+    const note =
+      kv.kvMode === "bf16" && ws >= RECO_AMPLE_CTX ? "ok" : "aggressive";
+    return {
+      kvMode: kv.kvMode,
+      bits: kv.bits,
+      chunk,
+      prefix,
+      prefillLimit,
+      outMaxTokens: out,
+      ctxMax: ws,
+      workingSet: prefillLimit + out,
+      note,
+    };
+  };
+
+  // Phase A — prefix cache ON, least-aggressive KV that stays usable.
+  for (const kv of RECO_KV_LADDER) {
+    const ws = maxCtxOf(kv.kvMode, RECO_BAL_CHUNK, true);
+    if (ws >= RECO_USABLE_CTX) return build(kv, true, ws);
+  }
+  // Phase B — budget too tight for a prefix-on context; drop prefix to salvage.
+  for (const kv of RECO_KV_LADDER) {
+    const ws = maxCtxOf(kv.kvMode, 256, false);
+    if (ws >= 1024) return build(kv, false, ws);
+  }
+  return {
+    kvMode: "tq",
+    bits: 4,
+    chunk: 256,
+    prefix: false,
+    prefillLimit: 256,
+    outMaxTokens: RECO_OUT_RESERVE,
+    ctxMax: 0,
+    workingSet: 256,
+    note: "tooSmall",
+  };
+}
+
+/**
+ * Per-family env-var namespace for the calculator-controlled knobs. Each
+ * backend reads its OWN `LUMEN_<FAMILY>_*` keys, so Apply must write the right
+ * set (and the seed must read it back from the same keys). `prefix` is shared
+ * across families (the MLX prefix cache is backend-agnostic).
+ */
+export type FamilyEnvKeys = {
+  /** KV quant on/off. Qwen35: "1"/"0"; Gemma4: a mode string ("on"/"off"). */
+  kv: string;
+  /** Whether `kv` is a boolean ("1"/"0") or a mode enum ("on"/"off"). */
+  kvKind: "bool" | "mode";
+  kvBits: string;
+  prefillChunk: string;
+};
+
+export function envKeysForFamily(family: ModelFamily): FamilyEnvKeys {
+  switch (family) {
+    case "qwen35":
+      return {
+        kv: "LUMEN_QWEN35_TQ_KV",
+        kvKind: "bool",
+        kvBits: "LUMEN_QWEN35_TQ_KV_BITS",
+        prefillChunk: "LUMEN_QWEN35_PREFILL_CHUNK",
+      };
+    case "gemma4":
+      return {
+        kv: "LUMEN_GEMMA4_QUANT_KV_MODE",
+        kvKind: "mode",
+        kvBits: "LUMEN_GEMMA4_QUANT_KV_BITS",
+        prefillChunk: "LUMEN_GEMMA4_PREFILL_CHUNK",
+      };
+  }
 }
 
 /** Resolve geometry from a model id by substring match (case-insensitive). */

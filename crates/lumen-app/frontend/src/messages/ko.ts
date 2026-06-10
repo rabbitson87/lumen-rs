@@ -360,6 +360,9 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "배치 엔진 prefill 청크 크기 (실험적)",
   "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
     "실험적: 배치 엔진(BATCHED_ENGINE=1, Gemma GGUF 전용)의 prefill 청크당 토큰 수. 장문 프롬프트의 prefill을 청크로 나누면 한 시퀀스가 거대한 단일 forward를 독점해 다른 배치 시퀀스를 head-of-line 정체시키는 것을 막습니다. 이 값보다 긴 프롬프트만 청킹되며, 짧은 프롬프트는 영향받지 않습니다. 기본 512.",
+  "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "최대 프롬프트 토큰 (거부 상한)",
+  "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
+    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 거부됩니다. prefill 청크 크기와 분리되어 있어, 작은 청크(낮은 peak 메모리)를 유지하면서도 매우 긴 프롬프트를 받을 수 있습니다. 미설정 시 LUMEN_PREFILL_CHUNK, 그다음 32768로 폴백. 긴 컨텍스트를 허용하려면 높이세요(메모리는 청크 prefill이 처리).",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
@@ -394,10 +397,27 @@ export const ko: Record<string, string> = {
   // 메모리 계산기 (context / chunk / KV 모드별 peak 메모리 예측).
   "memcalc.title": "메모리 계산기",
   "memcalc.noGeometry":
-    "모델 '{model}'의 메모리 프로파일이 없습니다. 카탈로그의 네이티브 MLX 모델(예: Qwen3.6-35B)을 지원합니다.",
+    "모델 '{model}'의 메모리 프로파일이 없습니다. 카탈로그의 네이티브 MLX 모델(예: Qwen3.6-35B, Gemma 4 26B-A4B)을 지원합니다.",
+  "memcalc.active": "가중치 / active",
+  "memcalc.active.hint":
+    "작은 prefill 시 상주 가중치 메모리 — 추정의 기준점. 모델 실측값으로 미리 채워짐. 시작 로그 [mlx-mem] ... active=N GB 값으로 고치면 기기·양자화별 정확한 추정.",
   "memcalc.budget": "예산",
+  "memcalc.budget.available": "📊 가용 {n}",
+  "memcalc.budget.availableHint":
+    "모델이 실제로 확보 가능한 메모리로 예산 맞추고 재최적화. reclaim 반영: 진짜 못 쓰는 건 WIRED뿐 — 모델 할당 시 macOS가 다른 앱의 inactive·압축 페이지를 swap/evict해 내줍니다. 그래서 우측 상단 'used'(reclaim 가능한 메모리도 used로 침)보다 훨씬 큼. 실시간 갱신.",
+  "memcalc.budget.overRam":
+    "예산 {budget} GB가 이 기기 RAM {ram} GB 초과 — 물리 RAM 넘는 한도는 스왑만 유발. {ram} 이하로 낮추세요.",
   "memcalc.budget.hint":
     "MLX 메모리 예산 ≈ 머신 RAM − OS 여유분. 정확한 값은 시작 로그 [mlx-mem] memory_limit set to N GB 에서 확인.",
+  "memcalc.optimize": "✨ 자동 최적화",
+  "memcalc.optimize.hint":
+    "이 RAM 예산에 맞는 최적 config로 모든 노브 자동 설정 (프롬프트+출력 컨텍스트 최대화, 예산이 빡빡해질수록 KV 품질/프리필 속도만 양보). 검토 후 적용.",
+  "memcalc.reco.ok":
+    "추천(에이전틱): bf16(양자화 없음) + prefix 캐시, 넉넉한 컨텍스트가 {budget} GB에 여유 있게 들어감.",
+  "memcalc.reco.aggressive":
+    "추천: {budget} GB가 빡빡해 품질/prefix를 낮춰 쓸 만한 컨텍스트 확보. bf16 + prefix 캐시는 예산을 올려야 함.",
+  "memcalc.reco.tooSmall":
+    "{budget} GB는 이 모델 로드 하한(가중치+오버헤드) 미만입니다. 예산을 올리거나 더 작은 모델을 선택하세요.",
   "memcalc.kv": "KV",
   "memcalc.bits": "bits",
   "memcalc.bits.hint":
@@ -406,6 +426,10 @@ export const ko: Record<string, string> = {
   "memcalc.peak": "peak / 예산",
   "memcalc.chunk": "청크",
   "memcalc.prefix": "prefix 캐시",
+  "memcalc.maxPrompt": "최대 프롬프트",
+  "memcalc.outMax": "출력 최대",
+  "memcalc.workingSet":
+    "워킹셋: 프롬프트 {prompt} + 출력 {out} = {total} tok → 피크 {peak} GB",
   "memcalc.context": "컨텍스트",
   "memcalc.over": "예산 초과",
   "memcalc.maxAtConfig": "이 설정의 최대 컨텍스트:",
@@ -415,7 +439,10 @@ export const ko: Record<string, string> = {
   "memcalc.apply": "튜닝에 적용",
   "memcalc.applied": "적용됨 ✓ — Stop → Start 해야 반영",
   "memcalc.apply.hint":
-    "QUANT 카드(KV 모드/비트) + env override(청크/prefix)를 갱신. 재시작 시 반영.",
+    "QUANT 카드(KV 모드/비트), CONTEXT 카드(최대 ctx/최대 프롬프트/출력) + env override(청크/prefix)를 모델별로 갱신. 재시작 시 반영.",
+  "memcalc.applyBudget": "메모리 한도로 설정",
+  "memcalc.applyBudget.hint":
+    "이 예산을 서버 MLX memory_limit_gb(하드 한도)에도 기록. 끄면 예산은 계획용 입력값으로만 사용.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
