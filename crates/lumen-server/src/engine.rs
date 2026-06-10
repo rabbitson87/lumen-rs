@@ -1031,6 +1031,18 @@ impl InferenceEngine {
                 parsed.visible.truncate(i);
             }
         }
+        // response_format: llguidance's `from_json_schema` grammar shapes the
+        // JSON correctly but never reports is_stopped/is_accepting at the
+        // closing brace (confirmed: both stay false through completion), so
+        // it doesn't force EOS and the model free-runs trailing prose after
+        // the `}`. Deterministically truncate the non-streaming answer to the
+        // first complete balanced JSON value so response_format yields clean
+        // JSON. No-op (keeps full text) if no complete value is present.
+        if req.response_json_schema().is_some()
+            && let Some(end) = first_json_value_end(&parsed.visible)
+        {
+            parsed.visible.truncate(end);
+        }
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -2223,6 +2235,45 @@ fn count_tokens(backend: &ModelBackend, text: &str) -> u32 {
 /// would otherwise report `0` — diverging from real OpenAI / Anthropic
 /// APIs which always count the serialized tool_use body. We approximate
 /// the missing cost by re-tokenizing `name + JSON(arguments)` per call.
+/// Byte index just past the first complete balanced JSON value (object or
+/// array) in `s`, or `None` if no complete value is present. String- and
+/// escape-aware so braces/brackets inside string literals don't affect the
+/// depth count. Used to trim trailing prose from `response_format` output
+/// (the JSON-schema grammar shapes the value but doesn't force EOS at its
+/// close). The returned index lands on a `}`/`]` (ASCII) so it is always a
+/// valid UTF-8 char boundary for `String::truncate`.
+fn first_json_value_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn completion_tokens_with_tools(
     backend: &ModelBackend,
     visible: &str,
