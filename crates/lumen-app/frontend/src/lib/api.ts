@@ -149,6 +149,8 @@ export interface SystemInfo {
 export interface MemoryUsage {
   used_bytes: number;
   total_bytes: number;
+  /** Wired (kernel-locked) bytes; the rest of `used` is reclaimable. */
+  wired_bytes: number;
 }
 
 export type LifecycleState = "stopped" | "starting" | "running" | "stopping" | "crashed";

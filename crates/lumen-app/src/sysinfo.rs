@@ -74,6 +74,12 @@ pub fn ram_defaults(total_gb: usize) -> MemoryDefaults {
 pub struct MemoryUsage {
     pub used_bytes: u64,
     pub total_bytes: u64,
+    /// Wired (kernel-locked, non-pageable) bytes. Everything else in
+    /// `used_bytes` — active working sets and the compressor's pages — is
+    /// reclaimable under pressure (paged out / swap-compressed) when a large
+    /// MLX allocation arrives, so `total - wired` is the realistic ceiling a
+    /// model can claim, whereas `total - used` is the no-swap comfortable free.
+    pub wired_bytes: u64,
 }
 
 pub fn current_memory_usage() -> Option<MemoryUsage> {
@@ -117,6 +123,7 @@ pub fn current_memory_usage() -> Option<MemoryUsage> {
     Some(MemoryUsage {
         used_bytes,
         total_bytes: total,
+        wired_bytes: wired * page_size,
     })
 }
 
