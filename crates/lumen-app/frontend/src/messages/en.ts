@@ -384,6 +384,12 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "Force required tool params",
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
     "For Qwen3.6 tool calls, inject a <parameter=KEY> opener before the model can close a function with a required parameter missing — preventing empty calls like read() with no path. The model still writes the value. Helps weak/quantized models with many tools; off by default.",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.label": "Tool-call grammar",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.help":
+    "Constrain Qwen3.6 tool-call output with a grammar so required tool_choice / named tool_choice can only emit well-formed calls with all required parameters present (a stronger, structural version of 'Force required tool params'). Masks logits after each forward — sampling only, no token skipping, so SSM/conv state is unaffected. On by default; set 0 to disable.",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.label": "Tool grammar on auto",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.help":
+    "Also apply the tool-call grammar when tool_choice is 'auto' (not just required/named). Off by default — auto lets the model decide whether to call a tool at all, so constraining it early can over-trigger calls. Enable only if a model over-emits malformed tool calls under auto.",
   "env.entry.LUMEN_QWEN35_TQ_KV.label": "TurboQuant KV cache",
   "env.entry.LUMEN_QWEN35_TQ_KV.help":
     "Compress the Qwen3.6 full-attention KV cache with TurboQuant (rotation + Lloyd-Max scalar quant), cutting the growing KV memory ~2-4× so longer contexts fit before OOM. Trades a small dequant-on-read cost; at long context the memory saved can outweigh it. Linear-attention layers are unaffected. Experimental — measure quality (cosine/top-1) before relying on it. Off by default.",

@@ -85,6 +85,12 @@ pub struct Gemma4GrammarState {
     /// True once `stop_reason()` reports termination — the matcher releases
     /// and subsequent tokens are unconstrained.
     finished: bool,
+    /// Token id that flips a [`GrammarMode::Lazy`] matcher on when first
+    /// sampled. Defaults to Gemma 4's `<|tool_call>` (id 48), but is
+    /// parameterized so other families can reuse this state machine with
+    /// their own opener (e.g. Qwen 3.6's `<tool_call>` — though Qwen's
+    /// required/named path runs Eager and never relies on this trigger).
+    lazy_trigger_token: u32,
 }
 
 impl Gemma4GrammarState {
@@ -105,6 +111,7 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
+            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -136,6 +143,7 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
+            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -200,6 +208,63 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
+            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
+        };
+        if matches!(mode, GrammarMode::Eager) {
+            state.activate()?;
+        }
+        Ok(state)
+    }
+
+    /// Qwen 3.6 variant — constrains the **nested-XML** tool-call body the
+    /// Qwen 3.6 model is trained on and that [`crate::qwen3_5_tools::
+    /// Qwen35ResponseParser`] reads:
+    ///
+    /// ```text
+    /// <tool_call>
+    /// <function=NAME>
+    /// <parameter=KEY>
+    /// VALUE
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    ///
+    /// Unlike Gemma 4's native `call:NAME{…}` form (or the JSON-union the
+    /// SGLang reference uses), Qwen reads this XML verbatim, so the grammar is
+    /// built directly over those tags ([`build_qwen35_tool_grammar_lark`]).
+    /// The body is **dup-free + required-enforcing** in the same spirit as
+    /// [`new_lark_strict`]: each `<parameter=KEY>` appears at most once and
+    /// every required key is mandatory, so a quantized 35B can't emit
+    /// `<function=read></function>` with empty params (the empty-param defect).
+    ///
+    /// `opener_token` is the id flipped on in [`GrammarMode::Lazy`] when first
+    /// sampled. Qwen's `<tool_call>` opener can tokenize to multiple ids, so
+    /// the Lazy/auto path should NOT rely on a single trigger; prefer
+    /// [`GrammarMode::Eager`] with [`observe_prefill`] for the
+    /// `tool_choice=required`/named path where the opener is prefilled. The
+    /// argument is kept for completeness (and for an exact single-token opener
+    /// if the tokenizer provides one); pass `None` to leave the Gemma default
+    /// (harmless — it just never matches a Qwen sample).
+    pub fn new_qwen35_xml(
+        factory: Arc<ParserFactory>,
+        tools: &[Value],
+        mode: GrammarMode,
+        opener_token: Option<u32>,
+    ) -> Result<Self> {
+        if tools.is_empty() {
+            return Err(anyhow!(
+                "Gemma4GrammarState::new_qwen35_xml called with empty tools"
+            ));
+        }
+        let schema = build_qwen35_tool_grammar_lark(tools)?;
+        let mut state = Self {
+            factory,
+            schema,
+            matcher: None,
+            mode,
+            finished: false,
+            lazy_trigger_token: opener_token.unwrap_or(TOK_TOOL_CALL_OPEN),
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -263,7 +328,7 @@ impl Gemma4GrammarState {
         }
         if self.matcher.is_none()
             && matches!(self.mode, GrammarMode::Lazy)
-            && token == TOK_TOOL_CALL_OPEN
+            && token == self.lazy_trigger_token
         {
             self.activate()?;
         }
@@ -428,6 +493,142 @@ fn build_tool_grammar_lark_with_mode(tools: &[Value], strict: bool) -> Result<To
     Ok(TopLevelGrammar::from_lark(lark_grammar_string(
         tools, strict,
     )?))
+}
+
+/// Build a Lark grammar matching Qwen 3.6's **nested-XML** tool-call form
+/// (`<tool_call><function=NAME><parameter=KEY>\nVALUE\n</parameter>…
+/// </function></tool_call>`). Always dup-free + required-enforcing: each
+/// `<parameter=KEY>` appears at most once, required keys are mandatory, so the
+/// model cannot emit `<function=read></function>` with no params.
+///
+/// Only the **tag structure** and **key set** are constrained — VALUE bytes
+/// are left free (`/(.|\n)*?/`-style, terminating at the `</parameter>` the
+/// grammar requires next) so the model freely writes string / JSON values that
+/// [`crate::qwen3_5_tools::parse_param_value`] decodes. Constraining the value
+/// shape would risk diverging from what the Qwen parser accepts; the
+/// load-bearing win is "every required key present, each at most once".
+pub fn build_qwen35_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
+    Ok(TopLevelGrammar::from_lark(qwen35_lark_grammar_string(
+        tools,
+    )?))
+}
+
+/// Render the raw Lark text for [`build_qwen35_tool_grammar_lark`]. Split out
+/// so tests can substring-match the unescaped grammar.
+fn qwen35_lark_grammar_string(tools: &[Value]) -> Result<String> {
+    if tools.is_empty() {
+        return Err(anyhow!("build_qwen35_tool_grammar_lark: empty tools"));
+    }
+    let mut call_alts: Vec<String> = Vec::with_capacity(tools.len());
+    let mut body_rules: Vec<(String, String)> = Vec::with_capacity(tools.len());
+
+    for t in tools {
+        let function = t
+            .get("function")
+            .ok_or_else(|| anyhow!("tool entry missing `function` field: {t}"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool function missing `name` string"))?;
+        if !is_safe_ident(name) {
+            return Err(anyhow!(
+                "tool name {name:?} contains non-identifier characters; \
+                 Qwen35 XML Lark generation refuses to escape"
+            ));
+        }
+        let parameters = function.get("parameters").cloned().unwrap_or(json!({
+            "type": "object",
+            "properties": {},
+        }));
+        let body_rule_name = format!("q_{name}_body");
+        let body_rule_rhs = qwen35_body_for_object_schema(&parameters)?;
+        body_rules.push((body_rule_name.clone(), body_rule_rhs));
+        // One alternative per tool so the `<function=NAME>` literal binds to
+        // THAT tool's parameter set, not any tool's.
+        call_alts.push(format!(
+            "(\"<function={name}>\\n\" {body_rule_name} \"</function>\\n\")"
+        ));
+    }
+
+    let call_alt = call_alts.join("\n          | ");
+    let mut grammar = String::new();
+    grammar.push_str("start: tool_call\n");
+    grammar.push_str("tool_call: \"<tool_call>\\n\" function_block \"</tool_call>\"\n");
+    grammar.push_str(&format!("function_block: {call_alt}\n"));
+    for (rule_name, rule_rhs) in &body_rules {
+        grammar.push_str(&format!("{rule_name}: {rule_rhs}\n"));
+    }
+    // A parameter value: any bytes (incl. newlines) up to the framing newline
+    // that precedes `</parameter>`. Non-greedy so the FIRST `\n</parameter>`
+    // closes the value. The framing `\n` on each side matches the renderer's
+    // `<parameter=KEY>\nVALUE\n</parameter>`.
+    grammar.push_str("param_value: /(.|\\n)*?/\n");
+    // Generic well-formed parameter block — used by the permissive fallback
+    // for tools whose schema isn't in the supported subset (unknown
+    // `properties` shape or non-identifier keys). The key name is left free
+    // (`/[^>\\n]*/`) but the surrounding tags are still enforced, so even the
+    // fallback can't degenerate into unstructured output.
+    grammar.push_str(
+        "param_block: \"<parameter=\" /[^>\\n]*/ \">\\n\" param_value \"\\n</parameter>\\n\"\n",
+    );
+    Ok(grammar)
+}
+
+/// Render the per-tool body RHS for the Qwen35 XML grammar: a dup-free,
+/// required-enforcing sequence of `<parameter=KEY>\nVALUE\n</parameter>\n`
+/// blocks. Required keys (canonical/schema order) are mandatory and appear
+/// first; optional keys follow, each `?`-gated. No Kleene star over the key
+/// alternation ⇒ no duplicate-parameter n-gram cycle.
+fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        // Unknown shape — allow any sequence of well-formed parameter blocks
+        // (still structurally constrained: each is `<parameter=…>…</parameter>`).
+        return Ok("(param_block)*".to_string());
+    };
+    if properties.is_empty() {
+        return Ok("\"\"".to_string());
+    }
+    // Per-key rendered block, keyed by name for canonical ordering.
+    let mut rendered: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (key, _schema) in properties {
+        if !is_safe_ident(key) {
+            // Unsupported key shape — fall back to any well-formed blocks.
+            return Ok("(param_block)*".to_string());
+        }
+        rendered.insert(
+            key.clone(),
+            format!("(\"<parameter={key}>\\n\" param_value \"\\n</parameter>\\n\")"),
+        );
+    }
+    let required: std::collections::BTreeSet<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let req_keys: Vec<&String> = rendered.keys().filter(|k| required.contains(*k)).collect();
+    let opt_keys: Vec<&String> = rendered.keys().filter(|k| !required.contains(*k)).collect();
+
+    let mut segments: Vec<String> = Vec::with_capacity(rendered.len());
+    // Required first, each mandatory (no `?`). Optionals follow, each `?`.
+    // Unlike the Gemma `call:NAME{…}` body there is no `,` separator between
+    // parameter blocks — each block is fully self-delimiting (`</parameter>\n`)
+    // — so required and optional blocks compose without comma bookkeeping.
+    for k in &req_keys {
+        segments.push(rendered[*k].clone());
+    }
+    for k in &opt_keys {
+        segments.push(format!("({})?", rendered[*k]));
+    }
+    if segments.is_empty() {
+        return Ok("(param_block)*".to_string());
+    }
+    Ok(segments.join(" "))
 }
 
 /// Render the raw Lark grammar text for `tools` in the given mode. Split out
@@ -1066,6 +1267,153 @@ mod tests {
             state.is_active(),
             "eager strict Lark grammar constrains from step 0 (required tool_choice path)"
         );
+    }
+
+    // ── WS-C #2: Qwen 3.6 nested-XML tool grammar ──
+
+    #[test]
+    fn qwen35_grammar_builds_native_xml_format() {
+        // Must emit the nested-XML tags the Qwen35 parser reads — NOT
+        // `call:NAME{…}` (Gemma) nor JSON-union. This is the load-bearing
+        // invariant: a wrong format would make the matcher reject every
+        // model token.
+        let s = qwen35_lark_grammar_string(&sample_tools()).expect("build qwen35 grammar");
+        assert!(s.contains("<tool_call>"), "tool_call opener tag");
+        assert!(s.contains("</tool_call>"), "tool_call closer tag");
+        assert!(
+            s.contains("<function=task_complete>"),
+            "function tag per tool"
+        );
+        assert!(s.contains("<function=ask_to_user>"));
+        assert!(s.contains("<parameter="), "parameter tag");
+        assert!(s.contains("</parameter>"));
+        assert!(s.contains("</function>"));
+        // No Gemma native form leaked in. The Gemma body opens with the
+        // QUOTED literal `"call:"` (an emitted terminal), distinct from this
+        // grammar's `tool_call:` rule NAME — assert the quoted literal is
+        // absent rather than the bare substring.
+        assert!(
+            !s.contains("\"call:\""),
+            "must not emit Gemma quoted call: literal"
+        );
+    }
+
+    #[test]
+    fn qwen35_grammar_enforces_required_param() {
+        // A tool whose only property is required must emit that parameter
+        // block unconditionally (no `?` gate) so `<function=read></function>`
+        // (empty params) is grammatically impossible — the empty-param defect.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        })];
+        let s = qwen35_lark_grammar_string(&tools).unwrap();
+        let body_line = s
+            .lines()
+            .find(|l| l.starts_with("q_read_body:"))
+            .expect("read body rule present");
+        assert!(
+            body_line.contains("<parameter=path>"),
+            "required param present: {body_line}"
+        );
+        assert!(
+            !body_line.contains(")?"),
+            "required-only param must not be optional-gated: {body_line}"
+        );
+    }
+
+    #[test]
+    fn qwen35_grammar_body_is_dup_free() {
+        // No Kleene star over the parameter-block alternation in a body rule
+        // ⇒ no duplicate-parameter n-gram cycle (the failure mode that kept
+        // Gemma's Eager Lark disabled).
+        let s = qwen35_lark_grammar_string(&sample_tools()).unwrap();
+        for line in s.lines() {
+            if line.starts_with("q_") && line.contains("_body:") {
+                assert!(
+                    !line.contains(")*"),
+                    "qwen35 body line must not repeat params with a Kleene star: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_grammar_optional_params_are_gated() {
+        // ask_to_user: `question` required, `options` optional → options must
+        // be `?`-gated, question must not be.
+        let s = qwen35_lark_grammar_string(&sample_tools()).unwrap();
+        let body_line = s
+            .lines()
+            .find(|l| l.starts_with("q_ask_to_user_body:"))
+            .expect("ask_to_user body present");
+        assert!(body_line.contains("<parameter=question>"));
+        assert!(body_line.contains("<parameter=options>"));
+        assert!(
+            body_line.contains(")?"),
+            "optional param must be `?`-gated: {body_line}"
+        );
+    }
+
+    #[test]
+    fn qwen35_grammar_state_active_in_eager() {
+        let factory = shared_factory_placeholder();
+        let state =
+            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Eager, None)
+                .expect("build eager qwen35 xml state");
+        assert!(
+            state.is_active(),
+            "eager qwen35 grammar constrains from step 0 (required tool_choice path)"
+        );
+    }
+
+    #[test]
+    fn qwen35_grammar_eager_matcher_compiles() {
+        // The Eager constructor calls `activate()` → `create_parser` →
+        // `Matcher::new`, which surfaces a Lark COMPILE error as
+        // `matcher.is_error()` → our `Err`. A successful build here proves the
+        // generated Lark (incl. the `param_value` / `param_block` regexes)
+        // actually compiles under llguidance, not just that the string looks
+        // right. Uses the placeholder single-byte factory.
+        let factory = shared_factory_placeholder();
+        let state =
+            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Eager, None)
+                .expect("eager qwen35 grammar must compile under llguidance");
+        assert!(state.is_active());
+    }
+
+    #[test]
+    fn qwen35_grammar_fallback_param_block_compiles() {
+        // A tool whose parameters aren't a supported object schema falls back
+        // to `(param_block)*`. Verify that path also compiles (the `param_block`
+        // rule + its `/[^>\n]*/` key regex).
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "raw", "parameters": { "type": "string" } }
+        })];
+        let s = qwen35_lark_grammar_string(&tools).unwrap();
+        assert!(s.contains("param_block"), "fallback uses param_block: {s}");
+        let factory = shared_factory_placeholder();
+        let state = Gemma4GrammarState::new_qwen35_xml(factory, &tools, GrammarMode::Eager, None)
+            .expect("fallback qwen35 grammar must compile under llguidance");
+        assert!(state.is_active());
+    }
+
+    #[test]
+    fn qwen35_grammar_rejects_unsafe_tool_name() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": "foo-bar", "parameters": { "type":"object","properties":{} } }
+        })];
+        let r = build_qwen35_tool_grammar_lark(&tools);
+        assert!(r.is_err(), "unsafe tool name must be rejected");
     }
 
     #[test]

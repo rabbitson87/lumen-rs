@@ -375,6 +375,12 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.label": "필수 툴 파라미터 강제",
   "env.entry.LUMEN_QWEN35_FORCE_REQUIRED_PARAMS.help":
     "Qwen3.6 툴콜에서 required 파라미터가 빠진 채 함수를 닫기 전에 <parameter=KEY> opener를 주입 — path 없는 read() 같은 빈 호출 방지. 값은 모델이 직접 작성. 툴 많고 약한/양자화 모델에 유효; 기본 꺼짐.",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.label": "툴콜 문법 강제",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.help":
+    "Qwen3.6 툴콜 출력을 문법으로 제약 — required/named tool_choice가 모든 required 파라미터를 갖춘 올바른 형태의 호출만 생성하게 함('required 파라미터 강제'의 더 강한 구조적 버전). forward 후 logits를 마스킹할 뿐(샘플링만, 토큰 스킵 없음)이라 SSM/conv state는 영향 없음. 기본 켜짐; 0으로 끔.",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.label": "auto에도 툴 문법",
+  "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.help":
+    "tool_choice가 'auto'일 때도 툴콜 문법을 적용(required/named뿐 아니라). 기본 꺼짐 — auto는 모델이 툴 호출 여부 자체를 결정하는데 일찍 제약하면 호출을 과다 유발할 수 있음. 모델이 auto에서 잘못된 툴콜을 남발할 때만 켜세요.",
   "env.entry.LUMEN_QWEN35_TQ_KV.label": "TurboQuant KV 캐시",
   "env.entry.LUMEN_QWEN35_TQ_KV.help":
     "Qwen3.6 full-attention KV 캐시를 TurboQuant(회전 + Lloyd-Max 스칼라 양자화)으로 압축 — 커지는 KV 메모리를 ~2-4× 줄여 더 긴 컨텍스트를 OOM 전에 수용. dequant-on-read 비용이 약간 있지만, 장문에선 절감 메모리가 이를 상쇄할 수 있음. linear-attention 레이어는 영향 없음. 실험적 — 의존 전 품질(cosine/top-1) 측정 권장. 기본 꺼짐.",

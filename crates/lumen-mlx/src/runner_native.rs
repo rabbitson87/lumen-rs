@@ -973,6 +973,26 @@ mod imp {
     /// KV/state and frees its transient graph; skipping the per-chunk eval
     /// would collapse the loop into one giant lazy graph evaluated at once —
     /// i.e. the exact OOM we are avoiding.
+    /// Argmax over a host `f32` logit buffer (already grammar-masked).
+    /// Returns the index of the max, or `None` for an empty buffer. NaN
+    /// entries never win (`>` is false for NaN), and `-inf` masked positions
+    /// are correctly never selected unless every position is `-inf` — in which
+    /// case the first index is returned (a degenerate grammar, surfaced as a
+    /// valid-but-arbitrary token rather than a panic).
+    fn argmax_host_f32(buf: &[f32]) -> Option<u32> {
+        let mut best_idx: usize = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        let mut seen = false;
+        for (i, &v) in buf.iter().enumerate() {
+            if !seen || v > best_val {
+                best_idx = i;
+                best_val = v;
+                seen = true;
+            }
+        }
+        seen.then_some(best_idx as u32)
+    }
+
     fn forward_chunked(
         model: &NativeQwen3_5MoeModel,
         tokens: &[u32],
@@ -1408,6 +1428,48 @@ mod imp {
                     }
                 }
             }
+            state.position += 1;
+            Ok((next_tok, state.position))
+        }
+
+        /// Grammar-aware decode step. Runs the **same forward** as
+        /// [`Self::decode_step`] — so the KV cache and, critically for Qwen
+        /// 3.6's ~75% linear-attn layers, the conv/SSM recurrent state advance
+        /// IDENTICALLY — but instead of an on-GPU argmax it pulls the
+        /// last-position logits to the host, hands them to `mask` (which sets
+        /// disallowed positions to `-inf` via the grammar matcher), then
+        /// argmaxes the masked buffer on the host.
+        ///
+        /// SSM safety: the forward is byte-for-byte the decode forward; masking
+        /// happens entirely AFTER the forward, on a host copy of the logits, so
+        /// it only changes WHICH token is selected, never the state recurrence.
+        /// The selected token is returned for the caller to feed back through a
+        /// normal `decode_step`/`decode_step_masked` next iteration — no token
+        /// is jumped and no forward is skipped.
+        pub(crate) fn decode_step_masked(
+            &mut self,
+            seq_id: u64,
+            last_token: u32,
+            mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
+        ) -> Result<(u32, usize)> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: decode_step_masked on unknown seq_id {seq_id}")
+            })?;
+            let logits = model
+                .forward_with_opts(&[last_token], &mut state.cache, /* last_only */ true)
+                .with_context(|| {
+                    format!("native mlx-rs runner: masked decode forward (seq_id={seq_id})")
+                })?;
+            // Pull last-position logits to host (single eval), mask, argmax.
+            let mut buf = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
+                .context("native mlx-rs runner: masked decode last-logits-to-cpu failed")?;
+            mask(&mut buf).context("native mlx-rs runner: grammar mask callback failed")?;
+            let next_tok = argmax_host_f32(&buf)
+                .ok_or_else(|| anyhow!("native mlx-rs runner: masked decode empty logit buffer"))?;
             state.position += 1;
             Ok((next_tok, state.position))
         }

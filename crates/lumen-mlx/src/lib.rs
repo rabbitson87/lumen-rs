@@ -27,6 +27,7 @@
 //! chosen variant.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -373,6 +374,26 @@ fn load_tokenizer_via_hub(model_id: &str) -> Result<Tokenizer> {
     Tokenizer::from_file(&path).map_err(|e| anyhow!("tokenizer from_file: {e}"))
 }
 
+/// Resolve the on-disk `tokenizer.json` path for `model_id`, mirroring
+/// [`load_tokenizer_via_hub`]'s lookup: a local directory's `tokenizer.json`
+/// first, else the HF-Hub-cached download. Used to build the llguidance parser
+/// factory for the Qwen 3.6 tool grammar (WS-C #2) — llguidance needs the raw
+/// JSON path (not the in-memory `Tokenizer`) to recover the byte-level token
+/// table its masks index into.
+fn resolve_tokenizer_json_path(model_id: &str) -> Result<PathBuf> {
+    let local = std::path::Path::new(model_id);
+    if local.is_dir() {
+        let tj = local.join("tokenizer.json");
+        if tj.is_file() {
+            return Ok(tj);
+        }
+    }
+    let api = ApiBuilder::new().build().context("hf_hub api init")?;
+    let repo = api.model(model_id.to_string());
+    repo.get("tokenizer.json")
+        .context("download tokenizer.json for grammar factory")
+}
+
 /// Crate-level resource directory (where `python/mlx_runner.py` lives). PyO3
 /// adds this to `sys.path`; the subprocess runner uses the file path directly.
 fn crate_python_dir() -> PathBuf {
@@ -496,6 +517,28 @@ impl RunnerImpl {
             Self::Native(r) => r.prefill_with_capture(seq_id, tokens, capture_layer_ids),
             _ => Err(anyhow!(
                 "prefill_with_capture is only supported on the native (mlx-rs) backend; \
+                 set LUMEN_MLX_BACKEND=native"
+            )),
+        }
+    }
+
+    /// Grammar-aware decode step (WS-C #2). Native-only. Runs the normal
+    /// decode forward (KV + linear-attn conv/SSM state advance identically),
+    /// then masks the host logits via `mask` before argmaxing — so the
+    /// grammar only changes WHICH token is sampled, never the recurrent state.
+    /// Errors on non-native backends (grammar is only wired on the native MLX
+    /// path).
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_masked(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
+    ) -> Result<(u32, usize)> {
+        match self {
+            Self::Native(r) => r.decode_step_masked(seq_id, last_token, mask),
+            _ => Err(anyhow!(
+                "decode_step_masked (grammar) is only supported on the native (mlx-rs) backend; \
                  set LUMEN_MLX_BACKEND=native"
             )),
         }
@@ -733,6 +776,30 @@ fn force_required_params_map(
         }
     }
     map
+}
+
+/// Whether the Qwen 3.6 tool-call grammar (WS-C #2) is enabled. **Default ON**
+/// for `tool_choice=required`/named so the quantized-35B empty-parameter defect
+/// is structurally blocked. Set `LUMEN_QWEN35_TOOL_GRAMMAR=0` to disable (A/B
+/// or if a grammar build issue is suspected). Independent of
+/// `LUMEN_QWEN35_FORCE_REQUIRED_PARAMS` (the older heuristic injector) — the
+/// grammar supersedes it but both can run; the grammar's required-key
+/// enforcement is the stronger guarantee.
+fn qwen35_tool_grammar_enabled() -> bool {
+    std::env::var("LUMEN_QWEN35_TOOL_GRAMMAR")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+/// Opt-in: also constrain the `tool_choice=auto` path with an **Eager**
+/// grammar (active from token 0). Default OFF — auto requests should be free to
+/// emit plain text and only fall into tool-call structure when the model
+/// chooses to. Mirrors `LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER`. Required/named are
+/// always Eager regardless of this flag.
+fn qwen35_tool_grammar_eager_auto() -> bool {
+    std::env::var("LUMEN_QWEN35_TOOL_GRAMMAR_EAGER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Render the chat-template system-prompt block alone (no trailing assistant
@@ -1436,6 +1503,13 @@ pub struct MlxQwen35Backend {
     session_ttl: Option<Duration>,
     session_max: Option<usize>,
     prefix_store: prefix_cache::PrefixCacheStore,
+    /// Lazily-built llguidance parser factory for the Qwen 3.6 tool-call
+    /// grammar (WS-C #2), backed by this model's `tokenizer.json`. `None`
+    /// inside the `Option` means construction failed (no tokenizer.json, or
+    /// the vocab table was empty) — such requests degrade gracefully to
+    /// unconstrained sampling rather than erroring. Built once on first
+    /// grammar-eligible request; the `Arc` is cloned per request.
+    grammar_factory: OnceLock<Option<std::sync::Arc<llguidance::ParserFactory>>>,
     /// OPT-IN draft-model speculative decode (default OFF). `Some` only when
     /// `LUMEN_MLX_DRAFT_MODEL` is set AND the draft loaded with a vocab size
     /// matching the target. `None` → the entire draft path is dormant and the
@@ -1542,6 +1616,7 @@ impl MlxQwen35Backend {
             session_ttl,
             session_max,
             prefix_store,
+            grammar_factory: OnceLock::new(),
             #[cfg(feature = "mlx-native")]
             draft: None,
         };
@@ -2173,12 +2248,61 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<(Vec<u32>, String)> {
-        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
-        let mut prompt = format_qwen3_chat_with_tools(messages, thinking, tools);
-        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
-        prompt.push_str(&prefill);
-        let ids = self.encode(&prompt)?;
+        let (ids, prefill, _prefill_tokens) =
+            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
         Ok((ids, prefill))
+    }
+
+    /// Like [`build_chat_input_with_tools`] but also returns the exact trailing
+    /// token ids that correspond to the appended `tool_choice` prefill suffix
+    /// (computed as `full.len() - prompt_only.len()`). The Eager grammar path
+    /// replays these through [`crate::grammar::Gemma4GrammarState::
+    /// observe_prefill`] so the matcher's parse position lines up with what the
+    /// model already has in context. Empty for Auto/None (no prefill).
+    fn build_chat_input_with_tools_split(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        Ok((ids, prefill, prefill_tokens))
+    }
+
+    /// Encode `prompt_only + prefill` and isolate the prefill's trailing token
+    /// ids by tokenizing `prompt_only` alone and taking the suffix of the
+    /// combined ids. If the combined encoding doesn't extend the prompt-only
+    /// encoding as a clean prefix (BPE re-merged across the join), the prefill
+    /// token split is reported empty — the caller then skips `observe_prefill`
+    /// and, for the Eager path, drops the grammar (a desynced matcher is worse
+    /// than free sampling). The full `ids` are always exact.
+    fn encode_with_prefill_split(
+        &self,
+        prompt_only: &str,
+        prefill: &str,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let mut full = String::with_capacity(prompt_only.len() + prefill.len());
+        full.push_str(prompt_only);
+        full.push_str(prefill);
+        let ids = self.encode(&full)?;
+        if prefill.is_empty() {
+            return Ok((ids, Vec::new()));
+        }
+        let prompt_ids = self.encode(prompt_only)?;
+        // The split is valid only if the full encoding starts with the
+        // prompt-only encoding (no cross-join BPE merge). Otherwise report no
+        // clean prefill split.
+        let prefill_tokens =
+            if prompt_ids.len() <= ids.len() && ids[..prompt_ids.len()] == prompt_ids[..] {
+                ids[prompt_ids.len()..].to_vec()
+            } else {
+                Vec::new()
+            };
+        Ok((ids, prefill_tokens))
     }
 
     /// Structured-history variant — used when the request carries
@@ -2190,14 +2314,31 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<(Vec<u32>, String)> {
+        let (ids, prefill, _prefill_tokens) = self.build_chat_input_with_tools_from_history_split(
+            turns,
+            thinking,
+            tools,
+            tool_choice,
+        )?;
+        Ok((ids, prefill))
+    }
+
+    /// `_split` variant of [`build_chat_input_with_tools_from_history`] —
+    /// see [`build_chat_input_with_tools_split`] for the prefill-token contract.
+    fn build_chat_input_with_tools_from_history_split(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
         };
-        let mut prompt = format_qwen3_chat_with_tools_from_history(turns, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
-        prompt.push_str(&prefill);
-        let ids = self.encode(&prompt)?;
-        Ok((ids, prefill))
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        Ok((ids, prefill, prefill_tokens))
     }
 
     pub fn alloc_seq_id(&self) -> u64 {
@@ -2210,6 +2351,118 @@ impl MlxQwen35Backend {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Lazily build (and cache) the llguidance parser factory for this model's
+    /// tokenizer. Returns `None` if the factory can't be built (no
+    /// `tokenizer.json`, empty vocab table) — callers then skip grammar and
+    /// sample unconstrained. The expensive construction (~10–50 ms) happens
+    /// once; the `Arc` is cloned per request. WS-C #2.
+    fn grammar_factory(&self) -> Option<std::sync::Arc<llguidance::ParserFactory>> {
+        self.grammar_factory
+            .get_or_init(|| match resolve_tokenizer_json_path(&self.model_id) {
+                Ok(path) => match crate::grammar::shared_factory_from_tokenizer(&path) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!(
+                            "[qwen35-backend] grammar factory unavailable \
+                             (tools sample without grammar mask): {e:#}"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "[qwen35-backend] grammar factory: tokenizer.json unresolved \
+                         (tools sample without grammar mask): {e:#}"
+                    );
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// Build a per-request Qwen 3.6 tool-call grammar state (WS-C #2) from the
+    /// request's tool defs + `tool_choice`. Returns `None` (sample
+    /// unconstrained) when: the grammar is disabled, there are no tools,
+    /// `tool_choice=None`, the factory is unavailable, a named choice refers to
+    /// an unknown tool, or the grammar fails to compile. Required/named build
+    /// an **Eager** grammar (active from token 0) so a prefill-forced opener
+    /// can't produce an empty-param body; `auto` builds a **Lazy** grammar
+    /// (off until the model starts a tool call) unless
+    /// `LUMEN_QWEN35_TOOL_GRAMMAR_EAGER=1`.
+    fn build_qwen35_tool_grammar(
+        &self,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Option<crate::grammar::Gemma4GrammarState> {
+        use crate::chat_io::ResolvedToolChoice;
+        use crate::grammar::{Gemma4GrammarState, GrammarMode};
+
+        // Grammar masking is only wired on the native MLX runner
+        // (`decode_step_masked`); other backends can't apply the mask, so don't
+        // build a grammar that would be inert.
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            let _ = (tools, tool_choice);
+            return None;
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            if !qwen35_tool_grammar_enabled() || tools.is_empty() {
+                return None;
+            }
+            // tool_choice=None means "must not call a tool" — no grammar.
+            let mode = match tool_choice {
+                ResolvedToolChoice::None => return None,
+                ResolvedToolChoice::Required | ResolvedToolChoice::Tool(_) => GrammarMode::Eager,
+                ResolvedToolChoice::Auto => {
+                    if qwen35_tool_grammar_eager_auto() {
+                        GrammarMode::Eager
+                    } else {
+                        GrammarMode::Lazy
+                    }
+                }
+            };
+            // For a named choice, the grammar must include the named tool; if the
+            // engine didn't already downgrade an unknown name to Auto, skip rather
+            // than build a grammar that can never match.
+            if let ResolvedToolChoice::Tool(name) = tool_choice {
+                if !tools.iter().any(|t| t.name == *name) {
+                    eprintln!(
+                        "[qwen35-backend] tool grammar skipped: tool_choice names unknown tool {name:?}"
+                    );
+                    return None;
+                }
+            }
+            let factory = self.grammar_factory()?;
+            // Convert the borrowed ToolDefs into the OpenAI-style `tools` JSON the
+            // grammar builder consumes (`{"type":"function","function":{...}}`).
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    let mut func = serde_json::Map::new();
+                    func.insert("name".into(), serde_json::Value::String(t.name.to_string()));
+                    if let Some(p) = t.parameters {
+                        func.insert("parameters".into(), p.clone());
+                    }
+                    serde_json::json!({ "type": "function", "function": func })
+                })
+                .collect();
+            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None) {
+                Ok(state) => {
+                    eprintln!(
+                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?})",
+                        tools.len()
+                    );
+                    Some(state)
+                }
+                Err(e) => {
+                    eprintln!("[qwen35-backend] tool grammar build failed (sampling free): {e:#}");
+                    None
+                }
+            }
+        }
     }
 
     /// Streaming chat. Calls `on_token` with each new decoded text fragment.
@@ -2447,12 +2700,15 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill) =
-            self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
+        let (prompt_ids, prefill, prefill_tokens) =
+            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
+            prefill_tokens,
+            grammar,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -2482,12 +2738,15 @@ impl MlxQwen35Backend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill) =
-            self.build_chat_input_with_tools(messages, thinking, tools, tool_choice)?;
+        let (prompt_ids, prefill, prefill_tokens) =
+            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
+            prefill_tokens,
+            grammar,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -2510,12 +2769,15 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill) =
-            self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
+        let (prompt_ids, prefill, prefill_tokens) = self
+            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
+            prefill_tokens,
+            grammar,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -2542,12 +2804,15 @@ impl MlxQwen35Backend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill) =
-            self.build_chat_input_with_tools_from_history(turns, thinking, tools, tool_choice)?;
+        let (prompt_ids, prefill, prefill_tokens) = self
+            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
+            prefill_tokens,
+            grammar,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -2570,6 +2835,18 @@ impl MlxQwen35Backend {
         &mut self,
         prompt_ids: Vec<u32>,
         prefill_str: String,
+        // Exact trailing token ids of `prefill_str` as they appear in
+        // `prompt_ids` (from the `_split` builders). Replayed into an Eager
+        // grammar via `observe_prefill` so the matcher's parse position lines
+        // up with the model's prefilled `<tool_call>\n<function=…` context.
+        // Empty when there's no prefill or the BPE split wasn't clean.
+        prefill_tokens: Vec<u32>,
+        // Per-request Qwen 3.6 tool-call grammar (WS-C #2). `Some` only for
+        // `tool_choice=required`/named (Eager) or auto with the eager opt-in;
+        // `None` → unconstrained decode (byte-identical to the pre-grammar
+        // path). When active, each decode step routes through
+        // `decode_step_masked` so disallowed tokens are masked before argmax.
+        grammar: Option<crate::grammar::Gemma4GrammarState>,
         max_new_tokens: usize,
         seq_id: u64,
         // Auto-derived key (from system message hash) or explicit session_id
@@ -2589,8 +2866,6 @@ impl MlxQwen35Backend {
     {
         use crate::chat_io::BackendStreamEvent;
         use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
-
-        let force_active = !force_required.is_empty();
 
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
@@ -2620,6 +2895,57 @@ impl MlxQwen35Backend {
             prompt_ids.len(),
             prompt_ids.len() as f64 / (prefill_ms / 1000.0)
         );
+
+        // ── WS-C #2: grammar prefill replay ──
+        // For an active (Eager) grammar, the chat template prefilled the
+        // `<tool_call>\n<function=…` opener via `prompt_ids` — those tokens
+        // went into the model's context but were never *sampled*, so the
+        // matcher hasn't seen them. Replay the exact prefill tokens through
+        // `observe_prefill` so the matcher's parse position matches the model.
+        // The first prefill-produced token `last` was argmaxed WITHOUT a mask
+        // (it continues the forced opener), so `observe` it too to stay
+        // aligned. Any desync (empty split despite a prefill, or a token the
+        // grammar rejects) drops the grammar → free sampling, never a corrupt
+        // masked decode.
+        let mut grammar = grammar;
+        if let Some(g) = grammar.as_mut() {
+            if g.is_active() {
+                let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
+                if !desync {
+                    for tok in &prefill_tokens {
+                        if let Err(e) = g.observe_prefill(*tok) {
+                            eprintln!(
+                                "[qwen35-backend] grammar prefill replay desynced \
+                                 (dropping grammar, sampling free): {e:#}"
+                            );
+                            desync = true;
+                            break;
+                        }
+                    }
+                }
+                if !desync {
+                    if let Err(e) = g.observe(last) {
+                        eprintln!(
+                            "[qwen35-backend] grammar first-token observe desynced \
+                             (dropping grammar, sampling free): {e:#}"
+                        );
+                        desync = true;
+                    }
+                }
+                if desync {
+                    grammar = None;
+                }
+            }
+        }
+
+        // The grammar (WS-C #2) enforces required params structurally and
+        // dup-free, superseding the heuristic `force_required` injector (whose
+        // `extend`-based forcing bypasses the matcher). When the grammar is
+        // active, disable force-injection so the two don't fight. Computed
+        // AFTER the prefill replay so a desync-dropped grammar correctly
+        // re-enables the injector fallback.
+        let grammar_will_constrain = grammar.as_ref().is_some_and(|g| g.is_active());
+        let force_active = !force_required.is_empty() && !grammar_will_constrain;
 
         // Detokenize + parser-feed for the first decoded token.
         let mut generated: Vec<u32> = vec![last];
@@ -2689,7 +3015,50 @@ impl MlxQwen35Backend {
                     }
                 }
             }
-            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            // Grammar-masked decode when active: same forward (KV + SSM state
+            // advance identically), but the host logits are grammar-masked
+            // before argmax, then the sampled token is fed back to the matcher.
+            // SSM safety: masking happens AFTER the forward on a host copy, so
+            // it only changes WHICH token is chosen, never the recurrence; the
+            // chosen token is then fed through the next normal forward.
+            let grammar_active = grammar.as_ref().is_some_and(|g| g.is_active());
+            let (next, new_pos) = if grammar_active {
+                #[cfg(feature = "mlx-native")]
+                {
+                    // Scope the `&mut grammar` borrow to the masked forward so
+                    // it ends before the post-step `g.observe` / `grammar =
+                    // None` reassignment.
+                    let stepped = {
+                        let g = grammar.as_mut().expect("grammar_active implies Some");
+                        let mut mask = |buf: &mut [f32]| -> Result<()> {
+                            g.apply_mask_to_logits(buf).map(|_| ())
+                        };
+                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                    };
+                    let (next, new_pos) = stepped?;
+                    // Advance the matcher with the sampled token. A desync here
+                    // (shouldn't happen — the token was masked-in) drops the
+                    // grammar so the rest of the call samples freely.
+                    let observe_err = grammar.as_mut().and_then(|g| g.observe(next).err());
+                    if let Some(e) = observe_err {
+                        eprintln!(
+                            "[qwen35-backend] grammar observe(sampled) desynced \
+                             (dropping grammar): {e:#}"
+                        );
+                        grammar = None;
+                    }
+                    (next, new_pos)
+                }
+                #[cfg(not(feature = "mlx-native"))]
+                {
+                    // Grammar masking requires the native runner; without it,
+                    // fall back to an unconstrained step (grammar is never
+                    // built on non-native backends, so this is unreachable).
+                    self.decode_step(seq_id, last, pos)?
+                }
+            } else {
+                self.decode_step(seq_id, last, pos)?
+            };
             last = next;
             pos = new_pos;
             generated.push(next);

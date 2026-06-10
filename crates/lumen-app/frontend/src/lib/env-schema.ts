@@ -214,6 +214,22 @@ export const ENV_SCHEMA: EnvEntry[] = [
     section: "advanced",
   },
   {
+    key: "LUMEN_QWEN35_TOOL_GRAMMAR",
+    labelKey: "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.label",
+    helpKey: "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR.help",
+    kind: "bool",
+    defaultValue: "1",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_QWEN35_TOOL_GRAMMAR_EAGER",
+    labelKey: "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.label",
+    helpKey: "env.entry.LUMEN_QWEN35_TOOL_GRAMMAR_EAGER.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
     key: "LUMEN_QWEN35_TQ_KV",
     labelKey: "env.entry.LUMEN_QWEN35_TQ_KV.label",
     helpKey: "env.entry.LUMEN_QWEN35_TQ_KV.help",
