@@ -1,6 +1,7 @@
 mod catalog;
 mod embedding;
 mod engine;
+mod load_stats;
 mod routes;
 mod types;
 
@@ -199,9 +200,13 @@ async fn main() -> Result<(), SendableError> {
         .warmup()
         .map_err(|e| SendableError::from(format!("warmup failed: {e}")))?;
 
-    // Channel-based engine: no Mutex, requests queue through channel
+    // Channel-based engine: no Mutex, requests queue through channel.
+    // Hand the shared lifetime-stats accumulator to the handle BEFORE moving
+    // the engine into its task, so `GET /v1/loads` reads the same atomics the
+    // engine bumps at each chat completion.
+    let load_stats = engine.load_stats();
     let (tx, rx) = tokio::sync::mpsc::channel(32);
-    let handle = EngineHandle::new(tx);
+    let handle = EngineHandle::new(tx, load_stats);
     tokio::spawn(async move { engine.run(rx).await });
 
     // Optional embedding model. Only spawn the subprocess when
@@ -249,6 +254,7 @@ async fn main() -> Result<(), SendableError> {
         }
     );
     eprintln!("  GET    /v1/models");
+    eprintln!("  GET    /v1/loads             (live serving stats, JSON)");
     eprintln!("  DELETE /v1/sessions/{{id}}     (drop MLX prompt cache)");
     eprintln!("  DELETE /v1/prefix-cache/{{key}} (drop one A1 master snapshot)");
     eprintln!("  DELETE /v1/prefix-cache        (clear all A1 master snapshots)");
@@ -286,6 +292,7 @@ async fn handle_connection(
             routes::embeddings::handle(request, response, embedding).await
         }
         ("GET", "/health") => routes::health::handle(response).await,
+        ("GET", "/v1/loads") => routes::loads::handle(request, response, handle).await,
         ("GET", "/v1/models") => routes::models::handle(request, response, handle).await,
         ("DELETE", p) if p.starts_with("/v1/sessions/") => {
             routes::sessions::handle(request, response, handle).await

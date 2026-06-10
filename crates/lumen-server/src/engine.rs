@@ -1,4 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use lumen_mlx::SamplingOverrides;
@@ -16,6 +17,7 @@ use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
 /// Gemma 4 26B-A4B native MLX backend wrapper. See
 /// `crates/lumen-mlx/src/gemma4_backend.rs` for the trait-shape API
 /// this dispatches into.
+use crate::load_stats::ServerLoadStats;
 use crate::types::*;
 
 /// Adaptive routing mode (selected at startup; cannot switch at runtime
@@ -528,6 +530,10 @@ fn flatten_turns_for_plain_backend(turns: &[ChatTurn<'_>]) -> Vec<(String, Strin
 pub struct InferenceEngine {
     backend: ModelBackend,
     model_id: String,
+    /// Shared process-lifetime serving counters for `GET /v1/loads`. Cloned
+    /// into `EngineHandle` at startup so the route reads the same atomics the
+    /// engine bumps at each chat completion.
+    load_stats: Arc<ServerLoadStats>,
 }
 
 /// Detect model architecture from model_id string.
@@ -627,6 +633,7 @@ impl InferenceEngine {
             return Ok(Self {
                 backend: ModelBackend::Mlx(backend),
                 model_id: model_id.to_string(),
+                load_stats: ServerLoadStats::new_arc(model_id),
             });
         }
         eprintln!("Loading Candle backend (mode={mode:?}): {model_id}");
@@ -705,6 +712,7 @@ impl InferenceEngine {
             return Ok(Self {
                 backend: ModelBackend::GemmaGguf(model),
                 model_id: model_id.to_string(),
+                load_stats: ServerLoadStats::new_arc(model_id),
             });
         }
 
@@ -721,7 +729,6 @@ impl InferenceEngine {
             use lumen_metal::mxfp4_gpu::MxFp4Context;
             use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
             use std::path::PathBuf;
-            use std::sync::Arc;
 
             let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
                 .map(PathBuf::from)
@@ -744,6 +751,7 @@ impl InferenceEngine {
             return Ok(Self {
                 backend: ModelBackend::Qwen35Moe(backend),
                 model_id: model_id.to_string(),
+                load_stats: ServerLoadStats::new_arc(model_id),
             });
         }
 
@@ -779,7 +787,15 @@ impl InferenceEngine {
         Ok(Self {
             backend,
             model_id: model_id.to_string(),
+            load_stats: ServerLoadStats::new_arc(model_id),
         })
+    }
+
+    /// Clone the shared lifetime-stats accumulator. Used at startup to hand
+    /// the same `Arc` to `EngineHandle` so `GET /v1/loads` reads the counters
+    /// the engine bumps.
+    pub fn load_stats(&self) -> Arc<ServerLoadStats> {
+        Arc::clone(&self.load_stats)
     }
 
     /// Run warmup forward passes to compile all Metal shaders and stabilize GPU power state.
@@ -931,6 +947,11 @@ impl InferenceEngine {
         let thinking_on =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
         let ov = req.sampling_overrides();
+        // Wall-clock around the full generation for the `/v1/loads` last
+        // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
+        // rate, but it is not threaded back here; this end-to-end rate is the
+        // honest, cheap-to-measure figure for observability.
+        let gen_started = Instant::now();
         let mut parsed = if needs_structured {
             let mut turns: Vec<ChatTurn<'_>> = req
                 .messages
@@ -1054,6 +1075,16 @@ impl InferenceEngine {
             None
         };
         let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+
+        // Observability: bump lifetime counters for `GET /v1/loads`.
+        let elapsed_s = gen_started.elapsed().as_secs_f64();
+        let tok_per_sec = if elapsed_s > 0.0 {
+            completion_tokens as f64 / elapsed_s
+        } else {
+            0.0
+        };
+        self.load_stats
+            .record(prompt_tokens as u64, completion_tokens as u64, tok_per_sec);
 
         Ok(ChatCompletionResponse {
             id: format!("chatcmpl-{}", gen_id()),
@@ -1551,6 +1582,9 @@ impl InferenceEngine {
         let stop_matcher =
             std::cell::RefCell::new(lumen_core::stop::StopMatcher::new(ov.stop.clone()));
         let stopped_by_seq = std::cell::Cell::new(false);
+        // Wall-clock around the streaming generation for the `/v1/loads`
+        // last tok/s gauge (recorded at the `Done` terminal below).
+        let gen_started = Instant::now();
         let result = if needs_structured {
             let arg_values: Vec<serde_json::Value> = req
                 .messages
@@ -1773,6 +1807,15 @@ impl InferenceEngine {
                 } else {
                     FinishReason::Stop
                 };
+                // Observability: bump lifetime counters for `GET /v1/loads`.
+                let elapsed_s = gen_started.elapsed().as_secs_f64();
+                let tok_per_sec = if elapsed_s > 0.0 {
+                    completion_tokens as f64 / elapsed_s
+                } else {
+                    0.0
+                };
+                self.load_stats
+                    .record(prompt_tokens as u64, completion_tokens as u64, tok_per_sec);
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -1788,6 +1831,9 @@ impl InferenceEngine {
                 // a `Done` with `FinishReason::Stop`. `completion_tokens` is a
                 // best-effort 0 since the parsed visible text is unavailable on
                 // this early-break path.
+                // Observability: still count the request (gen tokens unknown →
+                // 0, tok/s left unchanged via the 0.0 guard in `record`).
+                self.load_stats.record(prompt_tokens as u64, 0, 0.0);
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens: 0,
@@ -2523,11 +2569,20 @@ pub enum EngineRequest {
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineRequest>,
+    /// Shared lifetime serving counters for `GET /v1/loads`. The same `Arc`
+    /// the engine bumps at each chat completion (handed over at startup).
+    load_stats: Arc<ServerLoadStats>,
 }
 
 impl EngineHandle {
-    pub fn new(tx: mpsc::Sender<EngineRequest>) -> Self {
-        Self { tx }
+    pub fn new(tx: mpsc::Sender<EngineRequest>, load_stats: Arc<ServerLoadStats>) -> Self {
+        Self { tx, load_stats }
+    }
+
+    /// Read-side handle to the shared serving counters for the
+    /// `/v1/loads` route.
+    pub fn load_stats(&self) -> &Arc<ServerLoadStats> {
+        &self.load_stats
     }
 
     pub async fn chat_completion(
