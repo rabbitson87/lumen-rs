@@ -329,6 +329,17 @@ export const ENV_SCHEMA: EnvEntry[] = [
     section: "advanced",
   },
   {
+    key: "LUMEN_MAX_PROMPT_TOKENS",
+    labelKey: "env.entry.LUMEN_MAX_PROMPT_TOKENS.label",
+    helpKey: "env.entry.LUMEN_MAX_PROMPT_TOKENS.help",
+    kind: "number",
+    min: 2048,
+    max: 1048576,
+    step: 2048,
+    defaultValue: "32768",
+    section: "advanced",
+  },
+  {
     key: "LUMEN_QWEN35_PREFILL_CHUNK_LOG",
     labelKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label",
     helpKey: "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help",
