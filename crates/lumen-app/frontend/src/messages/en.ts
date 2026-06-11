@@ -371,7 +371,7 @@ export const en: Record<string, string> = {
     "Experimental: tokens per prefill chunk for the batched engine (BATCHED_ENGINE=1, Gemma GGUF only). Chunking a long prompt's prefill stops one sequence from monopolizing a single giant forward and stalling other batched sequences. Only prompts longer than this are chunked; shorter prompts are unaffected. Default 512.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "Max prompt tokens (reject cap)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "Hard ceiling on prompt length: requests longer than this are rejected before prefill. Decoupled from the prefill chunk size, so you can keep small chunks (low peak memory) while still accepting very long prompts. Falls back to LUMEN_PREFILL_CHUNK, then 32768. Raise to admit longer contexts; chunked prefill handles the memory.",
+    "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",

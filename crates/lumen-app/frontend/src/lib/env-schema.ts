@@ -352,7 +352,7 @@ export const ENV_SCHEMA: EnvEntry[] = [
     min: 2048,
     max: 1048576,
     step: 2048,
-    defaultValue: "32768",
+    defaultValue: "16384",
     section: "advanced",
   },
   {

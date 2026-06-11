@@ -959,6 +959,23 @@ impl InferenceEngine {
         let thinking_on =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
         let ov = req.sampling_overrides();
+        // Prompt-size reject cap — guard the MLX prefill from OOM-crashing on
+        // oversized prompts. The streaming path already had this guard; the
+        // non-streaming path did NOT, so a large prompt reached prefill and
+        // aborted the whole process via an uncaught Metal OOM. Reject early
+        // with a clean error instead. (count_chat_prompt_tokens is a cheap
+        // tokenize, no forward; the same count is reused for usage below.)
+        let prompt_tokens_guard = self
+            .backend
+            .count_chat_prompt_tokens(&messages, thinking_on);
+        let prompt_cap = resolve_prompt_cap();
+        if prompt_tokens_guard > prompt_cap {
+            return Err(anyhow::anyhow!(
+                "prompt too large: {prompt_tokens_guard} tokens > server cap {prompt_cap}. \
+                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
+                 or trim the conversation history."
+            ));
+        }
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
         // rate, but it is not threaded back here; this end-to-end rate is the
@@ -1562,11 +1579,7 @@ impl InferenceEngine {
         // old turns to fit (true context-shift) needs token access inside the
         // backend (the engine only has a token *count* here) — tracked
         // separately; for now an over-cap prompt is rejected with guidance.
-        let prefill_token_cap: u32 = std::env::var("LUMEN_MAX_PROMPT_TOKENS")
-            .or_else(|_| std::env::var("LUMEN_PREFILL_CHUNK"))
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32_768);
+        let prefill_token_cap: u32 = resolve_prompt_cap();
         if prompt_tokens > prefill_token_cap {
             let msg = format!(
                 "prompt too large: {prompt_tokens} tokens > server cap {prefill_token_cap}. \
@@ -2278,6 +2291,23 @@ fn count_tokens(backend: &ModelBackend, text: &str) -> u32 {
 /// (the JSON-schema grammar shapes the value but doesn't force EOS at its
 /// close). The returned index lands on a `}`/`]` (ASCII) so it is always a
 /// valid UTF-8 char boundary for `String::truncate`.
+/// Resolve the prompt-token REJECT cap shared by the streaming and
+/// non-streaming chat paths. Guards the MLX prefill from OOM-crashing on
+/// oversized prompts: a prompt of ~20k (Gemma-4-26B) to ~32k (Qwen3.6-35B)
+/// tokens triggers an uncaught Metal OOM that aborts the whole server
+/// process — so an over-cap prompt must be rejected with a clean error
+/// BEFORE prefill, not allowed through. Default 16384 — empirically safe on
+/// a 36 GB Mac for both families; raise via `LUMEN_MAX_PROMPT_TOKENS` when
+/// more RAM is available (longer prefill needs proportionally more memory).
+/// Precedence: `LUMEN_MAX_PROMPT_TOKENS` → legacy `LUMEN_PREFILL_CHUNK` → 16K.
+fn resolve_prompt_cap() -> u32 {
+    std::env::var("LUMEN_MAX_PROMPT_TOKENS")
+        .or_else(|_| std::env::var("LUMEN_PREFILL_CHUNK"))
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16_384)
+}
+
 /// Streaming analogue of [`first_json_value_end`]: a stateful tracker fed the
 /// decoded text chunks of a `response_format` stream. It emits text up to and
 /// including the first complete balanced JSON value, then signals `stopped` so

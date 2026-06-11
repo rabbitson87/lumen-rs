@@ -362,7 +362,7 @@ export const ko: Record<string, string> = {
     "실험적: 배치 엔진(BATCHED_ENGINE=1, Gemma GGUF 전용)의 prefill 청크당 토큰 수. 장문 프롬프트의 prefill을 청크로 나누면 한 시퀀스가 거대한 단일 forward를 독점해 다른 배치 시퀀스를 head-of-line 정체시키는 것을 막습니다. 이 값보다 긴 프롬프트만 청킹되며, 짧은 프롬프트는 영향받지 않습니다. 기본 512.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "최대 프롬프트 토큰 (거부 상한)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 거부됩니다. prefill 청크 크기와 분리되어 있어, 작은 청크(낮은 peak 메모리)를 유지하면서도 매우 긴 프롬프트를 받을 수 있습니다. 미설정 시 LUMEN_PREFILL_CHUNK, 그다음 32768로 폴백. 긴 컨텍스트를 허용하려면 높이세요(메모리는 청크 prefill이 처리).",
+    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
