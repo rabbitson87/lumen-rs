@@ -1233,6 +1233,25 @@ impl InferenceEngine {
         }
         lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
 
+        // Prompt-size reject cap (Anthropic /v1/messages) — same OOM guard as
+        // the OpenAI path: reject oversized prompts before prefill rather than
+        // letting them reach the backend and crash the server via an uncaught
+        // Metal OOM. Uses the flat `messages` count (the same approximation
+        // already used for usage below).
+        let anthropic_thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let prompt_tokens_guard = self
+            .backend
+            .count_chat_prompt_tokens(&messages, anthropic_thinking);
+        let prompt_cap = resolve_prompt_cap();
+        if prompt_tokens_guard > prompt_cap {
+            return Err(anyhow::anyhow!(
+                "prompt too large: {prompt_tokens_guard} tokens > server cap {prompt_cap}. \
+                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
+                 or trim the conversation history."
+            ));
+        }
+
         let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
             // Anthropic ships `tool_use.input` as a real JSON Value, so we
@@ -1953,6 +1972,19 @@ impl InferenceEngine {
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
         );
+        // Prompt-size reject cap (Anthropic streaming) — guard the prefill from
+        // an uncaught Metal OOM that would crash the server process.
+        let prompt_cap = resolve_prompt_cap();
+        if prompt_tokens > prompt_cap {
+            let msg = format!(
+                "prompt too large: {prompt_tokens} tokens > server cap {prompt_cap}. \
+                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
+                 or trim the conversation history."
+            );
+            eprintln!("[anthropic-stream] REJECTED ({msg})");
+            let _ = token_tx.try_send(StreamEvent::Error(msg));
+            return;
+        }
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
