@@ -791,6 +791,19 @@ fn qwen35_tool_grammar_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the Qwen 3.6 `response_format` (JSON-schema) grammar is enabled.
+/// **Default ON** when a request carries a JSON schema — `response_format` is an
+/// explicit per-request client signal, so the constraint is opt-in by the
+/// caller. Set `LUMEN_QWEN35_RESPONSE_FORMAT=0` to disable as a safety
+/// kill-switch (A/B or if a grammar build issue is suspected); the request then
+/// decodes free text (the server still trims to the first JSON value). Mirrors
+/// the `LUMEN_QWEN35_TOOL_GRAMMAR` style.
+fn qwen35_response_format_enabled() -> bool {
+    std::env::var("LUMEN_QWEN35_RESPONSE_FORMAT")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
 /// Opt-in: also constrain the `tool_choice=auto` path with an **Eager**
 /// grammar (active from token 0). Default OFF — auto requests should be free to
 /// emit plain text and only fall into tool-call structure when the model
@@ -1011,10 +1024,22 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                // Qwen 3.6 has no grammar wiring yet (WS-C #2) — a
-                // response_format on this family is silently ignored.
-                let _ = response_schema;
                 let _ = (top_p, temperature, ov);
+                // response_format (WS-F #1) takes precedence over tools — when a
+                // JSON schema is present, the whole assistant message is
+                // constrained to that schema (matching Gemma4's
+                // `select_grammar_state` policy: response_format > tool grammar).
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice, session_id);
+                    let seq_id = m.alloc_seq_id();
+                    return m.chat_response_format(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
                 // Phase 2: when tools are provided, route through the
                 // Qwen 3.6 nested-XML tool template + parser. No-tools
                 // path keeps the existing fast lane (MTP / spec /
@@ -1127,8 +1152,21 @@ impl MlxBackend {
         use crate::chat_io::{ChatTurn, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                // Qwen 3.6 has no grammar wiring yet (WS-C #2).
-                let _ = response_schema;
+                let _ = (top_p, temperature, ov, session_id);
+                // response_format (WS-F #1) precedence over tools — see flat
+                // `chat` path. The structured-history renderer is reused (no
+                // tools) so assistant.tool_calls / role:tool turns still render.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let seq_id = m.alloc_seq_id();
+                    return m.chat_response_format_from_history(
+                        turns,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
                 // Phase 2: structured-history paths ALWAYS go through
                 // the tool-aware renderer — the legacy IM-only template
                 // cannot represent `<tool_call>` blocks or
@@ -1137,7 +1175,6 @@ impl MlxBackend {
                 // that case the renderer omits the system `<tools>`
                 // block but still emits the assistant tool_calls and
                 // tool_response blocks correctly.
-                let _ = (top_p, temperature, ov, session_id);
                 let seq_id = m.alloc_seq_id();
                 m.chat_with_tools_from_history(
                     turns,
@@ -1233,10 +1270,25 @@ impl MlxBackend {
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                // response_format / JSON-schema constrained decoding is a
-                // Gemma 4 backend capability; the Qwen 3.5 family path
-                // ignores it for now (no grammar wiring).
-                let _ = (top_p, temperature, ov, response_schema);
+                let _ = (top_p, temperature, ov);
+                // response_format (WS-F #1) precedence over tools — the whole
+                // assistant message is JSON-schema constrained and streamed as
+                // `BackendStreamEvent::Text` deltas (no tool demux).
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice, session_id);
+                    let seq_id = m.alloc_seq_id();
+                    let mut text_adapter = |chunk: &str| {
+                        let _ = on_event(BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut text_adapter,
+                    );
+                }
                 // Phase 2: with tools provided, route through tool-aware
                 // streaming path so `<tool_call>` blocks demux into
                 // `BackendStreamEvent::ToolCallStart` + `parsed.tool_calls`.
@@ -1352,11 +1404,29 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
+                let _ = (top_p, temperature, ov, session_id);
+                // response_format (WS-F #1) precedence over tools — streamed as
+                // `BackendStreamEvent::Text` deltas; structured-history renderer
+                // reused with no tools.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let seq_id = m.alloc_seq_id();
+                    let mut on_event = on_event;
+                    let mut text_adapter = |chunk: &str| {
+                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format_from_history(
+                        turns,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut text_adapter,
+                    );
+                }
                 // Phase 2: structured-history streaming ALWAYS routes
                 // through the tool-aware path — same rationale as the
                 // non-streaming `chat_from_history` branch above.
-                // response_schema is Gemma 4-only (no grammar on Qwen path).
-                let _ = (top_p, temperature, ov, session_id, response_schema);
                 let seq_id = m.alloc_seq_id();
                 m.chat_streaming_with_tools_from_history(
                     turns,
@@ -2463,6 +2533,328 @@ impl MlxQwen35Backend {
                 }
             }
         }
+    }
+
+    /// Build a per-request `response_format` (JSON-schema) grammar for Qwen 3.6
+    /// (WS-F #1). Returns `None` (decode free text — the server still trims to
+    /// the first JSON value) when the response-format grammar is disabled, the
+    /// factory is unavailable, or the schema fails to compile into an
+    /// llguidance grammar.
+    ///
+    /// The grammar is model-agnostic ([`Gemma4GrammarState::new_json_schema`] —
+    /// the factory is built from *this* model's `tokenizer.json`) and **Eager**:
+    /// unlike a tool call there is no opener token to lazily trigger on, so the
+    /// JSON constraint must be live from the very first decode step (the whole
+    /// assistant message must be the JSON value).
+    fn build_qwen35_response_format_grammar(
+        &self,
+        schema: &serde_json::Value,
+    ) -> Option<crate::grammar::Gemma4GrammarState> {
+        use crate::grammar::{Gemma4GrammarState, GrammarMode};
+
+        // Grammar masking is only wired on the native MLX runner
+        // (`decode_step_masked`); other backends can't apply the mask.
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            let _ = schema;
+            return None;
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            if !qwen35_response_format_enabled() {
+                return None;
+            }
+            let factory = self.grammar_factory()?;
+            match Gemma4GrammarState::new_json_schema(factory, schema, GrammarMode::Eager) {
+                Ok(state) => {
+                    eprintln!("[qwen35-backend] response_format grammar active (json_schema)");
+                    Some(state)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[qwen35-backend] response_format grammar build failed \
+                         (sampling free): {e:#}"
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    /// Shared decode loop for the `response_format` (JSON-schema) entry points.
+    /// Drives an Eager JSON-schema grammar over the **visible output channel**:
+    /// the entire assistant message is constrained to be a single schema-shaped
+    /// JSON value. Used by the flat-message and structured-history chat paths
+    /// (streaming + non-streaming) — `on_token` receives each visible text
+    /// fragment so streaming clients see the JSON build up incrementally.
+    ///
+    /// SSM safety: every sampled token still flows through a normal forward;
+    /// the grammar only masks the **host logits** AFTER the forward (via
+    /// `decode_step_masked`), changing WHICH token is argmaxed, never skipping a
+    /// forward or jumping tokens — so the conv/SSM recurrent state of Qwen 3.6's
+    /// ~75% linear-attn layers advances identically to an unconstrained decode.
+    ///
+    /// On grammar build failure (`grammar == None`) or a mid-decode matcher
+    /// desync, this degrades to a plain greedy decode — the server-side
+    /// first-JSON-value trim still yields a parseable object in the common case.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_response_format_impl<F>(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        grammar: Option<crate::grammar::Gemma4GrammarState>,
+        max_new_tokens: usize,
+        seq_id: u64,
+        mut on_token: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
+        use crate::chat_io::ParsedResponse;
+
+        if prompt_ids.is_empty() {
+            return Err(anyhow!("empty prompt after tokenization"));
+        }
+
+        let mut grammar = grammar;
+        #[cfg_attr(not(feature = "mlx-native"), allow(unused_variables))]
+        let grammar_active_at_start = grammar.as_ref().is_some_and(|g| g.is_active());
+
+        // ── First-token masking ──
+        // For a free-form JSON `response_format` there is NO opener token to
+        // prefill (unlike a tool call's `<tool_call>` block), so the VERY FIRST
+        // generated token must already be grammar-masked (e.g. forced to `{`).
+        // `prefill`'s `argmax_last_token` is unmasked, so when a grammar is
+        // active we prefill `prompt_ids[..n-1]` and produce the first token via
+        // a *masked* decode step on the final prompt token. The cache advance is
+        // identical (N-1 prefill + 1 decode == N-token forward); the only
+        // difference is the first token's logits get the JSON mask. When no
+        // grammar is active we keep the plain single-shot prefill.
+        let t_prefill = std::time::Instant::now();
+        let (mut last, mut pos);
+        #[cfg(feature = "mlx-native")]
+        let mut first_masked = false;
+        #[cfg(feature = "mlx-native")]
+        if grammar_active_at_start && prompt_ids.len() >= 2 {
+            let split = prompt_ids.len() - 1;
+            let (_pf, _pos0) = self.prefill(seq_id, &prompt_ids[..split])?;
+            let final_tok = prompt_ids[split];
+            let stepped = {
+                let g = grammar.as_mut().expect("grammar active implies Some");
+                let mut mask =
+                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
+                self.runner.decode_step_masked(seq_id, final_tok, &mut mask)
+            };
+            let (n, p) = stepped?;
+            last = n;
+            pos = p;
+            first_masked = true;
+        } else {
+            let (l, p) = self.prefill(seq_id, &prompt_ids)?;
+            last = l;
+            pos = p;
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            let (l, p) = self.prefill(seq_id, &prompt_ids)?;
+            last = l;
+            pos = p;
+        }
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx] seq {seq_id} prefill-rf: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
+            prompt_ids.len(),
+            prompt_ids.len() as f64 / (prefill_ms / 1000.0)
+        );
+
+        // Advance the matcher with the first token (`decode_step_masked` masks
+        // but does NOT observe). When the token came from the masked decode
+        // (`first_masked`) it's grammar-legal by construction so `observe`
+        // succeeds; in the unmasked fallback path `observe` may reject it — drop
+        // the grammar then (the server's first-JSON-value trim still recovers an
+        // object).
+        #[cfg(feature = "mlx-native")]
+        let _ = first_masked;
+        if let Some(g) = grammar.as_mut() {
+            if g.is_active() {
+                if let Err(e) = g.observe(last) {
+                    eprintln!(
+                        "[qwen35-backend] response_format grammar first-token observe \
+                         desynced (dropping grammar, sampling free): {e:#}"
+                    );
+                    grammar = None;
+                }
+            }
+        }
+
+        let mut generated: Vec<u32> = vec![last];
+        let mut emitted_idx: usize = 0;
+        if let Ok(text) = self.decode(&generated) {
+            if !text.is_empty() && !text.contains('\u{FFFD}') {
+                on_token(&text);
+                emitted_idx = generated.len();
+            }
+        }
+        if self.eos_tokens.contains(&last) {
+            let out = self.decode(&generated).unwrap_or_default();
+            self.remove_seq(seq_id).ok();
+            return Ok(ParsedResponse {
+                visible: out,
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+
+        let t_decode = std::time::Instant::now();
+        for step in 1..max_new_tokens {
+            // Grammar-masked decode when active: same forward (KV + SSM state
+            // advance identically), host logits masked before argmax, then the
+            // sampled token fed back to the matcher.
+            let grammar_active = grammar.as_ref().is_some_and(|g| g.is_active());
+            let (next, new_pos) = if grammar_active {
+                #[cfg(feature = "mlx-native")]
+                {
+                    let stepped = {
+                        let g = grammar.as_mut().expect("grammar_active implies Some");
+                        let mut mask = |buf: &mut [f32]| -> Result<()> {
+                            g.apply_mask_to_logits(buf).map(|_| ())
+                        };
+                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                    };
+                    let (next, new_pos) = stepped?;
+                    let observe_err = grammar.as_mut().and_then(|g| g.observe(next).err());
+                    if let Some(e) = observe_err {
+                        eprintln!(
+                            "[qwen35-backend] response_format grammar observe(sampled) \
+                             desynced (dropping grammar): {e:#}"
+                        );
+                        grammar = None;
+                    }
+                    (next, new_pos)
+                }
+                #[cfg(not(feature = "mlx-native"))]
+                {
+                    self.decode_step(seq_id, last, pos)?
+                }
+            } else {
+                self.decode_step(seq_id, last, pos)?
+            };
+            last = next;
+            pos = new_pos;
+            generated.push(next);
+            let tail_start = emitted_idx;
+            if tail_start < generated.len() {
+                if let Ok(text) = self.decode(&generated[tail_start..]) {
+                    if !text.is_empty() && !text.contains('\u{FFFD}') {
+                        on_token(&text);
+                        emitted_idx = generated.len();
+                    }
+                }
+            }
+            if self.eos_tokens.contains(&next) {
+                eprintln!(
+                    "[mlx] seq {seq_id} EOS-rf at step {step} ({:.1} tok/s)",
+                    step as f64 / (t_decode.elapsed().as_secs_f64())
+                );
+                break;
+            }
+        }
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        let n_gen = generated.len();
+        eprintln!(
+            "[mlx] seq {seq_id} done-rf: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
+            n_gen as f64 / (decode_ms / 1000.0)
+        );
+        let out = self.decode(&generated).unwrap_or_default();
+        self.remove_seq(seq_id).ok();
+        Ok(ParsedResponse {
+            visible: out,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    /// `response_format` non-streaming chat (flat messages). Builds a
+    /// JSON-schema grammar from `schema` and runs the masked decode loop.
+    pub fn chat_response_format(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        schema: &serde_json::Value,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let grammar = self.build_qwen35_response_format_grammar(schema);
+        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+    }
+
+    /// `response_format` streaming chat (flat messages). Same as
+    /// [`chat_response_format`] but forwards each visible JSON fragment to
+    /// `on_token`.
+    pub fn chat_streaming_response_format<F>(
+        &mut self,
+        messages: &[(String, String)],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        schema: &serde_json::Value,
+        on_token: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
+        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let grammar = self.build_qwen35_response_format_grammar(schema);
+        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
+    }
+
+    /// `response_format` non-streaming chat (structured history). Routes the
+    /// turns through the tool-aware renderer (it is the only renderer that
+    /// represents assistant.tool_calls / role:tool turns) with no tools, then
+    /// runs the JSON-schema masked decode loop.
+    pub fn chat_response_format_from_history(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        schema: &serde_json::Value,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        use crate::chat_io::ResolvedToolChoice;
+        let (prompt_ids, _prefill, _prefill_tokens) = self
+            .build_chat_input_with_tools_from_history_split(
+                turns,
+                thinking,
+                &[],
+                &ResolvedToolChoice::None,
+            )?;
+        let grammar = self.build_qwen35_response_format_grammar(schema);
+        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+    }
+
+    /// `response_format` streaming chat (structured history).
+    pub fn chat_streaming_response_format_from_history<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        schema: &serde_json::Value,
+        on_token: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
+        use crate::chat_io::ResolvedToolChoice;
+        let (prompt_ids, _prefill, _prefill_tokens) = self
+            .build_chat_input_with_tools_from_history_split(
+                turns,
+                thinking,
+                &[],
+                &ResolvedToolChoice::None,
+            )?;
+        let grammar = self.build_qwen35_response_format_grammar(schema);
+        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
     }
 
     /// Streaming chat. Calls `on_token` with each new decoded text fragment.

@@ -296,19 +296,26 @@ impl Gemma4GrammarState {
             .compute_mask()
             .map_err(|e| anyhow!("Matcher::compute_mask: {e}"))?;
         // SimpleVob.len() reports the underlying vocab size used when the
-        // ParserFactory was built. Logits buffer must match — if not, the
-        // tokenizer env and the model are mismatched and downstream
-        // sampling is meaningless.
-        if mask.len() != logits.len() {
+        // ParserFactory was built (from tokenizer.json). The model's lm_head
+        // can emit a LARGER, padded vocab (e.g. Qwen 3.6: tokenizer 248077 vs
+        // lm_head 248320 — the tail are reserved/padding ids the tokenizer
+        // never decodes). Treat those extra logits as disallowed (-inf): they
+        // are never legal grammar outputs anyway. A logits buffer SMALLER than
+        // the mask, however, means the tokenizer env and the model are
+        // genuinely mismatched and downstream sampling is meaningless — error.
+        if logits.len() < mask.len() {
             return Err(anyhow!(
-                "grammar mask vocab mismatch: mask.len()={}, logits.len()={}",
+                "grammar mask vocab mismatch: mask.len()={} > logits.len()={}",
                 mask.len(),
                 logits.len()
             ));
         }
         let mut masked = 0usize;
+        let mask_len = mask.len();
         for (i, l) in logits.iter_mut().enumerate() {
-            if !mask.is_allowed(i as u32) {
+            // Indices past the tokenizer vocab (lm_head padding) are always
+            // disallowed; within range, defer to the grammar matcher.
+            if i >= mask_len || !mask.is_allowed(i as u32) {
                 *l = f32::NEG_INFINITY;
                 masked += 1;
             }
