@@ -860,11 +860,38 @@ fn lark_value_for_schema(
         let alts: Vec<String> = en.iter().map(lark_const_literal).collect();
         return Ok(format!("({})", alts.join(" | ")));
     }
+    // JSON Schema `type` may be a string OR an array of strings (e.g.
+    // `["string","null"]`). Render each variant and union them; this
+    // keeps brace counting deterministic when the field is nullable.
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        let mut alts: Vec<String> = Vec::new();
+        for t in types {
+            let Some(s) = t.as_str() else { continue };
+            let alt = render_single_type(s, schema, extra_rules, strict)?;
+            alts.push(alt);
+        }
+        if !alts.is_empty() {
+            return Ok(format!("({})", alts.join(" | ")));
+        }
+    }
     let type_str = schema.get("type").and_then(Value::as_str).unwrap_or("");
+    render_single_type(type_str, schema, extra_rules, strict)
+}
+
+/// Render one JSON Schema scalar/compound type to a Lark RHS — shared
+/// by single-type and multi-type schema paths so `["string","null"]`
+/// composes from the same building blocks as a plain `"string"`.
+fn render_single_type(
+    type_str: &str,
+    schema: &Value,
+    extra_rules: &mut Vec<String>,
+    strict: bool,
+) -> Result<String> {
     match type_str {
         "string" => Ok("string_val".to_string()),
         "number" | "integer" => Ok("number_val".to_string()),
         "boolean" => Ok("bool_val".to_string()),
+        "null" => Ok("\"null\"".to_string()),
         "array" => {
             let items = schema.get("items").cloned().unwrap_or(json!({}));
             let item_rule = lark_value_for_schema(&items, extra_rules, strict)?;
@@ -1126,6 +1153,42 @@ mod tests {
         assert!(s.contains("context_keys"));
         assert!(s.contains("code"));
         assert!(s.contains("python_interpreter"));
+    }
+
+    #[test]
+    fn lark_grammar_handles_multi_type_nullable_field() {
+        // JSON Schema `type: ["string","null"]` (nullable string) used to
+        // fall back to the permissive `<[^44,125]>*` rule, which allows
+        // raw `{` `}` in the field body and breaks balanced-brace parsing
+        // downstream. Verify the grammar now unions `string_val | "null"`
+        // so the field stays brace-safe and parser-deterministic.
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "match_decision",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "suggested_match": { "type": ["string", "null"] },
+                        "match_type": {
+                            "type": "string",
+                            "enum": ["\u{d300}", "\u{b9ac}\u{adf8}"]
+                        },
+                        "confidence": { "type": "integer" }
+                    },
+                    "required": ["suggested_match", "match_type", "confidence"]
+                }
+            }
+        })];
+        let s = lark_grammar_string(&tools, false).expect("build multi-type lark grammar");
+        assert!(
+            s.contains("string_val | \"null\""),
+            "nullable string should union string_val and the null literal; got:\n{s}"
+        );
+        assert!(
+            !s.contains("<[^44,125]>*"),
+            "no permissive fallback should remain for nullable string; got:\n{s}"
+        );
     }
 
     #[test]
