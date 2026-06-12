@@ -1432,6 +1432,87 @@ mod imp {
             Ok((next_tok, state.position))
         }
 
+        /// Phase 1b: batched decode of N sequences in ONE forward. N==1 delegates
+        /// to [`Self::decode_step`] (byte-identical single-seq path). N>=2 borrows
+        /// the N per-seq caches disjointly out of `self.seqs` and runs
+        /// `forward_decode_batch` (batched trunk/MoE/lm_head + batched Mamba via
+        /// state-stacking + per-seq full-attn). Each seq's `position` is bumped by
+        /// one. Result is aligned to `seq_ids` order.
+        pub(crate) fn decode_step_batch(
+            &mut self,
+            seq_ids: &[u64],
+            last_tokens: &[u32],
+            positions: &[usize],
+        ) -> Result<Vec<(u32, usize)>> {
+            let n = seq_ids.len();
+            if last_tokens.len() != n || positions.len() != n {
+                return Err(anyhow!(
+                    "decode_step_batch: mismatched lengths (seqs={n}, tokens={}, positions={})",
+                    last_tokens.len(),
+                    positions.len()
+                ));
+            }
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            if n == 1 {
+                return Ok(vec![self.decode_step(
+                    seq_ids[0],
+                    last_tokens[0],
+                    positions[0],
+                )?]);
+            }
+            // Distinct seq_ids are required for the disjoint HashMap borrow.
+            let id_set: std::collections::HashSet<u64> = seq_ids.iter().copied().collect();
+            if id_set.len() != n {
+                return Err(anyhow!("decode_step_batch: duplicate seq_id in batch"));
+            }
+            // Split-borrow: &model and &mut seqs are disjoint fields.
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            // Borrow each requested seq's state exactly once (disjoint by key).
+            let mut by_id: std::collections::HashMap<u64, &mut NativeSeqState> = self
+                .seqs
+                .iter_mut()
+                .filter(|(k, _)| id_set.contains(k))
+                .map(|(k, v)| (*k, v))
+                .collect();
+            if by_id.len() != n {
+                return Err(anyhow!(
+                    "decode_step_batch: {} of {n} seq_ids found in runner",
+                    by_id.len()
+                ));
+            }
+            // Re-order into caller's seq order.
+            let mut states: Vec<&mut NativeSeqState> = Vec::with_capacity(n);
+            for sid in seq_ids {
+                states.push(by_id.remove(sid).expect("checked present above"));
+            }
+            // Run the batched forward; the cache-slice borrow ends at block exit.
+            let next = {
+                let mut caches: Vec<&mut NativePromptCache> =
+                    states.iter_mut().map(|s| &mut s.cache).collect();
+                model
+                    .forward_decode_batch(last_tokens, &mut caches)
+                    .context("native mlx-rs runner: forward_decode_batch failed")?
+            };
+            if next.len() != n {
+                return Err(anyhow!(
+                    "decode_step_batch: forward returned {} tokens for {n} seqs",
+                    next.len()
+                ));
+            }
+            // Bump each seq's position and assemble the result.
+            let mut out = Vec::with_capacity(n);
+            for (i, s) in states.iter_mut().enumerate() {
+                s.position += 1;
+                out.push((next[i], s.position));
+            }
+            Ok(out)
+        }
+
         /// Grammar-aware decode step. Runs the **same forward** as
         /// [`Self::decode_step`] — so the KV cache and, critically for Qwen
         /// 3.6's ~75% linear-attn layers, the conv/SSM recurrent state advance

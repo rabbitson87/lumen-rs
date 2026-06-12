@@ -2228,6 +2228,211 @@ mod imp {
             Ok((logits_f32, captured))
         }
 
+        /// Phase 1b (Stage 0): one batched decode forward over N single-token
+        /// sequences, each with its own per-seq cache. Returns one argmax token
+        /// per seq in input order.
+        ///
+        /// The weight-bound work — embed, RMSNorm, residuals, **MoE**, and
+        /// **lm_head** — runs batched over `[N, 1, hidden]`, amortizing the
+        /// dominant decode cost (expert/projection weight reads) across N tokens.
+        /// **Linear-attn (Mamba) layers** are batched by stacking the N seqs'
+        /// conv/ssm states along axis 0 into a transient cache and calling the
+        /// existing (batch-native `gated_delta_step_kernel`) forward once, then
+        /// splitting the updated states back. **Full-attn layers** run the
+        /// existing single-seq `layer_full_attn_forward` per seq in a loop (each
+        /// using its own KV cache / offset / RoPE) and stack the outputs — this
+        /// is bit-identical to single-seq decode by construction (Stage 1 will
+        /// batch the full-attn projections; the per-seq SDPA stays).
+        ///
+        /// `caches[i]` is sequence `i`'s cache; `caches.len() == tokens.len()`.
+        /// N==1 is NOT special-cased here (the runner delegates N==1 to
+        /// `decode_step` to keep that path byte-identical).
+        pub fn forward_decode_batch(
+            &self,
+            tokens: &[u32],
+            caches: &mut [&mut NativePromptCache],
+        ) -> Result<Vec<u32>> {
+            let n = tokens.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            if caches.len() != n {
+                return Err(anyhow!(
+                    "forward_decode_batch: caches.len()={} != tokens.len()={n}",
+                    caches.len()
+                ));
+            }
+            let num_layers = self.num_layers();
+            for (i, c) in caches.iter().enumerate() {
+                if c.len() != num_layers {
+                    return Err(anyhow!(
+                        "forward_decode_batch: cache[{i}].len()={} != num_layers={num_layers}",
+                        c.len()
+                    ));
+                }
+            }
+            let cfg = self.text_config();
+            let hidden_dim = cfg.hidden_size as i32;
+            let nn = n as i32;
+
+            // Embedding: one token per seq → [N, hidden] → [N, 1, hidden].
+            let ids_i32: Vec<i32> = tokens.iter().map(|&u| u as i32).collect();
+            let ids_arr = Array::from_slice(&ids_i32, &[nn]);
+            let embed_raw = quantized_embedding_lookup_with_mode(
+                &self.embed_weight,
+                &self.embed_scales,
+                &ids_arr,
+                self.embed_group,
+                self.embed_bits,
+                self.embed_mode,
+            )
+            .context("forward_decode_batch: embed lookup failed")?;
+            let embed_f32 = Self::to_f32(embed_raw, "forward_decode_batch.embed")?;
+            let mut hidden_states = mlx_rs::ops::reshape(&embed_f32, &[nn, 1, hidden_dim])
+                .context("forward_decode_batch: reshape embed [N,1,hidden] failed")?;
+
+            for layer_idx in 0..num_layers {
+                let layer_w = &self.layer_weights[layer_idx];
+                let input_norm_w = match &layer_w.attn {
+                    AttnLayerWeights::Linear(l) => &l.input_layernorm,
+                    AttnLayerWeights::Full(f) => &f.input_layernorm,
+                };
+                let normed = rms_norm(&hidden_states, input_norm_w, cfg.rms_norm_eps)?;
+
+                let attn = if self.is_linear_per_layer[layer_idx] {
+                    // Mamba: stack N per-seq states → transient → batched kernel → split back.
+                    let nslots = caches[0]
+                        .layer_mut(layer_idx)
+                        .ok_or_else(|| anyhow!("forward_decode_batch: layer {layer_idx} missing"))?
+                        .as_linear_mut()?
+                        .len();
+                    let mut transient = NativeArraysCache::new(nslots);
+                    for slot in 0..nslots {
+                        let mut parts: Vec<Array> = Vec::with_capacity(n);
+                        for c in caches.iter_mut() {
+                            let lin = c
+                                .layer_mut(layer_idx)
+                                .ok_or_else(|| {
+                                    anyhow!("forward_decode_batch: layer {layer_idx} missing")
+                                })?
+                                .as_linear_mut()?;
+                            let a = lin.get(slot).ok_or_else(|| {
+                                anyhow!(
+                                    "forward_decode_batch: linear layer {layer_idx} slot {slot} \
+                                     empty (seq not prefilled?)"
+                                )
+                            })?;
+                            parts.push(a.clone());
+                        }
+                        let refs: Vec<&Array> = parts.iter().collect();
+                        let stacked = mlx_rs::ops::concatenate_axis(&refs, 0)
+                            .context("forward_decode_batch: stack linear state failed")?;
+                        transient.set(slot, stacked)?;
+                    }
+                    let out = self.layer_linear_attn_forward(&normed, layer_idx, &mut transient)?;
+                    for slot in 0..nslots {
+                        let updated = transient
+                            .get(slot)
+                            .ok_or_else(|| {
+                                anyhow!("forward_decode_batch: transient slot {slot} empty")
+                            })?
+                            .clone();
+                        for (i, c) in caches.iter_mut().enumerate() {
+                            let idx_i = Array::from_slice(&[i as i32], &[1]);
+                            let part = updated
+                                .take_axis(&idx_i, 0)
+                                .context("forward_decode_batch: split linear state failed")?;
+                            c.layer_mut(layer_idx)
+                                .unwrap()
+                                .as_linear_mut()?
+                                .set(slot, part)?;
+                        }
+                    }
+                    for c in caches.iter_mut() {
+                        c.layer_mut(layer_idx).unwrap().as_linear_mut()?.advance(1);
+                    }
+                    out
+                } else {
+                    // Full-attn: per-seq whole-layer loop (bit-identical to single-seq).
+                    let mut parts: Vec<Array> = Vec::with_capacity(n);
+                    for (i, c) in caches.iter_mut().enumerate() {
+                        let idx_i = Array::from_slice(&[i as i32], &[1]);
+                        let normed_i = normed
+                            .take_axis(&idx_i, 0)
+                            .context("forward_decode_batch: slice seq for full-attn failed")?;
+                        let lc = c.layer_mut(layer_idx).ok_or_else(|| {
+                            anyhow!("forward_decode_batch: layer {layer_idx} missing")
+                        })?;
+                        let attn_i = if matches!(lc, NativeLayerCache::FullTurboquant(_)) {
+                            let tq = lc.as_full_turboquant_mut()?;
+                            self.layer_full_attn_forward_tq(&normed_i, layer_idx, false, tq)?
+                        } else {
+                            let kv = lc.as_full_mut()?;
+                            self.layer_full_attn_forward(&normed_i, layer_idx, false, kv)?
+                        };
+                        parts.push(attn_i);
+                    }
+                    let refs: Vec<&Array> = parts.iter().collect();
+                    mlx_rs::ops::concatenate_axis(&refs, 0)
+                        .context("forward_decode_batch: stack full-attn outputs failed")?
+                };
+
+                let h = mlx_rs::ops::add(&hidden_states, &attn)
+                    .context("forward_decode_batch: residual add (post-attn) failed")?;
+                let post_norm_w = match &layer_w.attn {
+                    AttnLayerWeights::Linear(l) => &l.post_attention_layernorm,
+                    AttnLayerWeights::Full(f) => &f.post_attention_layernorm,
+                };
+                let h_normed = rms_norm(&h, post_norm_w, cfg.rms_norm_eps)?;
+                let mlp_out = self.layer_moe_forward(&h_normed, layer_idx)?;
+                hidden_states = mlx_rs::ops::add(&h, &mlp_out)
+                    .context("forward_decode_batch: residual add (post-mlp) failed")?;
+            }
+
+            // Final norm + lm_head over [N, 1, hidden] → [N, 1, vocab], per-row argmax.
+            let normed_out = rms_norm(&hidden_states, &self.final_norm_weight, cfg.rms_norm_eps)?;
+            let logits = if let Some(lm_head) = &self.lm_head {
+                self.linear_pre(lm_head, &normed_out)?
+            } else {
+                quantized_matmul_with_mode(
+                    &normed_out,
+                    &self.embed_weight,
+                    &self.embed_scales,
+                    None,
+                    true,
+                    self.embed_group,
+                    self.embed_bits,
+                    self.embed_mode,
+                )
+                .context("forward_decode_batch: tied lm_head matmul failed")?
+            };
+            let logits_f32 = Self::to_f32(logits, "forward_decode_batch.lm_head")?;
+            self.argmax_rows(&logits_f32)
+        }
+
+        /// Per-row argmax over `[N, 1, vocab]` logits → `Vec<u32>` of length N.
+        /// Single eval via `try_as_slice` (mirrors `argmax_last_token`'s tail).
+        fn argmax_rows(&self, logits: &Array) -> Result<Vec<u32>> {
+            if logits.ndim() != 3 {
+                return Err(anyhow!(
+                    "argmax_rows: expected [N, 1, V] logits, got ndim={}",
+                    logits.ndim()
+                ));
+            }
+            // Drop the L==1 axis → [N, V].
+            let idx0 = Array::from_int(0);
+            let rows = logits
+                .take_axis(&idx0, 1)
+                .context("argmax_rows: take_axis(0, axis=1) failed")?;
+            // Argmax over vocab, keeping the batch axis → [N].
+            let am = mlx_rs::ops::indexing::argmax_axis(&rows, -1, /* keep_dims */ false)
+                .context("argmax_rows: argmax_axis(-1) failed")?;
+            let slice = am
+                .try_as_slice::<u32>()
+                .map_err(|err| anyhow!("argmax_rows: read failed: {err}"))?;
+            Ok(slice.to_vec())
+        }
+
         // ─────────────────────────────────────────────────────────────────
         // MTP (Multi-Token Prediction) — speculative decode head wiring.
         // Mirrors `gemma4_moe::mtp_step` Steps A-E, retargeted for Qwen3.6's

@@ -349,6 +349,16 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::decode_step(self, seq_id, last_token, position)
     }
 
+    fn decode_step_batch(
+        &mut self,
+        seq_ids: &[u64],
+        last_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        // Phase 1b override: true batched forward (vs the trait default loop).
+        NativeMlxRunner::decode_step_batch(self, seq_ids, last_tokens, positions)
+    }
+
     fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
         NativeMlxRunner::remove_seq(self, seq_id)
     }
