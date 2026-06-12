@@ -256,6 +256,14 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "advanced",
   },
+  {
+    key: "LUMEN_MLX_PREFIX_INCREMENTAL",
+    labelKey: "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label",
+    helpKey: "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
   // ── Draft-model speculative decode (Qwen3.5/3.6 native, experimental) ──
   {
     key: "LUMEN_MLX_DRAFT_MODEL",

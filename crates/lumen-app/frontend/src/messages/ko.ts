@@ -390,6 +390,9 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.label": "tool_choice 강제 (Gemma 4)",
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.help":
     "tool_choice가 `required`이거나 특정 함수를 지정할 때, Eager grammar(첫 토큰부터 활성)로 디코딩을 제약해 호출 인자를 스키마에 맞춥니다. 기본 꺼짐: 기본 Lazy grammar는 모델이 tool-call opener를 낸 뒤에만 활성화되므로, 강제된 호출의 body가 현재 무제약입니다. Eager + 장기 agentic 루프는 일부 양자화 빌드를 반복 사이클에 빠뜨린 사례가 있으니 모델에서 검증 후 사용하세요. tool_choice=auto에는 영향 없음.",
+  "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label": "증분 prefix 캐시 (공유 시스템 프롬프트)",
+  "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help":
+    "cold prefill 시 공유 시스템 프롬프트 head도 스냅샷해서, 같은 시스템 프롬프트지만 user turn이 다른 후속 요청이 처음부터 다시 prefill하지 않고 캐시된 head를 fork하도록 합니다. 큰 시스템 프롬프트를 공유하는 멀티유저/분기 워크로드를 가속합니다. 기본 꺼짐: 스냅샷마다 KV 메모리를 점유(키별 branch cap으로 제한)하므로 RAM 여유가 있는 머신(고성능 MacBook / Mac Studio)에서 켜세요. Qwen 3.6 네이티브 경로 전용.",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.label": "드래프트 모델 (투기 디코딩) — 실험적",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.help":
     "실험적. Qwen3.5/3.6 네이티브 경로의 greedy 드래프트-모델 투기 디코딩용 소형 드래프트 모델의 경로 또는 HF id. 드래프트가 토큰을 제안하면 타깃이 단일 배치 forward로 검증해 일치하는 최장 prefix를 수락 — greedy 대비 무손실(타깃 argmax가 항상 정답). 네이티브 러너 필요 + 드래프트 vocab이 타깃과 일치해야 함(불일치 시 자동 비활성). greedy 요청에만 적용. 빈 값 = 꺼짐(기본; 기존 디코딩 그대로).",

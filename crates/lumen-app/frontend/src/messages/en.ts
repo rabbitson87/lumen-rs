@@ -399,6 +399,9 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.label": "Enforce tool_choice (Gemma 4)",
   "env.entry.LUMEN_GEMMA4_TOOL_GRAMMAR_EAGER.help":
     "When tool_choice is `required` or names a function, constrain decoding with an Eager grammar (active from the first token) so the call's arguments are schema-valid. Off by default: the default Lazy grammar only activates after the model emits the tool-call opener, so a forced call's body is currently unconstrained. Eager + long agentic loops drove some quantized builds into a repetition cycle — verify on your model before relying on it. Does not affect tool_choice=auto.",
+  "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label": "Incremental prefix cache (shared system prompt)",
+  "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help":
+    "On a cold prefill, also snapshot the shared system-prompt head so a later request with the SAME system prompt but a different user turn forks the cached head instead of re-prefilling it from scratch. Speeds up multi-user / branching workloads that share one big system prompt. Off by default; each extra snapshot pins KV memory (bounded by the per-key branch cap), so enable it on machines with RAM headroom (high-end MacBook / Mac Studio). Qwen 3.6 native path only.",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.label": "Draft model (spec decode) — experimental",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.help":
     "EXPERIMENTAL. Path or HF id of a small draft model for greedy draft-model speculative decoding on the Qwen3.5/3.6 native path. The draft proposes tokens that the target verifies in one batched forward, accepting the longest matching prefix — lossless vs greedy (target's argmax is always the source of truth). Requires the native runner and a draft whose vocab matches the target (auto-disabled on mismatch). Engaged for greedy requests only. Empty = OFF (default; existing decode runs unchanged).",

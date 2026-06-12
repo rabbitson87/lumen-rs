@@ -3096,6 +3096,10 @@ impl MlxQwen35Backend {
             self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
+        let incremental_boundary = self
+            .detect_system_prefix_len(messages)
+            .ok()
+            .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -3104,6 +3108,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            incremental_boundary,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -3134,6 +3139,10 @@ impl MlxQwen35Backend {
             self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
+        let incremental_boundary = self
+            .detect_system_prefix_len(messages)
+            .ok()
+            .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -3142,6 +3151,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            incremental_boundary,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -3165,6 +3175,10 @@ impl MlxQwen35Backend {
             .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
+        let incremental_boundary = self
+            .detect_system_prefix_len_from_turns(turns)
+            .ok()
+            .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -3173,6 +3187,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            incremental_boundary,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -3200,6 +3215,10 @@ impl MlxQwen35Backend {
             .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
+        let incremental_boundary = self
+            .detect_system_prefix_len_from_turns(turns)
+            .ok()
+            .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -3208,6 +3227,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
+            incremental_boundary,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -3246,6 +3266,12 @@ impl MlxQwen35Backend {
         // this request even when the feature is enabled — useful for ad-hoc
         // benchmarks that want clean cold-prefill timing.
         prefix_cache_key: Option<&str>,
+        // Phase 0 incremental-prefix boundary: token length of the shared
+        // system-prompt head, when known and a strict interior of the prompt.
+        // `Some(b)` lets the cold-MISS path snapshot `[..b]` as a reusable
+        // boundary (only acts when `LUMEN_MLX_PREFIX_INCREMENTAL=1`); `None`
+        // keeps the original single-prefill MISS.
+        incremental_boundary: Option<usize>,
         // Tool name → required param keys. Empty unless
         // `LUMEN_QWEN35_FORCE_REQUIRED_PARAMS` is on; when non-empty the decode
         // loop injects a `<parameter=KEY>\n` opener before the model can close
@@ -3280,6 +3306,7 @@ impl MlxQwen35Backend {
             seq_id,
             &prompt_ids,
             prefix_cache_key,
+            incremental_boundary,
         )?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
@@ -3713,6 +3740,24 @@ impl MlxQwen35Backend {
             return Ok(0);
         }
         let block = format_system_prefix(first);
+        let sys_ids = self.encode(&block)?;
+        Ok(sys_ids.len())
+    }
+
+    /// `detect_system_prefix_len` for the structured-history shape. Returns the
+    /// token length of the leading `System` turn's rendered block (0 if the
+    /// history doesn't start with a non-empty system turn). Used to supply the
+    /// Phase 0 incremental-prefix boundary for the tool-history entry points.
+    fn detect_system_prefix_len_from_turns(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+    ) -> Result<usize> {
+        use crate::chat_io::ChatTurn;
+        let content = match turns.first() {
+            Some(ChatTurn::System(s)) if !s.is_empty() => *s,
+            _ => return Ok(0),
+        };
+        let block = format_system_prefix(&("system".to_string(), content.to_string()));
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
     }

@@ -38,6 +38,11 @@ use std::time::{Duration, Instant};
 /// Default per-key branch cap when `LUMEN_MLX_PREFIX_CACHE_BRANCHES` is unset.
 const DEFAULT_BRANCHES: usize = 4;
 
+/// Default for incremental chunked-prefill boundary caching (Phase 0). OFF so
+/// the cold-MISS path is byte-identical to the pre-Phase-0 single-prefill until
+/// explicitly enabled via `LUMEN_MLX_PREFIX_INCREMENTAL`.
+const DEFAULT_INCREMENTAL: bool = false;
+
 /// The minimal runner surface the prefix cache needs. A backend implements this
 /// for its runner type — e.g. a blanket impl over a richer internal `Runner`
 /// trait — so the cache stays decoupled from any one runner enum.
@@ -78,6 +83,14 @@ pub struct PrefixCacheEntry {
     /// mid-fork would corrupt the in-progress request. Bumped around fork+extend
     /// and decremented when the operation completes.
     pub in_use: u32,
+    /// Set on an *incremental boundary* branch (a snapshot of the shared
+    /// system-prompt head taken mid-cold-prefill, Phase 0). Such a branch must
+    /// survive when the full-prompt branch is inserted afterwards: the full
+    /// prompt `starts_with` the head, so `insert_branch`'s supersede path would
+    /// otherwise release the head and silently defeat incremental caching. The
+    /// guard keeps both so a later prefix-sharing-but-divergent prompt can still
+    /// fork the head. Always `false` for full-prompt / boundary-store entries.
+    pub pinned_boundary: bool,
 }
 
 /// Keyed store of prefix-cache master snapshots plus its TTL / LRU policy.
@@ -92,18 +105,25 @@ pub struct PrefixCacheStore {
     max: Option<usize>,
     /// Max candidate branches kept per key.
     branches: usize,
+    /// Incremental chunked-prefill boundary caching (Phase 0). When ON, a cold
+    /// MISS with a supplied shared-prefix boundary snapshots the head as a
+    /// `pinned_boundary` branch before extending the tail, so a later
+    /// prefix-sharing-but-divergent prompt forks the head instead of cold-
+    /// prefilling. Default OFF (bit-identical desktop behaviour).
+    incremental: bool,
 }
 
 impl PrefixCacheStore {
     /// Construct from the `LUMEN_MLX_PREFIX_CACHE*` env vars.
     pub fn from_env() -> Self {
-        let (enabled, ttl, max, branches) = read_limits();
+        let (enabled, ttl, max, branches, incremental) = read_limits();
         Self {
             entries: HashMap::new(),
             enabled,
             ttl,
             max,
             branches,
+            incremental,
         }
     }
 
@@ -117,6 +137,7 @@ impl PrefixCacheStore {
             ttl,
             max,
             branches: DEFAULT_BRANCHES,
+            incremental: false,
         }
     }
 
@@ -134,6 +155,20 @@ impl PrefixCacheStore {
             ttl,
             max,
             branches: branches.max(1),
+            incremental: false,
+        }
+    }
+
+    /// Construct with explicit policy + branch cap + incremental flag (test-only).
+    #[cfg(test)]
+    fn with_incremental(enabled: bool, branches: usize, incremental: bool) -> Self {
+        Self {
+            entries: HashMap::new(),
+            enabled,
+            ttl: None,
+            max: None,
+            branches: branches.max(1),
+            incremental,
         }
     }
 
@@ -162,12 +197,22 @@ impl PrefixCacheStore {
     /// Falls through to a plain `runner.prefill` when `key` is `None` or the
     /// feature is disabled. Snapshot failures are logged but non-fatal — the
     /// request completes, just without (re)populating the cache.
+    ///
+    /// `incremental_boundary` (Phase 0) is `Some(sys_len)` when the caller knows
+    /// the length, in tokens, of a shared prefix (the system-prompt block) that
+    /// later divergent requests are likely to share. On a cold MISS with the
+    /// `incremental` policy enabled and a valid boundary (`0 < b < len`), the
+    /// head `prompt_ids[..b]` is snapshotted as a `pinned_boundary` branch before
+    /// the tail is extended — so a future `[sys + differentTail]` request forks
+    /// the head instead of cold-prefilling. `None` (or feature off / invalid
+    /// boundary) falls back to the exact single-prefill MISS path.
     pub fn prefill_optionally_cached<R: SnapshotRunner>(
         &mut self,
         runner: &mut R,
         seq_id: u64,
         prompt_ids: &[u32],
         key: Option<&str>,
+        incremental_boundary: Option<usize>,
     ) -> Result<(u32, usize)> {
         let key = match key.filter(|_| self.enabled) {
             Some(k) => k,
@@ -237,7 +282,39 @@ impl PrefixCacheStore {
                     e.hits += 1;
                 }
             } else {
+                let matched_pinned = self
+                    .entries
+                    .get(key)
+                    .and_then(|v| v.get(idx))
+                    .is_some_and(|e| e.pinned_boundary);
                 match runner.snapshot_state_deep(seq_id) {
+                    Ok((snap_id, _)) if matched_pinned => {
+                        // The match was an incremental boundary head (Phase 0).
+                        // KEEP it so future divergent prefix-sharing prompts can
+                        // still fork it, and add the advanced full prompt as a
+                        // SEPARATE branch. (Replacing it in place would collapse
+                        // the shared boundary after the first divergent hit.)
+                        self.set_in_use(key, idx, false);
+                        if let Some(e) = self.entries.get_mut(key).and_then(|v| v.get_mut(idx)) {
+                            e.last_access = Instant::now();
+                            e.hits += 1;
+                        }
+                        self.insert_branch(
+                            runner,
+                            key,
+                            PrefixCacheEntry {
+                                master_snapshot_id: snap_id,
+                                prefix_tokens: prompt_ids.to_vec(),
+                                last_access: Instant::now(),
+                                hits: 0,
+                                last_token: Some(last),
+                                in_use: 0,
+                                pinned_boundary: false,
+                            },
+                        );
+                        self.evict_stale(runner);
+                        advanced_to = prompt_ids.len();
+                    }
                     Ok((snap_id, _)) => {
                         // Replace the matched candidate in place with the advanced
                         // snapshot, releasing the superseded one. (Same key/index
@@ -253,6 +330,7 @@ impl PrefixCacheStore {
                                 hits,
                                 last_token: Some(last),
                                 in_use: 0,
+                                pinned_boundary: false,
                             };
                             prev
                         };
@@ -282,7 +360,52 @@ impl PrefixCacheStore {
         // Cold prefill, then snapshot under `key`. If the prompt shares a
         // non-trivial head with an existing branch but diverges in the tail,
         // store it as a NEW branch rather than overwriting the divergent one.
-        let (last, pos) = runner.prefill(seq_id, prompt_ids)?;
+        //
+        // Phase 0 incremental boundary caching: when enabled and the caller
+        // supplied a valid shared-prefix boundary, cold-prefill the head ONLY,
+        // snapshot it as a `pinned_boundary` branch, then extend the divergent
+        // tail. `extend` after `prefill` produces a cache byte-identical to a
+        // single `prefill` of the concatenation (same `forward_chunked`
+        // contract the HIT path relies on), so the returned `(last, pos)` is
+        // unchanged from a one-shot prefill — only an extra reusable snapshot is
+        // created. With the feature off (or no/invalid boundary) this is the
+        // exact original single-prefill path.
+        let do_incremental =
+            self.incremental && incremental_boundary.is_some_and(|b| b > 0 && b < prompt_ids.len());
+        let (last, pos) = if do_incremental {
+            let b = incremental_boundary.unwrap();
+            let _ = runner.prefill(seq_id, &prompt_ids[..b])?;
+            match runner.snapshot_state_deep(seq_id) {
+                Ok((snap_b, _)) => {
+                    // last_token = None: an exact-prompt-==-head retry must
+                    // re-extend for fresh logits (same contract as the streaming
+                    // boundary `store_master`). `pinned_boundary` keeps it alive
+                    // when the full-prompt branch is inserted below.
+                    self.insert_branch(
+                        runner,
+                        key,
+                        PrefixCacheEntry {
+                            master_snapshot_id: snap_b,
+                            prefix_tokens: prompt_ids[..b].to_vec(),
+                            last_access: Instant::now(),
+                            hits: 0,
+                            last_token: None,
+                            in_use: 0,
+                            pinned_boundary: true,
+                        },
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[mlx] prefix-cache: incremental boundary snapshot skipped \
+                         (key={key:?}, boundary={b}): {e:#}"
+                    );
+                }
+            }
+            runner.extend(seq_id, &prompt_ids[b..])?
+        } else {
+            runner.prefill(seq_id, prompt_ids)?
+        };
         match runner.snapshot_state_deep(seq_id) {
             Ok((snap_id, _snap_pos)) => {
                 self.insert_branch(
@@ -295,6 +418,7 @@ impl PrefixCacheStore {
                         hits: 0,
                         last_token: Some(last),
                         in_use: 0,
+                        pinned_boundary: false,
                     },
                 );
                 self.evict_stale(runner);
@@ -359,9 +483,13 @@ impl PrefixCacheStore {
 
         // Supersede an existing candidate that lies on the same line: either the
         // existing prefix is a prefix of the new one (new extends old), or they
-        // are byte-identical. Never supersede an `in_use` candidate.
+        // are byte-identical. Never supersede an `in_use` candidate, nor a
+        // `pinned_boundary` head (Phase 0): the full prompt always `starts_with`
+        // the shared head, so without this guard inserting the full-prompt branch
+        // would release the incremental boundary snapshot and defeat the feature.
         let supersede = cands.iter().position(|e| {
             e.in_use == 0
+                && !e.pinned_boundary
                 && !e.prefix_tokens.is_empty()
                 && entry.prefix_tokens.starts_with(&e.prefix_tokens)
         });
@@ -460,6 +588,7 @@ impl PrefixCacheStore {
                 hits: 0,
                 last_token,
                 in_use: 0,
+                pinned_boundary: false,
             },
         );
         self.evict_stale(runner);
@@ -504,11 +633,15 @@ impl PrefixCacheStore {
 /// - `LUMEN_MLX_PREFIX_CACHE_MAX=N`        — keep at most N entries, LRU-evict.
 /// - `LUMEN_MLX_PREFIX_CACHE_BRANCHES=N`   — keep at most N branches per key
 ///   (default 4). 1 restores strict single-entry-per-key behaviour.
+/// - `LUMEN_MLX_PREFIX_INCREMENTAL=1`      — Phase 0: on a cold MISS, also
+///   snapshot the shared system-prefix head as a pinned branch so a later
+///   prefix-sharing-but-divergent prompt forks the head instead of cold-
+///   prefilling. Default OFF (cold-MISS path stays byte-identical).
 ///
 /// Default is ON: the feature has been validated since 2026-05-18 and provides
 /// the 5-6× speedup users expect for repeated chat turns with a shared system
 /// prompt. The env var is the escape hatch for debugging, not the gate.
-fn read_limits() -> (bool, Option<Duration>, Option<usize>, usize) {
+fn read_limits() -> (bool, Option<Duration>, Option<usize>, usize, bool) {
     // Default ON: anything other than an explicit "0" / "false" / "no" / "off"
     // stays enabled. Empty string + unset both yield ON.
     let enabled = match std::env::var("LUMEN_MLX_PREFIX_CACHE")
@@ -533,7 +666,16 @@ fn read_limits() -> (bool, Option<Duration>, Option<usize>, usize) {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_BRANCHES);
-    (enabled, ttl, max, branches)
+    // Incremental boundary caching is opt-IN (default OFF): only an explicit
+    // truthy value turns it on, mirroring (inverted) the cache's default-ON gate.
+    let incremental = match std::env::var("LUMEN_MLX_PREFIX_INCREMENTAL")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        Some(v) => matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+        None => DEFAULT_INCREMENTAL,
+    };
+    (enabled, ttl, max, branches, incremental)
 }
 
 /// Pure TTL-then-LRU victim selection across the multi-entry store. Returns
@@ -663,7 +805,7 @@ mod tests {
         let mut store = PrefixCacheStore::with_policy(true, None, None);
         let mut m = MockRunner::default();
         let (tok, pos) = store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], None)
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], None, None)
             .unwrap();
         assert_eq!((tok, pos), (PREFILL_TOK, 3));
         assert_eq!(m.log, vec!["prefill(3)"]);
@@ -675,7 +817,7 @@ mod tests {
         let mut store = PrefixCacheStore::with_policy(false, None, None);
         let mut m = MockRunner::default();
         let (tok, _) = store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap();
         assert_eq!(tok, PREFILL_TOK);
         assert_eq!(m.log, vec!["prefill(3)"]);
@@ -689,7 +831,7 @@ mod tests {
         let mut m = MockRunner::default();
 
         let (tok, pos) = store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap();
         assert_eq!((tok, pos), (PREFILL_TOK, 3));
         assert_eq!(m.log, vec!["prefill(3)", "snapshot->0"]);
@@ -699,7 +841,7 @@ mod tests {
         // advance the (only) candidate in place, releasing snap 0.
         m.log.clear();
         let (tok, _) = store
-            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"))
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"), None)
             .unwrap();
         assert_eq!(tok, EXTEND_TOK);
         assert_eq!(
@@ -715,12 +857,12 @@ mod tests {
         let mut m = MockRunner::default();
 
         store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap();
         m.log.clear();
 
         let (tok, pos) = store
-            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3], Some("k"), None)
             .unwrap();
         assert_eq!((tok, pos), (PREFILL_TOK, 3));
         assert_eq!(m.log, vec!["fork(0)"]);
@@ -732,11 +874,11 @@ mod tests {
         let mut m = MockRunner::default();
 
         store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("a"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("a"), None)
             .unwrap();
         m.log.clear();
         store
-            .prefill_optionally_cached(&mut m, 2, &[9, 9, 9], Some("b"))
+            .prefill_optionally_cached(&mut m, 2, &[9, 9, 9], Some("b"), None)
             .unwrap();
         assert_eq!(store.len(), 1);
         assert!(
@@ -758,18 +900,18 @@ mod tests {
 
         // Seed branch A via cold MISS.
         store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap(); // snapshot->0
         // Seed branch B: diverges from A in the tail → NEW branch, no supersede.
         store
-            .prefill_optionally_cached(&mut m, 2, &[1, 2, 7, 8], Some("k"))
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 7, 8], Some("k"), None)
             .unwrap(); // snapshot->1
         assert_eq!(store.len(), 2, "divergent prompt must create a 2nd branch");
 
         m.log.clear();
         // Prompt extends B → fork snap 1 (B), not snap 0 (A).
         let (tok, _) = store
-            .prefill_optionally_cached(&mut m, 3, &[1, 2, 7, 8, 9], Some("k"))
+            .prefill_optionally_cached(&mut m, 3, &[1, 2, 7, 8, 9], Some("k"), None)
             .unwrap();
         assert_eq!(tok, EXTEND_TOK);
         assert!(
@@ -790,22 +932,22 @@ mod tests {
         let mut m = MockRunner::default();
 
         store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap();
         assert_eq!(store.len(), 1);
         // Shares head [1,2] but diverges (3 vs 9) → branch, keep both.
         store
-            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9], Some("k"))
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9], Some("k"), None)
             .unwrap();
         assert_eq!(store.len(), 2);
 
         // Both lines are still independently reusable.
         m.log.clear();
         let (a, _) = store
-            .prefill_optionally_cached(&mut m, 3, &[1, 2, 3, 4], Some("k"))
+            .prefill_optionally_cached(&mut m, 3, &[1, 2, 3, 4], Some("k"), None)
             .unwrap();
         let (b, _) = store
-            .prefill_optionally_cached(&mut m, 4, &[1, 2, 9, 4], Some("k"))
+            .prefill_optionally_cached(&mut m, 4, &[1, 2, 9, 4], Some("k"), None)
             .unwrap();
         assert_eq!((a, b), (EXTEND_TOK, EXTEND_TOK));
     }
@@ -817,15 +959,15 @@ mod tests {
         let mut m = MockRunner::default();
 
         store
-            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"))
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap(); // snap 0 (branch A, oldest)
         store
-            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9], Some("k"))
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9], Some("k"), None)
             .unwrap(); // snap 1 (branch B)
         assert_eq!(store.len(), 2);
         m.log.clear();
         store
-            .prefill_optionally_cached(&mut m, 3, &[1, 2, 5], Some("k"))
+            .prefill_optionally_cached(&mut m, 3, &[1, 2, 5], Some("k"), None)
             .unwrap(); // snap 2 (branch C) → cap=2 evicts A
         assert_eq!(store.len(), 2, "branch cap must hold len at 2");
         assert!(
@@ -871,6 +1013,141 @@ mod tests {
         assert_eq!(got2, Some((10, vec![1, 2, 3, 4])));
     }
 
+    // ── Phase 0: incremental chunked-prefill boundary caching ──────────────
+
+    #[test]
+    fn incremental_off_is_byte_identical_miss() {
+        // Feature OFF: a MISS with a boundary supplied must be the exact original
+        // single-prefill path — no boundary snapshot, one branch.
+        let mut store = PrefixCacheStore::with_incremental(true, 4, false);
+        let mut m = MockRunner::default();
+        let (tok, pos) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+        assert_eq!((tok, pos), (PREFILL_TOK, 4));
+        assert_eq!(m.log, vec!["prefill(4)", "snapshot->0"]);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn incremental_on_snapshots_boundary_branch() {
+        // Feature ON: cold-prefill the head [1,2], snapshot it (pinned), extend
+        // the tail [3,4], snapshot the full prompt. Two branches.
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+        // The full prompt's returned token comes from the tail extend.
+        assert_eq!(tok, EXTEND_TOK);
+        assert_eq!(
+            m.log,
+            vec!["prefill(2)", "snapshot->0", "extend(2)", "snapshot->1"]
+        );
+        assert_eq!(store.len(), 2, "head boundary + full prompt branches");
+    }
+
+    #[test]
+    fn incremental_boundary_lets_divergent_prompt_hit() {
+        // The headline win: after a [1,2,3,4] MISS that snapshotted the [1,2]
+        // boundary, a divergent [1,2,9,9] sharing only the head must HIT the
+        // boundary (fork snap 0 + extend the [9,9] tail), NOT cold-prefill.
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+
+        m.log.clear();
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9, 9], Some("k"), Some(2))
+            .unwrap();
+        assert_eq!(tok, EXTEND_TOK);
+        assert!(
+            m.log.iter().any(|l| l == "fork(0)"),
+            "must fork the [1,2] boundary snapshot, got {:?}",
+            m.log
+        );
+        assert!(
+            m.log.iter().any(|l| l == "extend(2)"),
+            "must extend only the divergent [9,9] tail, got {:?}",
+            m.log
+        );
+        assert!(
+            !m.log.iter().any(|l| l.starts_with("prefill(")),
+            "must NOT cold-prefill, got {:?}",
+            m.log
+        );
+        // The [1,2] boundary survives the divergent advance so a THIRD divergent
+        // prompt can still reuse it (head + 2 full-prompt tails).
+        assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn incremental_full_prompt_branch_preferred_over_boundary() {
+        // A prompt extending the FULL branch must fork the full snapshot (snap 1),
+        // not the shorter [1,2] boundary (snap 0) — LPM picks the longest match.
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+        m.log.clear();
+        store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"), Some(2))
+            .unwrap();
+        assert!(
+            m.log.iter().any(|l| l == "fork(1)"),
+            "must fork the longer full-prompt branch, got {:?}",
+            m.log
+        );
+        assert!(
+            !m.log.iter().any(|l| l == "fork(0)"),
+            "must not fork the shorter boundary, got {:?}",
+            m.log
+        );
+    }
+
+    #[test]
+    fn pinned_boundary_survives_full_prompt_supersede() {
+        // Inserting the full-prompt branch must NOT release the [1,2] boundary,
+        // even though [1,2,3,4] starts_with [1,2] (which would normally supersede).
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+        assert!(
+            !m.log.iter().any(|l| l == "release(0)"),
+            "the pinned boundary snapshot 0 must not be released, got {:?}",
+            m.log
+        );
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn incremental_respects_branch_cap() {
+        // cap=2: MISS creates [1,2]+[1,2,3,4] (at cap). A divergent HIT adds a
+        // 3rd branch, evicting the LRU non-pinned (the full-prompt branch),
+        // while the just-accessed boundary survives.
+        let mut store = PrefixCacheStore::with_incremental(true, 2, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4], Some("k"), Some(2))
+            .unwrap();
+        assert_eq!(store.len(), 2);
+        m.log.clear();
+        store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 9, 9], Some("k"), Some(2))
+            .unwrap();
+        assert_eq!(store.len(), 2, "branch cap holds len at 2");
+        assert!(
+            m.log.contains(&"release(1)".to_string()),
+            "LRU full-prompt branch (snap 1) must be evicted, got {:?}",
+            m.log
+        );
+    }
+
     fn fake_prefix_entry(snapshot_id: u64, last_access: Instant) -> PrefixCacheEntry {
         PrefixCacheEntry {
             master_snapshot_id: snapshot_id,
@@ -879,6 +1156,7 @@ mod tests {
             hits: 0,
             last_token: None,
             in_use: 0,
+            pinned_boundary: false,
         }
     }
 
