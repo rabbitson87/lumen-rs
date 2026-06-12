@@ -2935,6 +2935,24 @@ impl InferenceEngine {
     /// scheduler. All other paths remain sequential.
     pub async fn run(mut self, mut rx: mpsc::Receiver<EngineRequest>) {
         let batched = std::env::var("BATCHED_ENGINE").ok().as_deref() == Some("1");
+        // Phase 2: opt-in multi-seq scheduler for the MLX-native Qwen3.6 path.
+        // Distinct from BATCHED_ENGINE (which gates the Candle paths). Default
+        // OFF — the sequential path stays byte-identical until enabled. Computed
+        // as a plain bool BEFORE the match so no `&MlxBackend` (which is not
+        // `Send`, holding raw Metal pointers) is held across the `.await`.
+        #[cfg(feature = "mlx-native")]
+        let mlx_qwen35_batched = std::env::var("LUMEN_MLX_BATCH_DECODE").ok().as_deref()
+            == Some("1")
+            && matches!(
+                &self.backend,
+                ModelBackend::Mlx(b)
+                    if matches!(b.kind(), lumen_mlx::MlxBackendKind::Qwen35Family)
+            );
+        #[cfg(feature = "mlx-native")]
+        if mlx_qwen35_batched {
+            self.run_batched_mlx(&mut rx).await;
+            return;
+        }
         match &self.backend {
             ModelBackend::GemmaGguf(_) if batched => self.run_batched(&mut rx).await,
             #[cfg(feature = "qwen3_5_moe")]
@@ -4041,6 +4059,267 @@ impl InferenceEngine {
             // Qwen35 has no paged backend; prefill is always synchronous here.
             prefill_remaining: None,
         })
+    }
+
+    /// Phase 2: opt-in multi-seq scheduler for the MLX-native Qwen3.6 path.
+    /// Mirrors `run_batched_qwen35` but drives `MlxQwen35Backend::decode_step_batch`
+    /// (greedy argmax — already sampled) via `as_qwen35_mut()`, so it needs NO
+    /// backend API additions. Only PLAIN GREEDY chat is batched; any request with
+    /// tools, `response_format`, custom stop sequences, non-zero temperature, or
+    /// thinking enabled falls back to the sequential path. Default OFF
+    /// (`LUMEN_MLX_BATCH_DECODE=1` to enable). Currently uses the loop-based
+    /// `decode_step_batch` (Phase 1a) — bit-identical to N sequential decodes,
+    /// so this delivers multi-user latency fairness; Phase 1b swaps in the true
+    /// batched forward for throughput scaling with no change here.
+    /// `&mut` accessor to the inner Qwen3.6 MLX backend, or `None` when the
+    /// loaded backend isn't MLX-Qwen35. Used by the batched scheduler.
+    #[cfg(feature = "mlx-native")]
+    fn mlx_qwen35_mut(&mut self) -> Option<&mut lumen_mlx::MlxQwen35Backend> {
+        match &mut self.backend {
+            ModelBackend::Mlx(b) => b.as_qwen35_mut(),
+            _ => None,
+        }
+    }
+
+    /// Immutable counterpart of [`Self::mlx_qwen35_mut`].
+    #[cfg(feature = "mlx-native")]
+    fn mlx_qwen35(&self) -> Option<&lumen_mlx::MlxQwen35Backend> {
+        match &self.backend {
+            ModelBackend::Mlx(b) => b.as_qwen35(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    async fn run_batched_mlx(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
+        use std::collections::HashMap;
+
+        let max_batch: usize = std::env::var("PAGED_MAX_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+
+        let mut active: HashMap<u64, ActiveSeqState> = HashMap::new();
+        let mut next_seq_id: u64 = 1;
+
+        eprintln!("[mlx batched] active scheduler (max_batch={max_batch})");
+
+        loop {
+            // 1. Admit eligible streaming chat requests; route everything else
+            //    (non-streaming, tools, response_format, sampled, thinking,
+            //    Anthropic) to the sequential path so behavior is unchanged.
+            while active.len() < max_batch {
+                match rx.try_recv() {
+                    Ok(EngineRequest::StreamingChatCompletion { req, token_tx }) => {
+                        let thinking = req.enable_thinking_with_backend_default(
+                            self.backend.is_reasoning_first_family(),
+                        );
+                        if !Self::mlx_batch_eligible(&req) || thinking {
+                            self.chat_completion_streaming(&req, &token_tx);
+                            continue;
+                        }
+                        match self.start_streaming_seq_mlx(
+                            next_seq_id,
+                            &req.messages,
+                            req.max_tokens,
+                            thinking,
+                            token_tx.clone(),
+                        ) {
+                            Ok((seq, done)) => {
+                                if done {
+                                    let _ = seq.token_tx.try_send(StreamEvent::Done {
+                                        prompt_tokens: seq.prompt_tokens,
+                                        completion_tokens: seq.generated.len() as u32,
+                                        finish_reason: FinishReason::Stop,
+                                    });
+                                    if let Some(qb) = self.mlx_qwen35_mut() {
+                                        let _ = qb.remove_seq(next_seq_id);
+                                    }
+                                } else {
+                                    active.insert(next_seq_id, seq);
+                                }
+                                next_seq_id += 1;
+                            }
+                            Err(e) => {
+                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    Ok(other) => {
+                        self.dispatch_request_sequential(other);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            }
+
+            // Nothing active: block for the next request rather than spin.
+            if active.is_empty() {
+                match rx.recv().await {
+                    Some(req) => {
+                        self.dispatch_request_sequential(req);
+                        continue;
+                    }
+                    None => return,
+                }
+            }
+
+            // 2. One greedy decode step across all active seqs.
+            let ids: Vec<u64> = active.keys().copied().collect();
+            let last_tokens: Vec<u32> = ids.iter().map(|id| active[id].last_token).collect();
+            let positions: Vec<usize> = ids.iter().map(|id| active[id].position).collect();
+
+            let t_step = std::time::Instant::now();
+            let results = {
+                let qb = match self.mlx_qwen35_mut() {
+                    Some(q) => q,
+                    None => {
+                        eprintln!("[mlx batched] non-Qwen35 backend unreachable");
+                        return;
+                    }
+                };
+                qb.decode_step_batch(&ids, &last_tokens, &positions)
+            };
+            let results = match results {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[mlx batched] decode_step_batch failed: {e}");
+                    for (_id, seq) in active.drain() {
+                        let _ = seq.token_tx.try_send(StreamEvent::Error(e.to_string()));
+                    }
+                    continue;
+                }
+            };
+
+            // 3. Per-seq emit + EOS / max-tokens check.
+            let mut to_remove: Vec<u64> = Vec::new();
+            for (row, &id) in ids.iter().enumerate() {
+                let (next_tok, new_pos) = results[row];
+                let detok = self.mlx_qwen35().and_then(|qb| {
+                    let seq = active.get(&id)?;
+                    let mut g = seq.generated.clone();
+                    g.push(next_tok);
+                    qb.decode(&g).ok()
+                });
+                let seq = active.get_mut(&id).unwrap();
+                seq.generated.push(next_tok);
+                seq.last_token = next_tok;
+                seq.position = new_pos;
+                if let Some(text) = detok {
+                    if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
+                        let delta = text[seq.prev_text.len()..].to_string();
+                        if !delta.is_empty() {
+                            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
+                            seq.prev_text = text;
+                        }
+                    }
+                }
+                if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
+                    let n_gen = seq.generated.len();
+                    let _ = seq.token_tx.try_send(StreamEvent::Done {
+                        prompt_tokens: seq.prompt_tokens,
+                        completion_tokens: n_gen as u32,
+                        finish_reason: FinishReason::Stop,
+                    });
+                    to_remove.push(id);
+                }
+            }
+
+            let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[mlx batched] step: N={} latency={:.1}ms agg={:.1} tok/s",
+                ids.len(),
+                step_ms,
+                ids.len() as f64 / (step_ms / 1000.0),
+            );
+
+            for id in to_remove {
+                active.remove(&id);
+                if let Some(qb) = self.mlx_qwen35_mut() {
+                    let _ = qb.remove_seq(id);
+                }
+            }
+        }
+    }
+
+    /// Eligibility for the greedy MLX batched scheduler: plain chat only.
+    #[cfg(feature = "mlx-native")]
+    fn mlx_batch_eligible(req: &ChatCompletionRequest) -> bool {
+        req.temperature == 0.0
+            && req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+            && req.response_format.is_none()
+            && req.stop.is_none()
+    }
+
+    /// Prefill a new MLX-native streaming sequence under `seq_id`. Unlike the
+    /// Candle `start_streaming_seq_qwen35` (which warms `prompt[..len-1]` and
+    /// enters the loop on the last prompt token), the MLX `prefill` consumes the
+    /// FULL prompt and returns the FIRST GENERATED token — so that token is
+    /// emitted here and seeded into `generated`; the decode loop continues from
+    /// it. Returns `(state, done)` where `done` is true when the first token is
+    /// already EOS / hits the cap (the caller finalizes without inserting).
+    #[cfg(feature = "mlx-native")]
+    fn start_streaming_seq_mlx(
+        &mut self,
+        seq_id: u64,
+        messages: &[ChatMessage],
+        max_tokens: usize,
+        thinking: bool,
+        token_tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<(ActiveSeqState, bool)> {
+        let qb = self
+            .mlx_qwen35_mut()
+            .ok_or_else(|| anyhow::anyhow!("start_streaming_seq_mlx: not a Qwen35 MLX backend"))?;
+
+        let msg_pairs: Vec<(String, String)> = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking)?;
+        let prompt_tokens = prompt_ids.len() as u32;
+        let eos_tokens = qb.eos_tokens().to_vec();
+        let max_new = if max_tokens == 0 { 256 } else { max_tokens };
+
+        let t_prefill = std::time::Instant::now();
+        let (first_tok, position) = qb
+            .prefill(seq_id, &prompt_ids)
+            .map_err(|e| anyhow::anyhow!("prefill seq {seq_id}: {e}"))?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[mlx batched] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s)",
+            prompt_ids.len(),
+            prompt_ids.len() as f64 / (prefill_ms / 1000.0),
+        );
+
+        // first_tok is the first generated token: emit it and seed `generated`.
+        let generated = vec![first_tok];
+        let first_text = qb.decode(&generated).unwrap_or_default();
+        let mut prev_text = String::new();
+        if !first_text.contains('\u{FFFD}') && !first_text.is_empty() {
+            let _ = token_tx.try_send(StreamEvent::Delta(first_text.clone()));
+            prev_text = first_text;
+        }
+        let done = eos_tokens.contains(&first_tok) || generated.len() >= max_new;
+
+        let state = ActiveSeqState {
+            seq_id,
+            token_tx,
+            prompt_len: prompt_ids.len(),
+            generated,
+            max_new,
+            last_token: first_tok,
+            position,
+            prev_text,
+            prompt_tokens,
+            decode_start: std::time::Instant::now(),
+            temperature: 0.0,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+            eos_tokens,
+            pending_emit: None,
+            prefill_remaining: None,
+        };
+        Ok((state, done))
     }
 
     /// Prefill a new streaming seq under `seq_id`; returns the active-state
