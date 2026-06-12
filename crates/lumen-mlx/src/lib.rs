@@ -182,6 +182,36 @@ trait Runner {
         last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)>;
+    /// Phase 1: advance N sequences by one token each, returning
+    /// `(next_token, position)` per input index. The default implementation
+    /// loops over [`Runner::decode_step`] and is therefore **bit-identical** to
+    /// N independent single-seq decodes — it lets a multi-sequence scheduler
+    /// drive all active seqs in one tick. The native runner overrides this with
+    /// a single batched forward (Phase 1b: the model trunk + SSM kernel are
+    /// already batch-shaped), keeping this signature stable across that swap.
+    /// `seq_ids`, `last_tokens`, `positions` must be equal length, aligned by
+    /// index.
+    fn decode_step_batch(
+        &mut self,
+        seq_ids: &[u64],
+        last_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        if seq_ids.len() != last_tokens.len() || seq_ids.len() != positions.len() {
+            return Err(anyhow!(
+                "decode_step_batch: mismatched input lengths \
+                 (seqs={}, tokens={}, positions={})",
+                seq_ids.len(),
+                last_tokens.len(),
+                positions.len()
+            ));
+        }
+        let mut out = Vec::with_capacity(seq_ids.len());
+        for i in 0..seq_ids.len() {
+            out.push(self.decode_step(seq_ids[i], last_tokens[i], positions[i])?);
+        }
+        Ok(out)
+    }
     fn remove_seq(&mut self, seq_id: u64) -> Result<()>;
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
     fn forward_probe(&mut self, seq_id: u64, tokens: &[u32]) -> Result<ProbeRows>;
@@ -443,6 +473,19 @@ impl RunnerImpl {
     ) -> Result<(u32, usize)> {
         self.as_runner_mut()
             .decode_step(seq_id, last_token, position)
+    }
+
+    fn decode_step_batch(
+        &mut self,
+        seq_ids: &[u64],
+        last_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        // Forward to the active runner so the native runner's batched override
+        // (Phase 1b) is used; the default loop only applies to runners that
+        // don't override it.
+        self.as_runner_mut()
+            .decode_step_batch(seq_ids, last_tokens, positions)
     }
 
     fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
@@ -1720,6 +1763,20 @@ impl MlxQwen35Backend {
         position: usize,
     ) -> Result<(u32, usize)> {
         self.runner.decode_step(seq_id, last_token, position)
+    }
+
+    /// Phase 1: advance N already-prefilled sequences by one token each in a
+    /// single call, returning `(next_token, position)` per input index. Used by
+    /// the multi-sequence batched scheduler (Phase 2). Currently a bit-identical
+    /// loop over per-seq decode; swaps to a single batched forward in Phase 1b.
+    pub fn decode_step_batch(
+        &mut self,
+        seq_ids: &[u64],
+        last_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        self.runner
+            .decode_step_batch(seq_ids, last_tokens, positions)
     }
 
     /// Drains the per-step `(forward_ms, tail_ms)` timing log captured by the
@@ -4924,5 +4981,47 @@ mod tests {
         fn fork_from_snapshot(&mut self, _snapshot_id: u64, _dst_seq_id: u64) -> Result<usize> {
             Ok(0)
         }
+    }
+
+    #[test]
+    fn decode_step_batch_default_loops_per_seq() {
+        // The default `decode_step_batch` must equal N independent `decode_step`
+        // calls. ScriptedRunner::decode_step returns (last_token+1, position+1),
+        // so a 3-seq batch maps each (last, pos) -> (last+1, pos+1) in order.
+        let mut r = ScriptedRunner::default();
+        let got = r
+            .decode_step_batch(&[1, 2, 3], &[10, 20, 30], &[5, 6, 7])
+            .unwrap();
+        assert_eq!(got, vec![(11, 6), (21, 7), (31, 8)]);
+
+        // Equivalence: the batch result equals calling decode_step per seq.
+        let mut r2 = ScriptedRunner::default();
+        let seq_ids = [7u64, 8, 9];
+        let last = [100u32, 200, 300];
+        let pos = [1usize, 2, 3];
+        let per_seq: Vec<(u32, usize)> = seq_ids
+            .iter()
+            .zip(last.iter())
+            .zip(pos.iter())
+            .map(|((&s, &l), &p)| r2.decode_step(s, l, p).unwrap())
+            .collect();
+        let mut r3 = ScriptedRunner::default();
+        let batched = r3.decode_step_batch(&seq_ids, &last, &pos).unwrap();
+        assert_eq!(batched, per_seq);
+    }
+
+    #[test]
+    fn decode_step_batch_rejects_mismatched_lengths() {
+        let mut r = ScriptedRunner::default();
+        assert!(
+            r.decode_step_batch(&[1, 2], &[10], &[5, 6]).is_err(),
+            "mismatched token length must error"
+        );
+        assert!(
+            r.decode_step_batch(&[1, 2], &[10, 20], &[5]).is_err(),
+            "mismatched position length must error"
+        );
+        // Empty batch is a valid no-op.
+        assert_eq!(r.decode_step_batch(&[], &[], &[]).unwrap(), vec![]);
     }
 }
