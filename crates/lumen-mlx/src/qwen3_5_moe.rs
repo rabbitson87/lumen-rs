@@ -1059,6 +1059,27 @@ mod imp {
         head_dim: i32,
     }
 
+    /// Pre-RoPE full-attn projection output (Phase 1b Stage 1). Holds the
+    /// post-projection, post-per-head-RMSNorm, post-transpose Q/K/V + gate —
+    /// everything `full_attn_qkv_rope` produces *before* applying RoPE. The
+    /// batched decode path computes this once over `[N,1,hidden]` (amortizing
+    /// the weight-bound q/k/v projections) then applies RoPE + SDPA per seq
+    /// (each at its own cache offset). `rope_dim`/`base_theta` are carried so the
+    /// per-seq RoPE can be applied downstream.
+    struct FullAttnProj {
+        queries_t: Array,
+        k_t: Array,
+        v_t: Array,
+        gate: Array,
+        scale: f32,
+        b: i32,
+        l: i32,
+        num_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        base_theta: f32,
+    }
+
     impl NativeQwen3_5MoeModel {
         /// Load + validate a checkpoint laid out as a directory containing
         /// `config.json` and one or more `*.safetensors` shards.
@@ -1379,6 +1400,56 @@ mod imp {
             layer_idx: usize,
             offset: i32,
         ) -> Result<FullAttnQkv> {
+            // Projections + per-head norm (batched, weight-bound) then RoPE.
+            // Single-seq callers get a thin wrapper over the Stage-1 split, so
+            // this path is bit-identical to the pre-split implementation.
+            let p = self.full_attn_proj_no_rope(x, layer_idx)?;
+            let (q_rope, k_rope) =
+                self.apply_full_attn_rope(&p.queries_t, &p.k_t, p.rope_dim, p.base_theta, offset)?;
+            Ok(FullAttnQkv {
+                q_rope,
+                k_rope,
+                v_t: p.v_t,
+                gate: p.gate,
+                scale: p.scale,
+                b: p.b,
+                l: p.l,
+                num_heads: p.num_heads,
+                head_dim: p.head_dim,
+            })
+        }
+
+        /// Apply partial-rotary GPT-NeoX RoPE to the transposed Q/K at `offset`
+        /// (the cache token position). Honors `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS`.
+        /// Factored out of `full_attn_qkv_rope` so the batched decode path can
+        /// apply RoPE per seq at each seq's own offset.
+        fn apply_full_attn_rope(
+            &self,
+            queries_t: &Array,
+            k_t: &Array,
+            rope_dim: i32,
+            base_theta: f32,
+            offset: i32,
+        ) -> Result<(Array, Array)> {
+            let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if use_precomputed_freqs {
+                let freqs = &self.const_rope_freqs;
+                let q = rope_with_freqs(queries_t, rope_dim, false, 1.0, offset, freqs)?;
+                let k = rope_with_freqs(k_t, rope_dim, false, 1.0, offset, freqs)?;
+                Ok((q, k))
+            } else {
+                let q = rope(queries_t, rope_dim, false, base_theta, 1.0, offset)?;
+                let k = rope(k_t, rope_dim, false, base_theta, 1.0, offset)?;
+                Ok((q, k))
+            }
+        }
+
+        /// Steps (1)-(3) of the full-attn forward: q/k/v projections, gate split,
+        /// per-head RMSNorm, transpose — everything *before* RoPE. Batch-generic
+        /// (`b` read from `x.shape()[0]`). Returns the pre-RoPE Q/K/V + gate.
+        fn full_attn_proj_no_rope(&self, x: &Array, layer_idx: usize) -> Result<FullAttnProj> {
             if x.ndim() != 3 {
                 return Err(anyhow!(
                     "layer_full_attn_forward: expected x of rank 3 [B, L, hidden], got ndim={}",
@@ -1459,30 +1530,12 @@ mod imp {
             let v_t = mlx_rs::ops::transpose_axes(&v_4d, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose values failed")?;
 
-            // (4) Partial-rotary GPT-NeoX RoPE on queries + keys.
-            // `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS=1`
-            // supplies the cached inv-freq table → MLX dispatches the
-            // `rope_freqs_*` kernel variant (matches mlx-lm's path).
-            // Default-off opt-in; Gemma 4 A/B at 4K was WASH (MLX dedup),
-            // kept available for future verification and parity with
-            // mlx-lm shader trace.
-            let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let (q_rope, k_rope) = if use_precomputed_freqs {
-                let freqs = &self.const_rope_freqs;
-                let q = rope_with_freqs(&queries_t, rope_dim, false, 1.0, offset, freqs)?;
-                let k = rope_with_freqs(&k_t, rope_dim, false, 1.0, offset, freqs)?;
-                (q, k)
-            } else {
-                let q = rope(&queries_t, rope_dim, false, base_theta, 1.0, offset)?;
-                let k = rope(&k_t, rope_dim, false, base_theta, 1.0, offset)?;
-                (q, k)
-            };
-
-            Ok(FullAttnQkv {
-                q_rope,
-                k_rope,
+            // RoPE (step 4) is applied by the caller via `apply_full_attn_rope`
+            // — batched single-seq through `full_attn_qkv_rope`, or per-seq at
+            // each seq's own offset in the batched decode path.
+            Ok(FullAttnProj {
+                queries_t,
+                k_t,
                 v_t,
                 gate,
                 scale,
@@ -1490,6 +1543,8 @@ mod imp {
                 l,
                 num_heads,
                 head_dim,
+                rope_dim,
+                base_theta,
             })
         }
 
@@ -1532,6 +1587,57 @@ mod imp {
             // (8) o_proj: project back to hidden_size.
             let o_proj_raw = self.linear_pre(&lw.o_proj, &gated)?;
             Self::to_f32(o_proj_raw, &format!("layer{layer_idx}.o_proj"))
+        }
+
+        /// Phase 1b Stage 1: batched full-attn over `[N,1,hidden]` with N per-seq
+        /// caches. The weight-bound q/k/v/o projections + gate run ONCE over all
+        /// N tokens (the throughput lever); only the cheap per-seq RoPE + SDPA
+        /// loop (each at its own cache offset / KV history). Bit-identical to the
+        /// per-seq single-attn path by construction — same projection math, same
+        /// per-seq RoPE/SDPA. Plain (non-TurboQuant) caches only; the caller
+        /// routes TurboQuant layers to the per-seq whole-layer fallback.
+        fn layer_full_attn_forward_batch(
+            &self,
+            x: &Array,
+            layer_idx: usize,
+            caches: &mut [&mut NativeLayerCache],
+        ) -> Result<Array> {
+            let p = self.full_attn_proj_no_rope(x, layer_idx)?;
+            let mut attn_parts: Vec<Array> = Vec::with_capacity(caches.len());
+            for (i, c) in caches.iter_mut().enumerate() {
+                let idx_i = Array::from_slice(&[i as i32], &[1]);
+                let q_i = p
+                    .queries_t
+                    .take_axis(&idx_i, 0)
+                    .context("layer_full_attn_forward_batch: slice queries failed")?;
+                let k_i = p
+                    .k_t
+                    .take_axis(&idx_i, 0)
+                    .context("layer_full_attn_forward_batch: slice keys failed")?;
+                let v_i = p
+                    .v_t
+                    .take_axis(&idx_i, 0)
+                    .context("layer_full_attn_forward_batch: slice values failed")?;
+                let kv = c.as_full_mut()?;
+                let offset_i = kv.offset() as i32;
+                let (q_rope, k_rope) =
+                    self.apply_full_attn_rope(&q_i, &k_i, p.rope_dim, p.base_theta, offset_i)?;
+                let (k_full, v_full) = kv.update_and_fetch(&k_rope, &v_i)?;
+                let attn_i = sdpa(&q_rope, &k_full, &v_full, p.scale, /* causal */ false)?;
+                attn_parts.push(attn_i);
+            }
+            let refs: Vec<&Array> = attn_parts.iter().collect();
+            let attn_stacked = mlx_rs::ops::concatenate_axis(&refs, 0)
+                .context("layer_full_attn_forward_batch: stack attn outputs failed")?;
+            self.full_attn_finish(
+                &attn_stacked,
+                &p.gate,
+                p.b,
+                p.l,
+                p.num_heads,
+                p.head_dim,
+                layer_idx,
+            )
         }
 
         /// Linear-attention (`GatedDeltaNet`) layer body.
@@ -2353,28 +2459,40 @@ mod imp {
                     }
                     out
                 } else {
-                    // Full-attn: per-seq whole-layer loop (bit-identical to single-seq).
-                    let mut parts: Vec<Array> = Vec::with_capacity(n);
-                    for (i, c) in caches.iter_mut().enumerate() {
-                        let idx_i = Array::from_slice(&[i as i32], &[1]);
-                        let normed_i = normed
-                            .take_axis(&idx_i, 0)
-                            .context("forward_decode_batch: slice seq for full-attn failed")?;
-                        let lc = c.layer_mut(layer_idx).ok_or_else(|| {
-                            anyhow!("forward_decode_batch: layer {layer_idx} missing")
-                        })?;
-                        let attn_i = if matches!(lc, NativeLayerCache::FullTurboquant(_)) {
-                            let tq = lc.as_full_turboquant_mut()?;
-                            self.layer_full_attn_forward_tq(&normed_i, layer_idx, false, tq)?
-                        } else {
-                            let kv = lc.as_full_mut()?;
-                            self.layer_full_attn_forward(&normed_i, layer_idx, false, kv)?
-                        };
-                        parts.push(attn_i);
+                    // Full-attn. Plain (bf16) caches batch the q/k/v/o projections
+                    // (Stage 1); TurboQuant caches fall back to per-seq whole-layer.
+                    let is_tq = matches!(
+                        caches[0].layer_mut(layer_idx).ok_or_else(|| anyhow!(
+                            "forward_decode_batch: layer {layer_idx} missing"
+                        ))?,
+                        NativeLayerCache::FullTurboquant(_)
+                    );
+                    if is_tq {
+                        let mut parts: Vec<Array> = Vec::with_capacity(n);
+                        for (i, c) in caches.iter_mut().enumerate() {
+                            let idx_i = Array::from_slice(&[i as i32], &[1]);
+                            let normed_i = normed.take_axis(&idx_i, 0).context(
+                                "forward_decode_batch: slice seq for TQ full-attn failed",
+                            )?;
+                            let tq = c.layer_mut(layer_idx).unwrap().as_full_turboquant_mut()?;
+                            parts.push(
+                                self.layer_full_attn_forward_tq(&normed_i, layer_idx, false, tq)?,
+                            );
+                        }
+                        let refs: Vec<&Array> = parts.iter().collect();
+                        mlx_rs::ops::concatenate_axis(&refs, 0)
+                            .context("forward_decode_batch: stack TQ full-attn outputs failed")?
+                    } else {
+                        let mut layer_caches: Vec<&mut NativeLayerCache> = caches
+                            .iter_mut()
+                            .map(|c| {
+                                c.layer_mut(layer_idx).ok_or_else(|| {
+                                    anyhow!("forward_decode_batch: layer {layer_idx} missing")
+                                })
+                            })
+                            .collect::<Result<_>>()?;
+                        self.layer_full_attn_forward_batch(&normed, layer_idx, &mut layer_caches)?
                     }
-                    let refs: Vec<&Array> = parts.iter().collect();
-                    mlx_rs::ops::concatenate_axis(&refs, 0)
-                        .context("forward_decode_batch: stack full-attn outputs failed")?
                 };
 
                 let h = mlx_rs::ops::add(&hidden_states, &attn)
