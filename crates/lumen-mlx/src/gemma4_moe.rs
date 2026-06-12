@@ -6005,6 +6005,151 @@ pub(crate) mod imp {
             Ok(h)
         }
 
+        /// Phase 3: post-attention body of a decoder layer (post_attn_norm +
+        /// residual, dense MLP, MoE, epilogue), as a standalone helper so the
+        /// batched decode path can run it ONCE over `[N,1,H]` after looping the
+        /// attention per seq. This uses the UNFUSED (legacy) compute path — which
+        /// is exactly what the single-seq `decoder_layer_forward` runs by default
+        /// for NVFP4 experts (the fused routing+experts slot requires
+        /// `mode == MODE_AFFINE`, group 64; NVFP4 falls to the legacy branch) and
+        /// when the opt-in dense-MLP / epilogue fuses are off (both default OFF).
+        /// So for the production nvfp4 Gemma 4 it is bit-identical to the
+        /// single-seq layer; parity is asserted live. `residual_in` is the layer
+        /// input x; `attn_out` is the attention output.
+        fn decoder_layer_post_attn(
+            &self,
+            residual_in: &Array,
+            attn_out: &Array,
+            layer_idx: usize,
+        ) -> Result<Array> {
+            let lw = &self.layers[layer_idx];
+            let eps = self.config.text_config.rms_norm_eps;
+
+            let h = rms_norm(attn_out, &lw.post_attention_layernorm, eps)
+                .context("post_attn: post_attention_layernorm")?;
+            let h = mlx_rs::ops::add(residual_in, &h).context("post_attn: +residual (attn)")?;
+            let residual: &Array = &h;
+
+            // Dense MLP (unfused): pre_ff_norm → mlp → post_ff_1.
+            let h1 = rms_norm(&h, &lw.pre_feedforward_layernorm, eps)
+                .context("post_attn: pre_feedforward_layernorm")?;
+            let h1 = Self::dense_mlp_forward(&h1, &lw.dense_mlp)?;
+            let h1 = rms_norm(&h1, &lw.post_feedforward_layernorm_1, eps)
+                .context("post_attn: post_feedforward_layernorm_1")?;
+
+            // MoE (unfused legacy): router → pre_norm → experts → post_norm.
+            let (indices, weights) = self.router_forward(&h, &lw.router)?;
+            let h2 = rms_norm(&h, &lw.pre_feedforward_layernorm_2, eps)
+                .context("post_attn: pre_feedforward_layernorm_2")?;
+            let h2 = self.experts_forward(&h2, &indices, &weights, &lw.experts)?;
+            let h2 = rms_norm(&h2, &lw.post_feedforward_layernorm_2, eps)
+                .context("post_attn: post_feedforward_layernorm_2")?;
+
+            // Epilogue (unfused): add → post_ff_norm → +residual → ×layer_scalar.
+            let h = mlx_rs::ops::add(&h1, &h2).context("post_attn: h1 + h2")?;
+            let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
+                .context("post_attn: post_feedforward_layernorm")?;
+            let h = mlx_rs::ops::add(residual, &h).context("post_attn: +residual (ff)")?;
+            mlx_rs::ops::multiply(&h, &lw.layer_scalar).context("post_attn: × layer_scalar")
+        }
+
+        /// Phase 3: one batched decode forward over N single-token sequences,
+        /// each with its own per-seq Gemma 4 cache. Mirrors Qwen's
+        /// `forward_decode_batch`: the weight-bound embed/dense-MLP/MoE/lm_head
+        /// run batched over `[N,1,H]`, while the attention loops per seq (each at
+        /// its OWN rotating sliding-window cache offset — so the windows rotate
+        /// independently, no ragged-window mask needed). Returns one argmax token
+        /// per seq. N==1 is handled by the caller via the single-seq decode path.
+        pub fn forward_decode_batch(
+            &self,
+            tokens: &[u32],
+            caches: &mut [&mut NativeGemma4PromptCache],
+        ) -> Result<Vec<u32>> {
+            let cfg = &self.config.text_config;
+            assert_eq!(
+                cfg.hidden_size_per_layer_input, 0,
+                "forward_decode_batch: hidden_size_per_layer_input > 0 not supported"
+            );
+            let n = tokens.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            if caches.len() != n {
+                return Err(anyhow!(
+                    "forward_decode_batch: caches.len()={} != tokens.len()={n}",
+                    caches.len()
+                ));
+            }
+            let n_layers = cfg.num_hidden_layers;
+            for (i, c) in caches.iter().enumerate() {
+                if c.len() != n_layers {
+                    return Err(anyhow!(
+                        "forward_decode_batch: cache[{i}].len()={} != num_layers={n_layers}",
+                        c.len()
+                    ));
+                }
+            }
+            let nn = n as i32;
+            let hidden = cfg.hidden_size as i32;
+
+            // Embed: one token per seq → [N, hidden] → [N, 1, hidden] × scale.
+            let ids_i32: Vec<i32> = tokens.iter().map(|&u| u as i32).collect();
+            let ids_arr = Array::from_slice(&ids_i32, &[nn]);
+            let embed_rows = self.embed_lookup_affine(&ids_arr)?;
+            let h = mlx_rs::ops::reshape(&embed_rows, &[nn, 1, hidden])
+                .context("forward_decode_batch: reshape embed [N,1,H]")?;
+            let mut h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
+                .context("forward_decode_batch: × sqrt(hidden)")?;
+
+            for idx in 0..n_layers {
+                let lw = &self.layers[idx];
+                let normed = rms_norm(&h, &lw.input_layernorm, cfg.rms_norm_eps)
+                    .context("forward_decode_batch: input_layernorm")?;
+                // Per-seq attention (sliding + global), each on its own cache.
+                let mut attn_parts: Vec<Array> = Vec::with_capacity(n);
+                for (i, c) in caches.iter_mut().enumerate() {
+                    let idx_i = Array::from_slice(&[i as i32], &[1]);
+                    let normed_i = mlx_rs::ops::indexing::take_axis(&normed, &idx_i, 0)
+                        .context("forward_decode_batch: slice seq for attention")?;
+                    let lc = c.layer_mut(idx).ok_or_else(|| {
+                        anyhow!("forward_decode_batch: cache layer {idx} missing")
+                    })?;
+                    let attn_i = self.layer_attention_forward(&normed_i, idx, lc)?;
+                    attn_parts.push(attn_i);
+                }
+                let refs: Vec<&Array> = attn_parts.iter().collect();
+                let attn_batch = mlx_rs::ops::concatenate_axis(&refs, 0)
+                    .context("forward_decode_batch: stack attention outputs")?;
+                h = self.decoder_layer_post_attn(&h, &attn_batch, idx)?;
+            }
+
+            let h = rms_norm(&h, &self.final_norm, cfg.rms_norm_eps)
+                .context("forward_decode_batch: final_norm")?;
+            let logits = self.tied_lm_head_plus_softcap(&h)?;
+            self.argmax_rows(&logits)
+        }
+
+        /// Per-row argmax over `[N, 1, vocab]` logits → `Vec<u32>` of length N
+        /// (single eval via `try_as_slice`). Phase 3 batched-decode counterpart
+        /// of `argmax_last_token` (which is `[1,1]`-only).
+        fn argmax_rows(&self, logits: &Array) -> Result<Vec<u32>> {
+            if logits.ndim() != 3 {
+                return Err(anyhow!(
+                    "argmax_rows: expected [N, 1, V] logits, got ndim={}",
+                    logits.ndim()
+                ));
+            }
+            let idx0 = Array::from_int(0);
+            let rows = mlx_rs::ops::indexing::take_axis(logits, &idx0, 1)
+                .context("argmax_rows: take_axis(0, axis=1)")?;
+            let am = mlx_rs::ops::indexing::argmax_axis(&rows, -1, /* keep_dims */ false)
+                .context("argmax_rows: argmax_axis(-1)")?;
+            let slice = am
+                .try_as_slice::<u32>()
+                .map_err(|err| anyhow!("argmax_rows: read failed: {err}"))?;
+            Ok(slice.to_vec())
+        }
+
         /// Embedding lookup with affine-quant rows (4-bit) + biases support.
         /// `quantized_embedding_lookup_with_mode` in `native_embedding` is
         /// hard-coded to `biases=None`, which is fine for MXFP4 but misses

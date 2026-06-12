@@ -465,8 +465,20 @@ pub(crate) mod imp {
             .collect()
     }
 
+    /// Phase 3: live per-sequence decode state for the batched scheduler.
+    /// Holds one independent rotating Gemma 4 cache + its token position. Mirrors
+    /// the Qwen runner's `NativeSeqState`; populated at `prefill`, advanced at
+    /// `decode_step`/`decode_step_batch`, dropped at `remove_seq`.
+    struct NativeGemma4SeqState {
+        cache: crate::gemma4_moe::imp::NativeGemma4PromptCache,
+        position: usize,
+    }
+
     pub struct Gemma4Backend {
         model: NativeGemma4Model,
+        /// Phase 3: per-seq live decode caches keyed by seq_id, for the batched
+        /// scheduler. Separate from `prefix_caches` (snapshots, not live decode).
+        seqs: HashMap<u64, NativeGemma4SeqState>,
         chat: Gemma4ChatTemplate,
         /// Minijinja-based renderer that evaluates the model's upstream
         /// `chat_template.jinja` directly. Initialized only when
@@ -533,6 +545,7 @@ pub(crate) mod imp {
             };
             Ok(Self {
                 model,
+                seqs: HashMap::new(),
                 chat,
                 jinja_chat,
                 model_id: model_id.into(),
@@ -855,6 +868,131 @@ pub(crate) mod imp {
 
         pub fn model(&self) -> &NativeGemma4Model {
             &self.model
+        }
+
+        /// Phase 3: EOS token id set for the loaded Gemma 4 model.
+        pub fn eos_tokens(&self) -> &[u32] {
+            self.model.eos_tokens()
+        }
+
+        /// Phase 3: prefill `tokens` as a fresh live decode sequence `seq_id`,
+        /// returning `(first_generated_token, position)`. Mirrors the MLX prefill
+        /// convention (full prompt consumed; returns the first generated token).
+        pub fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            let mut cache = self.make_cache_for_prompt_len(tokens.len());
+            let logits = self
+                .model
+                .forward_last_token(tokens, &mut cache)
+                .with_context(|| format!("gemma4 prefill seq {seq_id}"))?;
+            let first_tok = self.model.argmax_last_token(&logits)?;
+            self.seqs.insert(
+                seq_id,
+                NativeGemma4SeqState {
+                    cache,
+                    position: tokens.len(),
+                },
+            );
+            Ok((first_tok, tokens.len()))
+        }
+
+        /// Phase 3: advance one live sequence by a single token (greedy).
+        pub fn decode_step(
+            &mut self,
+            seq_id: u64,
+            last_token: u32,
+            _position: usize,
+        ) -> Result<(u32, usize)> {
+            let model = &self.model;
+            let state = self
+                .seqs
+                .get_mut(&seq_id)
+                .ok_or_else(|| anyhow!("gemma4 decode_step: unknown seq_id {seq_id}"))?;
+            let logits = model
+                .forward_last_token(&[last_token], &mut state.cache)
+                .with_context(|| format!("gemma4 decode_step seq {seq_id}"))?;
+            let tok = model.argmax_last_token(&logits)?;
+            state.position += 1;
+            Ok((tok, state.position))
+        }
+
+        /// Phase 3: batched decode of N live sequences in ONE forward. N==1
+        /// delegates to `decode_step` (byte-identical). N>=2 borrows the N per-seq
+        /// caches disjointly out of `self.seqs` and runs the model's
+        /// `forward_decode_batch` (batched trunk/MoE/lm_head + per-seq sliding /
+        /// global attention, each rotating its own cache independently). Result is
+        /// aligned to `seq_ids` order; each seq's position is bumped by one.
+        pub fn decode_step_batch(
+            &mut self,
+            seq_ids: &[u64],
+            last_tokens: &[u32],
+            positions: &[usize],
+        ) -> Result<Vec<(u32, usize)>> {
+            let n = seq_ids.len();
+            if last_tokens.len() != n || positions.len() != n {
+                return Err(anyhow!(
+                    "gemma4 decode_step_batch: mismatched lengths (seqs={n}, tokens={}, positions={})",
+                    last_tokens.len(),
+                    positions.len()
+                ));
+            }
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            if n == 1 {
+                return Ok(vec![self.decode_step(
+                    seq_ids[0],
+                    last_tokens[0],
+                    positions[0],
+                )?]);
+            }
+            let id_set: std::collections::HashSet<u64> = seq_ids.iter().copied().collect();
+            if id_set.len() != n {
+                return Err(anyhow!(
+                    "gemma4 decode_step_batch: duplicate seq_id in batch"
+                ));
+            }
+            let model = &self.model;
+            let mut by_id: HashMap<u64, &mut NativeGemma4SeqState> = self
+                .seqs
+                .iter_mut()
+                .filter(|(k, _)| id_set.contains(k))
+                .map(|(k, v)| (*k, v))
+                .collect();
+            if by_id.len() != n {
+                return Err(anyhow!(
+                    "gemma4 decode_step_batch: {} of {n} seq_ids found",
+                    by_id.len()
+                ));
+            }
+            let mut states: Vec<&mut NativeGemma4SeqState> = Vec::with_capacity(n);
+            for sid in seq_ids {
+                states.push(by_id.remove(sid).expect("checked present above"));
+            }
+            let next = {
+                let mut caches: Vec<&mut crate::gemma4_moe::imp::NativeGemma4PromptCache> =
+                    states.iter_mut().map(|s| &mut s.cache).collect();
+                model
+                    .forward_decode_batch(last_tokens, &mut caches)
+                    .context("gemma4 decode_step_batch: forward_decode_batch")?
+            };
+            if next.len() != n {
+                return Err(anyhow!(
+                    "gemma4 decode_step_batch: forward returned {} tokens for {n} seqs",
+                    next.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(n);
+            for (i, s) in states.iter_mut().enumerate() {
+                s.position += 1;
+                out.push((next[i], s.position));
+            }
+            Ok(out)
+        }
+
+        /// Phase 3: drop a live decode sequence.
+        pub fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
+            self.seqs.remove(&seq_id);
+            Ok(())
         }
 
         /// Allocate a fresh cache with the per-request adaptive decision

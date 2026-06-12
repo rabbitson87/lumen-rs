@@ -2946,6 +2946,13 @@ impl InferenceEngine {
             && matches!(
                 &self.backend,
                 ModelBackend::Mlx(b)
+                    // Qwen 3.6 only for now. Gemma 4's batched decode forward is
+                    // implemented + token-level verified, but Gemma 4 emits a
+                    // reasoning channel even at thinking=false, and the batched
+                    // scheduler's naive detok doesn't separate reasoning from
+                    // visible text the way the sequential path does — so routing
+                    // Gemma 4 here would leak "thought" into visible content.
+                    // Re-enable once the batched streamer is channel-aware.
                     if matches!(b.kind(), lumen_mlx::MlxBackendKind::Qwen35Family)
             );
         #[cfg(feature = "mlx-native")]
@@ -4071,21 +4078,13 @@ impl InferenceEngine {
     /// `decode_step_batch` (Phase 1a) — bit-identical to N sequential decodes,
     /// so this delivers multi-user latency fairness; Phase 1b swaps in the true
     /// batched forward for throughput scaling with no change here.
-    /// `&mut` accessor to the inner Qwen3.6 MLX backend, or `None` when the
-    /// loaded backend isn't MLX-Qwen35. Used by the batched scheduler.
+    /// Family-agnostic `&mut dyn` driver for the batched MLX scheduler — Some for
+    /// any MLX backend (Qwen 3.6 or Gemma 4), None otherwise. Phase 3 generalized
+    /// this from the Qwen-only accessor so `run_batched_mlx` serves both families.
     #[cfg(feature = "mlx-native")]
-    fn mlx_qwen35_mut(&mut self) -> Option<&mut lumen_mlx::MlxQwen35Backend> {
+    fn mlx_batched_driver(&mut self) -> Option<&mut dyn lumen_mlx::MlxBatchedSeqDriver> {
         match &mut self.backend {
-            ModelBackend::Mlx(b) => b.as_qwen35_mut(),
-            _ => None,
-        }
-    }
-
-    /// Immutable counterpart of [`Self::mlx_qwen35_mut`].
-    #[cfg(feature = "mlx-native")]
-    fn mlx_qwen35(&self) -> Option<&lumen_mlx::MlxQwen35Backend> {
-        match &self.backend {
-            ModelBackend::Mlx(b) => b.as_qwen35(),
+            ModelBackend::Mlx(b) => Some(b.batched_seq_driver_mut()),
             _ => None,
         }
     }
@@ -4132,7 +4131,7 @@ impl InferenceEngine {
                                         completion_tokens: seq.generated.len() as u32,
                                         finish_reason: FinishReason::Stop,
                                     });
-                                    if let Some(qb) = self.mlx_qwen35_mut() {
+                                    if let Some(qb) = self.mlx_batched_driver() {
                                         let _ = qb.remove_seq(next_seq_id);
                                     }
                                 } else {
@@ -4171,7 +4170,7 @@ impl InferenceEngine {
 
             let t_step = std::time::Instant::now();
             let results = {
-                let qb = match self.mlx_qwen35_mut() {
+                let qb = match self.mlx_batched_driver() {
                     Some(q) => q,
                     None => {
                         eprintln!("[mlx batched] non-Qwen35 backend unreachable");
@@ -4195,7 +4194,7 @@ impl InferenceEngine {
             let mut to_remove: Vec<u64> = Vec::new();
             for (row, &id) in ids.iter().enumerate() {
                 let (next_tok, new_pos) = results[row];
-                let detok = self.mlx_qwen35().and_then(|qb| {
+                let detok = self.mlx_batched_driver().and_then(|qb| {
                     let seq = active.get(&id)?;
                     let mut g = seq.generated.clone();
                     g.push(next_tok);
@@ -4235,7 +4234,7 @@ impl InferenceEngine {
 
             for id in to_remove {
                 active.remove(&id);
-                if let Some(qb) = self.mlx_qwen35_mut() {
+                if let Some(qb) = self.mlx_batched_driver() {
                     let _ = qb.remove_seq(id);
                 }
             }
@@ -4268,8 +4267,8 @@ impl InferenceEngine {
         token_tx: mpsc::Sender<StreamEvent>,
     ) -> Result<(ActiveSeqState, bool)> {
         let qb = self
-            .mlx_qwen35_mut()
-            .ok_or_else(|| anyhow::anyhow!("start_streaming_seq_mlx: not a Qwen35 MLX backend"))?;
+            .mlx_batched_driver()
+            .ok_or_else(|| anyhow::anyhow!("start_streaming_seq_mlx: not an MLX backend"))?;
 
         let msg_pairs: Vec<(String, String)> = messages
             .iter()

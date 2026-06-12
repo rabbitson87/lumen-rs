@@ -893,6 +893,78 @@ fn format_system_prefix(message: &(String, String)) -> String {
 ///    using the shared `native_*` primitives
 /// 2. Add a variant to this enum + `MlxBackendKind`
 /// 3. Wire arch detection in `MlxBackend::load`
+/// Phase 3: the minimal per-seq driver surface the batched MLX scheduler
+/// (`lumen-server::engine::run_batched_mlx`) needs, so one scheduler works for
+/// any MLX family (Qwen 3.6 + Gemma 4). Both backends implement it by forwarding
+/// to their inherent methods — the trait only exists so the scheduler can hold
+/// one `&mut dyn` regardless of family.
+pub trait MlxBatchedSeqDriver {
+    fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>>;
+    fn eos_tokens(&self) -> &[u32];
+    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
+    fn decode_step_batch(
+        &mut self,
+        seq_ids: &[u64],
+        last_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<(u32, usize)>>;
+    fn decode(&self, tokens: &[u32]) -> Result<String>;
+    fn remove_seq(&mut self, seq_id: u64) -> Result<()>;
+}
+
+impl MlxBatchedSeqDriver for MlxQwen35Backend {
+    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
+        MlxQwen35Backend::build_chat_input(self, m, t)
+    }
+    fn eos_tokens(&self) -> &[u32] {
+        MlxQwen35Backend::eos_tokens(self)
+    }
+    fn prefill(&mut self, s: u64, t: &[u32]) -> Result<(u32, usize)> {
+        MlxQwen35Backend::prefill(self, s, t)
+    }
+    fn decode_step_batch(
+        &mut self,
+        s: &[u64],
+        l: &[u32],
+        p: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        MlxQwen35Backend::decode_step_batch(self, s, l, p)
+    }
+    fn decode(&self, t: &[u32]) -> Result<String> {
+        MlxQwen35Backend::decode(self, t)
+    }
+    fn remove_seq(&mut self, s: u64) -> Result<()> {
+        MlxQwen35Backend::remove_seq(self, s)
+    }
+}
+
+#[cfg(feature = "mlx-native")]
+impl MlxBatchedSeqDriver for crate::gemma4::Gemma4Backend {
+    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
+        crate::gemma4::Gemma4Backend::build_chat_input(self, m, t)
+    }
+    fn eos_tokens(&self) -> &[u32] {
+        crate::gemma4::Gemma4Backend::eos_tokens(self)
+    }
+    fn prefill(&mut self, s: u64, t: &[u32]) -> Result<(u32, usize)> {
+        crate::gemma4::Gemma4Backend::prefill(self, s, t)
+    }
+    fn decode_step_batch(
+        &mut self,
+        s: &[u64],
+        l: &[u32],
+        p: &[usize],
+    ) -> Result<Vec<(u32, usize)>> {
+        crate::gemma4::Gemma4Backend::decode_step_batch(self, s, l, p)
+    }
+    fn decode(&self, t: &[u32]) -> Result<String> {
+        crate::gemma4::Gemma4Backend::decode(self, t)
+    }
+    fn remove_seq(&mut self, s: u64) -> Result<()> {
+        crate::gemma4::Gemma4Backend::remove_seq(self, s)
+    }
+}
+
 pub enum MlxBackend {
     /// Qwen 2.5 / 3.5 / 3.6 (dense + MoE). Loaded via `NativeMlxRunner`
     /// (or the legacy pyo3 / subprocess runners for fallback).
@@ -969,6 +1041,33 @@ impl MlxBackend {
             Self::Qwen35Family(m) => Some(m),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => None,
+        }
+    }
+
+    /// Mutable accessor to the inner Gemma 4 backend (Phase 3 batched scheduler).
+    #[cfg(feature = "mlx-native")]
+    pub fn as_gemma4_mut(&mut self) -> Option<&mut crate::gemma4::Gemma4Backend> {
+        match self {
+            Self::Gemma4(m) => Some(m),
+            Self::Qwen35Family(_) => None,
+        }
+    }
+
+    /// Immutable counterpart of [`as_gemma4_mut`].
+    #[cfg(feature = "mlx-native")]
+    pub fn as_gemma4(&self) -> Option<&crate::gemma4::Gemma4Backend> {
+        match self {
+            Self::Gemma4(m) => Some(m),
+            Self::Qwen35Family(_) => None,
+        }
+    }
+
+    /// Phase 3: family-agnostic `&mut dyn` driver for the batched scheduler.
+    #[cfg(feature = "mlx-native")]
+    pub fn batched_seq_driver_mut(&mut self) -> &mut dyn MlxBatchedSeqDriver {
+        match self {
+            Self::Qwen35Family(m) => m,
+            Self::Gemma4(m) => m,
         }
     }
 
