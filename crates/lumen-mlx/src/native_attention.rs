@@ -108,6 +108,104 @@ mod imp {
         final_result
     }
 
+    /// Log-sum-exp of the attention scores `scale * (Q · Kᵀ)` over the key
+    /// axis, returning `[B, H, Lq, 1]`. This is the normalization statistic a
+    /// flash-style softmax merge needs but `scaled_dot_product_attention` does
+    /// not expose. GQA is handled by broadcasting each KV head across its query
+    /// head group (kv head `j` serves query heads `[j·G, (j+1)·G)`, matching
+    /// MLX's internal repeat), so the scores here line up 1:1 with the scores
+    /// SDPA used to produce its (per-segment normalized) output.
+    pub fn attn_lse(queries: &Array, keys: &Array, scale: f32) -> Result<Array> {
+        let qs = queries.shape();
+        let ks = keys.shape();
+        let (b, h, d) = (qs[0], qs[1], qs[3]);
+        let (hkv, p) = (ks[1], ks[2]);
+        // Expand KV heads to query-head count for GQA (no-op when h == hkv).
+        let keys_exp = if h == hkv {
+            keys.clone()
+        } else {
+            let g = h / hkv;
+            let k5 = mlx_rs::ops::reshape(keys, &[b, hkv, 1, p, d])
+                .context("attn_lse: reshape keys -> [B,Hkv,1,P,D]")?;
+            let k5b = mlx_rs::ops::broadcast_to(&k5, &[b, hkv, g, p, d])
+                .context("attn_lse: broadcast keys -> [B,Hkv,G,P,D]")?;
+            mlx_rs::ops::reshape(&k5b, &[b, h, p, d])
+                .context("attn_lse: reshape keys -> [B,H,P,D]")?
+        };
+        // scores = scale * Q @ Kᵀ  → [B, H, Lq, P]
+        let kt = mlx_rs::ops::transpose_axes(&keys_exp, &[0, 1, 3, 2])
+            .context("attn_lse: transpose keys -> [B,H,D,P]")?;
+        let scores = mlx_rs::ops::matmul(queries, &kt).context("attn_lse: Q @ Kᵀ")?;
+        let scale_arr = Array::from_f32(scale);
+        let scores =
+            mlx_rs::ops::multiply(&scores, &scale_arr).context("attn_lse: scores * scale")?;
+        // logsumexp over the key axis (keepdims) → [B, H, Lq, 1]
+        let m = scores
+            .max_axis(-1, true)
+            .context("attn_lse: max over keys")?;
+        let shifted = mlx_rs::ops::subtract(&scores, &m).context("attn_lse: scores - max")?;
+        let e = mlx_rs::ops::exp(&shifted).context("attn_lse: exp")?;
+        let s = e.sum_axis(-1, true).context("attn_lse: sum exp")?;
+        let lse = mlx_rs::ops::add(&m, &mlx_rs::ops::log(&s).context("attn_lse: log sum")?)
+            .context("attn_lse: m + log(sum)")?;
+        Ok(lse)
+    }
+
+    /// Flash-style split attention: attend a single query against two disjoint,
+    /// independently-stored key/value segments (a SHARED prefix and a per-seq
+    /// suffix) and merge the results — WITHOUT ever materializing the full
+    /// `[prefix ++ suffix]` buffer. This is the mechanism behind single-copy
+    /// shared-prefix KV: the prefix K/V is stored once and referenced by every
+    /// sequence in the batch, while each sequence keeps only its own (small)
+    /// divergent suffix.
+    ///
+    /// Math: with `o_p, o_s` the per-segment SDPA outputs (each softmax-
+    /// normalized over its own segment) and `lse_p, lse_s` the segments'
+    /// log-sum-exps, the full-attention output is the lse-weighted blend
+    ///   `out = (o_p·e^{lse_p−m} + o_s·e^{lse_s−m}) / (e^{lse_p−m} + e^{lse_s−m})`,
+    /// `m = max(lse_p, lse_s)`. This is algebraically identical to a single
+    /// softmax over the concatenated keys; only floating-point reassociation
+    /// differs (so it is NOT bit-identical to the concatenated SDPA, but
+    /// matches to ~1e-4 — see `sdpa_split_matches_full`).
+    ///
+    /// Empty-segment fast paths: a zero-length prefix or suffix degrades to a
+    /// plain SDPA over the non-empty segment (no merge, exact).
+    pub fn sdpa_split(
+        queries: &Array,
+        k_prefix: &Array,
+        v_prefix: &Array,
+        k_suffix: &Array,
+        v_suffix: &Array,
+        scale: f32,
+    ) -> Result<Array> {
+        let p_len = k_prefix.shape()[2];
+        let s_len = k_suffix.shape()[2];
+        if p_len == 0 {
+            return sdpa(queries, k_suffix, v_suffix, scale, false);
+        }
+        if s_len == 0 {
+            return sdpa(queries, k_prefix, v_prefix, scale, false);
+        }
+        let o_p = sdpa(queries, k_prefix, v_prefix, scale, false)?;
+        let o_s = sdpa(queries, k_suffix, v_suffix, scale, false)?;
+        let lse_p = attn_lse(queries, k_prefix, scale)?;
+        let lse_s = attn_lse(queries, k_suffix, scale)?;
+        let m = mlx_rs::ops::maximum(&lse_p, &lse_s).context("sdpa_split: max(lse_p, lse_s)")?;
+        let wp =
+            mlx_rs::ops::exp(&mlx_rs::ops::subtract(&lse_p, &m).context("sdpa_split: lse_p-m")?)
+                .context("sdpa_split: exp(lse_p-m)")?;
+        let ws =
+            mlx_rs::ops::exp(&mlx_rs::ops::subtract(&lse_s, &m).context("sdpa_split: lse_s-m")?)
+                .context("sdpa_split: exp(lse_s-m)")?;
+        let denom = mlx_rs::ops::add(&wp, &ws).context("sdpa_split: wp+ws")?;
+        let num = mlx_rs::ops::add(
+            &mlx_rs::ops::multiply(&o_p, &wp).context("sdpa_split: o_p*wp")?,
+            &mlx_rs::ops::multiply(&o_s, &ws).context("sdpa_split: o_s*ws")?,
+        )
+        .context("sdpa_split: blend numerator")?;
+        mlx_rs::ops::divide(&num, &denom).context("sdpa_split: normalize")
+    }
+
     /// SDPA with an explicit additive mask (`0.0` for allowed positions,
     /// `-inf` for masked) — used for sliding-window attention where the
     /// vanilla causal sentinel doesn't express the window cutoff.
@@ -272,7 +370,9 @@ pub use imp::lumen_sdpa_timing;
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)]
 // Consumed by Phase 3b model assembly in runner_native.rs and Gemma 4 sliding attention.
-pub(crate) use imp::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
+pub(crate) use imp::{
+    attn_lse, build_causal_mask, build_causal_mask_abs, sdpa, sdpa_split, sdpa_with_mask,
+};
 
 // SDPA bit-identical vs MLX reference.
 //
@@ -565,5 +665,101 @@ mod parity_tests {
                 .expect("build_causal_mask")
                 .is_none()
         );
+    }
+
+    // ───────────────────── split attention (shared-prefix KV dedup) ─────────────────────
+    use super::imp::{attn_lse, sdpa_split};
+    use mlx_rs::ops::concatenate_axis;
+
+    /// Deterministic pseudo-random fill in [-1, 1) — avoids Math.random so the
+    /// test is reproducible without a fixture file.
+    fn det_fill(n: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed.wrapping_add(0x9E3779B9);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                ((x >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// `sdpa_split(prefix, suffix)` must equal a plain SDPA over the
+    /// concatenated `[prefix ++ suffix]` keys/values to ~1e-4 (FP reassociation
+    /// only). Exercises GQA (4 query heads, 2 KV heads) and the q_len=1 decode
+    /// shape the batched scheduler uses.
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn sdpa_split_matches_full() {
+        let (b, h, hkv, d) = (1i32, 4i32, 2i32, 8i32);
+        let (p_len, s_len) = (5i32, 3i32);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q = Array::from_slice(&det_fill((b * h * d) as usize, 1), &[b, h, 1, d]);
+        let kp = Array::from_slice(
+            &det_fill((b * hkv * p_len * d) as usize, 2),
+            &[b, hkv, p_len, d],
+        );
+        let vp = Array::from_slice(
+            &det_fill((b * hkv * p_len * d) as usize, 3),
+            &[b, hkv, p_len, d],
+        );
+        let ks = Array::from_slice(
+            &det_fill((b * hkv * s_len * d) as usize, 4),
+            &[b, hkv, s_len, d],
+        );
+        let vs = Array::from_slice(
+            &det_fill((b * hkv * s_len * d) as usize, 5),
+            &[b, hkv, s_len, d],
+        );
+
+        let k_full = concatenate_axis(&[&kp, &ks], 2).expect("concat k");
+        let v_full = concatenate_axis(&[&vp, &vs], 2).expect("concat v");
+        let full = sdpa(&q, &k_full, &v_full, scale, false).expect("full sdpa");
+        let split = sdpa_split(&q, &kp, &vp, &ks, &vs, scale).expect("split sdpa");
+
+        full.eval().expect("eval full");
+        split.eval().expect("eval split");
+        assert_eq!(full.shape(), split.shape(), "split/full shape mismatch");
+
+        let fa: &[f32] = full.as_slice();
+        let sa: &[f32] = split.as_slice();
+        let mut max_abs = 0.0f32;
+        for (&a, &c) in fa.iter().zip(sa.iter()) {
+            max_abs = max_abs.max((a - c).abs());
+        }
+        assert!(
+            max_abs < 1e-4,
+            "sdpa_split diverged from concatenated SDPA: max_abs={max_abs}"
+        );
+    }
+
+    /// Empty-prefix and empty-suffix fast paths degrade to a plain SDPA over the
+    /// non-empty segment (exact, not merged).
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn sdpa_split_empty_segment_paths() {
+        let (b, h, hkv, d) = (1i32, 4i32, 2i32, 8i32);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let q = Array::from_slice(&det_fill((b * h * d) as usize, 7), &[b, h, 1, d]);
+        let ks = Array::from_slice(&det_fill((b * hkv * 3 * d) as usize, 8), &[b, hkv, 3, d]);
+        let vs = Array::from_slice(&det_fill((b * hkv * 3 * d) as usize, 9), &[b, hkv, 3, d]);
+        let empty_k = Array::from_slice::<f32>(&[], &[b, hkv, 0, d]);
+        let empty_v = Array::from_slice::<f32>(&[], &[b, hkv, 0, d]);
+
+        // Empty prefix → suffix-only SDPA (bit-identical).
+        let only_suffix =
+            sdpa_split(&q, &empty_k, &empty_v, &ks, &vs, scale).expect("empty prefix");
+        let ref_suffix = sdpa(&q, &ks, &vs, scale, false).expect("ref suffix");
+        only_suffix.eval().unwrap();
+        ref_suffix.eval().unwrap();
+        assert_eq!(only_suffix.as_slice::<f32>(), ref_suffix.as_slice::<f32>());
+
+        // Empty suffix → prefix-only SDPA (bit-identical).
+        let only_prefix =
+            sdpa_split(&q, &ks, &vs, &empty_k, &empty_v, scale).expect("empty suffix");
+        only_prefix.eval().unwrap();
+        assert_eq!(only_prefix.as_slice::<f32>(), ref_suffix.as_slice::<f32>());
     }
 }
