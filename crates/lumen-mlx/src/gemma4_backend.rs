@@ -361,6 +361,34 @@ pub(crate) mod imp {
         Ok(())
     }
 
+    impl Gemma4Backend {
+        /// Channel-aware decode for the batched streaming scheduler.
+        ///
+        /// The batched `run_batched_mlx` loop emits incremental deltas by
+        /// decoding the full `generated` prefix and diffing against the prior
+        /// text. A flat `decode()` strips the special `<|channel>`/`<channel|>`
+        /// boundary markers but leaves the *reasoning content between them* in
+        /// the visible text — so naive diffing leaks `thought` into
+        /// `delta.content`. This reuses the exact same `ResponseParser` state
+        /// machine the sequential path uses, partitioning the prefix into the
+        /// visible and reasoning channels and decoding each independently.
+        /// Returns `(visible, reasoning)` so the scheduler can diff each against
+        /// its own prior length and route to `Delta` / `ReasoningDelta`.
+        ///
+        /// Re-parsing the whole prefix each step is `O(n)`; for the typical
+        /// 256-token batched chat output the cost is negligible versus the
+        /// ~10 ms GPU step, and the cumulative-diff guarantees the same
+        /// byte-for-byte stream the sequential path produces.
+        pub fn stream_channels(&self, generated: &[u32]) -> Result<(String, String)> {
+            let mut parser = ResponseParser::new(&self.chat);
+            for &tok in generated {
+                parser.push(tok)?;
+            }
+            let parsed = parser.finalize()?;
+            Ok((parsed.visible, parsed.reasoning))
+        }
+    }
+
     /// Prefix-cache entry: snapshot of a prompt-prefilled cache that can be
     /// cloned + truncated to serve subsequent requests sharing a common
     /// prefix (e.g. the same system message across a 1000-item batch).

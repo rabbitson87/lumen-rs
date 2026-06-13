@@ -2940,23 +2940,17 @@ impl InferenceEngine {
         // OFF — the sequential path stays byte-identical until enabled. Computed
         // as a plain bool BEFORE the match so no `&MlxBackend` (which is not
         // `Send`, holding raw Metal pointers) is held across the `.await`.
+        // Phase 3 follow-up: both MLX families route here. Gemma 4 emits a
+        // reasoning channel even at thinking=false; the batched scheduler now
+        // splits visible vs reasoning via `stream_channels` (same
+        // `ResponseParser` the sequential path uses), so `delta.content` no
+        // longer leaks `thought` content and Gemma 4 batched serving matches
+        // the sequential stream.
         #[cfg(feature = "mlx-native")]
-        let mlx_qwen35_batched = std::env::var("LUMEN_MLX_BATCH_DECODE").ok().as_deref()
-            == Some("1")
-            && matches!(
-                &self.backend,
-                ModelBackend::Mlx(b)
-                    // Qwen 3.6 only for now. Gemma 4's batched decode forward is
-                    // implemented + token-level verified, but Gemma 4 emits a
-                    // reasoning channel even at thinking=false, and the batched
-                    // scheduler's naive detok doesn't separate reasoning from
-                    // visible text the way the sequential path does — so routing
-                    // Gemma 4 here would leak "thought" into visible content.
-                    // Re-enable once the batched streamer is channel-aware.
-                    if matches!(b.kind(), lumen_mlx::MlxBackendKind::Qwen35Family)
-            );
+        let mlx_batched = std::env::var("LUMEN_MLX_BATCH_DECODE").ok().as_deref() == Some("1")
+            && matches!(&self.backend, ModelBackend::Mlx(_));
         #[cfg(feature = "mlx-native")]
-        if mlx_qwen35_batched {
+        if mlx_batched {
             self.run_batched_mlx(&mut rx).await;
             return;
         }
@@ -4056,6 +4050,7 @@ impl InferenceEngine {
             last_token,
             position,
             prev_text: String::new(),
+            prev_reasoning: String::new(),
             prompt_tokens,
             decode_start: std::time::Instant::now(),
             temperature,
@@ -4089,6 +4084,60 @@ impl InferenceEngine {
         }
     }
 
+    /// Admit one streaming chat request into the MLX batched scheduler, or serve
+    /// it inline when it isn't batch-eligible. Shared by both admission sites in
+    /// `run_batched_mlx` (the non-blocking `try_recv` loop AND the blocking
+    /// empty-batch `recv`) so the FIRST request of a concurrent burst seeds the
+    /// batch instead of being dispatched sequentially — which would block the
+    /// loop and serialize the whole burst onto the sequential path.
+    ///
+    /// On success the seq is inserted into `active` (or finalized in place if its
+    /// first token already hit EOS / the cap) and `next_seq_id` is bumped.
+    /// Ineligible requests (tools, response_format, stop, non-zero temperature,
+    /// or thinking enabled) fall through to `chat_completion_streaming`.
+    #[cfg(feature = "mlx-native")]
+    fn admit_streaming_mlx(
+        &mut self,
+        req: ChatCompletionRequest,
+        token_tx: mpsc::Sender<StreamEvent>,
+        active: &mut std::collections::HashMap<u64, ActiveSeqState>,
+        next_seq_id: &mut u64,
+    ) {
+        let thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        if !Self::mlx_batch_eligible(&req) || thinking {
+            self.chat_completion_streaming(&req, &token_tx);
+            return;
+        }
+        let sid = *next_seq_id;
+        match self.start_streaming_seq_mlx(
+            sid,
+            &req.messages,
+            req.max_tokens,
+            thinking,
+            token_tx.clone(),
+        ) {
+            Ok((seq, done)) => {
+                if done {
+                    let _ = seq.token_tx.try_send(StreamEvent::Done {
+                        prompt_tokens: seq.prompt_tokens,
+                        completion_tokens: seq.generated.len() as u32,
+                        finish_reason: FinishReason::Stop,
+                    });
+                    if let Some(qb) = self.mlx_batched_driver() {
+                        let _ = qb.remove_seq(sid);
+                    }
+                } else {
+                    active.insert(sid, seq);
+                }
+                *next_seq_id += 1;
+            }
+            Err(e) => {
+                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            }
+        }
+    }
+
     #[cfg(feature = "mlx-native")]
     async fn run_batched_mlx(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
         use std::collections::HashMap;
@@ -4110,39 +4159,7 @@ impl InferenceEngine {
             while active.len() < max_batch {
                 match rx.try_recv() {
                     Ok(EngineRequest::StreamingChatCompletion { req, token_tx }) => {
-                        let thinking = req.enable_thinking_with_backend_default(
-                            self.backend.is_reasoning_first_family(),
-                        );
-                        if !Self::mlx_batch_eligible(&req) || thinking {
-                            self.chat_completion_streaming(&req, &token_tx);
-                            continue;
-                        }
-                        match self.start_streaming_seq_mlx(
-                            next_seq_id,
-                            &req.messages,
-                            req.max_tokens,
-                            thinking,
-                            token_tx.clone(),
-                        ) {
-                            Ok((seq, done)) => {
-                                if done {
-                                    let _ = seq.token_tx.try_send(StreamEvent::Done {
-                                        prompt_tokens: seq.prompt_tokens,
-                                        completion_tokens: seq.generated.len() as u32,
-                                        finish_reason: FinishReason::Stop,
-                                    });
-                                    if let Some(qb) = self.mlx_batched_driver() {
-                                        let _ = qb.remove_seq(next_seq_id);
-                                    }
-                                } else {
-                                    active.insert(next_seq_id, seq);
-                                }
-                                next_seq_id += 1;
-                            }
-                            Err(e) => {
-                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
+                        self.admit_streaming_mlx(req, token_tx, &mut active, &mut next_seq_id);
                     }
                     Ok(other) => {
                         self.dispatch_request_sequential(other);
@@ -4152,11 +4169,19 @@ impl InferenceEngine {
                 }
             }
 
-            // Nothing active: block for the next request rather than spin.
+            // Nothing active: block for the next request rather than spin. A
+            // streaming chat request is ADMITTED into the batch here (not
+            // dispatched sequentially) so the first request of a concurrent
+            // burst seeds the batch — the loop then re-enters the non-blocking
+            // admission above and picks up the rest of the burst.
             if active.is_empty() {
                 match rx.recv().await {
-                    Some(req) => {
-                        self.dispatch_request_sequential(req);
+                    Some(EngineRequest::StreamingChatCompletion { req, token_tx }) => {
+                        self.admit_streaming_mlx(req, token_tx, &mut active, &mut next_seq_id);
+                        continue;
+                    }
+                    Some(other) => {
+                        self.dispatch_request_sequential(other);
                         continue;
                     }
                     None => return,
@@ -4194,24 +4219,18 @@ impl InferenceEngine {
             let mut to_remove: Vec<u64> = Vec::new();
             for (row, &id) in ids.iter().enumerate() {
                 let (next_tok, new_pos) = results[row];
-                let detok = self.mlx_batched_driver().and_then(|qb| {
+                let channels = self.mlx_batched_driver().and_then(|qb| {
                     let seq = active.get(&id)?;
                     let mut g = seq.generated.clone();
                     g.push(next_tok);
-                    qb.decode(&g).ok()
+                    qb.stream_channels(&g).ok()
                 });
                 let seq = active.get_mut(&id).unwrap();
                 seq.generated.push(next_tok);
                 seq.last_token = next_tok;
                 seq.position = new_pos;
-                if let Some(text) = detok {
-                    if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
-                        let delta = text[seq.prev_text.len()..].to_string();
-                        if !delta.is_empty() {
-                            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-                            seq.prev_text = text;
-                        }
-                    }
+                if let Some((visible, reasoning)) = channels {
+                    emit_channel_delta(seq, visible, reasoning);
                 }
                 if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
                     let n_gen = seq.generated.len();
@@ -4290,13 +4309,21 @@ impl InferenceEngine {
             prompt_ids.len() as f64 / (prefill_ms / 1000.0),
         );
 
-        // first_tok is the first generated token: emit it and seed `generated`.
+        // first_tok is the first generated token: emit it (channel-aware) and
+        // seed `generated`. Using the same `stream_channels` split as the decode
+        // loop keeps Gemma 4's reasoning channel out of `delta.content` from
+        // token 0 (e.g. when the very first token opens the `<|channel>` span).
         let generated = vec![first_tok];
-        let first_text = qb.decode(&generated).unwrap_or_default();
+        let (vis0, rea0) = qb.stream_channels(&generated).unwrap_or_default();
         let mut prev_text = String::new();
-        if !first_text.contains('\u{FFFD}') && !first_text.is_empty() {
-            let _ = token_tx.try_send(StreamEvent::Delta(first_text.clone()));
-            prev_text = first_text;
+        let mut prev_reasoning = String::new();
+        if !vis0.contains('\u{FFFD}') && !vis0.is_empty() {
+            let _ = token_tx.try_send(StreamEvent::Delta(vis0.clone()));
+            prev_text = vis0;
+        }
+        if !rea0.contains('\u{FFFD}') && !rea0.is_empty() {
+            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(rea0.clone()));
+            prev_reasoning = rea0;
         }
         let done = eos_tokens.contains(&first_tok) || generated.len() >= max_new;
 
@@ -4309,6 +4336,7 @@ impl InferenceEngine {
             last_token: first_tok,
             position,
             prev_text,
+            prev_reasoning,
             prompt_tokens,
             decode_start: std::time::Instant::now(),
             temperature: 0.0,
@@ -4430,6 +4458,7 @@ impl InferenceEngine {
             last_token,
             position,
             prev_text: String::new(),
+            prev_reasoning: String::new(),
             prompt_tokens,
             decode_start: std::time::Instant::now(),
             temperature,
@@ -4705,6 +4734,11 @@ pub(crate) struct ActiveSeqState {
     pub last_token: u32,
     pub position: usize,
     pub prev_text: String,
+    /// Channel-aware streaming: cumulative reasoning-channel text already
+    /// emitted as `ReasoningDelta`. Mirrors `prev_text` for the visible
+    /// channel. Only the MLX batched path (Gemma 4) populates this; the
+    /// flat-decode paths leave it empty.
+    pub prev_reasoning: String,
     pub prompt_tokens: u32,
     pub decode_start: std::time::Instant,
     pub temperature: f32,
@@ -4745,6 +4779,31 @@ pub(crate) struct ActiveSeqState {
 /// duplicated, regardless of how many tokens accumulated since the last flush.
 /// Multi-byte UTF-8 boundaries are handled by the replacement-char guard
 /// exactly as the original synchronous path did.
+/// Channel-aware incremental emit for the MLX batched scheduler. Diffs the
+/// freshly-decoded `(visible, reasoning)` channel strings against the seq's
+/// cumulative `prev_text` / `prev_reasoning` and sends only the new tail of
+/// each channel (`Delta` / `ReasoningDelta`). The replacement-char guard skips
+/// emitting across an incomplete multi-byte UTF-8 boundary exactly like the
+/// flat-decode path: the next token completes the char and the cumulative diff
+/// recovers the held bytes, so no byte is dropped or duplicated.
+#[cfg(feature = "mlx-native")]
+fn emit_channel_delta(seq: &mut ActiveSeqState, visible: String, reasoning: String) {
+    if !visible.contains('\u{FFFD}') && visible.len() > seq.prev_text.len() {
+        let delta = visible[seq.prev_text.len()..].to_string();
+        if !delta.is_empty() {
+            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
+            seq.prev_text = visible;
+        }
+    }
+    if !reasoning.contains('\u{FFFD}') && reasoning.len() > seq.prev_reasoning.len() {
+        let delta = reasoning[seq.prev_reasoning.len()..].to_string();
+        if !delta.is_empty() {
+            let _ = seq.token_tx.try_send(StreamEvent::ReasoningDelta(delta));
+            seq.prev_reasoning = reasoning;
+        }
+    }
+}
+
 #[inline]
 fn flush_pending_emit(gem: &GemmaGgufModel, seq: &mut ActiveSeqState) {
     if seq.pending_emit.is_none() {

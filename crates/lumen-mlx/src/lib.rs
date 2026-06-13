@@ -910,6 +910,15 @@ pub trait MlxBatchedSeqDriver {
     ) -> Result<Vec<(u32, usize)>>;
     fn decode(&self, tokens: &[u32]) -> Result<String>;
     fn remove_seq(&mut self, seq_id: u64) -> Result<()>;
+    /// Decode generated tokens into `(visible, reasoning)` channel strings for
+    /// channel-aware batched streaming. Default: everything is visible (plain
+    /// models like Qwen 3.6 greedy carry no special reasoning-channel tokens).
+    /// Gemma 4 overrides this to split on its `<|channel>…<channel|>` reasoning
+    /// markers so the batched streamer doesn't leak `thought` content into the
+    /// visible delta the way a flat `decode()` diff would.
+    fn stream_channels(&self, generated: &[u32]) -> Result<(String, String)> {
+        Ok((self.decode(generated)?, String::new()))
+    }
 }
 
 impl MlxBatchedSeqDriver for MlxQwen35Backend {
@@ -962,6 +971,9 @@ impl MlxBatchedSeqDriver for crate::gemma4::Gemma4Backend {
     }
     fn remove_seq(&mut self, s: u64) -> Result<()> {
         crate::gemma4::Gemma4Backend::remove_seq(self, s)
+    }
+    fn stream_channels(&self, g: &[u32]) -> Result<(String, String)> {
+        crate::gemma4::Gemma4Backend::stream_channels(self, g)
     }
 }
 
