@@ -257,6 +257,22 @@ export const ENV_SCHEMA: EnvEntry[] = [
     section: "advanced",
   },
   {
+    key: "LUMEN_MLX_SERVER_MODE",
+    labelKey: "env.entry.LUMEN_MLX_SERVER_MODE.label",
+    helpKey: "env.entry.LUMEN_MLX_SERVER_MODE.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_MLX_BATCH_DECODE",
+    labelKey: "env.entry.LUMEN_MLX_BATCH_DECODE.label",
+    helpKey: "env.entry.LUMEN_MLX_BATCH_DECODE.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
     key: "LUMEN_MLX_PREFIX_INCREMENTAL",
     labelKey: "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label",
     helpKey: "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help",

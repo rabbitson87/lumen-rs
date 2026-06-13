@@ -181,17 +181,24 @@ mod imp {
         }
     }
 
-    /// Phase 4 dedup master switch (`LUMEN_MLX_SHARED_PREFIX`, default OFF).
-    /// Cached on first read; truthy = `1`/`true`/`on`/`yes`.
+    /// Phase 4 dedup switch. An explicit `LUMEN_MLX_SHARED_PREFIX` wins;
+    /// otherwise it inherits from `LUMEN_MLX_SERVER_MODE` (the bundled
+    /// multi-request serving / bulk-batch switch — dedup pays off most in bulk
+    /// jobs where many requests share one system prompt). Default OFF (solo
+    /// desktop path unchanged). Cached on first read; truthy = `1`/`true`/`on`/`yes`.
     fn shared_prefix_enabled() -> bool {
+        fn truthy(v: &str) -> bool {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        }
         static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *C.get_or_init(|| {
-            std::env::var("LUMEN_MLX_SHARED_PREFIX")
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    matches!(v.as_str(), "1" | "true" | "on" | "yes")
-                })
-                .unwrap_or(false)
+        *C.get_or_init(|| match std::env::var("LUMEN_MLX_SHARED_PREFIX") {
+            Ok(v) => truthy(&v),
+            Err(_) => std::env::var("LUMEN_MLX_SERVER_MODE")
+                .map(|v| truthy(&v))
+                .unwrap_or(false),
         })
     }
 

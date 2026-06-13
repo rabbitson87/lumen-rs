@@ -2929,12 +2929,39 @@ impl EngineHandle {
     }
 }
 
+/// Resolve an MLX multi-request feature flag. An explicit per-feature env var
+/// always wins (truthy = `1`/`true`/`on`/`yes`, anything else = off); when the
+/// per-feature var is UNSET, the flag inherits from `LUMEN_MLX_SERVER_MODE` —
+/// the single "multi-request serving" switch that turns on the whole concurrent
+/// path (batched decode + shared-prefix KV dedup) for live multi-user serving
+/// OR bulk batch jobs. Most MLX users run solo and leave this off, so the
+/// default desktop path stays byte-identical.
+#[cfg(feature = "mlx-native")]
+pub(crate) fn mlx_feature_on(specific: &str) -> bool {
+    fn truthy(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    }
+    match std::env::var(specific) {
+        Ok(v) => truthy(&v),
+        Err(_) => std::env::var("LUMEN_MLX_SERVER_MODE")
+            .map(|v| truthy(&v))
+            .unwrap_or(false),
+    }
+}
+
 impl InferenceEngine {
     /// Run the engine loop. When `BATCHED_ENGINE=1` and backend is GemmaGguf or Qwen35Moe,
     /// streaming chat/anthropic requests go through a continuous-batching
     /// scheduler. All other paths remain sequential.
     pub async fn run(mut self, mut rx: mpsc::Receiver<EngineRequest>) {
         let batched = std::env::var("BATCHED_ENGINE").ok().as_deref() == Some("1");
+        // Wraps the per-feature gate below — `mlx_feature_on` lets a single
+        // `LUMEN_MLX_SERVER_MODE=1` switch enable the whole multi-request path
+        // (batched decode + shared-prefix dedup), while a per-feature var still
+        // overrides it (e.g. `LUMEN_MLX_BATCH_DECODE=0` opts one part back out).
         // Phase 2: opt-in multi-seq scheduler for the MLX-native Qwen3.6 path.
         // Distinct from BATCHED_ENGINE (which gates the Candle paths). Default
         // OFF — the sequential path stays byte-identical until enabled. Computed
@@ -2947,7 +2974,7 @@ impl InferenceEngine {
         // longer leaks `thought` content and Gemma 4 batched serving matches
         // the sequential stream.
         #[cfg(feature = "mlx-native")]
-        let mlx_batched = std::env::var("LUMEN_MLX_BATCH_DECODE").ok().as_deref() == Some("1")
+        let mlx_batched = mlx_feature_on("LUMEN_MLX_BATCH_DECODE")
             && matches!(&self.backend, ModelBackend::Mlx(_));
         #[cfg(feature = "mlx-native")]
         if mlx_batched {
@@ -4244,11 +4271,13 @@ impl InferenceEngine {
             }
 
             let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+            let active_gb = lumen_mlx::metal_memory::get_active_memory().unwrap_or(0) as f64 / 1e9;
             eprintln!(
-                "[mlx batched] step: N={} latency={:.1}ms agg={:.1} tok/s",
+                "[mlx batched] step: N={} latency={:.1}ms agg={:.1} tok/s active={:.2}GB",
                 ids.len(),
                 step_ms,
                 ids.len() as f64 / (step_ms / 1000.0),
+                active_gb,
             );
 
             for id in to_remove {

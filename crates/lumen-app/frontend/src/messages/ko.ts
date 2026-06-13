@@ -393,6 +393,12 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label": "증분 prefix 캐시 (공유 시스템 프롬프트)",
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help":
     "cold prefill 시 공유 시스템 프롬프트 head도 스냅샷해서, 같은 시스템 프롬프트지만 user turn이 다른 후속 요청이 처음부터 다시 prefill하지 않고 캐시된 head를 fork하도록 합니다. 큰 시스템 프롬프트를 공유하는 멀티유저/분기 워크로드를 가속합니다. 기본 꺼짐: 스냅샷마다 KV 메모리를 점유(키별 branch cap으로 제한)하므로 RAM 여유가 있는 머신(고성능 MacBook / Mac Studio)에서 켜세요. Qwen 3.6 네이티브 경로 전용.",
+  "env.entry.LUMEN_MLX_SERVER_MODE.label": "다중요청 서빙 모드 (다중유저 + 벌크 배치)",
+  "env.entry.LUMEN_MLX_SERVER_MODE.help":
+    "고RAM Mac(고성능 MacBook / Mac Studio)에서 동시 서빙을 위한 스위치 하나: 다중요청 경로를 한 번에 켭니다 — batched decode(GPU 스텝당 여러 시퀀스 동시 진행) + 단일복사 공유 prefix KV 중복제거. 실시간 다중유저 서빙과 벌크/오프라인 배치 작업(많은 요청이 하나의 system prompt 공유 → 중복제거 효과 최대) 둘 다 커버합니다. 기본 꺼짐: MLX 사용자 대부분은 단일 대화이고, 꺼진 솔로 경로는 byte-identical. 각 기능은 개별 오버라이드 가능(예: 서버모드 켜진 채 LUMEN_MLX_BATCH_DECODE=0으로 batched decode만 끄기). MLX(Qwen 3.6 / Gemma 4) 전용; non-greedy/tool/thinking 요청은 항상 sequential로 폴백.",
+  "env.entry.LUMEN_MLX_BATCH_DECODE.label": "Batched decode (오버라이드)",
+  "env.entry.LUMEN_MLX_BATCH_DECODE.help":
+    "Batched 다중시퀀스 decode 스케줄러의 기능별 오버라이드. 보통 LUMEN_MLX_SERVER_MODE에서 상속; 서버모드와 무관하게 강제 on(1)/off(0) 하려면 명시 설정. 켜지면 동시 greedy chat 요청이 함께 진행(GPU 스텝 하나를 N 시퀀스가 분할)되어 다중유저 집계 처리량 증가; 단일 요청(N=1)은 sequential과 byte-identical. MLX 네이티브 경로 전용.",
   "env.entry.LUMEN_MLX_SHARED_PREFIX.label": "단일복사 공유 prefix KV (배치 내 중복제거)",
   "env.entry.LUMEN_MLX_SHARED_PREFIX.help":
     "여러 요청이 같은 배치에서 동시에 디코딩하며 공통 프롬프트 prefix를 공유할 때(예: 많은 유저가 하나의 큰 시스템 프롬프트 사용), 그 prefix의 attention KV를 한 번만 저장하고 모든 시퀀스가 flash 방식 log-sum-exp 병합으로 attend하게 합니다. 시퀀스마다 복사본을 들고 있는 대신이라 full-attention KV를 약 (N-1) × prefix_tokens 만큼 절약합니다 — 고성능 Mac에서 다수 유저/긴 시스템 프롬프트 서빙에 유효. 기본 꺼짐(꺼지면 디코딩 byte-identical); 병합은 full attention과 ~1e-4까지 수치적으로 동일(bit-identical 아님). 배치 디코딩(LUMEN_MLX_BATCH_DECODE)과 Qwen 3.6 네이티브 경로 필요.",
