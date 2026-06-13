@@ -393,6 +393,12 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label": "증분 prefix 캐시 (공유 시스템 프롬프트)",
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help":
     "cold prefill 시 공유 시스템 프롬프트 head도 스냅샷해서, 같은 시스템 프롬프트지만 user turn이 다른 후속 요청이 처음부터 다시 prefill하지 않고 캐시된 head를 fork하도록 합니다. 큰 시스템 프롬프트를 공유하는 멀티유저/분기 워크로드를 가속합니다. 기본 꺼짐: 스냅샷마다 KV 메모리를 점유(키별 branch cap으로 제한)하므로 RAM 여유가 있는 머신(고성능 MacBook / Mac Studio)에서 켜세요. Qwen 3.6 네이티브 경로 전용.",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX.label": "단일복사 공유 prefix KV (배치 내 중복제거)",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX.help":
+    "여러 요청이 같은 배치에서 동시에 디코딩하며 공통 프롬프트 prefix를 공유할 때(예: 많은 유저가 하나의 큰 시스템 프롬프트 사용), 그 prefix의 attention KV를 한 번만 저장하고 모든 시퀀스가 flash 방식 log-sum-exp 병합으로 attend하게 합니다. 시퀀스마다 복사본을 들고 있는 대신이라 full-attention KV를 약 (N-1) × prefix_tokens 만큼 절약합니다 — 고성능 Mac에서 다수 유저/긴 시스템 프롬프트 서빙에 유효. 기본 꺼짐(꺼지면 디코딩 byte-identical); 병합은 full attention과 ~1e-4까지 수치적으로 동일(bit-identical 아님). 배치 디코딩(LUMEN_MLX_BATCH_DECODE)과 Qwen 3.6 네이티브 경로 필요.",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.label": "공유 prefix 최소 토큰",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.help":
+    "단일복사 중복제거가 활성화되기 위한 최소 공유 prefix 길이(토큰). 짧은 공유 prefix는 KV 절약은 적으면서 스텝마다 split-attention 병합 비용은 들기 때문에, 공통 prefix가 이 길이 이상일 때만 중복제거가 동작합니다. 기본 64. LUMEN_MLX_SHARED_PREFIX가 켜진 경우에만 사용.",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.label": "드래프트 모델 (투기 디코딩) — 실험적",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.help":
     "실험적. Qwen3.5/3.6 네이티브 경로의 greedy 드래프트-모델 투기 디코딩용 소형 드래프트 모델의 경로 또는 HF id. 드래프트가 토큰을 제안하면 타깃이 단일 배치 forward로 검증해 일치하는 최장 prefix를 수락 — greedy 대비 무손실(타깃 argmax가 항상 정답). 네이티브 러너 필요 + 드래프트 vocab이 타깃과 일치해야 함(불일치 시 자동 비활성). greedy 요청에만 적용. 빈 값 = 꺼짐(기본; 기존 디코딩 그대로).",

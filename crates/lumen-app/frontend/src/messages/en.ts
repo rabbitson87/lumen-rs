@@ -402,6 +402,12 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.label": "Incremental prefix cache (shared system prompt)",
   "env.entry.LUMEN_MLX_PREFIX_INCREMENTAL.help":
     "On a cold prefill, also snapshot the shared system-prompt head so a later request with the SAME system prompt but a different user turn forks the cached head instead of re-prefilling it from scratch. Speeds up multi-user / branching workloads that share one big system prompt. Off by default; each extra snapshot pins KV memory (bounded by the per-key branch cap), so enable it on machines with RAM headroom (high-end MacBook / Mac Studio). Qwen 3.6 native path only.",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX.label": "Single-copy shared-prefix KV (in-batch dedup)",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX.help":
+    "When several requests decode concurrently in the same batch and share a common prompt prefix (e.g. many users hitting one big system prompt), store that prefix's attention KV ONCE and let every sequence attend it via a flash-style log-sum-exp merge, instead of every sequence carrying its own copy. Frees roughly (N-1) x prefix_tokens of full-attention KV — meaningful for many-user / long-system-prompt serving on high-end Macs. Off by default (decode is byte-identical when off); the merge is numerically equal to full attention to ~1e-4 (not bit-identical). Requires batched decode (LUMEN_MLX_BATCH_DECODE) and the Qwen 3.6 native path.",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.label": "Shared-prefix min tokens",
+  "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.help":
+    "Minimum shared prefix length (in tokens) before single-copy dedup activates. Short shared prefixes save little KV but still pay the per-step split-attention merge cost, so dedup only kicks in once the common prefix is at least this long. Default 64. Only used when LUMEN_MLX_SHARED_PREFIX is on.",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.label": "Draft model (spec decode) — experimental",
   "env.entry.LUMEN_MLX_DRAFT_MODEL.help":
     "EXPERIMENTAL. Path or HF id of a small draft model for greedy draft-model speculative decoding on the Qwen3.5/3.6 native path. The draft proposes tokens that the target verifies in one batched forward, accepting the longest matching prefix — lossless vs greedy (target's argmax is always the source of truth). Requires the native runner and a draft whose vocab matches the target (auto-disabled on mismatch). Engaged for greedy requests only. Empty = OFF (default; existing decode runs unchanged).",

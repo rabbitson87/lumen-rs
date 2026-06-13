@@ -264,6 +264,25 @@ export const ENV_SCHEMA: EnvEntry[] = [
     defaultValue: "0",
     section: "advanced",
   },
+  {
+    key: "LUMEN_MLX_SHARED_PREFIX",
+    labelKey: "env.entry.LUMEN_MLX_SHARED_PREFIX.label",
+    helpKey: "env.entry.LUMEN_MLX_SHARED_PREFIX.help",
+    kind: "bool",
+    defaultValue: "0",
+    section: "advanced",
+  },
+  {
+    key: "LUMEN_MLX_SHARED_PREFIX_MIN",
+    labelKey: "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.label",
+    helpKey: "env.entry.LUMEN_MLX_SHARED_PREFIX_MIN.help",
+    kind: "number",
+    min: 1,
+    max: 100000,
+    step: 1,
+    defaultValue: "64",
+    section: "advanced",
+  },
   // ── Draft-model speculative decode (Qwen3.5/3.6 native, experimental) ──
   {
     key: "LUMEN_MLX_DRAFT_MODEL",

@@ -68,8 +68,17 @@ mod imp {
         /// `keys.shape()[2] >= offset` always; padded space past offset is zero-filled.
         keys: Option<Array>,
         values: Option<Array>,
-        /// Logical sequence length consumed so far.
+        /// Logical sequence length stored in THIS buffer (the suffix length
+        /// when `base_offset > 0`). Internal buffer ops (`update_and_fetch`,
+        /// `keys_view`) index against this, NOT the absolute position.
         offset: usize,
+        /// Absolute position of the first token THIS buffer holds. Zero for a
+        /// normal cache. Non-zero only for a suffix-only cache under
+        /// shared-prefix KV dedup (Phase 4): the first `base_offset` tokens
+        /// live in a single shared prefix buffer, not here. RoPE / causal
+        /// positioning use `offset()` = `base_offset + offset`, while the
+        /// physical buffer still starts at index 0.
+        base_offset: usize,
     }
 
     impl NativeKvCache {
@@ -78,11 +87,95 @@ mod imp {
                 keys: None,
                 values: None,
                 offset: 0,
+                base_offset: 0,
             }
         }
 
+        /// Absolute logical position = shared-prefix length + suffix length.
+        /// Equals the internal buffer length when `base_offset == 0` (the
+        /// normal case), so every existing caller is byte-identical.
         pub fn offset(&self) -> usize {
+            self.base_offset + self.offset
+        }
+
+        /// Number of tokens physically held in THIS buffer (suffix length under
+        /// dedup; same as `offset()` otherwise).
+        pub fn buffer_len(&self) -> usize {
             self.offset
+        }
+
+        /// Absolute position of the first token this buffer holds.
+        pub fn base_offset(&self) -> usize {
+            self.base_offset
+        }
+
+        /// Phase 4 shared-prefix dedup: drop the first `prefix_len` tokens from
+        /// this buffer (they now live in a single shared prefix buffer) and
+        /// record `base_offset = prefix_len` so absolute positioning is
+        /// preserved. After this call the buffer holds only the divergent
+        /// suffix `[prefix_len .. offset())`. No-op when `prefix_len == 0`.
+        pub fn keep_suffix_from(&mut self, prefix_len: usize) -> Result<()> {
+            if prefix_len == 0 {
+                return Ok(());
+            }
+            let cur = self.base_offset + self.offset;
+            if prefix_len > cur {
+                return Err(anyhow!(
+                    "NativeKvCache::keep_suffix_from: prefix_len={} > offset={}",
+                    prefix_len,
+                    cur
+                ));
+            }
+            // Already suffix-only at this boundary (idempotent re-attach).
+            if prefix_len <= self.base_offset {
+                return Ok(());
+            }
+            let drop = prefix_len - self.base_offset; // tokens to cut from THIS buffer
+            let new_len = self.offset - drop;
+            if let (Some(k), Some(v)) = (self.keys.as_ref(), self.values.as_ref()) {
+                let k_suffix = slice_axis2(k, drop as i32, self.offset as i32)
+                    .context("keep_suffix_from: slice keys suffix")?;
+                let v_suffix = slice_axis2(v, drop as i32, self.offset as i32)
+                    .context("keep_suffix_from: slice values suffix")?;
+                self.keys = Some(k_suffix);
+                self.values = Some(v_suffix);
+            }
+            self.offset = new_len;
+            self.base_offset = prefix_len;
+            Ok(())
+        }
+
+        /// Frozen `[.., :prefix_len, :]` view of `(keys, values)` for building a
+        /// [`SharedPrefixKv`] from an already-prefilled donor cache. Requires
+        /// `base_offset == 0` (the donor holds the full prompt from position 0)
+        /// and `prefix_len <= offset`. The returned Arrays are slices over the
+        /// donor's buffer (refcount bump, not a deep copy) — the donor must
+        /// outlive the shared prefix, or the slices must be eval'd/cloned first.
+        pub fn prefix_kv(&self, prefix_len: usize) -> Result<(Array, Array)> {
+            if self.base_offset != 0 {
+                return Err(anyhow!(
+                    "NativeKvCache::prefix_kv: donor base_offset={} must be 0",
+                    self.base_offset
+                ));
+            }
+            if prefix_len > self.offset {
+                return Err(anyhow!(
+                    "NativeKvCache::prefix_kv: prefix_len={} > offset={}",
+                    prefix_len,
+                    self.offset
+                ));
+            }
+            let k = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| anyhow!("NativeKvCache::prefix_kv: empty keys"))?;
+            let v = self
+                .values
+                .as_ref()
+                .ok_or_else(|| anyhow!("NativeKvCache::prefix_kv: empty values"))?;
+            let kp = slice_axis2(k, 0, prefix_len as i32).context("prefix_kv: slice keys")?;
+            let vp = slice_axis2(v, 0, prefix_len as i32).context("prefix_kv: slice values")?;
+            Ok((kp, vp))
         }
 
         pub fn empty(&self) -> bool {
@@ -260,6 +353,7 @@ mod imp {
             self.keys = None;
             self.values = None;
             self.offset = 0;
+            self.base_offset = 0;
         }
 
         /// Replace keys / values / offset wholesale. Used by snapshot restore
@@ -2407,6 +2501,21 @@ mod imp {
         }
     }
 
+    /// Single-copy shared-prefix KV (Phase 4 in-batch dedup). Holds, per model
+    /// layer, the frozen prefix keys/values for FULL-ATTENTION layers — stored
+    /// ONCE and referenced by every sequence in a batch that shares this prompt
+    /// prefix, instead of each sequence carrying its own copy. Linear/Mamba
+    /// layers carry `None`: their recurrent state is per-seq and O(1)-sized, so
+    /// there is nothing to dedup (each seq keeps its own already-correct state).
+    pub struct SharedPrefixKv {
+        /// Number of shared prefix tokens (absolute positions `0..prefix_len`).
+        pub prefix_len: usize,
+        /// Per layer (indexed by `layer_idx`): `Some((k, v))` with shape
+        /// `[1, n_kv_heads, prefix_len, head_dim]` for full-attn layers, `None`
+        /// for linear/Mamba/TurboQuant layers.
+        pub layers: Vec<Option<(Array, Array)>>,
+    }
+
     /// One cache list per sequence — mirrors mlx-lm's `model.make_cache()`
     /// returning a `List[Cache]` of length `num_hidden_layers`.
     pub struct NativePromptCache {
@@ -2486,6 +2595,54 @@ mod imp {
             &mut self.layers
         }
 
+        /// Phase 4: capture the first `prefix_len` tokens of every full-attn
+        /// layer as a [`SharedPrefixKv`]. Call on a fully-prefilled DONOR cache
+        /// (`base_offset == 0`); the result is shared by all sequences in the
+        /// batch that have this prompt prefix. The captured Arrays are eval'd so
+        /// they are independent of the donor's subsequent mutation/eviction.
+        pub fn extract_shared_prefix(&self, prefix_len: usize) -> Result<SharedPrefixKv> {
+            let mut layers = Vec::with_capacity(self.layers.len());
+            for layer in &self.layers {
+                match layer {
+                    NativeLayerCache::Full(kv) => {
+                        let (k, v) = kv.prefix_kv(prefix_len)?;
+                        // Force materialization so the shared buffer doesn't
+                        // alias (and pin) the donor seq's growing cache.
+                        k.eval().context("extract_shared_prefix: eval k")?;
+                        v.eval().context("extract_shared_prefix: eval v")?;
+                        layers.push(Some((k, v)));
+                    }
+                    _ => layers.push(None),
+                }
+            }
+            Ok(SharedPrefixKv { prefix_len, layers })
+        }
+
+        /// Phase 4: drop the first `prefix_len` tokens from every full-attn
+        /// layer (they now live in a single [`SharedPrefixKv`]); each layer
+        /// keeps only its divergent suffix with `base_offset = prefix_len`.
+        /// Linear/TurboQuant layers are untouched (their state stays per-seq
+        /// and is not deduped). Idempotent.
+        pub fn keep_suffix_from(&mut self, prefix_len: usize) -> Result<()> {
+            for layer in &mut self.layers {
+                if let NativeLayerCache::Full(kv) = layer {
+                    kv.keep_suffix_from(prefix_len)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// First full-attn layer's `base_offset` (the shared-prefix length this
+        /// cache is currently attached to, or 0 if unshared).
+        pub fn shared_prefix_len(&self) -> usize {
+            for layer in &self.layers {
+                if let NativeLayerCache::Full(kv) = layer {
+                    return kv.base_offset();
+                }
+            }
+            0
+        }
+
         /// Token offset of the first full-attn layer — convenient for the
         /// decode loop's RoPE offset (all full-attn layers share the same
         /// offset because they're updated in lockstep).
@@ -2530,6 +2687,7 @@ mod imp {
 pub(crate) use imp::{
     NativeArraysCache, NativeKvCache, NativeKvCacheQuantized, NativeLayerCache, NativePromptCache,
     NativeRotatingKvCache, NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
+    SharedPrefixKv,
 };
 
 // exercise concat / set-get / advance / construction

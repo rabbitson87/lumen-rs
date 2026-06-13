@@ -60,10 +60,10 @@ mod imp {
         reset_layer_sub_timings, store_fine_timings,
     };
 
-    use crate::native_attention::sdpa;
+    use crate::native_attention::{sdpa, sdpa_split};
     use crate::native_cache::{
         NativeArraysCache, NativeKvCache, NativeLayerCache, NativePromptCache,
-        NativeRotatingKvCacheTurboQuant,
+        NativeRotatingKvCacheTurboQuant, SharedPrefixKv,
     };
     use crate::native_conv1d::conv1d;
     use crate::native_embedding::quantized_embedding_lookup_with_mode;
@@ -1601,6 +1601,7 @@ mod imp {
             x: &Array,
             layer_idx: usize,
             caches: &mut [&mut NativeLayerCache],
+            shared_layer: Option<&(Array, Array)>,
         ) -> Result<Array> {
             let p = self.full_attn_proj_no_rope(x, layer_idx)?;
             let mut attn_parts: Vec<Array> = Vec::with_capacity(caches.len());
@@ -1620,10 +1621,26 @@ mod imp {
                     .context("layer_full_attn_forward_batch: slice values failed")?;
                 let kv = c.as_full_mut()?;
                 let offset_i = kv.offset() as i32;
+                // A seq is attached to the shared prefix iff its cache was
+                // truncated to suffix-only (`base_offset > 0`). This is decided
+                // PER SEQ, so a batch may mix attached seqs (sharing the prefix)
+                // with fresh full-history seqs — each takes the right path.
+                let attached = shared_layer.is_some() && kv.base_offset() > 0;
                 let (q_rope, k_rope) =
                     self.apply_full_attn_rope(&q_i, &k_i, p.rope_dim, p.base_theta, offset_i)?;
-                let (k_full, v_full) = kv.update_and_fetch(&k_rope, &v_i)?;
-                let attn_i = sdpa(&q_rope, &k_full, &v_full, p.scale, /* causal */ false)?;
+                // RoPE used the absolute `offset_i`, so suffix K is positioned
+                // consistently with the shared prefix. `update_and_fetch` returns
+                // the seq's own buffer view: the suffix only when attached (then
+                // `sdpa_split` merges the single shared prefix segment via
+                // log-sum-exp), or the full history when unattached (plain SDPA,
+                // byte-identical to the pre-dedup path).
+                let (k_view, v_view) = kv.update_and_fetch(&k_rope, &v_i)?;
+                let attn_i = match (attached, shared_layer) {
+                    (true, Some((pk, pv))) => {
+                        sdpa_split(&q_rope, pk, pv, &k_view, &v_view, p.scale)?
+                    }
+                    _ => sdpa(&q_rope, &k_view, &v_view, p.scale, /* causal */ false)?,
+                };
                 attn_parts.push(attn_i);
             }
             let refs: Vec<&Array> = attn_parts.iter().collect();
@@ -2357,6 +2374,7 @@ mod imp {
             &self,
             tokens: &[u32],
             caches: &mut [&mut NativePromptCache],
+            shared: Option<&SharedPrefixKv>,
         ) -> Result<Vec<u32>> {
             let n = tokens.len();
             if n == 0 {
@@ -2491,7 +2509,14 @@ mod imp {
                                 })
                             })
                             .collect::<Result<_>>()?;
-                        self.layer_full_attn_forward_batch(&normed, layer_idx, &mut layer_caches)?
+                        let shared_layer =
+                            shared.and_then(|s| s.layers.get(layer_idx).and_then(|o| o.as_ref()));
+                        self.layer_full_attn_forward_batch(
+                            &normed,
+                            layer_idx,
+                            &mut layer_caches,
+                            shared_layer,
+                        )?
                     }
                 };
 

@@ -110,7 +110,7 @@ mod imp {
         Ok(())
     }
 
-    use crate::native_cache::{NativeKvCache, NativePromptCache};
+    use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
     use crate::native_snapshot::PromptCacheSnapshot;
     use crate::qwen3_5_moe::{MtpStepOutput, NativeQwen3_5MoeModel};
@@ -126,6 +126,11 @@ mod imp {
         /// `mtp_step` call (fresh K-step extrapolation). Idle / unused when
         /// MTP is not enabled.
         mtp_kv: NativeKvCache,
+        /// Prompt token ids this seq was prefilled with. Used by the batched
+        /// scheduler's shared-prefix dedup (Phase 4) to compute the longest
+        /// common prompt prefix across the active batch. Empty for seqs created
+        /// via snapshot fork (those don't participate in dedup).
+        prompt: Vec<u32>,
     }
 
     /// process-wide background worker that runs
@@ -176,6 +181,48 @@ mod imp {
         }
     }
 
+    /// Phase 4 dedup master switch (`LUMEN_MLX_SHARED_PREFIX`, default OFF).
+    /// Cached on first read; truthy = `1`/`true`/`on`/`yes`.
+    fn shared_prefix_enabled() -> bool {
+        static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *C.get_or_init(|| {
+            std::env::var("LUMEN_MLX_SHARED_PREFIX")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    matches!(v.as_str(), "1" | "true" | "on" | "yes")
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Minimum shared prefix length (tokens) worth deduping
+    /// (`LUMEN_MLX_SHARED_PREFIX_MIN`, default 64). Short shared prefixes save
+    /// little RAM but still pay the per-step `sdpa_split` merge overhead.
+    fn shared_prefix_min_tokens() -> usize {
+        std::env::var("LUMEN_MLX_SHARED_PREFIX_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64)
+    }
+
+    /// Longest common prefix length across a set of token sequences.
+    fn longest_common_prefix_len(seqs: &[&[u32]]) -> usize {
+        let Some(min_len) = seqs.iter().map(|s| s.len()).min() else {
+            return 0;
+        };
+        if seqs.is_empty() {
+            return 0;
+        }
+        let first = seqs[0];
+        for i in 0..min_len {
+            let c = first[i];
+            if seqs.iter().any(|s| s[i] != c) {
+                return i;
+            }
+        }
+        min_len
+    }
+
     pub(crate) struct NativeMlxRunner {
         model: Option<NativeQwen3_5MoeModel>,
         seqs: HashMap<u64, NativeSeqState>,
@@ -195,6 +242,12 @@ mod imp {
         /// released.
         snapshots: HashMap<u64, PromptCacheSnapshot>,
         next_snapshot_id: u64,
+        /// Phase 4 in-batch shared-prefix dedup. `Some` once the batched
+        /// scheduler has detected a common prompt prefix across ≥2 active seqs
+        /// and truncated their full-attn caches to suffix-only; holds the single
+        /// shared prefix KV those seqs attend against. `None` when dedup is off
+        /// (`LUMEN_MLX_SHARED_PREFIX` unset) or no common prefix has formed.
+        shared_prefix: Option<SharedPrefixKv>,
     }
 
     #[allow(dead_code)]
@@ -1132,6 +1185,7 @@ mod imp {
                 },
                 snapshots: HashMap::new(),
                 next_snapshot_id: 1,
+                shared_prefix: None,
             })
         }
 
@@ -1231,6 +1285,7 @@ mod imp {
                     cache,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    prompt: tokens.to_vec(),
                 },
             );
             Ok((next_tok, position))
@@ -1306,6 +1361,7 @@ mod imp {
                     cache,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    prompt: tokens.to_vec(),
                 },
             );
             Ok((next_tok, position, captured))
@@ -1438,6 +1494,95 @@ mod imp {
         /// `forward_decode_batch` (batched trunk/MoE/lm_head + batched Mamba via
         /// state-stacking + per-seq full-attn). Each seq's `position` is bumped by
         /// one. Result is aligned to `seq_ids` order.
+        /// Phase 4 in-batch shared-prefix dedup. When `LUMEN_MLX_SHARED_PREFIX`
+        /// is set and ≥2 batched seqs share a prompt prefix of at least
+        /// `LUMEN_MLX_SHARED_PREFIX_MIN` tokens (default 64), capture that prefix
+        /// ONCE from a donor seq and truncate every matching seq's full-attn
+        /// cache to suffix-only — so the shared prefix KV is stored a single
+        /// time instead of once per sequence. Idempotent and incremental: a
+        /// later-joining seq that matches the established prefix is attached;
+        /// the shared buffer is dropped once no active seq references it. No-op
+        /// (returns immediately) when the flag is off, leaving every cache full
+        /// and the decode path byte-identical to the pre-dedup behavior.
+        fn maybe_setup_shared_prefix(&mut self, seq_ids: &[u64]) -> Result<()> {
+            if !shared_prefix_enabled() {
+                return Ok(());
+            }
+            // Drop a stale shared prefix once the group that used it is gone.
+            if let Some(sp) = &self.shared_prefix {
+                let p = sp.prefix_len;
+                let any_attached = self.seqs.values().any(|s| s.cache.shared_prefix_len() == p);
+                if !any_attached {
+                    self.shared_prefix = None;
+                }
+            }
+            let min_tokens = shared_prefix_min_tokens();
+            match &self.shared_prefix {
+                None => {
+                    let prompts: Vec<&[u32]> = seq_ids
+                        .iter()
+                        .filter_map(|id| self.seqs.get(id).map(|s| s.prompt.as_slice()))
+                        .collect();
+                    if prompts.len() < 2 {
+                        return Ok(());
+                    }
+                    let p = longest_common_prefix_len(&prompts);
+                    if p < min_tokens {
+                        return Ok(());
+                    }
+                    let donor_id = seq_ids[0];
+                    let shared = {
+                        let donor = self.seqs.get(&donor_id).ok_or_else(|| {
+                            anyhow!("shared-prefix: donor seq {donor_id} missing")
+                        })?;
+                        if donor.cache.shared_prefix_len() != 0 {
+                            return Ok(());
+                        }
+                        donor.cache.extract_shared_prefix(p)?
+                    };
+                    // Every seq shares prompt[..p] by construction of the LCP.
+                    for id in seq_ids {
+                        if let Some(s) = self.seqs.get_mut(id) {
+                            if s.cache.shared_prefix_len() == 0 {
+                                s.cache.keep_suffix_from(p)?;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[mlx shared-prefix] built: prefix_len={p} seqs={} (single-copy KV)",
+                        seq_ids.len()
+                    );
+                    self.shared_prefix = Some(shared);
+                }
+                Some(sp) => {
+                    let p = sp.prefix_len;
+                    // Attach late-joiners whose prompt matches the established
+                    // prefix, using an already-attached seq as the reference.
+                    let reference: Option<Vec<u32>> = self
+                        .seqs
+                        .values()
+                        .find(|s| s.cache.shared_prefix_len() == p && s.prompt.len() >= p)
+                        .map(|s| s.prompt[..p].to_vec());
+                    if let Some(refpx) = reference {
+                        for id in seq_ids {
+                            if let Some(s) = self.seqs.get_mut(id) {
+                                if s.cache.shared_prefix_len() == 0
+                                    && s.prompt.len() >= p
+                                    && s.prompt[..p] == refpx[..]
+                                {
+                                    s.cache.keep_suffix_from(p)?;
+                                    eprintln!(
+                                        "[mlx shared-prefix] attached late seq {id} at prefix_len={p}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
         pub(crate) fn decode_step_batch(
             &mut self,
             seq_ids: &[u64],
@@ -1467,11 +1612,15 @@ mod imp {
             if id_set.len() != n {
                 return Err(anyhow!("decode_step_batch: duplicate seq_id in batch"));
             }
-            // Split-borrow: &model and &mut seqs are disjoint fields.
+            // Phase 4: (re)establish the shared prefix before borrowing seqs.
+            // Mutates seq caches (truncate) + self.shared_prefix; full &mut self.
+            self.maybe_setup_shared_prefix(seq_ids)?;
+            // Split-borrow: &model, &shared_prefix and &mut seqs are disjoint fields.
             let model = self
                 .model
                 .as_ref()
                 .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            let shared = self.shared_prefix.as_ref();
             // Borrow each requested seq's state exactly once (disjoint by key).
             let mut by_id: std::collections::HashMap<u64, &mut NativeSeqState> = self
                 .seqs
@@ -1495,7 +1644,7 @@ mod imp {
                 let mut caches: Vec<&mut NativePromptCache> =
                     states.iter_mut().map(|s| &mut s.cache).collect();
                 model
-                    .forward_decode_batch(last_tokens, &mut caches)
+                    .forward_decode_batch(last_tokens, &mut caches, shared)
                     .context("native mlx-rs runner: forward_decode_batch failed")?
             };
             if next.len() != n {
@@ -1857,6 +2006,7 @@ mod imp {
                     cache: fresh,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    prompt: Vec::new(),
                 },
             );
             Ok(position)
