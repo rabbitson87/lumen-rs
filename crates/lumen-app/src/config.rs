@@ -72,6 +72,24 @@ pub struct ServerConfig {
     /// → `SKIP_WARMUP=1`
     #[serde(default)]
     pub skip_warmup: bool,
+
+    // ── Disk KV cache (persistent prefix-cache tier) ────────────────────
+    /// → `LUMEN_KV_DISK=1` — persist prefix-cache KV snapshots to disk so they
+    /// survive server restart / eviction (avoids re-paying cold prefill).
+    #[serde(default)]
+    pub kv_disk_enabled: bool,
+    /// → `LUMEN_KV_DISK_MAX_GB` — max on-disk budget in GB (LRU-evicted).
+    /// `0` = unlimited (default).
+    #[serde(default)]
+    pub kv_disk_max_gb: usize,
+    /// → `LUMEN_KV_DISK_TTL_SECS` — drop disk entries idle longer than this.
+    /// Default 86400 (1 day); `0` = never expire.
+    #[serde(default = "default_kv_disk_ttl_secs")]
+    pub kv_disk_ttl_secs: u32,
+}
+
+fn default_kv_disk_ttl_secs() -> u32 {
+    86_400
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,6 +259,9 @@ impl Default for PersistentConfig {
                 tokenizer_id: None,
                 local_model_dir: None,
                 skip_warmup: false,
+                kv_disk_enabled: false,
+                kv_disk_max_gb: 0,
+                kv_disk_ttl_secs: 86_400,
             },
             quant: QuantConfig {
                 bits: 4,

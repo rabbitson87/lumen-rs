@@ -18,6 +18,12 @@ export interface ServerConfig {
   tokenizer_id: string | null;
   local_model_dir: string | null;
   skip_warmup: boolean;
+  /** → LUMEN_KV_DISK — persist prefix-cache KV to disk across restarts. */
+  kv_disk_enabled: boolean;
+  /** → LUMEN_KV_DISK_MAX_GB — on-disk budget in GB, 0 = unlimited. */
+  kv_disk_max_gb: number;
+  /** → LUMEN_KV_DISK_TTL_SECS — disk entry idle TTL in seconds, 0 = never. */
+  kv_disk_ttl_secs: number;
 }
 
 export interface QuantConfig {

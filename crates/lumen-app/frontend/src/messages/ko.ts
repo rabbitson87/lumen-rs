@@ -85,6 +85,18 @@ export const ko: Record<string, string> = {
   "metrics.kvCache": "KV 캐시",
   "metrics.requestsPerMin": "req/min",
 
+  // ── 디스크 KV 캐시 카드 ─────────────────────────────────────────
+  "diskkv.title": "디스크 KV 캐시",
+  "diskkv.titleHint": "(재시작 후에도 prefix KV 유지)",
+  "diskkv.enable": "사용",
+  "diskkv.off": "끔",
+  "diskkv.on": "켬",
+  "diskkv.maxGb": "최대 크기 (GB)",
+  "diskkv.ttl": "TTL (초)",
+  "diskkv.hint.enable":
+    "프롬프트 prefix KV 캐시를 디스크에 저장해 서버 재시작 시 cold prefill 없이 재사용합니다. 설정:",
+  "diskkv.hint.maxGb": "디스크 사용 한도. 초과 시 오래된 항목부터 제거. 0 = 무제한. 설정:",
+  "diskkv.hint.ttl": "이 시간보다 오래 미사용된 디스크 항목 삭제. 기본 86400(하루); 0 = 만료 없음. 설정:",
   // ── 컨텍스트 카드 ───────────────────────────────────────────────
   "context.title": "컨텍스트",
   "context.titleHint": "(QUANT 상태에 연동)",

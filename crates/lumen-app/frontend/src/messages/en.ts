@@ -91,6 +91,17 @@ export const en: Record<string, string> = {
   "metrics.requestsPerMin": "req/min",
 
   // ── CONTEXT card ────────────────────────────────────────────────
+  "diskkv.title": "DISK KV CACHE",
+  "diskkv.titleHint": "(persist prefix KV across restarts)",
+  "diskkv.enable": "Enable",
+  "diskkv.off": "Off",
+  "diskkv.on": "On",
+  "diskkv.maxGb": "Max size (GB)",
+  "diskkv.ttl": "TTL (seconds)",
+  "diskkv.hint.enable":
+    "Persist the prompt-prefix KV cache to disk so a server restart reuses it instead of cold-prefilling. Sets",
+  "diskkv.hint.maxGb": "On-disk budget; oldest entries evicted past this. 0 = unlimited. Sets",
+  "diskkv.hint.ttl": "Drop disk entries idle longer than this. Default 86400 (1 day); 0 = never expire. Sets",
   "context.title": "CONTEXT",
   "context.titleHint": "(driven by QUANT state)",
   "context.max": "Max",

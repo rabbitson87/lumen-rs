@@ -709,6 +709,19 @@ fn apply_env(
         }
     }
 
+    // ── Disk KV cache (persistent prefix-cache tier) ───────────────
+    if cfg.server.kv_disk_enabled {
+        cmd.env("LUMEN_KV_DISK", "1");
+        cmd.env(
+            "LUMEN_KV_DISK_MAX_GB",
+            cfg.server.kv_disk_max_gb.to_string(),
+        );
+        cmd.env(
+            "LUMEN_KV_DISK_TTL_SECS",
+            cfg.server.kv_disk_ttl_secs.to_string(),
+        );
+    }
+
     // ── Loader / warmup ────────────────────────────────────────────
     if let Some(eid) = &cfg.server.embedding_model_id {
         if !eid.is_empty() {
@@ -878,6 +891,9 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL",
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL_M",
+    "LUMEN_KV_DISK",
+    "LUMEN_KV_DISK_MAX_GB",
+    "LUMEN_KV_DISK_TTL_SECS",
     "LUMEN_MAX_CTX",
     "LUMEN_SLIDING_WINDOW",
     "LUMEN_PREFILL_CHUNK",

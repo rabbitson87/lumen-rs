@@ -1196,6 +1196,60 @@
     {/if}
   </section>
 
+  <!-- DISK KV CACHE -->
+  {#if config}
+  <section class="{cardBase} col-span-6">
+    <h2 class={cardH2}>{t("diskkv.title")} <span class="dim">{t("diskkv.titleHint")}</span></h2>
+
+    <div class={kvRow}>
+      <span class="dim">{t("diskkv.enable")}</span>
+      <div class="flex gap-1">
+        <button
+          class={`px-2.5 py-1 min-w-12 ${!config.server.kv_disk_enabled ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.server.kv_disk_enabled = false; saveServer(); }}
+        >{t("diskkv.off")}</button>
+        <button
+          class={`px-2.5 py-1 min-w-12 ${config.server.kv_disk_enabled ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.server.kv_disk_enabled = true; saveServer(); }}
+        >{t("diskkv.on")}</button>
+      </div>
+    </div>
+    <div class={ctxHint}>
+      {t("diskkv.hint.enable")} <code class={inlineCode}>LUMEN_KV_DISK</code>.
+    </div>
+
+    <div class={kvRow}>
+      <span class="dim">{t("diskkv.maxGb")}</span>
+      <input
+        type="number"
+        min="0"
+        step="1"
+        bind:value={config.server.kv_disk_max_gb}
+        onchange={saveServer}
+        disabled={!config.server.kv_disk_enabled}
+      />
+    </div>
+    <div class={ctxHint}>
+      {t("diskkv.hint.maxGb")} <code class={inlineCode}>LUMEN_KV_DISK_MAX_GB</code>.
+    </div>
+
+    <div class={kvRow}>
+      <span class="dim">{t("diskkv.ttl")}</span>
+      <input
+        type="number"
+        min="0"
+        step="3600"
+        bind:value={config.server.kv_disk_ttl_secs}
+        onchange={saveServer}
+        disabled={!config.server.kv_disk_enabled}
+      />
+    </div>
+    <div class={ctxHint}>
+      {t("diskkv.hint.ttl")} <code class={inlineCode}>LUMEN_KV_DISK_TTL_SECS</code>.
+    </div>
+  </section>
+  {/if}
+
   {/if}
 
   {#if activeTab === "main"}
