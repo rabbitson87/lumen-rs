@@ -111,6 +111,7 @@ pub(crate) mod imp {
     use crate::gemma4_moe::imp::{GenerateConfig, NativeGemma4Model, NativeGemma4PromptCache};
     use crate::gemma4_response::imp::{ParseState, ParsedResponse, ResponseParser};
     use crate::gemma4_sampling::imp::SamplingConfig;
+    use crate::kv_disk::{DiskKvStore, KvManifest};
 
     /// Builds a `SamplingConfig` from request-supplied `temperature`/`top_p`
     /// plus operator-supplied env (`REPEAT_PENALTY`, `LUMEN_REPEAT_LAST_N`,
@@ -539,6 +540,62 @@ pub(crate) mod imp {
         /// initialized on first decode step; stays `None` when the
         /// sidecar is missing or the env gate is off.
         correction_table: OnceLock<Option<Arc<CorrectionTable>>>,
+        /// L2 disk persistence tier (opt-in via `LUMEN_KV_DISK`). `Some` once a
+        /// model is loaded with the disk tier enabled — boundary prefix
+        /// snapshots are serialized here so they survive process restart /
+        /// in-memory eviction. `None` keeps behaviour byte-identical to the
+        /// in-memory-only path. Fingerprint = sanitized `model_id`.
+        disk: Option<DiskKvStore>,
+    }
+
+    /// Open the opt-in L2 disk persistence tier from env (shared `LUMEN_KV_DISK`
+    /// gate + `LUMEN_KV_DISK_MAX_GB` budget), namespaced by `model_id`. Returns
+    /// `None` when off or on open failure (never fatal).
+    fn open_kv_disk(model_id: &str) -> Option<DiskKvStore> {
+        let enabled = matches!(
+            std::env::var("LUMEN_KV_DISK")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        );
+        if !enabled {
+            return None;
+        }
+        let fp: String = model_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|gb| gb * 1024 * 1024 * 1024)
+            .unwrap_or(0);
+        // Last-access TTL, default 1 day; 0 disables expiry.
+        let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(86_400);
+        match DiskKvStore::open(DiskKvStore::default_root(), &fp, max_bytes, ttl_secs) {
+            Ok(s) => {
+                eprintln!(
+                    "[gemma4] kv-disk tier ON: fingerprint={fp:?} entries={} max_gb={}",
+                    s.len(),
+                    max_bytes / (1024 * 1024 * 1024),
+                );
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[gemma4] kv-disk tier disabled (open failed): {e:#}");
+                None
+            }
+        }
     }
 
     impl Gemma4Backend {
@@ -571,16 +628,19 @@ pub(crate) mod imp {
             } else {
                 None
             };
+            let model_id: String = model_id.into();
+            let disk = open_kv_disk(&model_id);
             Ok(Self {
                 model,
                 seqs: HashMap::new(),
                 chat,
                 jinja_chat,
-                model_id: model_id.into(),
+                model_id,
                 prefix_caches: HashMap::new(),
                 model_dir: dir.to_path_buf(),
                 grammar_factory: OnceLock::new(),
                 correction_table: OnceLock::new(),
+                disk,
             })
         }
 
@@ -1568,7 +1628,29 @@ pub(crate) mod imp {
                     debug_assert_eq!(cache.offset(), lcp);
                     (cache, kind)
                 }
-                None => (self.make_cache_for_prompt_len(prompt.len()), "miss"),
+                None => {
+                    // L2 disk tier: rehydrate a persisted snapshot (survives
+                    // restart / eviction) before paying a cold prefill. Register
+                    // the hit in-mem so later forks this process hit memory.
+                    if let Some((k, cache, prefix_tokens)) = self.load_prefix_from_disk(prompt, key)
+                    {
+                        eprintln!(
+                            "[gemma4] prefix-cache: disk rehydrate key={k:?} prefix={}",
+                            prefix_tokens.len()
+                        );
+                        self.prefix_caches.insert(
+                            k,
+                            Gemma4PrefixCacheEntry {
+                                master: cache.clone(),
+                                prefix_tokens,
+                                last_access: Instant::now(),
+                                hits: 1,
+                            },
+                        );
+                        return (cache, "hit-disk");
+                    }
+                    (self.make_cache_for_prompt_len(prompt.len()), "miss")
+                }
             }
         }
 
@@ -1754,6 +1836,113 @@ pub(crate) mod imp {
             // long-lived server (each entry pins a full KV snapshot — hundreds
             // of MB for a multi-k-token prefix).
             self.evict_prefix_cache();
+
+            // L2 disk tier: durably persist this boundary snapshot so a future
+            // process forks it instead of cold-prefilling. This funnel is the
+            // only safe point (`offset == prompt.len()`, pre-decode, no rotation
+            // rollback). Synchronous (durable across restart); no-op when the
+            // disk tier is off; non-fatal + skipped for quantized/TQ layers
+            // (`to_disk_records` errors → dense-only until those are wired).
+            if self.disk.is_some() {
+                match cache.to_disk_records() {
+                    Ok((layers, records)) => {
+                        let created_at_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let fp = self.disk.as_ref().unwrap().fingerprint().to_string();
+                        let manifest = KvManifest {
+                            model_fingerprint: fp,
+                            created_at_unix,
+                            position: prompt.len(),
+                            prefix_tokens: prompt.to_vec(),
+                            last_token: None,
+                            is_deep: true,
+                            layers,
+                        };
+                        if let Err(e) = self.disk.as_mut().unwrap().put(key, &manifest, &records) {
+                            eprintln!("[gemma4] kv-disk persist skipped (key={key:?}): {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[gemma4] kv-disk persist skipped (key={key:?}): {e:#}");
+                    }
+                }
+                // L2 spill: under memory pressure, drop cold in-memory prefix
+                // snapshots (now durably on disk) to free RAM; they rehydrate via
+                // `prefix_fork`'s disk path on next access. Off unless
+                // `LUMEN_KV_SPILL_MEM_GB` is set.
+                if crate::kv_disk::under_memory_pressure() {
+                    self.spill_prefix_cache(crate::kv_disk::spill_keep_floor());
+                }
+            }
+        }
+
+        /// Drop the coldest in-memory prefix snapshots until at most `keep_n`
+        /// remain (LRU by `last_access`). Spilled entries stay on the disk tier
+        /// and rehydrate via `prefix_fork`'s disk lookup.
+        fn spill_prefix_cache(&mut self, keep_n: usize) {
+            let before = self.prefix_caches.len();
+            while self.prefix_caches.len() > keep_n {
+                let Some(lru) = self
+                    .prefix_caches
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_access)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.prefix_caches.remove(&lru);
+            }
+            let after = self.prefix_caches.len();
+            if after < before {
+                eprintln!(
+                    "[gemma4] prefix-cache: spilled {} cold snapshot(s) to disk (kept {after})",
+                    before - after
+                );
+            }
+        }
+
+        /// L2 disk tier: try to rehydrate a persisted boundary snapshot for
+        /// `key` (or its `sys_key`) whose tokens are a STRICT prefix of `prompt`
+        /// (so the forked cache's `offset == prefix_len` with no rotation
+        /// rollback). Picks the longer match. Returns the loaded cache + its
+        /// disk key + prefix tokens, or `None` (disk off / miss / non-prefix /
+        /// corrupt / unsupported layers).
+        fn load_prefix_from_disk(
+            &mut self,
+            prompt: &[u32],
+            key: &str,
+        ) -> Option<(String, NativeGemma4PromptCache, Vec<u32>)> {
+            self.disk.as_ref()?;
+            let candidates = [key.to_string(), Self::sys_key(key)];
+            let mut best: Option<(String, NativeGemma4PromptCache, Vec<u32>)> = None;
+            for k in candidates {
+                let loaded = match self.disk.as_mut().unwrap().get(&k) {
+                    Ok(Some(v)) => v,
+                    _ => continue,
+                };
+                let (manifest, records) = loaded;
+                let plen = manifest.prefix_tokens.len();
+                let is_strict =
+                    plen > 0 && plen < prompt.len() && prompt.starts_with(&manifest.prefix_tokens);
+                if !is_strict {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .map(|(_, _, pt)| plen > pt.len())
+                    .unwrap_or(true)
+                {
+                    match NativeGemma4PromptCache::from_disk_records(&manifest.layers, &records) {
+                        Ok(cache) => best = Some((k, cache, manifest.prefix_tokens)),
+                        Err(e) => {
+                            eprintln!("[gemma4] kv-disk rehydrate decode failed (key={k:?}): {e:#}")
+                        }
+                    }
+                }
+            }
+            best
         }
 
         /// Max live prefix-cache entries before LRU eviction (`LUMEN_PREFIX_CACHE_MAX_ENTRIES`,

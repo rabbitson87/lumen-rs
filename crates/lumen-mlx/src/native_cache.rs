@@ -463,6 +463,30 @@ mod imp {
             self.bits
         }
 
+        // Quantized 3-tuple accessors `(packed_uint32, scales, biases)` + parts
+        // constructor for P2 disk persistence.
+        pub fn keys(&self) -> Option<&(Array, Array, Array)> {
+            self.keys.as_ref()
+        }
+        pub fn values(&self) -> Option<&(Array, Array, Array)> {
+            self.values.as_ref()
+        }
+        pub fn from_parts(
+            keys: Option<(Array, Array, Array)>,
+            values: Option<(Array, Array, Array)>,
+            offset: usize,
+            group_size: i32,
+            bits: i32,
+        ) -> Self {
+            Self {
+                keys,
+                values,
+                offset,
+                group_size,
+                bits,
+            }
+        }
+
         pub fn clear(&mut self) {
             self.keys = None;
             self.values = None;
@@ -774,6 +798,32 @@ mod imp {
 
         pub fn values(&self) -> Option<&Array> {
             self.values.as_ref()
+        }
+
+        pub fn idx(&self) -> usize {
+            self.idx
+        }
+
+        /// Reconstruct a rotating cache from disk-deserialized parts (P2 disk
+        /// persistence). Stores the FULL backing ring buffers verbatim (not a
+        /// logical view) so the circular `idx`-based reads reproduce exactly —
+        /// `offset`/`idx`/`max_size`/`keep` are restored as-is.
+        pub fn from_parts(
+            keys: Option<Array>,
+            values: Option<Array>,
+            offset: usize,
+            max_size: usize,
+            keep: usize,
+            idx: usize,
+        ) -> Self {
+            Self {
+                keys,
+                values,
+                offset,
+                max_size,
+                keep,
+                idx,
+            }
         }
 
         /// Update KV cache with new tokens. Dispatches to a fast in-place path
@@ -1138,6 +1188,40 @@ mod imp {
 
         pub fn bits(&self) -> i32 {
             self.bits
+        }
+
+        pub fn idx(&self) -> usize {
+            self.idx
+        }
+
+        // Quantized 3-tuple accessors + parts constructor (P2 disk persistence).
+        pub fn keys(&self) -> Option<&(Array, Array, Array)> {
+            self.keys.as_ref()
+        }
+        pub fn values(&self) -> Option<&(Array, Array, Array)> {
+            self.values.as_ref()
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn from_parts(
+            keys: Option<(Array, Array, Array)>,
+            values: Option<(Array, Array, Array)>,
+            offset: usize,
+            max_size: usize,
+            keep: usize,
+            idx: usize,
+            group_size: i32,
+            bits: i32,
+        ) -> Self {
+            Self {
+                keys,
+                values,
+                offset,
+                max_size,
+                keep,
+                idx,
+                group_size,
+                bits,
+            }
         }
 
         pub fn empty(&self) -> bool {
@@ -1636,6 +1720,66 @@ mod imp {
 
         pub fn bits(&self) -> u32 {
             self.bits
+        }
+
+        pub fn idx(&self) -> usize {
+            self.idx
+        }
+
+        // Per-slot Array accessors — used by disk persistence (P1c) to read the
+        // compressed ring buffers out for serialization.
+        pub fn keys_codes(&self) -> Option<&Array> {
+            self.keys_codes.as_ref()
+        }
+        pub fn keys_sigma(&self) -> Option<&Array> {
+            self.keys_sigma.as_ref()
+        }
+        pub fn values_codes(&self) -> Option<&Array> {
+            self.values_codes.as_ref()
+        }
+        pub fn values_sigma(&self) -> Option<&Array> {
+            self.values_sigma.as_ref()
+        }
+        pub fn keys_signs(&self) -> Option<&Array> {
+            self.keys_signs.as_ref()
+        }
+        pub fn keys_residual_norm(&self) -> Option<&Array> {
+            self.keys_residual_norm.as_ref()
+        }
+
+        /// Reconstruct a TurboQuant cache from disk-deserialized parts (P1c disk
+        /// persistence) — the inverse of the per-slot accessors. Scalar geometry
+        /// is restored verbatim; the caller passes arrays whose shapes already
+        /// match the recorded `offset` / `idx` / `max_size` bookkeeping.
+        #[allow(clippy::too_many_arguments)]
+        pub fn from_parts(
+            keys_codes: Option<Array>,
+            keys_sigma: Option<Array>,
+            values_codes: Option<Array>,
+            values_sigma: Option<Array>,
+            keys_signs: Option<Array>,
+            keys_residual_norm: Option<Array>,
+            offset: usize,
+            max_size: usize,
+            keep: usize,
+            idx: usize,
+            bits: u32,
+            qjl_m: Option<usize>,
+        ) -> Self {
+            Self {
+                keys_codes,
+                keys_sigma,
+                values_codes,
+                values_sigma,
+                keys_signs,
+                keys_residual_norm,
+                offset,
+                max_size,
+                keep,
+                idx,
+                bits,
+                qjl_m,
+            }
         }
 
         pub fn empty(&self) -> bool {

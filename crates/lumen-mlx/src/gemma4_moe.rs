@@ -18,6 +18,9 @@ pub(crate) mod imp {
 
     use std::ffi::CStr;
 
+    use crate::kv_disk::{
+        ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
+    };
     use crate::native_attention::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
     use crate::native_cache::{
         NativeKvCache, NativeKvCacheQuantized, NativeRotatingKvCache,
@@ -2283,6 +2286,20 @@ pub(crate) mod imp {
         layers: Vec<NativeGemma4LayerCache>,
     }
 
+    /// Read a present Array into the disk-record blob, returning its index;
+    /// `None` for an absent slot. (P2 Gemma4 disk persistence helper.)
+    fn push_record(records: &mut Vec<ArrayRecord>, a: Option<&Array>) -> Result<Option<usize>> {
+        match a {
+            None => Ok(None),
+            Some(arr) => {
+                let rec = record_from_array(arr)?;
+                let id = records.len();
+                records.push(rec);
+                Ok(Some(id))
+            }
+        }
+    }
+
     impl NativeGemma4PromptCache {
         /// Allocate caches for every layer of `cfg`. mlx_lm semantics:
         ///   layer_type == "full_attention"    → KVCache()
@@ -2297,6 +2314,271 @@ pub(crate) mod imp {
         /// callers that don't yet know the prompt length.
         pub fn for_config(cfg: &NativeGemma4TextConfig) -> Self {
             Self::for_config_with_tq(cfg, None, None)
+        }
+
+        /// P2 disk persistence — serialize this whole-cache snapshot into
+        /// `(per-layer metadata, flat ArrayRecord blob)` reusing the shared
+        /// `kv_disk` LKV1 primitives. Covers all live layer kinds: dense `Full`
+        /// / `Sliding`, affine-quantized `FullQuantized` / `SlidingQuantized`
+        /// (K/V 3-tuples), and TurboQuant `FullTurboquant` / `SlidingTurboquant`.
+        pub fn to_disk_records(&self) -> Result<(Vec<LayerMeta>, Vec<ArrayRecord>)> {
+            let mut records: Vec<ArrayRecord> = Vec::new();
+            let mut metas: Vec<LayerMeta> = Vec::with_capacity(self.layers.len());
+
+            // Push a quantized `(packed, scales, biases)` 3-tuple, returning the
+            // three record slot ids (or `None`s when the tuple is absent).
+            let push_q3 = |recs: &mut Vec<ArrayRecord>,
+                           t: Option<&(Array, Array, Array)>|
+             -> Result<Vec<Option<usize>>> {
+                match t {
+                    Some((p, s, b)) => Ok(vec![
+                        push_record(recs, Some(p))?,
+                        push_record(recs, Some(s))?,
+                        push_record(recs, Some(b))?,
+                    ]),
+                    None => Ok(vec![None, None, None]),
+                }
+            };
+            // Serialize a TurboQuant rotating cache (shared by Full/Sliding TQ).
+            let tq_records = |recs: &mut Vec<ArrayRecord>,
+                              c: &NativeRotatingKvCacheTurboQuant,
+                              kind: LayerKindTag|
+             -> Result<LayerMeta> {
+                let arrays = vec![
+                    push_record(recs, c.keys_codes())?,
+                    push_record(recs, c.keys_sigma())?,
+                    push_record(recs, c.values_codes())?,
+                    push_record(recs, c.values_sigma())?,
+                    push_record(recs, c.keys_signs())?,
+                    push_record(recs, c.keys_residual_norm())?,
+                ];
+                let mut m = LayerMeta::new(kind, c.offset());
+                m.arrays = arrays;
+                m.max_size = Some(c.max_size());
+                m.keep = Some(c.keep());
+                m.idx = Some(c.idx());
+                m.bits = Some(c.bits());
+                m.qjl_m = c.qjl_m();
+                Ok(m)
+            };
+
+            for layer in &self.layers {
+                match layer {
+                    NativeGemma4LayerCache::Full(c) => {
+                        // Logical view (`[.., :offset, ..]`) — smaller than the
+                        // block-prealloc backing; reconstructed via `set_state`.
+                        let kid = push_record(&mut records, c.keys_view()?.as_ref())?;
+                        let vid = push_record(&mut records, c.values_view()?.as_ref())?;
+                        let mut m = LayerMeta::new(LayerKindTag::Full, c.offset());
+                        m.arrays = vec![kid, vid];
+                        metas.push(m);
+                    }
+                    NativeGemma4LayerCache::Sliding(c) => {
+                        // Full backing ring (NOT a view) so circular reads
+                        // reproduce; `idx`/`offset` restore the ring position.
+                        let kid = push_record(&mut records, c.keys())?;
+                        let vid = push_record(&mut records, c.values())?;
+                        let mut m = LayerMeta::new(LayerKindTag::Sliding, c.offset());
+                        m.arrays = vec![kid, vid];
+                        m.max_size = Some(c.max_size());
+                        m.keep = Some(c.keep());
+                        m.idx = Some(c.idx());
+                        metas.push(m);
+                    }
+                    NativeGemma4LayerCache::FullQuantized(c) => {
+                        let mut arrays = push_q3(&mut records, c.keys())?;
+                        arrays.extend(push_q3(&mut records, c.values())?);
+                        let mut m = LayerMeta::new(LayerKindTag::FullQuantized, c.offset());
+                        m.arrays = arrays;
+                        m.group_size = Some(c.group_size());
+                        m.bits = Some(c.bits() as u32);
+                        metas.push(m);
+                    }
+                    NativeGemma4LayerCache::SlidingQuantized(c) => {
+                        let mut arrays = push_q3(&mut records, c.keys())?;
+                        arrays.extend(push_q3(&mut records, c.values())?);
+                        let mut m = LayerMeta::new(LayerKindTag::SlidingQuantized, c.offset());
+                        m.arrays = arrays;
+                        m.max_size = Some(c.max_size());
+                        m.keep = Some(c.keep());
+                        m.idx = Some(c.idx());
+                        m.group_size = Some(c.group_size());
+                        m.bits = Some(c.bits() as u32);
+                        metas.push(m);
+                    }
+                    NativeGemma4LayerCache::SlidingTurboquant(c) => {
+                        metas.push(tq_records(
+                            &mut records,
+                            c,
+                            LayerKindTag::SlidingTurboquant,
+                        )?);
+                    }
+                    NativeGemma4LayerCache::FullTurboquant(c) => {
+                        metas.push(tq_records(&mut records, c, LayerKindTag::FullTurboquant)?);
+                    }
+                }
+            }
+            Ok((metas, records))
+        }
+
+        /// Inverse of [`Self::to_disk_records`]. Rebuilds the layer vector from
+        /// the persisted metadata + record blob. Layer kinds + geometry come
+        /// from `metas` (written by the same model — guarded by the disk-store
+        /// fingerprint), so no model config is needed here.
+        pub fn from_disk_records(metas: &[LayerMeta], records: &[ArrayRecord]) -> Result<Self> {
+            let get = |id: Option<usize>| -> Result<Option<Array>> {
+                match id {
+                    None => Ok(None),
+                    Some(i) => {
+                        let rec = records.get(i).ok_or_else(|| {
+                            anyhow!(
+                                "kv_disk: Gemma4 from_disk_records record index {i} out of range"
+                            )
+                        })?;
+                        Ok(Some(record_to_array(rec)?))
+                    }
+                }
+            };
+            // Reconstruct a quantized `(packed, scales, biases)` 3-tuple from
+            // three consecutive `m.arrays` slots starting at `base`.
+            let get3 = |m: &LayerMeta, base: usize| -> Result<Option<(Array, Array, Array)>> {
+                let p = get(m.arrays.get(base).copied().flatten())?;
+                let s = get(m.arrays.get(base + 1).copied().flatten())?;
+                let b = get(m.arrays.get(base + 2).copied().flatten())?;
+                match (p, s, b) {
+                    (Some(p), Some(s), Some(b)) => Ok(Some((p, s, b))),
+                    (None, None, None) => Ok(None),
+                    _ => Err(anyhow!(
+                        "kv_disk: Gemma4 quantized 3-tuple partially present"
+                    )),
+                }
+            };
+            // Reconstruct a TurboQuant rotating cache (shared Full/Sliding TQ).
+            let tq_from = |m: &LayerMeta| -> Result<NativeRotatingKvCacheTurboQuant> {
+                let slot = |i: usize| get(m.arrays.get(i).copied().flatten());
+                let max_size = m
+                    .max_size
+                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing max_size"))?;
+                let keep = m
+                    .keep
+                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing keep"))?;
+                let idx = m
+                    .idx
+                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing idx"))?;
+                let bits = m
+                    .bits
+                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing bits"))?;
+                Ok(NativeRotatingKvCacheTurboQuant::from_parts(
+                    slot(0)?,
+                    slot(1)?,
+                    slot(2)?,
+                    slot(3)?,
+                    slot(4)?,
+                    slot(5)?,
+                    m.offset,
+                    max_size,
+                    keep,
+                    idx,
+                    bits,
+                    m.qjl_m,
+                ))
+            };
+
+            let mut layers = Vec::with_capacity(metas.len());
+            for m in metas {
+                match m.kind {
+                    LayerKindTag::Full => {
+                        let mut c = NativeKvCache::new();
+                        c.set_state(
+                            get(m.arrays.first().copied().flatten())?,
+                            get(m.arrays.get(1).copied().flatten())?,
+                            m.offset,
+                        );
+                        layers.push(NativeGemma4LayerCache::Full(c));
+                    }
+                    LayerKindTag::Sliding => {
+                        let keys = get(m.arrays.first().copied().flatten())?;
+                        let values = get(m.arrays.get(1).copied().flatten())?;
+                        let max_size = m.max_size.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 Sliding layer missing max_size")
+                        })?;
+                        let keep = m
+                            .keep
+                            .ok_or_else(|| anyhow!("kv_disk: Gemma4 Sliding layer missing keep"))?;
+                        let idx = m
+                            .idx
+                            .ok_or_else(|| anyhow!("kv_disk: Gemma4 Sliding layer missing idx"))?;
+                        // The record codec now reads the full ring buffer in
+                        // correct logical order (reshape-flat fix), so install it
+                        // verbatim with its rotation bookkeeping — handles both
+                        // pre-rotation (offset<=max_size) and rotated rings
+                        // (offset>max_size, long system prompts).
+                        layers.push(NativeGemma4LayerCache::Sliding(
+                            NativeRotatingKvCache::from_parts(
+                                keys, values, m.offset, max_size, keep, idx,
+                            ),
+                        ));
+                    }
+                    LayerKindTag::FullQuantized => {
+                        let group_size = m.group_size.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 FullQuantized layer missing group_size")
+                        })?;
+                        let bits = m.bits.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 FullQuantized layer missing bits")
+                        })? as i32;
+                        layers.push(NativeGemma4LayerCache::FullQuantized(
+                            NativeKvCacheQuantized::from_parts(
+                                get3(m, 0)?,
+                                get3(m, 3)?,
+                                m.offset,
+                                group_size,
+                                bits,
+                            ),
+                        ));
+                    }
+                    LayerKindTag::SlidingQuantized => {
+                        let max_size = m.max_size.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 SlidingQuantized layer missing max_size")
+                        })?;
+                        let keep = m.keep.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 SlidingQuantized layer missing keep")
+                        })?;
+                        let idx = m.idx.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 SlidingQuantized layer missing idx")
+                        })?;
+                        let group_size = m.group_size.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 SlidingQuantized layer missing group_size")
+                        })?;
+                        let bits = m.bits.ok_or_else(|| {
+                            anyhow!("kv_disk: Gemma4 SlidingQuantized layer missing bits")
+                        })? as i32;
+                        layers.push(NativeGemma4LayerCache::SlidingQuantized(
+                            NativeRotatingKvCacheQuantized::from_parts(
+                                get3(m, 0)?,
+                                get3(m, 3)?,
+                                m.offset,
+                                max_size,
+                                keep,
+                                idx,
+                                group_size,
+                                bits,
+                            ),
+                        ));
+                    }
+                    LayerKindTag::SlidingTurboquant => {
+                        layers.push(NativeGemma4LayerCache::SlidingTurboquant(tq_from(m)?));
+                    }
+                    LayerKindTag::FullTurboquant => {
+                        layers.push(NativeGemma4LayerCache::FullTurboquant(tq_from(m)?));
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "kv_disk: Gemma4 from_disk_records unsupported layer kind {other:?}"
+                        ));
+                    }
+                }
+            }
+            Ok(Self { layers })
         }
 
         /// Allocate caches with explicit TurboQuant and simple-Q4 on/off

@@ -110,6 +110,7 @@ mod imp {
         Ok(())
     }
 
+    use crate::kv_disk::{DiskKvStore, KvManifest};
     use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
     use crate::native_snapshot::PromptCacheSnapshot;
@@ -255,6 +256,16 @@ mod imp {
         /// shared prefix KV those seqs attend against. `None` when dedup is off
         /// (`LUMEN_MLX_SHARED_PREFIX` unset) or no common prefix has formed.
         shared_prefix: Option<SharedPrefixKv>,
+        /// L2 disk persistence tier (opt-in via `LUMEN_KV_DISK`). `Some` once a
+        /// model is loaded with the disk tier enabled — prefix-cache boundary
+        /// snapshots are serialized here so they survive process restart /
+        /// in-memory eviction (avoids re-paying cold prefill). `None` keeps the
+        /// path byte-identical to the in-memory-only behaviour.
+        disk: Option<DiskKvStore>,
+        /// Model identity used to namespace `disk` (sanitized `model_id`). A
+        /// mismatch means a persisted snapshot was made by a different model and
+        /// is discarded on load.
+        fingerprint: String,
     }
 
     #[allow(dead_code)]
@@ -1193,6 +1204,8 @@ mod imp {
                 snapshots: HashMap::new(),
                 next_snapshot_id: 1,
                 shared_prefix: None,
+                disk: None,
+                fingerprint: String::new(),
             })
         }
 
@@ -1222,7 +1235,67 @@ mod imp {
             self.seqs.clear();
             self.snapshots.clear();
             self.next_snapshot_id = 1;
+            self.init_disk_tier(model_id);
             Ok(info)
+        }
+
+        /// Construct the opt-in L2 disk persistence tier from env. Off unless
+        /// `LUMEN_KV_DISK` is truthy. `LUMEN_KV_DISK_MAX_GB` bounds the on-disk
+        /// LRU budget (0 / unset = unbounded). `fingerprint` namespaces the
+        /// cache directory by model identity so a different model can't load a
+        /// stale snapshot. Failures degrade to "no disk tier" — never fatal.
+        fn init_disk_tier(&mut self, model_id: &str) {
+            self.fingerprint = model_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let enabled = matches!(
+                std::env::var("LUMEN_KV_DISK")
+                    .ok()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            );
+            if !enabled {
+                self.disk = None;
+                return;
+            }
+            let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|gb| gb * 1024 * 1024 * 1024)
+                .unwrap_or(0);
+            // Last-access TTL, default 1 day; 0 disables expiry.
+            let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(86_400);
+            match DiskKvStore::open(
+                DiskKvStore::default_root(),
+                &self.fingerprint,
+                max_bytes,
+                ttl_secs,
+            ) {
+                Ok(store) => {
+                    eprintln!(
+                        "[mlx] kv-disk tier ON: fingerprint={:?} entries={} max_gb={}",
+                        self.fingerprint,
+                        store.len(),
+                        max_bytes / (1024 * 1024 * 1024),
+                    );
+                    self.disk = Some(store);
+                }
+                Err(e) => {
+                    eprintln!("[mlx] kv-disk tier disabled (open failed): {e:#}");
+                    self.disk = None;
+                }
+            }
         }
 
         pub(crate) fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
@@ -1963,6 +2036,97 @@ mod imp {
             // Idempotent — silent no-op if id is unknown (matches PyO3).
             self.snapshots.remove(&snapshot_id);
             Ok(())
+        }
+
+        /// L2 disk tier: serialize the deep snapshot `snapshot_id` to disk under
+        /// `key` so a future process can fork it instead of cold-prefilling.
+        /// No-op when the disk tier is off. Dense `Full` + `Linear` layers only
+        /// (TurboQuant-compressed layers cause `to_records` to error, surfaced
+        /// here as a non-fatal `Err` the caller logs and ignores).
+        pub(crate) fn persist_snapshot_disk(
+            &mut self,
+            snapshot_id: u64,
+            key: &str,
+            prefix_tokens: &[u32],
+            last_token: Option<u32>,
+        ) -> Result<()> {
+            if self.disk.is_none() {
+                return Ok(());
+            }
+            // Read the snapshot to host bytes BEFORE borrowing `disk` mutably so
+            // the two field borrows don't overlap.
+            let (layers, records, position, is_deep) = {
+                let snap = self.snapshots.get(&snapshot_id).ok_or_else(|| {
+                    anyhow!("native mlx-rs runner: persist_snapshot_disk — unknown snapshot {snapshot_id}")
+                })?;
+                let (layers, records) = snap.to_records()?;
+                (layers, records, snap.position(), snap.is_deep())
+            };
+            let created_at_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let manifest = KvManifest {
+                model_fingerprint: self.fingerprint.clone(),
+                created_at_unix,
+                position,
+                prefix_tokens: prefix_tokens.to_vec(),
+                last_token,
+                is_deep,
+                layers,
+            };
+            let disk = self
+                .disk
+                .as_mut()
+                .expect("disk tier present (checked above)");
+            disk.put(key, &manifest, &records)?;
+            Ok(())
+        }
+
+        /// L2 disk tier: rehydrate a persisted snapshot for `key` whose token
+        /// prefix is a prefix of `prompt_ids`. On success, materializes it into
+        /// the in-memory snapshot table (so it can be forked) and returns
+        /// `(snapshot_id, prefix_tokens, last_token)`. `None` on miss / disk off
+        /// / corrupt / non-prefix / fingerprint mismatch (the store itself
+        /// discards mismatched entries).
+        pub(crate) fn load_persisted_disk(
+            &mut self,
+            key: &str,
+            prompt_ids: &[u32],
+        ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+            if self.disk.is_none() {
+                return Ok(None);
+            }
+            let loaded = {
+                let disk = self
+                    .disk
+                    .as_mut()
+                    .expect("disk tier present (checked above)");
+                disk.get(key)?
+            };
+            let Some((manifest, records)) = loaded else {
+                return Ok(None);
+            };
+            // The persisted prefix must be a genuine prefix of this prompt, else
+            // forking it would produce a wrong KV state.
+            if manifest.prefix_tokens.is_empty() || !prompt_ids.starts_with(&manifest.prefix_tokens)
+            {
+                return Ok(None);
+            }
+            let snap = PromptCacheSnapshot::from_records(
+                &manifest.layers,
+                &records,
+                manifest.position,
+                /* is_deep = */ true,
+            )
+            .context("native mlx-rs runner: load_persisted_disk — from_records failed")?;
+            let sid = self.next_snapshot_id;
+            self.next_snapshot_id = self
+                .next_snapshot_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("native mlx-rs runner: snapshot_id counter exhausted"))?;
+            self.snapshots.insert(sid, snap);
+            Ok(Some((sid, manifest.prefix_tokens, manifest.last_token)))
         }
 
         pub(crate) fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {

@@ -47,6 +47,10 @@ mod gemma4_thinking;
 mod gemma4_tools;
 pub mod grammar;
 mod jinja_chat;
+// On-disk KV-cache persistence primitives (P0). Pure format/store layer
+// compiles under default features; Array<->record conversion is gated behind
+// `mlx-native`. Phase 1 wires this into the prefix-cache disk tier.
+pub mod kv_disk;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
 /// raise the wired-memory cap (mirrors mlx-lm's `wired_limit()` context).
@@ -531,6 +535,34 @@ impl RunnerImpl {
             .fork_from_snapshot(snapshot_id, dst_seq_id)
     }
 
+    /// L2 disk tier — persist a snapshot durably. Native-only; other backends
+    /// are no-ops (their snapshot state is not serializable here).
+    fn persist_snapshot_disk(
+        &mut self,
+        snapshot_id: u64,
+        key: &str,
+        prefix_tokens: &[u32],
+        last_token: Option<u32>,
+    ) -> Result<()> {
+        match self {
+            Self::Native(r) => r.persist_snapshot_disk(snapshot_id, key, prefix_tokens, last_token),
+            _ => Ok(()),
+        }
+    }
+
+    /// L2 disk tier — rehydrate a persisted snapshot. Native-only; other
+    /// backends always miss.
+    fn load_persisted_disk(
+        &mut self,
+        key: &str,
+        prompt_ids: &[u32],
+    ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        match self {
+            Self::Native(r) => r.load_persisted_disk(key, prompt_ids),
+            _ => Ok(None),
+        }
+    }
+
     fn take_native_decode_timing_log(&mut self) -> Option<Vec<(f64, f64)>> {
         match self {
             Self::Native(r) => r.take_decode_timing_log(),
@@ -654,6 +686,24 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
     }
     fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
         self.as_runner_mut().release_snapshot(snapshot_id)
+    }
+    // L2 disk tier hooks (tools path). Forward to the inherent methods, which
+    // are no-ops on non-native backends / when the disk tier is off.
+    fn persist_snapshot(
+        &mut self,
+        snapshot_id: u64,
+        key: &str,
+        prefix_tokens: &[u32],
+        last_token: Option<u32>,
+    ) -> Result<()> {
+        RunnerImpl::persist_snapshot_disk(self, snapshot_id, key, prefix_tokens, last_token)
+    }
+    fn load_persisted_snapshot(
+        &mut self,
+        key: &str,
+        prompt_ids: &[u32],
+    ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        RunnerImpl::load_persisted_disk(self, key, prompt_ids)
     }
 }
 
@@ -3779,6 +3829,11 @@ impl MlxQwen35Backend {
 
         self.prefix_store.evict_stale(&mut self.runner);
 
+        // Boundary snapshot to durably persist to the L2 disk tier, captured in
+        // the cache-write branch and flushed AFTER the decode loop so the write
+        // never delays token delivery. `(snapshot_id, boundary_prefix_tokens)`.
+        let mut persist_after: Option<(u64, Vec<u32>)> = None;
+
         let (mut last, mut pos);
         if boundary == 0 {
             // No isolatable prefix — plain cold prefill, no cache write.
@@ -3796,9 +3851,45 @@ impl MlxQwen35Backend {
             // Stage 1: position seq_id's cache exactly at `boundary` — fork a
             // cached prefix and extend up to the boundary when one is a strict
             // prefix, else cold-prefill up to the boundary.
-            let cached = self
+            let cached = match self
                 .prefix_store
-                .get_master_for(prefix_cache_key, &prompt_ids);
+                .get_master_for(prefix_cache_key, &prompt_ids)
+            {
+                Some(c) => Some(c),
+                // L2 disk tier: in-memory miss → try to rehydrate a persisted
+                // boundary snapshot for this key (survives restart / eviction).
+                // No-op (None) when the disk tier is off, so this stays
+                // byte-identical to the cold-prefill path. On a disk HIT we
+                // register it in the in-memory store so subsequent turns in this
+                // process hit memory directly.
+                None => match self
+                    .runner
+                    .load_persisted_disk(prefix_cache_key, &prompt_ids)
+                {
+                    Ok(Some((snap_id, prefix_tokens, last_token))) => {
+                        eprintln!(
+                            "[mlx] prefix-cache: disk rehydrate key={prefix_cache_key:?} \
+                             prefix={}",
+                            prefix_tokens.len()
+                        );
+                        self.prefix_store.store_master(
+                            &mut self.runner,
+                            prefix_cache_key,
+                            snap_id,
+                            prefix_tokens.clone(),
+                            last_token,
+                        );
+                        Some((snap_id, prefix_tokens))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!(
+                            "[mlx] prefix-cache: disk rehydrate failed (key={prefix_cache_key:?}): {e:#}"
+                        );
+                        None
+                    }
+                },
+            };
             let t = std::time::Instant::now();
             let reused = match cached {
                 Some((master, prefix))
@@ -3835,6 +3926,13 @@ impl MlxQwen35Backend {
                         prompt_ids[..boundary].to_vec(),
                         None,
                     );
+                    // L2 disk tier: DEFER the durable persist until after the
+                    // decode loop (see `persist_after` use below). Capturing the
+                    // boundary snapshot id + tokens here, but writing after
+                    // generation, keeps the (synchronous, durable) disk write off
+                    // the token-delivery path — TTFT / inter-token latency are
+                    // unaffected for streaming. No-op when the disk tier is off.
+                    persist_after = Some((snap_id, prompt_ids[..boundary].to_vec()));
                 }
                 Err(e) => eprintln!(
                     "[mlx] prefix-cache: boundary snapshot failed ({e}); not cached this turn"
@@ -3869,6 +3967,7 @@ impl MlxQwen35Backend {
             }
         }
         if self.eos_tokens.contains(&last) {
+            self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
             return Ok(out);
@@ -3900,9 +3999,40 @@ impl MlxQwen35Backend {
             "[mlx] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
             n_gen as f64 / (decode_ms / 1000.0)
         );
+        self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
         Ok(out)
+    }
+
+    /// Flush a deferred boundary snapshot to the L2 disk tier (synchronous,
+    /// durable). Called after generation so the disk write never delays token
+    /// delivery. No-op when `persist` is `None` or the disk tier is off;
+    /// non-fatal on error (the request already succeeded).
+    fn persist_boundary_snapshot(&mut self, persist: Option<(u64, Vec<u32>)>, key: &str) {
+        if let Some((snap_id, prefix)) = persist {
+            if let Err(e) = self
+                .runner
+                .persist_snapshot_disk(snap_id, key, &prefix, None)
+            {
+                eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
+            }
+        }
+        // L2 spill: under memory pressure, drop cold in-memory snapshots (now
+        // durably on disk) to free RAM; they rehydrate on next access. Off
+        // unless `LUMEN_KV_SPILL_MEM_GB` is set.
+        if crate::kv_disk::under_memory_pressure() {
+            let keep = crate::kv_disk::spill_keep_floor();
+            let before = self.prefix_store.len();
+            self.prefix_store.spill(&mut self.runner, keep);
+            let after = self.prefix_store.len();
+            if after < before {
+                eprintln!(
+                    "[mlx] prefix-cache: spilled {} cold snapshot(s) to disk (kept {after})",
+                    before - after
+                );
+            }
+        }
     }
 
     /// Returns the length, in tokens, of the system-prompt block at the start

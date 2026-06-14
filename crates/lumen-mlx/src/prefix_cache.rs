@@ -55,6 +55,35 @@ pub trait SnapshotRunner {
     /// consumed — multi-fork supported). Returns the new seq's position.
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
     fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()>;
+
+    /// L2 disk tier (opt-in): durably persist the deep snapshot `snapshot_id`
+    /// under `key` so it survives process restart / in-memory eviction. Default
+    /// is a no-op, so in-memory-only runners (and the disabled disk path) are
+    /// byte-identical to before. Errors are non-fatal — the caller logs and
+    /// continues without the durable copy.
+    fn persist_snapshot(
+        &mut self,
+        _snapshot_id: u64,
+        _key: &str,
+        _prefix_tokens: &[u32],
+        _last_token: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// L2 disk tier (opt-in): try to rehydrate a previously persisted snapshot
+    /// for `key` whose token prefix is a prefix of `prompt_ids`. On success the
+    /// runner materializes the snapshot into its in-memory snapshot table and
+    /// returns `(snapshot_id, prefix_tokens, last_token)` so the store can
+    /// register an entry and fork from it. Default returns `None` (no disk
+    /// tier), making the cold-MISS path unchanged.
+    fn load_persisted_snapshot(
+        &mut self,
+        _key: &str,
+        _prompt_ids: &[u32],
+    ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        Ok(None)
+    }
 }
 
 /// A prefix-cache master snapshot entry. Holds a deep snapshot of the per-layer
@@ -224,7 +253,38 @@ impl PrefixCacheStore {
         // longest prefix of `prompt_ids`. HIT requires either a strict extension
         // (suffix non-empty) or a byte-identical prompt with a stored argmax
         // (`last_token`) — the omp exact-retry case.
-        let hit = self.longest_hit(key, prompt_ids);
+        let hit = match self.longest_hit(key, prompt_ids) {
+            Some(idx) => Some(idx),
+            // L2 disk tier: on an in-memory miss, try to rehydrate a persisted
+            // snapshot for this key (survives restart / eviction). With the disk
+            // tier off, `load_persisted_snapshot` defaults to `None`, so this is
+            // byte-identical to the original cold-MISS path. On a disk HIT we
+            // register the rehydrated snapshot as a branch and re-run LPM so the
+            // standard fork+extend path below handles it uniformly.
+            None => match runner.load_persisted_snapshot(key, prompt_ids) {
+                Ok(Some((snap_id, prefix_tokens, last_token))) => {
+                    self.insert_branch(
+                        runner,
+                        key,
+                        PrefixCacheEntry {
+                            master_snapshot_id: snap_id,
+                            prefix_tokens,
+                            last_access: Instant::now(),
+                            hits: 0,
+                            last_token,
+                            in_use: 0,
+                            pinned_boundary: false,
+                        },
+                    );
+                    self.longest_hit(key, prompt_ids)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("[mlx] prefix-cache: disk rehydrate failed (key={key:?}): {e:#}");
+                    None
+                }
+            },
+        };
 
         if let Some(idx) = hit {
             let (master, prefix, cached_last) = {
@@ -422,6 +482,12 @@ impl PrefixCacheStore {
                     },
                 );
                 self.evict_stale(runner);
+                // L2 disk tier (opt-in): durably persist the freshly-prefilled
+                // snapshot so a future process can fork it instead of paying the
+                // cold prefill again. No-op when the disk tier is off.
+                if let Err(e) = runner.persist_snapshot(snap_id, key, prompt_ids, Some(last)) {
+                    eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
+                }
                 eprintln!(
                     "[mlx] prefix-cache MISS (tools) key={key:?} stored snapshot={snap_id} \
                      prefix_len={} branches={}",
@@ -549,6 +615,42 @@ impl PrefixCacheStore {
                 if cands.is_empty() {
                     self.entries.remove(&key);
                 }
+            }
+        }
+    }
+
+    /// L2 spill: drop the coldest in-memory snapshots (releasing them from the
+    /// runner) until at most `keep_n` remain. Spilled entries' KV stays on the
+    /// disk tier (persisted at store time) and rehydrates on next access, so
+    /// this frees RAM under memory pressure without losing the cache. In-use
+    /// entries are never spilled. No-op when already at/below `keep_n`.
+    pub fn spill<R: SnapshotRunner>(&mut self, runner: &mut R, keep_n: usize) {
+        while self.len() > keep_n {
+            let victim = self
+                .entries
+                .iter()
+                .flat_map(|(k, v)| {
+                    v.iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.in_use == 0)
+                        .map(move |(i, e)| (k.clone(), i, e.last_access))
+                })
+                .min_by_key(|(_, _, la)| *la)
+                .map(|(k, i, _)| (k, i));
+            match victim {
+                Some((k, i)) => {
+                    if let Some(cands) = self.entries.get_mut(&k) {
+                        if i < cands.len() {
+                            let e = cands.remove(i);
+                            let _ = runner.release_snapshot(e.master_snapshot_id);
+                        }
+                        if cands.is_empty() {
+                            self.entries.remove(&k);
+                        }
+                    }
+                }
+                // Every remaining entry is in-use — stop rather than spin.
+                None => break,
             }
         }
     }
@@ -1144,6 +1246,120 @@ mod tests {
         assert!(
             m.log.contains(&"release(1)".to_string()),
             "LRU full-prompt branch (snap 1) must be evicted, got {:?}",
+            m.log
+        );
+    }
+
+    // ── L2 disk tier (persist / rehydrate) wiring ──────────────────────────
+
+    /// Mock that logs the disk-tier hooks and can return one canned rehydrated
+    /// snapshot, so tests pin down the persist-on-MISS and load-on-MISS control
+    /// flow without a real runner. Kept separate from `MockRunner` so the
+    /// existing (disk-off, default no-op) tests stay byte-identical.
+    #[derive(Default)]
+    struct PersistMockRunner {
+        log: Vec<String>,
+        next_snap: u64,
+        /// Returned (once) by `load_persisted_snapshot` to simulate a disk HIT.
+        rehydrate: Option<(u64, Vec<u32>, Option<u32>)>,
+    }
+
+    impl SnapshotRunner for PersistMockRunner {
+        fn prefill(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("prefill({})", tokens.len()));
+            Ok((PREFILL_TOK, tokens.len()))
+        }
+        fn extend(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("extend({})", tokens.len()));
+            Ok((EXTEND_TOK, tokens.len()))
+        }
+        fn snapshot_state_deep(&mut self, _seq: u64) -> Result<(u64, usize)> {
+            let id = self.next_snap;
+            self.next_snap += 1;
+            self.log.push(format!("snapshot->{id}"));
+            Ok((id, 0))
+        }
+        fn fork_from_snapshot(&mut self, snapshot_id: u64, _dst: u64) -> Result<usize> {
+            self.log.push(format!("fork({snapshot_id})"));
+            Ok(0)
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            self.log.push(format!("release({snapshot_id})"));
+            Ok(())
+        }
+        fn persist_snapshot(
+            &mut self,
+            snapshot_id: u64,
+            _key: &str,
+            prefix_tokens: &[u32],
+            last_token: Option<u32>,
+        ) -> Result<()> {
+            self.log.push(format!(
+                "persist({snapshot_id},{},{last_token:?})",
+                prefix_tokens.len()
+            ));
+            Ok(())
+        }
+        fn load_persisted_snapshot(
+            &mut self,
+            _key: &str,
+            _prompt_ids: &[u32],
+        ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+            match self.rehydrate.take() {
+                Some(r) => {
+                    self.log.push("load->hit".to_string());
+                    Ok(Some(r))
+                }
+                None => {
+                    self.log.push("load->miss".to_string());
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cold_miss_persists_snapshot_to_disk_tier() {
+        // On an in-memory miss the driver first probes the disk tier (miss),
+        // cold-prefills, snapshots, then persists the fresh snapshot durably.
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = PersistMockRunner::default();
+        let (tok, pos) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
+            .unwrap();
+        assert_eq!((tok, pos), (PREFILL_TOK, 3));
+        assert_eq!(
+            m.log,
+            vec![
+                "load->miss".to_string(),
+                "prefill(3)".to_string(),
+                "snapshot->0".to_string(),
+                "persist(0,3,Some(100))".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn disk_rehydrate_avoids_cold_prefill_on_restart() {
+        // Simulates a fresh process: the in-memory store is empty, but the disk
+        // tier has a snapshot for the [1,2,3] prefix. A [1,2,3,4,5] prompt must
+        // rehydrate (load->hit), fork the disk snapshot, and extend only the
+        // [4,5] suffix — never cold-prefilling.
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = PersistMockRunner {
+            rehydrate: Some((42, vec![1, 2, 3], Some(100))),
+            ..Default::default()
+        };
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3, 4, 5], Some("k"), None)
+            .unwrap();
+        assert_eq!(tok, EXTEND_TOK);
+        assert!(m.log.contains(&"load->hit".to_string()), "log={:?}", m.log);
+        assert!(m.log.contains(&"fork(42)".to_string()), "log={:?}", m.log);
+        assert!(m.log.contains(&"extend(2)".to_string()), "log={:?}", m.log);
+        assert!(
+            !m.log.iter().any(|l| l.starts_with("prefill(")),
+            "must not cold-prefill after disk rehydrate, log={:?}",
             m.log
         );
     }

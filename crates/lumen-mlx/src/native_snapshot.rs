@@ -20,9 +20,12 @@
 #[cfg(feature = "mlx-native")]
 #[allow(dead_code)] // public surface used by runner_native.rs once snapshot stubs are wired
 mod imp {
-    use anyhow::{Context, Result, anyhow};
+    use anyhow::{Context, Result, anyhow, bail};
     use mlx_rs::Array;
 
+    use crate::kv_disk::{
+        ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
+    };
     use crate::native_cache::{
         NativeLayerCache, NativePromptCache, NativeRotatingKvCacheTurboQuant,
     };
@@ -231,6 +234,199 @@ mod imp {
             }
             Ok(())
         }
+
+        /// Serialize this snapshot into disk-persistable form: a per-layer
+        /// metadata vector plus a flat blob of `ArrayRecord`s. The store layer
+        /// wraps these in a `KvManifest` (adding fingerprint / prefix tokens /
+        /// last token) before writing the `LKV1` file.
+        ///
+        /// Each present `Array` is read back to host bytes via
+        /// `record_from_array` (float dtypes normalized to f32 — lossless for
+        /// bf16/f16). Absent Arrays are recorded as `None` index slots.
+        ///
+        /// `FullTurboquant` layers are not yet supported here and return an
+        /// error; the dense `Full` + `Linear` path (Qwen3.6 default KV) lands
+        /// first and is verified bit-identical before compression is layered on.
+        pub fn to_records(&self) -> Result<(Vec<LayerMeta>, Vec<ArrayRecord>)> {
+            let mut records: Vec<ArrayRecord> = Vec::new();
+            let mut metas: Vec<LayerMeta> = Vec::with_capacity(self.layers.len());
+
+            for layer in &self.layers {
+                match layer {
+                    LayerSnapshot::Full {
+                        keys,
+                        values,
+                        offset,
+                    } => {
+                        let keys_id = push_opt(&mut records, keys.as_ref())?;
+                        let values_id = push_opt(&mut records, values.as_ref())?;
+                        let mut m = LayerMeta::new(LayerKindTag::Full, *offset);
+                        m.arrays = vec![keys_id, values_id];
+                        metas.push(m);
+                    }
+                    LayerSnapshot::Linear {
+                        slots,
+                        offset,
+                        lengths,
+                        left_padding,
+                    } => {
+                        let mut arrays = Vec::with_capacity(slots.len());
+                        for slot in slots {
+                            arrays.push(push_opt(&mut records, slot.as_ref())?);
+                        }
+                        let lengths_id = push_opt(&mut records, lengths.as_ref())?;
+                        let left_padding_id = push_opt(&mut records, left_padding.as_ref())?;
+                        let mut m = LayerMeta::new(LayerKindTag::Linear, *offset);
+                        m.arrays = arrays;
+                        m.lengths_id = lengths_id;
+                        m.left_padding_id = left_padding_id;
+                        metas.push(m);
+                    }
+                    LayerSnapshot::FullTurboquant(tq) => {
+                        // Compressed ring: [keys_codes, keys_sigma, values_codes,
+                        // values_sigma, keys_signs?, keys_residual_norm?]. codes
+                        // are uint8, sigma/residual_norm f32, signs bf16 — all
+                        // round-trip through ArrayRecord. Rotating bookkeeping
+                        // (max_size/keep/idx/bits/qjl_m) goes in LayerMeta.
+                        let arrays = vec![
+                            push_opt(&mut records, tq.keys_codes())?,
+                            push_opt(&mut records, tq.keys_sigma())?,
+                            push_opt(&mut records, tq.values_codes())?,
+                            push_opt(&mut records, tq.values_sigma())?,
+                            push_opt(&mut records, tq.keys_signs())?,
+                            push_opt(&mut records, tq.keys_residual_norm())?,
+                        ];
+                        let mut m = LayerMeta::new(LayerKindTag::FullTurboquant, tq.offset());
+                        m.arrays = arrays;
+                        m.max_size = Some(tq.max_size());
+                        m.keep = Some(tq.keep());
+                        m.idx = Some(tq.idx());
+                        m.bits = Some(tq.bits());
+                        m.qjl_m = tq.qjl_m();
+                        metas.push(m);
+                    }
+                }
+            }
+
+            Ok((metas, records))
+        }
+
+        /// Reconstruct a snapshot from disk-persistable form. The inverse of
+        /// `to_records`. `is_deep` should be `true` so `install_into_fresh`
+        /// re-deep-clones into the destination cache for sibling isolation.
+        pub fn from_records(
+            metas: &[LayerMeta],
+            records: &[ArrayRecord],
+            position: usize,
+            is_deep: bool,
+        ) -> Result<Self> {
+            let get = |id: Option<usize>| -> Result<Option<Array>> {
+                match id {
+                    None => Ok(None),
+                    Some(i) => {
+                        let rec = records.get(i).ok_or_else(|| {
+                            anyhow!(
+                                "PromptCacheSnapshot::from_records: record index {i} out of range"
+                            )
+                        })?;
+                        Ok(Some(record_to_array(rec)?))
+                    }
+                }
+            };
+
+            let mut layers = Vec::with_capacity(metas.len());
+            for m in metas {
+                match m.kind {
+                    LayerKindTag::Full => {
+                        let keys = get(m.arrays.first().copied().flatten())?;
+                        let values = get(m.arrays.get(1).copied().flatten())?;
+                        layers.push(LayerSnapshot::Full {
+                            keys,
+                            values,
+                            offset: m.offset,
+                        });
+                    }
+                    LayerKindTag::Linear => {
+                        let mut slots = Vec::with_capacity(m.arrays.len());
+                        for a in &m.arrays {
+                            slots.push(get(*a)?);
+                        }
+                        let lengths = get(m.lengths_id)?;
+                        let left_padding = get(m.left_padding_id)?;
+                        layers.push(LayerSnapshot::Linear {
+                            slots,
+                            offset: m.offset,
+                            lengths,
+                            left_padding,
+                        });
+                    }
+                    LayerKindTag::Sliding
+                    | LayerKindTag::FullQuantized
+                    | LayerKindTag::SlidingQuantized
+                    | LayerKindTag::SlidingTurboquant => {
+                        // Gemma4-only layer kinds — the Qwen3.6 snapshot path
+                        // (this module) never produces them.
+                        bail!(
+                            "kv_disk: {:?} is a Gemma4-only layer kind; not valid in a \
+                             Qwen3.6 PromptCacheSnapshot",
+                            m.kind
+                        );
+                    }
+                    LayerKindTag::FullTurboquant => {
+                        let max_size = m.max_size.ok_or_else(|| {
+                            anyhow!("from_records: FullTurboquant layer missing max_size")
+                        })?;
+                        let keep = m.keep.ok_or_else(|| {
+                            anyhow!("from_records: FullTurboquant layer missing keep")
+                        })?;
+                        let idx = m.idx.ok_or_else(|| {
+                            anyhow!("from_records: FullTurboquant layer missing idx")
+                        })?;
+                        let bits = m.bits.ok_or_else(|| {
+                            anyhow!("from_records: FullTurboquant layer missing bits")
+                        })?;
+                        let slot = |i: usize| -> Result<Option<Array>> {
+                            get(m.arrays.get(i).copied().flatten())
+                        };
+                        let tq = NativeRotatingKvCacheTurboQuant::from_parts(
+                            slot(0)?, // keys_codes
+                            slot(1)?, // keys_sigma
+                            slot(2)?, // values_codes
+                            slot(3)?, // values_sigma
+                            slot(4)?, // keys_signs
+                            slot(5)?, // keys_residual_norm
+                            m.offset,
+                            max_size,
+                            keep,
+                            idx,
+                            bits,
+                            m.qjl_m,
+                        );
+                        layers.push(LayerSnapshot::FullTurboquant(tq));
+                    }
+                }
+            }
+
+            Ok(Self {
+                layers,
+                position,
+                is_deep,
+            })
+        }
+    }
+
+    /// Read a present `Array` into the blob and return its index; `None` for an
+    /// absent Array.
+    fn push_opt(records: &mut Vec<ArrayRecord>, a: Option<&Array>) -> Result<Option<usize>> {
+        match a {
+            None => Ok(None),
+            Some(arr) => {
+                let rec = record_from_array(arr)?;
+                let id = records.len();
+                records.push(rec);
+                Ok(Some(id))
+            }
+        }
     }
 
     /// Common write path — reassigns captured state into a layer. When
@@ -423,5 +619,60 @@ mod lifecycle_tests {
         let mut shorter = NativePromptCache::new(&kinds_short, 2);
         let err = snap.restore_into(&mut shorter).unwrap_err();
         assert!(err.to_string().contains("layer count mismatch"));
+    }
+
+    /// P1a — full disk persistence round trip for the dense Full+Linear path:
+    /// snapshot → records → LKV file → records → snapshot → install. Verifies
+    /// the serialized bytes are stable (bit-identical re-serialization) and the
+    /// reconstructed snapshot installs with the original offsets.
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn deep_snapshot_disk_roundtrip_is_byte_faithful() {
+        use crate::kv_disk::{KvManifest, read_lkv, write_lkv};
+
+        let mut master = make_hybrid_cache();
+        let full = master.layer_mut(3).unwrap().as_full_mut().unwrap();
+        full.update_and_fetch(
+            &make_kv_block(1, 2, 4, 8, 0.0),
+            &make_kv_block(1, 2, 4, 8, 1.0),
+        )
+        .unwrap();
+        let lin = master.layer_mut(0).unwrap().as_linear_mut().unwrap();
+        lin.set(0, make_kv_block(1, 1, 1, 4, 0.5)).unwrap();
+        lin.advance(4);
+
+        let snap = PromptCacheSnapshot::capture_deep(&master, 4).unwrap();
+        let (metas1, recs1) = snap.to_records().unwrap();
+
+        // Round trip through the on-disk LKV1 container.
+        let manifest = KvManifest {
+            model_fingerprint: "fp-test".into(),
+            created_at_unix: 0,
+            position: snap.position(),
+            prefix_tokens: vec![1, 2, 3],
+            last_token: Some(9),
+            is_deep: snap.is_deep(),
+            layers: metas1.clone(),
+        };
+        let mut buf = Vec::new();
+        write_lkv(&mut buf, &manifest, &recs1).unwrap();
+        let (m2, recs2) = read_lkv(&mut buf.as_slice()).unwrap();
+        assert_eq!(recs1, recs2, "records survive the LKV file round trip");
+
+        // Reconstruct and re-serialize — must be byte-identical to the original.
+        let snap2 =
+            PromptCacheSnapshot::from_records(&m2.layers, &recs2, m2.position, m2.is_deep).unwrap();
+        let (metas3, recs3) = snap2.to_records().unwrap();
+        assert_eq!(
+            metas1, metas3,
+            "layer metadata is stable across reconstruct"
+        );
+        assert_eq!(recs1, recs3, "tensor bytes are stable across reconstruct");
+
+        // Install the reconstructed snapshot — offsets must match the original.
+        let mut fork = master.clone_structure_only();
+        snap2.install_into_fresh(&mut fork).unwrap();
+        assert_eq!(fork.full_attn_offset(), 4);
+        assert_eq!(fork.layer(0).unwrap().offset(), 4);
     }
 }
