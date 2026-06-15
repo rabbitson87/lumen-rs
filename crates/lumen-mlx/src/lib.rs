@@ -651,14 +651,82 @@ impl RunnerImpl {
     }
 
     #[cfg(feature = "mlx-native")]
+    fn enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
+        match self {
+            Self::Native(r) => r.enable_mtp_calib(depth_count),
+            _ => Err(anyhow!("enable_mtp_calib requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
+        match self {
+            Self::Native(r) => r.finalize_mtp_calib(eps),
+            _ => Err(anyhow!("finalize_mtp_calib requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn set_mtp_corrector_bytes(&self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Native(r) => r.set_mtp_corrector_bytes(bytes),
+            _ => Err(anyhow!("set_mtp_corrector requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
+        match self {
+            Self::Native(r) => r.enable_mtp_proc_calib(depth_count),
+            _ => Err(anyhow!("enable_mtp_proc_calib requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Native(r) => r.finalize_mtp_proc_calib(),
+            _ => Err(anyhow!(
+                "finalize_mtp_proc_calib requires the native backend"
+            )),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn set_mtp_procrustes_bytes(&self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Native(r) => r.set_mtp_procrustes_bytes(bytes),
+            _ => Err(anyhow!("set_mtp_procrustes requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn enable_mtp_c4_calib(&self) -> Result<()> {
+        match self {
+            Self::Native(r) => r.enable_mtp_c4_calib(),
+            _ => Err(anyhow!("enable_mtp_c4_calib requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
+        match self {
+            Self::Native(r) => r.train_mtp_c4_lmhead(rank, steps, lr),
+            _ => Err(anyhow!("train_mtp_c4_lmhead requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
     fn qwen35_mtp_step(
         &mut self,
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
+        temperature: f32,
+        top_p: f32,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         match self {
-            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft),
+            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, temperature, top_p),
             _ => Err(anyhow!(
                 "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
                  set LUMEN_MLX_BACKEND=native"
@@ -2030,6 +2098,60 @@ impl MlxQwen35Backend {
         self.runner.qwen35_mtp_enabled()
     }
 
+    /// Begin MTP drift-corrector calibration: subsequent `qwen35_mtp_step`
+    /// calls accumulate (recursive draft hidden, trunk true hidden) pairs up to
+    /// `depth_count` (= max draft K used during calibration).
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
+        self.runner.enable_mtp_calib(depth_count)
+    }
+
+    /// Finish calibration: fit the corrector and return its serialized bytes
+    /// (write to a file, then load via `qwen35_load_mtp_corrector`).
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
+        self.runner.finalize_mtp_calib(eps)
+    }
+
+    /// Install a fitted corrector (serialized bytes from
+    /// `qwen35_finalize_mtp_calib`). Applied in the drafter loop thereafter.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_load_mtp_corrector(&self, bytes: &[u8]) -> Result<()> {
+        self.runner.set_mtp_corrector_bytes(bytes)
+    }
+
+    /// Start orthogonal-Procrustes calibration (the rotation shot). Heavy:
+    /// allocates `depth_count · hidden²` f64.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
+        self.runner.enable_mtp_proc_calib(depth_count)
+    }
+
+    /// Finish Procrustes calibration: prints the decisive residual report
+    /// (rel_raw vs rel_proc per depth) and returns the fitted corrector bytes.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
+        self.runner.finalize_mtp_proc_calib()
+    }
+
+    /// Install a fitted Procrustes corrector (serialized bytes).
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_load_mtp_procrustes(&self, bytes: &[u8]) -> Result<()> {
+        self.runner.set_mtp_procrustes_bytes(bytes)
+    }
+
+    /// Begin C4 calibration (collect lm_head-input / trunk-argmax pairs).
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_enable_mtp_c4_calib(&self) -> Result<()> {
+        self.runner.enable_mtp_c4_calib()
+    }
+
+    /// Train + install the C4 lm_head LoRA from collected calib pairs.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
+        self.runner.train_mtp_c4_lmhead(rank, steps, lr)
+    }
+
     /// Advance one MTP speculative cycle. See `qwen3_5_moe::mtp_step` for
     /// the Step A-E contract. Returns the committed token list (length
     /// `1 + n_accepted + 1`); the LAST element must be fed as
@@ -2040,9 +2162,11 @@ impl MlxQwen35Backend {
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
+        temperature: f32,
+        top_p: f32,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         self.runner
-            .qwen35_mtp_step(seq_id, committed_token, n_draft)
+            .qwen35_mtp_step(seq_id, committed_token, n_draft, temperature, top_p)
     }
 
     /// Env-driven MTP auto-enable hook called at the end of `load()`.
@@ -4381,6 +4505,18 @@ impl MlxQwen35Backend {
             return Ok(out);
         }
 
+        // MTP acceptance regime. Default greedy (temp 0 = exact argmax-match,
+        // lossless). `LUMEN_MTP_TEMP>0` switches to Leviathan rejection
+        // sampling (accept min(1,p/q) + residual) so accept rate rises toward
+        // the sampling regime; `LUMEN_MTP_TOPP` sets the nucleus.
+        let mtp_temp: f32 = std::env::var("LUMEN_MTP_TEMP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let mtp_topp: f32 = std::env::var("LUMEN_MTP_TOPP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         let t_decode = std::time::Instant::now();
         let mut cycles: usize = 0;
         let mut accepted_total: usize = 0;
@@ -4388,9 +4524,11 @@ impl MlxQwen35Backend {
         let mut stop = false;
         while generated.len() < max_new_tokens && !stop {
             let t_cycle = std::time::Instant::now();
-            let out = self.qwen35_mtp_step(seq_id, last, k).with_context(|| {
-                format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
-            })?;
+            let out = self
+                .qwen35_mtp_step(seq_id, last, k, mtp_temp, mtp_topp)
+                .with_context(|| {
+                    format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
+                })?;
             let cycle_ms = t_cycle.elapsed().as_secs_f64() * 1000.0;
             cycles += 1;
             accepted_total += out.n_accepted;

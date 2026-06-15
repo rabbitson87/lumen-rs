@@ -176,7 +176,7 @@ fn main() -> Result<()> {
     );
 
     // 5) Warmup — one MTP cycle (drops JIT-compile + cache-grow costs).
-    let warm = qwen.qwen35_mtp_step(1, last, k)?;
+    let warm = qwen.qwen35_mtp_step(1, last, k, 0.0, 1.0)?;
     println!(
         "warmup cycle: emitted {} tokens (n_acc={}/{}); last_tok={}",
         warm.committed.len(),
@@ -197,7 +197,7 @@ fn main() -> Result<()> {
     let mut emitted_total: usize = 0;
     for s in 0..steps {
         let t0 = Instant::now();
-        let out = qwen.qwen35_mtp_step(1, last, k)?;
+        let out = qwen.qwen35_mtp_step(1, last, k, 0.0, 1.0)?;
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
         cycle_ms.push(dt);
         accepted_total += out.n_accepted;

@@ -112,7 +112,7 @@ mod imp {
 
     static SWIGLU_SLOT: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
-    fn swiglu_fuse_enabled() -> bool {
+    pub fn swiglu_fuse_enabled() -> bool {
         // Default ON 2026-05-11 — landed as net WIN -0.671 ms (Welch t=-29σ) at
         // n=10 STEPS=300 PROMPT_LEN=3 on Qwen3.6-35B-A3B-mxfp4. Closes ~62% of
         // the 1.07 ms Native vs PyO3 decode gap. Opt out with
@@ -122,7 +122,11 @@ mod imp {
             .unwrap_or(true)
     }
 
-    fn swiglu_fused(gate: &Array, up: &Array) -> Result<Array> {
+    /// Fused `silu(gate) * up` (SwiGLU). Public so the Qwen3.5/3.6 DENSE MLP
+    /// path (`qwen3_5_moe::layer_dense_mlp_forward`) can reuse the same compiled
+    /// slot the mxfp4 `shared_mlp` already uses — the dense 9B/27B MLP is 44% of
+    /// forward and was running raw `silu`+`multiply` (2 dispatches) before.
+    pub fn swiglu_fused(gate: &Array, up: &Array) -> Result<Array> {
         let args = [gate, up];
         let mut out = invoke_compiled_multi_refs(
             &SWIGLU_SLOT,
@@ -628,5 +632,6 @@ mod imp {
 #[allow(unused_imports)] // Consumed by Phase 3d.4 wiring in native_model.rs.
 pub(crate) use imp::{
     AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights, SwitchGluWeights,
-    dense_mlp_forward, gelu_mul_fuse_enabled, gelu_mul_fused, moe_block_forward, switch_glu,
+    dense_mlp_forward, gelu_mul_fuse_enabled, gelu_mul_fused, moe_block_forward,
+    swiglu_fuse_enabled, swiglu_fused, switch_glu,
 };

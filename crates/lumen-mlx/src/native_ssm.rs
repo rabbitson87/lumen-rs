@@ -287,6 +287,151 @@ mod imp {
         Ok((y, state_out))
     }
 
+    /// Capture variant of the gated-delta kernel: identical recurrence, but
+    /// ALSO emits the per-position recurrent state into `state_per_pos`
+    /// `[B, T, Hv, Dv, Dk]`. Used for O(1) speculative rollback — on a partial
+    /// reject, the committed SSM state is `state_per_pos[:, keep-1]` (an
+    /// index-select), replacing the O(D) full-trunk replay. The state is f32
+    /// (StT), so the last-position slice is bit-identical to `state_out`.
+    pub const GATED_DELTA_CAPTURE_KERNEL_SOURCE: &str = r#"
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+
+          // Per-position state capture: state_per_pos[b, t, hv, dv, :]
+          auto sp = state_per_pos + (((((size_t)b_idx * T + t) * Hv + hv_idx) * Dv + dv_idx) * Dk);
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            sp[s_idx] = static_cast<StT>(state[i]);
+          }
+
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+    "#;
+
+    /// Capture-variant dispatch. Returns `(y, state_out, state_per_pos)` where
+    /// `state_per_pos: [B, seq, Hv, Dv, Dk]` (dtype = state_in.dtype).
+    pub fn gated_delta_step_kernel_capture(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+        state_in: &Array,
+    ) -> Result<(Array, Array, Array)> {
+        use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+
+        let q_shape = q.shape();
+        let v_shape = v.shape();
+        if q_shape.len() != 4 || v_shape.len() != 4 {
+            return Err(anyhow::anyhow!(
+                "gated_delta_step_kernel_capture: q/v must be 4-D, got q={:?} v={:?}",
+                q_shape,
+                v_shape
+            ));
+        }
+        let b = q_shape[0];
+        let seq = q_shape[1];
+        let n_k_heads = q_shape[2];
+        let head_k_dim = q_shape[3];
+        let n_v_heads = v_shape[2];
+        let head_v_dim = v_shape[3];
+
+        if head_k_dim % 32 != 0 {
+            return Err(anyhow::anyhow!(
+                "gated_delta_step_kernel_capture: head_k_dim must be a multiple of 32, got {head_k_dim}"
+            ));
+        }
+
+        let kernel = MetalKernel::new(
+            "gated_delta_step_capture",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out", "state_per_pos"],
+            GATED_DELTA_CAPTURE_KERNEL_SOURCE,
+            /* ensure_row_contiguous */ true,
+            /* atomic_outputs */ false,
+        )?;
+
+        let config = MetalKernelConfig::new();
+        config.add_template_arg_dtype("InT", q.dtype())?;
+        config.add_template_arg_dtype("StT", state_in.dtype())?;
+        config.add_template_arg_int("Dk", head_k_dim)?;
+        config.add_template_arg_int("Dv", head_v_dim)?;
+        config.add_template_arg_int("Hk", n_k_heads)?;
+        config.add_template_arg_int("Hv", n_v_heads)?;
+
+        config.set_grid(32, head_v_dim, b * n_v_heads)?;
+        config.set_thread_group(32, 4, 1)?;
+
+        config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
+        config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
+        config.add_output_arg(
+            &[b, seq, n_v_heads, head_v_dim, head_k_dim],
+            state_in.dtype(),
+        )?;
+
+        let t_scalar = Array::from_int(seq);
+        let outputs = kernel.apply(&[q, k, v, g, beta, state_in, &t_scalar], &config, 3)?;
+        let mut iter = outputs.into_iter();
+        let y = iter.next().expect("kernel produced y");
+        let state_out = iter.next().expect("kernel produced state_out");
+        let state_per_pos = iter.next().expect("kernel produced state_per_pos");
+        Ok((y, state_out, state_per_pos))
+    }
+
     /// `Qwen3NextRMSNormGated.__call__` (gate path):
     ///
     ///     x   = mx.fast.rms_norm(hidden_states, weight, eps)
@@ -490,7 +635,8 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b.5 SSM block assembly.
 pub use imp::{
-    compute_g, gated_delta_step_kernel, rms_norm_gated, rms_norm_gated_fused, rms_norm_gated_legacy,
+    compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, rms_norm_gated,
+    rms_norm_gated_fused, rms_norm_gated_legacy,
 };
 
 // compute_g bit-identical vs MLX reference.
@@ -1092,5 +1238,72 @@ mod parity_tests {
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn decode_q1_gated_delta_kernel_matches_mlx() {
         run_gated_delta_fixture("decode_q1");
+    }
+}
+
+#[cfg(all(test, feature = "mlx-native"))]
+mod capture_kernel_tests {
+    use super::imp::{gated_delta_step_kernel, gated_delta_step_kernel_capture};
+    use mlx_rs::Array;
+
+    fn mk(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 + 1.0) * seed).sin() * 0.5)
+            .collect()
+    }
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let d = mlx_rs::ops::abs(&mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        let m = d.max(None).unwrap();
+        m.eval().unwrap();
+        m.as_slice::<f32>()[0]
+    }
+
+    #[test]
+    fn capture_matches_base_and_per_position() {
+        let (b, t, hk, hv, dk, dv) = (1i32, 4i32, 1i32, 2i32, 32i32, 4i32);
+        let q = Array::from_slice(&mk((b * t * hk * dk) as usize, 0.11), &[b, t, hk, dk]);
+        let k = Array::from_slice(&mk((b * t * hk * dk) as usize, 0.13), &[b, t, hk, dk]);
+        let v = Array::from_slice(&mk((b * t * hv * dv) as usize, 0.17), &[b, t, hv, dv]);
+        let g = Array::from_slice(&mk((b * t * hv) as usize, 0.23), &[b, t, hv]);
+        let beta = Array::from_slice(&mk((b * t * hv) as usize, 0.19), &[b, t, hv]);
+        let state = Array::from_slice(&mk((b * hv * dv * dk) as usize, 0.05), &[b, hv, dv, dk]);
+
+        let (y_b, s_b) = gated_delta_step_kernel(&q, &k, &v, &g, &beta, &state).unwrap();
+        let (y_c, s_c, sp) =
+            gated_delta_step_kernel_capture(&q, &k, &v, &g, &beta, &state).unwrap();
+        for a in [&y_b, &s_b, &y_c, &s_c, &sp] {
+            a.eval().unwrap();
+        }
+
+        // y and final state bit-identical between base and capture.
+        assert_eq!(max_abs_diff(&y_b, &y_c), 0.0, "y base vs capture");
+        assert_eq!(max_abs_diff(&s_b, &s_c), 0.0, "state_out base vs capture");
+
+        // state_per_pos[:, T-1] == state_out  (last position == final state).
+        let parts = mlx_rs::ops::split(&sp, t, 1).unwrap(); // T parts [b,1,hv,dv,dk]
+        let last = parts[(t - 1) as usize].reshape(&[b, hv, dv, dk]).unwrap();
+        last.eval().unwrap();
+        assert_eq!(
+            max_abs_diff(&last, &s_b),
+            0.0,
+            "per-pos[T-1] vs final state"
+        );
+
+        // state_per_pos[:, 0] == base run over only token 0 (T=1).
+        let q0 = mlx_rs::ops::split(&q, t, 1).unwrap()[0].clone();
+        let k0 = mlx_rs::ops::split(&k, t, 1).unwrap()[0].clone();
+        let v0 = mlx_rs::ops::split(&v, t, 1).unwrap()[0].clone();
+        let g0 = mlx_rs::ops::split(&g, t, 1).unwrap()[0].clone();
+        let beta0 = mlx_rs::ops::split(&beta, t, 1).unwrap()[0].clone();
+        let (_y0, s0) = gated_delta_step_kernel(&q0, &k0, &v0, &g0, &beta0, &state).unwrap();
+        let first = parts[0].reshape(&[b, hv, dv, dk]).unwrap();
+        s0.eval().unwrap();
+        first.eval().unwrap();
+        assert_eq!(
+            max_abs_diff(&first, &s0),
+            0.0,
+            "per-pos[0] vs T=1 final state"
+        );
+        eprintln!("capture kernel OK: y/state bit-identical, per-pos[0] and [T-1] verified");
     }
 }

@@ -129,6 +129,11 @@ pub struct Qwen35MtpMoeMlp {
     pub sw_up_s: Array,
     pub sw_down_w: Array,
     pub sw_down_s: Array,
+    // Optional affine biases (Some for MTPLX-format affine-4bit experts,
+    // None for MXFP4 which is bias-free).
+    pub sw_gate_b: Option<Array>,
+    pub sw_up_b: Option<Array>,
+    pub sw_down_b: Option<Array>,
     pub sw_gs: i32,
     pub sw_bits: i32,
     pub sw_mode: &'static CStr,
@@ -139,6 +144,9 @@ pub struct Qwen35MtpMoeMlp {
     pub se_up_s: Array,
     pub se_down_w: Array,
     pub se_down_s: Array,
+    pub se_gate_b: Option<Array>,
+    pub se_up_b: Option<Array>,
+    pub se_down_b: Option<Array>,
     pub se_gs: i32,
     pub se_bits: i32,
     pub se_mode: &'static CStr,
@@ -254,18 +262,44 @@ impl Qwen35MtpBlock {
         let hidden = self.dims.hidden_size as i32;
         let eps = self.dims.rms_norm_eps;
 
+        let dbg = std::env::var("LUMEN_MTP_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let stat = |tag: &str, a: &Array| {
+            if !dbg {
+                return;
+            }
+            let f = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let amax = mlx_rs::ops::abs(&f).unwrap().max(None).unwrap();
+            let amean = mlx_rs::ops::abs(&f).unwrap().mean(None).unwrap();
+            amax.eval().ok();
+            amean.eval().ok();
+            eprintln!(
+                "[mtp.block] {tag:<16} shape={:?} |max|={:.4} |mean|={:.4}",
+                a.shape(),
+                amax.as_slice::<f32>()[0],
+                amean.as_slice::<f32>()[0]
+            );
+        };
+
         // ── (1) enorm + hnorm + concat ───────────────────────────────────
+        stat("embeds", embeds);
+        stat("h_pre", h_pre);
         let e_n = rms_norm(embeds, &self.enorm, eps).context("Qwen35MtpBlock: enorm failed")?;
         let h_n = rms_norm(h_pre, &self.hnorm, eps).context("Qwen35MtpBlock: hnorm failed")?;
+        stat("e_n", &e_n);
+        stat("h_n", &h_n);
         // DeepSeek-V3 / Qwen3.6 convention: [embed_norm, hidden_norm].
         let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)
             .context("Qwen35MtpBlock: concat(e_norm, h_norm) failed")?;
 
         // ── (2) eh_proj: [2*hidden] -> [hidden] ──────────────────────────
+        stat("concat", &concat);
         let mut cur = self
             .linear_pre(&self.eh_proj, &concat)
             .context("Qwen35MtpBlock: eh_proj failed")?;
         cur = self.to_f32(cur, "eh_proj_out")?;
+        stat("after_eh_proj", &cur);
 
         // ── (3) attention sub-block: pre-norm + self_attn + residual ─────
         let res_attn = cur.clone();
@@ -274,6 +308,7 @@ impl Qwen35MtpBlock {
         let attn_out = self
             .self_attention_forward(&cur_n, b, t, causal, cache)
             .context("Qwen35MtpBlock: self_attention_forward failed")?;
+        stat("attn_out", &attn_out);
         cur = mlx_rs::ops::add(&attn_out, &res_attn)
             .context("Qwen35MtpBlock: residual add (attn) failed")?;
 
@@ -289,6 +324,7 @@ impl Qwen35MtpBlock {
                 .moe_mlp_forward(&cur_n, m)
                 .context("Qwen35MtpBlock: moe_mlp_forward failed")?,
         };
+        stat("mlp_out", &mlp_out);
         cur = mlx_rs::ops::add(&mlp_out, &res_ffn)
             .context("Qwen35MtpBlock: residual add (ffn) failed")?;
 
@@ -302,12 +338,28 @@ impl Qwen35MtpBlock {
             None => trunk_final_norm_weight,
         };
         let norm_out = rms_norm(&cur, norm_w, eps).context("Qwen35MtpBlock: head norm failed")?;
+        stat("norm_out", &norm_out);
         let logits = self
             .linear_pre(trunk_lm_head, &norm_out)
             .context("Qwen35MtpBlock: lm_head failed")?;
+        stat("logits", &logits);
+
+        // Chained hidden for the next draft (k>=1). MTPLX's `_mtp_core` with
+        // mtp_hidden_variant="post_norm" feeds the NEXT draft the post-head-norm
+        // hidden (`mtp.norm(x)`), not the pre-norm residual. lumen historically
+        // returned pre-norm `cur`. Gated for A/B (LUMEN_MTP_CHAINED_POSTNORM).
+        // Default ON: A/B showed accept 0.333->0.362, speedup 0.845->0.873.
+        let chained_hidden = if std::env::var("LUMEN_MTP_CHAINED_POSTNORM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+        {
+            norm_out.clone()
+        } else {
+            new_h_pre
+        };
 
         let _ = hidden; // dims sanity check above already locked it
-        Ok((logits, new_h_pre))
+        Ok((logits, chained_hidden))
     }
 
     /// Self-attention with the block's own KV cache. Same structure as the
@@ -447,17 +499,17 @@ impl Qwen35MtpBlock {
                 gate_proj: SwitchExpertWeights {
                     weight: &w.sw_gate_w,
                     scales: &w.sw_gate_s,
-                    biases: None,
+                    biases: w.sw_gate_b.as_ref(),
                 },
                 up_proj: SwitchExpertWeights {
                     weight: &w.sw_up_w,
                     scales: &w.sw_up_s,
-                    biases: None,
+                    biases: w.sw_up_b.as_ref(),
                 },
                 down_proj: SwitchExpertWeights {
                     weight: &w.sw_down_w,
                     scales: &w.sw_down_s,
-                    biases: None,
+                    biases: w.sw_down_b.as_ref(),
                 },
                 group_size: w.sw_gs,
                 bits: w.sw_bits,
@@ -485,6 +537,71 @@ impl Qwen35MtpBlock {
             norm_topk_prob: w.norm_topk_prob,
         };
         moe_block_forward(x, &view)
+    }
+
+    /// Debug: run only enorm/hnorm/concat/eh_proj on explicit inputs.
+    /// Used by the numeric reference-comparison harness to isolate the
+    /// through-fc path. embeds/h_pre are [1, 1, hidden].
+    pub fn debug_through_fc(&self, embeds: &Array, h_pre: &Array) -> Result<(Array, Array, Array)> {
+        let eps = self.dims.rms_norm_eps;
+        let e_n = rms_norm(embeds, &self.enorm, eps)?;
+        let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
+        let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
+        let fc_out = self.linear_pre(&self.eh_proj, &concat)?;
+        let fc_out = self.to_f32(fc_out, "debug_fc_out")?;
+        Ok((e_n, h_n, fc_out))
+    }
+
+    /// Debug: run the FULL block forward on explicit (embeds, h_pre) and
+    /// return every intermediate stage, for layer-by-layer comparison against
+    /// the mlx Python reference. Mirrors `forward` exactly (steps 1-6) but uses
+    /// a fresh internal KV cache (offset 0, like a first draft). Order:
+    /// [e_n, h_n, fc_out, attn_out, post_attn, mlp_out, post_mlp, norm_out].
+    pub fn debug_block_stages(
+        &self,
+        embeds: &Array,
+        h_pre: &Array,
+    ) -> Result<Vec<(&'static str, Array)>> {
+        let eps = self.dims.rms_norm_eps;
+        let mut cache = crate::native_cache::NativeKvCache::new();
+
+        let e_n = rms_norm(embeds, &self.enorm, eps)?;
+        let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
+        let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
+        let fc_out = self.to_f32(self.linear_pre(&self.eh_proj, &concat)?, "dbg.fc")?;
+
+        let b = embeds.shape()[0];
+        let t = embeds.shape()[1];
+
+        let res_attn = fc_out.clone();
+        let cur_n = rms_norm(&fc_out, &self.input_layernorm, eps)?;
+        let attn_out = self.self_attention_forward(&cur_n, b, t, false, &mut cache)?;
+        let post_attn = mlx_rs::ops::add(&attn_out, &res_attn)?;
+
+        let res_ffn = post_attn.clone();
+        let cur_n2 = rms_norm(&post_attn, &self.post_attention_layernorm, eps)?;
+        let mlp_out = match &self.mlp {
+            Qwen35MtpMlp::Dense(d) => self.dense_mlp_forward(&cur_n2, d)?,
+            Qwen35MtpMlp::Moe(m) => self.moe_mlp_forward(&cur_n2, m)?,
+        };
+        let post_mlp = mlx_rs::ops::add(&mlp_out, &res_ffn)?;
+
+        let norm_w = self
+            .shared_head_norm
+            .as_ref()
+            .ok_or_else(|| anyhow!("debug_block_stages: shared_head_norm (mtp.norm) not loaded"))?;
+        let norm_out = rms_norm(&post_mlp, norm_w, eps)?;
+
+        Ok(vec![
+            ("e_n", e_n),
+            ("h_n", h_n),
+            ("fc_out", fc_out),
+            ("attn_out", attn_out),
+            ("post_attn", post_attn),
+            ("mlp_out", mlp_out),
+            ("post_mlp", post_mlp),
+            ("norm_out", norm_out),
+        ])
     }
 
     fn linear_pre(&self, lin: &Qwen35MtpLinear, x: &Array) -> Result<Array> {
@@ -670,39 +787,71 @@ pub fn load_block_from_hf(
             }
         }
     }
-    if mtp_to_shard.is_empty() {
-        return Err(anyhow!(
-            "no `mtp.*` tensors in {} -- HF original snapshot needed (the \
-             mlx-community MXFP4 conversions drop mtp.*)",
-            index_path.display()
-        ));
-    }
-
-    // 2) Group keys by shard so we mmap each safetensors file exactly once.
-    let mut shard_to_keys: HashMap<String, Vec<String>> = HashMap::new();
-    for (key, shard) in &mtp_to_shard {
-        shard_to_keys
-            .entry(shard.clone())
-            .or_default()
-            .push(key.clone());
-    }
-
-    // 3) Load tensors from each relevant shard into a single key->Array map.
-    //    Only the `mtp.*` keys are retained — the rest get dropped immediately.
-    let mut tensors: HashMap<String, Array> = HashMap::with_capacity(mtp_to_shard.len());
-    for (shard, keys) in shard_to_keys {
-        let path = hf_dir.join(&shard);
-        let map = Array::load_safetensors(&path)
-            .map_err(|err| anyhow!("load_safetensors({}) failed: {err}", path.display()))?;
-        for k in keys {
-            if let Some(arr) = map.get(&k) {
-                tensors.insert(k, arr.clone());
-            } else {
-                return Err(anyhow!(
-                    "expected key `{k}` in {} (per index.json) but it was absent",
-                    path.display(),
-                ));
+    // 3) Load `mtp.*` tensors into a single key->Array map. Two layouts:
+    //    (a) mtp.* listed in the index → load from the named shards.
+    //    (b) standalone `mtp.safetensors` sidecar (MTPLX 9B/27B Speed bundles,
+    //        and Forge heads) → load the whole file directly.
+    let mut tensors: HashMap<String, Array> = HashMap::new();
+    if !mtp_to_shard.is_empty() {
+        // (a) Group keys by shard so we mmap each safetensors file exactly once.
+        let mut shard_to_keys: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, shard) in &mtp_to_shard {
+            shard_to_keys
+                .entry(shard.clone())
+                .or_default()
+                .push(key.clone());
+        }
+        for (shard, keys) in shard_to_keys {
+            let path = hf_dir.join(&shard);
+            let map = Array::load_safetensors(&path)
+                .map_err(|err| anyhow!("load_safetensors({}) failed: {err}", path.display()))?;
+            for k in keys {
+                if let Some(arr) = map.get(&k) {
+                    tensors.insert(k, arr.clone());
+                } else {
+                    return Err(anyhow!(
+                        "expected key `{k}` in {} (per index.json) but it was absent",
+                        path.display(),
+                    ));
+                }
             }
+        }
+    } else {
+        // (b) Standalone sidecar. MTPLX bundles ship the head as either a flat
+        //     `mtp.safetensors` (9B) or an `mtp/weights.safetensors` subdir
+        //     (27B); `mtplx_runtime.json.mtp_file` names the latter.
+        let mut candidates = vec![
+            hf_dir.join("mtp.safetensors"),
+            hf_dir.join("mtp").join("weights.safetensors"),
+        ];
+        if let Ok(rt) = std::fs::read_to_string(hf_dir.join("mtplx_runtime.json"))
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&rt)
+            && let Some(f) = v.get("mtp_file").and_then(|x| x.as_str())
+        {
+            candidates.insert(0, hf_dir.join(f));
+        }
+        let sidecar = candidates
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no `mtp.*` in {} and no sidecar (mtp.safetensors / mtp/weights.safetensors) in {}",
+                    index_path.display(),
+                    hf_dir.display()
+                )
+            })?;
+        let map = Array::load_safetensors(&sidecar)
+            .map_err(|err| anyhow!("load_safetensors({}) failed: {err}", sidecar.display()))?;
+        for (k, arr) in map.iter() {
+            if k.starts_with("mtp.") {
+                tensors.insert(k.to_string(), arr.clone());
+            }
+        }
+        if tensors.is_empty() {
+            return Err(anyhow!(
+                "standalone {} held no `mtp.*` tensors",
+                sidecar.display()
+            ));
         }
     }
 
@@ -733,6 +882,43 @@ pub fn load_block_from_hf(
                        name: &str,
                        expect_shape: [i32; 2]|
      -> Result<Qwen35MtpLinear> {
+        use crate::native_quant::MODE_AFFINE;
+        // Pre-quantized affine head (27B Speed): the weight ships packed (U32)
+        // alongside `.scales` + `.biases`. Load directly and infer the layout
+        // from shapes instead of quantizing a bf16 weight. `name` ends in
+        // `.weight`; the sibling keys swap the suffix.
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        let scales_key = format!("{base}.scales");
+        if tensors.contains_key(&scales_key) {
+            let weight = tensors
+                .remove(name)
+                .ok_or_else(|| anyhow!("prequant mtp.* missing `{name}`"))?;
+            let scales = tensors
+                .remove(&scales_key)
+                .ok_or_else(|| anyhow!("prequant mtp.* missing `{scales_key}`"))?;
+            let biases = tensors.remove(&format!("{base}.biases"));
+            let out = expect_shape[0];
+            let in_features = expect_shape[1];
+            if weight.shape()[0] != out {
+                return Err(anyhow!(
+                    "{name}: prequant out-dim {} != expected {out}",
+                    weight.shape()[0]
+                ));
+            }
+            // packed_in = in * bits / 32 ; n_groups = in / group_size.
+            let packed_in = weight.shape()[1];
+            let bits = (32 * packed_in) / in_features.max(1);
+            let n_groups = scales.shape()[1];
+            let group_size = in_features / n_groups.max(1);
+            return Ok(Qwen35MtpLinear {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+                mode: MODE_AFFINE,
+            });
+        }
         let w = take_tensor(tensors, name, &expect_shape)?;
         if let Some(mode) = quant.mode_cstr() {
             let (packed, scales, biases) =
@@ -764,16 +950,55 @@ pub fn load_block_from_hf(
     let v_dim = num_heads * head_dim;
 
     // 5) Build linears + norms.
+    //
+    // ── RMSNorm (1 + weight) convention fix ──────────────────────────────
+    // The HF-original Qwen3.6 `mtp.*` snapshot stores RMSNorm weights in the
+    // `(1 + w)` convention (effective scale = 1 + w). lumen's `rms_norm`
+    // applies the weight directly, so we must fold `+1` at load. Confirmed
+    // empirically against the MTPLX Forge-matched head (`mtp.safetensors`):
+    // matched == raw + 1 to rel-MAE ~1e-4 for pre_fc_norm_{embedding,hidden},
+    // mtp.norm, input_layernorm, q_norm, k_norm — but NOT
+    // post_attention_layernorm (already folded in the HF export). The mxfp4
+    // trunk works without this because mlx-community's conversion already
+    // folded the trunk norms. Without the fold, e.g. pre_fc_norm_embedding
+    // (raw mean -0.73) multiplies by a negative scale → garbage drafts,
+    // 0% accept. Gated for A/B; default ON once validated.
+    let fold_plus_one = std::env::var("LUMEN_MTP_NORM_PLUS_ONE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let p1 = |a: Array| -> Result<Array> {
+        if fold_plus_one {
+            let one = Array::from_f32(1.0).as_dtype(a.dtype())?;
+            Ok(mlx_rs::ops::add(&a, &one)?)
+        } else {
+            Ok(a)
+        }
+    };
+
     let eh_proj = take_linear(&mut tensors, "mtp.fc.weight", [hidden, 2 * hidden])?;
-    let enorm = take_norm(&mut tensors, "mtp.pre_fc_norm_embedding.weight", hidden)?;
-    let hnorm = take_norm(&mut tensors, "mtp.pre_fc_norm_hidden.weight", hidden)?;
+    let enorm = p1(take_norm(
+        &mut tensors,
+        "mtp.pre_fc_norm_embedding.weight",
+        hidden,
+    )?)?;
+    let hnorm = p1(take_norm(
+        &mut tensors,
+        "mtp.pre_fc_norm_hidden.weight",
+        hidden,
+    )?)?;
     let shared_head_norm = match take_norm(&mut tensors, "mtp.norm.weight", hidden) {
-        Ok(t) => Some(t),
+        Ok(t) => Some(p1(t)?),
         // `mtp.norm.weight` is optional per llama.cpp / DeepSeek-V3 spec; if
         // the checkpoint omits it the block falls back to trunk's final_norm.
         Err(_) => None,
     };
-    let input_layernorm = take_norm(&mut tensors, "mtp.layers.0.input_layernorm.weight", hidden)?;
+    let input_layernorm = p1(take_norm(
+        &mut tensors,
+        "mtp.layers.0.input_layernorm.weight",
+        hidden,
+    )?)?;
+    // NOTE: post_attention_layernorm is NOT folded — already absolute in the
+    // HF export (matched == raw, rel-MAE 0).
     let post_attention_layernorm = take_norm(
         &mut tensors,
         "mtp.layers.0.post_attention_layernorm.weight",
@@ -801,16 +1026,16 @@ pub fn load_block_from_hf(
             "mtp.layers.0.self_attn.o_proj.weight",
             [hidden, v_dim],
         )?,
-        q_norm_weight: take_norm(
+        q_norm_weight: p1(take_norm(
             &mut tensors,
             "mtp.layers.0.self_attn.q_norm.weight",
             head_dim,
-        )?,
-        k_norm_weight: take_norm(
+        )?)?,
+        k_norm_weight: p1(take_norm(
             &mut tensors,
             "mtp.layers.0.self_attn.k_norm.weight",
             head_dim,
-        )?,
+        )?)?,
     };
 
     let mlp = match mlp_config {
@@ -994,6 +1219,9 @@ fn load_moe_mlp_from_tensors(
         sw_up_s,
         sw_down_w,
         sw_down_s,
+        sw_gate_b: None,
+        sw_up_b: None,
+        sw_down_b: None,
         sw_gs: 32,
         sw_bits: 4,
         sw_mode: MODE_MXFP4,
@@ -1003,6 +1231,9 @@ fn load_moe_mlp_from_tensors(
         se_up_s,
         se_down_w,
         se_down_s,
+        se_gate_b: None,
+        se_up_b: None,
+        se_down_b: None,
         se_gs: 32,
         se_bits: 4,
         se_mode: MODE_MXFP4,

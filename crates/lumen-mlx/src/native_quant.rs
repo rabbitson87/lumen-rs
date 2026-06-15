@@ -554,6 +554,119 @@ mod nvfp4_ffi_smoke {
     }
 }
 
+// MXFP4 3-D expert-stack quant triage — does the MTP loader's 3-D / split-view
+// quantize round-trip, or is it the source of the garbage draft logits?
+//
+//   cargo test -p lumen-mlx --features mlx-native mxfp4_3d_expert_roundtrip -- --nocapture
+#[cfg(all(test, feature = "mlx-native"))]
+mod mxfp4_3d_expert_triage {
+    use super::imp::{MODE_MXFP4, dequantize_with_mode, quantize_with_mode};
+    use mlx_rs::Array;
+
+    fn rel_mae(recon: &[f32], src: &[f32]) -> f32 {
+        let (mut num, mut den) = (0.0f32, 0.0f32);
+        for (a, b) in recon.iter().zip(src) {
+            num += (a - b).abs();
+            den += b.abs();
+        }
+        num / den.max(1e-9)
+    }
+
+    #[test]
+    fn mxfp4_3d_expert_roundtrip() {
+        let (e, out, inf) = (4i32, 64i32, 128i32); // in multiple of group 32
+        let n = (e * out * inf) as usize;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).sin() * 1.5).collect();
+
+        // ---- (1) 3-D direct quantize [E, out, in] (what the MTP loader does) ----
+        let w3 = Array::from_slice(&data, &[e, out, inf]);
+        let (p3, s3, _) = quantize_with_mode(&w3, 32, 4, MODE_MXFP4).expect("3D quant");
+        eprintln!("3D packed shape={:?} scales={:?}", p3.shape(), s3.shape());
+        let d3 = dequantize_with_mode(&p3, &s3, None, 32, 4, MODE_MXFP4)
+            .expect("3D dequant")
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        d3.eval().unwrap();
+        let rel_3d = rel_mae(d3.as_slice(), &data);
+        eprintln!("[A] 3D direct rel-MAE = {rel_3d:.4}");
+
+        // ---- (2) 3-D from NON-CONTIGUOUS split view (loader splits fused gate_up) ----
+        // Build [E, 2*out, in], split axis 1, quantize the first (strided) half.
+        let n2 = (e * 2 * out * inf) as usize;
+        let data2: Vec<f32> = (0..n2).map(|i| (i as f32 * 0.011).cos() * 1.5).collect();
+        let fused = Array::from_slice(&data2, &[e, 2 * out, inf]);
+        // Rust-computed LOGICAL-ORDER reference for the gate half (rows 0..out of
+        // the 2*out axis), so comparison never reads a strided view via as_slice.
+        let gate_expected: Vec<f32> = {
+            let mut v = Vec::with_capacity((e * out * inf) as usize);
+            for ei in 0..e {
+                for o in 0..out {
+                    for kk in 0..inf {
+                        let idx = (((ei * (2 * out)) + o) * inf + kk) as usize;
+                        v.push(data2[idx]);
+                    }
+                }
+            }
+            v
+        };
+        let halves = mlx_rs::ops::split(&fused, 2, 1).expect("split");
+        let gate_view = halves.into_iter().next().unwrap(); // non-contiguous [E,out,in]
+        let (pv, sv, _) = quantize_with_mode(&gate_view, 32, 4, MODE_MXFP4).expect("view quant");
+        let dv = dequantize_with_mode(&pv, &sv, None, 32, 4, MODE_MXFP4)
+            .expect("view dequant")
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        dv.eval().unwrap();
+        let rel_view = rel_mae(dv.as_slice(), &gate_expected);
+        eprintln!("[B] 3D split-view rel-MAE = {rel_view:.4}  (vs Rust logical-order ref)");
+
+        // ---- (3) per-expert 2-D loop (the proposed fix) ----
+        let mut max_rel_2d = 0.0f32;
+        let expert_slices = mlx_rs::ops::split(&w3, e, 0).expect("split experts"); // E × [1,out,in]
+        for slice in &expert_slices {
+            let tile = slice.reshape(&[out, inf]).unwrap();
+            tile.eval().unwrap();
+            let (pt, st, _) = quantize_with_mode(&tile, 32, 4, MODE_MXFP4).expect("2D quant");
+            let dt = dequantize_with_mode(&pt, &st, None, 32, 4, MODE_MXFP4)
+                .expect("2D dequant")
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap();
+            dt.eval().unwrap();
+            let tilef = tile.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            tilef.eval().unwrap();
+            max_rel_2d = max_rel_2d.max(rel_mae(dt.as_slice(), tilef.as_slice()));
+        }
+        eprintln!("[C] per-expert 2D loop max rel-MAE = {max_rel_2d:.4}");
+
+        // ---- (4) split-view MATERIALIZED contiguous (the proposed fix) ----
+        let zero = Array::from_f32(0.0).as_dtype(gate_view.dtype()).unwrap();
+        let gate_contig = mlx_rs::ops::add(&gate_view, &zero).expect("materialize");
+        gate_contig.eval().unwrap();
+        let (pc, sc, _) =
+            quantize_with_mode(&gate_contig, 32, 4, MODE_MXFP4).expect("contig quant");
+        let dc = dequantize_with_mode(&pc, &sc, None, 32, 4, MODE_MXFP4)
+            .expect("contig dequant")
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        dc.eval().unwrap();
+        let rel_fix = rel_mae(dc.as_slice(), &gate_expected);
+        eprintln!("[D] split-view + add(0) materialize rel-MAE = {rel_fix:.4}");
+
+        eprintln!(
+            "VERDICT: [B] huge & [D]~[C]~0.08 confirms non-contiguous view = bug, add(0) = fix."
+        );
+        assert!(
+            rel_fix < 0.2,
+            "materialized split-view must round-trip to noise floor"
+        );
+        // 2D loop is the known-good baseline; assert it round-trips to mxfp4 noise floor.
+        assert!(
+            max_rel_2d < 0.2,
+            "per-expert 2D quant should be ~mxfp4 noise floor"
+        );
+    }
+}
+
 // NVFP4 kernel-vs-FFI A/B — does a custom fused Metal kernel have any headroom over
 // mlx's quantized_matmul(NVFP4) for Gemma4-26B-A4B MoE shapes?
 //

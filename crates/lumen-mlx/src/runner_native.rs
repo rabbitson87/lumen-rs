@@ -127,6 +127,12 @@ mod imp {
         /// `mtp_step` call (fresh K-step extrapolation). Idle / unused when
         /// MTP is not enabled.
         mtp_kv: NativeKvCache,
+        /// 1-forward MTP carry (`LUMEN_MTP_ONE_FORWARD`): the trunk hidden that
+        /// predecessor-seeds the next cycle's drafter. `None` at seq creation
+        /// (forces a bootstrap Step-A on the first `mtp_step`); thereafter holds
+        /// `verify_hidden[n_accepted]` from the prior cycle. Idle on the
+        /// 2-forward path (which always returns `None`).
+        mtp_carried: Option<mlx_rs::Array>,
         /// Prompt token ids this seq was prefilled with. Used by the batched
         /// scheduler's shared-prefix dedup (Phase 4) to compute the longest
         /// common prompt prefix across the active batch. Empty for seqs created
@@ -1365,6 +1371,7 @@ mod imp {
                     cache,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    mtp_carried: None,
                     prompt: tokens.to_vec(),
                 },
             );
@@ -1441,6 +1448,7 @@ mod imp {
                     cache,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    mtp_carried: None,
                     prompt: tokens.to_vec(),
                 },
             );
@@ -1899,11 +1907,109 @@ mod imp {
             self.model.as_ref().is_some_and(|m| m.mtp_enabled())
         }
 
+        /// Start MTP corrector calibration (collect drift pairs up to depth K).
+        pub(crate) fn enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: enable_mtp_calib before model loaded"))?;
+            model.enable_mtp_calib(depth_count);
+            Ok(())
+        }
+
+        /// Drain calibration stats, fit a corrector, return its serialized bytes.
+        pub(crate) fn finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: finalize_mtp_calib before model loaded"))?;
+            let stats = model
+                .take_mtp_calib()
+                .ok_or_else(|| anyhow!("native runner: no calibration in progress"))?;
+            for (d, (n, pre, post)) in stats.drift_report(eps).into_iter().enumerate() {
+                eprintln!(
+                    "[mtp-calib] depth {} : n={n} rel-MAE pre={pre:.4} post(affine)={post:.4}",
+                    d + 1
+                );
+            }
+            Ok(stats.finalize(eps).to_bytes())
+        }
+
+        /// Install a corrector from its serialized bytes (or clear with empty).
+        pub(crate) fn set_mtp_corrector_bytes(&self, bytes: &[u8]) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: set_mtp_corrector before model loaded"))?;
+            let corr = lumen_core::mtp_corrector::MtpCorrector::from_bytes(bytes)
+                .ok_or_else(|| anyhow!("native runner: corrector bytes failed to parse"))?;
+            model.set_mtp_corrector(Some(corr));
+            Ok(())
+        }
+
+        // ── Orthogonal-Procrustes corrector (the rotation shot) ──────────
+        pub(crate) fn enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
+            let model = self.model.as_ref().ok_or_else(|| {
+                anyhow!("native runner: enable_mtp_proc_calib before model loaded")
+            })?;
+            model.enable_mtp_proc_calib(depth_count);
+            Ok(())
+        }
+
+        /// Drain Procrustes stats, print the decisive residual report
+        /// (`rel_raw` vs `rel_proc` per depth), return the fitted corrector bytes.
+        pub(crate) fn finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
+            let model = self.model.as_ref().ok_or_else(|| {
+                anyhow!("native runner: finalize_mtp_proc_calib before model loaded")
+            })?;
+            let stats = model
+                .take_mtp_proc_calib()
+                .ok_or_else(|| anyhow!("native runner: no Procrustes calibration in progress"))?;
+            for (d, (n, raw, proc)) in stats.residual_report().into_iter().enumerate() {
+                eprintln!(
+                    "[mtp-proc-calib] depth {} : n={n} rel-MAE raw={raw:.4} post(rotation)={proc:.4}",
+                    d + 1
+                );
+            }
+            Ok(stats.finalize().to_bytes())
+        }
+
+        pub(crate) fn set_mtp_procrustes_bytes(&self, bytes: &[u8]) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: set_mtp_procrustes before model loaded"))?;
+            let corr = lumen_core::mtp_procrustes::ProcrustesCorrector::from_bytes(bytes)
+                .ok_or_else(|| anyhow!("native runner: procrustes bytes failed to parse"))?;
+            model.set_mtp_procrustes(Some(corr));
+            Ok(())
+        }
+
+        // ── C4 trained lm_head LoRA ──────────────────────────────────────
+        pub(crate) fn enable_mtp_c4_calib(&self) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: enable_mtp_c4_calib before model loaded"))?;
+            model.enable_mtp_c4_calib();
+            Ok(())
+        }
+
+        pub(crate) fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: train_mtp_c4_lmhead before model loaded"))?;
+            model.train_mtp_c4_lmhead(rank, steps, lr)
+        }
+
         pub(crate) fn mtp_step(
             &mut self,
             seq_id: u64,
             committed_token: u32,
             n_draft: usize,
+            temperature: f32,
+            top_p: f32,
         ) -> Result<MtpStepOutput> {
             let model = self
                 .model
@@ -1917,12 +2023,15 @@ mod imp {
             let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: mtp_step on unknown seq_id {seq_id}")
             })?;
-            let out = model
+            let mut out = model
                 .mtp_step(
                     &mut state.cache,
                     &mut state.mtp_kv,
                     committed_token,
                     n_draft,
+                    state.mtp_carried.take(),
+                    temperature,
+                    top_p,
                 )
                 .with_context(|| {
                     format!("native mlx-rs runner: mtp_step orchestration (seq_id={seq_id})")
@@ -1930,6 +2039,9 @@ mod imp {
             // Position advances by the number of committed tokens — same
             // semantics as a series of `decode_step` calls.
             state.position += out.committed.len();
+            // Stash the 1-forward carry for the next cycle (None on 2-forward).
+            // Moved out of the returned struct — the upper decode loop ignores it.
+            state.mtp_carried = out.carried_hidden.take();
             Ok(out)
         }
 
@@ -2177,6 +2289,7 @@ mod imp {
                     cache: fresh,
                     position,
                     mtp_kv: NativeKvCache::new(),
+                    mtp_carried: None,
                     prompt: Vec::new(),
                 },
             );

@@ -70,14 +70,19 @@ mod imp {
     use crate::native_kernels::{sigmoid_mul_fuse_enabled, sigmoid_mul_fused};
     use crate::native_moe::{
         AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
-        SwitchGluWeights, moe_block_forward,
+        SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled, swiglu_fused,
     };
     use crate::native_norm::rms_norm;
     use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, quantized_matmul_with_mode};
     use crate::native_rope::{precompute_rope_freqs, rope, rope_with_freqs};
     use crate::native_snapshot::PromptCacheSnapshot;
-    use crate::native_ssm::{compute_g, gated_delta_step_kernel, rms_norm_gated};
+    use crate::native_ssm::{
+        compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, rms_norm_gated,
+    };
     use crate::qwen3_5_mtp::{Qwen35MtpBlock, Qwen35MtpLinear};
+    use lumen_core::sampling::{
+        SamplingConfig, Xorshift64, sample_distribution, sampling_distribution, speculative_accept,
+    };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -259,9 +264,17 @@ mod imp {
                 // (mxfp4 kernel vs affine kernel) is selected later from `mode`.
                 let mode_ok =
                     quant.mode == "mxfp4" || quant.mode == "affine" || quant.mode == "nvfp4";
-                if !mode_ok || quant.bits != 4 || quant.group_size == 0 {
+                // mxfp4/nvfp4 are 4-bit E2M1; affine ships 4/6/8-bit (9B Speed =
+                // affine 6-bit, 27B Speed = affine 4-bit). Require 4-bit for the
+                // E2M1 formats, allow {4,6,8} for affine.
+                let bits_ok = if quant.mode == "affine" {
+                    matches!(quant.bits, 4 | 6 | 8)
+                } else {
+                    quant.bits == 4
+                };
+                if !mode_ok || !bits_ok || quant.group_size == 0 {
                     return Err(anyhow!(
-                        "quantization_config must default to (mxfp4|affine|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
+                        "quantization_config must be (mxfp4|nvfp4)/4-bit or affine/{{4,6,8}}-bit with non-zero group, got mode='{}' bits={} group={}",
                         quant.mode,
                         quant.bits,
                         quant.group_size
@@ -677,7 +690,22 @@ mod imp {
 
     pub struct LayerWeights {
         pub attn: AttnLayerWeights,
-        pub moe: ResolvedMoeWeights,
+        pub mlp: MlpWeights,
+    }
+
+    /// Per-layer MLP variant. MoE (35B-A3B `switch_mlp` + shared expert) or
+    /// dense SwiGLU (9B/27B `mlp.{gate,up,down}_proj`).
+    pub enum MlpWeights {
+        Moe(ResolvedMoeWeights),
+        Dense(DenseMlpWeights),
+    }
+
+    /// Dense SwiGLU MLP weights (`down(silu(gate(x)) * up(x))`). Each linear is
+    /// a quantized (affine/mxfp4) `ResolvedLinear`.
+    pub struct DenseMlpWeights {
+        pub gate_proj: ResolvedLinear,
+        pub up_proj: ResolvedLinear,
+        pub down_proj: ResolvedLinear,
     }
 
     /// Resolve `(group_size, bits, mode)` for a quantized layer — same logic
@@ -786,6 +814,19 @@ mod imp {
             dt_bias: require_clone(weights, &format!("{prefix}.dt_bias"))?,
             norm_weight: require_clone(weights, &format!("{prefix}.norm.weight"))?,
             out_proj: resolve_linear(weights, config, &format!("{prefix}.out_proj"))?,
+        })
+    }
+
+    fn resolve_dense_mlp_layer(
+        weights: &NativeWeights,
+        config: &NativeModelConfig,
+        layer_idx: usize,
+    ) -> Result<DenseMlpWeights> {
+        let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
+        Ok(DenseMlpWeights {
+            gate_proj: resolve_linear(weights, config, &format!("{prefix}.gate_proj"))?,
+            up_proj: resolve_linear(weights, config, &format!("{prefix}.up_proj"))?,
+            down_proj: resolve_linear(weights, config, &format!("{prefix}.down_proj"))?,
         })
     }
 
@@ -1004,6 +1045,13 @@ mod imp {
         pub committed: Vec<u32>,
         pub n_attempted: usize,
         pub n_accepted: usize,
+        /// 1-forward path only: the trunk pre-final-norm hidden at verify
+        /// position `n_accepted` (`[1, 1, hidden]`), i.e. the predecessor
+        /// hidden of the correction token. The caller (runner) threads this
+        /// back into the next `mtp_step` as `carried_hidden` so the drafter
+        /// can seed without a separate Step-A forward. `None` on the 2-forward
+        /// path (which re-seeds via Step A every cycle).
+        pub carried_hidden: Option<Array>,
     }
 
     pub struct NativeQwen3_5MoeModel {
@@ -1018,6 +1066,8 @@ mod imp {
         linear_attn_constants: LinearAttnConstants,
         embed_weight: Array,
         embed_scales: Array,
+        // Affine embed (9B/27B) ships per-row biases; mxfp4 (35B) has none.
+        embed_biases: Option<Array>,
         embed_group: i32,
         embed_bits: i32,
         embed_mode: &'static CStr,
@@ -1043,6 +1093,35 @@ mod imp {
         // matches the MTP block's `h_pre` input contract.
         mtp_capture_slot: Mutex<Option<Array>>,
         mtp_capture_enabled: AtomicBool,
+        // Capture-commit (O(1) speculative rollback): when enabled during the
+        // verify forward, each GDN/linear-attn layer pushes
+        // (layer_idx, state_per_pos [B,s,nv,dv,dn], conv_input [B,n_keep+s,conv_dim])
+        // so Step E can index-select the accepted-prefix SSM+conv state instead
+        // of the O(D) full-trunk replay. Drained by `take_ssm_captures()`.
+        ssm_capture_slot: Mutex<Vec<(usize, Array, Array)>>,
+        ssm_capture_enabled: AtomicBool,
+        // MTP drift corrector (per-depth diagonal affine). `Some` when loaded
+        // via `set_mtp_corrector`; applied in the drafter loop to the chained
+        // hidden so deep drafts stay in-distribution (raises accept at K>=2).
+        mtp_corrector: Mutex<Option<lumen_core::mtp_corrector::MtpCorrector>>,
+        // Calibration accumulator. `Some` while collecting (draft_hidden,
+        // target_hidden) pairs to FIT a corrector; drained by
+        // `take_mtp_calib()`. Mutually exclusive with `mtp_corrector` in
+        // practice (calibrate the raw chain, then apply the fitted corrector).
+        mtp_calib: Mutex<Option<lumen_core::mtp_corrector::CorrectorStats>>,
+        // Orthogonal-Procrustes corrector + its calib accumulator (the
+        // rotation shot — rotation survives the head's input RMSNorm where the
+        // diagonal scale washed out). Same (x,y) pairing as `mtp_calib`.
+        mtp_procrustes: Mutex<Option<lumen_core::mtp_procrustes::ProcrustesCorrector>>,
+        mtp_proc_calib: Mutex<Option<lumen_core::mtp_procrustes::ProcrustesStats>>,
+        // C4 trained lm_head LoRA: `(A [rank,hidden], B [vocab,rank])`. When
+        // installed, the drafter corrects its logits `logits += (norm_out·Aᵀ)·Bᵀ`
+        // (norm_out = the returned chained hidden = the lm_head input). Trained
+        // on (norm_out, trunk-argmax) pairs via CE — the only accept-aligned
+        // lever (optimizes the head OUTPUT, not hidden L2 which proved inert).
+        mtp_c4_lmhead: Mutex<Option<(Array, Array)>>,
+        // C4 calibration: collected (x = norm_out host row, target = trunk argmax).
+        mtp_c4_calib: Mutex<Option<(Vec<Vec<f32>>, Vec<u32>)>>,
     }
 
     /// Post-projection / post-RoPE intermediates shared by the plain and
@@ -1092,7 +1171,9 @@ mod imp {
             }
             let config_path = model_dir.join("config.json");
             let config = NativeModelConfig::load(&config_path)?;
-            config.validate_qwen3_5_moe()?;
+            // Family validator: accepts MoE (35B-A3B) and Dense (9B/27B), and
+            // affine/mxfp4/nvfp4 quant. Returns which per-layer MLP to build.
+            let mlp_kind = config.validate_qwen3_5_family()?;
 
             let mut weights = NativeWeights::load_dir(model_dir)?;
             weights.sanitize()?;
@@ -1110,14 +1191,22 @@ mod imp {
                 } else {
                     AttnLayerWeights::Full(resolve_full_attn_layer(&weights, &config, layer_idx)?)
                 };
-                let moe = resolve_moe_layer(&weights, &config, layer_idx)?;
-                layer_weights.push(LayerWeights { attn, moe });
+                let mlp = match mlp_kind {
+                    MlpKind::Moe => {
+                        MlpWeights::Moe(resolve_moe_layer(&weights, &config, layer_idx)?)
+                    }
+                    MlpKind::Dense => {
+                        MlpWeights::Dense(resolve_dense_mlp_layer(&weights, &config, layer_idx)?)
+                    }
+                };
+                layer_weights.push(LayerWeights { attn, mlp });
             }
 
             // Embedding (always MXFP4 in production) + final norm + lm_head.
             let embed_base = "language_model.model.embed_tokens";
             let embed_weight = require_clone(&weights, &format!("{embed_base}.weight"))?;
             let embed_scales = require_clone(&weights, &format!("{embed_base}.scales"))?;
+            let embed_biases = weights.get(&format!("{embed_base}.biases")).cloned();
             let (embed_group, embed_bits, embed_mode) = quant_params_resolve(&config, embed_base);
             let final_norm_weight = require_clone(&weights, "language_model.model.norm.weight")?;
             let lm_head = if config.text_config.tie_word_embeddings {
@@ -1144,8 +1233,17 @@ mod imp {
                 mtp: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
+                ssm_capture_slot: Mutex::new(Vec::new()),
+                mtp_corrector: Mutex::new(None),
+                mtp_calib: Mutex::new(None),
+                mtp_procrustes: Mutex::new(None),
+                mtp_proc_calib: Mutex::new(None),
+                mtp_c4_lmhead: Mutex::new(None),
+                mtp_c4_calib: Mutex::new(None),
+                ssm_capture_enabled: AtomicBool::new(false),
                 embed_weight,
                 embed_scales,
+                embed_biases,
                 embed_group,
                 embed_bits,
                 embed_mode,
@@ -1919,8 +2017,17 @@ mod imp {
                     &_state_in_owned
                 }
             };
-            let (out_kernel, new_state) =
-                gated_delta_step_kernel(&q_scaled, &k_scaled, &v_post, &g, &beta, state_in)?;
+            let (out_kernel, new_state) = if self.ssm_capture_enabled() {
+                // Capture-commit: emit per-position SSM state + stash conv_input
+                // for O(1) speculative rollback in mtp_step Step E.
+                let (y, ns, state_per_pos) = gated_delta_step_kernel_capture(
+                    &q_scaled, &k_scaled, &v_post, &g, &beta, state_in,
+                )?;
+                self.push_ssm_capture(layer_idx, state_per_pos, conv_input.clone());
+                (y, ns)
+            } else {
+                gated_delta_step_kernel(&q_scaled, &k_scaled, &v_post, &g, &beta, state_in)?
+            };
             cache.set(1, new_state)?;
             cache.advance(s as usize);
             if let Some(t0) = t_ssm {
@@ -2074,10 +2181,40 @@ mod imp {
         /// returned tensor is the additive update to the residual stream
         /// (the caller adds `h + mlp_out`).
         pub(crate) fn layer_moe_forward(&self, x: &Array, layer_idx: usize) -> Result<Array> {
-            let weights = self.layer_weights[layer_idx].moe.view();
-            let raw = moe_block_forward(x, &weights)
-                .with_context(|| format!("layer_moe_forward({layer_idx}) failed"))?;
-            Self::to_f32(raw, &format!("layer{layer_idx}.mlp"))
+            match &self.layer_weights[layer_idx].mlp {
+                MlpWeights::Moe(m) => {
+                    let weights = m.view();
+                    let raw = moe_block_forward(x, &weights)
+                        .with_context(|| format!("layer_moe_forward({layer_idx}) failed"))?;
+                    Self::to_f32(raw, &format!("layer{layer_idx}.mlp"))
+                }
+                MlpWeights::Dense(d) => self
+                    .layer_dense_mlp_forward(x, d)
+                    .with_context(|| format!("layer_dense_mlp_forward({layer_idx}) failed")),
+            }
+        }
+
+        /// Dense SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
+        /// Mirrors `native_moe`'s shared-expert SwiGLU but as the whole MLP.
+        fn layer_dense_mlp_forward(&self, x: &Array, d: &DenseMlpWeights) -> Result<Array> {
+            // `linear_pre` carries each linear's affine biases (the 9B/27B dense
+            // MLP is affine-quantized WITH biases — unlike the mxfp4 shared
+            // expert, so `native_moe::shared_mlp` (biases=None) can't be reused).
+            let gate = self.linear_pre(&d.gate_proj, x)?;
+            let up = self.linear_pre(&d.up_proj, x)?;
+            // Reuse the landed mxfp4 SwiGLU fusion (-0.671ms/step, t=-29σ) — the
+            // dense path was running raw silu+multiply (2 dispatches). Same
+            // env off-switch (LUMEN_NATIVE_FUSE_SWIGLU=0) for A/B / rollback.
+            let act = if swiglu_fuse_enabled() {
+                swiglu_fused(&gate, &up).context("dense mlp: fused swiglu failed")?
+            } else {
+                let silu_gate =
+                    mlx_rs::nn::silu(&gate).context("dense mlp: silu(gate_proj) failed")?;
+                mlx_rs::ops::multiply(&silu_gate, &up)
+                    .context("dense mlp: silu(gate) * up failed")?
+            };
+            let raw = self.linear_pre(&d.down_proj, &act)?;
+            Self::to_f32(raw, "dense.mlp")
         }
 
         /// Forward pass. Phase 3d.4 closes the loop: every layer runs
@@ -2172,6 +2309,7 @@ mod imp {
             let embed_raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
+                self.embed_biases.as_ref(),
                 &ids_arr,
                 self.embed_group,
                 self.embed_bits,
@@ -2405,6 +2543,7 @@ mod imp {
             let embed_raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
+                self.embed_biases.as_ref(),
                 &ids_arr,
                 self.embed_group,
                 self.embed_bits,
@@ -2630,8 +2769,483 @@ mod imp {
             self.mtp_capture_enabled.store(on, Ordering::Relaxed);
         }
 
+        fn ssm_capture_enabled(&self) -> bool {
+            self.ssm_capture_enabled.load(Ordering::Relaxed)
+        }
+        fn set_ssm_capture_enabled(&self, on: bool) {
+            self.ssm_capture_enabled.store(on, Ordering::Relaxed);
+            if on {
+                if let Ok(mut s) = self.ssm_capture_slot.lock() {
+                    s.clear();
+                }
+            }
+        }
+        fn push_ssm_capture(&self, layer_idx: usize, state_per_pos: Array, conv_input: Array) {
+            if let Ok(mut s) = self.ssm_capture_slot.lock() {
+                s.push((layer_idx, state_per_pos, conv_input));
+            }
+        }
+        fn take_ssm_captures(&self) -> Vec<(usize, Array, Array)> {
+            self.ssm_capture_slot
+                .lock()
+                .map(|mut s| std::mem::take(&mut *s))
+                .unwrap_or_default()
+        }
+
+        /// O(1) capture-commit (Step E): install the accepted-prefix SSM+conv
+        /// state per linear layer (index-select from the per-position capture)
+        /// and truncate full-attn layers — replacing the O(D) replay forward.
+        /// `keep` = number of verify tokens to retain (1 next_token + accepted).
+        fn commit_captured(
+            &self,
+            cache: &mut NativePromptCache,
+            captures: &[(usize, Array, Array)],
+            keep: usize,
+            target_offset: usize,
+        ) -> Result<()> {
+            use std::collections::HashMap;
+            let cap: HashMap<usize, (&Array, &Array)> =
+                captures.iter().map(|(i, s, c)| (*i, (s, c))).collect();
+            for (layer_idx, layer) in cache.layers_mut().iter_mut().enumerate() {
+                match layer {
+                    NativeLayerCache::Full(kv) => {
+                        kv.truncate_to(target_offset).with_context(|| {
+                            format!("commit_captured: truncate full layer {layer_idx}")
+                        })?;
+                    }
+                    other @ NativeLayerCache::FullTurboquant(_) => {
+                        // TurboQuant KV rollback semantics not validated for
+                        // capture-commit; fall back is the replay path (caller
+                        // only uses capture-commit when dense KV).
+                        let _ = other;
+                        return Err(anyhow!(
+                            "commit_captured: FullTurboquant layer {layer_idx} unsupported (use replay path / dense KV)"
+                        ));
+                    }
+                    NativeLayerCache::Linear(arr) => {
+                        let (spp, cin) = cap.get(&layer_idx).ok_or_else(|| {
+                            anyhow!("commit_captured: missing capture for linear layer {layer_idx}")
+                        })?;
+                        let s_verify = spp.shape()[1] as usize; // K+1
+                        // SSM state after `keep` tokens = spp[:, keep-1].
+                        let parts = mlx_rs::ops::split(spp, s_verify as i32, 1)
+                            .context("commit_captured: split state_per_pos")?;
+                        let sslab = &parts[keep - 1]; // [b,1,nv,dv,dn]
+                        let sh = sslab.shape();
+                        let ssm = mlx_rs::ops::reshape(sslab, &[sh[0], sh[2], sh[3], sh[4]])
+                            .context("commit_captured: reshape ssm state")?;
+                        // Conv state after `keep` tokens = cin[:, keep : keep+n_keep].
+                        let cols = cin.shape()[1] as usize;
+                        let n_keep = cols - s_verify;
+                        let idx: Vec<i32> = (keep as i32..(keep as i32 + n_keep as i32)).collect();
+                        let idx_arr = Array::from_slice(&idx, &[n_keep as i32]);
+                        let conv = mlx_rs::ops::indexing::take_axis(cin, &idx_arr, 1)
+                            .context("commit_captured: slice conv state")?;
+                        ssm.eval().ok();
+                        conv.eval().ok();
+                        arr.set_slot(1, Some(ssm))
+                            .context("commit_captured: set ssm slot")?;
+                        arr.set_slot(0, Some(conv))
+                            .context("commit_captured: set conv slot")?;
+                        arr.set_offset(target_offset);
+                    }
+                }
+            }
+            Ok(())
+        }
+
         fn take_captured_h(&self) -> Option<Array> {
             self.mtp_capture_slot.lock().ok().and_then(|mut s| s.take())
+        }
+
+        /// Install (or clear) the MTP drift corrector. Applied in the drafter
+        /// loop to the chained hidden at each depth.
+        pub fn set_mtp_corrector(&self, c: Option<lumen_core::mtp_corrector::MtpCorrector>) {
+            if let Ok(mut slot) = self.mtp_corrector.lock() {
+                *slot = c;
+            }
+        }
+
+        /// True when a corrector is installed (drafter pulls hidden to host).
+        fn mtp_corrector_active(&self) -> bool {
+            self.mtp_corrector
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
+        /// Start collecting calibration stats (`depth_count = max draft K`).
+        pub fn enable_mtp_calib(&self, depth_count: usize) {
+            let hidden = self.text_config().hidden_size;
+            if let Ok(mut slot) = self.mtp_calib.lock() {
+                *slot = Some(lumen_core::mtp_corrector::CorrectorStats::new(
+                    depth_count,
+                    hidden,
+                ));
+            }
+        }
+
+        fn mtp_calib_active(&self) -> bool {
+            self.mtp_calib.lock().map(|s| s.is_some()).unwrap_or(false)
+        }
+
+        /// Drain the calibration accumulator (e.g. to `finalize()` + save).
+        pub fn take_mtp_calib(&self) -> Option<lumen_core::mtp_corrector::CorrectorStats> {
+            self.mtp_calib.lock().ok().and_then(|mut s| s.take())
+        }
+
+        // ── Orthogonal-Procrustes corrector (the rotation shot) ──────────
+        /// Install (or clear) the Procrustes corrector. Applied in the drafter
+        /// loop as `h ← s·(h-mean_x)·R + mean_y` at each depth.
+        pub fn set_mtp_procrustes(
+            &self,
+            c: Option<lumen_core::mtp_procrustes::ProcrustesCorrector>,
+        ) {
+            if let Ok(mut slot) = self.mtp_procrustes.lock() {
+                *slot = c;
+            }
+        }
+
+        fn mtp_procrustes_active(&self) -> bool {
+            self.mtp_procrustes
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
+        /// Start collecting Procrustes calibration stats (`depth_count = K`).
+        /// Heavy: allocates `depth_count · hidden²` f64 for the cross-product.
+        pub fn enable_mtp_proc_calib(&self, depth_count: usize) {
+            let hidden = self.text_config().hidden_size;
+            if let Ok(mut slot) = self.mtp_proc_calib.lock() {
+                *slot = Some(lumen_core::mtp_procrustes::ProcrustesStats::new(
+                    depth_count,
+                    hidden,
+                ));
+            }
+        }
+
+        fn mtp_proc_calib_active(&self) -> bool {
+            self.mtp_proc_calib
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
+        /// Drain the Procrustes calibration accumulator.
+        pub fn take_mtp_proc_calib(&self) -> Option<lumen_core::mtp_procrustes::ProcrustesStats> {
+            self.mtp_proc_calib.lock().ok().and_then(|mut s| s.take())
+        }
+
+        // ── C4 trained lm_head LoRA (the accept-aligned lever) ───────────
+        /// Apply the trunk lm_head to a post-final-norm hidden `x` (`[*, hidden]`)
+        /// → logits `[*, vocab]`. Mirrors the trunk forward's lm_head branch
+        /// (untied `lm_head` else tied embed). `x` is ALREADY normed (it's the
+        /// MTP block's `norm_out`), so no rms_norm here.
+        fn lm_head_apply(&self, x: &Array) -> Result<Array> {
+            let logits = if let Some(lm_head) = &self.lm_head {
+                self.linear_pre(lm_head, x)?
+            } else {
+                quantized_matmul_with_mode(
+                    x,
+                    &self.embed_weight,
+                    &self.embed_scales,
+                    None,
+                    true,
+                    self.embed_group,
+                    self.embed_bits,
+                    self.embed_mode,
+                )
+                .context("lm_head_apply: tied lm_head matmul failed")?
+            };
+            Self::to_f32(logits, "lm_head_apply")
+        }
+
+        /// Begin collecting C4 calibration: `(norm_out row, trunk-argmax token)`.
+        pub fn enable_mtp_c4_calib(&self) {
+            if let Ok(mut slot) = self.mtp_c4_calib.lock() {
+                *slot = Some((Vec::new(), Vec::new()));
+            }
+        }
+
+        fn mtp_c4_calib_active(&self) -> bool {
+            self.mtp_c4_calib
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
+        fn mtp_c4_active(&self) -> bool {
+            self.mtp_c4_lmhead
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
+        /// Correct draft logits with the trained lm_head LoRA:
+        /// `logits + (h·Aᵀ)·Bᵀ`. `h` is the lm_head input (`norm_out`, the
+        /// returned chained hidden). No-op if no adapter installed.
+        fn apply_c4_lmhead(&self, logits: &Array, h: &Array) -> Result<Array> {
+            let slot = match self.mtp_c4_lmhead.lock() {
+                Ok(s) => s,
+                Err(_) => return Ok(logits.clone()),
+            };
+            let Some((a, b)) = slot.as_ref() else {
+                return Ok(logits.clone());
+            };
+            // delta = (h @ Aᵀ) @ Bᵀ → [.., b_out]. B's first dim selects mode:
+            //   b_out == hidden → HIDDEN mode: logits = lm_head(h + delta_h)
+            //   b_out == vocab  → LOGIT  mode: logits = logits + delta
+            let hidden = self.text_config().hidden_size as i32;
+            let ha = h.matmul(&a.transpose_axes(&[1, 0])?)?; // [.., r]
+            let delta = ha.matmul(&b.transpose_axes(&[1, 0])?)?; // [.., b_out]
+            if b.shape()[0] == hidden {
+                let corrected = h.add(&delta)?;
+                self.lm_head_apply(&corrected)
+                    .context("apply_c4_lmhead: hidden-mode lm_head failed")
+            } else {
+                logits
+                    .add(&delta)
+                    .context("apply_c4_lmhead: logits + delta failed")
+            }
+        }
+
+        /// Train the C4 lm_head LoRA from the collected calibration pairs and
+        /// INSTALL it. CE-to-trunk-argmax loss over minibatches; base lm_head
+        /// frozen (its logits are a per-batch constant), only `A`/`B` learn via
+        /// `value_and_grad` + hand-rolled Adam (validated in `smoke_lora_train`).
+        pub fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
+            use mlx_rs::transforms::value_and_grad_with_argnums;
+            let (xs, targets) = {
+                let mut slot = self
+                    .mtp_c4_calib
+                    .lock()
+                    .map_err(|_| anyhow!("c4 calib lock poisoned"))?;
+                slot.take()
+                    .ok_or_else(|| anyhow!("no C4 calibration in progress"))?
+            };
+            let n = xs.len();
+            if n == 0 || n != targets.len() {
+                return Err(anyhow!("C4 calib empty or mismatched ({n} rows)"));
+            }
+            let hidden = self.text_config().hidden_size;
+            // Flatten host rows → X [n, hidden].
+            let mut flat = Vec::with_capacity(n * hidden);
+            for r in &xs {
+                if r.len() != hidden {
+                    return Err(anyhow!("C4 calib row len {} != hidden {hidden}", r.len()));
+                }
+                flat.extend_from_slice(r);
+            }
+            let x_all = Array::from_slice(&flat, &[n as i32, hidden as i32]);
+            let t_all: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
+            let tgt_all = Array::from_slice(&t_all, &[n as i32]);
+
+            // Probe vocab from a 1-row lm_head application.
+            let row0 = x_all.take_axis(&Array::from_slice(&[0i32], &[1]), 0)?;
+            let probe = self.lm_head_apply(&row0)?;
+            let vocab = probe.shape()[probe.ndim() - 1];
+
+            // HIDDEN mode (LUMEN_C4_HIDDEN=1): the adapter corrects the lm_head
+            // INPUT (`logits = lm_head(x + (x·Aᵀ)·Bᵀ)`) with a HIDDEN-sized
+            // `B[hidden,r]` — far fewer params than the vocab-sized logit
+            // adapter, and the logit delta is constrained to lm_head's column
+            // space (a strong generalizing inductive bias). Trained on the same
+            // output CE. The lm_head being linear, `lm_head(x+δ)=lm_head(x)+δ·Wᵀ`,
+            // so we materialize the dense `Wᵀ` (`[hidden,vocab]`) ONCE via
+            // `lm_head_apply(I)` to keep the training graph differentiable
+            // (avoids needing a quantized_matmul input-vjp).
+            let hidden_mode = std::env::var("LUMEN_C4_HIDDEN").as_deref() == Ok("1");
+            let b_out = if hidden_mode { hidden as i32 } else { vocab };
+            let wt_dense: Option<Array> = if hidden_mode {
+                let eye = Array::eye::<f32>(hidden as i32, None, None)?;
+                let wt = self
+                    .lm_head_apply(&eye)?
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)?; // [hidden, vocab]
+                wt.eval()?;
+                eprintln!(
+                    "[c4-train] HIDDEN mode: dense lm_head Wᵀ {:?} materialized",
+                    wt.shape()
+                );
+                Some(wt)
+            } else {
+                None
+            };
+
+            // LoRA params: A [r,h] small random, B [b_out,r] zeros (delta starts 0).
+            mlx_rs::random::seed(1234)?;
+            let r = rank as i32;
+            let mut a = mlx_rs::random::normal::<f32>(&[r, hidden as i32], None, None, None)?
+                .multiply(Array::from_f32((1.0 / hidden as f32).sqrt()))?;
+            let mut b = Array::zeros::<f32>(&[b_out, r])?;
+            a.eval()?;
+            b.eval()?;
+            let (mut ma, mut va) = (
+                Array::zeros::<f32>(&[r, hidden as i32])?,
+                Array::zeros::<f32>(&[r, hidden as i32])?,
+            );
+            let (mut mb, mut vb) = (
+                Array::zeros::<f32>(&[b_out, r])?,
+                Array::zeros::<f32>(&[b_out, r])?,
+            );
+            let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+
+            // Decoupled weight decay (AdamW).
+            let wd: f32 = std::env::var("LUMEN_C4_WD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            let adam =
+                |p: &Array, g: &Array, m: &mut Array, v: &mut Array, t: i32| -> Result<Array> {
+                    *m = m
+                        .multiply(Array::from_f32(b1))?
+                        .add(&g.multiply(Array::from_f32(1.0 - b1))?)?;
+                    *v = v
+                        .multiply(Array::from_f32(b2))?
+                        .add(&g.multiply(g)?.multiply(Array::from_f32(1.0 - b2))?)?;
+                    let mhat = m.divide(Array::from_f32(1.0 - b1.powi(t)))?;
+                    let vhat = v.divide(Array::from_f32(1.0 - b2.powi(t)))?;
+                    let upd = mhat.divide(&mlx_rs::ops::sqrt(&vhat)?.add(Array::from_f32(eps))?)?;
+                    let stepped = p.subtract(&upd.multiply(Array::from_f32(lr))?)?;
+                    if wd > 0.0 {
+                        stepped
+                            .multiply(Array::from_f32(1.0 - lr * wd))
+                            .map_err(Into::into)
+                    } else {
+                        Ok(stepped)
+                    }
+                };
+
+            // Train / held-out split (last 20% = held-out; in broad-corpus mode
+            // these are the LAST prompts' rows ⇒ a cross-context generalization
+            // gate). Early-stop: keep the (A,B) with the best HELD-OUT argmax
+            // accuracy (= would-be greedy accept), never the train-CE-minimizing
+            // last step — that memorizes (the vocab-sized B routes per token).
+            let n_ho = (n / 5).clamp(1, n.saturating_sub(1).max(1));
+            let n_tr = (n - n_ho).max(1);
+            let tr_idx = Array::from_slice(&(0..n_tr as i32).collect::<Vec<_>>(), &[n_tr as i32]);
+            let ho_idx =
+                Array::from_slice(&(n_tr as i32..n as i32).collect::<Vec<_>>(), &[n_ho as i32]);
+            let x_tr = x_all.take_axis(&tr_idx, 0)?;
+            let t_tr = tgt_all.take_axis(&tr_idx, 0)?;
+            let x_ho = x_all.take_axis(&ho_idx, 0)?;
+            let t_ho = tgt_all.take_axis(&ho_idx, 0)?;
+            let base_ho = self.lm_head_apply(&x_ho)?; // frozen held-out base logits
+            base_ho.eval()?;
+            // Held-out baseline accept proxy (no adapter).
+            let ho_acc = |a: &Array, b: &Array| -> Result<f32> {
+                let ha = x_ho.matmul(&a.transpose_axes(&[1, 0])?)?;
+                let delta = ha.matmul(&b.transpose_axes(&[1, 0])?)?; // [n_ho, b_out]
+                let delta_logits = match &wt_dense {
+                    Some(wt) => delta
+                        .as_dtype(mlx_rs::Dtype::Bfloat16)?
+                        .matmul(wt)?
+                        .as_dtype(mlx_rs::Dtype::Float32)?,
+                    None => delta,
+                };
+                let logits = base_ho.add(&delta_logits)?;
+                let pred = mlx_rs::ops::indexing::argmax_axis(&logits, 1, false)?
+                    .as_dtype(mlx_rs::Dtype::Int32)?;
+                let acc = pred
+                    .eq(&t_ho)?
+                    .as_dtype(mlx_rs::Dtype::Float32)?
+                    .mean(false)?;
+                acc.eval()?;
+                Ok(acc.item::<f32>())
+            };
+            let zero_b = Array::zeros::<f32>(&[b_out, r])?;
+            let base_ho_acc = ho_acc(&a, &zero_b)?;
+
+            let batch = n_tr.min(128);
+            let mut best = (base_ho_acc, a.clone(), b.clone());
+            for step in 1..=steps as i32 {
+                let start = ((step as usize - 1) * batch) % n_tr;
+                let idx: Vec<i32> = (0..batch).map(|i| ((start + i) % n_tr) as i32).collect();
+                let idx_arr = Array::from_slice(&idx, &[batch as i32]);
+                let xb = x_tr.take_axis(&idx_arr, 0)?; // [batch, hidden]
+                let tb = t_tr.take_axis(&idx_arr, 0)?; // [batch]
+                let base_logits = self.lm_head_apply(&xb)?; // frozen constant
+                base_logits.eval()?;
+                let bsz = batch as i32;
+                let loss_fn = {
+                    let xb = xb.clone();
+                    let base = base_logits.clone();
+                    let tb = tb.clone();
+                    let wt = wt_dense.clone();
+                    move |args: &[Array]| -> Vec<Array> {
+                        let a = &args[0];
+                        let b = &args[1];
+                        let ha = xb.matmul(&a.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        let delta = ha.matmul(&b.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        // HIDDEN mode: map the hidden-space delta through the
+                        // frozen dense lm_head into logit space; else delta IS
+                        // the logit correction.
+                        let delta_logits = match &wt {
+                            Some(w) => delta
+                                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                                .unwrap()
+                                .matmul(w)
+                                .unwrap()
+                                .as_dtype(mlx_rs::Dtype::Float32)
+                                .unwrap(),
+                            None => delta,
+                        };
+                        let logits = base.add(&delta_logits).unwrap();
+                        let lse = logits.logsumexp_axis(1, false).unwrap();
+                        let tl = logits
+                            .take_along_axis(&tb.reshape(&[bsz, 1]).unwrap(), 1)
+                            .unwrap()
+                            .reshape(&[bsz])
+                            .unwrap();
+                        vec![lse.subtract(&tl).unwrap().mean(false).unwrap()]
+                    }
+                };
+                let (loss, grads) = value_and_grad_with_argnums(loss_fn, &[0i32, 1i32][..])(&[
+                    a.clone(),
+                    b.clone(),
+                ])?;
+                a = adam(&a, &grads[0], &mut ma, &mut va, step)?;
+                b = adam(&b, &grads[1], &mut mb, &mut vb, step)?;
+                a.eval()?;
+                b.eval()?;
+                if step == 1 || step % 5 == 0 || step == steps as i32 {
+                    let hacc = ho_acc(&a, &b)?;
+                    if hacc > best.0 {
+                        best = (hacc, a.clone(), b.clone());
+                    }
+                    eprintln!(
+                        "[c4-train] step {step}: CE={:.4} heldout_acc={hacc:.3} (best {:.3}, base {base_ho_acc:.3})",
+                        loss[0].item::<f32>(),
+                        best.0
+                    );
+                }
+            }
+            // Install the best-held-out checkpoint only if it beats the
+            // no-adapter baseline; otherwise leave the adapter UNINSTALLED
+            // (identity) so a non-generalizing fit can't hurt serving.
+            let best_acc = best.0;
+            if best_acc > base_ho_acc + 1e-4 {
+                if let Ok(mut slot) = self.mtp_c4_lmhead.lock() {
+                    *slot = Some((best.1, best.2));
+                }
+                eprintln!(
+                    "[c4-train] installed best checkpoint: heldout_acc {best_acc:.3} > base {base_ho_acc:.3} (rank={rank}, n_tr={n_tr}, n_ho={n_ho}, vocab={vocab})"
+                );
+            } else {
+                eprintln!(
+                    "[c4-train] NOT installed: best heldout_acc {best_acc:.3} did not beat base {base_ho_acc:.3} — adapter does not generalize (rank={rank}, n={n})"
+                );
+            }
+            Ok(())
+        }
+
+        /// Pull a `[1, 1, hidden]` (or `[1, hidden]`) array to a host `Vec<f32>`.
+        fn hidden_to_host_f32(&self, h: &Array) -> Result<Vec<f32>> {
+            let f = h
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .context("mtp corrector: cast hidden to f32 failed")?;
+            f.eval().context("mtp corrector: eval hidden failed")?;
+            Ok(f.as_slice::<f32>().to_vec())
         }
 
         /// Build a `Qwen35MtpLinear` view of the trunk's lm_head — direct
@@ -2671,6 +3285,7 @@ mod imp {
             let raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
+                self.embed_biases.as_ref(),
                 &ids_arr,
                 self.embed_group,
                 self.embed_bits,
@@ -2681,6 +3296,23 @@ mod imp {
             let hidden = self.text_config().hidden_size as i32;
             mlx_rs::ops::reshape(&f32, &[1, 1, hidden])
                 .context("mtp_step: embed reshape [1, 1, hidden] failed")
+        }
+
+        /// Pull one position's logit row from a `[1, L, vocab]` array into a
+        /// host `Vec<f32>`. Used by the MTP sampling path to build the
+        /// target/draft distributions for Leviathan rejection acceptance.
+        /// `pos` is along axis 1 (`-1` = last).
+        fn logits_row_to_cpu_f32(&self, logits: &Array, pos: i32) -> Result<Vec<f32>> {
+            let l = logits.shape()[1];
+            let p = if pos < 0 { l + pos } else { pos };
+            let idx = Array::from_slice(&[p], &[1]);
+            let row = logits
+                .take_axis(&idx, 1)
+                .context("mtp sampling: take_axis(pos) failed")?
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .context("mtp sampling: cast row to f32 failed")?;
+            row.eval().context("mtp sampling: eval row failed")?;
+            Ok(row.as_slice::<f32>().to_vec())
         }
 
         /// One MTP speculative step.
@@ -2726,9 +3358,49 @@ mod imp {
             mtp_kv: &mut NativeKvCache,
             committed_token: u32,
             n_draft: usize,
+            carried_hidden: Option<Array>,
+            temperature: f32,
+            top_p: f32,
         ) -> Result<MtpStepOutput> {
             if n_draft == 0 {
                 return Err(anyhow!("mtp_step: n_draft must be >= 1"));
+            }
+            // Sampling config for Leviathan/Chen rejection acceptance. When
+            // `temperature <= 0` the whole path stays GREEDY (argmax exact
+            // match) — byte-identical to the pre-sampling behavior. With
+            // `temperature > 0`, drafts are SAMPLED from `q` and accepted via
+            // `min(1, p/q)` + residual, so accept rate rises toward the
+            // sampling regime (MTPLX ~70% @ temp 0.6) instead of greedy ~57%.
+            // Penalties are disabled here (per-position window consistency
+            // between p and q is hard to guarantee); temp/top_p/top_k drive it.
+            let cfg = SamplingConfig {
+                temperature,
+                top_p: if top_p > 0.0 { top_p } else { 1.0 },
+                ..SamplingConfig::default()
+            };
+            // 1-forward restructure (MTPLX-style): drop the per-cycle Step-A
+            // trunk forward by carrying the verify hidden across cycles. The
+            // committed/correction token is verified as `verify_in[0]` instead
+            // of forwarded separately, halving trunk forwards per cycle.
+            //
+            // Accept-gated: 1-forward WINS in the high-accept regime and LOSES
+            // below it (removing Step A also removes a guaranteed token). A/B:
+            // dense 9B (acc 0.63) 32.8->38.1 tok/s +16%, 27B (0.69) 14.8->17.4
+            // +18%; MoE 35B-A3B (0.56) 72.5->69.9 -4%. So DEFAULT 1-forward ON
+            // for Dense models, OFF for MoE. `LUMEN_MTP_ONE_FORWARD=0/1` overrides.
+            let one_forward = match std::env::var("LUMEN_MTP_ONE_FORWARD") {
+                Ok(v) => v != "0",
+                Err(_) => self.config.text_config.mlp_kind() == MlpKind::Dense,
+            };
+            if one_forward {
+                return self.mtp_step_one_forward(
+                    trunk_cache,
+                    mtp_kv,
+                    committed_token,
+                    n_draft,
+                    carried_hidden,
+                    &cfg,
+                );
             }
             let block = self
                 .mtp
@@ -2736,6 +3408,11 @@ mod imp {
                 .ok_or_else(|| anyhow!("mtp_step: MTP not enabled (call try_enable_mtp first)"))?;
 
             let m_pre = trunk_cache.full_attn_offset();
+
+            // Sampling vs greedy. Deterministic per-step RNG (seed + cache
+            // offset) so the same prompt reproduces the same draws.
+            let sampling = cfg.temperature > 0.0;
+            let mut rng = Xorshift64::new(cfg.seed.wrapping_add(m_pre as u64).wrapping_add(0xA5));
 
             // Reset the MTP block's own KV cache — every mtp_step is a fresh
             // K-step extrapolation. Cross-call attention context lives in the
@@ -2752,17 +3429,64 @@ mod imp {
             let trunk_h = self
                 .take_captured_h()
                 .ok_or_else(|| anyhow!("mtp_step: Step A failed to capture trunk last hidden"))?;
-            let next_token = self
-                .argmax_last_token(&logits_a)
-                .context("mtp_step: Step A argmax next_token")?;
+            // The MTP head was trained to consume the POST-final-norm trunk
+            // hidden (MTPLX reference defaults hidden_variant="post_norm":
+            // hidden = inner.norm(hidden_states)). The capture stashes the
+            // PRE-final-norm residual, so apply the trunk final norm here to
+            // match the head's training distribution. Gated for A/B.
+            let trunk_h = if std::env::var("LUMEN_MTP_POSTNORM_H")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                let eps = self.text_config().rms_norm_eps;
+                rms_norm(&trunk_h, &self.final_norm_weight, eps)
+                    .context("mtp_step: post-final-norm trunk_h")?
+            } else {
+                trunk_h
+            };
+            // `next_token` is the trunk's guaranteed token. Greedy: argmax.
+            // Sampling: a genuine sample from the trunk distribution, so the
+            // committed stream is a valid sample at temperature T.
+            let next_token = if sampling {
+                let mut row = self.logits_row_to_cpu_f32(&logits_a, -1)?;
+                let p = sampling_distribution(&mut row, &[], &cfg);
+                sample_distribution(&p, &mut rng)
+            } else {
+                self.argmax_last_token(&logits_a)
+                    .context("mtp_step: Step A argmax next_token")?
+            };
             // trunk_cache offset is now M+1.
 
             // === Step B: drafter loop ===
+            // Greedy: pick the draft via argmax. Sampling: draw the draft from
+            // its distribution `q` and STASH `q` (Leviathan acceptance needs
+            // q[draft] and the residual (p-q)+ at the reject position).
             let trunk_final_norm_w = self.final_norm_weight.clone();
             let trunk_lm_head = self.trunk_lm_head_view();
+            // Drift-corrector / calibration plumbing. Corrector: apply to the
+            // chained hidden (host round-trip) before feeding the next draft
+            // step. Calib: stash the RAW per-depth chained hidden to pair with
+            // the verify-true hidden after Step C.
+            let corr_active = self.mtp_corrector_active();
+            let proc_active = self.mtp_procrustes_active();
+            let calib_active = self.mtp_calib_active();
+            let proc_calib_active = self.mtp_proc_calib_active();
+            let c4_calib_active = self.mtp_c4_calib_active();
+            let c4_active = self.mtp_c4_active();
+            // Pull the raw chained hidden to host when ANY corrector/calib
+            // (diagonal / Procrustes / C4) needs it.
+            let need_host = calib_active || proc_calib_active || c4_calib_active;
+            let apply_corr = corr_active || proc_active;
+            let hidden_dim = self.text_config().hidden_size as i32;
+            let mut draft_hiddens_host: Vec<Vec<f32>> = Vec::new();
             let mut last_h = trunk_h;
             let mut last_tok = next_token;
             let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
+            let mut draft_qs: Vec<Vec<f32>> = if sampling {
+                Vec::with_capacity(n_draft)
+            } else {
+                Vec::new()
+            };
             for k in 0..n_draft {
                 let embeds = self
                     .embed_lookup_single(last_tok)
@@ -2777,11 +3501,54 @@ mod imp {
                         &trunk_lm_head,
                     )
                     .with_context(|| format!("mtp_step: Step B block.forward k={k}"))?;
-                let draft_tok = self
-                    .argmax_last_token(&logits_b)
-                    .with_context(|| format!("mtp_step: Step B argmax k={k}"))?;
+                // C4 lm_head LoRA: correct the draft logits using norm_out
+                // (= the returned chained hidden = the lm_head input). Only
+                // affects which token is DRAFTED; the hidden chain is unchanged.
+                let logits_b = if c4_active {
+                    self.apply_c4_lmhead(&logits_b, &new_h)
+                        .with_context(|| format!("mtp_step: Step B c4 apply k={k}"))?
+                } else {
+                    logits_b
+                };
+                let draft_tok = if sampling {
+                    let mut row = self.logits_row_to_cpu_f32(&logits_b, -1)?;
+                    let q = sampling_distribution(&mut row, &[], &cfg);
+                    let d = sample_distribution(&q, &mut rng);
+                    draft_qs.push(q);
+                    d
+                } else {
+                    self.argmax_last_token(&logits_b)
+                        .with_context(|| format!("mtp_step: Step B argmax k={k}"))?
+                };
                 drafts.push(draft_tok);
-                last_h = new_h;
+                if need_host {
+                    // Raw (uncorrected) chained hidden at depth k+1 → x.
+                    draft_hiddens_host.push(self.hidden_to_host_f32(&new_h)?);
+                }
+                // Chain the hidden, applying the corrector (depth k+1) so the
+                // next draft step sees an in-distribution hidden. Procrustes
+                // takes precedence over the diagonal when both are installed.
+                last_h = if apply_corr {
+                    let mut hv = if need_host {
+                        draft_hiddens_host[draft_hiddens_host.len() - 1].clone()
+                    } else {
+                        self.hidden_to_host_f32(&new_h)?
+                    };
+                    if proc_active {
+                        if let Ok(slot) = self.mtp_procrustes.lock() {
+                            if let Some(c) = slot.as_ref() {
+                                c.apply(&mut hv, k + 1);
+                            }
+                        }
+                    } else if let Ok(slot) = self.mtp_corrector.lock() {
+                        if let Some(c) = slot.as_ref() {
+                            c.apply(&mut hv, k + 1);
+                        }
+                    }
+                    Array::from_slice(&hv, &[1, 1, hidden_dim])
+                } else {
+                    new_h
+                };
                 last_tok = draft_tok;
             }
             // mtp_kv offset is now n_draft (drafter wrote one slot per draft).
@@ -2793,44 +3560,154 @@ mod imp {
             let snap = PromptCacheSnapshot::capture_shallow(trunk_cache, m_pre + 1)
                 .context("mtp_step: snapshot pre-Step-C failed")?;
 
+            // Capture-commit: O(1) rollback via per-position SSM/conv capture
+            // during verify, replacing the O(D) full-trunk replay. Default ON;
+            // A/B validated identical accept (28/50) vs replay, speedup
+            // 1.000->1.015x. Falls back to snapshot+replay on commit error
+            // (e.g. TurboQuant-KV layers). Disable with LUMEN_MTP_CAPTURE_COMMIT=0.
+            let use_capture = std::env::var("LUMEN_MTP_CAPTURE_COMMIT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
             // === Step C: trunk verify [next_token, draft_0..draft_{K-1}] ===
             let mut verify_in: Vec<u32> = Vec::with_capacity(1 + n_draft);
             verify_in.push(next_token);
             verify_in.extend_from_slice(&drafts);
+            if use_capture {
+                self.set_ssm_capture_enabled(true);
+            }
+            // Calibration: capture the trunk's true per-position hidden so we
+            // can pair verify_hidden[k] (target) with draft_hiddens_host[k] (x).
+            if calib_active || proc_calib_active {
+                self.set_mtp_capture_enabled(true);
+            }
             let verify_logits = self
                 .forward(&verify_in, trunk_cache)
                 .context("mtp_step: Step C trunk verify forward")?;
+            if use_capture {
+                self.set_ssm_capture_enabled(false);
+            }
+            if calib_active || proc_calib_active {
+                self.set_mtp_capture_enabled(false);
+                if let Some(vh) = self.take_captured_h() {
+                    // vh = [1, K+1, hidden]; verify position k = true hidden at
+                    // the position draft_hiddens_host[k] estimates. Pair them.
+                    let n_pairs = n_draft.min(draft_hiddens_host.len());
+                    let ys: Vec<Option<Vec<f32>>> = (0..n_pairs)
+                        .map(|k| self.logits_row_to_cpu_f32(&vh, k as i32).ok())
+                        .collect();
+                    if calib_active {
+                        if let Ok(mut slot) = self.mtp_calib.lock() {
+                            if let Some(stats) = slot.as_mut() {
+                                for k in 0..n_pairs {
+                                    if let Some(y) = &ys[k] {
+                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if proc_calib_active {
+                        if let Ok(mut slot) = self.mtp_proc_calib.lock() {
+                            if let Some(stats) = slot.as_mut() {
+                                for k in 0..n_pairs {
+                                    if let Some(y) = &ys[k] {
+                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let captures = if use_capture {
+                self.take_ssm_captures()
+            } else {
+                Vec::new()
+            };
             // trunk_cache offset is now M + 1 + (K + 1) = M + K + 2.
 
             // === Step D: accept-reject ===
-            // Argmax along the vocab (last) axis → [1, K+1] u32 row of
-            // trunk's true predictions per verify position.
-            let argmax_per_pos =
-                mlx_rs::ops::indexing::argmax_axis(&verify_logits, -1, /* keep_dims */ false)
-                    .context("mtp_step: Step D argmax")?
-                    .as_dtype(mlx_rs::Dtype::Int32)
-                    .context("mtp_step: Step D cast to Int32")?;
-            argmax_per_pos
-                .eval()
-                .context("mtp_step: Step D eval argmax")?;
-            let preds_i32: &[i32] = argmax_per_pos.as_slice();
-            let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
-            if std::env::var("LUMEN_MTP_DEBUG")
+            // Two regimes producing (n_accepted, correction):
+            //   greedy   — argmax per verify position; accept while it equals
+            //              the draft; correction = trunk argmax at the first
+            //              non-accepted position.
+            //   sampling — Leviathan/Chen: accept draft_k with prob
+            //              min(1, p_k/q_k); on reject the correction is sampled
+            //              from the residual (p-q)+; on full accept the bonus is
+            //              sampled from p at the last verify position. p_k is the
+            //              verify distribution at position k (target for draft_k).
+            let debug = std::env::var("LUMEN_MTP_DEBUG")
                 .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                eprintln!(
-                    "[qwen3_5 mtp_step m_pre={m_pre}] next_token={next_token} drafts={drafts:?} preds={preds:?}"
-                );
-            }
-            let mut n_accepted = 0usize;
-            for k in 0..n_draft {
-                if preds[k] == drafts[k] {
-                    n_accepted += 1;
-                } else {
-                    break;
+                .unwrap_or(false);
+            let (n_accepted, correction) = if sampling {
+                let mut acc = 0usize;
+                let corr;
+                loop {
+                    let mut prow = self.logits_row_to_cpu_f32(&verify_logits, acc as i32)?;
+                    let p = sampling_distribution(&mut prow, &[], &cfg);
+                    if acc == n_draft {
+                        // All drafts accepted → bonus sampled from p at the
+                        // final verify position (index n_draft).
+                        corr = sample_distribution(&p, &mut rng);
+                        break;
+                    }
+                    let out = speculative_accept(&p, &draft_qs[acc], drafts[acc], &mut rng);
+                    if out.accepted {
+                        acc += 1;
+                    } else {
+                        corr = out.token;
+                        break;
+                    }
                 }
-            }
+                if debug {
+                    eprintln!(
+                        "[qwen3_5 mtp_step(sample) m_pre={m_pre}] next={next_token} drafts={drafts:?} n_acc={acc} corr={corr}"
+                    );
+                }
+                (acc, corr)
+            } else {
+                let argmax_per_pos = mlx_rs::ops::indexing::argmax_axis(
+                    &verify_logits,
+                    -1,
+                    /* keep_dims */ false,
+                )
+                .context("mtp_step: Step D argmax")?
+                .as_dtype(mlx_rs::Dtype::Int32)
+                .context("mtp_step: Step D cast to Int32")?;
+                argmax_per_pos
+                    .eval()
+                    .context("mtp_step: Step D eval argmax")?;
+                let preds_i32: &[i32] = argmax_per_pos.as_slice();
+                let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
+                if debug {
+                    eprintln!(
+                        "[qwen3_5 mtp_step m_pre={m_pre}] next_token={next_token} drafts={drafts:?} preds={preds:?}"
+                    );
+                }
+                // C4 calib: pair each draft's lm_head input (norm_out =
+                // draft_hiddens_host[k]) with the trunk's correct token
+                // (preds[k]). Trains the lm_head LoRA to re-aim the draft logits.
+                if c4_calib_active {
+                    if let Ok(mut slot) = self.mtp_c4_calib.lock() {
+                        if let Some((xs, tgts)) = slot.as_mut() {
+                            for k in 0..n_draft.min(draft_hiddens_host.len()) {
+                                xs.push(draft_hiddens_host[k].clone());
+                                tgts.push(preds[k]);
+                            }
+                        }
+                    }
+                }
+                let mut acc = 0usize;
+                for k in 0..n_draft {
+                    if preds[k] == drafts[k] {
+                        acc += 1;
+                    } else {
+                        break;
+                    }
+                }
+                (acc, preds[acc])
+            };
 
             // === Step E: rollback trunk_cache on partial reject ===
             //
@@ -2847,30 +3724,327 @@ mod imp {
             let target_offset = m_pre + 1 + 1 + n_accepted; // committed + next + accepted drafts
             let cur_offset = trunk_cache.full_attn_offset();
             if cur_offset > target_offset {
-                snap.restore_into(trunk_cache)
-                    .context("mtp_step: Step E snapshot restore failed")?;
-                // After restore, trunk_cache.full_attn_offset() == m_pre + 1.
-                // Replay `[next_token, accepted_drafts..]` (length 1 + n_accepted)
-                // to advance to target_offset = m_pre + 1 + 1 + n_accepted.
-                let mut replay: Vec<u32> = Vec::with_capacity(1 + n_accepted);
-                replay.push(next_token);
-                replay.extend_from_slice(&drafts[..n_accepted]);
-                self.forward_with_opts(&replay, trunk_cache, /* last_only */ true)
-                    .context("mtp_step: Step E replay forward failed")?;
+                let committed_by_capture = if use_capture && !captures.is_empty() {
+                    // O(1) capture-commit: index-select the accepted-prefix
+                    // SSM+conv state per linear layer; truncate full-attn layers.
+                    // keep = verify tokens to retain = 1 (next_token) + accepted.
+                    let keep = 1 + n_accepted;
+                    match self.commit_captured(trunk_cache, &captures, keep, target_offset) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            // Cache may be partially modified; restore_into below
+                            // rebuilds from the pre-verify snapshot, then replay.
+                            eprintln!("[mtp] capture-commit fell back to replay: {e}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if !committed_by_capture {
+                    snap.restore_into(trunk_cache)
+                        .context("mtp_step: Step E snapshot restore failed")?;
+                    // After restore, trunk_cache.full_attn_offset() == m_pre + 1.
+                    // Replay `[next_token, accepted_drafts..]` (length 1 + n_accepted)
+                    // to advance to target_offset = m_pre + 1 + 1 + n_accepted.
+                    let mut replay: Vec<u32> = Vec::with_capacity(1 + n_accepted);
+                    replay.push(next_token);
+                    replay.extend_from_slice(&drafts[..n_accepted]);
+                    self.forward_with_opts(&replay, trunk_cache, /* last_only */ true)
+                        .context("mtp_step: Step E replay forward failed")?;
+                }
             }
 
-            // Commit list — last element is `preds[n_accepted]`, the
-            // correction/bonus token NOT in the cache. Caller threads it
-            // into the next `mtp_step` call as `committed_token`.
+            // Commit list — last element is the `correction`/bonus token NOT in
+            // the cache. Caller threads it into the next `mtp_step` call as
+            // `committed_token`.
             let mut committed = Vec::with_capacity(1 + n_accepted + 1);
             committed.push(next_token);
             committed.extend_from_slice(&drafts[..n_accepted]);
-            committed.push(preds[n_accepted]);
+            committed.push(correction);
 
             Ok(MtpStepOutput {
                 committed,
                 n_attempted: n_draft,
                 n_accepted,
+                carried_hidden: None,
+            })
+        }
+
+        /// One MTP speculative step, MTPLX-style **single trunk forward** per
+        /// cycle (`LUMEN_MTP_ONE_FORWARD=1`).
+        ///
+        /// The 2-forward `mtp_step` pays a Step-A trunk forward each cycle just
+        /// to (a) write `committed_token` into the cache and (b) capture its
+        /// hidden to seed the drafter. This path removes (a)+(b) for steady
+        /// cycles: the committed/correction token is verified as
+        /// `verify_in[0]` (so it lands in the cache for free), and the seed
+        /// hidden is *carried* from the previous cycle's verify forward
+        /// (`verify_hidden[n_accepted]` = the predecessor hidden of the
+        /// correction). Net: 1 trunk forward/cycle instead of 2.
+        ///
+        /// Bootstrap (`carried_hidden == None`, cycle 0): no carried hidden
+        /// exists yet, so we run a one-time Step-A forward to seed it — making
+        /// cycle 0 identical to the 2-forward path. Every subsequent cycle is
+        /// single-forward.
+        ///
+        /// State contract (steady): `trunk_cache` at offset `M`,
+        /// `committed_token` NOT in cache, `carried_hidden` = its predecessor
+        /// hidden. Returns `committed = [accepted_drafts.., correction]`
+        /// (the committed/lead token was already emitted last cycle, so it is
+        /// NOT re-emitted) and `carried_hidden = Some(verify_hidden[n_accepted])`.
+        fn mtp_step_one_forward(
+            &self,
+            trunk_cache: &mut NativePromptCache,
+            mtp_kv: &mut NativeKvCache,
+            committed_token: u32,
+            n_draft: usize,
+            carried_hidden: Option<Array>,
+            cfg: &SamplingConfig,
+        ) -> Result<MtpStepOutput> {
+            let block = self
+                .mtp
+                .as_ref()
+                .ok_or_else(|| anyhow!("mtp_step1: MTP not enabled (call try_enable_mtp first)"))?;
+
+            // Sampling vs greedy (see 2-forward `mtp_step` for the rationale).
+            let sampling = cfg.temperature > 0.0;
+            let entry_off = trunk_cache.full_attn_offset();
+            let mut rng =
+                Xorshift64::new(cfg.seed.wrapping_add(entry_off as u64).wrapping_add(0xA5));
+
+            // Fresh K-step extrapolation each cycle — cross-cycle context lives
+            // in the trunk cache; the drafter only needs intra-step attention.
+            mtp_kv.clear();
+
+            // Resolve the drafter seed: (lead_token, h_draft, emit_lead).
+            //   - lead_token: the guaranteed-correct token that opens `verify_in`
+            //     and gets written to the cache by the verify forward.
+            //   - h_draft: trunk pre-final-norm hidden to draft FROM (predecessor
+            //     of lead_token).
+            //   - emit_lead: whether lead_token is new output this cycle
+            //     (bootstrap: next_token is new; steady: committed_token was
+            //     already emitted last cycle as that cycle's correction).
+            let (lead_token, h_draft, emit_lead) = match carried_hidden {
+                None => {
+                    // BOOTSTRAP (cycle 0): seed the carry with a Step-A forward.
+                    self.set_mtp_capture_enabled(true);
+                    let logits_a = self
+                        .forward_with_opts(
+                            &[committed_token],
+                            trunk_cache,
+                            /* last_only */ true,
+                        )
+                        .context("mtp_step1: bootstrap Step-A forward")?;
+                    self.set_mtp_capture_enabled(false);
+                    let h0 = self
+                        .take_captured_h()
+                        .ok_or_else(|| anyhow!("mtp_step1: bootstrap capture failed"))?;
+                    let next_token = if sampling {
+                        let mut row = self.logits_row_to_cpu_f32(&logits_a, -1)?;
+                        let p = sampling_distribution(&mut row, &[], cfg);
+                        sample_distribution(&p, &mut rng)
+                    } else {
+                        self.argmax_last_token(&logits_a)
+                            .context("mtp_step1: bootstrap argmax")?
+                    };
+                    // cache: M -> M+1 (committed_token now at M).
+                    (next_token, h0, true)
+                }
+                Some(h) => {
+                    // STEADY: committed_token = previous cycle's correction
+                    // (already emitted). It enters the cache via verify_in[0];
+                    // h is its predecessor hidden, carried from the prior verify.
+                    (committed_token, h, false)
+                }
+            };
+
+            // Offset where the verify forward will write `lead_token`.
+            let verify_base = trunk_cache.full_attn_offset();
+
+            // === Drafter loop: extrapolate K tokens from (lead_token, h_draft) ===
+            let trunk_final_norm_w = self.final_norm_weight.clone();
+            let trunk_lm_head = self.trunk_lm_head_view();
+            let mut last_h = h_draft;
+            let mut last_tok = lead_token;
+            let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
+            let mut draft_qs: Vec<Vec<f32>> = if sampling {
+                Vec::with_capacity(n_draft)
+            } else {
+                Vec::new()
+            };
+            for k in 0..n_draft {
+                let embeds = self
+                    .embed_lookup_single(last_tok)
+                    .with_context(|| format!("mtp_step1: drafter embed k={k}"))?;
+                let (logits_b, new_h) = block
+                    .forward(
+                        &embeds,
+                        &last_h,
+                        mtp_kv,
+                        /* causal */ false,
+                        &trunk_final_norm_w,
+                        &trunk_lm_head,
+                    )
+                    .with_context(|| format!("mtp_step1: drafter block.forward k={k}"))?;
+                let draft_tok = if sampling {
+                    let mut row = self.logits_row_to_cpu_f32(&logits_b, -1)?;
+                    let q = sampling_distribution(&mut row, &[], cfg);
+                    let d = sample_distribution(&q, &mut rng);
+                    draft_qs.push(q);
+                    d
+                } else {
+                    self.argmax_last_token(&logits_b)
+                        .with_context(|| format!("mtp_step1: drafter argmax k={k}"))?
+                };
+                drafts.push(draft_tok);
+                last_h = new_h;
+                last_tok = draft_tok;
+            }
+
+            // Snapshot pre-verify for the capture-commit replay fallback.
+            let snap = PromptCacheSnapshot::capture_shallow(trunk_cache, verify_base)
+                .context("mtp_step1: snapshot pre-verify failed")?;
+            let use_capture = std::env::var("LUMEN_MTP_CAPTURE_COMMIT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
+            // === Verify [lead_token, drafts]; capture ALL-position trunk hidden
+            //     (for the next cycle's carry) + per-position SSM state. ===
+            let mut verify_in: Vec<u32> = Vec::with_capacity(1 + n_draft);
+            verify_in.push(lead_token);
+            verify_in.extend_from_slice(&drafts);
+            if use_capture {
+                self.set_ssm_capture_enabled(true);
+            }
+            // Full (non-last_only) forward stashes hidden BEFORE the lm_head
+            // slice, so the capture slot holds [1, K+1, hidden].
+            self.set_mtp_capture_enabled(true);
+            let verify_logits = self
+                .forward(&verify_in, trunk_cache)
+                .context("mtp_step1: verify forward")?;
+            self.set_mtp_capture_enabled(false);
+            if use_capture {
+                self.set_ssm_capture_enabled(false);
+            }
+            let verify_hidden_all = self
+                .take_captured_h()
+                .ok_or_else(|| anyhow!("mtp_step1: verify hidden capture failed"))?;
+            let captures = if use_capture {
+                self.take_ssm_captures()
+            } else {
+                Vec::new()
+            };
+            // cache: verify_base -> verify_base + (K+1).
+
+            // === Accept-reject === (greedy exact-match or Leviathan sampling;
+            // see 2-forward `mtp_step` Step D for the regime details).
+            let debug = std::env::var("LUMEN_MTP_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let (n_accepted, correction) = if sampling {
+                let mut acc = 0usize;
+                let corr;
+                loop {
+                    let mut prow = self.logits_row_to_cpu_f32(&verify_logits, acc as i32)?;
+                    let p = sampling_distribution(&mut prow, &[], cfg);
+                    if acc == n_draft {
+                        corr = sample_distribution(&p, &mut rng);
+                        break;
+                    }
+                    let out = speculative_accept(&p, &draft_qs[acc], drafts[acc], &mut rng);
+                    if out.accepted {
+                        acc += 1;
+                    } else {
+                        corr = out.token;
+                        break;
+                    }
+                }
+                if debug {
+                    eprintln!(
+                        "[qwen3_5 mtp_step1(sample) base={verify_base} boot={emit_lead}] lead={lead_token} drafts={drafts:?} n_acc={acc} corr={corr}"
+                    );
+                }
+                (acc, corr)
+            } else {
+                let argmax_per_pos = mlx_rs::ops::indexing::argmax_axis(
+                    &verify_logits,
+                    -1,
+                    /* keep_dims */ false,
+                )
+                .context("mtp_step1: accept argmax")?
+                .as_dtype(mlx_rs::Dtype::Int32)
+                .context("mtp_step1: accept cast i32")?;
+                argmax_per_pos.eval().context("mtp_step1: accept eval")?;
+                let preds_i32: &[i32] = argmax_per_pos.as_slice();
+                let preds: Vec<u32> = preds_i32.iter().map(|x| *x as u32).collect();
+                let mut acc = 0usize;
+                for k in 0..n_draft {
+                    if preds[k] == drafts[k] {
+                        acc += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if debug {
+                    eprintln!(
+                        "[qwen3_5 mtp_step1 base={verify_base} boot={emit_lead}] lead={lead_token} drafts={drafts:?} preds={preds:?} n_acc={acc}"
+                    );
+                }
+                (acc, preds[acc])
+            };
+
+            // Next cycle's carry: trunk pre-final-norm hidden at verify position
+            // n_accepted = predecessor hidden of the correction token. Same
+            // capture site/distribution as the bootstrap's h_draft.
+            let idx = Array::from_slice(&[n_accepted as i32], &[1]);
+            let next_carried = verify_hidden_all
+                .take_axis(&idx, 1)
+                .context("mtp_step1: select verify_hidden[n_accepted]")?;
+
+            // === Rollback to keep [lead_token, accepted_drafts] ===
+            let target_offset = verify_base + 1 + n_accepted;
+            let cur_offset = trunk_cache.full_attn_offset();
+            if cur_offset > target_offset {
+                let committed_by_capture = if use_capture && !captures.is_empty() {
+                    let keep = 1 + n_accepted;
+                    match self.commit_captured(trunk_cache, &captures, keep, target_offset) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("[mtp] capture-commit fell back to replay: {e}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if !committed_by_capture {
+                    snap.restore_into(trunk_cache)
+                        .context("mtp_step1: snapshot restore failed")?;
+                    let mut replay: Vec<u32> = Vec::with_capacity(1 + n_accepted);
+                    replay.push(lead_token);
+                    replay.extend_from_slice(&drafts[..n_accepted]);
+                    self.forward_with_opts(&replay, trunk_cache, /* last_only */ true)
+                        .context("mtp_step1: replay forward failed")?;
+                }
+            }
+
+            // === Commit output ===
+            // Steady: lead_token was already emitted last cycle (it was that
+            // cycle's correction) → emit only [accepted_drafts.., correction].
+            // Bootstrap: lead_token (next_token) is new → include it.
+            let mut committed = Vec::with_capacity(2 + n_accepted);
+            if emit_lead {
+                committed.push(lead_token);
+            }
+            committed.extend_from_slice(&drafts[..n_accepted]);
+            committed.push(correction);
+
+            Ok(MtpStepOutput {
+                committed,
+                n_attempted: n_draft,
+                n_accepted,
+                carried_hidden: Some(next_carried),
             })
         }
 

@@ -47,6 +47,7 @@ mod imp {
     pub fn quantized_embedding_lookup_with_mode(
         packed: &Array,
         scales: &Array,
+        biases: Option<&Array>,
         token_ids: &Array,
         group_size: i32,
         bits: i32,
@@ -54,14 +55,22 @@ mod imp {
     ) -> Result<Array> {
         let selected_packed = packed
             .take_axis(token_ids, 0)
-            .context("mlx-rs take_axis (mxfp4 packed rows) failed")?;
+            .context("mlx-rs take_axis (packed rows) failed")?;
         let selected_scales = scales
             .take_axis(token_ids, 0)
-            .context("mlx-rs take_axis (mxfp4 scales rows) failed")?;
+            .context("mlx-rs take_axis (scales rows) failed")?;
+        // Affine dequant needs per-row biases (3-tensor); mxfp4/nvfp4 pass None.
+        let selected_biases = match biases {
+            Some(b) => Some(
+                b.take_axis(token_ids, 0)
+                    .context("mlx-rs take_axis (biases rows) failed")?,
+            ),
+            None => None,
+        };
         dequantize_with_mode(
             &selected_packed,
             &selected_scales,
-            None,
+            selected_biases.as_ref(),
             group_size,
             bits,
             mode,
