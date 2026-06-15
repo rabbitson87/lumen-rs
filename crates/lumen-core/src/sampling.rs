@@ -350,6 +350,180 @@ pub fn sample_from_logits(
     sample_top_p(logits, cfg.top_p, rng)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Speculative (Leviathan/Chen) rejection-sampling acceptance.
+//
+// Self-speculative decoding (MTP, draft-model, n-gram) proposes draft tokens
+// and verifies them in one batched forward. The acceptance rule that keeps the
+// output distribution EXACTLY equal to plain sampling at the given temperature
+// is the Leviathan/Chen theorem:
+//
+//   - the draft token `d` must be SAMPLED from the draft distribution `q`
+//     (NOT argmax — argmax makes q one-hot and accept degenerates to
+//     exact-match, i.e. greedy);
+//   - accept `d` with probability `min(1, p[d] / q[d])` where `p` is the
+//     target (trunk-verify) distribution;
+//   - on reject, emit a correction sampled from the residual `(p - q)_+`
+//     renormalized;
+//   - after the last accepted position, the bonus token is sampled from `p`.
+//
+// `p` and `q` MUST be the same post-processed sampling distribution (same
+// temperature / top-k / top-p), or the ratio is meaningless. Mirrors MTPLX
+// `mtplx/sampling.py` (`acceptance_probability`, `residual_distribution`).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build the model's true sampling distribution from raw logits: applies the
+/// full pipeline (penalty → top-k → min-p → temperature → softmax → top-p
+/// nucleus mask) and returns a normalized full-vocab probability vector. Tokens
+/// removed by top-k / top-p are exactly `0.0`. Use this for BOTH the target `p`
+/// (verify logits) and the draft `q` (drafter logits) so the speculative ratio
+/// is well-defined. `recent` feeds the repeat/presence/frequency penalties;
+/// pass an empty slice to disable them (recommended for spec drafts, where a
+/// per-position penalty window is hard to keep consistent between p and q).
+pub fn sampling_distribution(logits: &mut [f32], recent: &[u32], cfg: &SamplingConfig) -> Vec<f32> {
+    let n = cfg.repeat_penalty_last_n.min(recent.len());
+    if n > 0 {
+        let window = &recent[recent.len() - n..];
+        if cfg.repeat_penalty != 1.0 {
+            apply_repeat_penalty(logits, window, cfg.repeat_penalty);
+        }
+        if cfg.presence_penalty != 0.0 || cfg.frequency_penalty != 0.0 {
+            apply_presence_frequency_penalty(
+                logits,
+                window,
+                cfg.presence_penalty,
+                cfg.frequency_penalty,
+            );
+        }
+    }
+    crate::dry::apply_dry_penalty(logits, recent, &cfg.dry);
+    apply_top_k(logits, cfg.top_k);
+    apply_min_p(logits, cfg.min_p);
+    let t = cfg.temperature.max(1e-5);
+    if (t - 1.0).abs() > 1e-6 {
+        let inv = 1.0 / t;
+        for v in logits.iter_mut() {
+            *v *= inv;
+        }
+    }
+    softmax_inplace(logits);
+    // Top-p nucleus as a MASK (zero the tail, renormalize) rather than a draw,
+    // so the returned vector is the exact distribution sampled from.
+    let top_p = cfg.top_p;
+    if top_p < 1.0 && top_p > 0.0 {
+        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+        idx.sort_unstable_by(|&a, &b| {
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cum = 0.0_f32;
+        let mut cutoff = idx.len();
+        for (rank, &i) in idx.iter().enumerate() {
+            cum += logits[i as usize];
+            if cum >= top_p {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        cutoff = cutoff.max(1);
+        for &i in &idx[cutoff..] {
+            logits[i as usize] = 0.0;
+        }
+        let mass: f32 = logits.iter().sum();
+        if mass > 0.0 {
+            let inv = 1.0 / mass;
+            for v in logits.iter_mut() {
+                *v *= inv;
+            }
+        }
+    }
+    logits.to_vec()
+}
+
+/// Sample an index from a probability vector that need not sum to 1
+/// (renormalizes by total mass). Falls back to argmax on degenerate (all-zero)
+/// input so it never deadlocks.
+pub fn sample_distribution(probs: &[f32], rng: &mut Xorshift64) -> u32 {
+    let mass: f32 = probs.iter().sum();
+    if !(mass > 0.0) {
+        return probs
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+    let r = rng.next_f32() * mass;
+    let mut acc = 0.0_f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if r < acc {
+            return i as u32;
+        }
+    }
+    (probs.len() - 1) as u32
+}
+
+/// Outcome of one speculative acceptance test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecAccept {
+    /// Whether the draft token was accepted.
+    pub accepted: bool,
+    /// The token to commit: the draft itself if accepted, else a correction
+    /// sampled from the residual `(p - q)_+`.
+    pub token: u32,
+}
+
+/// Leviathan/Chen single-draft acceptance: accept `draft` with probability
+/// `min(1, p[draft]/q[draft])`; on reject, return a correction sampled from the
+/// residual `(p - q)_+`. `p`/`q` must be the same post-processed distribution
+/// (see [`sampling_distribution`]). Equivalent to MTPLX `accept_or_correct`.
+pub fn speculative_accept(p: &[f32], q: &[f32], draft: u32, rng: &mut Xorshift64) -> SpecAccept {
+    let d = draft as usize;
+    let pp = p.get(d).copied().unwrap_or(0.0);
+    let qq = q.get(d).copied().unwrap_or(0.0);
+    let accept_p = if qq <= 0.0 {
+        if pp > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (pp / qq).min(1.0)
+    };
+    if rng.next_f32() <= accept_p {
+        return SpecAccept {
+            accepted: true,
+            token: draft,
+        };
+    }
+    SpecAccept {
+        accepted: false,
+        token: sample_residual(p, q, rng),
+    }
+}
+
+/// Sample from the residual distribution `(p - q)_+` renormalized. Falls back
+/// to `argmax(p)` if the residual is degenerate (e.g. q dominates p everywhere).
+pub fn sample_residual(p: &[f32], q: &[f32], rng: &mut Xorshift64) -> u32 {
+    let n = p.len();
+    let mut resid = vec![0.0_f32; n];
+    let mut mass = 0.0_f32;
+    for i in 0..n {
+        let r = p[i] - q.get(i).copied().unwrap_or(0.0);
+        if r > 0.0 {
+            resid[i] = r;
+            mass += r;
+        }
+    }
+    if !(mass > 0.0) {
+        return p
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+    sample_distribution(&resid, rng)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +652,80 @@ mod tests {
         assert!((l[2] - (-0.6)).abs() < 1e-5);
         assert_eq!(l[0], 0.0); // untouched
         assert_eq!(l[3], 0.0);
+    }
+
+    // ── Speculative rejection-sampling acceptance ──────────────────────────
+
+    #[test]
+    fn spec_accept_certain_when_p_ge_q() {
+        // p[d] >= q[d] → accept_p = 1 → always accepted regardless of rng.
+        let p = vec![0.6_f32, 0.4];
+        let q = vec![0.3_f32, 0.7];
+        let mut rng = Xorshift64::new(7);
+        for _ in 0..50 {
+            let out = speculative_accept(&p, &q, 0, &mut rng);
+            assert!(out.accepted && out.token == 0);
+        }
+    }
+
+    #[test]
+    fn spec_reject_correction_from_residual() {
+        // q wildly over-proposes token 0 (q0=0.9) vs p0=0.1 → mostly rejected;
+        // residual (p-q)+ has all mass on token 1 → correction must be 1.
+        let p = vec![0.1_f32, 0.9];
+        let q = vec![0.9_f32, 0.1];
+        let mut rng = Xorshift64::new(3);
+        let mut rejects = 0;
+        for _ in 0..200 {
+            let out = speculative_accept(&p, &q, 0, &mut rng);
+            if !out.accepted {
+                rejects += 1;
+                assert_eq!(out.token, 1, "residual mass is all on token 1");
+            }
+        }
+        assert!(rejects > 100, "p0/q0=1/9 → ~89% reject, got {rejects}/200");
+    }
+
+    /// THE invariant: committed-token distribution == target p. Monte-Carlo a
+    /// single spec position (draft sampled from q, accept min(1,p/q), else
+    /// residual) and confirm the empirical commit histogram matches p.
+    #[test]
+    fn spec_acceptance_reproduces_target_distribution() {
+        let p = vec![0.5_f32, 0.3, 0.15, 0.05];
+        let q = vec![0.1_f32, 0.2, 0.3, 0.4]; // deliberately mismatched draft
+        let n = p.len();
+        let mut rng = Xorshift64::new(0xC0FFEE);
+        let iters = 200_000;
+        let mut hist = vec![0u32; n];
+        for _ in 0..iters {
+            let draft = sample_distribution(&q, &mut rng); // draft ~ q
+            let out = speculative_accept(&p, &q, draft, &mut rng);
+            hist[out.token as usize] += 1;
+        }
+        for i in 0..n {
+            let emp = hist[i] as f32 / iters as f32;
+            assert!(
+                (emp - p[i]).abs() < 0.01,
+                "token {i}: empirical {emp:.4} vs target {:.4}",
+                p[i]
+            );
+        }
+    }
+
+    #[test]
+    fn sampling_distribution_top_p_masks_and_renormalizes() {
+        // Strong peak; top_p=0.6 should keep only the top token(s) and renorm.
+        let mut logits = vec![3.0_f32, 1.0, 0.5, 0.0];
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_p: 0.6,
+            ..SamplingConfig::default()
+        };
+        let dist = sampling_distribution(&mut logits, &[], &cfg);
+        let sum: f32 = dist.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "renormalized to 1, got {sum}");
+        // The peak (idx 0) softmax prob > 0.6 alone, so only idx 0 survives.
+        assert!(dist[0] > 0.99, "nucleus collapses to peak: {dist:?}");
+        assert_eq!(dist[3], 0.0);
     }
 }
