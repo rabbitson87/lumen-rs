@@ -120,6 +120,18 @@
   // updates without manual reassignment — fixes the case where completed
   // download lines wouldn't disappear after the 3s auto-dismiss timer.
   let downloads = new SvelteMap<string, DownloadProgress>();
+
+  // Per-repo cumulative bytes for COMPLETED shards. The live `downloads` map
+  // auto-clears finished shards after 3s (to declutter the per-file list), but
+  // the per-MODEL aggregate (`downloadByRepo`) derives from that map — so
+  // without this persistent tally the model-level total/percent would reset to
+  // just the in-flight shard each time a shard finished (looked per-file, not
+  // cumulative). `files` guards against double-counting on retry/duplicate
+  // `done` events; the whole repo entry is reset when a re-download begins.
+  let completedByRepo = new SvelteMap<
+    string,
+    { downloaded: number; total: number; files: Set<string> }
+  >();
   let statusMessage = $state<string | null>(null);
   // Optional inline action attached to the current statusMessage. Used by
   // `savedToast()` to surface a "Restart now" button on the same toast when
@@ -149,7 +161,16 @@
       string,
       { downloaded: number; total: number; active: boolean }
     >();
+    // Seed with the persistent completed-shard tallies so finished shards keep
+    // counting toward the model total even after they leave the live map.
+    for (const [repo, c] of completedByRepo) {
+      agg.set(repo, { downloaded: c.downloaded, total: c.total, active: false });
+    }
+    // Add the live (in-flight or not-yet-cleared) shards, skipping any already
+    // folded into the completed tally so a still-visible `done` shard isn't
+    // counted twice.
     for (const p of downloads.values()) {
+      if (p.done && completedByRepo.get(p.repo_id)?.files.has(p.file)) continue;
       const a = agg.get(p.repo_id) ?? { downloaded: 0, total: 0, active: false };
       a.downloaded += p.downloaded_bytes;
       a.total += p.total_bytes ?? 0;
@@ -378,27 +399,6 @@
     unlistenLog = await onLog((lines) => {
       // One reactive update per batch (not per line): trim once after appending.
       logs = [...logs, ...lines].slice(-LOG_MAX_LINES);
-    });
-    unlistenStatus = await onStatus((s) => {
-      status = s;
-    });
-    unlistenDownload = await onDownload((p) => {
-      const key = `${p.repo_id}/${p.file}`;
-      downloads.set(key, p);
-      if (p.done) {
-        api.listModels().then((m) => {
-          models = m;
-          refreshOutdated();
-        });
-        // Auto-clear completed lines after 3s so the progress panel
-        // doesn't crowd up during back-to-back downloads. Re-check `done`
-        // first so an in-flight resume on the same key (rare but possible
-        // with retry logic) doesn't drop a now-active entry.
-        setTimeout(() => {
-          if (downloads.get(key)?.done) {
-            downloads.delete(key);
-          }
-        }, 3000);
       // Watch for the server's prompt-too-large guard line and surface the
       // explainer modal. Format (engine.rs guard_prompt_fits):
       //   [mlx-guard] PROMPT_REJECTED prompt_tokens=N effective_cap=M max_ctx=K|none prompt_cap=C
@@ -414,6 +414,47 @@
           };
         }
       }
+    });
+    unlistenStatus = await onStatus((s) => {
+      status = s;
+    });
+    unlistenDownload = await onDownload((p) => {
+      const key = `${p.repo_id}/${p.file}`;
+      // A previously-completed shard downloading again means a new session for
+      // this repo (re-download / update) — drop the stale cumulative tally so
+      // the model percent restarts from zero instead of inheriting old bytes.
+      if (!p.done && completedByRepo.get(p.repo_id)?.files.has(p.file)) {
+        completedByRepo.delete(p.repo_id);
+      }
+      downloads.set(key, p);
+      if (p.done) {
+        // Fold this finished shard into the persistent per-repo tally BEFORE
+        // the live entry is auto-cleared below, so the model total stays
+        // cumulative. Guard against double-counting duplicate `done` events.
+        const c = completedByRepo.get(p.repo_id) ?? {
+          downloaded: 0,
+          total: 0,
+          files: new Set<string>(),
+        };
+        if (!c.files.has(p.file)) {
+          c.downloaded += p.downloaded_bytes;
+          c.total += p.total_bytes ?? 0;
+          c.files.add(p.file);
+          completedByRepo.set(p.repo_id, c);
+        }
+        api.listModels().then((m) => {
+          models = m;
+          refreshOutdated();
+        });
+        // Auto-clear completed lines after 3s so the progress panel
+        // doesn't crowd up during back-to-back downloads. Re-check `done`
+        // first so an in-flight resume on the same key (rare but possible
+        // with retry logic) doesn't drop a now-active entry.
+        setTimeout(() => {
+          if (downloads.get(key)?.done) {
+            downloads.delete(key);
+          }
+        }, 3000);
       } else if (p.downloaded_bytes === 0) {
         // The backend emits a `0 bytes / done:false` placeholder right before
         // each HTTP GET, then `continue`s silently on 404 (common for the
@@ -729,6 +770,16 @@
   let confirmDel = $state<{ id: string; kind: "chat" | "embedding" } | null>(null);
   let confirmDelBusy = $state(false);
 
+  // Prompt-too-large / OOM-guard modal. Populated from the server's
+  // `[mlx-guard] PROMPT_REJECTED ...` stderr line (see onLog below). The app
+  // is a control plane that tails server logs — it is not the chat client —
+  // so the trigger is the log line, not an HTTP response.
+  let oomError = $state<{
+    promptTokens: number;
+    effectiveCap: number;
+    maxCtx: number | null;
+  } | null>(null);
+
   function removeModel(id: string) {
     confirmDel = { id, kind: "chat" };
   }
@@ -770,16 +821,6 @@
 
   /// "Update" button handler for an out-of-date installed model.  Deletes
   /// the local directory + triggers a fresh download against the current
-  // Prompt-too-large / OOM-guard modal. Populated from the server's
-  // `[mlx-guard] PROMPT_REJECTED ...` stderr line (see onLog below). The app
-  // is a control plane that tails server logs — it is not the chat client —
-  // so the trigger is the log line, not an HTTP response.
-  let oomError = $state<{
-    promptTokens: number;
-    effectiveCap: number;
-    maxCtx: number | null;
-  } | null>(null);
-
   /// Hub `main` SHA.  Re-uses the existing download path so the user sees
   /// the same progress UI; SHA marker is rewritten at the end.
   async function updateOutdated(id: string) {
@@ -1715,47 +1756,6 @@
   </div>
 {/if}
 
-<!-- ── Footer panel: logs + env overrides ──────────────────────── -->
-<footer class="border-t border-border bg-panel flex flex-col fixed left-0 right-0 bottom-0 z-8">
-  {#if logsOpen}
-    <div
-      bind:this={logsContainer}
-      onscroll={onLogsScroll}
-      class="{panelScroll} mono px-4 py-1.5 pb-2.5 text-xs"
-    >
-      <!-- Virtualization via `content-visibility: auto`: the browser
-           skips layout + paint for off-screen entries even though all
-           ${LOG_MAX_LINES} live in the DOM. `contain-intrinsic-size`
-           gives a per-line estimate so scrollbar height stays stable
-           before items are first measured. Combined with the 2000-line
-           cap this keeps the panel responsive on multi-hour sessions. -->
-      {#each logs as l}
-        <div
-          class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}
-          style="content-visibility: auto; contain-intrinsic-size: auto 18px;"
-        >{l.line}</div>
-      {/each}
-      {#if logs.length === 0}
-        <div class="dim">{t("footer.logs.empty")}</div>
-      {/if}
-    </div>
-  {/if}
-  {#if envOpen && config}
-    <div class={panelScroll}>
-      <EnvOverrides
-        value={config.env_overrides}
-        typedKeys={typedEnvKeys}
-        onSave={saveEnvOverrides}
-      />
-    </div>
-  {/if}
-  {#if doctorOpen}
-    <div class={panelScroll}>
-      <DoctorPanel
-        report={doctorReport}
-        onReport={(r) => (doctorReport = r)}
-      />
-    </div>
 <!-- ── Prompt-too-large / OOM-guard modal ────────────────────────
      Triggered by the server's `[mlx-guard] PROMPT_REJECTED` log line
      (parsed in onLog). Explains the cause + recommended settings.
@@ -1815,6 +1815,47 @@
   </div>
 {/if}
 
+<!-- ── Footer panel: logs + env overrides ──────────────────────── -->
+<footer class="border-t border-border bg-panel flex flex-col fixed left-0 right-0 bottom-0 z-8">
+  {#if logsOpen}
+    <div
+      bind:this={logsContainer}
+      onscroll={onLogsScroll}
+      class="{panelScroll} mono px-4 py-1.5 pb-2.5 text-xs"
+    >
+      <!-- Virtualization via `content-visibility: auto`: the browser
+           skips layout + paint for off-screen entries even though all
+           ${LOG_MAX_LINES} live in the DOM. `contain-intrinsic-size`
+           gives a per-line estimate so scrollbar height stays stable
+           before items are first measured. Combined with the 2000-line
+           cap this keeps the panel responsive on multi-hour sessions. -->
+      {#each logs as l}
+        <div
+          class={`whitespace-pre-wrap break-all ${l.stream === "stderr" ? "text-[#d6b9ff]" : "text-text-dim"}`}
+          style="content-visibility: auto; contain-intrinsic-size: auto 18px;"
+        >{l.line}</div>
+      {/each}
+      {#if logs.length === 0}
+        <div class="dim">{t("footer.logs.empty")}</div>
+      {/if}
+    </div>
+  {/if}
+  {#if envOpen && config}
+    <div class={panelScroll}>
+      <EnvOverrides
+        value={config.env_overrides}
+        typedKeys={typedEnvKeys}
+        onSave={saveEnvOverrides}
+      />
+    </div>
+  {/if}
+  {#if doctorOpen}
+    <div class={panelScroll}>
+      <DoctorPanel
+        report={doctorReport}
+        onReport={(r) => (doctorReport = r)}
+      />
+    </div>
   {/if}
   {#if updateOpen}
     <div class={panelScroll}>
