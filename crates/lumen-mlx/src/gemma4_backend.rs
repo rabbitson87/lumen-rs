@@ -51,6 +51,75 @@ pub(crate) mod imp {
         }
     }
 
+    /// Background worker that drops MLX's reusable Metal-buffer pool after each
+    /// chat completion. MLX keeps freed buffers in a reuse cache that grows with
+    /// every request's KV-sized allocations; without a periodic clear, process
+    /// RAM climbs monotonically across independent requests until unified memory
+    /// swaps and decode collapses (observed: 35 → 2.5 tok/s on a 24 GB Mac with
+    /// gemma-4-26b-a4b, restored only by a server restart). The gemma4 streaming
+    /// path uses a stack-local cache and never reaches `remove_seq`, so the clear
+    /// is funnelled through `log_chat_done` instead — the one point every chat
+    /// path (streaming + non-streaming) passes through.
+    ///
+    /// Mirrors the proven Qwen3.5 native-path fix (`runner_native.rs`'s
+    /// `CacheCleanerWorker`); kept self-contained here to avoid coupling across
+    /// the two feature-gated `imp` modules. Deferred to this thread so the
+    /// post-DONE flush isn't blocked by the ~45 ms clear at cache-saturated
+    /// steady state. Race-safe: `mlx_clear_cache` only frees already-released
+    /// pool buffers, never in-flight tensors.
+    struct Gemma4CacheCleaner {
+        tx: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Gemma4CacheCleaner {
+        fn global() -> &'static Self {
+            static WORKER: OnceLock<Gemma4CacheCleaner> = OnceLock::new();
+            WORKER.get_or_init(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                std::thread::Builder::new()
+                    .name("gemma4-cache-cleaner".into())
+                    .spawn(move || {
+                        while rx.recv().is_ok() {
+                            // Coalesce bursts: one clear settles the pool, so
+                            // drain any queued requests before running it.
+                            while rx.try_recv().is_ok() {}
+                            unsafe {
+                                mlx_sys::mlx_clear_cache();
+                            }
+                        }
+                    })
+                    .expect("spawn gemma4-cache-cleaner thread");
+                Gemma4CacheCleaner { tx }
+            })
+        }
+
+        fn request_clear(&self) {
+            // Fire-and-forget; channel error only at process teardown.
+            let _ = self.tx.send(());
+        }
+    }
+
+    /// Reclaim MLX's buffer pool after a chat completion (see
+    /// [`Gemma4CacheCleaner`]). Default ON; shares the Qwen3.5 path's toggles so
+    /// one env var controls both native backends: opt out with
+    /// `LUMEN_NATIVE_NO_CLEAR_CACHE=1`, force synchronous (block the flush, for
+    /// A/B or mem-probe interleaving) with `LUMEN_NATIVE_DEFER_CLEAR_CACHE=0`.
+    fn reclaim_mlx_cache_after_chat() {
+        if std::env::var("LUMEN_NATIVE_NO_CLEAR_CACHE").is_ok() {
+            return;
+        }
+        let defer = std::env::var("LUMEN_NATIVE_DEFER_CLEAR_CACHE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if defer {
+            Gemma4CacheCleaner::global().request_clear();
+        } else {
+            unsafe {
+                mlx_sys::mlx_clear_cache();
+            }
+        }
+    }
+
     /// Dump rendered prompt to stderr when `LUMEN_DUMP_PROMPT` is set.
     /// Set to `1` / `true` for compact dump (decoded text + length), set to
     /// `full` for verbose dump (token IDs + decoded text, no truncation).
@@ -170,6 +239,10 @@ pub(crate) mod imp {
         eprintln!(
             "[gemma4] chat done: prefill {prefill_tokens} tok in {prefill_ms:.0}ms ({p_tps:.1} tok/s) | decode {decode_tokens} tok in {decode_ms:.0}ms ({d_tps:.1} tok/s) | e2e {decode_tokens} tok in {e2e_ms:.0}ms ({e_tps:.1} tok/s)"
         );
+        // Every gemma4 chat path funnels through here, so this is the single
+        // point to reclaim MLX's buffer pool and stop the per-request RAM climb
+        // that swaps the box and collapses decode (35 → 2.5 tok/s) until restart.
+        reclaim_mlx_cache_after_chat();
     }
 
     fn build_sampling_config(
