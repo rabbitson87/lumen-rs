@@ -1,7 +1,7 @@
 {
   "name": "lumen-app-frontend",
   "private": true,
-  "version": "0.10.0",
+  "version": "0.10.1",
   "type": "module",
   "scripts": {
     "predev": "cargo build --manifest-path ../../../Cargo.toml -p lumen-server --release",
