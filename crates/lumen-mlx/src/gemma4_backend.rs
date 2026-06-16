@@ -1031,6 +1031,15 @@ pub(crate) mod imp {
             &self.model
         }
 
+        /// Effective max context (already capped by `LUMEN_MAX_CTX` at config
+        /// load, see `gemma4_moe.rs`). A prompt can never exceed this — the KV
+        /// cache physically can't hold more, and on MLX an over-max_ctx prefill
+        /// OOM-aborts the whole process. The engine uses this as a hard prompt
+        /// reject ceiling.
+        pub fn max_context(&self) -> usize {
+            self.model.config().text_config.max_position_embeddings
+        }
+
         /// Phase 3: EOS token id set for the loaded Gemma 4 model.
         pub fn eos_tokens(&self) -> &[u32] {
             self.model.eos_tokens()

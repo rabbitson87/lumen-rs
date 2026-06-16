@@ -1231,6 +1231,20 @@ impl MlxBackend {
         }
     }
 
+    /// Effective model max context, when the backend exposes a hard ceiling.
+    /// `Some(n)` means a prompt longer than `n` tokens can never be served
+    /// (the KV can't hold it; on MLX an over-ctx prefill OOM-aborts the
+    /// process), so the engine rejects such prompts up front. Gemma 4 reports
+    /// its `LUMEN_MAX_CTX`-capped value; Qwen3.5 returns `None` (its context is
+    /// not env-capped here, so only the operator prompt cap applies).
+    pub fn max_context(&self) -> Option<usize> {
+        match self {
+            Self::Qwen35Family(_) => None,
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => Some(m.max_context()),
+        }
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => m.encode(text),

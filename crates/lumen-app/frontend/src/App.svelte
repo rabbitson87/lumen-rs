@@ -399,6 +399,21 @@
             downloads.delete(key);
           }
         }, 3000);
+      // Watch for the server's prompt-too-large guard line and surface the
+      // explainer modal. Format (engine.rs guard_prompt_fits):
+      //   [mlx-guard] PROMPT_REJECTED prompt_tokens=N effective_cap=M max_ctx=K|none prompt_cap=C
+      for (const l of lines) {
+        const m = l.line.match(
+          /\[mlx-guard\] PROMPT_REJECTED prompt_tokens=(\d+) effective_cap=(\d+) max_ctx=(\d+|none)/,
+        );
+        if (m) {
+          oomError = {
+            promptTokens: Number(m[1]),
+            effectiveCap: Number(m[2]),
+            maxCtx: m[3] === "none" ? null : Number(m[3]),
+          };
+        }
+      }
       } else if (p.downloaded_bytes === 0) {
         // The backend emits a `0 bytes / done:false` placeholder right before
         // each HTTP GET, then `continue`s silently on 404 (common for the
@@ -755,6 +770,16 @@
 
   /// "Update" button handler for an out-of-date installed model.  Deletes
   /// the local directory + triggers a fresh download against the current
+  // Prompt-too-large / OOM-guard modal. Populated from the server's
+  // `[mlx-guard] PROMPT_REJECTED ...` stderr line (see onLog below). The app
+  // is a control plane that tails server logs — it is not the chat client —
+  // so the trigger is the log line, not an HTTP response.
+  let oomError = $state<{
+    promptTokens: number;
+    effectiveCap: number;
+    maxCtx: number | null;
+  } | null>(null);
+
   /// Hub `main` SHA.  Re-uses the existing download path so the user sees
   /// the same progress UI; SHA marker is rewritten at the end.
   async function updateOutdated(id: string) {
@@ -1731,6 +1756,65 @@
         onReport={(r) => (doctorReport = r)}
       />
     </div>
+<!-- ── Prompt-too-large / OOM-guard modal ────────────────────────
+     Triggered by the server's `[mlx-guard] PROMPT_REJECTED` log line
+     (parsed in onLog). Explains the cause + recommended settings.
+     Backdrop click + Esc dismiss. -->
+{#if oomError}
+  <div
+    class="fixed inset-0 z-100 flex items-center justify-center bg-black/55 backdrop-blur-sm"
+    onclick={() => (oomError = null)}
+    onkeydown={(e) => { if (e.key === "Escape") oomError = null; }}
+    role="presentation"
+  >
+    <div
+      class="bg-panel border border-border rounded-xl shadow-[0_8px_32px_rgba(0,0,0,0.5)] p-5 min-w-105 max-w-150"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="oom-title"
+      tabindex="-1"
+    >
+      <h3 id="oom-title" class="m-0 mb-2.5 text-sm font-semibold text-err">
+        {t("oom.title")}
+      </h3>
+      <p class="mb-3 text-xs text-text-dim leading-[1.55]">
+        {t("oom.body")}
+      </p>
+      <!-- token figures (locale-neutral) -->
+      <div class="mb-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+        <span class="text-text-dim">{t("oom.label.prompt")}</span>
+        <span class="mono text-err">{oomError.promptTokens.toLocaleString()} tok</span>
+        <span class="text-text-dim">{t("oom.label.limit")}</span>
+        <span class="mono text-text">{oomError.effectiveCap.toLocaleString()} tok</span>
+        {#if oomError.maxCtx !== null}
+          <span class="text-text-dim">{t("oom.label.context")}</span>
+          <span class="mono text-text">{oomError.maxCtx.toLocaleString()} tok</span>
+        {/if}
+      </div>
+      <h4 class="m-0 mb-1.5 text-xs font-semibold text-text">
+        {t("oom.recommend.title")}
+      </h4>
+      <ul class="mb-4 pl-4 list-disc text-xs text-text-dim leading-[1.55] flex flex-col gap-1">
+        <li>{t("oom.recommend.trim")}</li>
+        <li>{t("oom.recommend.ctx")}</li>
+        <li>{t("oom.recommend.kv")}</li>
+        <li>{t("oom.recommend.calc")}</li>
+      </ul>
+      <div class="flex justify-end gap-2">
+        <button onclick={() => (oomError = null)}>{t("oom.action.dismiss")}</button>
+        <button
+          class="primary"
+          onclick={() => { activeTab = "tuning"; oomError = null; }}
+        >
+          {t("oom.action.tuning")}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
   {/if}
   {#if updateOpen}
     <div class={panelScroll}>

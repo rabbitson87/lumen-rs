@@ -617,4 +617,23 @@ export const ko: Record<string, string> = {
   // ── 진단 상세 ───────────────────────────────────────────────────
   "doctor.detail.active_model.incomplete":
     "필수 파일 (config.json + safetensors/gguf 샤드 1개 이상)이 누락되었습니다.",
+
+  // ── 프롬프트 과대 / OOM 가드 모달 ──────────────────────────────
+  "oom.title": "이 모델에 비해 프롬프트가 너무 큽니다",
+  "oom.body":
+    "들어온 요청의 프롬프트가 이 기기에서 모델이 메모리에 담을 수 있는 크기를 초과했습니다. 프로세스가 메모리 부족으로 죽기 전에 서버가 거부했습니다. 아래 값은 토큰 수입니다.",
+  "oom.label.prompt": "프롬프트",
+  "oom.label.limit": "허용 한도",
+  "oom.label.context": "모델 컨텍스트 (LUMEN_MAX_CTX)",
+  "oom.recommend.title": "해결 방법",
+  "oom.recommend.trim":
+    "클라이언트가 보내는 양을 줄이세요 — 프롬프트 단축 또는 대화 기록 정리. 가장 확실합니다.",
+  "oom.recommend.ctx":
+    "Context max를 메모리 안전값으로 유지하세요. LUMEN_MAX_CTX를 GPU가 실제로 담을 수 없는 값까지 올리면 이 크래시가 다시 발생합니다 — 숫자를 올린다고 메모리가 생기지 않습니다.",
+  "oom.recommend.kv":
+    "KV 캐시 양자화(4-bit)를 켜면 같은 메모리로 더 큰 컨텍스트를 담을 수 있습니다.",
+  "oom.recommend.calc":
+    "튜닝 탭의 메모리 계산기로 RAM에 맞는 안전 컨텍스트를 확인하세요.",
+  "oom.action.tuning": "튜닝 열기",
+  "oom.action.dismiss": "닫기",
 };

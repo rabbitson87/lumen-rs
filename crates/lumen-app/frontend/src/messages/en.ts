@@ -626,4 +626,23 @@ export const en: Record<string, string> = {
   // ── Doctor detail (incomplete-shard explainer) ─────────────────
   "doctor.detail.active_model.incomplete":
     "Required files (config.json + at least one safetensors/gguf shard) are missing.",
+
+  // ── Prompt-too-large / OOM-guard modal ─────────────────────────
+  "oom.title": "Prompt too large for this model",
+  "oom.body":
+    "An incoming request's prompt was larger than this model can hold in memory on this machine. The server rejected it before it could crash the process with an out-of-memory error. Values below are token counts.",
+  "oom.label.prompt": "Prompt",
+  "oom.label.limit": "Accepted limit",
+  "oom.label.context": "Model context (LUMEN_MAX_CTX)",
+  "oom.recommend.title": "How to fix",
+  "oom.recommend.trim":
+    "Reduce what the client sends — shorter prompt or trimmed conversation history. Most reliable.",
+  "oom.recommend.ctx":
+    "Keep Context max at a memory-safe value. Raising LUMEN_MAX_CTX past what the GPU can actually hold just re-triggers this crash — it does not add memory.",
+  "oom.recommend.kv":
+    "Turn on KV cache quantization (4-bit) to fit more context in the same memory.",
+  "oom.recommend.calc":
+    "Use the memory calculator in the Tuning tab to find the safe context for your RAM.",
+  "oom.action.tuning": "Open Tuning",
+  "oom.action.dismiss": "Dismiss",
 };

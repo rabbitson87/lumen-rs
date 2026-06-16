@@ -201,6 +201,18 @@ impl ModelBackend {
         }
     }
 
+    /// Hard model context ceiling (tokens), when the backend exposes one.
+    /// Used by the prompt-size guard as an absolute reject limit: a prompt
+    /// over this can't fit the KV and OOM-aborts MLX, so it must be rejected
+    /// regardless of `LUMEN_MAX_PROMPT_TOKENS`. Only MLX backends report a
+    /// value today.
+    fn max_context(&self) -> Option<u32> {
+        match self {
+            Self::Mlx(m) => m.max_context().map(|c| c as u32),
+            _ => None,
+        }
+    }
+
     fn generate(
         &mut self,
         input_ids: &[u32],
@@ -968,14 +980,7 @@ impl InferenceEngine {
         let prompt_tokens_guard = self
             .backend
             .count_chat_prompt_tokens(&messages, thinking_on);
-        let prompt_cap = resolve_prompt_cap();
-        if prompt_tokens_guard > prompt_cap {
-            return Err(anyhow::anyhow!(
-                "prompt too large: {prompt_tokens_guard} tokens > server cap {prompt_cap}. \
-                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
-                 or trim the conversation history."
-            ));
-        }
+        guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
         // rate, but it is not threaded back here; this end-to-end rate is the
@@ -1243,14 +1248,7 @@ impl InferenceEngine {
         let prompt_tokens_guard = self
             .backend
             .count_chat_prompt_tokens(&messages, anthropic_thinking);
-        let prompt_cap = resolve_prompt_cap();
-        if prompt_tokens_guard > prompt_cap {
-            return Err(anyhow::anyhow!(
-                "prompt too large: {prompt_tokens_guard} tokens > server cap {prompt_cap}. \
-                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
-                 or trim the conversation history."
-            ));
-        }
+        guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
 
         let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
@@ -1598,15 +1596,8 @@ impl InferenceEngine {
         // old turns to fit (true context-shift) needs token access inside the
         // backend (the engine only has a token *count* here) — tracked
         // separately; for now an over-cap prompt is rejected with guidance.
-        let prefill_token_cap: u32 = resolve_prompt_cap();
-        if prompt_tokens > prefill_token_cap {
-            let msg = format!(
-                "prompt too large: {prompt_tokens} tokens > server cap {prefill_token_cap}. \
-                 Raise LUMEN_MAX_PROMPT_TOKENS (chunked prefill handles the memory — \
-                 check the Tuning memory calculator first) or trim the history."
-            );
-            eprintln!("[chat-stream] REJECTED ({msg})");
-            let _ = token_tx.try_send(StreamEvent::Error(msg));
+        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
 
@@ -1974,15 +1965,8 @@ impl InferenceEngine {
         );
         // Prompt-size reject cap (Anthropic streaming) — guard the prefill from
         // an uncaught Metal OOM that would crash the server process.
-        let prompt_cap = resolve_prompt_cap();
-        if prompt_tokens > prompt_cap {
-            let msg = format!(
-                "prompt too large: {prompt_tokens} tokens > server cap {prompt_cap}. \
-                 Raise LUMEN_MAX_PROMPT_TOKENS (needs more RAM for the longer prefill) \
-                 or trim the conversation history."
-            );
-            eprintln!("[anthropic-stream] REJECTED ({msg})");
-            let _ = token_tx.try_send(StreamEvent::Error(msg));
+        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
 
@@ -2338,6 +2322,64 @@ fn resolve_prompt_cap() -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16_384)
+}
+
+/// Effective prompt-token reject limit = min(operator cap, model max_ctx).
+/// The model context is a HARD ceiling: a prompt longer than it can't fit the
+/// KV cache, and on MLX the over-ctx prefill aborts the whole process with an
+/// uncaught Metal OOM. So even when the operator raises `LUMEN_MAX_PROMPT_TOKENS`,
+/// `max_ctx` still bounds the accepted prompt. Returns
+/// `(effective_limit, operator_cap, max_ctx_opt)` for messaging/logging.
+fn effective_prompt_cap_for(backend: &ModelBackend) -> (u32, u32, Option<u32>) {
+    let operator_cap = resolve_prompt_cap();
+    let max_ctx = backend.max_context();
+    let effective = match max_ctx {
+        Some(mc) => operator_cap.min(mc),
+        None => operator_cap,
+    };
+    (effective, operator_cap, max_ctx)
+}
+
+/// Pre-flight prompt-size guard shared by every chat entry (OpenAI + Anthropic,
+/// streaming + non-streaming). Rejects an oversized prompt BEFORE prefill so it
+/// never reaches Metal (an over-ctx prefill OOM-aborts the process — a C++
+/// exception Rust cannot catch, so rejection is the only defense). On reject it
+/// emits a single parseable `[mlx-guard] PROMPT_REJECTED ...` stderr line that
+/// the desktop app watches for to pop the "prompt too large" modal, and returns
+/// an `Err` whose message explains the cause + the fix.
+fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
+    let (effective, operator_cap, max_ctx) = effective_prompt_cap_for(backend);
+    if prompt_tokens <= effective {
+        return Ok(());
+    }
+    let max_ctx_field = max_ctx
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    // Space-delimited key=val so the app's log watcher can parse it without a
+    // structured side-channel (the app tails server stderr).
+    eprintln!(
+        "[mlx-guard] PROMPT_REJECTED prompt_tokens={prompt_tokens} effective_cap={effective} \
+         max_ctx={max_ctx_field} prompt_cap={operator_cap}"
+    );
+    // Bound by max_ctx (not the operator cap) → the real fix is to shrink the
+    // prompt or, only if memory allows, raise LUMEN_MAX_CTX. Bound by the
+    // operator cap → raising LUMEN_MAX_PROMPT_TOKENS (memory permitting) works.
+    let hint = match max_ctx {
+        Some(mc) if mc <= operator_cap => format!(
+            " The model context is capped at {mc} tokens (LUMEN_MAX_CTX). \
+             Trim the prompt/conversation, or raise LUMEN_MAX_CTX only if there is \
+             enough memory to prefill it (raising it past what the GPU can hold just \
+             re-triggers the out-of-memory crash)."
+        ),
+        _ => format!(
+            " Server prompt cap is {operator_cap} tokens (LUMEN_MAX_PROMPT_TOKENS). \
+             Trim the prompt, or raise the cap only if there is enough RAM for the \
+             longer prefill."
+        ),
+    };
+    Err(anyhow::anyhow!(
+        "prompt too large: {prompt_tokens} tokens > limit {effective}.{hint}"
+    ))
 }
 
 /// Streaming analogue of [`first_json_value_end`]: a stateful tracker fed the
