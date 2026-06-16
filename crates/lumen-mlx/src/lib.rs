@@ -3449,7 +3449,7 @@ impl MlxQwen35Backend {
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
         let incremental_boundary = self
-            .detect_system_prefix_len(messages)
+            .detect_system_tools_prefix_len(messages, tools)
             .ok()
             .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
@@ -3492,7 +3492,7 @@ impl MlxQwen35Backend {
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key(messages);
         let incremental_boundary = self
-            .detect_system_prefix_len(messages)
+            .detect_system_tools_prefix_len(messages, tools)
             .ok()
             .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
@@ -3528,7 +3528,7 @@ impl MlxQwen35Backend {
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
         let incremental_boundary = self
-            .detect_system_prefix_len_from_turns(turns)
+            .detect_system_tools_prefix_len_from_turns(turns, tools)
             .ok()
             .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
@@ -3568,7 +3568,7 @@ impl MlxQwen35Backend {
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
         let prefix_key = auto_prefix_key_from_turns(turns);
         let incremental_boundary = self
-            .detect_system_prefix_len_from_turns(turns)
+            .detect_system_tools_prefix_len_from_turns(turns, tools)
             .ok()
             .filter(|&b| b > 0 && b < prompt_ids.len());
         self.chat_with_tools_impl(
@@ -4192,6 +4192,52 @@ impl MlxQwen35Backend {
         let block = format_system_prefix(&("system".to_string(), content.to_string()));
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
+    }
+
+    /// Tools-aware variant of [`Self::detect_system_prefix_len`]: returns the
+    /// token length of the **system + rendered-tools** head — the stable prefix
+    /// every same-system/same-tools request shares, which is what the agentic
+    /// chat path actually re-uses across turns and client compactions. The
+    /// plain system-only boundary leaves the ~25K-token tool-schema block out
+    /// of the snapshot, so it gets cold-prefilled every divergent turn; this
+    /// captures it. Mirrors exactly what `format_qwen3_chat_with_tools_*` emits
+    /// before the first body turn (`render_tools_system_block`), so
+    /// `prompt_ids[..len]` is a strict prefix. Falls back to the system-only
+    /// boundary when there are no tools.
+    fn detect_system_tools_prefix_len(
+        &self,
+        messages: &[(String, String)],
+        tools: &[crate::chat_io::ToolDef<'_>],
+    ) -> Result<usize> {
+        if tools.is_empty() {
+            return self.detect_system_prefix_len(messages);
+        }
+        let leading_system = match messages.first() {
+            Some((role, text)) if role == "system" && !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        };
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let ids = self.encode(&block)?;
+        Ok(ids.len())
+    }
+
+    /// `detect_system_tools_prefix_len` for the structured-history shape.
+    fn detect_system_tools_prefix_len_from_turns(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        tools: &[crate::chat_io::ToolDef<'_>],
+    ) -> Result<usize> {
+        use crate::chat_io::ChatTurn;
+        if tools.is_empty() {
+            return self.detect_system_prefix_len_from_turns(turns);
+        }
+        let leading_system = match turns.first() {
+            Some(ChatTurn::System(s)) if !s.is_empty() => Some(*s),
+            _ => None,
+        };
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let ids = self.encode(&block)?;
+        Ok(ids.len())
     }
 
     /// Drop a prefix-cache entry by key, releasing its master snapshot.

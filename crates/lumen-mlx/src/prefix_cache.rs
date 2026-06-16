@@ -38,10 +38,14 @@ use std::time::{Duration, Instant};
 /// Default per-key branch cap when `LUMEN_MLX_PREFIX_CACHE_BRANCHES` is unset.
 const DEFAULT_BRANCHES: usize = 4;
 
-/// Default for incremental chunked-prefill boundary caching (Phase 0). OFF so
-/// the cold-MISS path is byte-identical to the pre-Phase-0 single-prefill until
-/// explicitly enabled via `LUMEN_MLX_PREFIX_INCREMENTAL`.
-const DEFAULT_INCREMENTAL: bool = false;
+/// Default for incremental chunked-prefill boundary caching (Phase 0). **ON**:
+/// on a cold MISS the stable head (system + rendered tools, via the tools-aware
+/// boundary in `lib.rs::detect_system_tools_prefix_len*`) is snapshotted as a
+/// `pinned_boundary` branch so a later same-system/same-tools but divergent-tail
+/// prompt (e.g. a client compaction/resume) FORKS the ~48K head instead of
+/// cold-prefilling it again (~98s → ~1-2s on the agentic path). Set
+/// `LUMEN_MLX_PREFIX_INCREMENTAL=0` to revert to the byte-identical single-prefill.
+const DEFAULT_INCREMENTAL: bool = true;
 
 /// The minimal runner surface the prefix cache needs. A backend implements this
 /// for its runner type — e.g. a blanket impl over a richer internal `Runner`

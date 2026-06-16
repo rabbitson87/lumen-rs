@@ -85,7 +85,10 @@ const TOOL_INSTRUCTION_BLOCK: &str = "\n\nIf you choose to call a function ONLY 
 /// Render the system prefix containing the `<tools>` block + instruction.
 /// Optional existing system content is appended after the IMPORTANT block,
 /// separated by `\n\n` — matches Qwen's template behavior.
-fn render_tools_system_block(tools: &[ToolDef<'_>], extra_system: Option<&str>) -> String {
+pub(crate) fn render_tools_system_block(
+    tools: &[ToolDef<'_>],
+    extra_system: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str("<|im_start|>system\n");
     s.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
