@@ -271,7 +271,15 @@ mod imp {
         config.add_template_arg_int("Hv", n_v_heads)?;
 
         config.set_grid(32, head_v_dim, b * n_v_heads)?;
-        config.set_thread_group(32, 4, 1)?;
+        // Threadgroup y (Dv tiling) tunes occupancy — x=32 fixed (simd_sum over
+        // the Dk tile). y only affects scheduling, not the result. Default 4;
+        // `LUMEN_SSM_TG_Y` sweeps {1,2,4,8,16} (must divide head_v_dim).
+        let tg_y = std::env::var("LUMEN_SSM_TG_Y")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&y| y >= 1 && head_v_dim % y == 0)
+            .unwrap_or(4);
+        config.set_thread_group(32, tg_y, 1)?;
 
         config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
         config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
@@ -414,7 +422,15 @@ mod imp {
         config.add_template_arg_int("Hv", n_v_heads)?;
 
         config.set_grid(32, head_v_dim, b * n_v_heads)?;
-        config.set_thread_group(32, 4, 1)?;
+        // Threadgroup y (Dv tiling) tunes occupancy — x=32 fixed (simd_sum over
+        // the Dk tile). y only affects scheduling, not the result. Default 4;
+        // `LUMEN_SSM_TG_Y` sweeps {1,2,4,8,16} (must divide head_v_dim).
+        let tg_y = std::env::var("LUMEN_SSM_TG_Y")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .filter(|&y| y >= 1 && head_v_dim % y == 0)
+            .unwrap_or(4);
+        config.set_thread_group(32, tg_y, 1)?;
 
         config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
         config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
@@ -630,13 +646,114 @@ mod imp {
             .ok_or_else(|| anyhow::anyhow!("rms_norm_gated_fused: kernel produced no output"))?;
         Ok(y)
     }
+
+    // ─── Fused linear-attn input-side kernel (M2c) ───────────────────────
+    //
+    // conv1d(window-K depthwise) + silu + split + per-head q/k RMSNorm in ONE
+    // Metal dispatch, producing q_scaled, k_scaled, v_post directly. Replaces
+    // ~5 decode (s=1) launches/layer (conv1d, silu, split, rms_norm×2) with 1
+    // — the launch-latency lever (gate-0 measured the chain at ~10ms/step).
+    // Parity-validated standalone in `examples/m2c_inproj_tail_fused.rs`
+    // (rel ~1e-7 vs the op-by-op path).
+    //
+    // Layout: conv_input [K, conv_dim] (K decode time-taps), conv_w [conv_dim, K],
+    // wq/wk [dn] (scale folded). conv_dim = 2*key_dim + value_dim,
+    // key_dim = NK*DN, value_dim = NV*DV. grid (lane, row): row 0..NK = q heads,
+    // NK..2NK = k heads, 2NK..2NK+NV = v heads; lane = channel within head.
+    const INPROJ_TAIL_SOURCE: &str = r#"
+        uint d = thread_position_in_grid.x;
+        uint row = thread_position_in_grid.y;
+        threadgroup float sh[1024];
+        uint nk = (uint)NK, nv = (uint)NV;
+        uint dn = (uint)DN, dv = (uint)DV;
+        uint key_dim = nk * dn;
+        uint conv_dim = 2u * key_dim + nv * dv;
+        uint region, head, width, ch_base;
+        if (row < nk)         { region = 0u; head = row;         width = dn; ch_base = head * dn; }
+        else if (row < 2u*nk) { region = 1u; head = row - nk;    width = dn; ch_base = key_dim + head * dn; }
+        else                  { region = 2u; head = row - 2u*nk; width = dv; ch_base = 2u*key_dim + head * dv; }
+        if (d >= width) return;
+        uint c = ch_base + d;
+        float acc = 0.0f;
+        for (uint k = 0u; k < (uint)K; ++k) {
+            acc += float(conv_input[k * conv_dim + c]) * float(conv_w[c * (uint)K + k]);
+        }
+        float s = acc / (1.0f + metal::exp(-acc));
+        if (region == 2u) { out_v[head * dv + d] = static_cast<InT>(s); return; }
+        sh[d] = s * s;
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+            if (d < stride) sh[d] += sh[d + stride];
+            threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        }
+        float inv = metal::rsqrt(sh[0] / float(width) + float(eps[0]));
+        float wv = (region == 0u) ? float(wq[d]) : float(wk[d]);
+        float y = s * inv * wv;
+        if (region == 0u) out_q[head * dn + d] = static_cast<InT>(y);
+        else              out_k[head * dn + d] = static_cast<InT>(y);
+    "#;
+
+    /// Fused conv+silu+split+q/k-RMSNorm. Returns (q_scaled[NK,DN],
+    /// k_scaled[NK,DN], v_post[NV,DV]). `conv_input`:[K,conv_dim] (contiguous),
+    /// `conv_w`:[conv_dim,K], `wq`/`wk`:[DN] (scale folded). Bit-close to the
+    /// op-by-op path (see examples/m2c_inproj_tail_fused.rs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn inproj_tail_fused(
+        conv_input: &Array,
+        conv_w: &Array,
+        wq: &Array,
+        wk: &Array,
+        eps: f32,
+        nk: i32,
+        nv: i32,
+        dn: i32,
+        dv: i32,
+        k_taps: i32,
+    ) -> Result<(Array, Array, Array)> {
+        use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
+        let kernel = MetalKernel::new(
+            "inproj_tail_fused",
+            &["conv_input", "conv_w", "wq", "wk", "eps"],
+            &["out_q", "out_k", "out_v"],
+            INPROJ_TAIL_SOURCE,
+            /* ensure_row_contiguous */ true,
+            /* atomic_outputs */ false,
+        )?;
+        let config = MetalKernelConfig::new();
+        config.add_template_arg_dtype("InT", conv_input.dtype())?;
+        config.add_template_arg_int("NK", nk)?;
+        config.add_template_arg_int("NV", nv)?;
+        config.add_template_arg_int("DN", dn)?;
+        config.add_template_arg_int("DV", dv)?;
+        config.add_template_arg_int("K", k_taps)?;
+        let rows = nk + nk + nv;
+        let lane = dn.max(dv);
+        config.set_grid(lane, rows, 1)?;
+        config.set_thread_group(lane, 1, 1)?;
+        config.add_output_arg(&[nk, dn], conv_input.dtype())?;
+        config.add_output_arg(&[nk, dn], conv_input.dtype())?;
+        config.add_output_arg(&[nv, dv], conv_input.dtype())?;
+        let eps_arr = Array::from_slice(&[eps], &[1]);
+        let outs = kernel.apply(&[conv_input, conv_w, wq, wk, &eps_arr], &config, 3)?;
+        let mut it = outs.into_iter();
+        let q = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("inproj_tail_fused: no out_q"))?;
+        let k = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("inproj_tail_fused: no out_k"))?;
+        let v = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("inproj_tail_fused: no out_v"))?;
+        Ok((q, k, v))
+    }
 }
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b.5 SSM block assembly.
 pub use imp::{
-    compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, rms_norm_gated,
-    rms_norm_gated_fused, rms_norm_gated_legacy,
+    compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, inproj_tail_fused,
+    rms_norm_gated, rms_norm_gated_fused, rms_norm_gated_legacy,
 };
 
 // compute_g bit-identical vs MLX reference.

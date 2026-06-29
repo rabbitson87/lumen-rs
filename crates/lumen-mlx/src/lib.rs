@@ -105,7 +105,7 @@ pub mod gemma4 {
 }
 pub mod env_state;
 mod golden;
-mod metal_kernel;
+pub mod metal_kernel;
 pub mod native_attention;
 mod native_cache;
 mod native_compile_cache;
@@ -134,8 +134,9 @@ mod qwen3_5_tools;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
 pub use qwen3_5_mtp::{
-    MtpLoadQuant, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock, Qwen35MtpDims, StepBBenchPoint,
-    load_block_from_hf, run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
+    HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
+    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
+    smoke_forward_with_synth_trunk,
 };
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
@@ -717,6 +718,24 @@ impl RunnerImpl {
     }
 
     #[cfg(feature = "mlx-native")]
+    fn enable_mtp_hi_calib(&self) -> Result<()> {
+        match self {
+            Self::Native(r) => r.enable_mtp_hi_calib(),
+            _ => Err(anyhow!("enable_mtp_hi_calib requires the native backend")),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn train_mtp_headinternal(&self, cfg: crate::qwen3_5_mtp::HiTrainCfg) -> Result<(f32, f32)> {
+        match self {
+            Self::Native(r) => r.train_mtp_headinternal(cfg),
+            _ => Err(anyhow!(
+                "train_mtp_headinternal requires the native backend"
+            )),
+        }
+    }
+
+    #[cfg(feature = "mlx-native")]
     fn qwen35_mtp_step(
         &mut self,
         seq_id: u64,
@@ -866,23 +885,33 @@ fn read_session_limits() -> (Option<Duration>, Option<usize>) {
 /// Compute a process-stable cache key for a chat request based on the system
 /// message content. Returns `None` if there is no system message to share —
 /// the prefix cache only ever shares the system-prompt block.
-/// Phase 2 S4 — opt-in MTP routing for the Qwen3.5 streaming decode.
-/// Returns `Some(k)` when `LUMEN_SPEC=mtp` is set; respects `LUMEN_SPEC_K`
-/// for the draft count (default 2 to match the S1.5 cycle-math sweet spot).
-/// Returns `None` for any other `LUMEN_SPEC` value (`ngram`, unset, ...) so
-/// the existing n-gram path keeps working unchanged.
+/// True when `dir` carries a self-contained MTP head — the `mtp/weights.safetensors`
+/// sidecar that MTPLX repos (e.g. Qwen3.6-27B-MTPLX) ship, or a flat
+/// `mtp.safetensors`. Used to AUTO-enable MTP at load without env vars.
 #[cfg(feature = "mlx-native")]
-fn read_qwen35_mtp_k_from_env() -> Option<usize> {
-    let spec = std::env::var("LUMEN_SPEC").ok()?;
-    if !spec.eq_ignore_ascii_case("mtp") {
-        return None;
+fn model_has_mtp_head(dir: &std::path::Path) -> bool {
+    dir.join("mtp").join("weights.safetensors").is_file() || dir.join("mtp.safetensors").is_file()
+}
+
+/// Resolve the effective MTP draft count for the streaming decode, assuming the
+/// caller has already confirmed the head is installed (`qwen35_mtp_enabled()`).
+/// `LUMEN_SPEC=mtp` → explicit on (K = `LUMEN_SPEC_K`, default 2). `LUMEN_SPEC`
+/// set to anything else → `None` (defer to that mode). UNSET → AUTO-route
+/// through MTP (K = `LUMEN_SPEC_K`, default 1 — the dense-27B accept sweet spot),
+/// so a self-contained MTP model serves at spec speed with no env vars.
+#[cfg(feature = "mlx-native")]
+fn effective_qwen35_mtp_k() -> Option<usize> {
+    let k_env = || {
+        std::env::var("LUMEN_SPEC_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+    };
+    match std::env::var("LUMEN_SPEC") {
+        Ok(s) if s.eq_ignore_ascii_case("mtp") => Some(k_env().unwrap_or(2)),
+        Ok(_) => None,
+        Err(_) => Some(k_env().unwrap_or(1)),
     }
-    let k: usize = std::env::var("LUMEN_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&v| v >= 1)
-        .unwrap_or(2);
-    Some(k)
 }
 
 fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
@@ -2166,6 +2195,22 @@ impl MlxQwen35Backend {
         self.runner.train_mtp_c4_lmhead(rank, steps, lr)
     }
 
+    /// Begin head-internal PoC calibration (collect k=0 embed/h_pre/target).
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_enable_mtp_hi_calib(&self) -> Result<()> {
+        self.runner.enable_mtp_hi_calib()
+    }
+
+    /// Train the head-internal (eh_proj) LoRA on collected calib; returns
+    /// `(in_sample_accept_before, in_sample_accept_after)` — the GO/fold gate.
+    #[cfg(feature = "mlx-native")]
+    pub fn qwen35_train_mtp_headinternal(
+        &self,
+        cfg: crate::qwen3_5_mtp::HiTrainCfg,
+    ) -> Result<(f32, f32)> {
+        self.runner.train_mtp_headinternal(cfg)
+    }
+
     /// Advance one MTP speculative cycle. See `qwen3_5_moe::mtp_step` for
     /// the Step A-E contract. Returns the committed token list (length
     /// `1 + n_accepted + 1`); the LAST element must be fed as
@@ -2195,32 +2240,68 @@ impl MlxQwen35Backend {
     /// the server boots even if MTP weights are absent.
     #[cfg(feature = "mlx-native")]
     fn try_enable_qwen35_mtp_from_env(&mut self) -> Result<()> {
-        let on = std::env::var("LUMEN_QWEN35_MTP")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        // `LUMEN_QWEN35_MTP`: "0"/"false" hard-disables; "1"/"true" forces on
+        // (errors loudly if prerequisites missing); UNSET = AUTO — enable when
+        // the loaded model ships a self-contained MTP head and we're on the
+        // native runner. This makes self-contained MTPLX repos "just work"
+        // (17.5 tok/s) without any env vars; the escape hatch is MTP=0.
+        let env_val = std::env::var("LUMEN_QWEN35_MTP").ok();
+        let explicit_off = env_val
+            .as_deref()
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if !on {
+        if explicit_off {
             return Ok(());
         }
-        // Honored only on the native runner — non-native runners surface a
-        // clear error so misconfigured deployments fail loudly.
+        let explicit_on = env_val
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // MTP runs only on the native runner. Auto mode skips silently on other
+        // runners; explicit on fails loudly so misconfig is visible.
         if !matches!(self.runner, RunnerImpl::Native(_)) {
-            return Err(anyhow!(
-                "LUMEN_QWEN35_MTP=1 requires the native runner (set LUMEN_MLX_BACKEND=native)"
-            ));
+            if explicit_on {
+                return Err(anyhow!(
+                    "LUMEN_QWEN35_MTP=1 requires the native runner (set LUMEN_MLX_BACKEND=native)"
+                ));
+            }
+            return Ok(());
         }
-        let hf_dir = std::env::var("LUMEN_QWEN35_HF_ORIGINAL").map_err(|_| {
-            anyhow!(
-                "LUMEN_QWEN35_MTP=1 requires LUMEN_QWEN35_HF_ORIGINAL to point at an HF-original \
-                 snapshot directory holding `mtp.*` tensors (e.g. \
-                 ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/<hash>)"
-            )
-        })?;
-        let hf_path = std::path::PathBuf::from(&hf_dir);
-        if !hf_path.is_dir() {
-            return Err(anyhow!(
-                "LUMEN_QWEN35_HF_ORIGINAL `{hf_dir}` is not a directory"
-            ));
-        }
+
+        // Resolve the dir holding the MTP head.
+        // * Explicit `LUMEN_QWEN35_HF_ORIGINAL` is honored ONLY under explicit
+        //   opt-in (`MTP=1`). A bare HF_ORIGINAL without opt-in (e.g. a bench
+        //   harness that manages MTP itself) must NOT auto-trigger enable.
+        // * Otherwise (auto mode) default to the loaded model dir and require a
+        //   self-contained `mtp/weights.safetensors` head.
+        let hf_path: std::path::PathBuf = match std::env::var("LUMEN_QWEN35_HF_ORIGINAL") {
+            Ok(d) => {
+                if !explicit_on {
+                    return Ok(());
+                }
+                let p = std::path::PathBuf::from(&d);
+                if !p.is_dir() {
+                    return Err(anyhow!("LUMEN_QWEN35_HF_ORIGINAL `{d}` is not a directory"));
+                }
+                p
+            }
+            Err(_) => match crate::runner_native::resolve_model_dir(&self.model_id) {
+                Ok(dir) if model_has_mtp_head(&dir) => dir,
+                _ => {
+                    if explicit_on {
+                        return Err(anyhow!(
+                            "LUMEN_QWEN35_MTP=1 requires LUMEN_QWEN35_HF_ORIGINAL to point at a \
+                             snapshot holding `mtp.*` tensors, or a model dir carrying \
+                             `mtp/weights.safetensors`"
+                        ));
+                    }
+                    // Auto mode: model has no self-contained MTP head → run the
+                    // baseline decode path unchanged.
+                    return Ok(());
+                }
+            },
+        };
         // Dim detection from model_id — same substring rules as the server's
         // `is_qwen3_5_dense`. 27B = Dense; everything else under the Qwen3.6
         // family with mtp.* = MoE (35B-A3B currently).
@@ -3245,8 +3326,8 @@ impl MlxQwen35Backend {
         // hasn't opted out. Falls back to baseline decode_step otherwise so
         // unmtp-loaded deployments behave identically.
         #[cfg(feature = "mlx-native")]
-        if let Some(k) = read_qwen35_mtp_k_from_env() {
-            if self.qwen35_mtp_enabled() {
+        if self.qwen35_mtp_enabled() {
+            if let Some(k) = effective_qwen35_mtp_k() {
                 return self.chat_streaming_qwen35_mtp(
                     messages,
                     max_new_tokens,

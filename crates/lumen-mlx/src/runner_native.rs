@@ -945,7 +945,7 @@ mod imp {
     /// Network failures, gated repos, or repos without safetensors shards
     /// surface as a typed error pointing the user back to either a local
     /// directory or `LUMEN_MLX_BACKEND=pyo3`.
-    fn resolve_model_dir(model_id: &str) -> Result<PathBuf> {
+    pub(crate) fn resolve_model_dir(model_id: &str) -> Result<PathBuf> {
         if model_id.is_empty() {
             return Err(anyhow!(
                 "native mlx-rs runner: model_id is empty (pass a local directory or HF Hub repo id)"
@@ -2003,6 +2003,25 @@ mod imp {
             model.train_mtp_c4_lmhead(rank, steps, lr)
         }
 
+        pub(crate) fn enable_mtp_hi_calib(&self) -> Result<()> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native runner: enable_mtp_hi_calib before model loaded"))?;
+            model.enable_mtp_hi_calib();
+            Ok(())
+        }
+
+        pub(crate) fn train_mtp_headinternal(
+            &self,
+            cfg: crate::qwen3_5_mtp::HiTrainCfg,
+        ) -> Result<(f32, f32)> {
+            let model = self.model.as_ref().ok_or_else(|| {
+                anyhow!("native runner: train_mtp_headinternal before model loaded")
+            })?;
+            model.train_mtp_headinternal(cfg)
+        }
+
         pub(crate) fn mtp_step(
             &mut self,
             seq_id: u64,
@@ -2938,3 +2957,5 @@ mod imp {
 }
 
 pub(crate) use imp::NativeMlxRunner;
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::resolve_model_dir;

@@ -320,7 +320,7 @@ mod imp {
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b.5.d SSM kernel + future kernels.
-pub(crate) use imp::{MetalKernel, MetalKernelConfig};
+pub use imp::{MetalKernel, MetalKernelConfig};
 
 // Smoke test — verify the FFI wrapper works with a minimal kernel before
 // we use it for the more complex SSM kernel. Mirrors the C example

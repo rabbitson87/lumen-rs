@@ -73,13 +73,16 @@ mod imp {
         SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled, swiglu_fused,
     };
     use crate::native_norm::rms_norm;
-    use crate::native_quant::{MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, quantized_matmul_with_mode};
+    use crate::native_quant::{
+        MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, dequantize_with_mode, quantize_with_mode,
+        quantized_matmul_with_mode,
+    };
     use crate::native_rope::{precompute_rope_freqs, rope, rope_with_freqs};
     use crate::native_snapshot::PromptCacheSnapshot;
     use crate::native_ssm::{
         compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, rms_norm_gated,
     };
-    use crate::qwen3_5_mtp::{Qwen35MtpBlock, Qwen35MtpLinear};
+    use crate::qwen3_5_mtp::{HiTrainCfg, MtpLoraPos, MtpLoraSet, Qwen35MtpBlock, Qwen35MtpLinear};
     use lumen_core::sampling::{
         SamplingConfig, Xorshift64, sample_distribution, sampling_distribution, speculative_accept,
     };
@@ -88,6 +91,52 @@ mod imp {
 
     pub(crate) fn sigmoid_mul_fuse_enabled_pub() -> bool {
         sigmoid_mul_fuse_enabled()
+    }
+
+    /// Top-`k` softmax over a full logits row → `(ids, probs)` where `probs` are
+    /// TRUE marginals `exp(logit - logsumexp(full row))` (NOT renormalized over
+    /// the top-k). The dropped tail is tiny for a peaked next-token dist, so the
+    /// truncated set is a faithful soft target for KL distillation. Head-internal
+    /// MTP PoC only.
+    fn topk_softmax(row: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
+        let n = row.len();
+        let k = k.min(n).max(1);
+        let mut idx: Vec<usize> = (0..n).collect();
+        if k < n {
+            // Partition so the first k indices are the k largest logits.
+            idx.select_nth_unstable_by(k - 1, |&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(k);
+        }
+        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let lse = max + row.iter().map(|&x| (x - max).exp()).sum::<f32>().ln();
+        let ids: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+        let probs: Vec<f32> = idx.iter().map(|&i| (row[i] - lse).exp()).collect();
+        (ids, probs)
+    }
+
+    /// Rebuild an `MtpLoraSet` from a flat `value_and_grad` arg list. `args` is
+    /// `[A0, B0, A1, B1, ...]` in the same order as `positions`. Head-internal
+    /// MTP PoC only.
+    fn build_lora_set(positions: &[MtpLoraPos], args: &[Array]) -> MtpLoraSet {
+        let mut set = MtpLoraSet::default();
+        for (i, p) in positions.iter().enumerate() {
+            let pair = Some((args[2 * i].clone(), args[2 * i + 1].clone()));
+            match p {
+                MtpLoraPos::Eh => set.eh_proj = pair,
+                MtpLoraPos::Q => set.q = pair,
+                MtpLoraPos::K => set.k = pair,
+                MtpLoraPos::V => set.v = pair,
+                MtpLoraPos::O => set.o = pair,
+                MtpLoraPos::Gate => set.gate = pair,
+                MtpLoraPos::Up => set.up = pair,
+                MtpLoraPos::Down => set.down = pair,
+            }
+        }
+        set
     }
 
     // ───────────────────────── config.json parsing ─────────────────────────
@@ -702,9 +751,20 @@ mod imp {
 
     /// Dense SwiGLU MLP weights (`down(silu(gate(x)) * up(x))`). Each linear is
     /// a quantized (affine/mxfp4) `ResolvedLinear`.
+    ///
+    /// Gate+up fusion: at decode (matvec) the dense MLP matmuls are
+    /// LATENCY/dispatch-bound, not BW-bound (a 50MB affine4 QMV hits only ~44%
+    /// of M3 Max peak BW; a 100MB one hits ~59%). Concatenating gate_proj and
+    /// up_proj along the OUTPUT axis into ONE `quantized_matmul` (then splitting
+    /// the result) removes one dispatch/layer (~0.2ms × n_layers) and amortizes
+    /// the kernel better — bit-identical (each output row is independently
+    /// packed, so row-concat ≡ two matmuls + output concat). `gate_up_proj` is
+    /// `Some` (and gate/up `None`) when fused; `LUMEN_NATIVE_FUSE_GATE_UP=0`
+    /// keeps them separate. Exactly one of {(gate,up), gate_up} is populated.
     pub struct DenseMlpWeights {
-        pub gate_proj: ResolvedLinear,
-        pub up_proj: ResolvedLinear,
+        pub gate_proj: Option<ResolvedLinear>,
+        pub up_proj: Option<ResolvedLinear>,
+        pub gate_up_proj: Option<ResolvedLinear>,
         pub down_proj: ResolvedLinear,
     }
 
@@ -750,13 +810,94 @@ mod imp {
             .clone();
         let biases = weights.get(&format!("{base}.biases")).cloned();
         let (group_size, bits, mode) = quant_params_resolve(config, base);
-        Ok(ResolvedLinear {
+        let lin = ResolvedLinear {
             weight,
             scales,
             biases,
             group_size,
             bits,
             mode,
+        };
+        // Optional weight requant to FEWER bits (the bytes/token BW lever). Decode
+        // is BW-bound on weight bytes, so N-bit weights decode ∝ N. `LUMEN_NATIVE_
+        // REQUANT_BITS=3` re-affine-quantizes the loaded affine weights to 3-bit
+        // at load (4→3 is lossy → quality drops; this is the SPEED proof on the
+        // 4-bit checkpoint — a production 3-bit needs a bf16 source). Only affine
+        // (mxfp4/nvfp4 are fixed E2M1 4-bit). MLP/attn/lm_head all qualify.
+        match requant_target_bits_for(base) {
+            Some(tb) if lin.mode == MODE_AFFINE && lin.bits > tb => requant_linear_affine(&lin, tb)
+                .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit")),
+            _ => Ok(lin),
+        }
+    }
+
+    /// `LUMEN_NATIVE_REQUANT_BITS` → target affine bits ∈ {2,3} (else None/off).
+    fn requant_target_bits() -> Option<i32> {
+        match std::env::var("LUMEN_NATIVE_REQUANT_BITS")
+            .ok()?
+            .trim()
+            .parse::<i32>()
+        {
+            Ok(b @ (2 | 3)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Per-component requant target (MIXED PRECISION lever). MLP linears
+    /// (gate/up/down — 63% of weight bytes, OFF the MTP-accept-critical path)
+    /// take `LUMEN_NATIVE_REQUANT_MLP_BITS`; everything else (attn / in_proj /
+    /// out_proj / lm_head — feeds the MTP draft head, so accept-sensitive) takes
+    /// `LUMEN_NATIVE_REQUANT_OTHER_BITS`. Both fall back to the global
+    /// `LUMEN_NATIVE_REQUANT_BITS`. Rationale (measured): 2-bit everywhere makes
+    /// the baseline fast (15.4 tok/s) but collapses MTP accept 0.85→0.53; keeping
+    /// attention at 4-bit preserves accept while 2-bit MLP cuts the bulk of bytes
+    /// → fast baseline + high accept → MTP toward ~21. bits∈{2,3,4} (4 = keep).
+    fn requant_target_bits_for(base: &str) -> Option<i32> {
+        let parse = |s: String| {
+            s.trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|b| matches!(b, 2 | 3 | 4))
+        };
+        let key = if base.contains(".mlp") {
+            "LUMEN_NATIVE_REQUANT_MLP_BITS"
+        } else {
+            "LUMEN_NATIVE_REQUANT_OTHER_BITS"
+        };
+        if let Ok(v) = std::env::var(key) {
+            return parse(v);
+        }
+        requant_target_bits()
+    }
+
+    /// Dequantize an affine `ResolvedLinear` to bf16, then re-affine-quantize to
+    /// `bits` (group 64). Output is a smaller weight that decodes proportionally
+    /// faster (BW lever). The bf16 intermediate is per-linear (freed after).
+    fn requant_linear_affine(lin: &ResolvedLinear, bits: i32) -> Result<ResolvedLinear> {
+        let w = dequantize_with_mode(
+            &lin.weight,
+            &lin.scales,
+            lin.biases.as_ref(),
+            lin.group_size,
+            lin.bits,
+            lin.mode,
+        )
+        .context("requant: dequantize")?;
+        let gs = 64;
+        let (weight, scales, biases) =
+            quantize_with_mode(&w, gs, bits, MODE_AFFINE).context("requant: quantize")?;
+        weight.eval().context("requant: eval weight")?;
+        scales.eval().context("requant: eval scales")?;
+        if let Some(b) = &biases {
+            b.eval().context("requant: eval biases")?;
+        }
+        Ok(ResolvedLinear {
+            weight,
+            scales,
+            biases,
+            group_size: gs,
+            bits,
+            mode: MODE_AFFINE,
         })
     }
 
@@ -823,10 +964,68 @@ mod imp {
         layer_idx: usize,
     ) -> Result<DenseMlpWeights> {
         let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
-        Ok(DenseMlpWeights {
-            gate_proj: resolve_linear(weights, config, &format!("{prefix}.gate_proj"))?,
-            up_proj: resolve_linear(weights, config, &format!("{prefix}.up_proj"))?,
-            down_proj: resolve_linear(weights, config, &format!("{prefix}.down_proj"))?,
+        let gate = resolve_linear(weights, config, &format!("{prefix}.gate_proj"))?;
+        let up = resolve_linear(weights, config, &format!("{prefix}.up_proj"))?;
+        let down_proj = resolve_linear(weights, config, &format!("{prefix}.down_proj"))?;
+        // Fuse gate+up into one QMV when their quant params match. Default OFF:
+        // A/B on 27B M3 Max showed NO win (separate 85.7ms vs fused 89.2ms/tok) —
+        // real decode pipelines the matmuls (BW-bound), so fusing same-byte
+        // matmuls saves nothing and the extra split op slightly hurts. The
+        // isolation bench (bench_affine4_qmv_decode) overstated dispatch overhead
+        // because it eval()s every call (defeats pipelining). Kept env-gated
+        // (`LUMEN_NATIVE_FUSE_GATE_UP=1`) as a tested-negative / future-HW lever.
+        let fuse = std::env::var("LUMEN_NATIVE_FUSE_GATE_UP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            && gate.group_size == up.group_size
+            && gate.bits == up.bits
+            && gate.mode == up.mode;
+        if fuse {
+            Ok(DenseMlpWeights {
+                gate_proj: None,
+                up_proj: None,
+                gate_up_proj: Some(fuse_gate_up(&gate, &up)?),
+                down_proj,
+            })
+        } else {
+            Ok(DenseMlpWeights {
+                gate_proj: Some(gate),
+                up_proj: Some(up),
+                gate_up_proj: None,
+                down_proj,
+            })
+        }
+    }
+
+    /// Concatenate gate_proj + up_proj along the OUTPUT axis (axis 0) into one
+    /// quantized linear. Packed weight `[out, in/8]`, scales/biases `[out,
+    /// in/group]` — each output row is packed independently, so row-concat is
+    /// exact. The fused QMV output `[.., 2*interm]` splits back to (gate, up).
+    fn fuse_gate_up(gate: &ResolvedLinear, up: &ResolvedLinear) -> Result<ResolvedLinear> {
+        let weight = mlx_rs::ops::concatenate_axis(&[&gate.weight, &up.weight], 0)
+            .context("fuse_gate_up: concat weight")?;
+        let scales = mlx_rs::ops::concatenate_axis(&[&gate.scales, &up.scales], 0)
+            .context("fuse_gate_up: concat scales")?;
+        let biases = match (&gate.biases, &up.biases) {
+            (Some(gb), Some(ub)) => Some(
+                mlx_rs::ops::concatenate_axis(&[gb, ub], 0)
+                    .context("fuse_gate_up: concat biases")?,
+            ),
+            (None, None) => None,
+            _ => return Err(anyhow!("fuse_gate_up: gate/up biases presence mismatch")),
+        };
+        weight.eval().context("fuse_gate_up: eval weight")?;
+        scales.eval().context("fuse_gate_up: eval scales")?;
+        if let Some(b) = &biases {
+            b.eval().context("fuse_gate_up: eval biases")?;
+        }
+        Ok(ResolvedLinear {
+            weight,
+            scales,
+            biases,
+            group_size: gate.group_size,
+            bits: gate.bits,
+            mode: gate.mode,
         })
     }
 
@@ -1030,6 +1229,46 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// PROBE (timing only, NOT correct — `LUMEN_PROBE_SKIP_LINCOMPUTE=1`):
+    /// gate-0 of the fused linear-attn kernel build. When set, the decode (s=1)
+    /// linear-attn path SKIPS the entire non-matmul chain (conv1d, silu, split,
+    /// q/k rms_norm, sigmoid, compute_g, the SSM Metal kernel, rms_norm_gated)
+    /// and feeds a cheap value-slice of `mixed_qkv` straight into out_proj.
+    /// in_proj + out_proj (the BW-bound matmuls) and the cache `advance` are
+    /// kept so step timing stays realistic. Output is garbage — this measures
+    /// ONLY how many ms the linear-attn non-matmul compute actually costs in the
+    /// real pipeline, i.e. the upper bound on the fused-kernel payoff. If the
+    /// step drops a lot → launch-latency bound → fuse. If barely → abort build.
+    fn probe_skip_lincompute() -> bool {
+        std::env::var("LUMEN_PROBE_SKIP_LINCOMPUTE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// PROBE (timing only — `LUMEN_PROBE_SKIP_INPROJ_SMALL=1`, requires
+    /// LINCOMPUTE skip too): gate-0 of lever A (in_proj concat). Skips the 3
+    /// SMALL in_proj matmuls (z/b/a) and keeps only in_proj_qkv. Combined with
+    /// the lincompute probe (which returns early using only mixed_qkv), the A/B
+    /// delta vs lincompute-alone = the real cost of the 3 small-matmul launches,
+    /// i.e. the upper bound on the in_proj-concat payoff.
+    fn probe_skip_inproj_small() -> bool {
+        std::env::var("LUMEN_PROBE_SKIP_INPROJ_SMALL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
+    /// split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
+    /// ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
+    /// non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
+    /// default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
+    /// the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
+    fn fuse_linattn_in_enabled() -> bool {
+        std::env::var("LUMEN_NATIVE_FUSE_LINATTN_IN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
     /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.
     ///
     /// `committed`: tokens the caller should append to its generation stream.
@@ -1122,6 +1361,22 @@ mod imp {
         mtp_c4_lmhead: Mutex<Option<(Array, Array)>>,
         // C4 calibration: collected (x = norm_out host row, target = trunk argmax).
         mtp_c4_calib: Mutex<Option<(Vec<Vec<f32>>, Vec<u32>)>>,
+        // Head-internal C4 PoC calibration: k=0 (embed row, h_pre row, trunk-argmax
+        // target, trunk soft target = top-64 (ids, probs)). Unlike mtp_c4_calib
+        // (frozen post-block hidden → lm_head LoRA, dead generalization), this
+        // trains a LoRA INSIDE the block (any of eh/q/k/v/o/gate/up/down) via
+        // `forward_train_lora_multi` so the head's own forward reshapes the
+        // hidden. The soft target enables a KL/distillation objective (vs the
+        // CE-to-argmax that overfit). Decisive untested accept lever for dense.
+        #[allow(clippy::type_complexity)]
+        mtp_hi_calib: Mutex<
+            Option<(
+                Vec<Vec<f32>>,
+                Vec<Vec<f32>>,
+                Vec<u32>,
+                Vec<(Vec<u32>, Vec<f32>)>,
+            )>,
+        >,
     }
 
     /// Post-projection / post-RoPE intermediates shared by the plain and
@@ -1240,6 +1495,7 @@ mod imp {
                 mtp_proc_calib: Mutex::new(None),
                 mtp_c4_lmhead: Mutex::new(None),
                 mtp_c4_calib: Mutex::new(None),
+                mtp_hi_calib: Mutex::new(None),
                 ssm_capture_enabled: AtomicBool::new(false),
                 embed_weight,
                 embed_scales,
@@ -1843,11 +2099,20 @@ mod imp {
             //     identity ops adding only graph nodes.
             let t_in_proj = timing_on.then(Instant::now);
             let mixed_qkv = self.linear_pre(&lw.in_proj_qkv, x)?;
-            let z_flat = self.linear_pre(&lw.in_proj_z, x)?;
-            let b_pre = self.linear_pre(&lw.in_proj_b, x)?;
-            let a_pre = self.linear_pre(&lw.in_proj_a, x)?;
-            let z_4d = mlx_rs::ops::reshape(&z_flat, &[b, s, nv, dv])
-                .context("layer_linear_attn_forward: reshape z failed")?;
+            // PROBE lever-A gate-0: skip the 3 small in_proj matmuls (z/b/a).
+            // Only valid with LINCOMPUTE skip (which returns early below using
+            // only mixed_qkv) — the dummies are never consumed.
+            let skip_inproj_small = probe_skip_lincompute() && probe_skip_inproj_small() && s == 1;
+            let (z_4d, b_pre, a_pre) = if skip_inproj_small {
+                (mixed_qkv.clone(), mixed_qkv.clone(), mixed_qkv.clone())
+            } else {
+                let z_flat = self.linear_pre(&lw.in_proj_z, x)?;
+                let b_pre = self.linear_pre(&lw.in_proj_b, x)?;
+                let a_pre = self.linear_pre(&lw.in_proj_a, x)?;
+                let z_4d = mlx_rs::ops::reshape(&z_flat, &[b, s, nv, dv])
+                    .context("layer_linear_attn_forward: reshape z failed")?;
+                (z_4d, b_pre, a_pre)
+            };
             let _ = nv_per_nk; // retained for future fused-mode toggle
             if let Some(t0) = t_in_proj {
                 // Batched eval: matches Python `mx.eval(qkv, z, b, a)` —
@@ -1856,6 +2121,47 @@ mod imp {
                 mlx_rs::transforms::eval([&z_4d, &mixed_qkv, &b_pre, &a_pre])
                     .context("layer_linear_attn_forward: batched eval(in_proj) failed")?;
                 bump_linear_in_proj_ms(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // PROBE gate-0 (LUMEN_PROBE_SKIP_LINCOMPUTE): skip the whole non-matmul
+            // chain, feed a value-slice of mixed_qkv straight to out_proj. Garbage
+            // output, real step timing. See `probe_skip_lincompute` doc.
+            if probe_skip_lincompute() && s == 1 {
+                let n_keep = kernel_size - 1;
+                let total_len = s + n_keep;
+                let _conv_state_owned;
+                let conv_state: &Array = match cache.get(0) {
+                    Some(arr) => arr,
+                    None => {
+                        _conv_state_owned = mlx_rs::ops::zeros_dtype(
+                            &[b, n_keep, conv_dim],
+                            mlx_rs::Dtype::Float32,
+                        )
+                        .context("probe: zero-init conv_state failed")?;
+                        &_conv_state_owned
+                    }
+                };
+                let conv_input = mlx_rs::ops::concatenate_axis(&[conv_state, &mixed_qkv], 1)
+                    .context("probe: concat conv_input failed")?;
+                let new_conv_state = {
+                    use mlx_rs::ops::indexing::TryIndexOp;
+                    conv_input
+                        .try_index((.., (s as i32)..(total_len as i32), ..))
+                        .context("probe: slice conv_state failed")?
+                };
+                cache.set(0, new_conv_state)?;
+                cache.advance(s as usize);
+                // value portion of mixed_qkv = [.., 2*key_dim .. conv_dim] = value_dim
+                let v_slice = {
+                    use mlx_rs::ops::indexing::TryIndexOp;
+                    mixed_qkv
+                        .try_index((.., .., (2 * key_dim)..(conv_dim)))
+                        .context("probe: slice value portion failed")?
+                };
+                let out_flat = mlx_rs::ops::reshape(&v_slice, &[b, s, value_dim])
+                    .context("probe: reshape out_flat failed")?;
+                let out_proj_raw = self.linear_pre(&lw.out_proj, &out_flat)?;
+                return Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.probe_out_proj"));
             }
 
             // (B: conv) conv_state load → concat → cache update via take_axis →
@@ -1907,96 +2213,173 @@ mod imp {
                     .context("layer_linear_attn_forward: take_axis(conv_state) failed")?
             };
             cache.set(0, new_conv_state)?;
-            let conv_w = &lw.conv1d_weight;
-            let conv_raw = conv1d(
-                &conv_input,
-                conv_w,
-                /* stride */ 1,
-                /* padding */ 0,
-                conv_dim,
-            )?;
-            let conv_out = mlx_rs::nn::silu(&conv_raw)
-                .context("layer_linear_attn_forward: silu(conv1d) failed")?;
-            let conv_parts = mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
-                .context("layer_linear_attn_forward: split conv_out failed")?;
-            if conv_parts.len() != 3 {
-                return Err(anyhow!(
-                    "layer_linear_attn_forward: conv split returned {} parts (want 3)",
-                    conv_parts.len()
-                ));
-            }
-            let q_post = mlx_rs::ops::reshape(&conv_parts[0], &[b, s, nk, dn])
-                .context("layer_linear_attn_forward: reshape q_post failed")?;
-            let k_post = mlx_rs::ops::reshape(&conv_parts[1], &[b, s, nk, dn])
-                .context("layer_linear_attn_forward: reshape k_post failed")?;
-            let v_post = mlx_rs::ops::reshape(&conv_parts[2], &[b, s, nv, dv])
-                .context("layer_linear_attn_forward: reshape v_post failed")?;
-            if let Some(t0) = t_conv {
-                mlx_rs::transforms::eval([&q_post, &k_post, &v_post])
-                    .context("layer_linear_attn_forward: batched eval(conv) failed")?;
-                bump_linear_conv_ms(t0.elapsed().as_secs_f64() * 1000.0);
-            }
 
-            // (C: norm_qk) ones-weight rms_norm × 2 + scalar broadcast multiplies.
-            let t_norm_qk = timing_on.then(Instant::now);
-            // Layer-A: cached ones_w + scale_q/k vs per-call construction.
-            // Bit-identical replacement (same dtype/shape/value).
-            let (q_n, k_n, q_scaled, k_scaled) = if alloc_reuse_enabled() {
-                if linear_attn_scale_fuse_enabled() {
-                    // Fused path (LANDED 2026-05-11): absorb scale_q/k into
-                    // rms_norm weight (`scaled_w_q = ones × scale_q`). Saves
-                    // 2 multiply ops/linear-attn layer × 21 layers = 42 ops/step.
-                    // Bit-identical: rms_norm(x, ones*s) = rms_norm(x, ones) * s.
-                    let q_scaled = mlx_rs::fast::rms_norm(
-                        &q_post,
-                        &self.linear_attn_constants.scaled_w_q_dn,
-                        1e-6,
-                    )
-                    .context("layer_linear_attn_forward: rms_norm(q, scaled_w) failed")?;
-                    let k_scaled = mlx_rs::fast::rms_norm(
-                        &k_post,
-                        &self.linear_attn_constants.scaled_w_k_dn,
-                        1e-6,
-                    )
-                    .context("layer_linear_attn_forward: rms_norm(k, scaled_w) failed")?;
-                    // q_n/k_n unused in fused path — fabricate dummy refs to
-                    // satisfy the tuple return; the `let _ = (q_n, k_n)`
-                    // below silences the unused warning.
-                    (q_scaled.clone(), k_scaled.clone(), q_scaled, k_scaled)
-                } else {
-                    let ones_w = &self.linear_attn_constants.ones_w_dn;
-                    let q_n = mlx_rs::fast::rms_norm(&q_post, ones_w, 1e-6)
-                        .context("layer_linear_attn_forward: rms_norm(q, cached) failed")?;
-                    let k_n = mlx_rs::fast::rms_norm(&k_post, ones_w, 1e-6)
-                        .context("layer_linear_attn_forward: rms_norm(k, cached) failed")?;
-                    let q_scaled = mlx_rs::ops::multiply(&q_n, &self.linear_attn_constants.scale_q)
-                        .context("layer_linear_attn_forward: q_scaled multiply (cached) failed")?;
-                    let k_scaled = mlx_rs::ops::multiply(&k_n, &self.linear_attn_constants.scale_k)
-                        .context("layer_linear_attn_forward: k_scaled multiply (cached) failed")?;
-                    (q_n, k_n, q_scaled, k_scaled)
-                }
+            // M4 fused input-side path (LUMEN_NATIVE_FUSE_LINATTN_IN): conv+silu
+            // +split+q/k-RMSNorm in ONE kernel (parity: examples/m2c_*). Produces
+            // q_scaled/k_scaled/v_post directly; bypasses the conv+norm blocks.
+            let (q_scaled, k_scaled, v_post) = if fuse_linattn_in_enabled()
+                && s == 1
+                && alloc_reuse_enabled()
+                && linear_attn_scale_fuse_enabled()
+            {
+                let conv_input_2d = mlx_rs::ops::reshape(&conv_input, &[total_len, conv_dim])
+                    .context("fuse_linattn_in: reshape conv_input [K, conv_dim]")?;
+                let conv_w_2d = mlx_rs::ops::reshape(&lw.conv1d_weight, &[conv_dim, kernel_size])
+                    .context("fuse_linattn_in: reshape conv_w [conv_dim, K]")?;
+                let (q2, k2, v2) = crate::native_ssm::inproj_tail_fused(
+                    &conv_input_2d,
+                    &conv_w_2d,
+                    &self.linear_attn_constants.scaled_w_q_dn,
+                    &self.linear_attn_constants.scaled_w_k_dn,
+                    1e-6,
+                    nk,
+                    nv,
+                    dn,
+                    dv,
+                    kernel_size,
+                )?;
+                let q_scaled = mlx_rs::ops::reshape(&q2, &[b, s, nk, dn])
+                    .context("fuse_linattn_in: reshape q_scaled")?;
+                let k_scaled = mlx_rs::ops::reshape(&k2, &[b, s, nk, dn])
+                    .context("fuse_linattn_in: reshape k_scaled")?;
+                let v_post = mlx_rs::ops::reshape(&v2, &[b, s, nv, dv])
+                    .context("fuse_linattn_in: reshape v_post")?;
+                (q_scaled, k_scaled, v_post)
             } else {
-                let inv_scale = (dn as f32).powf(-0.5);
-                let ones_w = mlx_rs::ops::ones::<f32>(&[dn])
-                    .context("layer_linear_attn_forward: ones weight failed")?;
-                let q_n = mlx_rs::fast::rms_norm(&q_post, &ones_w, 1e-6)
-                    .context("layer_linear_attn_forward: rms_norm(q) failed")?;
-                let k_n = mlx_rs::fast::rms_norm(&k_post, &ones_w, 1e-6)
-                    .context("layer_linear_attn_forward: rms_norm(k) failed")?;
-                let scale_q = Array::from_f32(inv_scale * inv_scale);
-                let scale_k = Array::from_f32(inv_scale);
-                let q_scaled = mlx_rs::ops::multiply(&q_n, &scale_q)
-                    .context("layer_linear_attn_forward: q_scaled multiply failed")?;
-                let k_scaled = mlx_rs::ops::multiply(&k_n, &scale_k)
-                    .context("layer_linear_attn_forward: k_scaled multiply failed")?;
-                (q_n, k_n, q_scaled, k_scaled)
+                let conv_w = &lw.conv1d_weight;
+                // Decode (s=1) depthwise conv as an explicit windowed sum of mlx
+                // elementwise ops instead of the general `conv1d` kernel:
+                //   out[0,c] = Σ_{k} conv_input[k,c] · w[c,0,k]   (cross-correlation)
+                // Folds into the compile graph + skips the general-conv launch.
+                // Bit-identical (same FMA order is not guaranteed, but f32 window=4
+                // sum matches to ~1e-7). `LUMEN_NATIVE_CONV_DECODE_EW=0` reverts.
+                // Default OFF: A/B showed no speedup (mlx conv1d already efficient;
+                // bit-identical, wash). Kept env-gated as a tested-negative.
+                let conv_decode_ew = s == 1
+                    && std::env::var("LUMEN_NATIVE_CONV_DECODE_EW")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                let conv_raw = if conv_decode_ew {
+                    let w2 = mlx_rs::ops::reshape(conv_w, &[conv_dim, kernel_size])
+                        .context("conv decode-ew: reshape weight")?;
+                    let mut acc: Option<Array> = None;
+                    for k in 0..kernel_size {
+                        use mlx_rs::ops::indexing::TryIndexOp;
+                        let xk = conv_input
+                            .try_index((.., k..(k + 1), ..))
+                            .context("conv decode-ew: slice input tap")?; // [b,1,conv_dim]
+                        let wk = w2
+                            .try_index((.., k..(k + 1)))
+                            .context("conv decode-ew: slice weight tap")?
+                            .reshape(&[conv_dim])
+                            .context("conv decode-ew: reshape weight tap")?; // [conv_dim]
+                        let term = xk.multiply(&wk).context("conv decode-ew: tap multiply")?;
+                        acc = Some(match acc {
+                            Some(a) => a.add(&term).context("conv decode-ew: tap add")?,
+                            None => term,
+                        });
+                    }
+                    acc.expect("conv decode-ew: kernel_size >= 1")
+                } else {
+                    conv1d(
+                        &conv_input,
+                        conv_w,
+                        /* stride */ 1,
+                        /* padding */ 0,
+                        conv_dim,
+                    )?
+                };
+                let conv_out = mlx_rs::nn::silu(&conv_raw)
+                    .context("layer_linear_attn_forward: silu(conv1d) failed")?;
+                let conv_parts =
+                    mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)
+                        .context("layer_linear_attn_forward: split conv_out failed")?;
+                if conv_parts.len() != 3 {
+                    return Err(anyhow!(
+                        "layer_linear_attn_forward: conv split returned {} parts (want 3)",
+                        conv_parts.len()
+                    ));
+                }
+                let q_post = mlx_rs::ops::reshape(&conv_parts[0], &[b, s, nk, dn])
+                    .context("layer_linear_attn_forward: reshape q_post failed")?;
+                let k_post = mlx_rs::ops::reshape(&conv_parts[1], &[b, s, nk, dn])
+                    .context("layer_linear_attn_forward: reshape k_post failed")?;
+                let v_post = mlx_rs::ops::reshape(&conv_parts[2], &[b, s, nv, dv])
+                    .context("layer_linear_attn_forward: reshape v_post failed")?;
+                if let Some(t0) = t_conv {
+                    mlx_rs::transforms::eval([&q_post, &k_post, &v_post])
+                        .context("layer_linear_attn_forward: batched eval(conv) failed")?;
+                    bump_linear_conv_ms(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                // (C: norm_qk) ones-weight rms_norm × 2 + scalar broadcast multiplies.
+                let t_norm_qk = timing_on.then(Instant::now);
+                // Layer-A: cached ones_w + scale_q/k vs per-call construction.
+                // Bit-identical replacement (same dtype/shape/value).
+                let (q_n, k_n, q_scaled, k_scaled) = if alloc_reuse_enabled() {
+                    if linear_attn_scale_fuse_enabled() {
+                        // Fused path (LANDED 2026-05-11): absorb scale_q/k into
+                        // rms_norm weight (`scaled_w_q = ones × scale_q`). Saves
+                        // 2 multiply ops/linear-attn layer × 21 layers = 42 ops/step.
+                        // Bit-identical: rms_norm(x, ones*s) = rms_norm(x, ones) * s.
+                        let q_scaled = mlx_rs::fast::rms_norm(
+                            &q_post,
+                            &self.linear_attn_constants.scaled_w_q_dn,
+                            1e-6,
+                        )
+                        .context("layer_linear_attn_forward: rms_norm(q, scaled_w) failed")?;
+                        let k_scaled = mlx_rs::fast::rms_norm(
+                            &k_post,
+                            &self.linear_attn_constants.scaled_w_k_dn,
+                            1e-6,
+                        )
+                        .context("layer_linear_attn_forward: rms_norm(k, scaled_w) failed")?;
+                        // q_n/k_n unused in fused path — fabricate dummy refs to
+                        // satisfy the tuple return; the `let _ = (q_n, k_n)`
+                        // below silences the unused warning.
+                        (q_scaled.clone(), k_scaled.clone(), q_scaled, k_scaled)
+                    } else {
+                        let ones_w = &self.linear_attn_constants.ones_w_dn;
+                        let q_n = mlx_rs::fast::rms_norm(&q_post, ones_w, 1e-6)
+                            .context("layer_linear_attn_forward: rms_norm(q, cached) failed")?;
+                        let k_n = mlx_rs::fast::rms_norm(&k_post, ones_w, 1e-6)
+                            .context("layer_linear_attn_forward: rms_norm(k, cached) failed")?;
+                        let q_scaled =
+                            mlx_rs::ops::multiply(&q_n, &self.linear_attn_constants.scale_q)
+                                .context(
+                                    "layer_linear_attn_forward: q_scaled multiply (cached) failed",
+                                )?;
+                        let k_scaled =
+                            mlx_rs::ops::multiply(&k_n, &self.linear_attn_constants.scale_k)
+                                .context(
+                                    "layer_linear_attn_forward: k_scaled multiply (cached) failed",
+                                )?;
+                        (q_n, k_n, q_scaled, k_scaled)
+                    }
+                } else {
+                    let inv_scale = (dn as f32).powf(-0.5);
+                    let ones_w = mlx_rs::ops::ones::<f32>(&[dn])
+                        .context("layer_linear_attn_forward: ones weight failed")?;
+                    let q_n = mlx_rs::fast::rms_norm(&q_post, &ones_w, 1e-6)
+                        .context("layer_linear_attn_forward: rms_norm(q) failed")?;
+                    let k_n = mlx_rs::fast::rms_norm(&k_post, &ones_w, 1e-6)
+                        .context("layer_linear_attn_forward: rms_norm(k) failed")?;
+                    let scale_q = Array::from_f32(inv_scale * inv_scale);
+                    let scale_k = Array::from_f32(inv_scale);
+                    let q_scaled = mlx_rs::ops::multiply(&q_n, &scale_q)
+                        .context("layer_linear_attn_forward: q_scaled multiply failed")?;
+                    let k_scaled = mlx_rs::ops::multiply(&k_n, &scale_k)
+                        .context("layer_linear_attn_forward: k_scaled multiply failed")?;
+                    (q_n, k_n, q_scaled, k_scaled)
+                };
+                let _ = (q_n, k_n); // values consumed only via q_scaled/k_scaled
+                if let Some(t0) = t_norm_qk {
+                    mlx_rs::transforms::eval([&q_scaled, &k_scaled])
+                        .context("layer_linear_attn_forward: batched eval(norm_qk) failed")?;
+                    bump_linear_norm_qk_ms(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                (q_scaled, k_scaled, v_post)
             };
-            let _ = (q_n, k_n); // values consumed only via q_scaled/k_scaled
-            if let Some(t0) = t_norm_qk {
-                mlx_rs::transforms::eval([&q_scaled, &k_scaled])
-                    .context("layer_linear_attn_forward: batched eval(norm_qk) failed")?;
-                bump_linear_norm_qk_ms(t0.elapsed().as_secs_f64() * 1000.0);
-            }
 
             // (D: ssm) sigmoid(b) + compute_g + Metal SSM step kernel.
             let t_ssm = timing_on.then(Instant::now);
@@ -2200,8 +2583,25 @@ mod imp {
             // `linear_pre` carries each linear's affine biases (the 9B/27B dense
             // MLP is affine-quantized WITH biases — unlike the mxfp4 shared
             // expert, so `native_moe::shared_mlp` (biases=None) can't be reused).
-            let gate = self.linear_pre(&d.gate_proj, x)?;
-            let up = self.linear_pre(&d.up_proj, x)?;
+            // Gate+up fusion: one QMV `[.., 2*interm]` then split (bit-identical,
+            // saves one dispatch/layer — the decode matvec is dispatch-bound).
+            let (gate, up) = if let Some(gu) = &d.gate_up_proj {
+                let fused = self.linear_pre(gu, x)?;
+                let parts = mlx_rs::ops::split(&fused, 2, -1)
+                    .context("dense mlp: split fused gate_up failed")?;
+                let mut it = parts.into_iter();
+                let gate = it.next().expect("dense mlp: fused split[0] (gate)");
+                let up = it.next().expect("dense mlp: fused split[1] (up)");
+                (gate, up)
+            } else {
+                let gate = self.linear_pre(
+                    d.gate_proj.as_ref().expect("dense mlp: gate_proj missing"),
+                    x,
+                )?;
+                let up =
+                    self.linear_pre(d.up_proj.as_ref().expect("dense mlp: up_proj missing"), x)?;
+                (gate, up)
+            };
             // Reuse the landed mxfp4 SwiGLU fusion (-0.671ms/step, t=-29σ) — the
             // dense path was running raw silu+multiply (2 dispatches). Same
             // env off-switch (LUMEN_NATIVE_FUSE_SWIGLU=0) for A/B / rollback.
@@ -2484,6 +2884,27 @@ mod imp {
                     .eval()
                     .context("forward: timing eval(lm_head) failed")?;
                 fine.lm_head_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                // Decode-component breakdown (L==1): localizes the non-matmul
+                // (SSM/conv/norm) cost vs the matmul (in/out_proj/moe/lm_head) so
+                // custom-kernel work targets the right thing. Per-component eval
+                // barriers inflate absolute ms but the SPLIT is valid.
+                eprintln!(
+                    "[native-decode-fine] L={} embed={:.2} full_attn={:.2}/{} lin_attn={:.2}/{} moe={:.2}/{} lm_head={:.2} | lin_sub: in_proj={:.2} conv={:.2} norm_qk={:.2} ssm={:.2} out_proj={:.2}",
+                    input_ids.len(),
+                    fine.embed_ms,
+                    fine.full_attn_ms,
+                    fine.full_attn_count,
+                    fine.linear_attn_ms,
+                    fine.linear_attn_count,
+                    fine.moe_ms,
+                    fine.moe_count,
+                    fine.lm_head_ms,
+                    fine.linear_in_proj_ms,
+                    fine.linear_conv_ms,
+                    fine.linear_norm_qk_ms,
+                    fine.linear_ssm_ms,
+                    fine.linear_out_proj_ms,
+                );
                 store_fine_timings(fine);
             }
             Ok((logits_f32, captured))
@@ -2982,6 +3403,21 @@ mod imp {
                 .unwrap_or(false)
         }
 
+        /// Begin head-internal C4 PoC calibration: k=0 `(embed row, h_pre row,
+        /// trunk-argmax target)`.
+        pub fn enable_mtp_hi_calib(&self) {
+            if let Ok(mut slot) = self.mtp_hi_calib.lock() {
+                *slot = Some((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            }
+        }
+
+        fn mtp_hi_calib_active(&self) -> bool {
+            self.mtp_hi_calib
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+        }
+
         /// Correct draft logits with the trained lm_head LoRA:
         /// `logits + (h·Aᵀ)·Bᵀ`. `h` is the lm_head input (`norm_out`, the
         /// returned chained hidden). No-op if no adapter installed.
@@ -3239,6 +3675,293 @@ mod imp {
             Ok(())
         }
 
+        /// Head-internal C4 PoC: train rank-`r` LoRAs on a SUBSET of the MTP
+        /// block's projections (`cfg.positions` ⊆ {eh,q,k,v,o,gate,up,down})
+        /// against the trunk's k=0 target, via `forward_train_lora_multi`
+        /// (gradients flow through the block's attention + MLP — the path the
+        /// dead frozen-hidden lm_head C4 could NOT reach). `cfg.kl` switches the
+        /// objective from CE-to-argmax to top-`topk` distillation KL against the
+        /// trunk's verify distribution (the variation probed after CE overfit).
+        /// Returns `(held_out_accept_before, held_out_accept_best)` — the
+        /// DECISION GATE: if held-out doesn't move, the single head is the
+        /// ceiling (fold). Does NOT install; PoC measurement only.
+        pub fn train_mtp_headinternal(&self, cfg: HiTrainCfg) -> Result<(f32, f32)> {
+            use mlx_rs::transforms::value_and_grad_with_argnums;
+            let (es, hs, tgts, soft) = {
+                let mut slot = self
+                    .mtp_hi_calib
+                    .lock()
+                    .map_err(|_| anyhow!("hi calib lock poisoned"))?;
+                slot.take()
+                    .ok_or_else(|| anyhow!("no head-internal calibration in progress"))?
+            };
+            let n = es.len();
+            if n == 0 || n != hs.len() || n != tgts.len() || n != soft.len() {
+                return Err(anyhow!("hi calib empty or mismatched (n={n})"));
+            }
+            let HiTrainCfg {
+                rank,
+                steps,
+                lr,
+                weight_decay,
+                positions,
+                kl,
+                topk,
+                seed,
+            } = cfg;
+            if positions.is_empty() {
+                return Err(anyhow!("hi train: no LoRA positions selected"));
+            }
+            let topk = topk.clamp(1, 64);
+            let block = self
+                .mtp
+                .as_ref()
+                .ok_or_else(|| anyhow!("train_mtp_headinternal: MTP block not enabled"))?;
+            let hidden = self.text_config().hidden_size;
+            let h32 = hidden as i32;
+            let flat = |rows: &[Vec<f32>]| -> Result<Array> {
+                let mut f = Vec::with_capacity(n * hidden);
+                for r in rows {
+                    if r.len() != hidden {
+                        return Err(anyhow!("hi calib row {} != hidden {hidden}", r.len()));
+                    }
+                    f.extend_from_slice(r);
+                }
+                Ok(Array::from_slice(&f, &[n as i32, 1, h32]))
+            };
+            let x_e = flat(&es)?;
+            let x_h = flat(&hs)?;
+            let t_all = Array::from_slice(
+                &tgts.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+                &[n as i32],
+            );
+            let fnorm = self.final_norm_weight.clone();
+            let lmhead = self.trunk_lm_head_view();
+
+            // Per-position LoRA (in, out) dims.
+            let intermediate = || -> Result<i32> {
+                block.dense_intermediate().ok_or_else(|| {
+                    anyhow!("MLP-position LoRA needs a Dense MTP block (MoE unsupported)")
+                })
+            };
+            let dim_in_out = |p: MtpLoraPos| -> Result<(i32, i32)> {
+                Ok(match p {
+                    MtpLoraPos::Eh => (2 * h32, h32),
+                    MtpLoraPos::Q => (h32, block.q_out_dim()),
+                    MtpLoraPos::K => (h32, block.kv_out_dim()),
+                    MtpLoraPos::V => (h32, block.kv_out_dim()),
+                    MtpLoraPos::O => (block.o_in_dim(), h32),
+                    MtpLoraPos::Gate | MtpLoraPos::Up => (h32, intermediate()?),
+                    MtpLoraPos::Down => (intermediate()?, h32),
+                })
+            };
+
+            // Train / held-out split (last 20% = held-out → cross-context, since
+            // the broad calib's last rows are the last prompts). The decisive
+            // gate: train ONLY on the train split, measure accept on held-out.
+            let n_ho = (n / 5).clamp(1, n.saturating_sub(1).max(1));
+            let n_tr = (n - n_ho).max(1);
+            let tr_idx = Array::from_slice(&(0..n_tr as i32).collect::<Vec<_>>(), &[n_tr as i32]);
+            let ho_idx =
+                Array::from_slice(&(n_tr as i32..n as i32).collect::<Vec<_>>(), &[n_ho as i32]);
+            let (xe_tr, xh_tr, t_tr) = (
+                x_e.take_axis(&tr_idx, 0)?,
+                x_h.take_axis(&tr_idx, 0)?,
+                t_all.take_axis(&tr_idx, 0)?,
+            );
+            let (xe_ho, xh_ho, t_ho) = (
+                x_e.take_axis(&ho_idx, 0)?,
+                x_h.take_axis(&ho_idx, 0)?,
+                t_all.take_axis(&ho_idx, 0)?,
+            );
+
+            // Top-k soft target arrays (train split only — held-out uses accept).
+            let (soft_ids_tr, soft_ps_tr) = {
+                let m = n_tr;
+                let mut ids = Vec::with_capacity(m * topk);
+                let mut ps = Vec::with_capacity(m * topk);
+                for (rid, rp) in soft.iter().take(n_tr) {
+                    for j in 0..topk {
+                        if j < rid.len() {
+                            ids.push(rid[j] as i32);
+                            ps.push(rp[j]);
+                        } else {
+                            ids.push(0);
+                            ps.push(0.0);
+                        }
+                    }
+                }
+                (
+                    Array::from_slice(&ids, &[m as i32, topk as i32]),
+                    Array::from_slice(&ps, &[m as i32, topk as i32]),
+                )
+            };
+
+            // Accept (argmax-match) on a (embed,h_pre,target) set at the current
+            // flat LoRA args.
+            let accept =
+                |args: &[Array], xe: &Array, xh: &Array, tg: &Array, m: usize| -> Result<f32> {
+                    let set = build_lora_set(&positions, args);
+                    let logits = block
+                        .forward_train_lora_multi(xe, xh, &set, &fnorm, &lmhead)?
+                        .reshape(&[m as i32, -1])?;
+                    let pred = mlx_rs::ops::indexing::argmax_axis(&logits, 1, false)?
+                        .as_dtype(mlx_rs::Dtype::Int32)?;
+                    let eq = pred.eq(tg)?.as_dtype(mlx_rs::Dtype::Float32)?.mean(false)?;
+                    eq.eval()?;
+                    Ok(eq.item::<f32>())
+                };
+
+            // Init flat args [A0,B0,A1,B1,...]: A [r,in] small-random, B [out,r]
+            // zero (delta starts 0 → identical to the real baseline draft).
+            mlx_rs::random::seed(seed)?;
+            let r = rank as i32;
+            let mut args: Vec<Array> = Vec::with_capacity(positions.len() * 2);
+            for &p in &positions {
+                let (din, dout) = dim_in_out(p)?;
+                let mut a = mlx_rs::random::normal::<f32>(&[r, din], None, None, None)?
+                    .multiply(Array::from_f32((1.0 / din as f32).sqrt()))?;
+                let mut b = Array::zeros::<f32>(&[dout, r])?;
+                a.eval()?;
+                b.eval()?;
+                args.push(a);
+                args.push(b);
+            }
+            let n_args = args.len();
+            let argnums: Vec<i32> = (0..n_args as i32).collect();
+            let ho_before = accept(&args, &xe_ho, &xh_ho, &t_ho, n_ho)?;
+
+            // Per-arg AdamW state.
+            let mut m_state: Vec<Array> = args
+                .iter()
+                .map(|a| Array::zeros::<f32>(a.shape()).unwrap())
+                .collect();
+            let mut v_state: Vec<Array> = args
+                .iter()
+                .map(|a| Array::zeros::<f32>(a.shape()).unwrap())
+                .collect();
+            let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+            let wd = weight_decay;
+            let adam =
+                |p: &Array, g: &Array, m: &mut Array, v: &mut Array, t: i32| -> Result<Array> {
+                    *m = m
+                        .multiply(Array::from_f32(b1))?
+                        .add(&g.multiply(Array::from_f32(1.0 - b1))?)?;
+                    *v = v
+                        .multiply(Array::from_f32(b2))?
+                        .add(&g.multiply(g)?.multiply(Array::from_f32(1.0 - b2))?)?;
+                    let mhat = m.divide(Array::from_f32(1.0 - b1.powi(t)))?;
+                    let vhat = v.divide(Array::from_f32(1.0 - b2.powi(t)))?;
+                    let upd = mhat.divide(&mlx_rs::ops::sqrt(&vhat)?.add(Array::from_f32(eps))?)?;
+                    // Decoupled weight decay (AdamW): p -= lr*(upd + wd*p).
+                    let step_dir = if wd > 0.0 {
+                        upd.add(&p.multiply(Array::from_f32(wd))?)?
+                    } else {
+                        upd
+                    };
+                    p.subtract(&step_dir.multiply(Array::from_f32(lr))?)
+                        .map_err(Into::into)
+                };
+
+            // loss_fn trains on the TRAIN split only (held-out untouched).
+            let (xe_c, xh_c, t_c) = (xe_tr.clone(), xh_tr.clone(), t_tr.clone());
+            let fnorm_l = fnorm.clone();
+            let lmhead_l = self.trunk_lm_head_view();
+            let positions_l = positions.clone();
+            let (sid, sps) = (soft_ids_tr.clone(), soft_ps_tr.clone());
+            let m_tr = n_tr;
+            let kl_obj = kl;
+            let loss_fn = move |args: &[Array]| -> Vec<Array> {
+                let set = build_lora_set(&positions_l, args);
+                let logits = block
+                    .forward_train_lora_multi(&xe_c, &xh_c, &set, &fnorm_l, &lmhead_l)
+                    .unwrap()
+                    .reshape(&[m_tr as i32, -1])
+                    .unwrap();
+                let loss = if kl_obj {
+                    // Distillation cross-entropy −Σ_topk p·log_softmax(draft). The
+                    // dropped tail makes it a truncated KL (the entropy term is a
+                    // param-free constant → same gradient as full KL).
+                    let lse = logits.logsumexp_axis(1, true).unwrap(); // [m,1]
+                    let logp = logits.subtract(&lse).unwrap(); // [m,vocab]
+                    let gathered = logp.take_along_axis(&sid, 1).unwrap(); // [m,topk]
+                    let per = gathered.multiply(&sps).unwrap().sum_axis(1, false).unwrap(); // [m]
+                    per.multiply(Array::from_f32(-1.0))
+                        .unwrap()
+                        .mean(false)
+                        .unwrap()
+                } else {
+                    let lse = logits.logsumexp_axis(1, false).unwrap();
+                    let tl = logits
+                        .take_along_axis(&t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
+                        .unwrap()
+                        .reshape(&[m_tr as i32])
+                        .unwrap();
+                    lse.subtract(&tl).unwrap().mean(false).unwrap()
+                };
+                vec![loss]
+            };
+            let mut vg = value_and_grad_with_argnums(loss_fn, &argnums[..]);
+            // Early-stop: keep the args with the best HELD-OUT accept (the
+            // generalizing checkpoint, not the train-loss-minimizing last step).
+            let mut best_ho = ho_before;
+            let mut best_args = args.clone();
+            // Stable-plateau metric: mean held-out over the LAST quarter of
+            // steps. The per-step `best` is a max over `steps` noisy evals (n_ho
+            // samples, σ≈sqrt(p(1-p)/n_ho)) → upward-biased by max-selection
+            // (E[max] ≈ baseline + ~2.5σ even with a no-op LoRA). The tail-mean
+            // is the honest "did the LoRA settle ABOVE baseline" signal.
+            let mut ho_hist: Vec<f32> = Vec::with_capacity(steps);
+            for step in 1..=steps as i32 {
+                let (loss, grads) = vg(&args)?;
+                for i in 0..n_args {
+                    args[i] = adam(&args[i], &grads[i], &mut m_state[i], &mut v_state[i], step)?;
+                    args[i].eval()?;
+                }
+                let ho = accept(&args, &xe_ho, &xh_ho, &t_ho, n_ho)?;
+                ho_hist.push(ho);
+                if ho > best_ho {
+                    best_ho = ho;
+                    best_args = args.clone();
+                }
+                if step <= 8 || step % 20 == 0 || step == steps as i32 {
+                    let tr = accept(&args, &xe_tr, &xh_tr, &t_tr, n_tr)?;
+                    eprintln!(
+                        "[hi-train] step {step:>3}: loss={:.4} train-acc={tr:.3} heldout-acc={ho:.3}",
+                        loss[0].item::<f32>()
+                    );
+                }
+            }
+            let _ = best_args;
+            let tail_start = ho_hist.len().saturating_sub((steps / 4).max(1));
+            let tail = &ho_hist[tail_start..];
+            let tail_mean = if tail.is_empty() {
+                ho_before
+            } else {
+                tail.iter().sum::<f32>() / tail.len() as f32
+            };
+            // 1σ of the held-out accept estimate (binomial), for a noise yardstick.
+            let sigma = ((ho_before * (1.0 - ho_before)) / n_ho as f32).sqrt();
+            let pos_str = positions
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
+            eprintln!(
+                "[hi-train] DONE n={n} (tr={n_tr} ho={n_ho}) pos={pos_str} obj={} rank={rank} wd={wd}: \
+                 HELD-OUT before {ho_before:.3} | tail-mean {tail_mean:.3} (Δ {:+.3}, {:.1}σ) | max {best_ho:.3} (selection-biased)",
+                if kl { "kl" } else { "ce" },
+                tail_mean - ho_before,
+                if sigma > 0.0 {
+                    (tail_mean - ho_before) / sigma
+                } else {
+                    0.0
+                }
+            );
+            // Return the HONEST tail-mean as the verdict number (not the biased max).
+            Ok((ho_before, tail_mean))
+        }
+
         /// Pull a `[1, 1, hidden]` (or `[1, hidden]`) array to a host `Vec<f32>`.
         fn hidden_to_host_f32(&self, h: &Array) -> Result<Vec<f32>> {
             let f = h
@@ -3473,6 +4196,10 @@ mod imp {
             let proc_calib_active = self.mtp_proc_calib_active();
             let c4_calib_active = self.mtp_c4_calib_active();
             let c4_active = self.mtp_c4_active();
+            let hi_calib_active = self.mtp_hi_calib_active();
+            // Head-internal PoC: stash k=0 block inputs (embed, h_pre) → paired
+            // with preds[0] in Step D.
+            let mut hi_k0: Option<(Vec<f32>, Vec<f32>)> = None;
             // Pull the raw chained hidden to host when ANY corrector/calib
             // (diagonal / Procrustes / C4) needs it.
             let need_host = calib_active || proc_calib_active || c4_calib_active;
@@ -3491,6 +4218,12 @@ mod imp {
                 let embeds = self
                     .embed_lookup_single(last_tok)
                     .with_context(|| format!("mtp_step: Step B embed k={k}"))?;
+                if hi_calib_active && k == 0 {
+                    hi_k0 = Some((
+                        self.hidden_to_host_f32(&embeds)?,
+                        self.hidden_to_host_f32(&last_h)?,
+                    ));
+                }
                 let (logits_b, new_h) = block
                     .forward(
                         &embeds,
@@ -3698,6 +4431,23 @@ mod imp {
                         }
                     }
                 }
+                if hi_calib_active {
+                    // Soft target for the KL/distillation objective: top-64 of
+                    // the trunk's verify distribution at position 0 (the k=0
+                    // target). Captured to host; renormalization happens at train.
+                    let soft0 = {
+                        let row = self.logits_row_to_cpu_f32(&verify_logits, 0)?;
+                        topk_softmax(&row, 64)
+                    };
+                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock()) {
+                        if let Some((es, hs, tgts, soft)) = slot.as_mut() {
+                            es.push(e.clone());
+                            hs.push(h.clone());
+                            tgts.push(preds[0]);
+                            soft.push(soft0);
+                        }
+                    }
+                }
                 let mut acc = 0usize;
                 for k in 0..n_draft {
                     if preds[k] == drafts[k] {
@@ -3817,6 +4567,17 @@ mod imp {
             // in the trunk cache; the drafter only needs intra-step attention.
             mtp_kv.clear();
 
+            // Per-stage timing (LUMEN_MTP_STAGE_TIMING=1) — localizes the K>1
+            // overhead (drafter head-fwds vs verify forward vs SSM rollback) so
+            // the verify-kernel/capture-commit work targets the real cost. eval()
+            // at each boundary defeats MLX lazy scheduling (same as fine-timing).
+            let st = std::env::var("LUMEN_MTP_STAGE_TIMING")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let (mut t_draft, mut t_snap, mut t_verify, mut t_accept, mut t_carry, mut t_roll) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let mut roll_replay = false;
+
             // Resolve the drafter seed: (lead_token, h_draft, emit_lead).
             //   - lead_token: the guaranteed-correct token that opens `verify_in`
             //     and gets written to the cache by the verify forward.
@@ -3873,6 +4634,7 @@ mod imp {
             } else {
                 Vec::new()
             };
+            let t_draft0 = st.then(Instant::now);
             for k in 0..n_draft {
                 let embeds = self
                     .embed_lookup_single(last_tok)
@@ -3901,10 +4663,17 @@ mod imp {
                 last_h = new_h;
                 last_tok = draft_tok;
             }
+            if let Some(t) = t_draft0 {
+                t_draft = t.elapsed().as_secs_f64() * 1000.0;
+            }
 
             // Snapshot pre-verify for the capture-commit replay fallback.
+            let t_snap0 = st.then(Instant::now);
             let snap = PromptCacheSnapshot::capture_shallow(trunk_cache, verify_base)
                 .context("mtp_step1: snapshot pre-verify failed")?;
+            if let Some(t) = t_snap0 {
+                t_snap = t.elapsed().as_secs_f64() * 1000.0;
+            }
             let use_capture = std::env::var("LUMEN_MTP_CAPTURE_COMMIT")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -3920,9 +4689,18 @@ mod imp {
             // Full (non-last_only) forward stashes hidden BEFORE the lm_head
             // slice, so the capture slot holds [1, K+1, hidden].
             self.set_mtp_capture_enabled(true);
+            let t_verify0 = st.then(Instant::now);
             let verify_logits = self
                 .forward(&verify_in, trunk_cache)
                 .context("mtp_step1: verify forward")?;
+            if st {
+                // Force the whole verify graph (SSM + capture writes are ancestors
+                // of these logits) so the timer captures real GPU work, not queue.
+                verify_logits
+                    .eval()
+                    .context("mtp_step1: verify timing eval")?;
+                t_verify = t_verify0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            }
             self.set_mtp_capture_enabled(false);
             if use_capture {
                 self.set_ssm_capture_enabled(false);
@@ -3942,6 +4720,7 @@ mod imp {
             let debug = std::env::var("LUMEN_MTP_DEBUG")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+            let t_accept0 = st.then(Instant::now);
             let (n_accepted, correction) = if sampling {
                 let mut acc = 0usize;
                 let corr;
@@ -3993,16 +4772,27 @@ mod imp {
                 }
                 (acc, preds[acc])
             };
+            if let Some(t) = t_accept0 {
+                t_accept = t.elapsed().as_secs_f64() * 1000.0;
+            }
 
             // Next cycle's carry: trunk pre-final-norm hidden at verify position
             // n_accepted = predecessor hidden of the correction token. Same
             // capture site/distribution as the bootstrap's h_draft.
+            let t_carry0 = st.then(Instant::now);
             let idx = Array::from_slice(&[n_accepted as i32], &[1]);
             let next_carried = verify_hidden_all
                 .take_axis(&idx, 1)
                 .context("mtp_step1: select verify_hidden[n_accepted]")?;
+            if st {
+                next_carried
+                    .eval()
+                    .context("mtp_step1: carry timing eval")?;
+                t_carry = t_carry0.unwrap().elapsed().as_secs_f64() * 1000.0;
+            }
 
             // === Rollback to keep [lead_token, accepted_drafts] ===
+            let t_roll0 = st.then(Instant::now);
             let target_offset = verify_base + 1 + n_accepted;
             let cur_offset = trunk_cache.full_attn_offset();
             if cur_offset > target_offset {
@@ -4019,14 +4809,28 @@ mod imp {
                     false
                 };
                 if !committed_by_capture {
+                    roll_replay = true;
                     snap.restore_into(trunk_cache)
                         .context("mtp_step1: snapshot restore failed")?;
                     let mut replay: Vec<u32> = Vec::with_capacity(1 + n_accepted);
                     replay.push(lead_token);
                     replay.extend_from_slice(&drafts[..n_accepted]);
-                    self.forward_with_opts(&replay, trunk_cache, /* last_only */ true)
+                    let rlog = self
+                        .forward_with_opts(&replay, trunk_cache, /* last_only */ true)
                         .context("mtp_step1: replay forward failed")?;
+                    if st {
+                        rlog.eval().context("mtp_step1: replay timing eval")?;
+                    }
                 }
+            }
+            if let Some(t) = t_roll0 {
+                t_roll = t.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[mtp-stage] K={n_draft} acc={n_accepted} draft={t_draft:.2} snap={t_snap:.2} \
+                     verify={t_verify:.2} accept={t_accept:.2} carry={t_carry:.2} \
+                     roll={t_roll:.2} replay={}",
+                    if roll_replay { 1 } else { 0 }
+                );
             }
 
             // === Commit output ===

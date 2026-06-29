@@ -102,6 +102,21 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 24,
         notes: "MoE flagship. 35B params, ~3B active per token. Best speed/quality on M3 Max.",
     },
+    RecommendedModel {
+        // Dense 27B with a built-in MTP self-speculative head (mtp/weights.safetensors
+        // sidecar in the repo). 4-bit affine (group-64), ~16 GB. The dense trunk
+        // gives higher MTP draft-accept than the 35B MoE, so self-spec decode nets
+        // ~17.5 tok/s on M3 Max (≈19 with 3-bit requant via LUMEN_NATIVE_REQUANT_BITS=3).
+        // The plain `Qwen/Qwen3.6-27B` base has NO mtp head → no speculative speedup,
+        // so prefer this MTPLX build. Serve with MTP: native runner + LUMEN_QWEN35_MTP=1
+        // + LUMEN_SPEC=mtp + LUMEN_QWEN35_HF_ORIGINAL=<this model dir>.
+        id: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+        family: ModelFamily::Qwen35Dense,
+        label: "Qwen 3.6 — 27B Dense (MTPLX)",
+        approx_size_gb: 16,
+        min_ram_gb: 24,
+        notes: "Dense 27B, 4-bit affine, with a built-in MTP self-speculative head. Stronger English / math / code than the 35B MoE; ~17.5 tok/s decode on M3 Max with MTP (≈19 at 3-bit). ~16 GB, needs ~24 GB RAM. Enable speculative decode: native runner + `LUMEN_QWEN35_MTP=1` + `LUMEN_SPEC=mtp` (point `LUMEN_QWEN35_HF_ORIGINAL` at the model dir, which holds the `mtp/` head).",
+    },
     // Gemma 4 lineup — the NVFP4 base + two derived hybrids that share its fast
     // NVFP4 expert core. Built + measured 2026-06-02 (see the hsng95
     // `…-nvfp4-{smin,qmax}-mlx` model cards). NVFP4's finer per-group scales
