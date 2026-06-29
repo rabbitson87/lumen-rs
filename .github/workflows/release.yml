@@ -31,7 +31,16 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: macos-14
+    # macos-26 (not macos-14): the MLX Neural-Accelerator (NAX) GEMM path —
+    # the M5 Pro/Max prefill speedup — is gated at runtime by
+    # `is_nax_available()`, which expands to `__builtin_available(macOS 26.2)`.
+    # Compiling that guard needs an SDK that *knows* macOS 26.2, i.e. Xcode 26.x.
+    # macos-14/macos-15 default to Xcode 16.x and don't reliably carry Xcode 26
+    # (disk-space constrained), so they fail with "macOS 26.2 is not a valid
+    # availability version". macos-26 (GA, arm64-native) ships Xcode 26.x by
+    # default. The kernels are baked into the metallib host-independently, so an
+    # arm64 runner builds a binary that activates the M5 path at runtime on M5.
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +58,17 @@ jobs:
           # binary path; the workflow places it relative to the workspace
           # root, so the checkout depth must be full (not shallow).
           fetch-depth: 0
+
+      # ── Pin newest stable Xcode (macOS 26.2 SDK for the NAX availability guard) ──
+      # macos-26 already defaults to Xcode 26.x, but GitHub rotates that default
+      # (26.0.1 → 26.2 → 26.3 …) and trims old point releases for disk space.
+      # `latest-stable` deterministically selects the newest installed 26.x so
+      # MLX's `__builtin_available(macOS 26.2, *)` guard always finds a ≥26.2 SDK
+      # and libmlx/metallib build with the NAX kernels.
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
       # ── Toolchains ────────────────────────────────────────────────
       - name: Install Rust toolchain (with matrix target)
