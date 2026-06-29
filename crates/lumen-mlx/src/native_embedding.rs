@@ -314,7 +314,7 @@ mod parity_tests {
         let ids = Array::from_slice(&ids_i32, &[fx.n_tokens as i32]);
 
         let bf16 = quantized_embedding_lookup_with_mode(
-            &packed, &scales, &ids, GROUP_SIZE, BITS, MODE_MXFP4,
+            &packed, &scales, None, &ids, GROUP_SIZE, BITS, MODE_MXFP4,
         )
         .expect("mxfp4 quantized embedding lookup must succeed");
         assert_eq!(

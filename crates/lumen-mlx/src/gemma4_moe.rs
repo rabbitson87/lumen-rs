@@ -7679,20 +7679,25 @@ pub(crate) mod imp {
             assert_eq!(mode, MODE_AFFINE);
         }
 
-        /// Mode strings outside the supported set must be rejected at validation
-        /// time, with the offending mode echoed in the error message so
-        /// `mlx_lm.convert`'s `--q-mode nvfp4` / `mxfp8` builds fail fast at
-        /// load rather than producing silent garbage during decode.
+        /// Mode strings outside the supported set {affine, mxfp4, mxfp8, nvfp4}
+        /// must be rejected at validation time, with the offending mode echoed
+        /// in the error message so `mlx_lm.convert` builds with an unknown
+        /// `--q-mode` fail fast at load rather than producing silent garbage
+        /// during decode. (nvfp4 / mxfp8 are now supported — use a deliberately
+        /// bogus mode so this stays meaningful as the supported set grows.)
         #[test]
         fn rejects_unsupported_quant_mode() {
             let json = minimal_config_json(
                 r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
                 true,
             )
-            .replace(r#""mode":"affine""#, r#""mode":"nvfp4""#);
+            .replace(r#""mode":"affine""#, r#""mode":"notarealmode""#);
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
             let err = cfg.validate_gemma4_family().unwrap_err().to_string();
-            assert!(err.contains("nvfp4"), "error should echo bad mode: {err}");
+            assert!(
+                err.contains("notarealmode"),
+                "error should echo bad mode: {err}"
+            );
         }
 
         /// Overrides with an explicit `"mode": "mxfp4"` dispatch MODE_MXFP4
@@ -7785,8 +7790,14 @@ pub(crate) mod imp {
             assert!(cfg.validate_gemma4_family().is_err());
         }
 
+        /// A config WITHOUT the lmstudio-style per-tensor MLP override must
+        /// still validate: in-house `mlx_lm.convert` builds keep MLPs at the
+        /// default bit-width, and per-key dispatch via `quant_params_for`
+        /// handles whatever overrides (if any) the config actually contains.
+        /// (Was `rejects_missing_mlp_override`; the sanity probe that required
+        /// the override was removed — see `validate_gemma4_family`.)
         #[test]
-        fn rejects_missing_mlp_override() {
+        fn accepts_missing_mlp_override() {
             let json = minimal_config_json(
                 r#""sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention""#,
                 true,
@@ -7796,7 +7807,8 @@ pub(crate) mod imp {
                 "",
             );
             let cfg: NativeGemma4Config = serde_json::from_str(&json).expect("parse");
-            assert!(cfg.validate_gemma4_family().is_err());
+            cfg.validate_gemma4_family()
+                .expect("missing MLP override is allowed (per-key dispatch handles defaults)");
         }
 
         #[test]
