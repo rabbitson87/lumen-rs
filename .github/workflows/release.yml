@@ -70,6 +70,22 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      # ── Metal Toolchain (the `metal` shader compiler) ─────────────
+      # Xcode 26 ships the Metal compiler as a *separately downloadable*
+      # component, and macos-26 runners don't pre-install it. mlx-sys's CMake
+      # build compiles MLX's Metal kernels into mlx.metallib via the `metal`
+      # tool, so without this the next step dies with:
+      #   "error: cannot execute tool 'metal' due to missing Metal Toolchain;
+      #    use: xcodebuild -downloadComponent MetalToolchain".
+      # Idempotent; retry once for the occasionally-flaky asset download.
+      - name: Download Metal Toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain \
+            || (sleep 20 && xcodebuild -downloadComponent MetalToolchain)
+          # Fail fast here (not 10 min into the CMake build) if metal is still absent.
+          xcrun -f metal
+          xcrun metal --version || true
+
       # ── Toolchains ────────────────────────────────────────────────
       - name: Install Rust toolchain (with matrix target)
         uses: dtolnay/rust-toolchain@stable
