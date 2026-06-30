@@ -1474,7 +1474,6 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        use crate::chat_io::{ChatTurn, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
                 let _ = (top_p, temperature, ov, session_id);
@@ -3729,8 +3728,7 @@ impl MlxQwen35Backend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        use crate::chat_io::BackendStreamEvent;
-        use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
+        use crate::qwen3_5_tools::Qwen35ResponseParser;
 
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));

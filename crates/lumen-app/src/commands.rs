@@ -163,6 +163,20 @@ pub async fn set_active_model(
     state: State<'_, AppState>,
     model_id: String,
 ) -> CmdResult<PersistentConfig> {
+    // Diffusion image models (`flux2-dev`) are synthetic catalog ids — they are
+    // NOT a single on-disk directory (the diffusion backend assembles them from
+    // several component repos), so they never appear in `scan_local`. Promote
+    // them to active directly, bypassing the on-disk readiness check below.
+    {
+        let cat = state.catalog.lock().await;
+        if cat.is_image_model(&model_id) {
+            drop(cat);
+            let mut g = state.config.lock().await;
+            g.active_model = Some(model_id);
+            g.save().map_err(err)?;
+            return Ok(g.clone());
+        }
+    }
     // Validate the model is on disk AND its download completed cleanly
     // before promoting it to active. Without this, a truncated shard
     // can be selected as the active model and the server crashes
@@ -369,6 +383,16 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     // locally we pass the absolute path as MODEL_ID — the MLX native runner
     // and tokenizer loader both detect `is_dir()` and skip HF Hub entirely.
     let cat = state.catalog.lock().await;
+    // Diffusion image model → launch the server in dedicated image mode and skip
+    // the chat-model path/byte resolution (the diffusion backend loads its own
+    // hardcoded component repos; MODEL_ID is unused in image mode).
+    if cat.is_image_model(&active_id) {
+        drop(cat);
+        return sup
+            .start(app, &cfg, &active_id, None, /* image_mode */ true)
+            .await
+            .map_err(err);
+    }
     let entries = models::scan_local(&models_dir, &cat).map_err(err)?;
     let active_entry = entries.iter().find(|m| m.id == active_id);
 
@@ -393,9 +417,15 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     };
     drop(cat);
 
-    sup.start(app, &cfg, &model_arg, active_bytes)
-        .await
-        .map_err(err)
+    sup.start(
+        app,
+        &cfg,
+        &model_arg,
+        active_bytes,
+        /* image_mode */ false,
+    )
+    .await
+    .map_err(err)
 }
 
 #[tauri::command]
@@ -429,6 +459,87 @@ pub async fn server_metrics(state: State<'_, AppState>) -> CmdResult<ServerMetri
         ms_per_step: snap.ms_per_step,
         kv_cache_mb: None,
         requests_per_min: snap.requests_per_min,
+    })
+}
+
+// ── Text-to-image generation (diffusion proxy) ──────────────────────
+
+/// One generated image, returned as a base-64 PNG (OpenAI `images` shape).
+#[derive(Debug, Serialize)]
+pub struct GeneratedImage {
+    /// Base-64-encoded PNG bytes (no `data:` prefix). The frontend wraps this
+    /// in `data:image/png;base64,<…>` for `<img src>` + download.
+    pub b64_json: String,
+}
+
+/// Proxy a text-to-image request to the locally-running server's
+/// `POST /v1/images/generations` endpoint (image mode). Runs the HTTP call
+/// from Rust so the Tauri webview never has to fetch a custom localhost port
+/// itself (avoids any CSP / mixed-content surprises across platforms).
+///
+/// The server must already be Running in image mode — `start_server` does that
+/// when the active model is a diffusion catalog id. Generation is slow
+/// (minutes on 36 GB), so the per-request timeout is generous.
+#[tauri::command]
+pub async fn generate_image(
+    state: State<'_, AppState>,
+    prompt: String,
+    size: String,
+    steps: u32,
+    seed: i64,
+    guidance: f32,
+) -> CmdResult<GeneratedImage> {
+    let status = state.supervisor.status().await;
+    if status.state != server::LifecycleState::Running {
+        return Err("server is not running — start it in image mode first".to_string());
+    }
+    // Loopback host for the request even if the server binds 0.0.0.0 / ::.
+    let host = match status.host.as_str() {
+        "0.0.0.0" | "::" | "" => "127.0.0.1",
+        h => h,
+    };
+    let url = format!("http://{host}:{}/v1/images/generations", status.port);
+
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "size": size,
+        "steps": steps,
+        "seed": seed,
+        "guidance": guidance,
+    });
+
+    let client = reqwest::Client::builder()
+        // Image generation can take several minutes; don't cut it short.
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(err)?;
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("image generation failed ({code}): {text}"));
+    }
+
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response JSON: {e}"))?;
+    let b64 = parsed
+        .get("data")
+        .and_then(|d| d.get(0))
+        .and_then(|d| d.get("b64_json"))
+        .and_then(|b| b.as_str())
+        .ok_or_else(|| "response missing data[0].b64_json".to_string())?;
+
+    Ok(GeneratedImage {
+        b64_json: b64.to_string(),
     })
 }
 

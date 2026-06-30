@@ -25,6 +25,7 @@
   import DoctorPanel from "./lib/DoctorPanel.svelte";
   import UpdatePanel from "./lib/UpdatePanel.svelte";
   import ApiTabs from "./lib/ApiTabs.svelte";
+  import ImagePanel from "./lib/ImagePanel.svelte";
   import { bytes, duration } from "./lib/format";
   import { i18n, t, LOCALE_LABELS, type Locale } from "./lib/i18n.svelte";
 
@@ -222,6 +223,24 @@
     if (!config?.active_model) return null;
     return models.find((m) => m.id === config!.active_model) ?? null;
   });
+
+  // Text-to-image catalog entries. `image_models` is `#[serde(default)]` on the
+  // Rust side so it may be absent against an older server binary — default [].
+  let imageModels = $derived(catalog.image_models ?? []);
+
+  // The active model id, if it is a diffusion image model. Drives both the
+  // image-models card's ✓ state and the generation panel's visibility.
+  let activeImageModelId = $derived.by(() => {
+    const id = config?.active_model;
+    if (!id) return null;
+    return imageModels.some((m) => m.id === id) ? id : null;
+  });
+
+  // Show the generation panel only when an image model is active AND the
+  // server is up (image mode serves POST /v1/images/generations).
+  let imagePanelVisible = $derived(
+    activeImageModelId != null && status.state === "running",
+  );
 
   // Memory the model can realistically claim, reclaim-aware. macOS evicts /
   // swap-compresses inactive + compressor + other apps' active pages when a big
@@ -1465,6 +1484,49 @@
     {/if}
   </section>
 
+  <!-- IMAGE MODELS (text-to-image / diffusion) -->
+  {#if imageModels.length > 0}
+  <section class="{cardBase} col-span-3">
+    <h2 class={cardH2}>{t("imageModels.title")} <span class="dim">{t("imageModels.titleHint")}</span></h2>
+    <div class="flex flex-col gap-2">
+      {#each imageModels as im}
+        {@const isActive = config?.active_model === im.id}
+        {@const fits = !systemInfo || im.min_ram_gb <= systemInfo.ram_gb}
+        <div
+          class={`image-card relative overflow-hidden flex flex-col gap-1.5 px-3 py-2.5 rounded-md bg-panel-2 border ${
+            isActive
+              ? "border-accent shadow-[0_0_0_1px_var(--color-accent)_inset] bg-accent/6"
+              : "border-transparent hover:border-border"
+          }`}
+        >
+          <!-- Diagonal corner ribbon marking this as an image / diffusion model -->
+          <span class="image-ribbon" aria-hidden="true">{t("imageModels.badge")}</span>
+          <div class="flex items-center gap-2 pl-5">
+            <span class="mono text-ok font-bold w-4">{isActive ? "✓" : ""}</span>
+            <div class="min-w-0 flex-1">
+              <div class="text-[13px] text-text">{im.label}</div>
+              <div class="dim mono text-[11px]">{im.id} · {im.approx_size_gb}GB · ≥{im.min_ram_gb}GB RAM</div>
+            </div>
+            <button
+              class="primary"
+              onclick={() => setActive(im.id)}
+              disabled={isActive}
+              title={fits ? "" : t("imageModels.action.title.overBudget")}
+            >{isActive ? t("imageModels.active") : t("action.use")}</button>
+          </div>
+          {#if !fits}
+            <div class="text-warn text-[11px] leading-normal">⚠ {t("imageModels.overBudget")}</div>
+          {/if}
+          <div class="dim text-[11px] leading-normal">{im.notes}</div>
+        </div>
+      {/each}
+    </div>
+    {#if activeImageModelId != null && status.state !== "running"}
+      <div class="dim mt-2.5 text-[11px] leading-normal">{t("imageModels.startHint")}</div>
+    {/if}
+  </section>
+  {/if}
+
   <!-- SERVER -->
   <section class="{cardBase} col-span-3">
     <h2 class={cardH2}>{t("server.title")}</h2>
@@ -1590,6 +1652,12 @@
       </div>
     {/if}
   </section>
+
+  <!-- IMAGE GENERATION PANEL — only when a diffusion model is active and the
+       server is running in image mode (serves POST /v1/images/generations). -->
+  {#if imagePanelVisible && activeImageModelId}
+    <ImagePanel modelId={activeImageModelId} />
+  {/if}
 
   {/if}
 
@@ -1958,5 +2026,42 @@
   }
   details.mem-explainer[open] > summary::before {
     content: "▾ ";
+  }
+
+  /* Diagonal "IMAGE" corner ribbon for text-to-image / diffusion model cards.
+     Classic technique: a wide banner pinned beyond the top-left corner and
+     rotated -45° so it crosses the corner at a diagonal. The parent card sets
+     `position: relative; overflow: hidden;` (Tailwind `relative overflow-hidden`)
+     so the banner is clipped to a neat triangle. Colors come from the app's
+     accent token — no hardcoded brand values. */
+  .image-ribbon {
+    position: absolute;
+    top: 9px;
+    left: -30px;
+    width: 96px;
+    transform: rotate(-45deg);
+    transform-origin: center;
+    text-align: center;
+    background: var(--accent);
+    color: var(--bg);
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    line-height: 14px;
+    text-transform: uppercase;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    user-select: none;
+    z-index: 1;
+  }
+
+  /* When this image model is the selected / active one, brighten the ribbon
+     so the active image model is unmistakably distinguished. */
+  .image-card.border-accent .image-ribbon {
+    background: var(--accent);
+    color: var(--bg);
+    box-shadow:
+      0 0 0 1px var(--accent),
+      0 1px 4px rgba(0, 0, 0, 0.55);
   }
 </style>

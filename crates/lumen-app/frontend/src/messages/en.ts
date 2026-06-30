@@ -266,6 +266,29 @@ export const en: Record<string, string> = {
   "models.embedding.autoFetched": "(server auto-fetched from cache)",
   "models.embedding.pickHint": "Pick / change in the API tab",
 
+  // ── Image models card (text-to-image / diffusion) ───────────────
+  "imageModels.title": "IMAGE MODELS",
+  "imageModels.titleHint": "text-to-image",
+  "imageModels.badge": "IMAGE",
+  "imageModels.active": "Active",
+  "imageModels.overBudget": "Larger than this Mac's RAM — generation may swap or fail.",
+  "imageModels.action.title.overBudget": "Exceeds this Mac's RAM budget",
+  "imageModels.startHint": "Press Start to launch the server in image mode, then a generation panel appears below.",
+
+  // ── Image generation panel ──────────────────────────────────────
+  "image.title": "IMAGE GENERATION",
+  "image.prompt": "Prompt",
+  "image.prompt.placeholder": "A cinematic photo of a red fox in a snowy forest, golden hour…",
+  "image.size": "Size",
+  "image.steps": "Steps",
+  "image.steps.hint": "Default 28. Use 4–8 for a fast draft.",
+  "image.seed": "Seed",
+  "image.guidance": "Guidance",
+  "image.generate": "Generate",
+  "image.generating": "Generating…",
+  "image.generating.note": "This can take a few minutes on 36 GB.",
+  "image.download": "Download PNG",
+
   // ── EnvOverrides panel ──────────────────────────────────────────
   "env.title": "Environment overrides",
   "env.intro":

@@ -1,0 +1,49 @@
+[package]
+name = "lumen-diffusion"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLUX.2-dev native diffusion subsystem (text-to-image).
+#
+# Deliberately separate from the autoregressive LLM stack (KV cache / MTP /
+# chat): diffusion is iterative denoising, sharing none of that machinery. This
+# crate reuses only the low-level MLX primitives (quantized matmul, SDPA, norms)
+# from the patched mlx-rs fork — the same one lumen-mlx pins — plus a handful of
+# net-new ops (Conv2d, 4D RoPE, AdaLN, GroupNorm) that the LLM path never needed.
+#
+# Like lumen-mlx, the MLX path is feature-gated (`mlx-native`, off by default)
+# so a plain `cargo build` at the workspace root stays light and never compiles
+# the heavy mlx-sys fork unless explicitly requested.
+#
+# Design docs: .ai/memory/active/flux2-dev-diffusion-port/{PLAN,CONTEXT,CHECKLIST}.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+anyhow = "1.0.102"
+
+# bf16 -> f32 conversion for the BF16 diffusers weights (VAE / DiT / text enc).
+half = "2.7.1"
+# Parse the safetensors JSON header (self-contained loader; no safetensors crate).
+serde_json = "1"
+# PNG encoding for the generated image (decoder output → RGB8 → file).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Live FLUX.2 prompt tokenization (Mistral/Tekken). Pure-Rust / CPU-only, so it
+# is an unconditional dep — no MLX/Metal needed to turn a prompt into token ids.
+tokenizers = { workspace = true }
+
+# Patched mlx-rs / mlx-sys fork (rabbitson87/mlx-rs, lumen-rs-patches branch).
+# Pinned to the SAME rev as lumen-mlx so cargo reuses the already-compiled
+# dependency rather than building a second copy. Provides conv2d / conv_transpose2d
+# / group-norm / quantized_matmul used across the VAE, DiT, and text encoder.
+mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true, default-features = false, features = [
+    "accelerate",
+] }
+mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true }
+
+[features]
+default = []
+mlx-native = ["dep:mlx-rs", "dep:mlx-sys", "mlx-rs/safetensors"]
+mlx-native-metal = ["mlx-native", "mlx-rs/metal"]

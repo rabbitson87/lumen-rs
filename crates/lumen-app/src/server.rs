@@ -353,6 +353,7 @@ impl ServerSupervisor {
         cfg: &PersistentConfig,
         model_id: &str,
         active_model_bytes: Option<u64>,
+        image_mode: bool,
     ) -> Result<ServerStatus> {
         {
             let g = self.inner.lock().await;
@@ -376,7 +377,7 @@ impl ServerSupervisor {
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_env(&mut cmd, cfg, model_id, active_model_bytes);
+        apply_env(&mut cmd, cfg, model_id, active_model_bytes, image_mode);
 
         let mut child = cmd
             .spawn()
@@ -672,11 +673,21 @@ fn apply_env(
     cfg: &PersistentConfig,
     model_id: &str,
     active_model_bytes: Option<u64>,
+    image_mode: bool,
 ) {
     // ── Core ────────────────────────────────────────────────────────
     cmd.env("MODEL_ID", model_id)
         .env("PORT", cfg.server.port.to_string())
         .env("LUMEN_HOST", &cfg.server.host);
+
+    // Diffusion image model → launch in dedicated image mode (no LLM load; the
+    // ~30 GB pipeline cannot co-reside with an LLM on a 36 GB Mac). MODEL_ID is
+    // harmless here (the LLM stays unloaded). Crucially we must NOT pin a wired
+    // limit below in image mode — the diffusion working set (~31 GB) exceeds the
+    // device recommended set and pinning it OOM-kills the load.
+    if image_mode {
+        cmd.env("LUMEN_SERVE", "image");
+    }
 
     match cfg.server.cors {
         CorsMode::Off => cmd.env("LUMEN_CORS", "off"),
@@ -688,7 +699,13 @@ fn apply_env(
     }
 
     // ── Metal memory caps ──────────────────────────────────────────
-    if cfg.server.disable_wired_limit {
+    // Image mode manages its own governors server-side (skips the wired ceiling
+    // because the ~31 GB diffusion working set exceeds the device recommended
+    // set). Pinning a wired/byte limit from here would re-introduce the OOM, so
+    // leave all caps unset and let the server pick image-mode defaults.
+    if image_mode {
+        // no-op: server-side image-mode memory defaults apply.
+    } else if cfg.server.disable_wired_limit {
         cmd.env("LUMEN_DISABLE_WIRED_LIMIT", "1");
     } else {
         // Wired limit precedence:

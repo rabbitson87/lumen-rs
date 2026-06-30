@@ -48,12 +48,26 @@ pub struct RecommendedEmbedding {
     pub notes: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecommendedImageModel {
+    pub id: String,
+    pub label: String,
+    pub approx_size_gb: u32,
+    pub min_ram_gb: u32,
+    pub notes: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub families: Vec<FamilyInfo>,
     pub recommended: Vec<RecommendedModel>,
     #[serde(default)]
     pub embeddings: Vec<RecommendedEmbedding>,
+    /// Text-to-image (diffusion) models. Served in `LUMEN_SERVE=image` mode via
+    /// `POST /v1/images/generations`. `#[serde(default)]` keeps older servers
+    /// (no `image_models` field) deserializing cleanly.
+    #[serde(default)]
+    pub image_models: Vec<RecommendedImageModel>,
 }
 
 impl Catalog {
@@ -97,6 +111,20 @@ impl Catalog {
                 canonical_name(&r.id.rsplit('/').next().unwrap_or(&r.id).to_lowercase());
             rid_canon == id_canon || rsuf_canon == suf_canon
         })
+    }
+
+    /// Find a text-to-image model entry by id (exact or trailing-component).
+    pub fn find_image_model(&self, id: &str) -> Option<&RecommendedImageModel> {
+        let suffix = id.rsplit('/').next().unwrap_or(id);
+        self.image_models
+            .iter()
+            .find(|m| m.id == id || m.id.rsplit('/').next().unwrap_or(&m.id) == suffix)
+    }
+
+    /// Whether the given active-model id refers to a diffusion image model
+    /// (→ launch the server in `LUMEN_SERVE=image` mode).
+    pub fn is_image_model(&self, id: &str) -> bool {
+        self.find_image_model(id).is_some()
     }
 }
 

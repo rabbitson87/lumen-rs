@@ -80,6 +80,7 @@ fn main() {
             commands::stop_server,
             commands::server_status,
             commands::server_metrics,
+            commands::generate_image,
             commands::open_config_dir,
             commands::get_system_info,
             commands::get_memory_usage,

@@ -1113,6 +1113,82 @@ pub struct EmbeddingResponse {
 // test class is the first place to look if deserialization fails.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// === OpenAI Images API types (POST /v1/images/generations) ===
+
+/// Request body for `POST /v1/images/generations`. OpenAI-compatible plus a
+/// few diffusion extensions (`steps`, `seed`, `guidance`).
+#[derive(Debug, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub prompt: String,
+    #[serde(default = "default_image_n")]
+    pub n: usize,
+    /// One of "256x256", "512x512", "1024x1024". Default "1024x1024".
+    #[serde(default)]
+    pub size: Option<String>,
+    /// "b64_json" (supported) or "url" (rejected — local server has no URL host).
+    #[serde(default)]
+    pub response_format: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    // ── diffusion extensions ──
+    /// Denoise steps. Default 28.
+    #[serde(default = "default_image_steps")]
+    pub steps: usize,
+    /// Latent RNG seed. Default 0. Varied per image when `n > 1`.
+    #[serde(default)]
+    pub seed: u64,
+    /// Classifier-free guidance scalar. Default 4.0.
+    #[serde(default = "default_image_guidance")]
+    pub guidance: f32,
+}
+
+fn default_image_n() -> usize {
+    1
+}
+fn default_image_steps() -> usize {
+    28
+}
+fn default_image_guidance() -> f32 {
+    4.0
+}
+
+impl ImageGenerationRequest {
+    /// Parse `(width, height)` from the `size` field. Accepts "WxH" with
+    /// W,H multiples of 16. Defaults to 1024x1024 when absent.
+    pub fn dimensions(&self) -> Result<(i32, i32), String> {
+        let s = self.size.as_deref().unwrap_or("1024x1024");
+        let (w, h) = s
+            .split_once('x')
+            .ok_or_else(|| format!("invalid size {s:?}; expected WxH e.g. \"512x512\""))?;
+        let w: i32 = w
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid width in size {s:?}"))?;
+        let h: i32 = h
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid height in size {s:?}"))?;
+        if w <= 0 || h <= 0 || w % 16 != 0 || h % 16 != 0 {
+            return Err(format!(
+                "size {s:?}: width/height must be positive multiples of 16"
+            ));
+        }
+        Ok((w, h))
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageGenerationResponse {
+    pub created: u64,
+    pub data: Vec<ImageData>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+}
+
 #[cfg(test)]
 mod tool_calling_serde {
     use super::*;
@@ -1617,5 +1693,43 @@ mod tool_calling_serde {
         });
         let req: AnthropicRequest = serde_json::from_value(raw).unwrap();
         assert!(!req.enable_thinking());
+    }
+
+    #[test]
+    fn image_request_defaults_and_dimensions() {
+        let raw = serde_json::json!({ "prompt": "a red fox in snow" });
+        let req: ImageGenerationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.n, 1);
+        assert_eq!(req.steps, 28);
+        assert_eq!(req.seed, 0);
+        assert!((req.guidance - 4.0).abs() < 1e-6);
+        // Default size is 1024x1024 when `size` is absent.
+        assert_eq!(req.dimensions().unwrap(), (1024, 1024));
+    }
+
+    #[test]
+    fn image_request_parses_explicit_size_and_extensions() {
+        let raw = serde_json::json!({
+            "prompt": "p",
+            "n": 2,
+            "size": "512x512",
+            "steps": 10,
+            "seed": 7,
+            "guidance": 3.5,
+            "response_format": "b64_json",
+        });
+        let req: ImageGenerationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.n, 2);
+        assert_eq!(req.steps, 10);
+        assert_eq!(req.seed, 7);
+        assert!((req.guidance - 3.5).abs() < 1e-6);
+        assert_eq!(req.dimensions().unwrap(), (512, 512));
+    }
+
+    #[test]
+    fn image_request_rejects_non_multiple_of_16_size() {
+        let raw = serde_json::json!({ "prompt": "p", "size": "513x512" });
+        let req: ImageGenerationRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.dimensions().is_err());
     }
 }

@@ -259,6 +259,29 @@ export const ko: Record<string, string> = {
   "models.embedding.autoFetched": "(서버가 캐시에서 자동 로드)",
   "models.embedding.pickHint": "API 탭에서 선택 / 변경",
 
+  // ── 이미지 모델 카드 (텍스트→이미지 / 디퓨전) ──────────────────
+  "imageModels.title": "이미지 모델",
+  "imageModels.titleHint": "텍스트→이미지",
+  "imageModels.badge": "IMAGE",
+  "imageModels.active": "사용 중",
+  "imageModels.overBudget": "이 Mac의 RAM보다 큽니다 — 생성 시 스왑되거나 실패할 수 있습니다.",
+  "imageModels.action.title.overBudget": "이 Mac의 RAM 예산을 초과합니다",
+  "imageModels.startHint": "시작을 눌러 서버를 이미지 모드로 실행하면 아래에 생성 패널이 나타납니다.",
+
+  // ── 이미지 생성 패널 ────────────────────────────────────────────
+  "image.title": "이미지 생성",
+  "image.prompt": "프롬프트",
+  "image.prompt.placeholder": "눈 덮인 숲 속 붉은 여우의 영화 같은 사진, 황금빛 시간…",
+  "image.size": "크기",
+  "image.steps": "스텝",
+  "image.steps.hint": "기본값 28. 빠른 초안에는 4–8 사용.",
+  "image.seed": "시드",
+  "image.guidance": "가이던스",
+  "image.generate": "생성",
+  "image.generating": "생성 중…",
+  "image.generating.note": "36 GB에서는 몇 분 걸릴 수 있습니다.",
+  "image.download": "PNG 다운로드",
+
   // ── 환경 변수 패널 ──────────────────────────────────────────────
   "env.title": "환경 변수 오버라이드",
   "env.intro":

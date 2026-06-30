@@ -46,7 +46,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 /// Sidecar filename inside a quantized model directory.
 pub const SIDECAR_FILENAME: &str = "logit_corrections.bin";

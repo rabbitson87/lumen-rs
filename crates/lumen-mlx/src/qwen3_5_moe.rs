@@ -3819,9 +3819,9 @@ mod imp {
             let mut args: Vec<Array> = Vec::with_capacity(positions.len() * 2);
             for &p in &positions {
                 let (din, dout) = dim_in_out(p)?;
-                let mut a = mlx_rs::random::normal::<f32>(&[r, din], None, None, None)?
+                let a = mlx_rs::random::normal::<f32>(&[r, din], None, None, None)?
                     .multiply(Array::from_f32((1.0 / din as f32).sqrt()))?;
-                let mut b = Array::zeros::<f32>(&[dout, r])?;
+                let b = Array::zeros::<f32>(&[dout, r])?;
                 a.eval()?;
                 b.eval()?;
                 args.push(a);

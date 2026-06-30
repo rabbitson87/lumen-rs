@@ -12,7 +12,14 @@ turboquant-cache = { workspace = true }
 lumen-model = { workspace = true }
 lumen-metal = { workspace = true, optional = true }
 lumen-mlx = { path = "../lumen-mlx" }
+# Native FLUX.2-dev text-to-image backend. Optional — pulled in only when the
+# server's `mlx-native` feature is on (gates the heavy mlx-sys fork + ~30 GB
+# diffusion models). The `DiffusionHandle` channel type is always compiled; the
+# actual `DiffusionService` worker is `#[cfg(feature = "mlx-native")]`.
+lumen-diffusion = { path = "../lumen-diffusion", optional = true }
 candle-core = { workspace = true }
+# base64 for the `/v1/images/generations` b64_json response payload.
+base64 = "0.22"
 
 atomic_http = { workspace = true }
 tokio = { workspace = true }
@@ -46,7 +53,14 @@ dotenvy = "0.15.7"
 default = ["turboquant-gpu", "mlx-native"]
 turboquant-gpu = ["lumen-model/turboquant-gpu", "dep:lumen-metal"]
 mpsgraph = ["lumen-model/mpsgraph", "lumen-metal/mpsgraph"]
-mlx-native = ["lumen-mlx/mlx-native"]
+# mlx-native also pulls in the native FLUX.2-dev diffusion backend (text-to-image)
+# with its Metal feature, so `image`/`hybrid` serve modes can generate images on
+# the GPU. mlx-rs/metal is additive — it unifies with lumen-mlx's mlx-rs build.
+mlx-native = [
+    "lumen-mlx/mlx-native",
+    "dep:lumen-diffusion",
+    "lumen-diffusion/mlx-native-metal",
+]
 # Umbrella feature for everything Candle-backend-related. Off by default.
 # Toggles the Qwen 3.5/3.6 MoE Candle path (and any future Candle-only
 # integrations) in one flag.

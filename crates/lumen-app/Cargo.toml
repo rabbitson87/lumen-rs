@@ -1,6 +1,6 @@
 [package]
 name = "lumen-app"
-version = "0.10.1"
+version = "0.11.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -36,7 +36,7 @@ reqwest = { version = "0.13.3", default-features = false, features = [
 # Config persistence (TOML at ~/Library/Application Support/Lumen/config.toml)
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "1.1.2+spec-1.1.0"
+toml = "1.1.2"
 
 # Model registry — local scan only. Downloads use raw HTTPS via reqwest.
 walkdir = "2.5.0"

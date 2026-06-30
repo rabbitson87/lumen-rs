@@ -134,10 +134,28 @@ export interface RecommendedEmbedding {
   notes: string;
 }
 
+/** Text-to-image (diffusion) model entry. Served in `LUMEN_SERVE=image` mode
+ *  via `POST /v1/images/generations`. Mirrors `RecommendedImageModel` (Rust). */
+export interface RecommendedImageModel {
+  id: string;
+  label: string;
+  approx_size_gb: number;
+  min_ram_gb: number;
+  notes: string;
+}
+
 export interface Catalog {
   families: FamilyInfo[];
   recommended: RecommendedModel[];
   embeddings: RecommendedEmbedding[];
+  /** `#[serde(default)]` on the Rust side → may be absent against an older
+   *  server binary, so default to `[]` at the call site. */
+  image_models?: RecommendedImageModel[];
+}
+
+/** One generated image (base-64 PNG, no `data:` prefix). */
+export interface GeneratedImage {
+  b64_json: string;
 }
 
 export interface MemoryDefaults {
@@ -254,6 +272,16 @@ export const api = {
     invoke<UpdateStatus[]>("check_model_updates", { repoIds: repo_ids }),
   downloadModel: (repo_id: string, files: string[] | null = null) =>
     invoke<void>("download_model", { repoId: repo_id, files }),
+
+  /** Proxy a text-to-image request through the Rust backend to the running
+   *  server's `POST /v1/images/generations`. Returns a base-64 PNG. */
+  generateImage: (args: {
+    prompt: string;
+    size: string;
+    steps: number;
+    seed: number;
+    guidance: number;
+  }) => invoke<GeneratedImage>("generate_image", args),
 
   startServer: () => invoke<ServerStatus>("start_server"),
   stopServer: () => invoke<ServerStatus>("stop_server"),

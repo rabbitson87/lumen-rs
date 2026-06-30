@@ -29,6 +29,7 @@ minijinja = { version = "2.13", default-features = false, features = [
     "loop_controls",
     "preserve_order",
     "json",
+    "serde",
 ] }
 # Python-compat handler for `.get()`, `.split()`, `.startswith()`, etc.
 # The upstream chat_template.jinja files emit Python idioms that vanilla

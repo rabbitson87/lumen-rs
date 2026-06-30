@@ -386,7 +386,7 @@ impl ProcrustesCorrector {
             return None;
         }
         let mut off = 12usize;
-        let mut read = |count: usize, off: &mut usize| -> Vec<f32> {
+        let read = |count: usize, off: &mut usize| -> Vec<f32> {
             let v: Vec<f32> = (0..count)
                 .map(|i| {
                     let o = *off + i * 4;

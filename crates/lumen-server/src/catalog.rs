@@ -56,11 +56,26 @@ pub struct RecommendedEmbedding {
     pub notes: &'static str,
 }
 
+/// Recommended text-to-image (diffusion) model. Unlike chat/embedding models
+/// these are served via `POST /v1/images/generations` with the server launched
+/// in `LUMEN_SERVE=image` mode (the diffusion pipeline cannot co-reside with an
+/// LLM on a 36 GB Mac). The desktop app surfaces these in their own card and
+/// launches the server in image mode when one is selected.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecommendedImageModel {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub approx_size_gb: u32,
+    pub min_ram_gb: u32,
+    pub notes: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Catalog {
     pub families: Vec<FamilyInfo>,
     pub recommended: Vec<RecommendedModel>,
     pub embeddings: Vec<RecommendedEmbedding>,
+    pub image_models: Vec<RecommendedImageModel>,
 }
 
 pub const FAMILIES: &[FamilyInfo] = &[
@@ -194,6 +209,33 @@ pub const EMBEDDINGS: &[RecommendedEmbedding] = &[
     },
 ];
 
+/// Recommended text-to-image models. Served via `POST /v1/images/generations`
+/// (OpenAI-compatible) with the server launched in `LUMEN_SERVE=image` mode.
+/// FLUX.2-dev is assembled from three 4-bit MLX repos (DiT+VAE, text encoder);
+/// the desktop app downloads them and launches the diffusion backend.
+pub const IMAGE_MODELS: &[RecommendedImageModel] = &[
+    RecommendedImageModel {
+        id: "flux2-dev",
+        label: "FLUX.2 dev — text-to-image (4-bit)",
+        approx_size_gb: 31,
+        min_ram_gb: 36,
+        notes: "**Black Forest Labs FLUX.2 [dev]** — 32B rectified-flow image model, native MLX 4-bit. Generates images from text via `POST /v1/images/generations` (OpenAI-compatible). Components: DiT+VAE (`AITRADER/FLUX2-dev-mlx-4bit`, ~18 GB) + Mistral-Small-3.2 text encoder (`mlx-community/Mistral-Small-3.2-24B-Instruct-2506-4bit`, ~13 GB). Served in dedicated image mode (cannot co-reside with an LLM on 36 GB). ~140 s / 256² image on M3 Max; 512²/28-step for full quality. Knobs: size, steps, seed, guidance.",
+    },
+    RecommendedImageModel {
+        // Full-precision (bf16) sibling of `flux2-dev`. The DiT auto-detects
+        // dense vs quantized per linear; the text encoder does the same via the
+        // `Linear` enum (`.scales`-presence). When this id is the active image
+        // model the diffusion engine auto-resolves the downloaded repo's
+        // `transformer/` `text_encoder/` `vae/` subdirs (or set the 3
+        // `LUMEN_FLUX2_*` env vars explicitly).
+        id: "black-forest-labs/FLUX.2-dev",
+        label: "FLUX.2 dev — full precision (bf16)",
+        approx_size_gb: 113,
+        min_ram_gb: 128,
+        notes: "**Black Forest Labs FLUX.2 [dev] — full precision (bf16).** The official non-quantized repo (`black-forest-labs/FLUX.2-dev`, gated — auto-accept on download). Identical 32B rectified-flow architecture as the 4-bit `flux2-dev` entry but every weight is dense BF16: maximum image quality, no quantization loss. ~113 GB on disk, needs ≥128 GB RAM (≈64 GB peak just for the encoder is not enough — the full pipeline is large). Components are the repo's own `transformer/` (bf16 DiT), `text_encoder/` (bf16 Mistral-Small-3.2) and `vae/` subdirs — the engine resolves them automatically once downloaded, or point at them with `LUMEN_FLUX2_DIT_DIR` / `LUMEN_FLUX2_ENCODER_DIR` / `LUMEN_FLUX2_VAE_PATH`. Served in dedicated image mode. Use the 4-bit entry on 36–64 GB machines.",
+    },
+];
+
 /// Detect which family a repo id / local dir name belongs to. Mirrors the
 /// detection logic in `engine::detect_architecture` but maps to the catalog
 /// enum (one variant per loader path) — the engine's `"qwen2"` fallback is
@@ -249,5 +291,6 @@ pub fn catalog() -> Catalog {
         families: FAMILIES.to_vec(),
         recommended: RECOMMENDED.to_vec(),
         embeddings: EMBEDDINGS.to_vec(),
+        image_models: IMAGE_MODELS.to_vec(),
     }
 }
