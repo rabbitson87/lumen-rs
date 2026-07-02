@@ -81,6 +81,9 @@ export interface PersistentConfig {
   advanced: AdvancedConfig;
   env_overrides: Record<string, string>;
   active_model: string | null;
+  /** Active diffusion image model id; independent of `active_model` so a chat
+   *  model and an image model can be selected together (→ hybrid serve). */
+  active_image_model: string | null;
   server_binary_path: string | null;
   models_dir: string;
 }

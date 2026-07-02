@@ -172,7 +172,14 @@ pub async fn set_active_model(
         if cat.is_image_model(&model_id) {
             drop(cat);
             let mut g = state.config.lock().await;
-            g.active_model = Some(model_id);
+            // Image models occupy their own slot (independent of the chat model)
+            // so a chat + image pair can be active at once → hybrid serve.
+            // Clicking the already-active image model toggles it back off.
+            g.active_image_model = if g.active_image_model.as_deref() == Some(model_id.as_str()) {
+                None
+            } else {
+                Some(model_id)
+            };
             g.save().map_err(err)?;
             return Ok(g.clone());
         }
@@ -203,7 +210,13 @@ pub async fn set_active_model(
         }
     }
     let mut g = state.config.lock().await;
-    g.active_model = Some(model_id);
+    // Clicking the already-active chat model toggles it off (lets the user run
+    // image-only by deselecting the LLM).
+    g.active_model = if g.active_model.as_deref() == Some(model_id.as_str()) {
+        None
+    } else {
+        Some(model_id)
+    };
     g.save().map_err(err)?;
     Ok(g.clone())
 }
@@ -357,72 +370,88 @@ pub async fn check_model_updates(
 pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ServerStatus> {
     let g = state.config.lock().await;
     let mut cfg = g.clone();
-    let active_id = g
-        .active_model
-        .clone()
-        .ok_or_else(|| "no active model — pick one in the MODELS card first".to_string())?;
+    // Two independent slots: a chat/LLM model and an image/diffusion model.
+    // Either or both may be set → chat, image, or hybrid serve.
+    let chat_id = g.active_model.clone();
+    let image_id = g.active_image_model.clone();
     let models_dir = g.models_dir.clone();
     let sup = state.supervisor.clone();
     drop(g);
 
+    if chat_id.is_none() && image_id.is_none() {
+        return Err(
+            "no active model — pick a chat and/or image model in the MODELS card first".to_string(),
+        );
+    }
+
     // Hard-gate the launch when the most-recent revision check flagged the
-    // active model as out of date.  The frontend already greys out the Start
-    // button in that state — this is the belt-and-suspenders guard for direct
-    // RPC bypass (CLI testing, future plugin, etc.) so the engine never loads
-    // weights against a tokenizer/config that has since been re-uploaded.
-    if state.outdated_models.lock().await.contains(&active_id) {
-        return Err(format!(
-            "active model `{active_id}` is out of date — open the MODELS card \
-             and click Update first, then start the server"
-        ));
-    }
-
-    // Resolve the on-disk path of the active model. Flat-layout dirs use the
-    // dir name (e.g. `gemma-4-26b-a4b-mlx-imatrix3plus-awq`) which won't match the HF Hub
-    // id (`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`). When the model is found
-    // locally we pass the absolute path as MODEL_ID — the MLX native runner
-    // and tokenizer loader both detect `is_dir()` and skip HF Hub entirely.
-    let cat = state.catalog.lock().await;
-    // Diffusion image model → launch the server in dedicated image mode and skip
-    // the chat-model path/byte resolution (the diffusion backend loads its own
-    // hardcoded component repos; MODEL_ID is unused in image mode).
-    if cat.is_image_model(&active_id) {
-        drop(cat);
-        return sup
-            .start(app, &cfg, &active_id, None, /* image_mode */ true)
-            .await
-            .map_err(err);
-    }
-    let entries = models::scan_local(&models_dir, &cat).map_err(err)?;
-    let active_entry = entries.iter().find(|m| m.id == active_id);
-
-    let (model_arg, active_bytes) = if let Some(entry) = active_entry {
-        // Mirror into local_model_dir too — engine.rs reads LUMEN_GEMMA4_DIR /
-        // LUMEN_QWEN35_SHARDS for the non-MLX (Candle) Gemma4Native /
-        // Qwen35Moe paths.
-        if cfg.server.local_model_dir.is_none() {
-            cfg.server.local_model_dir = Some(entry.path.clone());
+    // active chat model as out of date.  The frontend already greys out the
+    // Start button in that state — this is the belt-and-suspenders guard for
+    // direct RPC bypass (CLI testing, future plugin, etc.) so the engine never
+    // loads weights against a tokenizer/config that has since been re-uploaded.
+    if let Some(ref cid) = chat_id {
+        if state.outdated_models.lock().await.contains(cid) {
+            return Err(format!(
+                "active model `{cid}` is out of date — open the MODELS card \
+                 and click Update first, then start the server"
+            ));
         }
-        (
-            entry.path.to_string_lossy().into_owned(),
-            Some(entry.size_bytes),
-        )
+    }
+
+    // Resolve the on-disk path of the active chat model. Flat-layout dirs use
+    // the dir name (e.g. `gemma-4-26b-a4b-mlx-imatrix3plus-awq`) which won't
+    // match the HF Hub id (`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq`). When
+    // the model is found locally we pass the absolute path as MODEL_ID — the MLX
+    // native runner and tokenizer loader both detect `is_dir()` and skip HF Hub
+    // entirely. The diffusion backend resolves its own component repos from
+    // IMAGE_MODEL_ID, so the image slot needs no path resolution here.
+    let cat = state.catalog.lock().await;
+    let (model_arg, active_bytes) = if let Some(ref cid) = chat_id {
+        let entries = models::scan_local(&models_dir, &cat).map_err(err)?;
+        match entries.iter().find(|m| m.id == *cid) {
+            Some(entry) => {
+                // Mirror into local_model_dir too — engine.rs reads
+                // LUMEN_GEMMA4_DIR / LUMEN_QWEN35_SHARDS for the non-MLX
+                // (Candle) Gemma4Native / Qwen35Moe paths.
+                if cfg.server.local_model_dir.is_none() {
+                    cfg.server.local_model_dir = Some(entry.path.clone());
+                }
+                (
+                    entry.path.to_string_lossy().into_owned(),
+                    Some(entry.size_bytes),
+                )
+            }
+            None => {
+                // Not on disk — resolve to the canonical HF id so the server
+                // can fetch.
+                let id = cat
+                    .find_recommended(cid)
+                    .map(|r| r.id.clone())
+                    .unwrap_or_else(|| cid.clone());
+                (id, None)
+            }
+        }
     } else {
-        // Not on disk — resolve to the canonical HF id so the server can fetch.
-        let id = cat
-            .find_recommended(&active_id)
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| active_id.clone());
-        (id, None)
+        // Image-only: no LLM to resolve. Empty MODEL_ID → server omits it.
+        (String::new(), None)
     };
     drop(cat);
+
+    let serve = match (chat_id.is_some(), image_id.is_some()) {
+        (true, true) => server::ServeKind::Hybrid,
+        (false, true) => server::ServeKind::Image,
+        (true, false) => server::ServeKind::Chat,
+        // Guarded by the early `is_none() && is_none()` return above.
+        (false, false) => unreachable!(),
+    };
 
     sup.start(
         app,
         &cfg,
         &model_arg,
         active_bytes,
-        /* image_mode */ false,
+        image_id.as_deref(),
+        serve,
     )
     .await
     .map_err(err)

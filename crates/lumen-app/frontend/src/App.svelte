@@ -185,6 +185,13 @@
     config?.active_model != null && outdatedModels.has(config.active_model)
   );
 
+  // No model in either slot → nothing to serve. Blocks the Start button (the
+  // server would otherwise reject the launch). Both slots are independent, so
+  // this is only true when chat AND image are both unselected.
+  let noModelSelected = $derived(
+    config?.active_model == null && config?.active_image_model == null
+  );
+
   // True when the configured active model exists on disk but its
   // download is incomplete (truncated shard, missing index, stray
   // .part file). Block the Start button so the server doesn't crash
@@ -231,7 +238,7 @@
   // The active model id, if it is a diffusion image model. Drives both the
   // image-models card's ✓ state and the generation panel's visibility.
   let activeImageModelId = $derived.by(() => {
-    const id = config?.active_model;
+    const id = config?.active_image_model;
     if (!id) return null;
     return imageModels.some((m) => m.id === id) ? id : null;
   });
@@ -995,14 +1002,16 @@
       class={status.state === "running" || status.state === "starting" ? "danger" : "primary"}
       onclick={toggleServer}
       disabled={status.state === "starting" || status.state === "stopping" ||
-        (status.state !== "running" && (activeOutdated || activeBroken))}
+        (status.state !== "running" && (noModelSelected || activeOutdated || activeBroken))}
       title={status.state === "running"
         ? ""
-        : activeBroken
-          ? t("header.title.brokenActive")
-          : activeOutdated
-            ? t("header.title.outdatedActive")
-            : ""}
+        : noModelSelected
+          ? t("header.title.noModel")
+          : activeBroken
+            ? t("header.title.brokenActive")
+            : activeOutdated
+              ? t("header.title.outdatedActive")
+              : ""}
     >
       {status.state === "running" || status.state === "starting" ? t("header.stop") : t("header.start")}
     </button>
@@ -1401,9 +1410,13 @@
           {:else}
             <button
               onclick={() => setActive(m.id)}
-              disabled={isActive || !m.supported}
-              title={!m.supported ? t("models.action.title.unsupported") : ""}
-            >{t("action.use")}</button>
+              disabled={!m.supported}
+              title={!m.supported
+                ? t("models.action.title.unsupported")
+                : isActive
+                  ? t("models.action.title.deselect")
+                  : ""}
+            >{isActive ? t("action.deselect") : t("action.use")}</button>
           {/if}
           <button class="danger" onclick={() => removeModel(m.id)}>{t("action.delete")}</button>
         </div>
@@ -1490,7 +1503,7 @@
     <h2 class={cardH2}>{t("imageModels.title")} <span class="dim">{t("imageModels.titleHint")}</span></h2>
     <div class="flex flex-col gap-2">
       {#each imageModels as im}
-        {@const isActive = config?.active_model === im.id}
+        {@const isActive = config?.active_image_model === im.id}
         {@const fits = !systemInfo || im.min_ram_gb <= systemInfo.ram_gb}
         <div
           class={`image-card relative overflow-hidden flex flex-col gap-1.5 px-3 py-2.5 rounded-md bg-panel-2 border ${
@@ -1508,10 +1521,13 @@
               <div class="dim mono text-[11px]">{im.id} · {im.approx_size_gb}GB · ≥{im.min_ram_gb}GB RAM</div>
             </div>
             <button
-              class="primary"
+              class={isActive ? "" : "primary"}
               onclick={() => setActive(im.id)}
-              disabled={isActive}
-              title={fits ? "" : t("imageModels.action.title.overBudget")}
+              title={isActive
+                ? t("imageModels.action.title.deselect")
+                : fits
+                  ? ""
+                  : t("imageModels.action.title.overBudget")}
             >{isActive ? t("imageModels.active") : t("action.use")}</button>
           </div>
           {#if !fits}

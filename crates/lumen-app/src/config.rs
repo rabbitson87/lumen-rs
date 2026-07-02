@@ -35,7 +35,16 @@ pub struct PersistentConfig {
     /// write wins, with a warning displayed in the UI).
     #[serde(default)]
     pub env_overrides: BTreeMap<String, String>,
+    /// Active chat / LLM model id. Independent of `active_image_model` so a
+    /// chat model and an image model can be selected at once (→ hybrid serve).
     pub active_model: Option<String>,
+    /// Active text-to-image diffusion model id (e.g. `flux2-dev`). Kept in a
+    /// separate slot from `active_model` so selecting an image model no longer
+    /// overwrites the chat model — with both set, the server launches in
+    /// `LUMEN_SERVE=hybrid` (LLM + diffusion co-resident). `#[serde(default)]`
+    /// keeps older configs (which lack the field) loadable.
+    #[serde(default)]
+    pub active_image_model: Option<String>,
     /// Optional override for the `lumen-server` binary path. When `None` the
     /// app searches PATH and (in bundled builds) the sidecar location.
     pub server_binary_path: Option<PathBuf>,
@@ -296,6 +305,7 @@ impl Default for PersistentConfig {
             },
             env_overrides: BTreeMap::new(),
             active_model: None,
+            active_image_model: None,
             server_binary_path: None,
             models_dir,
         }

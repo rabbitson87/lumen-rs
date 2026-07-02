@@ -23,6 +23,7 @@ export const ko: Record<string, string> = {
     "활성 모델의 다운로드가 완료되지 않았습니다. 모델 카드에서 재다운로드를 먼저 진행하세요.",
   "header.title.outdatedActive":
     "활성 모델의 최신 버전이 Hub에 있습니다. 모델 카드에서 업데이트를 먼저 진행하세요.",
+  "header.title.noModel": "모델 카드에서 채팅 또는 이미지 모델을 먼저 선택하세요.",
 
   // ── 상태 표시 ───────────────────────────────────────────────────
   "status.stopped": "중지됨",
@@ -35,6 +36,7 @@ export const ko: Record<string, string> = {
   "action.download": "다운로드",
   "action.delete": "삭제",
   "action.use": "사용",
+  "action.deselect": "선택 해제",
   "action.update": "업데이트",
   "action.redownload": "재다운로드",
   "action.downloading": "다운로드 중…",
@@ -207,6 +209,7 @@ export const ko: Record<string, string> = {
     "누락 또는 잘린 파일을 검증 후 재다운로드",
   "models.action.title.update": "최신 Hub 가중치로 재다운로드",
   "models.action.title.unsupported": "서버 측 지원 카탈로그에 없음",
+  "models.action.title.deselect": "클릭하여 선택 해제 — 이미지 전용으로 실행하거나 다른 LLM 선택",
 
   // ── 헤더 메모리 바 ──────────────────────────────────────────────
   "header.memory.title": "시스템 메모리 — wired + active + compressor",
@@ -266,7 +269,8 @@ export const ko: Record<string, string> = {
   "imageModels.active": "사용 중",
   "imageModels.overBudget": "이 Mac의 RAM보다 큽니다 — 생성 시 스왑되거나 실패할 수 있습니다.",
   "imageModels.action.title.overBudget": "이 Mac의 RAM 예산을 초과합니다",
-  "imageModels.startHint": "시작을 눌러 서버를 이미지 모드로 실행하면 아래에 생성 패널이 나타납니다.",
+  "imageModels.action.title.deselect": "클릭하여 이 이미지 모델 선택 해제",
+  "imageModels.startHint": "시작을 눌러 서버를 이미지 모드로 실행하면 아래에 생성 패널이 나타납니다. LLM도 함께 선택하면 하이브리드 모드(둘 다 동시 서빙)로 실행됩니다.",
 
   // ── 이미지 생성 패널 ────────────────────────────────────────────
   "image.title": "이미지 생성",

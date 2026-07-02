@@ -28,6 +28,8 @@ export const en: Record<string, string> = {
     "Active model's download is incomplete. Re-download it first (MODELS card → Re-download).",
   "header.title.outdatedActive":
     "Active model has a newer version on Hub. Update it first (MODELS card → Update).",
+  "header.title.noModel":
+    "Select a chat and/or image model in the MODELS card first.",
 
   // ── Status indicators ───────────────────────────────────────────
   "status.stopped": "stopped",
@@ -40,6 +42,7 @@ export const en: Record<string, string> = {
   "action.download": "Download",
   "action.delete": "Delete",
   "action.use": "Use",
+  "action.deselect": "Deselect",
   "action.update": "Update",
   "action.redownload": "Re-download",
   "action.downloading": "Downloading…",
@@ -213,6 +216,8 @@ export const en: Record<string, string> = {
   "models.action.title.update": "Re-download with the latest Hub weights",
   "models.action.title.unsupported":
     "Not in the server-side supported catalog",
+  "models.action.title.deselect":
+    "Click to deselect — run image-only, or pick a different LLM",
 
   // ── Header memory bar ───────────────────────────────────────────
   "header.memory.title":
@@ -273,7 +278,8 @@ export const en: Record<string, string> = {
   "imageModels.active": "Active",
   "imageModels.overBudget": "Larger than this Mac's RAM — generation may swap or fail.",
   "imageModels.action.title.overBudget": "Exceeds this Mac's RAM budget",
-  "imageModels.startHint": "Press Start to launch the server in image mode, then a generation panel appears below.",
+  "imageModels.action.title.deselect": "Click to deselect this image model",
+  "imageModels.startHint": "Press Start to launch the server in image mode, then a generation panel appears below. Selecting an LLM as well launches hybrid mode (both serve at once).",
 
   // ── Image generation panel ──────────────────────────────────────
   "image.title": "IMAGE GENERATION",
