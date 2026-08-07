@@ -384,10 +384,11 @@ Notes:
   speculative decode, for the same reason.
 - `response_format` is not supported alongside images. On Qwen 3.6, tools
   are not either. Both are rejected with an error rather than ignored.
-- A request that mixes images with a tool-calling history (an assistant
-  `tool_calls` turn or a `role:"tool"` message) is rejected: that history
-  renders through a different code path which does not carry images, and
-  answering from it would silently drop them.
+- Images mixed with a tool-calling history (an assistant `tool_calls` turn
+  or a `role:"tool"` message) work on `/v1/chat/completions` with Gemma 4 —
+  the structured renderer carries images on its `User` turns. The same
+  combination is still rejected on `/v1/messages`, and on Qwen 3.6, rather
+  than silently dropping the image.
 - Requires the mlx-native backend. Other backends return an error rather
   than answering without the image.
 

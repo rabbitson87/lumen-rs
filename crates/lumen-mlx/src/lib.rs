@@ -1740,6 +1740,69 @@ impl MlxBackend {
     /// that the legacy `(role, content)` shape can't represent. Falls
     /// through to plain-text rendering for Qwen 3.5 (Phase 2 will wire its
     /// own structured renderer).
+    /// [`Self::chat_from_history`] with images attached to `User` turns.
+    ///
+    /// Falls through to the text path when nothing is attached. Image requests
+    /// bypass the prefix cache (keyed on text alone) and reject
+    /// `response_format`, which routes through a grammar path that has no
+    /// image wiring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_from_history_with_images(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            );
+        }
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input"
+                    ));
+                }
+                let _ = session_id;
+                m.chat_from_history_with_images(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input with a tool-calling history requires the Gemma 4 backend"
+            )),
+        }
+    }
+
     pub fn chat_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1987,6 +2050,71 @@ impl MlxBackend {
     /// loops can stream natural-language continuations. Qwen 3.5
     /// family currently flattens to plain text (loses tool metadata);
     /// future Hermes-style structured streaming lands in Phase 2.
+    /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_from_history_with_images<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_streaming_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            );
+        }
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input"
+                    ));
+                }
+                let _ = session_id;
+                m.chat_streaming_from_history_with_images(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input with a tool-calling history requires the Gemma 4 backend"
+            )),
+        }
+    }
+
     pub fn chat_streaming_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],

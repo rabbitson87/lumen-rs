@@ -471,6 +471,86 @@ impl ModelBackend {
         }
     }
 
+    /// [`Self::chat_from_history`] with images attached to `User` turns.
+    /// Only the MLX Gemma 4 backend can consume them.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_from_history_with_images(
+        &mut self,
+        turns: &[ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<ParsedResponse> {
+        match self {
+            Self::Mlx(m) => m.chat_from_history_with_images(
+                turns,
+                images,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "this backend has no image support; image input requires an \
+                 mlx-native vision-capable backend with LUMEN_VISION=1"
+            )),
+        }
+    }
+
+    /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_streaming_from_history_with_images<F>(
+        &mut self,
+        turns: &[ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<ParsedResponse>
+    where
+        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
+    {
+        match self {
+            Self::Mlx(m) => m.chat_streaming_from_history_with_images(
+                turns,
+                images,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "this backend has no image support; image input requires an \
+                 mlx-native vision-capable backend with LUMEN_VISION=1"
+            )),
+        }
+    }
+
     /// [`Self::chat_streaming`] with inline images. Only the MLX Gemma 4
     /// backend can consume them; every other backend rejects the request
     /// rather than streaming an answer that never saw the image.
@@ -1014,9 +1094,6 @@ impl InferenceEngine {
         // walk would bind image `i` to the wrong message (or to none).
         let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
         let images = images_aligned_to_kept(&req.messages, &kept);
-        // The structured branch below wins over the image branch, so without
-        // this a request carrying both would answer from the text alone.
-        reject_images_with_tool_history(needs_structured, images.is_some())?;
 
         // Owning storage for `ChatTurn` borrows when routing structured.
         let arg_values: Vec<serde_json::Value> = if needs_structured {
@@ -1120,18 +1197,36 @@ impl InferenceEngine {
                 })
                 .collect();
             lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
-            self.backend.chat_from_history(
-                &turns,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                thinking_on,
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                req.response_json_schema().as_ref(),
-            )?
+            // `turns` is 1:1 with `req.messages` and the turn strip applies the
+            // same predicate as the flat one, so the surviving turns line up
+            // with `images` — which is already indexed by the survivors.
+            match images.as_deref() {
+                Some(imgs) => self.backend.chat_from_history_with_images(
+                    &turns,
+                    imgs,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking_on,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    req.response_json_schema().as_ref(),
+                )?,
+                None => self.backend.chat_from_history(
+                    &turns,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking_on,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    req.response_json_schema().as_ref(),
+                )?,
+            }
         } else if let Some(images) = images.as_deref() {
             self.backend.chat_with_images(
                 &messages,
@@ -1767,13 +1862,6 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-        // The structured branch below wins over the image branch, so without
-        // this a request carrying both would stream an answer from the text
-        // alone.
-        if let Err(e) = reject_images_with_tool_history(needs_structured, images.is_some()) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-            return;
-        }
 
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         let tool_choice =
@@ -1873,69 +1961,90 @@ impl InferenceEngine {
                 })
                 .collect();
             lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
-            self.backend.chat_streaming_from_history(
-                &turns,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                response_schema.as_ref(),
-                |ev: BackendStreamEvent<'_>| -> Result<()> {
-                    match ev {
-                        BackendStreamEvent::Text(t) => {
-                            if let Some(js) = json_stop.as_ref() {
-                                // response_format: stream up to the first
-                                // complete JSON value, then end the decode loop
-                                // (reuses the stopped_by_seq early-break path).
-                                let (emit, stopped) = js.borrow_mut().push(t);
-                                if !emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(emit));
-                                }
-                                if stopped {
-                                    stopped_by_seq.set(true);
-                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                }
+            // See the non-streaming path: post-strip turns line up with
+            // `images`, which is already indexed by the survivors.
+            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
+                match ev {
+                    BackendStreamEvent::Text(t) => {
+                        if let Some(js) = json_stop.as_ref() {
+                            // response_format: stream up to the first
+                            // complete JSON value, then end the decode loop
+                            // (reuses the stopped_by_seq early-break path).
+                            let (emit, stopped) = js.borrow_mut().push(t);
+                            if !emit.is_empty() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(emit));
+                            }
+                            if stopped {
+                                stopped_by_seq.set(true);
+                                return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                            }
+                        } else {
+                            let mut sm = stop_matcher.borrow_mut();
+                            if sm.is_inert() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                             } else {
-                                let mut sm = stop_matcher.borrow_mut();
-                                if sm.is_inert() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                                } else {
-                                    let step = sm.push(t);
-                                    if !step.emit.is_empty() {
-                                        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
-                                    }
-                                    if step.stopped {
-                                        stopped_by_seq.set(true);
-                                        drop(sm);
-                                        // Break the backend decode loop early. The
-                                        // `stopped_by_seq` flag distinguishes this
-                                        // from a real error in the match below.
-                                        return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                    }
+                                let step = sm.push(t);
+                                if !step.emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                }
+                                if step.stopped {
+                                    stopped_by_seq.set(true);
+                                    drop(sm);
+                                    // Break the backend decode loop early. The
+                                    // `stopped_by_seq` flag distinguishes this
+                                    // from a real error in the match below.
+                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
                                 }
                             }
                         }
-                        BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                        }
-                        BackendStreamEvent::ToolCallStart { name } => {
-                            // Early per-call Start suppressed. Args are not known
-                            // until a call closes, so emitting Start0,Start1,Start2
-                            // up front (then Args0,Args1,Args2 in a batch) made
-                            // clients fold every later parallel call's arguments
-                            // onto index 0 — only the first tool call kept its args.
-                            // The reconciliation loop below now emits each call as a
-                            // sequential Start_i → Args_i → Stop_i unit.
-                            let _ = name;
-                        }
                     }
-                    Ok(())
-                },
-            )
+                    BackendStreamEvent::Reasoning(t) => {
+                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                    }
+                    BackendStreamEvent::ToolCallStart { name } => {
+                        // Early per-call Start suppressed. Args are not known
+                        // until a call closes, so emitting Start0,Start1,Start2
+                        // up front (then Args0,Args1,Args2 in a batch) made
+                        // clients fold every later parallel call's arguments
+                        // onto index 0 — only the first tool call kept its args.
+                        // The reconciliation loop below now emits each call as a
+                        // sequential Start_i → Args_i → Stop_i unit.
+                        let _ = name;
+                    }
+                }
+                Ok(())
+            };
+            let thinking =
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+            match images.as_deref() {
+                Some(imgs) => self.backend.chat_streaming_from_history_with_images(
+                    &turns,
+                    imgs,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    response_schema.as_ref(),
+                    on_event,
+                ),
+                None => self.backend.chat_streaming_from_history(
+                    &turns,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    response_schema.as_ref(),
+                    on_event,
+                ),
+            }
         } else {
             // Bound first so both the text and the image dispatch below can
             // take it — only one of them runs.

@@ -353,22 +353,13 @@ pub(crate) mod imp {
                     self.encode_plain(&format!("{role}\n"))
                         .with_context(|| format!("encode '{role}\\n'"))?,
                 );
-                for &n in image_soft_tokens
-                    .get(body_offset + bi)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                {
-                    if n == 0 {
-                        return Err(anyhow!("chat-template: image with 0 soft tokens"));
-                    }
-                    out.push(TOK_IMAGE_OPEN);
-                    out.extend(std::iter::repeat_n(TOK_IMAGE_SOFT, n));
-                    out.push(TOK_IMAGE_CLOSE);
-                    out.extend(
-                        self.encode_plain("\n")
-                            .context("encode '\\n' after image")?,
-                    );
-                }
+                self.push_image_blocks(
+                    &mut out,
+                    image_soft_tokens
+                        .get(body_offset + bi)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                )?;
                 out.extend(
                     self.encode_plain(msg.content.trim())
                         .with_context(|| format!("encode {role} content"))?,
@@ -422,11 +413,55 @@ pub(crate) mod imp {
         /// `Tool.tool_call_id` against the assistant's prior
         /// `tool_calls[].id`, with `Tool.name` as a fallback when the
         /// client supplies one.
+        /// Emit one `<|image>` + N × `<|image|>` + `<image|>` block per image,
+        /// each followed by a newline.
+        ///
+        /// The `N` placeholders are what the forward pass replaces with that
+        /// image's soft tokens, so the count has to match what the tower will
+        /// produce exactly — a mismatch is caught later as a run-length error
+        /// rather than silently misaligning the splice.
+        fn push_image_blocks(&self, out: &mut Vec<u32>, counts: &[usize]) -> Result<()> {
+            for &n in counts {
+                if n == 0 {
+                    return Err(anyhow!("chat-template: image with 0 soft tokens"));
+                }
+                out.push(TOK_IMAGE_OPEN);
+                out.extend(std::iter::repeat_n(TOK_IMAGE_SOFT, n));
+                out.push(TOK_IMAGE_CLOSE);
+                out.extend(
+                    self.encode_plain("\n")
+                        .context("encode '\\n' after image")?,
+                );
+            }
+            Ok(())
+        }
+
         pub fn render_chat_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
             opts: &RenderOptions,
             tools: &[crate::chat_io::ToolDef<'_>],
+        ) -> Result<Vec<u32>> {
+            self.render_chat_history_with_images(turns, opts, tools, &[])
+        }
+
+        /// [`Self::render_chat_history`] with images attached to `User` turns.
+        ///
+        /// `image_soft_tokens[i]` lists the soft-token count of each image on
+        /// `turns[i]`; a shorter slice or an empty entry means no images, so
+        /// passing `&[]` is byte-identical to the text-only renderer.
+        ///
+        /// Indexed by **turn**, not by request message. The engine expands one
+        /// message into several turns (a user message carrying tool results
+        /// becomes N `Tool` turns plus a `User` turn), so the caller has to
+        /// build this alongside the turns themselves rather than reusing the
+        /// message-indexed vector.
+        pub fn render_chat_history_with_images(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            opts: &RenderOptions,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            image_soft_tokens: &[Vec<usize>],
         ) -> Result<Vec<u32>> {
             use crate::chat_io::ChatTurn;
 
@@ -482,6 +517,12 @@ pub(crate) mod imp {
                     ChatTurn::User(text) => {
                         out.push(TOK_TURN_OPEN);
                         out.extend(self.encode_plain("user\n").context("encode 'user\\n'")?);
+                        // Images lead the turn, before its text — same
+                        // placement as the flat renderer.
+                        self.push_image_blocks(
+                            &mut out,
+                            image_soft_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                        )?;
                         out.extend(
                             self.encode_plain(text.trim())
                                 .context("encode user content")?,

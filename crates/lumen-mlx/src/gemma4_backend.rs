@@ -1297,6 +1297,42 @@ pub(crate) mod imp {
         /// `tool_calls` / tool result data the `(role, content)` shape
         /// can't represent. Used by the turn-2 continuation path
         /// (`chat_with_history`).
+        /// [`Self::build_chat_input_from_history`] with per-turn image
+        /// soft-token counts.
+        ///
+        /// Rejects the jinja path for the same reason the flat renderer does:
+        /// the template emits a single `<|image|>` and expanding it into the
+        /// per-image run is the processor's job, which is not reimplemented
+        /// inside the template engine.
+        pub fn build_chat_input_from_history_with_images(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            image_counts: &[Vec<usize>],
+        ) -> Result<Vec<u32>> {
+            if image_counts.iter().all(|c| c.is_empty()) {
+                return self.build_chat_input_from_history(turns, thinking, tools);
+            }
+            if self.jinja_chat.is_some() {
+                return Err(anyhow!(
+                    "image input is not supported with a jinja chat template; \
+                     unset the template to use the built-in Gemma 4 renderer"
+                ));
+            }
+            let ids = self.chat.render_chat_history_with_images(
+                turns,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                },
+                tools,
+                image_counts,
+            )?;
+            maybe_dump_prompt(&self.chat, &ids, "from_history_with_images");
+            Ok(ids)
+        }
+
         pub fn build_chat_input_from_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1493,14 +1529,56 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            self.chat_from_history_with_images(
+                turns,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// [`Self::chat_from_history`] with images attached to `User` turns.
+        ///
+        /// `images[i]` holds the encoded byte streams on `turns[i]` — indexed
+        /// by **turn**, since the caller expands one request message into
+        /// several turns. Empty is byte-identical to [`Self::chat_from_history`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_from_history_with_images(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            let (counts, prepared) = self.measure_turn_images(images)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+            )?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
                 sampling: build_sampling_config(temperature, top_p, ov),
             };
-            let stats = self.model.generate(&prompt, &cfg)?;
+            let stats = if prepared.is_empty() {
+                self.model.generate(&prompt, &cfg)?
+            } else {
+                self.model
+                    .generate_with_cache_and_images(&prompt, &prepared, &cfg, None)?
+            };
             eprintln!(
                 "[gemma4] chat_from_history done: {} tokens in {:.0}ms ({:.1} tok/s)",
                 stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
@@ -1708,13 +1786,36 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
+            self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &[],
+                thinking,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// [`Self::build_prompt_and_prefill_from_history`] with per-turn image
+        /// soft-token counts. Empty counts are byte-identical.
+        fn build_prompt_and_prefill_from_history_with_images(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            image_counts: &[Vec<usize>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
                 ResolvedToolChoice::None => &[],
                 _ => tools,
             };
-            let mut prompt =
-                self.build_chat_input_from_history(turns, thinking, effective_tools)?;
+            let mut prompt = self.build_chat_input_from_history_with_images(
+                turns,
+                thinking,
+                effective_tools,
+                image_counts,
+            )?;
             let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
             prompt.extend(prefill.iter().copied());
             Ok((prompt, prefill))
@@ -2586,8 +2687,54 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            self.chat_streaming_from_history_with_images(
+                turns,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            )
+        }
+
+        /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_streaming_from_history_with_images(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            let (counts, prepared) = self.measure_turn_images(images)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+            )?;
+            let vision = if prepared.is_empty() {
+                None
+            } else {
+                Some(
+                    self.model
+                        .encode_images_for_prompt(&prompt, &prepared)
+                        .context("chat_streaming_from_history: encode images")?,
+                )
+            };
             let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
@@ -2597,11 +2744,32 @@ pub(crate) mod imp {
                 top_p,
                 ov,
                 grammar,
-                None, /* pre_built_cache */
+                None, /* pre_built_cache — images bypass the prefix cache */
                 None, /* snapshot_prefix_key */
-                None, /* vision */
+                vision,
                 on_event,
             )
+        }
+
+        /// Decode + resize every image once, returning per-turn counts (for the
+        /// renderer) alongside the flattened prepared images in prompt order
+        /// (for the tower).
+        fn measure_turn_images(
+            &self,
+            images: &[Vec<Vec<u8>>],
+        ) -> Result<(Vec<Vec<usize>>, Vec<crate::gemma4_vision::PreparedImage>)> {
+            let mut counts = Vec::with_capacity(images.len());
+            let mut flat = Vec::new();
+            for per_turn in images {
+                let mut row = Vec::with_capacity(per_turn.len());
+                for bytes in per_turn {
+                    let prepared = self.model.prepare_image(bytes)?;
+                    row.push(prepared.num_soft_tokens);
+                    flat.push(prepared);
+                }
+                counts.push(row);
+            }
+            Ok((counts, flat))
         }
 
         fn decode_streaming_with_prompt(
