@@ -1007,6 +1007,61 @@ mod tests {
     }
 
     #[test]
+    fn tools_template_carries_an_image_block_ahead_of_its_text() {
+        // Images and tools compose only because they touch different parts of
+        // the prompt: the image block rides inside a user message body, the
+        // tool template wraps around it. Verify the template passes the block
+        // through untouched and in front of the question — the placeholder run
+        // is spliced positionally, so a template that reordered or escaped it
+        // would put the pixels on the wrong rows.
+        let params = weather_tool();
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Get weather"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let body = format!("{}what city is this?", crate::qwen36_vision::IMAGE_BLOCK);
+        let messages = vec![("user".into(), body)];
+        let s = format_qwen3_chat_with_tools(&messages, false, &tools);
+        assert!(
+            s.contains(&format!(
+                "<|im_start|>user\n{}what city is this?<|im_end|>",
+                crate::qwen36_vision::IMAGE_BLOCK
+            )),
+            "image block must survive the tools template, ahead of the text:\n{s}"
+        );
+        assert_eq!(
+            s.matches("<|image_pad|>").count(),
+            1,
+            "exactly one placeholder per image before id-level expansion"
+        );
+    }
+
+    #[test]
+    fn history_template_folds_a_system_turn_into_the_tools_block() {
+        // This is why the structured-history image path refuses anything but a
+        // User turn: a System turn's text does not render where it was written,
+        // it is absorbed into the `<tools>` block. A placeholder attached there
+        // would move relative to the other images, and the k-th placeholder run
+        // would then be spliced with the wrong one.
+        let params = weather_tool();
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Get weather"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let turns = vec![ChatTurn::System("SYSTEM_MARKER"), ChatTurn::User("hi")];
+        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools);
+        assert!(s.contains("SYSTEM_MARKER"), "system text is still present");
+        assert!(
+            !s.contains("<|im_start|>system\nSYSTEM_MARKER"),
+            "system turn is folded into the tools block, not emitted verbatim:\n{s}"
+        );
+    }
+
+    #[test]
     fn render_param_value_preserves_strings_serializes_objects() {
         let v_str = JsonValue::String("hello".into());
         assert_eq!(value_to_param_str(&v_str), "hello");

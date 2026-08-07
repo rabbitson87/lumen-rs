@@ -356,8 +356,9 @@ impl ModelBackend {
     }
 
     /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
-    /// Only the MLX Gemma 4 backend can consume them; every other backend
-    /// rejects the request rather than silently answering without the image.
+    /// Only a vision-capable MLX backend (Gemma 4 or Qwen 3.6, with
+    /// `LUMEN_VISION=1`) can consume them; every other backend rejects the
+    /// request rather than silently answering without the image.
     #[allow(clippy::too_many_arguments)]
     fn chat_with_images(
         &mut self,
@@ -472,7 +473,7 @@ impl ModelBackend {
     }
 
     /// [`Self::chat_from_history`] with images attached to `User` turns.
-    /// Only the MLX Gemma 4 backend can consume them.
+    /// Only a vision-capable MLX backend (Gemma 4 or Qwen 3.6) can consume them.
     #[allow(clippy::too_many_arguments)]
     fn chat_from_history_with_images(
         &mut self,

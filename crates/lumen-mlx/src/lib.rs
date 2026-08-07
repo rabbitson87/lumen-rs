@@ -1474,6 +1474,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_with_tools(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1612,15 +1613,28 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                // The Qwen3.6 image path is greedy-only for now: the family's
-                // sampled/tool/response_format branches all key on text.
-                if response_schema.is_some() || !tools.is_empty() {
+                // The Qwen3.6 image path is greedy-only: the family's sampled
+                // branches key on text.
+                if response_schema.is_some() {
                     return Err(anyhow::anyhow!(
-                        "response_format / tools are not supported together with image                          input on the Qwen 3.6 backend"
+                        "response_format is not supported together with image input on the \
+                         Qwen 3.6 backend"
                     ));
                 }
-                let _ = (temperature, top_p, ov, tool_choice, session_id);
+                let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
+                if !tools.is_empty() {
+                    return m.chat_with_tools(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                    );
+                }
+                let _ = tool_choice;
                 // Non-streaming: drive the same loop and discard the deltas.
                 let visible = m.chat_streaming_with_images(
                     messages,
@@ -1704,14 +1718,28 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                if response_schema.is_some() || !tools.is_empty() {
+                if response_schema.is_some() {
                     return Err(anyhow::anyhow!(
-                        "response_format / tools are not supported together with image                          input on the Qwen 3.6 backend"
+                        "response_format is not supported together with image input on the \
+                         Qwen 3.6 backend"
                     ));
                 }
-                let _ = (temperature, top_p, ov, tool_choice, session_id);
+                let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
                 let mut on_event = on_event;
+                if !tools.is_empty() {
+                    return m.chat_streaming_with_tools(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                        on_event,
+                    );
+                }
+                let _ = tool_choice;
                 let mut sink = |chunk: &str| {
                     let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
                 };
@@ -1796,9 +1824,29 @@ impl MlxBackend {
                     tool_choice,
                 )
             }
+            Self::Qwen35Family(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input on the \
+                         Qwen 3.6 backend"
+                    ));
+                }
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                m.chat_with_tools_from_history(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    tools,
+                    tool_choice,
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
-                "image input with a tool-calling history requires the Gemma 4 backend"
+                "image input with a tool-calling history requires a vision-capable MLX \
+                 backend (LUMEN_VISION=1)"
             )),
         }
     }
@@ -1844,6 +1892,7 @@ impl MlxBackend {
                 let seq_id = m.alloc_seq_id();
                 m.chat_with_tools_from_history(
                     turns,
+                    &[],
                     max_new_tokens,
                     thinking,
                     seq_id,
@@ -1964,6 +2013,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_streaming_with_tools(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -2108,9 +2158,30 @@ impl MlxBackend {
                     on_event,
                 )
             }
+            Self::Qwen35Family(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input on the \
+                         Qwen 3.6 backend"
+                    ));
+                }
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                m.chat_streaming_with_tools_from_history(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    tools,
+                    tool_choice,
+                    on_event,
+                )
+            }
             #[allow(unreachable_patterns)]
             _ => Err(anyhow::anyhow!(
-                "image input with a tool-calling history requires the Gemma 4 backend"
+                "image input with a tool-calling history requires a vision-capable MLX \
+                 backend (LUMEN_VISION=1)"
             )),
         }
     }
@@ -2161,6 +2232,7 @@ impl MlxBackend {
                 let seq_id = m.alloc_seq_id();
                 m.chat_streaming_with_tools_from_history(
                     turns,
+                    &[],
                     max_new_tokens,
                     thinking,
                     seq_id,
@@ -2326,6 +2398,20 @@ struct DraftRunner {
     runner: NativeMlxRunner,
     cfg: spec_decode::DraftConfig,
     eos_tokens: Vec<u32>,
+}
+
+/// Messages rewritten to carry their images, plus everything prefill needs to
+/// pair each placeholder run with the right image. See
+/// [`MlxQwen35Backend::attach_image_blocks`].
+#[cfg(feature = "mlx-native")]
+struct AttachedImages {
+    /// `(role, content)` with an `<|image_pad|>` block prepended to the body of
+    /// every message that had an image attached.
+    messages: Vec<(String, String)>,
+    /// Decoded and resized images, in prompt order.
+    prepared: Vec<crate::qwen36_vision::PreparedImage>,
+    /// `counts[k]` is how many placeholder rows `prepared[k]` occupies.
+    counts: Vec<usize>,
 }
 
 impl MlxQwen35Backend {
@@ -3198,30 +3284,61 @@ impl MlxQwen35Backend {
         images: &[Vec<Vec<u8>>],
         thinking: bool,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
-        let mut prepared = Vec::new();
-        let mut counts = Vec::new();
-        let mut rendered: Vec<(String, String)> = Vec::with_capacity(messages.len());
+        let attached = self.attach_image_blocks(messages, images)?;
+        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking))?;
+        let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
+        Ok((ids, attached.prepared))
+    }
+
+    /// Decode every attached image and splice an `<|image_pad|>` block into the
+    /// head of its message, returning the rewritten messages together with the
+    /// prepared images and their token counts **in prompt order**.
+    ///
+    /// Prompt order is the contract: `prefill_with_images` pairs the k-th
+    /// placeholder run with the k-th prepared image, and
+    /// [`expand_image_placeholders`](Self::expand_image_placeholders) sizes the
+    /// k-th run from `counts[k]`. Iterating messages in order and prepending to
+    /// each body is what keeps all three in step.
+    #[cfg(feature = "mlx-native")]
+    fn attach_image_blocks(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+    ) -> Result<AttachedImages> {
+        let mut out = AttachedImages {
+            messages: Vec::with_capacity(messages.len()),
+            prepared: Vec::new(),
+            counts: Vec::new(),
+        };
         for (i, (role, content)) in messages.iter().enumerate() {
             let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let mut body = String::new();
             for bytes in attached {
                 let p = self.runner.prepare_image(bytes)?;
-                counts.push(p.num_tokens);
-                prepared.push(p);
+                out.counts.push(p.num_tokens);
+                out.prepared.push(p);
                 body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
             }
             body.push_str(content);
-            rendered.push((role.clone(), body));
+            out.messages.push((role.clone(), body));
         }
+        Ok(out)
+    }
 
-        let ids = self.encode(&format_qwen3_chat(&rendered, thinking))?;
+    /// Blow each single `<|image_pad|>` token up to the run of placeholder rows
+    /// its image will occupy.
+    ///
+    /// Done on token ids rather than on the rendered text so the counts stay
+    /// exact no matter how the tokenizer would have merged a long repeated
+    /// literal.
+    #[cfg(feature = "mlx-native")]
+    fn expand_image_placeholders(&self, ids: &[u32], counts: &[usize]) -> Result<Vec<u32>> {
         let image_token = self
             .runner
             .image_token_id()
             .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
-        let ids = crate::qwen36_vision::expand_image_placeholders(&ids, image_token, &counts)
-            .map_err(|e| anyhow!("expand image placeholders: {e}"))?;
-        Ok((ids, prepared))
+        crate::qwen36_vision::expand_image_placeholders(ids, image_token, counts)
+            .map_err(|e| anyhow!("expand image placeholders: {e}"))
     }
 
     pub fn build_chat_input(
@@ -3268,6 +3385,40 @@ impl MlxQwen35Backend {
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
+    }
+
+    /// [`build_chat_input_with_tools_split`](Self::build_chat_input_with_tools_split)
+    /// with inline images.
+    ///
+    /// The two features compose because they touch different parts of the
+    /// prompt: images add placeholder runs inside the message bodies, the tool
+    /// template wraps everything and appends its `tool_choice` prefill at the
+    /// very end. Ordering matters in one place — the prefill split is taken
+    /// *before* the placeholders expand. Expansion only ever grows runs that
+    /// sit ahead of the prefill, so the prefill's token ids are the same either
+    /// way, but taking the split afterwards would compare a grown `ids` against
+    /// an ungrown `prompt_ids` and report a spurious BPE desync.
+    #[cfg(feature = "mlx-native")]
+    fn build_chat_input_with_tools_and_images_split(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Vec<u32>,
+        Vec<crate::qwen36_vision::PreparedImage>,
+    )> {
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        let attached = self.attach_image_blocks(messages, images)?;
+        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
+        Ok((ids, prefill, prefill_tokens, attached.prepared))
     }
 
     /// Encode `prompt_only + prefill` and isolate the prefill's trailing token
@@ -3336,6 +3487,79 @@ impl MlxQwen35Backend {
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
+    }
+
+    /// [`build_chat_input_with_tools_from_history_split`](Self::build_chat_input_with_tools_from_history_split)
+    /// with inline images, `images[i]` belonging to `turns[i]`.
+    ///
+    /// Only `User` turns can carry an image. That is a real restriction rather
+    /// than a simplification: this renderer does not emit every turn's text
+    /// verbatim — a leading `System` turn is folded into the `<tools>` block and
+    /// an `Assistant` turn with tool calls may render no text at all — so a
+    /// placeholder attached elsewhere could vanish or move, and the k-th
+    /// placeholder run would then be spliced with the wrong image. Refusing is
+    /// the only honest option; silently dropping the image is the failure mode
+    /// this whole feature exists to avoid.
+    #[cfg(feature = "mlx-native")]
+    fn build_chat_input_with_tools_and_images_from_history_split(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Vec<u32>,
+        Vec<crate::qwen36_vision::PreparedImage>,
+    )> {
+        use crate::chat_io::ChatTurn;
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+        };
+
+        // Rewrite the User turns that carry images. The rewritten bodies are
+        // owned here so the borrowed `ChatTurn`s built below can point at them.
+        let mut bodies: Vec<Option<String>> = Vec::with_capacity(turns.len());
+        let mut prepared = Vec::new();
+        let mut counts = Vec::new();
+        for (i, turn) in turns.iter().enumerate() {
+            let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            if attached.is_empty() {
+                bodies.push(None);
+                continue;
+            }
+            let ChatTurn::User(text) = turn else {
+                return Err(anyhow!(
+                    "images can only be attached to a user message on the Qwen 3.6 \
+                     tool-calling path"
+                ));
+            };
+            let mut body = String::new();
+            for bytes in attached {
+                let p = self.runner.prepare_image(bytes)?;
+                counts.push(p.num_tokens);
+                prepared.push(p);
+                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
+            }
+            body.push_str(text);
+            bodies.push(Some(body));
+        }
+        let rewritten: Vec<ChatTurn<'_>> = turns
+            .iter()
+            .zip(bodies.iter())
+            .map(|(turn, body)| match body {
+                Some(b) => ChatTurn::User(b.as_str()),
+                None => turn.clone(),
+            })
+            .collect();
+
+        let prompt_only = format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        let ids = self.expand_image_placeholders(&ids, &counts)?;
+        Ok((ids, prefill, prefill_tokens, prepared))
     }
 
     pub fn alloc_seq_id(&self) -> u64 {
@@ -4057,34 +4281,21 @@ impl MlxQwen35Backend {
     pub fn chat_with_tools(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill, prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key(messages);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len(messages, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_flat(
+            messages,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
             |_ev| Ok(()),
         )
     }
@@ -4093,9 +4304,11 @@ impl MlxQwen35Backend {
     /// `BackendStreamEvent::Text` for visible-text deltas and
     /// `BackendStreamEvent::ToolCallStart { name }` the moment the
     /// parser sees `<function=NAME>`.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_with_tools<F>(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -4106,28 +4319,14 @@ impl MlxQwen35Backend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill, prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key(messages);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len(messages, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_flat(
+            messages,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
             on_event,
         )
     }
@@ -4136,42 +4335,31 @@ impl MlxQwen35Backend {
     pub fn chat_with_tools_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill, prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key_from_turns(turns);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len_from_turns(turns, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_history(
+            turns,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
             |_ev| Ok(()),
         )
     }
 
     /// Structured-history streaming variant.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_with_tools_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -4182,14 +4370,78 @@ impl MlxQwen35Backend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill, prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
+        self.chat_with_tools_history(
+            turns,
+            images,
+            max_new_tokens,
+            thinking,
+            seq_id,
+            tools,
+            tool_choice,
+            on_event,
+        )
+    }
+
+    /// Prompt-building half of the flat-message tool path, shared by the
+    /// streaming and non-streaming entry points (they differ only in the sink).
+    ///
+    /// Images turn off both prefix-cache reuse and the incremental boundary:
+    /// each is keyed on text alone, so a hit would hand this request KV rows
+    /// built from another request's pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_tools_flat<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let has_images = images.iter().any(|v| !v.is_empty());
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
+            self.build_chat_input_with_tools_and_images_split(
+                messages,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+            )?
+        } else {
+            let (ids, prefill, prefill_tokens) =
+                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            let (ids, prefill, prefill_tokens) =
+                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key_from_turns(turns);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len_from_turns(turns, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
+        let prefix_key = if has_images {
+            None
+        } else {
+            auto_prefix_key(messages)
+        };
+        let incremental_boundary = if has_images {
+            None
+        } else {
+            self.detect_system_tools_prefix_len(messages, tools)
+                .ok()
+                .filter(|&b| b > 0 && b < prompt_ids.len())
+        };
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -4204,6 +4456,91 @@ impl MlxQwen35Backend {
             } else {
                 Default::default()
             },
+            prepared,
+            on_event,
+        )
+    }
+
+    /// Structured-history counterpart of [`chat_with_tools_flat`](Self::chat_with_tools_flat).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_tools_history<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let has_images = images.iter().any(|v| !v.is_empty());
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
+            self.build_chat_input_with_tools_and_images_from_history_split(
+                turns,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+            )?
+        } else {
+            let (ids, prefill, prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            let (ids, prefill, prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
+        let prefix_key = if has_images {
+            None
+        } else {
+            auto_prefix_key_from_turns(turns)
+        };
+        let incremental_boundary = if has_images {
+            None
+        } else {
+            self.detect_system_tools_prefix_len_from_turns(turns, tools)
+                .ok()
+                .filter(|&b| b > 0 && b < prompt_ids.len())
+        };
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            prefill_tokens,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            incremental_boundary,
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
+            prepared,
             on_event,
         )
     }
@@ -4248,6 +4585,10 @@ impl MlxQwen35Backend {
         // loop injects a `<parameter=KEY>\n` opener before the model can close
         // a `<function=NAME>` block with a required param still missing.
         force_required: std::collections::HashMap<String, Vec<String>>,
+        // Images to splice over the prompt's placeholder runs, in prompt order.
+        // Empty for a text-only request, which then prefills byte-identically
+        // to the pre-vision path.
+        prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4271,13 +4612,38 @@ impl MlxQwen35Backend {
 
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
         let t_prefill = std::time::Instant::now();
-        let (mut last, mut pos) = self.prefix_store.prefill_optionally_cached(
-            &mut self.runner,
-            seq_id,
-            &prompt_ids,
-            prefix_cache_key,
-            incremental_boundary,
-        )?;
+        // A vision prompt cannot reuse a cached prefix: the cache is keyed on
+        // text alone, and the placeholder rows only mean anything once this
+        // request's images have been spliced over them. The callers already
+        // pass `None` for the key; this asserts the invariant at the one place
+        // that would silently corrupt the prompt if it were violated.
+        #[cfg(feature = "mlx-native")]
+        let (mut last, mut pos) = if prepared_images.is_empty() {
+            self.prefix_store.prefill_optionally_cached(
+                &mut self.runner,
+                seq_id,
+                &prompt_ids,
+                prefix_cache_key,
+                incremental_boundary,
+            )?
+        } else {
+            self.prefill_with_images(seq_id, &prompt_ids, &prepared_images)?
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (mut last, mut pos) = {
+            if !prepared_images.is_empty() {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            self.prefix_store.prefill_optionally_cached(
+                &mut self.runner,
+                seq_id,
+                &prompt_ids,
+                prefix_cache_key,
+                incremental_boundary,
+            )?
+        };
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
