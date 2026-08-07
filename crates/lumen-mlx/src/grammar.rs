@@ -85,12 +85,26 @@ pub struct Gemma4GrammarState {
     /// True once `stop_reason()` reports termination — the matcher releases
     /// and subsequent tokens are unconstrained.
     finished: bool,
-    /// Token id that flips a [`GrammarMode::Lazy`] matcher on when first
-    /// sampled. Defaults to Gemma 4's `<|tool_call>` (id 48), but is
-    /// parameterized so other families can reuse this state machine with
-    /// their own opener (e.g. Qwen 3.6's `<tool_call>` — though Qwen's
-    /// required/named path runs Eager and never relies on this trigger).
-    lazy_trigger_token: u32,
+    /// How a [`GrammarMode::Lazy`] matcher wakes up. `None` disables lazy
+    /// triggering entirely — the grammar then only ever constrains in
+    /// [`GrammarMode::Eager`].
+    lazy_trigger: Option<LazyTrigger>,
+}
+
+/// The token that activates a [`GrammarMode::Lazy`] grammar, and whether that
+/// token belongs to the grammar it activates.
+///
+/// The distinction is load-bearing. Gemma 4's Lark grammar starts at the
+/// literal `call:`; the `<|tool_call>` opener that precedes it is not a
+/// terminal anywhere in that grammar, so feeding the trigger to the
+/// freshly-built matcher fails the parse outright. Qwen 3.6's XML grammar
+/// does open with `<tool_call>`, so there the trigger *is* the grammar's
+/// first terminal and must be consumed for the matcher to line up with the
+/// model's context.
+#[derive(Clone, Copy, Debug)]
+struct LazyTrigger {
+    token: u32,
+    in_grammar: bool,
 }
 
 impl Gemma4GrammarState {
@@ -111,7 +125,12 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
-            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
+            lazy_trigger: Some(LazyTrigger {
+                token: TOK_TOOL_CALL_OPEN,
+                // The schema describes the args body only; `<|tool_call>` is
+                // emitted before it and is not part of the grammar.
+                in_grammar: false,
+            }),
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -131,19 +150,24 @@ impl Gemma4GrammarState {
     /// requested `mode`; pass [`GrammarMode::Eager`] so the constraint is
     /// live from the first decode step (there is no lazy trigger token for
     /// free-form JSON output).
+    ///
+    /// The grammar is pinned to **compact** JSON — see
+    /// [`with_compact_whitespace`] for why the default is unusable here.
     pub fn new_json_schema(
         factory: Arc<ParserFactory>,
         schema: &Value,
         mode: GrammarMode,
     ) -> Result<Self> {
-        let schema = TopLevelGrammar::from_json_schema(schema.clone());
+        let schema = TopLevelGrammar::from_json_schema(with_compact_whitespace(schema.clone()));
         let mut state = Self {
             factory,
             schema,
             matcher: None,
             mode,
             finished: false,
-            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
+            // The whole assistant message is the JSON value — there is no
+            // opener token to wait for, so this variant has no lazy trigger.
+            lazy_trigger: None,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -208,7 +232,13 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
-            lazy_trigger_token: TOK_TOOL_CALL_OPEN,
+            lazy_trigger: Some(LazyTrigger {
+                token: TOK_TOOL_CALL_OPEN,
+                // `start: tool_call` begins at the literal `call:`. The
+                // `<|tool_call>` opener that triggers activation sits before
+                // it and is not a terminal in this grammar.
+                in_grammar: false,
+            }),
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -264,7 +294,14 @@ impl Gemma4GrammarState {
             matcher: None,
             mode,
             finished: false,
-            lazy_trigger_token: opener_token.unwrap_or(TOK_TOOL_CALL_OPEN),
+            // `tool_call: "<tool_call>\n" …` — the opener IS the grammar's
+            // first terminal here, so an explicit trigger gets consumed.
+            // `None` means no lazy trigger at all: borrowing Gemma's id 48
+            // would fire on Qwen's ordinary `Q` token and desync instantly.
+            lazy_trigger: opener_token.map(|token| LazyTrigger {
+                token,
+                in_grammar: true,
+            }),
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -276,6 +313,19 @@ impl Gemma4GrammarState {
     /// sampler to decide whether to compute the mask at all.
     pub fn is_active(&self) -> bool {
         !self.finished && self.matcher.is_some()
+    }
+
+    /// Stop constraining, permanently, and let the rest of the generation
+    /// sample freely.
+    ///
+    /// For callers that hit a desync they cannot recover from. A grammar is an
+    /// assist, not a correctness requirement — decoding on against a matcher
+    /// whose parse position no longer matches the model's context would mask
+    /// out legal tokens, so releasing beats both continuing and failing the
+    /// whole request.
+    pub fn release(&mut self) {
+        self.finished = true;
+        self.matcher = None;
     }
 
     /// Mask raw f32 logits so positions outside the current grammar are
@@ -325,19 +375,34 @@ impl Gemma4GrammarState {
 
     /// Observe a sampled token and advance internal state.
     ///
-    /// In lazy mode, this also handles the activation transition:
-    /// when the model emits `<|tool_call>` (id 48) for the first time,
-    /// the matcher is created and `consume_token` is called so the
-    /// grammar tracks the opener as having been emitted.
+    /// In lazy mode, this also handles the activation transition: when the
+    /// model emits the trigger token (Gemma 4's `<|tool_call>`, id 48) for
+    /// the first time, the matcher is created so the *next* sampled token is
+    /// constrained.
+    ///
+    /// Whether the trigger itself is then fed to that fresh matcher depends on
+    /// [`LazyTrigger::in_grammar`]. For Gemma 4 it must not be: the Lark
+    /// grammar starts at the literal `call:`, so consuming `<|tool_call>`
+    /// fails the parse on its very first byte — llguidance renders special
+    /// tokens with a `0xFF` marker prefix, which is where the
+    /// `byte 'ÿ' fails parse` error came from. That aborted every streaming
+    /// tool call, since the streaming path is the only one that wires the
+    /// grammar in.
     pub fn observe(&mut self, token: u32) -> Result<()> {
         if self.finished {
             return Ok(());
         }
-        if self.matcher.is_none()
-            && matches!(self.mode, GrammarMode::Lazy)
-            && token == self.lazy_trigger_token
-        {
+        if self.matcher.is_none() && matches!(self.mode, GrammarMode::Lazy) {
+            let Some(trigger) = self.lazy_trigger else {
+                return Ok(());
+            };
+            if token != trigger.token {
+                return Ok(());
+            }
             self.activate()?;
+        }
+        if self.is_extragrammatical_opener(token) {
+            return Ok(());
         }
         if let Some(m) = &mut self.matcher {
             m.consume_token(token)
@@ -358,13 +423,18 @@ impl Gemma4GrammarState {
     ///
     /// Unlike [`observe`], this does NOT run the lazy-activation transition
     /// (the matcher is already active in Eager mode) and is a no-op in Lazy
-    /// mode or once finished. Each token must be one the grammar accepts at
-    /// the current position (the prefilled `call:NAME{` prefix is exactly the
-    /// grammar's deterministic opener), so `consume_token` should not error;
-    /// if it does, the error is surfaced so the caller can fall back to free
-    /// sampling rather than decode against a desynced matcher.
+    /// mode or once finished. The `<|tool_call>` opener is skipped for the
+    /// same reason [`observe`] skips it — Gemma 4's grammar starts at the
+    /// `call:` that follows — while the rest of the prefill (`call:NAME{` for
+    /// a named choice) is exactly the grammar's deterministic opener and
+    /// parses cleanly. Anything else erroring is surfaced so the caller can
+    /// fall back to free sampling rather than decode against a desynced
+    /// matcher.
     pub fn observe_prefill(&mut self, token: u32) -> Result<()> {
         if self.finished {
+            return Ok(());
+        }
+        if self.is_extragrammatical_opener(token) {
             return Ok(());
         }
         let Some(m) = self.matcher.as_mut() else {
@@ -376,6 +446,15 @@ impl Gemma4GrammarState {
             self.finished = true;
         }
         Ok(())
+    }
+
+    /// True when `token` is the opener that *precedes* the grammar rather than
+    /// belonging to it. Such a token is never fed to the matcher, in any mode
+    /// and from either entry point: it activates a Lazy grammar and is
+    /// otherwise transparent.
+    fn is_extragrammatical_opener(&self, token: u32) -> bool {
+        self.lazy_trigger
+            .is_some_and(|t| t.token == token && !t.in_grammar)
     }
 
     fn activate(&mut self) -> Result<()> {
@@ -419,6 +498,30 @@ impl Gemma4GrammarState {
 /// `call:NAME{args}<tool_call|>` ([`crate::gemma4_response`]), so this schema
 /// just needs to produce the JSON-shaped args body; the surrounding tokens
 /// are emitted by the model freely.
+/// Pin a JSON Schema's grammar to compact output, with no optional whitespace
+/// between tokens.
+///
+/// llguidance defaults to `whitespace_flexible`, which inserts a skippable
+/// `[ \n\r\t]+` between every JSON token. For a human writing JSON that is a
+/// convenience; for constrained decoding it is a trap. The whitespace run has
+/// no upper bound, so after `{` the model may legally emit newlines and spaces
+/// forever — and a greedy sampler does exactly that, filling `max_tokens` with
+/// indentation and never reaching a key. Compact JSON removes the degree of
+/// freedom entirely, so the first token after `{` has to be a quote.
+///
+/// A caller that has already set `x-guidance` knows what it wants and is left
+/// alone; a non-object schema (`true` / `false`) has nowhere to put the hint
+/// and passes through unchanged.
+fn with_compact_whitespace(mut schema: Value) -> Value {
+    let Some(obj) = schema.as_object_mut() else {
+        return schema;
+    };
+    if !obj.contains_key("x-guidance") {
+        obj.insert("x-guidance".into(), json!({ "whitespace_flexible": false }));
+    }
+    schema
+}
+
 fn build_tool_grammar(tools: &[Value]) -> Result<TopLevelGrammar> {
     let mut variants: Vec<Value> = Vec::with_capacity(tools.len());
     for t in tools {
@@ -1069,6 +1172,170 @@ mod tests {
         // independent of the placeholder vocab's specific symbols.
         state.observe(42).expect("observe(42) free-text");
         assert!(!state.is_active(), "free text does not activate lazy mode");
+    }
+
+    #[test]
+    fn lazy_activation_does_not_feed_the_trigger_to_the_matcher() {
+        // The regression that broke every streaming tool call: activation used
+        // to `consume_token(48)` on the matcher it had just built, but the
+        // grammar starts at `call:` and knows nothing about the opener, so the
+        // parse failed on its first byte and the error aborted the request.
+        //
+        // The placeholder env maps ids to single bytes, so id 48 is `'0'` here
+        // rather than `<|tool_call>` — either way it is a byte the grammar does
+        // not accept at position 0, which is exactly the condition under test.
+        let factory = shared_factory_placeholder();
+        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Lazy)
+            .expect("build lazy lark state");
+        state
+            .observe(TOK_TOOL_CALL_OPEN)
+            .expect("the trigger token activates the grammar without being parsed by it");
+        assert!(
+            state.is_active(),
+            "the grammar must be constraining once the opener is sampled"
+        );
+    }
+
+    #[test]
+    fn lazy_activation_leaves_the_matcher_at_the_start_of_the_body() {
+        // Corollary of the fix, and the part that proves the matcher is
+        // actually usable afterwards rather than merely non-erroring: the
+        // first constrained token must be the start of `call:`. `'c'` is
+        // accepted; the trigger id is not.
+        let factory = shared_factory_placeholder();
+        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Lazy)
+            .expect("build lazy lark state");
+        state.observe(TOK_TOOL_CALL_OPEN).expect("activate");
+        state
+            .observe(u32::from(b'c'))
+            .expect("grammar resumes at the `call:` literal");
+        assert!(state.is_active());
+        assert!(
+            state.observe(u32::from(b'x')).is_err(),
+            "a byte that cannot continue `call:` must still be rejected — \
+             otherwise the matcher is not really constraining"
+        );
+    }
+
+    #[test]
+    fn lazy_trigger_is_opt_in_for_non_gemma_grammars() {
+        // Qwen 3.6 passes `opener_token: None`. Borrowing Gemma's id 48 there
+        // meant the ordinary letter `Q` woke the XML grammar mid-sentence and
+        // desynced it. With no trigger configured, Lazy simply never activates.
+        let factory = shared_factory_placeholder();
+        let mut state =
+            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Lazy, None)
+                .expect("build lazy qwen35 state");
+        state.observe(TOK_TOOL_CALL_OPEN).expect("no trigger set");
+        assert!(
+            !state.is_active(),
+            "an unconfigured lazy trigger must never activate the grammar"
+        );
+    }
+
+    #[test]
+    fn qwen35_lazy_trigger_is_consumed_because_it_opens_the_grammar() {
+        // The mirror image of the Gemma case: `tool_call: "<tool_call>\n" …`
+        // starts *with* the opener, so an explicit trigger has to be parsed or
+        // the matcher would sit one terminal behind the model's context.
+        // `'<'` is the first byte of that literal in the placeholder env.
+        let factory = shared_factory_placeholder();
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            factory,
+            &sample_tools(),
+            GrammarMode::Lazy,
+            Some(u32::from(b'<')),
+        )
+        .expect("build lazy qwen35 state with an explicit opener");
+        state
+            .observe(u32::from(b'<'))
+            .expect("activate and consume");
+        assert!(state.is_active());
+        state
+            .observe(u32::from(b't'))
+            .expect("matcher advanced past `<`, so `t` continues `<tool_call>`");
+    }
+
+    #[test]
+    fn response_format_grammar_forbids_whitespace_runs() {
+        // With llguidance's default flexible whitespace, `{` may be followed by
+        // an unbounded `[ \n\r\t]+` run, and greedy decode rides it until
+        // max_tokens — the observed failure was a reply of pure indentation.
+        // Compact JSON makes the next byte after `{` a quote.
+        let factory = shared_factory_placeholder();
+        let schema = json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+        });
+        let mut state = Gemma4GrammarState::new_json_schema(factory, &schema, GrammarMode::Eager)
+            .expect("build response_format grammar");
+        state.observe(u32::from(b'{')).expect("object opens");
+        assert!(
+            state.observe(u32::from(b'\n')).is_err(),
+            "whitespace after `{{` must not be a legal continuation"
+        );
+    }
+
+    #[test]
+    fn response_format_grammar_respects_an_explicit_x_guidance() {
+        // A caller who set `x-guidance` themselves gets their setting, not ours.
+        let factory = shared_factory_placeholder();
+        let schema = json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+            "x-guidance": { "whitespace_flexible": true },
+        });
+        let mut state = Gemma4GrammarState::new_json_schema(factory, &schema, GrammarMode::Eager)
+            .expect("build response_format grammar");
+        state.observe(u32::from(b'{')).expect("object opens");
+        state
+            .observe(u32::from(b'\n'))
+            .expect("caller asked for flexible whitespace");
+    }
+
+    #[test]
+    fn eager_prefill_replay_skips_the_opener_and_parses_the_rest() {
+        // `tool_choice=required`/named prefills `<|tool_call>` (and, for a
+        // named choice, `call:NAME{`) into the prompt and replays it through
+        // the Eager matcher. Replaying the opener used to fail for the same
+        // reason lazy activation did, and the caller's response was to drop the
+        // grammar — so `required` never actually enforced anything. The opener
+        // must pass through untouched while the rest still parses.
+        let factory = shared_factory_placeholder();
+        let mut state =
+            Gemma4GrammarState::new_lark_strict(factory, &sample_tools(), GrammarMode::Eager)
+                .expect("build eager strict lark state");
+        state
+            .observe_prefill(TOK_TOOL_CALL_OPEN)
+            .expect("the opener is context, not grammar");
+        assert!(state.is_active(), "the grammar must still be constraining");
+        for b in b"call:task_complete{" {
+            state
+                .observe_prefill(u32::from(*b))
+                .expect("the named-choice prefill is the grammar's own opener");
+        }
+        assert!(state.is_active());
+    }
+
+    #[test]
+    fn release_stops_constraining() {
+        let factory = shared_factory_placeholder();
+        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Eager)
+            .expect("build eager lark state");
+        assert!(state.is_active());
+        state.release();
+        assert!(!state.is_active(), "released grammar must not constrain");
+        let mut logits = vec![1.0_f32; 262];
+        assert_eq!(
+            state.apply_mask_to_logits(&mut logits).expect("noop mask"),
+            0,
+            "a released grammar masks nothing"
+        );
+        state
+            .observe(u32::from(b'x'))
+            .expect("a released grammar accepts anything");
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub(crate) mod imp {
                     let _ = state.apply_mask_to_logits(&mut buf)?;
                 }
                 let tok = sample_from_logits(&mut buf, recent_tokens, cfg, rng);
-                state.observe(tok)?;
+                observe_or_release(state, tok);
                 tok
             }
             None => sample_from_logits(&mut buf, recent_tokens, cfg, rng),
@@ -321,7 +321,7 @@ pub(crate) mod imp {
             }
             let next = sample_from_logits(&mut buf, recent_tokens, cfg, rng);
             if let Some(state) = grammar.as_mut() {
-                state.observe(next)?;
+                observe_or_release(state, next);
             }
             return Ok(next);
         }
@@ -340,8 +340,30 @@ pub(crate) mod imp {
             correction,
         )?;
         if let Some(state) = grammar.as_mut() {
-            state.observe(next)?;
+            observe_or_release(state, next);
         }
         Ok(next)
+    }
+
+    /// Advance the grammar with a sampled token, releasing it if it desyncs.
+    ///
+    /// The grammar is an assist: it steers the model towards a parseable tool
+    /// call. Propagating a desync used to abort the whole streaming request —
+    /// the user saw an error instead of a reply — even though the sensible
+    /// response is to finish generating without the mask and let the response
+    /// parser deal with whatever comes out. This mirrors what the Qwen 3.6
+    /// decode loops in `lib.rs` already do.
+    ///
+    /// Loud on purpose: a desync means the grammar and the model's context
+    /// disagree, which is a bug worth seeing in the log even though it no
+    /// longer costs the user their request.
+    fn observe_or_release(state: &mut Gemma4GrammarState, token: u32) {
+        if let Err(e) = state.observe(token) {
+            eprintln!(
+                "[gemma4-sampling] grammar desynced at token {token} \
+                 (releasing it; decode continues unconstrained): {e:#}"
+            );
+            state.release();
+        }
     }
 }
