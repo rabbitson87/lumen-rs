@@ -24,6 +24,10 @@ assets/*.bin
 crates/lumen-model/tests/fixtures/*.safetensors
 crates/lumen-mlx/tests/fixtures/*.safetensors
 crates/lumen-metal/tests/fixtures/
+# Exception: the vision-tower golden is 2.9 MB, not GB-scale, and is the only
+# thing standing between `gemma4_vision_parity` and a Python dependency at test
+# time. Committing it keeps that test pure Rust and runnable from a clean clone.
+!crates/lumen-mlx/tests/fixtures/gemma4_vision_golden.safetensors
 
 # ── Personal AI workflow tooling (kept local; not part of the public project) ──
 .ai/

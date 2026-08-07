@@ -8,6 +8,13 @@ license.workspace = true
 anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+# Vision input decoding for the Gemma 4 image tower (PNG/JPEG/WebP in,
+# bicubic resize onto the patch grid). No encoder side is needed here.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+] }
 tokenizers = "0.23.1"
 hf-hub = "0.5.0"
 # Phase 2 — grammar-constrained tool calling. JSON Schema → token mask
