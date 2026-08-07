@@ -45,8 +45,14 @@ mod gemma4_response;
 mod gemma4_sampling;
 mod gemma4_thinking;
 mod gemma4_tools;
+pub mod gemma4_vision;
 pub mod grammar;
 mod jinja_chat;
+pub mod qwen36_vision;
+/// Resource-bounded image decoding shared by both image towers.
+mod vision_image;
+/// Placeholder-run bookkeeping shared by both image towers.
+mod vision_splice;
 // On-disk KV-cache persistence primitives (P0). Pure format/store layer
 // compiles under default features; Array<->record conversion is gated behind
 // `mlx-native`. Phase 1 wires this into the prefix-cache disk tier.
@@ -81,7 +87,8 @@ pub mod gemma4 {
     };
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
-        NativeGemma4Model, NativeGemma4PromptCache, set_forward_step, take_gemma4_breakdown,
+        NativeGemma4Model, NativeGemma4PromptCache, quant_params_for, set_forward_step,
+        take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
@@ -181,6 +188,23 @@ pub struct ProbeRows {
 trait Runner {
     fn name(&self) -> &'static str;
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
+    /// [`Runner::prefill`] with encoded images spliced over their placeholder
+    /// runs.
+    ///
+    /// Only the native runner implements this. The others reject rather than
+    /// prefilling a prompt whose image placeholders would never be filled —
+    /// which would answer confidently about an image the model never saw.
+    #[cfg(feature = "mlx-native")]
+    fn prefill_with_images(
+        &mut self,
+        _seq_id: u64,
+        _tokens: &[u32],
+        _images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        Err(anyhow!(
+            "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
+        ))
+    }
     fn decode_step(
         &mut self,
         seq_id: u64,
@@ -345,6 +369,15 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::prefill(self, seq_id, tokens)
     }
 
+    fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        NativeMlxRunner::prefill_with_images(self, seq_id, tokens, images)
+    }
+
     fn decode_step(
         &mut self,
         seq_id: u64,
@@ -478,6 +511,47 @@ impl RunnerImpl {
 
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         self.as_runner_mut().prefill(seq_id, tokens)
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        self.as_runner_mut()
+            .prefill_with_images(seq_id, tokens, images)
+    }
+
+    /// Decode + resize one image onto the tower's patch grid. Native only —
+    /// the other runners have no tower to size against.
+    #[cfg(feature = "mlx-native")]
+    fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
+        match self {
+            Self::Native(r) => r.prepare_image(encoded),
+            _ => Err(anyhow!(
+                "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
+            )),
+        }
+    }
+
+    /// Token id whose embedding rows the vision features replace.
+    #[cfg(feature = "mlx-native")]
+    fn image_token_id(&self) -> Option<u32> {
+        match self {
+            Self::Native(r) => r.image_token_id(),
+            _ => None,
+        }
+    }
+
+    /// The loaded tower's config, for header-only prompt sizing.
+    #[cfg(feature = "mlx-native")]
+    fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+        match self {
+            Self::Native(r) => r.vision_config(),
+            _ => None,
+        }
     }
 
     fn decode_step(
@@ -1302,6 +1376,32 @@ impl MlxBackend {
         }
     }
 
+    /// Prompt tokens the attached images will add on top of the rendered text.
+    ///
+    /// `build_chat_input` only sees `(role, content)` strings, so an image
+    /// request's real prompt is hundreds of tokens longer than what it reports
+    /// — enough to matter for the context guard and for `usage.prompt_tokens`.
+    /// Reads image headers only; never decodes pixels. Backends without image
+    /// support contribute nothing.
+    pub fn image_prompt_tokens(&self, images: &[Vec<Vec<u8>>]) -> usize {
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => images
+                .iter()
+                .flatten()
+                .map(|bytes| m.image_prompt_tokens(bytes).unwrap_or(0))
+                .sum(),
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen35Family(m) => images
+                .iter()
+                .flatten()
+                .map(|bytes| m.image_prompt_tokens(bytes).unwrap_or(0))
+                .sum(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
     pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
         match self {
             Self::Qwen35Family(m) => m.drop_prefix_cache(key),
@@ -1453,6 +1553,185 @@ impl MlxBackend {
                     )
                 }
             }
+        }
+    }
+
+    /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
+    ///
+    /// Falls through to [`Self::chat`] when nothing is attached, so callers can
+    /// route every request here. Image requests skip the prefix cache: the
+    /// cached prefix is keyed on text alone, and a vision prompt's placeholder
+    /// rows are only meaningful together with the image they were spliced from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_with_images(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            );
+        }
+        match self {
+            Self::Gemma4(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input"
+                    ));
+                }
+                let _ = session_id;
+                m.chat_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                // The Qwen3.6 image path is greedy-only for now: the family's
+                // sampled/tool/response_format branches all key on text.
+                if response_schema.is_some() || !tools.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "response_format / tools are not supported together with image                          input on the Qwen 3.6 backend"
+                    ));
+                }
+                let _ = (temperature, top_p, ov, tool_choice, session_id);
+                let seq_id = m.alloc_seq_id();
+                // Non-streaming: drive the same loop and discard the deltas.
+                let visible = m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    |_| {},
+                )?;
+                Ok(crate::chat_io::ParsedResponse {
+                    visible,
+                    ..Default::default()
+                })
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
+            )),
+        }
+    }
+
+    /// [`Self::chat_streaming`] with inline images.
+    ///
+    /// Same contract as [`Self::chat_with_images`]: falls through to the text
+    /// path when nothing is attached, and rejects rather than silently
+    /// answering without the image on a backend that cannot see it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_with_images<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_streaming(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            );
+        }
+        match self {
+            Self::Gemma4(m) => {
+                if response_schema.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "response_format is not supported together with image input"
+                    ));
+                }
+                let _ = session_id;
+                m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                if response_schema.is_some() || !tools.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "response_format / tools are not supported together with image                          input on the Qwen 3.6 backend"
+                    ));
+                }
+                let _ = (temperature, top_p, ov, tool_choice, session_id);
+                let seq_id = m.alloc_seq_id();
+                let mut on_event = on_event;
+                let mut sink = |chunk: &str| {
+                    let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                };
+                let visible = m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    &mut sink,
+                )?;
+                Ok(crate::chat_io::ParsedResponse {
+                    visible,
+                    ..Default::default()
+                })
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
+            )),
         }
     }
 
@@ -2035,6 +2314,33 @@ impl MlxQwen35Backend {
 
     pub fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         self.runner.prefill(seq_id, tokens)
+    }
+
+    /// Prompt tokens one attached image adds — its merged-token run plus the
+    /// vision sentinels. Header-only; no pixel decode.
+    #[cfg(feature = "mlx-native")]
+    pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+        let cfg = self
+            .runner
+            .vision_config()
+            .ok_or_else(|| anyhow!("vision tower not loaded"))?;
+        crate::qwen36_vision::image_prompt_tokens(encoded, &cfg)
+            .map_err(|e| anyhow!("image sizing failed: {e}"))
+    }
+
+    /// [`Self::prefill`] with encoded images spliced over their placeholder
+    /// runs. An empty slice is byte-identical to [`Self::prefill`].
+    #[cfg(feature = "mlx-native")]
+    pub fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        if images.is_empty() {
+            return self.runner.prefill(seq_id, tokens);
+        }
+        self.runner.prefill_with_images(seq_id, tokens, images)
     }
 
     pub fn decode_step(
@@ -2743,6 +3049,53 @@ impl MlxQwen35Backend {
             .map_err(|e| anyhow!("tokenizer decode: {e}"))
     }
 
+    /// [`Self::build_chat_input`] with inline images.
+    ///
+    /// Returns the prompt ids alongside the prepared images in prompt order —
+    /// the pairing `prefill_with_images` relies on.
+    ///
+    /// The rendered text carries one `<|image_pad|>` per image; the expansion
+    /// to one placeholder per merged token happens after tokenization, so the
+    /// counts stay exact regardless of how the tokenizer would have handled a
+    /// long repeated literal.
+    ///
+    /// Images are placed at the **start** of their turn, before that message's
+    /// text: the flattened `(role, content)` shape has already lost where each
+    /// content part sat, and image-then-question is what essentially every
+    /// vision client sends.
+    #[cfg(feature = "mlx-native")]
+    pub fn build_chat_input_with_images(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        let mut prepared = Vec::new();
+        let mut counts = Vec::new();
+        let mut rendered: Vec<(String, String)> = Vec::with_capacity(messages.len());
+        for (i, (role, content)) in messages.iter().enumerate() {
+            let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let mut body = String::new();
+            for bytes in attached {
+                let p = self.runner.prepare_image(bytes)?;
+                counts.push(p.num_tokens);
+                prepared.push(p);
+                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
+            }
+            body.push_str(content);
+            rendered.push((role.clone(), body));
+        }
+
+        let ids = self.encode(&format_qwen3_chat(&rendered, thinking))?;
+        let image_token = self
+            .runner
+            .image_token_id()
+            .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+        let ids = crate::qwen36_vision::expand_image_placeholders(&ids, image_token, &counts)
+            .map_err(|e| anyhow!("expand image placeholders: {e}"))?;
+        Ok((ids, prepared))
+    }
+
     pub fn build_chat_input(
         &self,
         messages: &[(String, String)],
@@ -3314,18 +3667,43 @@ impl MlxQwen35Backend {
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
+        on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.chat_streaming_with_images(messages, &[], max_new_tokens, thinking, seq_id, on_token)
+    }
+
+    /// [`Self::chat_streaming`] with inline images.
+    ///
+    /// `images[i]` holds the encoded byte streams attached to `messages[i]`.
+    /// An empty slice is byte-identical to [`Self::chat_streaming`].
+    ///
+    /// Image requests skip MTP, draft/n-gram speculation and the prefix cache:
+    /// all four are keyed on text alone, and a vision prompt's placeholder rows
+    /// only mean anything together with the image spliced over them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_with_images<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
         mut on_token: F,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
+        let has_images = images.iter().any(|v| !v.is_empty());
         // Phase 2 S4 — MTP routing. `LUMEN_SPEC=mtp` activates the
         // qwen3_5_mtp speculative path when (1) the native runner installed
         // a drafter (via LUMEN_QWEN35_MTP=1 at load), and (2) the request
         // hasn't opted out. Falls back to baseline decode_step otherwise so
         // unmtp-loaded deployments behave identically.
         #[cfg(feature = "mlx-native")]
-        if self.qwen35_mtp_enabled() {
+        if !has_images && self.qwen35_mtp_enabled() {
             if let Some(k) = effective_qwen35_mtp_k() {
                 return self.chat_streaming_qwen35_mtp(
                     messages,
@@ -3346,7 +3724,7 @@ impl MlxQwen35Backend {
         // OFF: when no draft is loaded, this is a no-op and the existing path
         // below runs byte-identically.
         #[cfg(feature = "mlx-native")]
-        if self.draft_enabled() {
+        if !has_images && self.draft_enabled() {
             return self.chat_streaming_spec_draft(
                 messages,
                 max_new_tokens,
@@ -3356,7 +3734,7 @@ impl MlxQwen35Backend {
             );
         }
 
-        if let Some(cfg) = spec_decode::read_spec_config() {
+        if !has_images && let Some(cfg) = spec_decode::read_spec_config() {
             return self.chat_streaming_spec_ngram(
                 messages,
                 max_new_tokens,
@@ -3380,11 +3758,30 @@ impl MlxQwen35Backend {
             }
         }
 
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        // Images change both halves: the prompt gains a placeholder run per
+        // image, and prefill has to splice the encoded features over it.
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prepared) = if has_images {
+            self.build_chat_input_with_images(messages, images, thinking)?
+        } else {
+            (self.build_chat_input(messages, thinking)?, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let prompt_ids = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            self.build_chat_input(messages, thinking)?
+        };
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
         let t_prefill = std::time::Instant::now();
+        #[cfg(feature = "mlx-native")]
+        let (mut last, mut pos) = self.prefill_with_images(seq_id, &prompt_ids, &prepared)?;
+        #[cfg(not(feature = "mlx-native"))]
         let (mut last, mut pos) = self.prefill(seq_id, &prompt_ids)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(

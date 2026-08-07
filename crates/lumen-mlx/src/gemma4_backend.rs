@@ -1287,6 +1287,12 @@ pub(crate) mod imp {
             self.build_chat_input_with_tools(messages, thinking, &[])
         }
 
+        /// Prompt tokens one attached image adds — its soft-token run plus the
+        /// sentinels and trailing newline. Header-only; no pixel decode.
+        pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+            self.model.image_prompt_tokens(encoded)
+        }
+
         /// Structured-history variant — accepts `ChatTurn`s carrying
         /// `tool_calls` / tool result data the `(role, content)` shape
         /// can't represent. Used by the turn-2 continuation path
@@ -1521,14 +1527,90 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+            self.chat_with_images(
+                messages,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// Render an image-bearing prompt and return it alongside the images in
+        /// prompt order.
+        ///
+        /// Every image is measured first — the prompt must reserve exactly as
+        /// many `<|image|>` placeholders as the tower will emit soft tokens,
+        /// and that count depends on the image's aspect ratio. Measuring runs
+        /// decode + resize only, not the tower.
+        ///
+        /// The returned `PreparedImage`s are flattened in prompt order, matching
+        /// the placeholder runs the renderer just emitted, which is the pairing
+        /// `encode_images_for_prompt` relies on. They are carried rather than
+        /// re-derived so each image is decoded and resized exactly once.
+        fn build_image_prompt(
+            &self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<(Vec<u32>, Vec<u32>, Vec<crate::gemma4_vision::PreparedImage>)> {
+            let mut counts: Vec<Vec<usize>> = Vec::with_capacity(images.len());
+            let mut flat: Vec<crate::gemma4_vision::PreparedImage> = Vec::new();
+            for per_msg in images {
+                let mut row = Vec::with_capacity(per_msg.len());
+                for bytes in per_msg {
+                    let prepared = self.model.prepare_image(bytes)?;
+                    row.push(prepared.num_soft_tokens);
+                    flat.push(prepared);
+                }
+                counts.push(row);
+            }
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_with_images(
+                messages,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+            )?;
+            Ok((prompt, prefill_tokens, flat))
+        }
+
+        /// [`Self::chat`] with inline images.
+        ///
+        /// `images[i]` holds the encoded image byte streams attached to
+        /// `messages[i]`. An empty slice is byte-identical to [`Self::chat`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_with_images(
+            &mut self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            let (prompt, prefill_tokens, flat) =
+                self.build_image_prompt(messages, images, thinking, tools, tool_choice)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
                 sampling: build_sampling_config(temperature, top_p, ov),
             };
-            let stats = self.model.generate(&prompt, &cfg)?;
+            let stats = if flat.is_empty() {
+                self.model.generate(&prompt, &cfg)?
+            } else {
+                self.model
+                    .generate_with_cache_and_images(&prompt, &flat, &cfg, None)?
+            };
             log_chat_done(
                 stats.prompt_tokens,
                 stats.prefill_ms,
@@ -1566,13 +1648,53 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
+            self.build_prompt_and_prefill_with_images(messages, &[], thinking, tools, tool_choice)
+        }
+
+        /// [`Self::build_prompt_and_prefill`] with per-message image
+        /// soft-token counts. Empty `image_counts` is byte-identical.
+        fn build_prompt_and_prefill_with_images(
+            &self,
+            messages: &[(String, String)],
+            image_counts: &[Vec<usize>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::gemma4_tools::imp::ToolDef<'_>] = match tool_choice {
                 ResolvedToolChoice::None => &[],
                 _ => tools,
             };
-            let mut prompt =
-                self.build_chat_input_with_tools(messages, thinking, effective_tools)?;
+            let has_images = image_counts.iter().any(|c| !c.is_empty());
+
+            let mut prompt = if !has_images {
+                // No images → keep the untouched path, including the
+                // model-supplied jinja template when one is present.
+                self.build_chat_input_with_tools(messages, thinking, effective_tools)?
+            } else {
+                if self.jinja_chat.is_some() {
+                    // The jinja renderer emits a single `<|image|>`; expanding it
+                    // to the per-image soft-token run is the processor's job and
+                    // we don't reimplement that inside the template engine.
+                    return Err(anyhow!(
+                        "image input is not supported with a jinja chat template; \
+                         unset the template to use the built-in Gemma 4 renderer"
+                    ));
+                }
+                let parsed = Self::parse_role_pairs(messages)?;
+                let ids = self.chat.render_to_ids_with_tools_and_images(
+                    &parsed,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                    },
+                    effective_tools,
+                    image_counts,
+                )?;
+                maybe_dump_prompt(&self.chat, &ids, "with_images");
+                ids
+            };
             let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
             prompt.extend(prefill.iter().copied());
             Ok((prompt, prefill))
@@ -2173,6 +2295,7 @@ pub(crate) mod imp {
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
+                None, /* vision */
                 on_event,
             )
         }
@@ -2249,6 +2372,7 @@ pub(crate) mod imp {
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
+                None, /* vision */
                 on_event,
             )
         }
@@ -2368,8 +2492,76 @@ pub(crate) mod imp {
                 top_p,
                 ov,
                 grammar,
-                None,
-                None,
+                None, /* pre_built_cache */
+                None, /* snapshot_prefix_key */
+                None, /* vision */
+                on_event,
+            )
+        }
+
+        /// [`Self::chat_streaming`] with inline images.
+        ///
+        /// `images[i]` holds the encoded image byte streams attached to
+        /// `messages[i]`. With nothing attached this is byte-identical to
+        /// [`Self::chat_streaming`], so callers can route every request here.
+        ///
+        /// Images are encoded once, up front, and handed to the prefill loop;
+        /// the chunked prefill then splices each image's rows into whichever
+        /// chunk covers them. Decode is pure text and takes the unchanged
+        /// path. Like the non-streaming variant this skips the prefix cache —
+        /// the cached prefix is keyed on text alone, and a vision prompt's
+        /// placeholder rows only mean anything together with the image they
+        /// were spliced from.
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_streaming_with_images(
+            &mut self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            if !images.iter().any(|v| !v.is_empty()) {
+                return self.chat_streaming(
+                    messages,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                );
+            }
+
+            let (prompt, prefill_tokens, flat) =
+                self.build_image_prompt(messages, images, thinking, tools, tool_choice)?;
+            // Encode before the prefill loop starts: the runs are prompt-global
+            // and every chunk needs to be able to look up any of them.
+            let vision = self
+                .model
+                .encode_images_for_prompt(&prompt, &flat)
+                .context("chat_streaming: encode images")?;
+            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            self.decode_streaming_with_prompt(
+                prompt,
+                prefill_tokens,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                grammar,
+                None, /* pre_built_cache — images bypass the prefix cache */
+                None, /* snapshot_prefix_key */
+                Some(vision),
                 on_event,
             )
         }
@@ -2405,8 +2597,9 @@ pub(crate) mod imp {
                 top_p,
                 ov,
                 grammar,
-                None,
-                None,
+                None, /* pre_built_cache */
+                None, /* snapshot_prefix_key */
+                None, /* vision */
                 on_event,
             )
         }
@@ -2446,6 +2639,13 @@ pub(crate) mod imp {
             // requests). `Some((key, 0))` snapshots the full prompt — used
             // when trailing header detection isn't available.
             snapshot_prefix_key: Option<(String, usize)>,
+            // Encoded images for an image-bearing prompt: prompt-global
+            // `(start, len)` placeholder runs paired with their `[len_i,
+            // hidden]` soft tokens, already produced by
+            // `encode_images_for_prompt`. Encoding happens once here, before
+            // the chunk loop, and each chunk splices whichever rows fall in
+            // its window. `None` is the text path, unchanged.
+            vision: Option<(Vec<(usize, usize)>, Vec<mlx_rs::Array>)>,
             mut on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             // ── Manual prefill + decode loop so we can inject the
@@ -2632,17 +2832,30 @@ pub(crate) mod imp {
                     // (8K × hidden × vocab quantized matmul) whose output is
                     // immediately reduced to a single argmax. Bit-identical
                     // tokens; see playbook_lm_head_last_token_slice.md.
-                    let chunk_logits = self
-                        .model
-                        .forward_last_token(chunk, &mut cache)
-                        .with_context(|| {
-                            format!(
-                                "chat_streaming: prefill chunk {}/{} ({} tokens)",
-                                i + 1,
-                                n_chunks,
-                                chunk.len()
-                            )
-                        })?;
+                    //
+                    // With images attached the chunk goes through the
+                    // soft-token variant instead: the runs are prompt-global,
+                    // so the chunk's absolute start tells the splice which
+                    // rows (if any) land in this window.
+                    let chunk_start = prefill_start + i * chunk_size;
+                    let chunk_logits = match vision.as_ref() {
+                        Some((runs, soft)) => self.model.forward_last_token_with_soft(
+                            chunk,
+                            &mut cache,
+                            chunk_start,
+                            runs,
+                            soft,
+                        ),
+                        None => self.model.forward_last_token(chunk, &mut cache),
+                    }
+                    .with_context(|| {
+                        format!(
+                            "chat_streaming: prefill chunk {}/{} ({} tokens)",
+                            i + 1,
+                            n_chunks,
+                            chunk.len()
+                        )
+                    })?;
                     // EVEN the final chunk gets eval'd. Keeping it lazy in the
                     // multi-chunk regime piles chunk-N's forward graph onto
                     // the subsequent argmax + async_eval call, which then
@@ -2701,10 +2914,13 @@ pub(crate) mod imp {
                 // logits feeding into the decode argmax.
                 if let Some(split) = snapshot_split {
                     let trailing = &prompt[split..];
-                    let trailing_logits = self
-                        .model
-                        .forward_last_token(trailing, &mut cache)
-                        .context("chat_streaming: prefill trailing header")?;
+                    let trailing_logits = match vision.as_ref() {
+                        Some((runs, soft)) => self
+                            .model
+                            .forward_last_token_with_soft(trailing, &mut cache, split, runs, soft),
+                        None => self.model.forward_last_token(trailing, &mut cache),
+                    }
+                    .context("chat_streaming: prefill trailing header")?;
                     trailing_logits
                         .eval()
                         .context("chat_streaming: prefill trailing header eval")?;

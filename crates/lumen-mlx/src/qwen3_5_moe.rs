@@ -154,6 +154,21 @@ mod imp {
         pub text_config: NativeTextConfig,
         #[serde(default)]
         pub quantization_config: Option<NativeQuantizationConfig>,
+
+        // ── multimodal (image) ──
+        // Present on every `Qwen3_5*ForConditionalGeneration` checkpoint. All
+        // optional so a text-only conversion still parses.
+        #[serde(default)]
+        pub vision_config: Option<crate::qwen36_vision::NativeQwen36VisionConfig>,
+        /// Placeholder token whose embedding rows the vision features replace
+        /// (`<|image_pad|>`, 248056 on Qwen3.6).
+        #[serde(default)]
+        pub image_token_id: Option<u32>,
+        /// `<|vision_start|>` / `<|vision_end|>` sentinels around each run.
+        #[serde(default)]
+        pub vision_start_token_id: Option<u32>,
+        #[serde(default)]
+        pub vision_end_token_id: Option<u32>,
     }
 
     /// `text_config` block — all fields the forward path needs.
@@ -172,12 +187,22 @@ mod imp {
         pub layer_types: Vec<NativeLayerType>,
 
         // RoPE
+        //
+        // NOTE: shipped Qwen3.6 configs carry `rope_theta` only inside
+        // `rope_parameters`, so this flat field always falls back to its
+        // default — which happens to be the same 10_000_000 the nested block
+        // specifies. Left as-is rather than re-plumbed, because changing where
+        // theta comes from changes decode numerics for every existing
+        // checkpoint; `rope_parameters` below is additive.
         #[serde(default = "default_rope_theta")]
         pub rope_theta: f32,
         #[serde(default = "default_partial_rotary_factor")]
         pub partial_rotary_factor: f32,
         #[serde(default = "default_max_pos_emb")]
         pub max_position_embeddings: usize,
+        /// Nested rope block. Present on Qwen3.6; read for its MRoPE fields.
+        #[serde(default)]
+        pub rope_parameters: Option<NativeRopeParameters>,
 
         // Linear (delta-net) attention dims
         #[serde(default)]
@@ -214,6 +239,56 @@ mod imp {
         pub tie_word_embeddings: bool,
         // Other unknown fields (`attn_output_gate`, …) are silently dropped by serde
         // — no allow-list needed.
+    }
+
+    /// `text_config.rope_parameters` — the nested rope block Qwen3.6 ships.
+    ///
+    /// Only the MRoPE fields are consumed today. They are inert for text-only
+    /// prompts (all three axes carry the same position, so MRoPE degenerates to
+    /// ordinary 1-D RoPE) and become load-bearing once an image block gives its
+    /// tokens a constant `t` with an `h`/`w` grid.
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct NativeRopeParameters {
+        /// Frequency channels allocated to `(t, h, w)`. Sums to
+        /// `rope_dim / 2` — `[11, 11, 10]` for Qwen3.6's 64-wide rotary span.
+        #[serde(default)]
+        pub mrope_section: Option<Vec<usize>>,
+        /// Spread the axes across the spectrum instead of assigning contiguous
+        /// blocks. See `native_rope::mrope_axis_of_channel`.
+        #[serde(default)]
+        pub mrope_interleaved: bool,
+    }
+
+    /// Encoded images for one forward pass: where this window starts in the
+    /// full prompt, the prompt-global placeholder runs, and each image's
+    /// `[run_len, hidden]` block.
+    ///
+    /// Passed as a unit because the three are only meaningful together — the
+    /// runs are addressed against the whole prompt, so a window offset is
+    /// required to interpret them.
+    pub(crate) type VisionSoft<'a> = Option<(usize, &'a [(usize, usize)], &'a [Array])>;
+
+    /// Per-token `(t, h, w)` positions for the tokens in one forward pass.
+    ///
+    /// `None` — the overwhelmingly common case — means "contiguous text
+    /// positions starting at the cache offset", which is what
+    /// `mlx::fast::rope`'s scalar `offset` already expresses and what every
+    /// text-only prompt wants.
+    ///
+    /// `Shifted(delta)` is still contiguous, just offset — decode *after* an
+    /// image block, where the axes have realigned but the position counter
+    /// advanced more slowly than the token count did (an image occupies `h·w`
+    /// slots yet advances by only `max(h, w)`), so the running position is
+    /// `cache.offset() + delta` with `delta` negative. Upstream calls this
+    /// `mrope_position_deltas`. Still fused.
+    ///
+    /// `Explicit` carries per-token `(t, h, w)` triples. Only the prefill of an
+    /// image-bearing prompt needs it, and only it pays for the unfused path.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum RopePlan<'a> {
+        Sequential,
+        Shifted(i32),
+        Explicit(&'a [[i32; 3]]),
     }
 
     /// MLP variant within the qwen3_5 family. Dense (27B) carries `intermediate_size`
@@ -467,6 +542,23 @@ mod imp {
             ((self.head_dim as f32) * self.partial_rotary_factor) as usize
         }
 
+        /// `(sections, interleaved)` for MRoPE, when the config declares a
+        /// usable `mrope_section`.
+        ///
+        /// `None` means "no MRoPE" and the caller keeps the fused scalar-offset
+        /// rope. A section list that does not have three entries summing to
+        /// `rope_dim / 2` is also `None` rather than an error: it would only
+        /// matter for image input, which refuses to run without this anyway,
+        /// and a text-only deploy should not fail to load over it.
+        pub fn mrope(&self) -> Option<([usize; 3], bool)> {
+            let params = self.rope_parameters.as_ref()?;
+            let s = params.mrope_section.as_ref()?;
+            if s.len() != 3 || s.iter().sum::<usize>() != self.rope_dim() / 2 {
+                return None;
+            }
+            Some(([s[0], s[1], s[2]], params.mrope_interleaved))
+        }
+
         pub fn is_linear_per_layer(&self) -> Vec<bool> {
             self.layer_types.iter().map(|t| t.is_linear()).collect()
         }
@@ -562,6 +654,12 @@ mod imp {
 
         pub fn get(&self, name: &str) -> Option<&Array> {
             self.tensors.get(name)
+        }
+
+        /// Raw tensor bag. Read this **before** [`Self::sanitize`] if you need
+        /// the `vision_tower.*` / `model.visual.*` entries it drops.
+        pub fn tensors(&self) -> &HashMap<String, Array> {
+            &self.tensors
         }
 
         pub fn require(&self, name: &str) -> Result<&Array> {
@@ -1377,6 +1475,20 @@ mod imp {
                 Vec<(Vec<u32>, Vec<f32>)>,
             )>,
         >,
+        /// Image encoder. `Some` only when `LUMEN_VISION=1` **and** the
+        /// checkpoint still carries `vision_tower.*` weights. `None` leaves the
+        /// text path byte-for-byte unchanged, memory footprint included.
+        vision: Option<crate::qwen36_vision::NativeQwen36VisionTower>,
+    }
+
+    /// Opt-in gate for loading the ~0.9 GB image tower.
+    fn vision_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     /// Post-projection / post-RoPE intermediates shared by the plain and
@@ -1431,6 +1543,38 @@ mod imp {
             let mlp_kind = config.validate_qwen3_5_family()?;
 
             let mut weights = NativeWeights::load_dir(model_dir)?;
+
+            // Build the image tower from the raw bag — `sanitize()` drops every
+            // `vision_tower.*` / `model.visual.*` entry on the next line.
+            let vision = if vision_enabled() {
+                match config.vision_config.clone() {
+                    Some(vcfg) if weights.get("vision_tower.pos_embed.weight").is_some() => Some(
+                        crate::qwen36_vision::NativeQwen36VisionTower::load(
+                            weights.tensors(),
+                            vcfg,
+                        )
+                        .context("load Qwen 3.6 vision tower")?,
+                    ),
+                    Some(_) => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but {} ships no vision_tower.* weights \
+                             (text-only conversion) — image input stays disabled",
+                            model_dir.display()
+                        );
+                        None
+                    }
+                    None => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but config.json has no vision_config \
+                             — image input stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             weights.sanitize()?;
 
             let is_linear_per_layer = config.text_config.is_linear_per_layer();
@@ -1485,6 +1629,7 @@ mod imp {
                 is_linear_per_layer,
                 layer_weights,
                 linear_attn_constants,
+                vision,
                 mtp: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
@@ -1665,8 +1810,9 @@ mod imp {
             layer_idx: usize,
             causal: bool,
             cache: &mut NativeKvCache,
+            positions: RopePlan<'_>,
         ) -> Result<Array> {
-            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
             // (5) Append to KV cache and fetch full history.
             let (k_full, v_full) = cache.update_and_fetch(&p.k_rope, &p.v_t)?;
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
@@ -1696,12 +1842,13 @@ mod imp {
             layer_idx: usize,
             causal: bool,
             cache: &mut NativeRotatingKvCacheTurboQuant,
+            positions: RopePlan<'_>,
         ) -> Result<Array> {
             use crate::turboquant::{
                 TURBOQUANT_SEED, lloyd_max_centroids, lloyd_max_dequantize_scaled,
                 lloyd_max_quantize_stage1, rotate_last_axis, rotation_matrix_f32,
             };
-            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
 
             let centroids = lloyd_max_centroids(cache.bits())
                 .context("layer_full_attn_forward_tq: Lloyd-Max centroids")?;
@@ -1753,13 +1900,20 @@ mod imp {
             x: &Array,
             layer_idx: usize,
             offset: i32,
+            positions: RopePlan<'_>,
         ) -> Result<FullAttnQkv> {
             // Projections + per-head norm (batched, weight-bound) then RoPE.
             // Single-seq callers get a thin wrapper over the Stage-1 split, so
             // this path is bit-identical to the pre-split implementation.
             let p = self.full_attn_proj_no_rope(x, layer_idx)?;
-            let (q_rope, k_rope) =
-                self.apply_full_attn_rope(&p.queries_t, &p.k_t, p.rope_dim, p.base_theta, offset)?;
+            let (q_rope, k_rope) = self.apply_full_attn_rope(
+                &p.queries_t,
+                &p.k_t,
+                p.rope_dim,
+                p.base_theta,
+                offset,
+                positions,
+            )?;
             Ok(FullAttnQkv {
                 q_rope,
                 k_rope,
@@ -1777,6 +1931,7 @@ mod imp {
         /// (the cache token position). Honors `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS`.
         /// Factored out of `full_attn_qkv_rope` so the batched decode path can
         /// apply RoPE per seq at each seq's own offset.
+        #[allow(clippy::too_many_arguments)]
         fn apply_full_attn_rope(
             &self,
             queries_t: &Array,
@@ -1784,7 +1939,41 @@ mod imp {
             rope_dim: i32,
             base_theta: f32,
             offset: i32,
+            positions: RopePlan<'_>,
         ) -> Result<(Array, Array)> {
+            // Explicit positions mean MRoPE: an image block's tokens share a
+            // `t` and spread over an `h`/`w` grid, which no scalar offset can
+            // express. Text-only prompts pass `None` and keep the fused kernel
+            // — MRoPE would degenerate to the same rotation anyway, just
+            // slower.
+            // Match on the plan first: this runs per full-attn layer on every
+            // decode step, and the text path should not even look at the config.
+            let offset = match positions {
+                RopePlan::Sequential => offset,
+                RopePlan::Shifted(delta) => offset + delta,
+                RopePlan::Explicit(pos) => {
+                    if let Some((sections, interleaved)) = self.text_config().mrope() {
+                        let q = crate::native_rope::mrope(
+                            queries_t,
+                            rope_dim,
+                            pos,
+                            sections,
+                            interleaved,
+                            base_theta,
+                        )?;
+                        let k = crate::native_rope::mrope(
+                            k_t,
+                            rope_dim,
+                            pos,
+                            sections,
+                            interleaved,
+                            base_theta,
+                        )?;
+                        return Ok((q, k));
+                    }
+                    offset
+                }
+            };
             let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -1980,8 +2169,17 @@ mod imp {
                 // PER SEQ, so a batch may mix attached seqs (sharing the prefix)
                 // with fresh full-history seqs — each takes the right path.
                 let attached = shared_layer.is_some() && kv.base_offset() > 0;
-                let (q_rope, k_rope) =
-                    self.apply_full_attn_rope(&q_i, &k_i, p.rope_dim, p.base_theta, offset_i)?;
+                // Batched decode is one token per seq, so positions are always
+                // the scalar `offset_i` — even under MRoPE, where the three
+                // axes have realigned by the time decode starts.
+                let (q_rope, k_rope) = self.apply_full_attn_rope(
+                    &q_i,
+                    &k_i,
+                    p.rope_dim,
+                    p.base_theta,
+                    offset_i,
+                    RopePlan::Sequential,
+                )?;
                 // RoPE used the absolute `offset_i`, so suffix K is positioned
                 // consistently with the shared prefix. `update_and_fetch` returns
                 // the seq's own buffer view: the suffix only when attached (then
@@ -2623,8 +2821,14 @@ mod imp {
         /// `lm_head` (untied) or the embedding `as_linear` (tied) projects
         /// the hidden states into vocab logits with shape `[B, L, vocab]`.
         pub fn forward(&self, input_ids: &[u32], cache: &mut NativePromptCache) -> Result<Array> {
-            let (logits, _) =
-                self.forward_impl(input_ids, cache, /* last_only */ false, &[])?;
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                /* last_only */ false,
+                &[],
+                RopePlan::Sequential,
+                None,
+            )?;
             Ok(logits)
         }
 
@@ -2643,7 +2847,58 @@ mod imp {
             cache: &mut NativePromptCache,
             last_only: bool,
         ) -> Result<Array> {
-            let (logits, _) = self.forward_impl(input_ids, cache, last_only, &[])?;
+            let (logits, _) =
+                self.forward_impl(input_ids, cache, last_only, &[], RopePlan::Sequential, None)?;
+            Ok(logits)
+        }
+
+        /// [`Self::forward_with_opts`] with the running MRoPE position shifted
+        /// by `mrope_delta`.
+        ///
+        /// After an image block, `cache.offset()` counts tokens but the MRoPE
+        /// position counter has advanced more slowly — an image occupies `h·w`
+        /// slots and advances by `max(h, w)`. `mrope_delta` is that difference,
+        /// so decode keeps using the fused kernel and merely starts from the
+        /// right number. `0` is byte-identical to [`Self::forward_with_opts`].
+        pub fn forward_decode_shifted(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            mrope_delta: i32,
+        ) -> Result<Array> {
+            let plan = if mrope_delta == 0 {
+                RopePlan::Sequential
+            } else {
+                RopePlan::Shifted(mrope_delta)
+            };
+            let (logits, _) = self.forward_impl(input_ids, cache, last_only, &[], plan, None)?;
+            Ok(logits)
+        }
+
+        /// [`Self::forward_with_opts`] with explicit MRoPE positions.
+        ///
+        /// `positions[i]` is the `(t, h, w)` triple for `input_ids[i]`. Used by
+        /// the image path, where a vision block's tokens share a `t` and spread
+        /// over an `h`/`w` grid. Passing text-only positions (all three axes
+        /// equal, contiguous from the cache offset) is equivalent to
+        /// [`Self::forward_with_opts`] but takes the slower unfused rope, so
+        /// callers with no image should keep using that.
+        pub fn forward_with_positions(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            positions: &[[i32; 3]],
+        ) -> Result<Array> {
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                &[],
+                RopePlan::Explicit(positions),
+                None,
+            )?;
             Ok(logits)
         }
 
@@ -2670,7 +2925,195 @@ mod imp {
             last_only: bool,
             capture_layer_ids: &[usize],
         ) -> Result<(Array, Vec<Array>)> {
-            self.forward_impl(input_ids, cache, last_only, capture_layer_ids)
+            self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                capture_layer_ids,
+                RopePlan::Sequential,
+                None,
+            )
+        }
+
+        /// Is the image tower loaded and usable?
+        pub fn vision_available(&self) -> bool {
+            self.vision.is_some()
+        }
+
+        /// Token id whose embedding rows vision features replace.
+        pub fn image_token_id(&self) -> Option<u32> {
+            self.config.image_token_id
+        }
+
+        /// `spatial_merge_size`, for converting a patch grid to the merged
+        /// token grid the MRoPE positions are laid out over.
+        pub fn vision_merge_size(&self) -> Option<usize> {
+            self.vision.as_ref().map(|v| v.config().spatial_merge_size)
+        }
+
+        /// The loaded tower's config, for header-only prompt sizing.
+        pub fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+            self.vision.as_ref().map(|v| v.config().clone())
+        }
+
+        /// Decode + resize one image onto the patch grid, without running the
+        /// tower.
+        ///
+        /// Callers hold the result: `num_tokens` sizes the prompt's placeholder
+        /// run and `grid` drives the MRoPE positions, then the same
+        /// [`PreparedImage`] goes into [`Self::encode_prepared_image`].
+        /// Re-deriving it at encode time would decode and resize twice.
+        ///
+        /// [`PreparedImage`]: crate::qwen36_vision::PreparedImage
+        pub fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            crate::qwen36_vision::prepare_image(encoded, vision.config())
+                .map_err(|e| anyhow!("image preprocessing failed: {e}"))
+        }
+
+        /// Run the tower on an already-prepared image, returning
+        /// `[num_tokens, out_hidden_size]` language-model embeddings.
+        pub fn encode_prepared_image(
+            &self,
+            prepared: &crate::qwen36_vision::PreparedImage,
+        ) -> Result<Array> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let cfg = vision.config();
+            let per_patch =
+                cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size * cfg.in_channels;
+            let n = (prepared.grid.0 * prepared.grid.1) as i32;
+            let px = Array::from_slice(&prepared.patches, &[n, per_patch as i32]);
+            let soft = vision
+                .forward(&px, prepared.grid)
+                .context("vision tower forward")?;
+            // Materialize now so the tower's intermediates are freed before the
+            // text prefill allocates its own working set.
+            soft.eval().context("vision: eval soft tokens")?;
+            Ok(soft)
+        }
+
+        /// Locate each image's placeholder run and encode the matching image,
+        /// checking the two agree on length.
+        ///
+        /// Encoding happens once, before the chunked prefill starts, because
+        /// the runs are prompt-global and any chunk may need any of them.
+        pub fn encode_images_for_prompt(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::qwen36_vision::PreparedImage],
+        ) -> Result<(Vec<(usize, usize)>, Vec<Array>)> {
+            let image_token = self
+                .config
+                .image_token_id
+                .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+            let runs = crate::vision_splice::image_token_runs(prompt_ids, image_token);
+            if runs.len() != images.len() {
+                return Err(anyhow!(
+                    "prompt has {} image-token run(s) but {} image(s) were supplied",
+                    runs.len(),
+                    images.len()
+                ));
+            }
+            let mut soft = Vec::with_capacity(images.len());
+            for (idx, (prepared, run)) in images.iter().zip(runs.iter()).enumerate() {
+                if prepared.num_tokens != run.1 {
+                    return Err(anyhow!(
+                        "image {idx} encodes to {} tokens but the prompt reserved {} \
+                         image_pad placeholders",
+                        prepared.num_tokens,
+                        run.1
+                    ));
+                }
+                soft.push(
+                    self.encode_prepared_image(prepared)
+                        .with_context(|| format!("encoding image {idx}"))?,
+                );
+            }
+            Ok((runs, soft))
+        }
+
+        /// [`Self::forward_with_opts`] for one chunk of an image-bearing prompt.
+        ///
+        /// `positions` covers this chunk's tokens; `span_start` / `runs` /
+        /// `soft` stay prompt-global across the whole chunk loop.
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward_chunk_with_images(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            positions: &[[i32; 3]],
+            span_start: usize,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                &[],
+                RopePlan::Explicit(positions),
+                Some((span_start, runs, soft)),
+            )?;
+            Ok(logits)
+        }
+
+        /// Replace the embedding rows covered by each image's placeholder run
+        /// with that image's features, for the window
+        /// `[span_start, span_start + l)`.
+        fn splice_soft_tokens(
+            &self,
+            h: &Array,
+            span_start: i32,
+            l: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let hidden = self.text_config().hidden_size as i32;
+            let dt = h.dtype();
+            let slices = crate::vision_splice::clip_runs_to_window(span_start, l, runs)?;
+            if slices.is_empty() {
+                return Ok(h.clone());
+            }
+
+            let take_span = |x: &Array, start: i32, end: i32| -> Result<Array> {
+                let idx: Vec<i32> = (start..end).collect();
+                let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+                mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("splice: take_axis(axis=1)")
+            };
+
+            let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
+            let mut cursor = 0i32;
+            for s in &slices {
+                if s.local_start > cursor {
+                    segments.push(
+                        take_span(h, cursor, s.local_start)
+                            .context("splice: text span before image")?,
+                    );
+                }
+                let block = soft
+                    .get(s.image)
+                    .ok_or_else(|| anyhow!("splice: no features for image {}", s.image))?;
+                let run_len = runs[s.image].1 as i32;
+                let block = mlx_rs::ops::reshape(block, &[1, run_len, hidden])
+                    .context("splice: reshape image features")?;
+                let block = take_span(&block, s.row_start, s.row_end)
+                    .context("splice: clip image features to window")?;
+                segments.push(block.as_dtype(dt).context("splice: cast image features")?);
+                cursor = s.local_end;
+            }
+            if cursor < l {
+                segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
+            }
+            let refs: Vec<&Array> = segments.iter().collect();
+            let out =
+                mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
+            debug_assert_eq!(out.shape(), [1, l, hidden]);
+            Ok(out)
         }
 
         /// Inner forward implementation, parameterized by both `last_only`
@@ -2683,7 +3126,18 @@ mod imp {
             cache: &mut NativePromptCache,
             last_only: bool,
             capture_layer_ids: &[usize],
+            positions: RopePlan<'_>,
+            soft: VisionSoft<'_>,
         ) -> Result<(Array, Vec<Array>)> {
+            if let RopePlan::Explicit(pos) = positions {
+                if pos.len() != input_ids.len() {
+                    return Err(anyhow!(
+                        "forward: {} rope positions for {} tokens",
+                        pos.len(),
+                        input_ids.len()
+                    ));
+                }
+            }
             if input_ids.is_empty() {
                 return Err(anyhow!("forward: input_ids is empty"));
             }
@@ -2720,6 +3174,17 @@ mod imp {
             let hidden_dim = cfg.hidden_size as i32;
             let hidden_states = mlx_rs::ops::reshape(&embed_f32, &[1, l, hidden_dim])
                 .context("forward: reshape embeddings to [1, L, hidden] failed")?;
+
+            // Vision splice. Unlike Gemma 4 there is no embedding scale to
+            // order against — the image features simply replace the
+            // placeholder rows' embeddings.
+            let hidden_states = match soft {
+                None => hidden_states,
+                Some((span_start, runs, blocks)) => self
+                    .splice_soft_tokens(&hidden_states, span_start as i32, l, runs, blocks)
+                    .context("forward: splice vision soft tokens")?,
+            };
+
             if let Some(t0) = t_embed {
                 hidden_states
                     .eval()
@@ -2762,10 +3227,10 @@ mod imp {
                     self.layer_linear_attn_forward(&normed, layer_idx, lin)?
                 } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
                     let tq = layer_cache.as_full_turboquant_mut()?;
-                    self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq)?
+                    self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq, positions)?
                 } else {
                     let kv = layer_cache.as_full_mut()?;
-                    self.layer_full_attn_forward(&normed, layer_idx, causal, kv)?
+                    self.layer_full_attn_forward(&normed, layer_idx, causal, kv, positions)?
                 };
                 if let Some(t0) = t_attn {
                     attn.eval().context("forward: timing eval(attn) failed")?;
@@ -3053,9 +3518,13 @@ mod imp {
                                 "forward_decode_batch: slice seq for TQ full-attn failed",
                             )?;
                             let tq = c.layer_mut(layer_idx).unwrap().as_full_turboquant_mut()?;
-                            parts.push(
-                                self.layer_full_attn_forward_tq(&normed_i, layer_idx, false, tq)?,
-                            );
+                            parts.push(self.layer_full_attn_forward_tq(
+                                &normed_i,
+                                layer_idx,
+                                false,
+                                tq,
+                                RopePlan::Sequential,
+                            )?);
                         }
                         let refs: Vec<&Array> = parts.iter().collect();
                         mlx_rs::ops::concatenate_axis(&refs, 0)
@@ -4906,6 +5375,301 @@ pub use imp::MtpStepOutput;
 // Default-feature-build tests exercise pure-Rust paths (config parsing,
 // sanitize key rewriting on a fake weight map). MLX FFI tests are gated by
 // `feature = "mlx-native"` and `#[ignore]`'d per Issue #5.
+
+/// MRoPE gate: introducing an unfused rope path is only safe if it is a no-op
+/// for every text-only prompt, which is all of them until image input lands.
+/// The cheap half of that (config parsing, section validation) runs everywhere;
+/// the expensive half (identical logits from a real checkpoint) is `#[ignore]`d
+/// behind `LUMEN_QWEN35_MODEL_DIR`.
+#[cfg(all(test, feature = "mlx-native"))]
+mod mrope_tests {
+    use super::imp::{NativeModelConfig, NativeQwen3_5MoeModel};
+
+    /// The shipped Qwen3.6 configs put rope settings in a nested block; the
+    /// sections have to line up with the rotary span or MRoPE is refused.
+    #[test]
+    fn parses_qwen36_rope_parameters() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "rope_type": "default"
+                }
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.rope_dim(), 64);
+        assert_eq!(cfg.text_config.mrope(), Some(([11, 11, 10], true)));
+    }
+
+    /// The whole qwen3_5 family declares MRoPE, including the 35B-A3B config
+    /// checked in here — they are all `…ForConditionalGeneration` checkpoints.
+    /// That is exactly why the identity gate below matters: MRoPE is not an
+    /// opt-in for exotic models, it is on for every Qwen3.6 prompt we serve.
+    #[test]
+    fn shipped_qwen35_config_declares_mrope() {
+        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), Some(([11, 11, 10], true)));
+    }
+
+    /// A config with no `rope_parameters` (older/plain text checkpoints) keeps
+    /// the fused kernel unconditionally.
+    #[test]
+    fn absent_rope_parameters_means_no_mrope() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), None);
+    }
+
+    /// A section list that does not tile the rotary span is ignored rather than
+    /// fatal: it only matters for image input, and a text-only deploy should
+    /// not fail to load over it.
+    #[test]
+    fn mismatched_sections_disable_mrope_instead_of_failing() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": { "mrope_section": [11, 11], "mrope_interleaved": true }
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), None);
+    }
+
+    /// THE gate for Phase A: feeding identity positions (`t == h == w ==
+    /// offset + i`) through the unfused MRoPE path must produce the same tokens
+    /// as the fused scalar-offset path. If this drifts, every text prompt on a
+    /// Qwen3.6 checkpoint drifts with it.
+    ///
+    /// ```sh
+    /// LUMEN_QWEN35_MODEL_DIR=~/models/Qwen3.6-27B-MTPLX-Speed \
+    ///   cargo test -p lumen-mlx --features mlx-native \
+    ///   mrope_tests::identity_positions -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "needs a real Qwen3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn identity_positions_match_the_fused_rope_path() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let model = NativeQwen3_5MoeModel::load(&dir).expect("load model");
+        assert!(
+            model.text_config().mrope().is_some(),
+            "checkpoint declares no mrope_section — this gate would be vacuous"
+        );
+
+        // Real token ids, not a synthetic ramp: routing (MoE) and the linear
+        // layers behave differently on out-of-distribution input.
+        let prompt: Vec<u32> = vec![
+            9707, 11, 4340, 653, 498, 1936, 264, 4285, 1815, 304, 22775, 30,
+        ];
+
+        let mut cache_a = model.make_cache();
+        let fused = model
+            .forward_with_opts(&prompt, &mut cache_a, /* last_only */ true)
+            .expect("fused forward");
+
+        let positions: Vec<[i32; 3]> = (0..prompt.len() as i32).map(|i| [i, i, i]).collect();
+        let mut cache_b = model.make_cache();
+        let manual = model
+            .forward_with_positions(&prompt, &mut cache_b, true, &positions)
+            .expect("mrope forward");
+
+        let to_vec = |a: &mlx_rs::Array| {
+            a.as_dtype(mlx_rs::Dtype::Float32)
+                .expect("cast")
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let (a, b) = (to_vec(&fused), to_vec(&manual));
+        assert_eq!(a.len(), b.len());
+
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(
+            argmax(&a),
+            argmax(&b),
+            "identity-position MRoPE picked a different next token than fused rope"
+        );
+
+        // Logits agreeing closely is the stronger statement; the argmax above
+        // is the one that actually decides output.
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        println!("logit max|Δ| = {max_abs:.4e} (peak |logit| = {scale:.3})");
+        assert!(
+            max_abs < 0.02 * scale,
+            "logits diverge by {max_abs} (peak {scale}) — the unfused path is not equivalent"
+        );
+    }
+}
+
+/// End-to-end gate for the Qwen 3.6 image path.
+///
+/// A vision tower fails silently — a wrong rotary split, norm convention or
+/// token order yields confident nonsense, not an error — and with no PyTorch on
+/// this machine there is no golden tensor to compare against. So the gate is
+/// behavioural: encode a probe image whose content is known, run the real
+/// checkpoint, and require the model to describe it. Structural bugs do not
+/// survive that; a scrambled tower produces text about something else entirely.
+///
+/// ```sh
+/// LUMEN_VISION=1 LUMEN_QWEN35_MODEL_DIR=~/models/Qwen3.6-27B-MTPLX-Speed \
+///   cargo test -p lumen-mlx --features mlx-native --release \
+///   qwen36_vision_e2e -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(all(test, feature = "mlx-native"))]
+mod qwen36_vision_e2e {
+    use super::imp::NativeQwen3_5MoeModel;
+    use crate::qwen36_vision;
+
+    /// The same probe the Gemma 4 parity fixture uses: bright rectangles
+    /// scattered on black. Distinctive enough that a generic answer cannot pass
+    /// for a correct one.
+    const PROBE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gemma4_vision_probe.png"
+    );
+
+    #[test]
+    #[ignore = "needs LUMEN_VISION=1 and a Qwen3.6 checkpoint with vision weights"]
+    fn describes_a_known_image() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let model = NativeQwen3_5MoeModel::load(&dir).expect("load model");
+        assert!(
+            model.vision_available(),
+            "vision tower not loaded — set LUMEN_VISION=1 and use a checkpoint \
+             that still ships vision_tower.* weights"
+        );
+        let tok =
+            tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+
+        let bytes = std::fs::read(PROBE).expect("read probe image");
+        let prepared = model.prepare_image(&bytes).expect("prepare image");
+        let merge = model.vision_merge_size().expect("merge size");
+        println!(
+            "probe → {}×{} patches, {} merged tokens",
+            prepared.grid.0, prepared.grid.1, prepared.num_tokens
+        );
+
+        // One placeholder per image in the rendered text; expanded to one per
+        // merged token at the id level.
+        let text = format!(
+            "<|im_start|>user\n{}Describe this image in one sentence.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            qwen36_vision::IMAGE_BLOCK
+        );
+        let ids: Vec<u32> = tok
+            .encode(text.as_str(), true)
+            .expect("tokenize")
+            .get_ids()
+            .to_vec();
+        let image_token = model.image_token_id().expect("image_token_id");
+        assert!(
+            ids.contains(&image_token),
+            "the tokenizer did not resolve <|image_pad|> to {image_token}"
+        );
+        let prompt =
+            qwen36_vision::expand_image_placeholders(&ids, image_token, &[prepared.num_tokens])
+                .expect("expand placeholders");
+        println!("prompt = {} tokens", prompt.len());
+
+        // Prefill with the image spliced in, then greedy-decode.
+        let (runs, soft) = model
+            .encode_images_for_prompt(&prompt, std::slice::from_ref(&prepared))
+            .expect("encode image");
+        let positions =
+            qwen36_vision::mrope_positions(&prompt, image_token, &[prepared.merged_grid(merge)])
+                .expect("positions");
+        let delta = qwen36_vision::next_position(&positions) - prompt.len() as i32;
+        println!("mrope delta = {delta} (positions run shorter than tokens)");
+
+        let mut cache = model.make_cache();
+        let logits = model
+            .forward_chunk_with_images(&prompt, &mut cache, true, &positions, 0, &runs, &soft)
+            .expect("prefill");
+        let mut next = model.argmax_last_token(&logits).expect("argmax");
+
+        let eos: Vec<u32> = model.eos_tokens().to_vec();
+        let mut generated = Vec::new();
+        for _ in 0..48 {
+            if eos.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            let logits = model
+                .forward_decode_shifted(&[next], &mut cache, true, delta)
+                .expect("decode");
+            next = model.argmax_last_token(&logits).expect("argmax");
+        }
+        let reply = tok.decode(&generated, true).expect("decode text");
+        println!("--- reply ---\n{reply}\n-------------");
+
+        assert!(!reply.trim().is_empty(), "model produced nothing");
+        // The probe is unmistakable: coloured rectangles on a black field. A
+        // structurally broken tower describes something else, or asks for the
+        // image it never received.
+        let lower = reply.to_lowercase();
+        let hits = [
+            "black",
+            "dark",
+            "color",
+            "colour",
+            "rectangle",
+            "square",
+            "shape",
+            "block",
+        ]
+        .iter()
+        .filter(|w| lower.contains(*w))
+        .count();
+        assert!(
+            hits >= 2,
+            "reply does not describe the probe image (matched {hits} cue words): {reply:?}"
+        );
+    }
+}
 
 #[cfg(all(test, feature = "mlx-native"))]
 mod config_tests {

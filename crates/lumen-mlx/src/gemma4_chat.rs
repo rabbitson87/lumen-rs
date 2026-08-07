@@ -40,6 +40,13 @@ pub(crate) mod imp {
     pub const TOK_TURN_OPEN: u32 = 105; // <|turn>
     pub const TOK_TURN_CLOSE: u32 = 106; // <turn|>
 
+    // Vision placeholders. `processing_gemma4.py` expands the template's single
+    // `<|image|>` into `<|image>` + N × `<|image|>` + `<image|>`, where N is the
+    // soft-token count the image processor reports for that image.
+    pub const TOK_IMAGE_OPEN: u32 = 255999; // <|image>  (boi_token_id)
+    pub const TOK_IMAGE_SOFT: u32 = 258880; // <|image|> (image_token_id)
+    pub const TOK_IMAGE_CLOSE: u32 = 258882; // <image|> (eoi_token_id)
+
     /// Whether to pre-fill the empty `<|channel>thought\n<channel|>` block on
     /// the generation prompt when thinking is OFF.
     ///
@@ -259,6 +266,32 @@ pub(crate) mod imp {
             opts: &RenderOptions,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
         ) -> Result<Vec<u32>> {
+            self.render_to_ids_with_tools_and_images(messages, opts, tools, &[])
+        }
+
+        /// Like [`Self::render_to_ids_with_tools`] but prepends image
+        /// placeholder blocks to the messages that carry them.
+        ///
+        /// `image_soft_tokens[i]` lists the soft-token count of each image on
+        /// `messages[i]` (a shorter slice, or empty entries, means no images).
+        /// Each count `n` emits `<|image>` + n × `<|image|>` + `<image|>`; the
+        /// model's forward pass later replaces those `n` embedding rows with the
+        /// vision tower's output.
+        ///
+        /// Images are placed at the **start** of their turn, before the text.
+        /// The upstream processor preserves the part order within a message;
+        /// we do not, because the flattened `content` string has already lost
+        /// where each part sat. Image-then-question is the order essentially
+        /// every vision client sends, so the difference is not observable in
+        /// practice — but a message interleaving text/image/text will render
+        /// with both text runs after the image.
+        pub fn render_to_ids_with_tools_and_images(
+            &self,
+            messages: &[ChatMessage<'_>],
+            opts: &RenderOptions,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            image_soft_tokens: &[Vec<usize>],
+        ) -> Result<Vec<u32>> {
             // ── header ────────────────────────────────────────────────
             let mut out: Vec<u32> = Vec::with_capacity(64 + messages.len() * 32 + tools.len() * 96);
             out.push(TOK_BOS);
@@ -305,7 +338,10 @@ pub(crate) mod imp {
             }
 
             // ── body messages ─────────────────────────────────────────
-            for msg in body {
+            // `body` skips a leading system message, so image indices — which
+            // are keyed to the caller's original message list — need that shift.
+            let body_offset = messages.len() - body.len();
+            for (bi, msg) in body.iter().enumerate() {
                 if msg.role == ChatRole::System {
                     return Err(anyhow!(
                         "chat-template: extra system message at index > 0 not supported"
@@ -317,6 +353,22 @@ pub(crate) mod imp {
                     self.encode_plain(&format!("{role}\n"))
                         .with_context(|| format!("encode '{role}\\n'"))?,
                 );
+                for &n in image_soft_tokens
+                    .get(body_offset + bi)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
+                    if n == 0 {
+                        return Err(anyhow!("chat-template: image with 0 soft tokens"));
+                    }
+                    out.push(TOK_IMAGE_OPEN);
+                    out.extend(std::iter::repeat_n(TOK_IMAGE_SOFT, n));
+                    out.push(TOK_IMAGE_CLOSE);
+                    out.extend(
+                        self.encode_plain("\n")
+                            .context("encode '\\n' after image")?,
+                    );
+                }
                 out.extend(
                     self.encode_plain(msg.content.trim())
                         .with_context(|| format!("encode {role} content"))?,

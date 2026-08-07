@@ -27,11 +27,14 @@ pub(crate) mod imp {
         NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
     };
     use crate::native_norm::rms_norm;
+    // Shared with the Qwen 3.6 tower — see `vision_splice` for why the window
+    // arithmetic lives outside both.
     use crate::native_quant::{
         MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, MODE_NVFP4, dequantize_with_mode,
         gather_qmm_with_mode, quantize_with_mode, quantized_matmul_with_mode,
     };
     use crate::native_rope::{rope, rope_with_freqs};
+    use crate::vision_splice::{clip_runs_to_window, image_token_runs};
     use mlx_rs::error::Exception;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
     use std::cell::Cell;
@@ -1217,6 +1220,24 @@ pub(crate) mod imp {
         pub quantization_config: Option<NativeGemma4QuantizationConfig>,
         #[serde(default)]
         pub tie_word_embeddings: Option<bool>,
+
+        // ── multimodal (image) ──
+        // Present on `Gemma4ForConditionalGeneration` checkpoints. All optional
+        // so text-only deploys and vision-stripped quantizations still parse.
+        #[serde(default)]
+        pub vision_config: Option<crate::gemma4_vision::NativeGemma4VisionConfig>,
+        /// Placeholder token whose embedding rows get replaced by vision soft
+        /// tokens (258880 on 26B-A4B).
+        #[serde(default)]
+        pub image_token_id: Option<u32>,
+        /// `<start_of_image>` / `<end_of_image>` sentinels around each run.
+        #[serde(default)]
+        pub boi_token_id: Option<u32>,
+        #[serde(default)]
+        pub eoi_token_id: Option<u32>,
+        /// Soft tokens the processor budgets per image (280 on 26B-A4B).
+        #[serde(default)]
+        pub vision_soft_tokens_per_image: Option<usize>,
     }
 
     /// `text_config` block — every field the forward path needs.
@@ -1790,6 +1811,12 @@ pub(crate) mod imp {
 
         pub fn get(&self, name: &str) -> Option<&Array> {
             self.tensors.get(name)
+        }
+
+        /// Raw tensor bag. Read this **before** [`Self::sanitize`] if you need
+        /// the `vision_tower.*` / `embed_vision.*` entries it strips.
+        pub fn tensors(&self) -> &HashMap<String, Array> {
+            &self.tensors
         }
 
         pub fn require(&self, name: &str) -> Result<&Array> {
@@ -3197,6 +3224,14 @@ pub(crate) mod imp {
         pub layer_scalar: Array,
     }
 
+    /// `x[:, start..end, :]` for a `[B, L, H]` array. Expressed as a gather
+    /// because mlx-rs exposes no axis-slice op; the cost is prefill-only.
+    fn take_span(x: &Array, start: i32, end: i32) -> Result<Array> {
+        let idx: Vec<i32> = (start..end).collect();
+        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+        mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("take_span: take_axis(axis=1)")
+    }
+
     fn require_clone(weights: &NativeGemma4Weights, name: &str) -> Result<Array> {
         weights
             .require(name)
@@ -3678,6 +3713,21 @@ pub(crate) mod imp {
         /// directory has a `logit_corrections.bin` sidecar.
         correction_capture_slot: std::sync::Mutex<Option<Array>>,
         correction_capture_enabled: std::sync::atomic::AtomicBool,
+        /// Image encoder. `Some` only when `LUMEN_VISION=1` **and** the
+        /// checkpoint still carries `vision_tower.*` weights (some AWQ/imatrix
+        /// requantizations drop them). `None` leaves the text path byte-for-byte
+        /// unchanged, including its memory footprint.
+        vision: Option<crate::gemma4_vision::NativeGemma4VisionTower>,
+    }
+
+    /// Opt-in gate for loading the ~1.1 GB image tower.
+    fn vision_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     impl NativeGemma4Model {
@@ -3689,6 +3739,62 @@ pub(crate) mod imp {
             cfg.validate_gemma4_family()?;
 
             let mut weights = NativeGemma4Weights::load_dir(model_dir)?;
+
+            // Build the image tower from the raw bag — `sanitize()` strips
+            // `vision_tower.*` / `embed_vision.*` right after this.
+            //
+            // The gate checks the projection, not just the tower: a checkpoint
+            // could plausibly keep one and drop the other, and the projection
+            // is the piece with no fallback.
+            let vision_present = weights.get("vision_tower.std_scale").is_some()
+                && weights
+                    .get("embed_vision.embedding_projection.weight")
+                    .is_some();
+            let vision = if vision_enabled() {
+                match cfg.vision_config.clone() {
+                    Some(vcfg) if vision_present => {
+                        // Resolve the projection's quantization through the same
+                        // path every other quantized tensor uses, so a per-tensor
+                        // override or a non-affine checkpoint (nvfp4 ships one)
+                        // is honoured instead of silently mis-dequantized.
+                        let (group_size, bits, mode) =
+                            quant_params_for(&cfg, "embed_vision.embedding_projection").context(
+                                "resolve quantization for embed_vision.embedding_projection",
+                            )?;
+                        Some(
+                            crate::gemma4_vision::NativeGemma4VisionTower::load(
+                                weights.tensors(),
+                                vcfg,
+                                crate::gemma4_vision::VisionProjectionQuant {
+                                    group_size,
+                                    bits,
+                                    mode,
+                                },
+                            )
+                            .context("load Gemma 4 vision tower")?,
+                        )
+                    }
+                    Some(_) => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but {} ships no vision_tower.* / \
+                             embed_vision.* weights (requantized text-only) — image input \
+                             stays disabled",
+                            model_dir.display()
+                        );
+                        None
+                    }
+                    None => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but config.json has no vision_config \
+                             — image input stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             weights.sanitize()?;
             weights.validate_keys_against_config(&cfg.text_config)?;
 
@@ -3878,6 +3984,7 @@ pub(crate) mod imp {
                 correction_capture_slot: std::sync::Mutex::new(None),
                 correction_capture_enabled: std::sync::atomic::AtomicBool::new(false),
                 mtp_active: std::sync::atomic::AtomicBool::new(false),
+                vision,
             })
         }
 
@@ -6472,6 +6579,65 @@ pub(crate) mod imp {
             .context("embed_lookup: dequantize_with_mode failed")
         }
 
+        /// Replace the embedding rows covered by each image's placeholder run
+        /// with that image's soft tokens, returning the rebuilt
+        /// `[1, l, hidden]` stream.
+        ///
+        /// `runs` are **prompt-global** `(start, len)` spans and `soft[i]` is
+        /// the `[len_i, hidden]` encoding of `runs[i]`; `h` covers the prompt
+        /// window `[span_start, span_start + l)`. Single-pass prefill passes
+        /// `span_start = 0` with the whole prompt. Chunked prefill hands over
+        /// one window at a time, so a run may fall entirely outside the window
+        /// or straddle either edge — only the overlapping rows are spliced
+        /// here and the remainder arrives with the neighbouring chunk.
+        fn splice_soft_tokens_for_span(
+            &self,
+            h: &Array,
+            span_start: i32,
+            l: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let hidden = self.config.text_config.hidden_size as i32;
+            let dt = h.dtype();
+            let slices = clip_runs_to_window(span_start, l, runs)?;
+            // No image touches this window — hand back the embeddings untouched
+            // rather than round-tripping them through a gather + concat.
+            if slices.is_empty() {
+                return Ok(h.clone());
+            }
+
+            let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
+            let mut cursor: i32 = 0;
+            for s in &slices {
+                if s.local_start > cursor {
+                    segments.push(
+                        take_span(h, cursor, s.local_start)
+                            .context("splice: text span before image")?,
+                    );
+                }
+                let soft_i = soft
+                    .get(s.image)
+                    .ok_or_else(|| anyhow!("splice: no soft tokens for image {}", s.image))?;
+                let run_len = runs[s.image].1 as i32;
+                let soft_3d = mlx_rs::ops::reshape(soft_i, &[1, run_len, hidden])
+                    .context("splice: reshape soft tokens")?;
+                let soft_3d = take_span(&soft_3d, s.row_start, s.row_end)
+                    .context("splice: clip soft tokens to window")?;
+                segments.push(soft_3d.as_dtype(dt).context("splice: cast soft tokens")?);
+                cursor = s.local_end;
+            }
+            if cursor < l {
+                segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
+            }
+
+            let refs: Vec<&Array> = segments.iter().collect();
+            let out =
+                mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
+            debug_assert_eq!(out.shape(), [1, l, hidden]);
+            Ok(out)
+        }
+
         /// Apply Gemma 4's `final_logit_softcapping`:
         ///   `out = tanh(out / softcap) * softcap`
         /// with `softcap = 30.0` per 26B-A4B's config.
@@ -6524,6 +6690,191 @@ pub(crate) mod imp {
             let l = input_ids.len() as i32;
             let ids = Array::from_slice(input_ids, &[1, l]);
             self.forward_array(&ids, cache)
+        }
+
+        /// Is the image tower loaded and usable?
+        pub fn vision_available(&self) -> bool {
+            self.vision.is_some()
+        }
+
+        /// Token id whose embedding rows vision soft tokens replace.
+        pub fn image_token_id(&self) -> Option<u32> {
+            self.config.image_token_id
+        }
+
+        /// Prompt tokens this image will occupy: its soft-token run plus the
+        /// `<|image>` / `<image|>` sentinels and the newline the renderer emits
+        /// after the block.
+        ///
+        /// Header-only — no pixel decode — so the server can size a prompt for
+        /// the context guard and usage accounting before deciding whether to
+        /// run anything at all.
+        pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let vcfg = vision.config();
+            let budget = crate::gemma4_vision::imp::soft_token_budget_override()
+                .or(self.config.vision_soft_tokens_per_image)
+                .unwrap_or(280);
+            let soft = crate::gemma4_vision::soft_token_count(
+                encoded,
+                vcfg.patch_size,
+                budget,
+                vcfg.pooling_kernel_size,
+            )
+            .map_err(|e| anyhow!("image sizing failed: {e}"))?;
+            // + `<|image>`, `<image|>`, and the trailing newline.
+            Ok(soft + 3)
+        }
+
+        /// Decode + resize one image onto the patch grid, without running the
+        /// tower.
+        ///
+        /// Callers hold the result: `num_soft_tokens` sizes the prompt's
+        /// placeholder run, and the same [`PreparedImage`] then goes straight
+        /// into [`Self::encode_prepared_image`]. Re-deriving it from the bytes
+        /// at encode time would decode and bicubic-resize every image twice.
+        ///
+        /// [`PreparedImage`]: crate::gemma4_vision::PreparedImage
+        pub fn prepare_image(&self, encoded: &[u8]) -> Result<crate::gemma4_vision::PreparedImage> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let vcfg = vision.config();
+            let budget = crate::gemma4_vision::imp::soft_token_budget_override()
+                .or(self.config.vision_soft_tokens_per_image)
+                .unwrap_or(280);
+            crate::gemma4_vision::prepare_image(
+                encoded,
+                vcfg.patch_size,
+                budget,
+                vcfg.pooling_kernel_size,
+            )
+            .map_err(|e| anyhow!("image preprocessing failed: {e}"))
+        }
+
+        /// Run the tower on an already-prepared image, returning
+        /// `[num_soft_tokens, hidden]` language-model embeddings.
+        pub fn encode_prepared_image(
+            &self,
+            prepared: &crate::gemma4_vision::PreparedImage,
+        ) -> Result<Array> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+
+            let n = (prepared.grid.0 * prepared.grid.1) as i32;
+            let width = (3 * vision.config().patch_size * vision.config().patch_size) as i32;
+            let px = Array::from_slice(&prepared.pixel_values, &[n, width]);
+            let soft = vision
+                .forward(&px, prepared.grid)
+                .context("vision tower forward")?;
+            // Materialize now so the tower's intermediates are freed before the
+            // 30-layer text prefill allocates its own working set.
+            soft.eval().context("vision: eval soft tokens")?;
+            Ok(soft)
+        }
+
+        /// Forward with image inputs spliced in.
+        ///
+        /// `input_ids` must already contain one run of `image_token_id` per
+        /// image, of exactly `prepared[i].num_soft_tokens` length (the caller
+        /// builds this while rendering the chat template). Each run's embedding
+        /// rows are replaced wholesale by that image's soft tokens.
+        ///
+        /// Ordering matters: upstream scales the *text* embeddings by
+        /// `sqrt(hidden_size)` and then `masked_scatter`s the **unscaled** image
+        /// features over them, so the splice happens after the scale, not
+        /// before.
+        pub fn forward_with_images(
+            &self,
+            input_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
+            cache: &mut NativeGemma4PromptCache,
+            slice_last_token: bool,
+        ) -> Result<Array> {
+            if images.is_empty() {
+                let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+                return self.forward_array_impl(&ids, cache, slice_last_token);
+            }
+            let (runs, soft_tokens) = self.encode_images_for_prompt(input_ids, images)?;
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            self.forward_array_impl_with_soft(&ids, cache, slice_last_token, 0, &runs, &soft_tokens)
+        }
+
+        /// Locate each image's placeholder run in `prompt_ids` and encode the
+        /// matching image, checking the two agree on length.
+        ///
+        /// Split out from [`Self::forward_with_images`] because chunked prefill
+        /// has to encode every image **once**, before the chunk loop starts,
+        /// and then splice slices of the result into whichever chunks the runs
+        /// land in. Returns prompt-global runs paired with `[len_i, hidden]`
+        /// soft tokens, ready for [`Self::forward_last_token_with_soft`].
+        pub fn encode_images_for_prompt(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
+        ) -> Result<(Vec<(usize, usize)>, Vec<Array>)> {
+            let image_token = self
+                .config
+                .image_token_id
+                .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+
+            let runs = image_token_runs(prompt_ids, image_token);
+            if runs.len() != images.len() {
+                return Err(anyhow!(
+                    "prompt has {} image-token run(s) but {} image(s) were supplied",
+                    runs.len(),
+                    images.len()
+                ));
+            }
+
+            let mut soft_tokens = Vec::with_capacity(images.len());
+            for (idx, (prepared, run)) in images.iter().zip(runs.iter()).enumerate() {
+                if prepared.num_soft_tokens != run.1 {
+                    return Err(anyhow!(
+                        "image {idx} encodes to {} soft tokens but the prompt reserved {} \
+                         image_token placeholders",
+                        prepared.num_soft_tokens,
+                        run.1
+                    ));
+                }
+                soft_tokens.push(
+                    self.encode_prepared_image(prepared)
+                        .with_context(|| format!("encoding image {idx}"))?,
+                );
+            }
+            Ok((runs, soft_tokens))
+        }
+
+        /// [`Self::forward_last_token`] for one chunk of an image-bearing
+        /// prompt.
+        ///
+        /// `span_start` is the chunk's offset in the full prompt; `runs` /
+        /// `soft` come from [`Self::encode_images_for_prompt`] and stay
+        /// prompt-global across the whole chunk loop. Chunks that contain no
+        /// placeholder rows fall through to the plain text path.
+        pub fn forward_last_token_with_soft(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativeGemma4PromptCache,
+            span_start: usize,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            if input_ids.is_empty() {
+                return Err(anyhow!("forward_last_token_with_soft: empty input_ids"));
+            }
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            self.forward_array_impl_with_soft(
+                &ids,
+                cache,
+                /* slice_last_token */ true,
+                span_start as i32,
+                runs,
+                soft,
+            )
         }
 
         /// Prefill-optimized variant of `forward()` — returns only the LAST
@@ -6593,6 +6944,24 @@ pub(crate) mod imp {
             cache: &mut NativeGemma4PromptCache,
             slice_last_token: bool,
         ) -> Result<Array> {
+            self.forward_array_impl_with_soft(input_ids, cache, slice_last_token, 0, &[], &[])
+        }
+
+        /// [`Self::forward_array_impl`] with optional vision splicing.
+        ///
+        /// `runs` are prompt-global `(start, len)` spans of `image_token_id`,
+        /// ascending and non-overlapping; `soft[i]` is `[len_i, hidden]`.
+        /// `span_start` is where `input_ids` begins in that prompt — `0` for a
+        /// single-pass prefill, the running offset for a chunked one.
+        fn forward_array_impl_with_soft(
+            &self,
+            input_ids: &Array,
+            cache: &mut NativeGemma4PromptCache,
+            slice_last_token: bool,
+            span_start: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
             let cfg = &self.config.text_config;
             assert_eq!(
                 cfg.hidden_size_per_layer_input, 0,
@@ -6618,6 +6987,17 @@ pub(crate) mod imp {
             // (2) h *= sqrt(hidden_size) — Phase 1.5 P8: cached const_embed_scale.
             let h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
                 .context("forward: × sqrt(hidden_size)")?;
+
+            // (2b) Vision splice. Upstream applies the embed scale to the text
+            // embeddings and then `masked_scatter`s the image features over
+            // them, so the soft tokens must land *after* the multiply and stay
+            // unscaled. Rebuilding h by concatenating the untouched spans is
+            // cheaper than a scatter and keeps everything on the lazy graph.
+            let h = if runs.is_empty() {
+                h
+            } else {
+                self.splice_soft_tokens_for_span(&h, span_start, l, runs, soft)?
+            };
             dump_hidden(&h, "embed")?;
 
             // (3) Decoder layers.
@@ -6811,6 +7191,22 @@ pub(crate) mod imp {
             cfg: &GenerateConfig,
             cache_in: Option<&mut NativeGemma4PromptCache>,
         ) -> Result<GenerateStats> {
+            self.generate_with_cache_and_images(prompt_ids, &[], cfg, cache_in)
+        }
+
+        /// [`Self::generate_with_cache`] with image inputs.
+        ///
+        /// `prompt_ids` must carry one run of `image_token_id` per image, sized
+        /// to that image's `num_soft_tokens`. Only the prefill differs — decode
+        /// steps are pure text and take the unchanged path, so MTP /
+        /// lookup-spec / sampling all behave identically.
+        pub fn generate_with_cache_and_images(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
+            cfg: &GenerateConfig,
+            cache_in: Option<&mut NativeGemma4PromptCache>,
+        ) -> Result<GenerateStats> {
             if prompt_ids.is_empty() {
                 return Err(anyhow!("generate: empty prompt"));
             }
@@ -6868,9 +7264,16 @@ pub(crate) mod imp {
             // `argmax_last_token_lazy` anyway. forward() retains full-
             // logits semantics for forward_probe / debug callers.
             let prefill_start = Instant::now();
-            let logits = self
-                .forward_last_token(prompt_ids, &mut cache)
-                .context("generate: prefill forward_last_token")?;
+            let logits = if images.is_empty() {
+                self.forward_last_token(prompt_ids, &mut cache)
+                    .context("generate: prefill forward_last_token")?
+            } else {
+                // Image prefill still slices to the last token; the only
+                // difference is that the placeholder rows carry vision
+                // features instead of `<|image|>` embeddings.
+                self.forward_with_images(prompt_ids, images, &mut cache, true)
+                    .context("generate: prefill forward_with_images")?
+            };
             // Lazy argmax — schedule async eval so the GPU starts work while
             // we queue up the first decode step's graph.
             let mut current = self
