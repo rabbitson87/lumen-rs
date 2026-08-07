@@ -201,6 +201,19 @@ impl ModelBackend {
         }
     }
 
+    /// Extra prompt tokens contributed by inline images.
+    ///
+    /// `count_chat_prompt_tokens` renders text only, so an image request's real
+    /// prompt is hundreds of tokens longer than it reports — enough to matter
+    /// both for the context guard and for the usage figures we hand back.
+    /// Header-only, so this stays cheap even for a request we then reject.
+    fn image_prompt_tokens(&self, images: &[Vec<Vec<u8>>]) -> u32 {
+        match self {
+            Self::Mlx(m) => m.image_prompt_tokens(images) as u32,
+            _ => 0,
+        }
+    }
+
     /// Hard model context ceiling (tokens), when the backend exposes one.
     /// Used by the prompt-size guard as an absolute reject limit: a prompt
     /// over this can't fit the KV and OOM-aborts MLX, so it must be rejected
@@ -342,6 +355,46 @@ impl ModelBackend {
         }
     }
 
+    /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
+    /// Only the MLX Gemma 4 backend can consume them; every other backend
+    /// rejects the request rather than silently answering without the image.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_images(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<ParsedResponse> {
+        match self {
+            Self::Mlx(m) => m.chat_with_images(
+                messages,
+                images,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "this backend has no image support; image input requires an \
+                 mlx-native vision-capable backend (Gemma 4 or Qwen 3.6) with \
+                 LUMEN_VISION=1"
+            )),
+        }
+    }
+
     fn chat_streaming<F>(
         &mut self,
         messages: &[(String, String)],
@@ -415,6 +468,51 @@ impl ModelBackend {
                 response_schema,
                 on_event,
             ),
+        }
+    }
+
+    /// [`Self::chat_streaming`] with inline images. Only the MLX Gemma 4
+    /// backend can consume them; every other backend rejects the request
+    /// rather than streaming an answer that never saw the image.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_streaming_with_images<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<ParsedResponse>
+    where
+        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
+    {
+        match self {
+            Self::Mlx(m) => m.chat_streaming_with_images(
+                messages,
+                images,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "this backend has no image support; image input requires an \
+                 mlx-native vision-capable backend (Gemma 4 or Qwen 3.6) with \
+                 LUMEN_VISION=1"
+            )),
         }
     }
 }
@@ -910,7 +1008,15 @@ impl InferenceEngine {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
+        // `kept[i]` is the index in `req.messages` that survived as
+        // `messages[i]`. Any per-message side table has to be re-indexed
+        // through it — the strip *removes* turns, so a naive `req.messages`
+        // walk would bind image `i` to the wrong message (or to none).
+        let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+        let images = images_aligned_to_kept(&req.messages, &kept);
+        // The structured branch below wins over the image branch, so without
+        // this a request carrying both would answer from the text alone.
+        reject_images_with_tool_history(needs_structured, images.is_some())?;
 
         // Owning storage for `ChatTurn` borrows when routing structured.
         let arg_values: Vec<serde_json::Value> = if needs_structured {
@@ -977,9 +1083,17 @@ impl InferenceEngine {
         // aborted the whole process via an uncaught Metal OOM. Reject early
         // with a clean error instead. (count_chat_prompt_tokens is a cheap
         // tokenize, no forward; the same count is reused for usage below.)
+        // Images add their soft-token runs on top of the rendered text; count
+        // them here too or an image request slips past the guard by hundreds of
+        // tokens per image.
+        let image_tokens = images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
         let prompt_tokens_guard = self
             .backend
-            .count_chat_prompt_tokens(&messages, thinking_on);
+            .count_chat_prompt_tokens(&messages, thinking_on)
+            + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
@@ -1018,6 +1132,20 @@ impl InferenceEngine {
                 &tool_choice,
                 req.response_json_schema().as_ref(),
             )?
+        } else if let Some(images) = images.as_deref() {
+            self.backend.chat_with_images(
+                &messages,
+                images,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                thinking_on,
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                req.response_json_schema().as_ref(),
+            )?
         } else {
             self.backend.chat(
                 &messages,
@@ -1033,9 +1161,13 @@ impl InferenceEngine {
             )?
         };
 
+        // Same text count as the guard above, plus the image runs the model
+        // actually prefilled — reporting the text-only figure would under-count
+        // an image request by hundreds of tokens.
         let prompt_tokens = self
             .backend
-            .count_chat_prompt_tokens(&messages, thinking_on);
+            .count_chat_prompt_tokens(&messages, thinking_on)
+            + image_tokens;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
@@ -1236,7 +1368,16 @@ impl InferenceEngine {
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
-        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
+        // Images travel beside the flattened text, so they have to survive the
+        // same strip — see `images_aligned_to_kept` on the OpenAI path.
+        let all_images = anthropic_images_flat(&req.messages, system_text.is_some())?;
+        let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+        let images: Option<Vec<Vec<Vec<u8>>>> = if kept.iter().any(|&i| !all_images[i].is_empty()) {
+            Some(kept.iter().map(|&i| all_images[i].clone()).collect())
+        } else {
+            None
+        };
+        reject_images_with_tool_history(needs_structured, images.is_some())?;
 
         // Prompt-size reject cap (Anthropic /v1/messages) — same OOM guard as
         // the OpenAI path: reject oversized prompts before prefill rather than
@@ -1430,6 +1571,20 @@ impl InferenceEngine {
                 // Anthropic /v1/messages has no `response_format`.
                 None,
             )?
+        } else if let Some(images) = images.as_deref() {
+            self.backend.chat_with_images(
+                &messages,
+                images,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                None,
+            )?
         } else {
             // Plain path — uses the flat messages built above. Matches
             // the pre-Phase-1.4 behavior bit-for-bit.
@@ -1447,10 +1602,14 @@ impl InferenceEngine {
             )?
         };
 
+        // Images add their placeholder runs on top of the rendered text.
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-        );
+        ) + images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match and
@@ -1540,7 +1699,10 @@ impl InferenceEngine {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
+        // See `chat_completion`: the strip removes turns, so per-message image
+        // attachments have to be re-indexed through the surviving positions.
+        let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+        let images = images_aligned_to_kept(&req.messages, &kept);
 
         let tool_names: Vec<&str> = req
             .tools
@@ -1563,10 +1725,15 @@ impl InferenceEngine {
                 .unwrap_or(0)
         );
 
+        // Includes the image soft-token runs; this figure feeds both the
+        // context guard below and the `usage` block at the end of the stream.
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-        );
+        ) + images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
 
         let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
@@ -1597,6 +1764,13 @@ impl InferenceEngine {
         // backend (the engine only has a token *count* here) — tracked
         // separately; for now an over-cap prompt is rejected with guidance.
         if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            return;
+        }
+        // The structured branch below wins over the image branch, so without
+        // this a request carrying both would stream an answer from the text
+        // alone.
+        if let Err(e) = reject_images_with_tool_history(needs_structured, images.is_some()) {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
@@ -1763,69 +1937,90 @@ impl InferenceEngine {
                 },
             )
         } else {
-            self.backend.chat_streaming(
-                &messages,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                response_schema.as_ref(),
-                |ev: BackendStreamEvent<'_>| -> Result<()> {
-                    match ev {
-                        BackendStreamEvent::Text(t) => {
-                            if let Some(js) = json_stop.as_ref() {
-                                // response_format: stream up to the first
-                                // complete JSON value, then end the decode loop
-                                // (reuses the stopped_by_seq early-break path).
-                                let (emit, stopped) = js.borrow_mut().push(t);
-                                if !emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(emit));
-                                }
-                                if stopped {
-                                    stopped_by_seq.set(true);
-                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                }
+            // Bound first so both the text and the image dispatch below can
+            // take it — only one of them runs.
+            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
+                match ev {
+                    BackendStreamEvent::Text(t) => {
+                        if let Some(js) = json_stop.as_ref() {
+                            // response_format: stream up to the first
+                            // complete JSON value, then end the decode loop
+                            // (reuses the stopped_by_seq early-break path).
+                            let (emit, stopped) = js.borrow_mut().push(t);
+                            if !emit.is_empty() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(emit));
+                            }
+                            if stopped {
+                                stopped_by_seq.set(true);
+                                return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                            }
+                        } else {
+                            let mut sm = stop_matcher.borrow_mut();
+                            if sm.is_inert() {
+                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                             } else {
-                                let mut sm = stop_matcher.borrow_mut();
-                                if sm.is_inert() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                                } else {
-                                    let step = sm.push(t);
-                                    if !step.emit.is_empty() {
-                                        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
-                                    }
-                                    if step.stopped {
-                                        stopped_by_seq.set(true);
-                                        drop(sm);
-                                        // Break the backend decode loop early. The
-                                        // `stopped_by_seq` flag distinguishes this
-                                        // from a real error in the match below.
-                                        return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                    }
+                                let step = sm.push(t);
+                                if !step.emit.is_empty() {
+                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+                                }
+                                if step.stopped {
+                                    stopped_by_seq.set(true);
+                                    drop(sm);
+                                    // Break the backend decode loop early. The
+                                    // `stopped_by_seq` flag distinguishes this
+                                    // from a real error in the match below.
+                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
                                 }
                             }
                         }
-                        BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                        }
-                        BackendStreamEvent::ToolCallStart { name } => {
-                            // Early per-call Start suppressed. Args are not known
-                            // until a call closes, so emitting Start0,Start1,Start2
-                            // up front (then Args0,Args1,Args2 in a batch) made
-                            // clients fold every later parallel call's arguments
-                            // onto index 0 — only the first tool call kept its args.
-                            // The reconciliation loop below now emits each call as a
-                            // sequential Start_i → Args_i → Stop_i unit.
-                            let _ = name;
-                        }
                     }
-                    Ok(())
-                },
-            )
+                    BackendStreamEvent::Reasoning(t) => {
+                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                    }
+                    BackendStreamEvent::ToolCallStart { name } => {
+                        // Early per-call Start suppressed. Args are not known
+                        // until a call closes, so emitting Start0,Start1,Start2
+                        // up front (then Args0,Args1,Args2 in a batch) made
+                        // clients fold every later parallel call's arguments
+                        // onto index 0 — only the first tool call kept its args.
+                        // The reconciliation loop below now emits each call as a
+                        // sequential Start_i → Args_i → Stop_i unit.
+                        let _ = name;
+                    }
+                }
+                Ok(())
+            };
+            let thinking =
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+            match images.as_ref() {
+                Some(imgs) => self.backend.chat_streaming_with_images(
+                    &messages,
+                    imgs,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    response_schema.as_ref(),
+                    on_event,
+                ),
+                None => self.backend.chat_streaming(
+                    &messages,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    response_schema.as_ref(),
+                    on_event,
+                ),
+            }
         };
 
         match result {
@@ -1957,15 +2152,39 @@ impl InferenceEngine {
         for msg in &req.messages {
             messages.push((msg.role.clone(), msg.content.as_text()));
         }
-        lumen_mlx::chat_io::strip_client_meta_wrappers_flat(&mut messages);
+        // Images ride beside the flattened text and must survive the same
+        // strip — see `images_aligned_to_kept` on the OpenAI path.
+        let all_images = match anthropic_images_flat(
+            &req.messages,
+            system_text.as_ref().is_some_and(|s| !s.is_empty()),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+        let images: Option<Vec<Vec<Vec<u8>>>> = if kept.iter().any(|&i| !all_images[i].is_empty()) {
+            Some(kept.iter().map(|&i| all_images[i].clone()).collect())
+        } else {
+            None
+        };
 
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-        );
+        ) + images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
         // Prompt-size reject cap (Anthropic streaming) — guard the prefill from
         // an uncaught Metal OOM that would crash the server process.
         if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            return;
+        }
+        if let Err(e) = reject_images_with_tool_history(needs_structured, images.is_some()) {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
@@ -2146,38 +2365,58 @@ impl InferenceEngine {
                 },
             )
         } else {
-            self.backend.chat_streaming(
-                &messages,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                // Anthropic Messages API has no `response_format` field.
-                None,
-                |ev: BackendStreamEvent<'_>| -> Result<()> {
-                    match ev {
-                        BackendStreamEvent::Text(t) => {
-                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                        }
-                        BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                        }
-                        BackendStreamEvent::ToolCallStart { name } => {
-                            // Early per-call Start suppressed — see the call-1
-                            // closure above and the reconciliation loop below.
-                            // Sequential Start_i → Args_i → Stop_i per call is the
-                            // standard order; batched up-front Starts dropped args
-                            // for parallel calls after index 0.
-                            let _ = name;
-                        }
+            // Bound first so both dispatches below can take it — only one runs.
+            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
+                match ev {
+                    BackendStreamEvent::Text(t) => {
+                        let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                     }
-                    Ok(())
-                },
-            )
+                    BackendStreamEvent::Reasoning(t) => {
+                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                    }
+                    BackendStreamEvent::ToolCallStart { name } => {
+                        // Early per-call Start suppressed — see the call-1
+                        // closure above and the reconciliation loop below.
+                        // Sequential Start_i → Args_i → Stop_i per call is the
+                        // standard order; batched up-front Starts dropped args
+                        // for parallel calls after index 0.
+                        let _ = name;
+                    }
+                }
+                Ok(())
+            };
+            let thinking =
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+            match images.as_deref() {
+                Some(imgs) => self.backend.chat_streaming_with_images(
+                    &messages,
+                    imgs,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    // Anthropic Messages API has no `response_format` field.
+                    None,
+                    on_event,
+                ),
+                None => self.backend.chat_streaming(
+                    &messages,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    thinking,
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                    on_event,
+                ),
+            }
         };
 
         match result {
@@ -2515,6 +2754,76 @@ fn needs_structured_history(messages: &[ChatMessage]) -> bool {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false)
     })
+}
+
+/// Per-message image attachments, re-indexed onto the post-strip message
+/// vector: `kept[i]` is the index in `req.messages` that survived as
+/// `messages[i]`, so the returned vector lines up index-for-index with the
+/// `(role, content)` pairs the backend receives.
+///
+/// Returns `None` when nothing survived with an image, which is also the
+/// "route to the plain text path" signal — a request whose only image rode on
+/// a stripped meta-wrapper turn has no image left to encode.
+fn images_aligned_to_kept(messages: &[ChatMessage], kept: &[usize]) -> Option<Vec<Vec<Vec<u8>>>> {
+    if !ChatMessage::any_images_at(messages, kept) {
+        return None;
+    }
+    Some(kept.iter().map(|&i| messages[i].images.clone()).collect())
+}
+
+/// Per-message image attachments from an Anthropic request, aligned with the
+/// flattened `(role, content)` vector.
+///
+/// That vector may carry a synthesized leading `system` entry which has no
+/// counterpart in `req.messages`, so the offset has to be reproduced here or
+/// every image binds one turn early.
+fn anthropic_images_flat(
+    messages: &[AnthropicMessage],
+    has_system: bool,
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    let mut out: Vec<Vec<Vec<u8>>> = Vec::with_capacity(messages.len() + 1);
+    if has_system {
+        // A system block carries no images (Anthropic's system field is text
+        // or text blocks only), but the slot must exist to keep the indices
+        // lined up with `messages`.
+        out.push(Vec::new());
+    }
+    for msg in messages {
+        let mut row = Vec::new();
+        if let AnthropicContent::Blocks(blocks) = &msg.content {
+            for b in blocks {
+                if let AnthropicContentBlock::Image { source } = b {
+                    row.push(
+                        source
+                            .decode()
+                            .map_err(|e| anyhow::anyhow!("image block: {e}"))?,
+                    );
+                }
+            }
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Reject a request that carries both images and a tool-calling history.
+///
+/// The two need different renderers: tool history goes through the structured
+/// `ChatTurn` path (the flat `(role, content)` shape cannot represent a
+/// `role:"tool"` message), and that path has no way to carry images. Whichever
+/// way such a request routed, something would be dropped — and dropping the
+/// image means answering confidently about a picture the model never saw,
+/// which is exactly the failure this whole change exists to remove. So it is
+/// refused instead, loudly.
+fn reject_images_with_tool_history(needs_structured: bool, has_images: bool) -> Result<()> {
+    if needs_structured && has_images {
+        return Err(anyhow::anyhow!(
+            "image input is not supported together with a tool-calling history \
+             (an assistant `tool_calls` turn or a `role:\"tool\"` message); \
+             the structured renderer those require does not carry images"
+        ));
+    }
+    Ok(())
 }
 
 /// Anthropic variant of `needs_structured_history`. We scan content blocks
@@ -4332,12 +4641,19 @@ impl InferenceEngine {
     }
 
     /// Eligibility for the greedy MLX batched scheduler: plain chat only.
+    ///
+    /// Anything ineligible falls back to the sequential path, which is the
+    /// full-featured one. In particular **image requests are ineligible**: the
+    /// batched driver prefills through `build_chat_input` + `prefill`, neither
+    /// of which carries images, so admitting one would answer from the text
+    /// alone — the silent drop this whole path is guarded against elsewhere.
     #[cfg(feature = "mlx-native")]
     fn mlx_batch_eligible(req: &ChatCompletionRequest) -> bool {
         req.temperature == 0.0
             && req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true)
             && req.response_format.is_none()
             && req.stop.is_none()
+            && !req.messages.iter().any(|m| !m.images.is_empty())
     }
 
     /// Prefill a new MLX-native streaming sequence under `seq_id`. Unlike the
@@ -4898,6 +5214,71 @@ fn flush_pending_emit(gem: &GemmaGgufModel, seq: &mut ActiveSeqState) {
 // Pure functions only; full integration (request → backend dispatch →
 // response) is exercised via manual smoke tests against a loaded model.
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Images and a tool-calling history need different renderers, and the
+/// structured one wins the branch. Without an explicit refusal a request
+/// carrying both would answer from the text alone — the silent-drop failure
+/// this whole change set exists to remove.
+/// The batched scheduler's driver prefills through `build_chat_input` +
+/// `prefill`, neither of which carries images. Admitting an image request there
+/// would answer from the text alone, so eligibility has to exclude it — the
+/// sequential fallback is the path that knows about images.
+#[cfg(all(test, feature = "mlx-native"))]
+mod batch_eligibility {
+    use super::*;
+    use serde_json::json;
+
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn req(content: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": content }],
+            "temperature": 0.0,
+        }))
+        .expect("parse request")
+    }
+
+    #[test]
+    fn plain_greedy_chat_is_eligible() {
+        assert!(InferenceEngine::mlx_batch_eligible(&req(json!("hello"))));
+    }
+
+    #[test]
+    fn image_requests_are_not_eligible() {
+        let url = format!("data:image/png;base64,{TINY_PNG_B64}");
+        let r = req(json!([
+            { "type": "text", "text": "what is this?" },
+            { "type": "image_url", "image_url": { "url": url } },
+        ]));
+        assert!(
+            !InferenceEngine::mlx_batch_eligible(&r),
+            "an image request must fall back to the sequential path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_tool_history_conflict {
+    use super::reject_images_with_tool_history;
+
+    #[test]
+    fn images_plus_tool_history_is_refused() {
+        let err = reject_images_with_tool_history(true, true)
+            .err()
+            .expect("the combination must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("image"), "unhelpful error: {msg}");
+        assert!(msg.contains("tool"), "unhelpful error: {msg}");
+    }
+
+    #[test]
+    fn either_one_alone_is_fine() {
+        assert!(reject_images_with_tool_history(true, false).is_ok());
+        assert!(reject_images_with_tool_history(false, true).is_ok());
+        assert!(reject_images_with_tool_history(false, false).is_ok());
+    }
+}
 
 #[cfg(test)]
 mod phase_1_4_dispatch_tests {
