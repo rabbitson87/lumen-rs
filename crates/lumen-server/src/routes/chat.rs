@@ -639,7 +639,20 @@ async fn handle_streaming(
                 }
                 break;
             }
-            StreamEvent::Error(_) => break,
+            // Relay the message before closing. Dropping it ended the stream
+            // as an empty *success*, so a client that asked for something
+            // unsupported — or blew the context cap — got a blank reply and no
+            // way to tell why.
+            StreamEvent::Error(msg) => {
+                let payload = serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                    }
+                });
+                write_sse(&mut tcp, &payload).await?;
+                break;
+            }
         }
     }
 

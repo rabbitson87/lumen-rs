@@ -229,7 +229,16 @@ async fn handle_streaming(
                 let _ = prompt_tokens; // surfaced in message_start above
                 break;
             }
-            StreamEvent::Error(_) => break,
+            // Relay it as an Anthropic `error` event rather than dropping it —
+            // a silently truncated stream gives the client no way to tell a
+            // rejected request from an empty answer.
+            StreamEvent::Error(msg) => {
+                let mut buf = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":".to_vec();
+                serde_json::to_writer(&mut buf, &msg).expect("write to Vec cannot fail");
+                buf.extend_from_slice(b"}}\n\n");
+                tcp.write_all(&buf).await?;
+                break;
+            }
         }
     }
 
