@@ -4617,17 +4617,48 @@ impl MlxQwen35Backend {
         // request's images have been spliced over them. The callers already
         // pass `None` for the key; this asserts the invariant at the one place
         // that would silently corrupt the prompt if it were violated.
+        //
+        // ── First-token masking ──
+        // Prefill argmaxes its final position with no grammar mask, so with an
+        // active grammar the very first generated token was the one token the
+        // matcher never got to constrain. Checking it afterwards is too late:
+        // the model's unmasked pick disagreeing with the grammar is precisely
+        // when the grammar is doing its job, yet the old code responded by
+        // throwing the grammar away. `tool_choice=required` therefore never
+        // enforced anything — asked for `get_weather`, the model would open
+        // `<function=` and continue `weather`, the matcher would reject it, and
+        // the request would finish on free sampling. Holding the last prompt
+        // token back and feeding it through `decode_step_masked` puts that
+        // first choice under the mask like every later one.
+        //
+        // Only the last token moves, and it is always the tail of the assistant
+        // header or the `tool_choice` prefill — never an image placeholder — so
+        // the image runs stay wholly inside the prefilled span. The `is_none`
+        // guard makes that explicit rather than relying on it.
+        let mut grammar = grammar;
+        #[cfg(feature = "mlx-native")]
+        let hold_back_last = grammar.as_ref().is_some_and(|g| g.is_active())
+            && prompt_ids.len() > 1
+            && self.runner.image_token_id() != prompt_ids.last().copied();
+        #[cfg(not(feature = "mlx-native"))]
+        let hold_back_last = false;
+        let prefill_ids = if hold_back_last {
+            &prompt_ids[..prompt_ids.len() - 1]
+        } else {
+            &prompt_ids[..]
+        };
+
         #[cfg(feature = "mlx-native")]
         let (mut last, mut pos) = if prepared_images.is_empty() {
             self.prefix_store.prefill_optionally_cached(
                 &mut self.runner,
                 seq_id,
-                &prompt_ids,
+                prefill_ids,
                 prefix_cache_key,
                 incremental_boundary,
             )?
         } else {
-            self.prefill_with_images(seq_id, &prompt_ids, &prepared_images)?
+            self.prefill_with_images(seq_id, prefill_ids, &prepared_images)?
         };
         #[cfg(not(feature = "mlx-native"))]
         let (mut last, mut pos) = {
@@ -4639,7 +4670,7 @@ impl MlxQwen35Backend {
             self.prefix_store.prefill_optionally_cached(
                 &mut self.runner,
                 seq_id,
-                &prompt_ids,
+                prefill_ids,
                 prefix_cache_key,
                 incremental_boundary,
             )?
@@ -4647,8 +4678,8 @@ impl MlxQwen35Backend {
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
-            prompt_ids.len(),
-            prompt_ids.len() as f64 / (prefill_ms / 1000.0)
+            prefill_ids.len(),
+            prefill_ids.len() as f64 / (prefill_ms / 1000.0)
         );
 
         // ── WS-C #2: grammar prefill replay ──
@@ -4657,12 +4688,10 @@ impl MlxQwen35Backend {
         // went into the model's context but were never *sampled*, so the
         // matcher hasn't seen them. Replay the exact prefill tokens through
         // `observe_prefill` so the matcher's parse position matches the model.
-        // The first prefill-produced token `last` was argmaxed WITHOUT a mask
-        // (it continues the forced opener), so `observe` it too to stay
-        // aligned. Any desync (empty split despite a prefill, or a token the
-        // grammar rejects) drops the grammar → free sampling, never a corrupt
-        // masked decode.
-        let mut grammar = grammar;
+        // A desync here (empty split despite a prefill, or a token the grammar
+        // rejects) drops the grammar → free sampling, never a corrupt masked
+        // decode. Unlike the first *generated* token above, these are tokens the
+        // prompt already committed to, so there is nothing left to constrain.
         if let Some(g) = grammar.as_mut() {
             if g.is_active() {
                 let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
@@ -4678,16 +4707,50 @@ impl MlxQwen35Backend {
                         }
                     }
                 }
-                if !desync {
-                    if let Err(e) = g.observe(last) {
-                        eprintln!(
-                            "[qwen35-backend] grammar first-token observe desynced \
-                             (dropping grammar, sampling free): {e:#}"
-                        );
-                        desync = true;
-                    }
-                }
                 if desync {
+                    grammar = None;
+                }
+            }
+        }
+
+        // Now that the matcher is aligned, produce the first generated token
+        // under the mask by feeding it the prompt token we held back.
+        #[cfg(feature = "mlx-native")]
+        if hold_back_last {
+            let held = *prompt_ids.last().expect("hold_back_last implies non-empty");
+            let stepped = {
+                let g = grammar
+                    .as_mut()
+                    .expect("hold_back_last implies an active grammar");
+                let mut mask =
+                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
+                self.runner.decode_step_masked(seq_id, held, &mut mask)
+            };
+            match stepped {
+                Ok((next, new_pos)) => {
+                    last = next;
+                    pos = new_pos;
+                }
+                Err(e) => {
+                    // The mask itself failed (vocab mismatch, matcher error).
+                    // Take the step unmasked so the request still answers.
+                    eprintln!(
+                        "[qwen35-backend] masked first step failed (dropping grammar): {e:#}"
+                    );
+                    grammar = None;
+                    let (next, new_pos) = self.decode_step(seq_id, held, pos)?;
+                    last = next;
+                    pos = new_pos;
+                }
+            }
+        }
+        if let Some(g) = grammar.as_mut() {
+            if g.is_active() {
+                if let Err(e) = g.observe(last) {
+                    eprintln!(
+                        "[qwen35-backend] grammar first-token observe desynced \
+                         (dropping grammar, sampling free): {e:#}"
+                    );
                     grammar = None;
                 }
             }
