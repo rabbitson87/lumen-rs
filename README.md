@@ -13,6 +13,11 @@ a personal research project. Apple Silicon only. Currently validated:
   Flagship-KR), custom AWQ + imatrix MLX builds validated across 11 measurement
   axes. The upstream `mlx-community/gemma-4-26b-a4b-mlx-4bit` and `-3bit`
   variants also work.
+- **Image input** on `/v1/chat/completions` via Gemma 4's native-resolution
+  vision tower — opt in with `LUMEN_VISION=1`. The MLX port is checked
+  tensor-for-tensor against the upstream reference (cosine similarity
+  1.00000000) by `gemma4_vision_parity`. Requires a checkpoint that kept its
+  `vision_tower.*` weights.
 
 Ships in two forms:
 
@@ -336,6 +341,64 @@ curl -s localhost:8080/v1/chat/completions \
   }' | jq .
 ```
 
+#### Image input (Gemma 4 and Qwen 3.6 vision towers)
+
+With `LUMEN_VISION=1` and a checkpoint that still carries its
+`vision_tower.*` weights, the endpoint accepts OpenAI-style
+`image_url` content parts. Both native MLX families have a tower:
+Gemma 4's native-resolution ViT and Qwen 3.6's Qwen3-VL ViT.
+
+```bash
+B64=$(base64 -i photo.png)
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d "{
+    \"model\": \"gemma-4-26b-a4b\",
+    \"max_tokens\": 128,
+    \"messages\": [{\"role\": \"user\", \"content\": [
+      {\"type\": \"text\", \"text\": \"Describe this image.\"},
+      {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$B64\"}}
+    ]}]
+  }" | jq -r '.choices[0].message.content'
+```
+
+Notes:
+
+- **Only `data:` URLs.** Remote URLs are rejected rather than fetched —
+  the server does not issue outbound requests on a caller's behalf.
+- `POST /v1/messages` takes the same images in Anthropic's shape —
+  `{"type": "image", "source": {"type": "base64", "media_type": …, "data": …}}`.
+  A `url` source is refused for the same SSRF reason, and an unrecognized
+  block type fails the request rather than being silently ignored.
+- PNG, JPEG and WebP decode; the image is resized preserving aspect
+  ratio onto the patch grid, so no particular input size is required.
+- Images are placed at the **start** of their turn, before that
+  message's text. A message that interleaves text/image/text renders
+  with both text runs after the image.
+- `"stream": true` works on both families. Images are encoded once before
+  prefill and spliced into whichever prefill chunk covers them; decode is
+  pure text.
+- Image requests bypass the prefix cache — it is keyed on text alone, and
+  a vision prompt's placeholder rows only mean anything together with the
+  image they were spliced from. On Qwen 3.6 they also bypass MTP and
+  speculative decode, for the same reason.
+- `response_format` is not supported alongside images. On Qwen 3.6, tools
+  are not either. Both are rejected with an error rather than ignored.
+- A request that mixes images with a tool-calling history (an assistant
+  `tool_calls` turn or a `role:"tool"` message) is rejected: that history
+  renders through a different code path which does not carry images, and
+  answering from it would silently drop them.
+- Requires the mlx-native backend. Other backends return an error rather
+  than answering without the image.
+
+Qwen 3.6 sizes each image to a **token** budget rather than a pixel one,
+since tokens are what the prompt and KV cache pay for:
+
+| Var | Purpose |
+|---|---|
+| `LUMEN_VISION_MAX_IMAGE_TOKENS` | Cap on merged tokens per image (default `1024`). One token covers `merge² × patch²` = 32×32 pixels. |
+| `LUMEN_VISION_MIN_IMAGE_TOKENS` | Floor, so a thumbnail still gets enough patches to read (default `16`). |
+
 ### `POST /v1/completions`
 
 OpenAI-compatible legacy completions endpoint. Same backend as
@@ -427,6 +490,21 @@ optimization preserves model quality.
 | `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
 | `KESTREL_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
 
+### Vision (Gemma 4 image input)
+
+| Var | Purpose |
+|---|---|
+| `LUMEN_VISION=1` | Load the Gemma 4 image tower (~1.1 GB on top of the text weights) and accept `image_url` content parts. Off by default, so text-only deploys keep their exact memory footprint. |
+| `LUMEN_VISION_MAX_SOFT_TOKENS` | Per-image soft-token budget: `70` \| `140` \| `280` \| `560` \| `1120` (default: the checkpoint's `vision_soft_tokens_per_image`, 280 on 26B-A4B). Lower values shrink the patch grid, which cuts attention cost quadratically and activation memory linearly — `140` is a good starting point on 36 GB machines. |
+| `LUMEN_VISION_EVAL_EVERY` | Drain the lazy graph every N encoder layers (default `4`; `0` disables). Without it, all 27 layers' activations stay live until the first eval and peak memory climbs by several GB. |
+| `LUMEN_VISION_F32` | Run the tower in float32 instead of the checkpoint's bf16. Used by the parity test; not for production. |
+
+The tower needs a checkpoint that still ships `vision_tower.*` weights.
+Some requantizations drop them — `mlx-community/gemma-4-26b-a4b-it-4bit`
+keeps all 358 tensors, while
+`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq` has none. When they are
+missing the server logs a warning at load and image input stays off.
+
 A full list of advanced flags lives in source-level docstrings under
 [crates/lumen-mlx/src/env_state.rs](crates/lumen-mlx/src/env_state.rs).
 
@@ -459,6 +537,33 @@ Two pieces of custom kernel work that the public release covers:
   mlx Primitive — keeps the kernel in mlx's own command-buffer
   batching, avoiding the bridge-dispatch cost (~30 ms/step when the
   pattern is violated).
+
+### Gemma 4 vision tower
+
+`crates/lumen-mlx/src/gemma4_vision.rs`. Gemma 4's image encoder is **not**
+the SigLIP tower Gemma 3 used — it is a native-resolution ViT
+(`model_type: "gemma4_vision"`):
+
+- linear patch embedding over 16×16 RGB patches (no conv), plus a
+  factorized 2-D absolute position table (`[2, 10240, 1152]`, x + y),
+- 27 Gemma-shaped blocks (RMSNorm pre/post around both attention and
+  MLP, QK-norm, GeGLU) with **2-D RoPE** and **bidirectional** attention,
+- 3×3 average pooling → ×√hidden → standardize, then a quantized
+  1152 → 2816 projection into the language model's embedding space.
+
+Two conventions differ from the text tower and are easy to get wrong: the
+vision RMSNorm is a plain `normed * weight` (**not** the text
+`normed * (1 + weight)`), and the attention scale is `1.0` (the q_norm
+absorbs the `1/√head_dim`).
+
+Soft tokens are spliced over the `<|image|>` placeholder rows **after**
+the text embeddings are scaled by `√hidden_size`, matching upstream's
+`masked_scatter` ordering — the image features themselves are unscaled.
+
+A single image is processed unpadded: upstream pads only to batch
+differently-sized images, and the padded and unpadded paths were verified
+to produce identical soft tokens, which lets this port skip the attention
+mask entirely.
 
 ---
 
@@ -583,8 +688,8 @@ crates/
   lumen-core/         pure-Rust TurboQuant codec (Lloyd-Max + QJL, hardware-agnostic)
   lumen-metal/        Metal compute kernels: affine 3/4/8-bit quant GEMM,
                       MXFP4, flash-attn, rms_norm, silu_mul, sampling
-  lumen-mlx/          MLX-native Gemma 4 26B-A4B MoE backend + custom mlx
-                      primitives (kestrel_flash_attn_bf16) + bridge crates
+  lumen-mlx/          MLX-native Gemma 4 26B-A4B MoE backend + vision tower
+                      + custom mlx primitives (kestrel_flash_attn_bf16)
   lumen-model/        candle-based model assemblies (Gemma, Gemma-GGUF,
                       Qwen, Qwen3-Embedding) + KV-cache strategies
   lumen-server/       atomic_http-based OpenAI-compatible HTTP server

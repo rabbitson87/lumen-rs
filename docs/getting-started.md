@@ -222,6 +222,61 @@ curl -s localhost:8080/v1/chat/completions \
   }' | jq -r '.choices[0].message.content'
 ```
 
+### Image input (optional)
+
+Gemma 4 and Qwen 3.6 both ship an image tower, but neither is loaded
+unless you ask for it — it costs ~1.1 GB (Gemma 4) or ~0.9 GB (Qwen 3.6)
+on top of the text weights. Restart the server with:
+
+```bash
+LUMEN_VISION=1 \
+LUMEN_VISION_MAX_SOFT_TOKENS=140 \
+MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
+  cargo run --release --features mlx-native --bin lumen-server
+```
+
+`LUMEN_VISION_MAX_SOFT_TOKENS=140` halves the patch grid versus the
+checkpoint default of 280, which keeps peak memory near the text-only
+footprint on a 36 GB machine.
+
+Qwen 3.6 is the same flag, with a token budget instead of a soft-token
+one (`LUMEN_VISION_MAX_IMAGE_TOKENS`, default 1024):
+
+```bash
+LUMEN_VISION=1 \
+LUMEN_VISION_MAX_IMAGE_TOKENS=512 \
+MODEL_ID=~/models/Qwen3.6-27B-MTPLX-Speed \
+  cargo run --release --features mlx-native --bin lumen-server
+```
+
+Either way, the request looks the same:
+
+```bash
+B64=$(base64 -i some-image.png)
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d "{
+    \"model\": \"gemma-4-26b-a4b\",
+    \"max_tokens\": 128,
+    \"messages\": [{\"role\": \"user\", \"content\": [
+      {\"type\": \"text\", \"text\": \"Describe this image in one sentence.\"},
+      {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$B64\"}}
+    ]}]
+  }" | jq -r '.choices[0].message.content'
+```
+
+Only `data:` URLs are accepted — the server will not fetch remote ones.
+If the reply ignores the image, check the startup log: checkpoints that
+were requantized without their `vision_tower.*` weights print a warning
+and leave image input disabled. There is also a CLI path that skips HTTP
+entirely:
+
+```bash
+LUMEN_VISION=1 MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
+  cargo run --release --features mlx-native -p lumen-mlx \
+  --example gemma4_vision_describe -- some-image.png "What is this?"
+```
+
 ## 6. Download integration-test fixtures (optional)
 
 For the `--features qwen3_5_moe` integration tests, fetch the
@@ -236,6 +291,18 @@ Pulls from
 [hsng95/lumen-rs-fixtures](https://huggingface.co/datasets/hsng95/lumen-rs-fixtures).
 Override with `LUMEN_FIXTURES_REPO=<USER>/<repo>` if you maintain a
 fork. Default-feature tests do not need this.
+
+The vision-tower parity fixture is **not** part of that download — it is
+2.9 MB and committed to the repo, so `gemma4_vision_parity` runs from a
+clean clone with no Python and no HF access. It only needs the
+checkpoint, for the weights:
+
+```bash
+LUMEN_GEMMA4_MODEL_DIR=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
+  cargo test -p lumen-mlx --features mlx-native --test gemma4_vision_parity -- --nocapture
+```
+
+Without that env var the test skips rather than fails.
 
 ## 7. Common A/B switches
 
