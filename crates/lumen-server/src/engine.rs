@@ -1473,7 +1473,6 @@ impl InferenceEngine {
         } else {
             None
         };
-        reject_images_with_tool_history(needs_structured, images.is_some())?;
 
         // Prompt-size reject cap (Anthropic /v1/messages) — same OOM guard as
         // the OpenAI path: reject oversized prompts before prefill rather than
@@ -1609,6 +1608,12 @@ impl InferenceEngine {
                 })
                 .collect();
 
+            // Message-indexed view of the already-decoded images (the flat
+            // vector carries a leading slot for the synthesized system entry).
+            let msg_images: &[Vec<Vec<u8>>] = &all_images[usize::from(system_text.is_some())..];
+            let tool_result_counts: Vec<usize> = tool_result_buf.iter().map(Vec::len).collect();
+            let user_has_text: Vec<bool> = user_text_buf.iter().map(|s| !s.is_empty()).collect();
+
             let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
             if let Some(ref s) = system_text {
                 turns.push(ChatTurn::System(s.as_str()));
@@ -1639,9 +1644,10 @@ impl InferenceEngine {
                         // `AnthropicContent::Text(s)` — via the synthesized
                         // single-block view — and `AnthropicContent::Blocks`
                         // shapes, so a missing text means the message had
-                        // no text content at all.)
+                        // no text content at all.) An image-only message still
+                        // gets a turn — that is where its placeholder run goes.
                         let utext = user_text_buf[i].as_str();
-                        if !utext.is_empty() {
+                        if !utext.is_empty() || !msg_images[i].is_empty() {
                             turns.push(ChatTurn::User(utext));
                         }
                     }
@@ -1653,20 +1659,58 @@ impl InferenceEngine {
                     }
                 }
             }
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
-            self.backend.chat_from_history(
-                &turns,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                // Anthropic /v1/messages has no `response_format`.
-                None,
-            )?
+            // Built by replaying the expansion above; the length check catches
+            // the two drifting apart rather than letting an image bind to the
+            // wrong turn.
+            let turn_images = anthropic_turn_images(
+                &req.messages,
+                system_text.is_some(),
+                msg_images,
+                &tool_result_counts,
+                &user_has_text,
+            )?;
+            anyhow::ensure!(
+                turn_images.len() == turns.len(),
+                "anthropic turn/image expansion disagree ({} vs {} turns)",
+                turn_images.len(),
+                turns.len()
+            );
+            let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
+            let turn_images: Vec<Vec<Vec<u8>>> =
+                kept.iter().map(|&i| turn_images[i].clone()).collect();
+            if turn_images.iter().any(|v| !v.is_empty()) {
+                self.backend.chat_from_history_with_images(
+                    &turns,
+                    &turn_images,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                )?
+            } else {
+                self.backend.chat_from_history(
+                    &turns,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    // Anthropic /v1/messages has no `response_format`.
+                    None,
+                )?
+            }
         } else if let Some(images) = images.as_deref() {
             self.backend.chat_with_images(
                 &messages,
@@ -2294,10 +2338,6 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-        if let Err(e) = reject_images_with_tool_history(needs_structured, images.is_some()) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-            return;
-        }
 
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
@@ -2412,6 +2452,13 @@ impl InferenceEngine {
                 })
                 .collect();
 
+            // Message-indexed view of the already-decoded images (the flat
+            // vector carries a leading slot for the synthesized system entry).
+            let msg_images: &[Vec<Vec<u8>>] =
+                &all_images[usize::from(system_text.as_ref().is_some_and(|s| !s.is_empty()))..];
+            let tool_result_counts: Vec<usize> = tool_result_buf.iter().map(Vec::len).collect();
+            let user_has_text: Vec<bool> = user_text_buf.iter().map(|s| !s.is_empty()).collect();
+
             let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
             if let Some(ref s) = system_text {
                 if !s.is_empty() {
@@ -2434,46 +2481,96 @@ impl InferenceEngine {
                                 content: body.as_str(),
                             });
                         }
-                        if !user_text_buf[i].is_empty() {
+                        // An image-only message still gets a turn — that is
+                        // where its placeholder run goes.
+                        if !user_text_buf[i].is_empty() || !msg_images[i].is_empty() {
                             turns.push(ChatTurn::User(user_text_buf[i].as_str()));
                         }
                     }
                     _ => {}
                 }
             }
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
-            self.backend.chat_streaming_from_history(
-                &turns,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                // Anthropic Messages API has no `response_format` field.
-                None,
-                |ev: BackendStreamEvent<'_>| -> Result<()> {
-                    match ev {
-                        BackendStreamEvent::Text(t) => {
-                            let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                        }
-                        BackendStreamEvent::Reasoning(t) => {
-                            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                        }
-                        BackendStreamEvent::ToolCallStart { name } => {
-                            // Early per-call Start suppressed — see the call-1
-                            // closure above and the reconciliation loop below.
-                            // Sequential Start_i → Args_i → Stop_i per call is the
-                            // standard order; batched up-front Starts dropped args
-                            // for parallel calls after index 0.
-                            let _ = name;
-                        }
+            // Built by replaying the expansion above; the length check catches
+            // the two drifting apart rather than letting an image bind to the
+            // wrong turn.
+            let turn_images = match anthropic_turn_images(
+                &req.messages,
+                system_text.as_ref().is_some_and(|s| !s.is_empty()),
+                msg_images,
+                &tool_result_counts,
+                &user_has_text,
+            ) {
+                Ok(v) if v.len() == turns.len() => v,
+                Ok(v) => {
+                    let _ = token_tx.try_send(StreamEvent::Error(format!(
+                        "anthropic turn/image expansion disagree ({} vs {} turns)",
+                        v.len(),
+                        turns.len()
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+                    return;
+                }
+            };
+            let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
+            let turn_images: Vec<Vec<Vec<u8>>> =
+                kept.iter().map(|&i| turn_images[i].clone()).collect();
+            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
+                match ev {
+                    BackendStreamEvent::Text(t) => {
+                        let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
                     }
-                    Ok(())
-                },
-            )
+                    BackendStreamEvent::Reasoning(t) => {
+                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+                    }
+                    BackendStreamEvent::ToolCallStart { name } => {
+                        // Early per-call Start suppressed — see the call-1
+                        // closure above and the reconciliation loop below.
+                        // Sequential Start_i → Args_i → Stop_i per call is the
+                        // standard order; batched up-front Starts dropped args
+                        // for parallel calls after index 0.
+                        let _ = name;
+                    }
+                }
+                Ok(())
+            };
+            if turn_images.iter().any(|v| !v.is_empty()) {
+                self.backend.chat_streaming_from_history_with_images(
+                    &turns,
+                    &turn_images,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                    on_event,
+                )
+            } else {
+                self.backend.chat_streaming_from_history(
+                    &turns,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    // Anthropic Messages API has no `response_format` field.
+                    None,
+                    on_event,
+                )
+            }
         } else {
             // Bound first so both dispatches below can take it — only one runs.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
@@ -2916,24 +3013,61 @@ fn anthropic_images_flat(
     Ok(out)
 }
 
-/// Reject a request that carries both images and a tool-calling history.
+/// Per-turn image attachments for the Anthropic structured path.
 ///
-/// The two need different renderers: tool history goes through the structured
-/// `ChatTurn` path (the flat `(role, content)` shape cannot represent a
-/// `role:"tool"` message), and that path has no way to carry images. Whichever
-/// way such a request routed, something would be dropped — and dropping the
-/// image means answering confidently about a picture the model never saw,
-/// which is exactly the failure this whole change exists to remove. So it is
-/// refused instead, loudly.
-fn reject_images_with_tool_history(needs_structured: bool, has_images: bool) -> Result<()> {
-    if needs_structured && has_images {
-        return Err(anyhow::anyhow!(
-            "image input is not supported together with a tool-calling history \
-             (an assistant `tool_calls` turn or a `role:\"tool\"` message); \
-             the structured renderer those require does not carry images"
-        ));
+/// The message-indexed vector cannot be reused here. One Anthropic message
+/// expands into several turns — a user message with N `tool_result` blocks
+/// becomes N `Tool` turns followed by its `User` turn — so from the first tool
+/// result onward, message index and turn index diverge and every later image
+/// would bind to the wrong turn. This replays that same expansion and emits
+/// exactly one row per turn.
+///
+/// `has_system_turn` mirrors whatever condition the caller used to push its
+/// `ChatTurn::System`; the two Anthropic call sites disagree about the empty
+/// system string, so it is passed rather than re-derived.
+///
+/// Images on an assistant turn are refused. There is nowhere to put them: the
+/// renderers place a placeholder run at the head of a user turn, and an
+/// assistant turn carrying tool calls may render no text at all.
+fn anthropic_turn_images(
+    messages: &[AnthropicMessage],
+    has_system_turn: bool,
+    msg_images: &[Vec<Vec<u8>>],
+    tool_result_counts: &[usize],
+    user_has_text: &[bool],
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    let mut out: Vec<Vec<Vec<u8>>> = Vec::with_capacity(messages.len() + 4);
+    if has_system_turn {
+        out.push(Vec::new());
     }
-    Ok(())
+    for (i, msg) in messages.iter().enumerate() {
+        let attached = msg_images.get(i).cloned().unwrap_or_default();
+        match msg.role.as_str() {
+            "assistant" => {
+                if !attached.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "images can only be attached to a user message; message {i} is an \
+                         assistant turn"
+                    ));
+                }
+                out.push(Vec::new());
+            }
+            "user" => {
+                // Tool turns come first and never carry images.
+                for _ in 0..tool_result_counts.get(i).copied().unwrap_or(0) {
+                    out.push(Vec::new());
+                }
+                // The User turn is emitted when the message has text *or*
+                // images — an image-only message still needs a turn to hang
+                // its placeholder run on.
+                if user_has_text.get(i).copied().unwrap_or(false) || !attached.is_empty() {
+                    out.push(attached);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Anthropic variant of `needs_structured_history`. We scan content blocks
@@ -5368,25 +5502,88 @@ mod batch_eligibility {
     }
 }
 
+/// Alignment of the Anthropic structured path's per-turn image vector.
+///
+/// This is the one place in the image plumbing with no runtime error signal to
+/// fall back on: a misaligned row does not fail, it splices one image's pixels
+/// onto another turn's placeholder rows and the model answers confidently about
+/// the wrong picture. So the expansion is pinned directly.
 #[cfg(test)]
-mod image_tool_history_conflict {
-    use super::reject_images_with_tool_history;
+mod anthropic_turn_image_alignment {
+    use super::anthropic_turn_images;
+    use crate::types::{AnthropicContent, AnthropicMessage};
 
-    #[test]
-    fn images_plus_tool_history_is_refused() {
-        let err = reject_images_with_tool_history(true, true)
-            .err()
-            .expect("the combination must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("image"), "unhelpful error: {msg}");
-        assert!(msg.contains("tool"), "unhelpful error: {msg}");
+    fn msg(role: &str) -> AnthropicMessage {
+        AnthropicMessage {
+            role: role.to_string(),
+            content: AnthropicContent::Text(String::new()),
+        }
+    }
+
+    fn img(tag: u8) -> Vec<Vec<u8>> {
+        vec![vec![tag]]
     }
 
     #[test]
-    fn either_one_alone_is_fine() {
-        assert!(reject_images_with_tool_history(true, false).is_ok());
-        assert!(reject_images_with_tool_history(false, true).is_ok());
-        assert!(reject_images_with_tool_history(false, false).is_ok());
+    fn tool_results_expand_one_message_into_several_turns() {
+        // user(2 tool_results + text + image) → Tool, Tool, User(image).
+        // A message-indexed vector would have put the image on the first Tool
+        // turn, two rows early.
+        let messages = vec![msg("assistant"), msg("user")];
+        let rows = anthropic_turn_images(
+            &messages,
+            false,
+            &[Vec::new(), img(7)],
+            &[0, 2],
+            &[false, true],
+        )
+        .expect("build rows");
+        assert_eq!(rows.len(), 4, "1 assistant + 2 tool + 1 user turn");
+        assert!(rows[0].is_empty(), "assistant turn");
+        assert!(rows[1].is_empty(), "first tool_result turn");
+        assert!(rows[2].is_empty(), "second tool_result turn");
+        assert_eq!(rows[3], img(7), "the image belongs to the user turn");
+    }
+
+    #[test]
+    fn a_system_turn_shifts_every_row() {
+        let messages = vec![msg("user")];
+        let rows =
+            anthropic_turn_images(&messages, true, &[img(1)], &[0], &[true]).expect("build rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_empty(), "system turn carries no image");
+        assert_eq!(rows[1], img(1));
+    }
+
+    #[test]
+    fn an_image_only_message_still_gets_a_turn() {
+        // No text, so the turn builder would previously have emitted nothing —
+        // and the image would have had no turn to attach to.
+        let messages = vec![msg("user")];
+        let rows =
+            anthropic_turn_images(&messages, false, &[img(3)], &[0], &[false]).expect("build rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], img(3));
+    }
+
+    #[test]
+    fn a_textless_imageless_message_emits_no_turn() {
+        // A user message that is nothing but tool_results contributes its Tool
+        // turns and no User turn.
+        let messages = vec![msg("user")];
+        let rows = anthropic_turn_images(&messages, false, &[Vec::new()], &[1], &[false])
+            .expect("build rows");
+        assert_eq!(rows.len(), 1, "the tool turn only");
+        assert!(rows[0].is_empty());
+    }
+
+    #[test]
+    fn an_image_on_an_assistant_turn_is_refused() {
+        let messages = vec![msg("assistant")];
+        let err = anthropic_turn_images(&messages, false, &[img(9)], &[0], &[false])
+            .err()
+            .expect("an assistant turn has nowhere to put an image");
+        assert!(err.to_string().contains("user message"), "{err}");
     }
 }
 

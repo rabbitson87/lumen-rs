@@ -382,13 +382,18 @@ Notes:
   a vision prompt's placeholder rows only mean anything together with the
   image they were spliced from. On Qwen 3.6 they also bypass MTP and
   speculative decode, for the same reason.
-- `response_format` is not supported alongside images. On Qwen 3.6, tools
-  are not either. Both are rejected with an error rather than ignored.
-- Images mixed with a tool-calling history (an assistant `tool_calls` turn
-  or a `role:"tool"` message) work on `/v1/chat/completions` with Gemma 4 —
-  the structured renderer carries images on its `User` turns. The same
-  combination is still rejected on `/v1/messages`, and on Qwen 3.6, rather
-  than silently dropping the image.
+- `response_format` is not supported alongside images, on either family. It
+  is rejected with an error rather than ignored.
+- Tools work alongside images on both families and both APIs, including a
+  tool-calling history (an assistant `tool_calls` turn or a `role:"tool"` /
+  `tool_result` message): the structured renderers carry images on their
+  `User` turns. On `/v1/messages` one message expands into several turns —
+  N `tool_result` blocks become N tool turns before the user turn — and the
+  images are indexed per *turn* so they stay put.
+- An image may only be attached to a **user** message. Attaching one to an
+  assistant turn is refused, because the renderers place the placeholder run
+  at the head of a user turn and an assistant turn carrying tool calls may
+  render no text at all.
 - Requires the mlx-native backend. Other backends return an error rather
   than answering without the image.
 

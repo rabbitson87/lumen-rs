@@ -186,27 +186,43 @@ pub fn is_client_meta_wrapper(content: &str) -> bool {
 /// `tool_choice="required"` (OpenAI) or `tool_choice={type:"any"}`
 /// (Anthropic) parameters, both first-class.
 pub fn strip_client_meta_wrappers(turns: &mut Vec<ChatTurn<'_>>) {
+    let _ = strip_client_meta_wrappers_indexed(turns);
+}
+
+/// [`strip_client_meta_wrappers`] that also reports, for each surviving turn,
+/// its index in the input.
+///
+/// The turn counterpart of [`strip_client_meta_wrappers_flat_indexed`], and it
+/// exists for the same reason: a caller carrying a per-turn side table — image
+/// attachments — has to filter it with the *same* predicate, or entry `i` ends
+/// up describing a different turn than it did before the strip.
+pub fn strip_client_meta_wrappers_indexed(turns: &mut Vec<ChatTurn<'_>>) -> Vec<usize> {
     if std::env::var("LUMEN_STRIP_CLIENT_META_WRAPPERS")
         .map(|s| s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false)
     {
-        return;
+        return (0..turns.len()).collect();
     }
     let before = turns.len();
-    turns.retain(|t| match t {
-        ChatTurn::User(s) => {
-            if is_client_meta_wrapper(s) {
+    let mut kept: Vec<usize> = Vec::with_capacity(before);
+    let mut idx = 0usize;
+    turns.retain(|t| {
+        let i = idx;
+        idx += 1;
+        match t {
+            ChatTurn::User(s) if is_client_meta_wrapper(s) => {
                 let preview: String = s.trim().chars().take(80).collect();
                 eprintln!(
                     "[chat-io] stripped client meta-wrapper user turn (len={}): {preview:?}...",
                     s.len()
                 );
                 false
-            } else {
+            }
+            _ => {
+                kept.push(i);
                 true
             }
         }
-        _ => true,
     });
     if turns.len() < before {
         eprintln!(
@@ -215,6 +231,7 @@ pub fn strip_client_meta_wrappers(turns: &mut Vec<ChatTurn<'_>>) {
             before - turns.len()
         );
     }
+    kept
 }
 
 /// Heuristic classification of the chat request into "agent" vs "chat"
