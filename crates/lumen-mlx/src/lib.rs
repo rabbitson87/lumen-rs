@@ -1459,6 +1459,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_response_format(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1594,12 +1595,25 @@ impl MlxBackend {
         }
         match self {
             Self::Gemma4(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input"
-                    ));
-                }
                 let _ = session_id;
+                // Same trick as the text path: only the streaming decode
+                // applies the response-format grammar, so a non-streaming
+                // schema request runs it with a no-op sink.
+                if let Some(schema) = response_schema {
+                    return m.chat_streaming_with_images(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        Some(schema),
+                        |_| Ok(()),
+                    );
+                }
                 m.chat_with_images(
                     messages,
                     images,
@@ -1615,14 +1629,20 @@ impl MlxBackend {
             Self::Qwen35Family(m) => {
                 // The Qwen3.6 image path is greedy-only: the family's sampled
                 // branches key on text.
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input on the \
-                         Qwen 3.6 backend"
-                    ));
-                }
                 let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
+                // response_format wins over tools, matching the text path.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    return m.chat_response_format(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
                 if !tools.is_empty() {
                     return m.chat_with_tools(
                         messages,
@@ -1697,11 +1717,6 @@ impl MlxBackend {
         }
         match self {
             Self::Gemma4(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input"
-                    ));
-                }
                 let _ = session_id;
                 m.chat_streaming_with_images(
                     messages,
@@ -1718,15 +1733,25 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input on the \
-                         Qwen 3.6 backend"
-                    ));
-                }
                 let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
                 let mut on_event = on_event;
+                // response_format wins over tools, matching the text path.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let mut sink = |chunk: &str| {
+                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut sink,
+                    );
+                }
                 if !tools.is_empty() {
                     return m.chat_streaming_with_tools(
                         messages,
@@ -1806,12 +1831,24 @@ impl MlxBackend {
         match self {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input"
-                    ));
-                }
                 let _ = session_id;
+                // Only the streaming decode applies the response-format
+                // grammar; run it with a no-op sink for the non-streaming call.
+                if let Some(schema) = response_schema {
+                    return m.chat_streaming_from_history_with_images(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        Some(schema),
+                        |_| Ok(()),
+                    );
+                }
                 m.chat_from_history_with_images(
                     turns,
                     images,
@@ -1825,14 +1862,19 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input on the \
-                         Qwen 3.6 backend"
-                    ));
-                }
                 let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    return m.chat_response_format_from_history(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
                 m.chat_with_tools_from_history(
                     turns,
                     images,
@@ -1875,6 +1917,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_response_format_from_history(
                         turns,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1997,6 +2040,7 @@ impl MlxBackend {
                     };
                     return m.chat_streaming_response_format(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -2138,11 +2182,6 @@ impl MlxBackend {
         match self {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input"
-                    ));
-                }
                 let _ = session_id;
                 m.chat_streaming_from_history_with_images(
                     turns,
@@ -2159,14 +2198,24 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                if response_schema.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "response_format is not supported together with image input on the \
-                         Qwen 3.6 backend"
-                    ));
-                }
                 let _ = (temperature, top_p, ov, session_id);
                 let seq_id = m.alloc_seq_id();
+                let mut on_event = on_event;
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let mut sink = |chunk: &str| {
+                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format_from_history(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut sink,
+                    );
+                }
                 m.chat_streaming_with_tools_from_history(
                     turns,
                     images,
@@ -2219,6 +2268,7 @@ impl MlxBackend {
                     };
                     return m.chat_streaming_response_format_from_history(
                         turns,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -3749,9 +3799,14 @@ impl MlxQwen35Backend {
     /// desync, this degrades to a plain greedy decode — the server-side
     /// first-JSON-value trim still yields a parseable object in the common case.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn chat_response_format_impl<F>(
         &mut self,
         prompt_ids: Vec<u32>,
+        // Images to splice over the prompt's placeholder runs, in prompt order.
+        // Empty for a text-only request, which then prefills byte-identically
+        // to the pre-vision path.
+        prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
         grammar: Option<crate::grammar::Gemma4GrammarState>,
         max_new_tokens: usize,
         seq_id: u64,
@@ -3784,10 +3839,23 @@ impl MlxQwen35Backend {
         let (mut last, mut pos);
         #[cfg(feature = "mlx-native")]
         let mut first_masked = false;
+        // Vision prompts prefill through the image-splicing path; the held-back
+        // token is the tail of the assistant header, never a placeholder, so the
+        // runs stay wholly inside the prefilled span either way.
+        #[cfg(feature = "mlx-native")]
+        macro_rules! prefill_span {
+            ($ids:expr) => {
+                if prepared_images.is_empty() {
+                    self.prefill(seq_id, $ids)
+                } else {
+                    self.prefill_with_images(seq_id, $ids, &prepared_images)
+                }
+            };
+        }
         #[cfg(feature = "mlx-native")]
         if grammar_active_at_start && prompt_ids.len() >= 2 {
             let split = prompt_ids.len() - 1;
-            let (_pf, _pos0) = self.prefill(seq_id, &prompt_ids[..split])?;
+            let (_pf, _pos0) = prefill_span!(&prompt_ids[..split])?;
             let final_tok = prompt_ids[split];
             let stepped = {
                 let g = grammar.as_mut().expect("grammar active implies Some");
@@ -3800,12 +3868,17 @@ impl MlxQwen35Backend {
             pos = p;
             first_masked = true;
         } else {
-            let (l, p) = self.prefill(seq_id, &prompt_ids)?;
+            let (l, p) = prefill_span!(&prompt_ids)?;
             last = l;
             pos = p;
         }
         #[cfg(not(feature = "mlx-native"))]
         {
+            if !prepared_images.is_empty() {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
             let (l, p) = self.prefill(seq_id, &prompt_ids)?;
             last = l;
             pos = p;
@@ -3929,22 +4002,100 @@ impl MlxQwen35Backend {
     pub fn chat_response_format(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input(messages, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            |_| {},
+        )
+    }
+
+    /// Prompt for a flat-message `response_format` request, with or without
+    /// images. Split out so the streaming and non-streaming entry points cannot
+    /// drift on how the placeholder runs are built.
+    fn build_response_format_input(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return Ok((self.build_chat_input(messages, thinking)?, Vec::new()));
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            self.build_chat_input_with_images(messages, images, thinking)
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            Err(anyhow!(
+                "image input requires a build with the `mlx-native` feature"
+            ))
+        }
+    }
+
+    /// Structured-history counterpart of
+    /// [`build_response_format_input`](Self::build_response_format_input).
+    ///
+    /// Goes through the tool-aware renderer with no tools — it is the only one
+    /// that can represent assistant `tool_calls` / `role:tool` turns — so the
+    /// same `User`-turn-only image rule applies.
+    fn build_response_format_input_from_history(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        use crate::chat_io::ResolvedToolChoice;
+        if !images.iter().any(|v| !v.is_empty()) {
+            let (ids, _prefill, _prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    &[],
+                    &ResolvedToolChoice::None,
+                )?;
+            return Ok((ids, Vec::new()));
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            let (ids, _prefill, _prefill_tokens, prepared) = self
+                .build_chat_input_with_tools_and_images_from_history_split(
+                    turns,
+                    images,
+                    thinking,
+                    &[],
+                    &ResolvedToolChoice::None,
+                )?;
+            Ok((ids, prepared))
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            Err(anyhow!(
+                "image input requires a build with the `mlx-native` feature"
+            ))
+        }
     }
 
     /// `response_format` streaming chat (flat messages). Same as
     /// [`chat_response_format`] but forwards each visible JSON fragment to
     /// `on_token`.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_response_format<F>(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -3954,9 +4105,17 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input(messages, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            on_token,
+        )
     }
 
     /// `response_format` non-streaming chat (structured history). Routes the
@@ -3966,27 +4125,31 @@ impl MlxQwen35Backend {
     pub fn chat_response_format_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        use crate::chat_io::ResolvedToolChoice;
-        let (prompt_ids, _prefill, _prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(
-                turns,
-                thinking,
-                &[],
-                &ResolvedToolChoice::None,
-            )?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input_from_history(turns, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            |_| {},
+        )
     }
 
     /// `response_format` streaming chat (structured history).
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_response_format_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -3996,16 +4159,17 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
-        use crate::chat_io::ResolvedToolChoice;
-        let (prompt_ids, _prefill, _prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(
-                turns,
-                thinking,
-                &[],
-                &ResolvedToolChoice::None,
-            )?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input_from_history(turns, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            on_token,
+        )
     }
 
     /// Streaming chat. Calls `on_token` with each new decoded text fragment.
