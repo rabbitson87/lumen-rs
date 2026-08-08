@@ -382,8 +382,13 @@ Notes:
   a vision prompt's placeholder rows only mean anything together with the
   image they were spliced from. On Qwen 3.6 they also bypass MTP and
   speculative decode, for the same reason.
-- `response_format` is not supported alongside images, on either family. It
-  is rejected with an error rather than ignored.
+- `response_format` works alongside images on both families — describing a
+  picture as structured JSON is a first-class path. When a request carries both
+  a schema and tools, the schema wins, matching the text path.
+- Set `"additionalProperties": false` on a `json_schema`. Without it the schema
+  permits any extra key, and a model handed that freedom invents keys until
+  `max_tokens`. lumen leaves this to the caller because the schema means what it
+  says, but it is the first thing to check when a structured reply looks wrong.
 - Tools work alongside images on both families and both APIs, including a
   tool-calling history (an assistant `tool_calls` turn or a `role:"tool"` /
   `tool_result` message): the structured renderers carry images on their
