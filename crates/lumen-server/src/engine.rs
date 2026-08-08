@@ -1149,6 +1149,7 @@ impl InferenceEngine {
 
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
         // Resolve enable_thinking once — the backend hint covers the
         // common case where OpenAI-compat clients send placeholder model
         // ids ("gpt-3.5-turbo") that hide the actual loaded family.
@@ -1438,6 +1439,7 @@ impl InferenceEngine {
         let ov = req.sampling_overrides();
         let tool_choice =
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
         let system_text = req
             .system
@@ -1911,6 +1913,7 @@ impl InferenceEngine {
         let tools_owned = openai_tools_to_defs(req.tools.as_deref());
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
         // OpenAI `response_format` → JSON-schema constrained decoding
         // (Gemma 4 only). `None` when absent / `text` → exact existing path.
         let response_schema = req.response_json_schema();
@@ -2342,6 +2345,7 @@ impl InferenceEngine {
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let tool_choice =
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -3084,6 +3088,31 @@ fn anthropic_needs_structured_history(messages: &[AnthropicMessage]) -> bool {
             )
         }),
     })
+}
+
+/// Drop the tool definitions when `tool_choice` resolved to `"none"`.
+///
+/// `"none"` promises the model generates a message instead of calling a tool.
+/// Until this existed the promise was not kept: the resolver produced
+/// `ResolvedToolChoice::None`, the backends used it to *skip building a
+/// grammar*, and nothing else looked at it — so the tool block still went into
+/// the prompt and Qwen 3.6 answered `"What is the weather in Busan?"` with a
+/// `get_weather` call. Gemma 4 happened to comply, which is luck, not a
+/// guarantee.
+///
+/// Withholding the definitions makes it structural: a model cannot call what it
+/// was never shown. Filtering the parsed call afterwards would be the
+/// alternative and is worse — the model would have spent its budget on a call
+/// that gets thrown away, leaving an empty reply.
+fn tools_visible_to_model<'a>(
+    tools: Vec<ToolDef<'a>>,
+    tool_choice: &ResolvedToolChoice<'_>,
+) -> Vec<ToolDef<'a>> {
+    if matches!(tool_choice, ResolvedToolChoice::None) {
+        Vec::new()
+    } else {
+        tools
+    }
 }
 
 /// Phase 1.6: resolve the OpenAI `tool_choice` into our canonical
@@ -5508,6 +5537,43 @@ mod batch_eligibility {
 /// fall back on: a misaligned row does not fail, it splices one image's pixels
 /// onto another turn's placeholder rows and the model answers confidently about
 /// the wrong picture. So the expansion is pinned directly.
+#[cfg(test)]
+mod tool_choice_none_withholds_tools {
+    use super::{ResolvedToolChoice, ToolDef, tools_visible_to_model};
+
+    fn one_tool() -> Vec<ToolDef<'static>> {
+        vec![ToolDef {
+            name: "get_weather",
+            description: None,
+            parameters: None,
+            response: None,
+        }]
+    }
+
+    #[test]
+    fn none_hides_them() {
+        assert!(
+            tools_visible_to_model(one_tool(), &ResolvedToolChoice::None).is_empty(),
+            "a model cannot call what it was never shown"
+        );
+    }
+
+    #[test]
+    fn every_other_choice_keeps_them() {
+        for choice in [
+            ResolvedToolChoice::Auto,
+            ResolvedToolChoice::Required,
+            ResolvedToolChoice::Tool("get_weather"),
+        ] {
+            assert_eq!(
+                tools_visible_to_model(one_tool(), &choice).len(),
+                1,
+                "{choice:?} must still see the tools"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod anthropic_turn_image_alignment {
     use super::anthropic_turn_images;
