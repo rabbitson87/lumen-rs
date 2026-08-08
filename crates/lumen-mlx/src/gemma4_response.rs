@@ -240,21 +240,49 @@ pub(crate) mod imp {
                 break;
             };
             // Read NAME permissively — any character up to the first
-            // '{' (newline is a hard boundary). Accepts non-OpenAI-spec
-            // function names (spaces, parens, dots, …) so clients like
-            // Ayla can pass MCP-prefixed names through without
-            // sanitizing — e.g. `Playwright (Stealth)__browser_navigate`.
+            // '{'. Accepts non-OpenAI-spec function names (spaces, parens,
+            // dots, …) so clients like Ayla can pass MCP-prefixed names
+            // through without sanitizing — e.g.
+            // `Playwright (Stealth)__browser_navigate`.
+            //
+            // Three hard boundaries stop the scan. A newline or carriage
+            // return, because a name never spans lines. And a further
+            // `call:`, because that is the opener of the *next* call: without
+            // it, a malformed `call:no_brace call:good{x:1}` swallows the
+            // second opener into the first name and yields a tool named
+            // "no_brace call:good" — a name no client declared, silently
+            // wrong rather than loudly skipped. Whitespace deliberately does
+            // NOT stop the scan; that is what makes the MCP names above work.
             let name_start = call_pos + "call:".len();
             let mut brace_start = name_start;
+            let mut hit_next_call = false;
             while brace_start < bytes.len() {
                 let b = bytes[brace_start];
                 if b == b'{' || b == b'\n' || b == b'\r' {
                     break;
                 }
+                // Compared as bytes: `brace_start` walks byte-by-byte and a
+                // name may be non-ASCII, so slicing `text` here could land
+                // mid-character. "call:" is pure ASCII and UTF-8 continuation
+                // bytes never collide with it, so a byte match implies a real
+                // character boundary.
+                if bytes[brace_start..].starts_with(b"call:") {
+                    hit_next_call = true;
+                    break;
+                }
                 brace_start += 1;
             }
             if brace_start >= bytes.len() || bytes[brace_start] != b'{' {
-                i = name_start;
+                // Malformed: this opener has no args block. Resume at the
+                // next `call:` when that is what stopped us — the outer
+                // search then re-finds it and parses it properly. Otherwise
+                // step past this opener so a later one can still be found.
+                // Either way `i` strictly advances, so the loop terminates.
+                i = if hit_next_call {
+                    brace_start
+                } else {
+                    name_start
+                };
                 continue;
             }
             // Trim trailing whitespace from NAME.
@@ -516,6 +544,62 @@ pub(crate) mod imp {
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "Playwright (Stealth)__browser_navigate");
             assert_eq!(calls[0].arguments["url"], "https://example.com");
+        }
+
+        #[test]
+        fn body_parser_stops_a_name_at_the_next_opener() {
+            // The counterweight to the permissive name above. A `call:`
+            // without an args block must not swallow the opener that follows
+            // it: the greedy scan used to yield one call named
+            // "bad_no_brace call:good", which no client ever declared, and a
+            // fuzzy name matcher downstream can turn that into a *plausible*
+            // wrong tool. Skipping the malformed opener and parsing the real
+            // call is the only reading that cannot invent a tool.
+            let calls = parse_tool_call_body("call:bad_no_brace call:good{x:1}")
+                .expect("recovers to the well-formed call");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "good");
+            assert_eq!(calls[0].arguments["x"], 1);
+        }
+
+        #[test]
+        fn body_parser_skips_a_run_of_malformed_openers() {
+            // Several bad openers in a row must not stall the scan — each one
+            // has to advance it — and must not merge into one another.
+            let calls = parse_tool_call_body("call:a call:b call:c{x:1}")
+                .expect("recovers past every malformed opener");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "c");
+        }
+
+        #[test]
+        fn body_parser_reports_no_call_when_every_opener_is_malformed() {
+            // No args block anywhere: an error, not a phantom tool call, and
+            // not a hang.
+            let err = parse_tool_call_body("call:a call:b call:c")
+                .expect_err("nothing well-formed to parse");
+            assert!(format!("{err}").contains("no call:"), "{err}");
+        }
+
+        #[test]
+        fn body_parser_stops_a_non_ascii_name_at_the_next_opener() {
+            // The scan walks bytes, so a multi-byte name is where an
+            // ASCII-only boundary check would slice mid-character and panic.
+            let calls = parse_tool_call_body("call:날씨_조회 call:good{x:1}")
+                .expect("recovers past a non-ASCII malformed opener");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "good");
+        }
+
+        #[test]
+        fn body_parser_keeps_a_non_ascii_name_that_is_well_formed() {
+            // Argument *keys* are ASCII here on purpose: `gemma4_args_to_json`
+            // quotes bare keys byte-wise and mangles multi-byte ones, which is
+            // a separate pre-existing limitation. This pins the name handling.
+            let calls = parse_tool_call_body(r#"call:날씨_조회{city:<|"|>서울<|"|>}"#)
+                .expect("non-ASCII names still round-trip");
+            assert_eq!(calls[0].name, "날씨_조회");
+            assert_eq!(calls[0].arguments["city"], "서울");
         }
 
         #[test]
