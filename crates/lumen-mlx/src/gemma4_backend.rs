@@ -494,7 +494,7 @@ pub(crate) mod imp {
     /// downstream clients reject). For agentic clients (Moltis-style
     /// matchers, OpenAI-spec tool callers) ON is the safer production
     /// default. Cached on first read.
-    fn gemma4_grammar_lark_enabled() -> bool {
+    pub(crate) fn gemma4_grammar_lark_enabled() -> bool {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
             std::env::var("LUMEN_GEMMA4_GRAMMAR_LARK")

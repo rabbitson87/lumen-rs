@@ -988,6 +988,30 @@ fn effective_qwen35_mtp_k() -> Option<usize> {
     }
 }
 
+/// Would a Gemma 4 request get a grammar if it went through the streaming
+/// decode?
+///
+/// The non-streaming path runs a batched `generate()` that applies no mask, so
+/// this is what decides whether a request must be re-routed through streaming
+/// to get the constraint it asked for. It mirrors the conditions
+/// `Gemma4Backend::select_grammar_state` uses — response_format unconditionally,
+/// tools only when the Lark grammar is enabled and `tool_choice` is not
+/// `"none"` — because a mismatch either loses the grammar again or pays a cold
+/// prefill for nothing.
+#[cfg(feature = "mlx-native")]
+fn gemma4_grammar_would_constrain(
+    response_schema: Option<&serde_json::Value>,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+) -> bool {
+    if response_schema.is_some() {
+        return true;
+    }
+    !tools.is_empty()
+        && !matches!(tool_choice, crate::chat_io::ResolvedToolChoice::None)
+        && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
+}
+
 fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     let (role, content) = messages.first()?;
     if role != "system" || content.is_empty() {
@@ -1498,15 +1522,19 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                // response_format wiring (WS-F #1): the batched `generate()`
-                // path below applies no grammar. When a JSON schema is
-                // present, route through the streaming decode — which DOES
-                // apply the response-format grammar — with a no-op sink and
-                // collect its ParsedResponse. Rare path; it forgoes the
-                // prefix cache, trading a cold prefill for a correct
-                // (schema-constrained) non-streaming answer instead of
-                // silently emitting free text.
-                if let Some(schema) = response_schema {
+                // The batched `generate()` path below applies no grammar at
+                // all, so any request that would have one runs through the
+                // streaming decode with a no-op sink and returns its
+                // ParsedResponse. It forgoes the prefix cache — a cold prefill
+                // in exchange for the constraint the caller asked for, rather
+                // than silently unconstrained output.
+                //
+                // This covers `response_format` and tool calls alike. Leaving
+                // tools out is what let a non-streaming `tool_choice=required`
+                // return `迎get_weather`: no matcher was ever built, so the
+                // name was whatever the model felt like, and only the response
+                // parser's fuzzy repair stood between that and the client.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming(
                         messages,
                         max_new_tokens,
@@ -1516,7 +1544,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
@@ -1597,9 +1625,9 @@ impl MlxBackend {
             Self::Gemma4(m) => {
                 let _ = session_id;
                 // Same trick as the text path: only the streaming decode
-                // applies the response-format grammar, so a non-streaming
-                // schema request runs it with a no-op sink.
-                if let Some(schema) = response_schema {
+                // applies a grammar, so a non-streaming request that wants one
+                // runs it with a no-op sink.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming_with_images(
                         messages,
                         images,
@@ -1610,7 +1638,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
@@ -1832,9 +1860,9 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                // Only the streaming decode applies the response-format
-                // grammar; run it with a no-op sink for the non-streaming call.
-                if let Some(schema) = response_schema {
+                // Only the streaming decode applies a grammar; run it with a
+                // no-op sink for the non-streaming call.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming_from_history_with_images(
                         turns,
                         images,
@@ -1845,7 +1873,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
@@ -1951,13 +1979,11 @@ impl MlxBackend {
                 // turn content. Falls through to the no-prefix-cache path
                 // when neither yields a key (e.g. user-first chat with no
                 // system turn).
-                // response_format wiring (WS-F #1): mirror the flat `chat`
-                // path — when a JSON schema is present, route through the
-                // grammar-aware streaming decode with a no-op sink so the
-                // non-streaming structured-history answer is actually
-                // schema-constrained (the cache/`generate` path applies no
-                // grammar). Rare path; forgoes the prefix cache.
-                if let Some(schema) = response_schema {
+                // Mirror the flat `chat` path — a request that would get a
+                // grammar routes through the grammar-aware streaming decode
+                // with a no-op sink, because the cache/`generate` path applies
+                // none. Forgoes the prefix cache for those requests.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming_from_history(
                         turns,
                         max_new_tokens,
@@ -1967,7 +1993,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
