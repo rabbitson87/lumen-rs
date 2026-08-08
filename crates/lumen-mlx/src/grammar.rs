@@ -152,13 +152,13 @@ impl Gemma4GrammarState {
     /// free-form JSON output).
     ///
     /// The grammar is pinned to **compact** JSON — see
-    /// [`with_compact_whitespace`] for why the default is unusable here.
+    /// [`with_bounded_whitespace`] for why the default is unusable here.
     pub fn new_json_schema(
         factory: Arc<ParserFactory>,
         schema: &Value,
         mode: GrammarMode,
     ) -> Result<Self> {
-        let schema = TopLevelGrammar::from_json_schema(with_compact_whitespace(schema.clone()));
+        let schema = TopLevelGrammar::from_json_schema(with_bounded_whitespace(schema.clone()));
         let mut state = Self {
             factory,
             schema,
@@ -498,26 +498,50 @@ impl Gemma4GrammarState {
 /// `call:NAME{args}<tool_call|>` ([`crate::gemma4_response`]), so this schema
 /// just needs to produce the JSON-shaped args body; the surrounding tokens
 /// are emitted by the model freely.
-/// Pin a JSON Schema's grammar to compact output, with no optional whitespace
-/// between tokens.
+/// Give a JSON Schema grammar exactly the spacing a model writes by hand, and
+/// no more.
 ///
-/// llguidance defaults to `whitespace_flexible`, which inserts a skippable
+/// llguidance defaults to `whitespace_flexible`, which puts a skippable
 /// `[ \n\r\t]+` between every JSON token. For a human writing JSON that is a
-/// convenience; for constrained decoding it is a trap. The whitespace run has
-/// no upper bound, so after `{` the model may legally emit newlines and spaces
-/// forever — and a greedy sampler does exactly that, filling `max_tokens` with
-/// indentation and never reaching a key. Compact JSON removes the degree of
-/// freedom entirely, so the first token after `{` has to be a quote.
+/// convenience; under greedy constrained decoding it is a trap, because the run
+/// has no upper bound. Observed on Gemma 4: after `{` the model emitted
+/// newlines and indentation until it hit `max_tokens`, and the reply was `{`.
+///
+/// Forbidding whitespace outright stops that but overcorrects. Models write
+/// `"key": "value"`, and with nowhere legal to put the space the residue lands
+/// *inside* the string — both families produced `{"city": ": way more…"}` under
+/// compact separators, Gemma 4 never recovering from it.
+///
+/// So instead of a whitespace *rule* the spacing goes into the separators
+/// themselves: `": "` and `", "` are literals, matching the model's own
+/// distribution while remaining a fixed width that cannot be padded. A bounded
+/// `whitespace_pattern` looks like the obvious answer and is not — it is
+/// llguidance's *skip* rule, re-matched between every token, so consecutive
+/// matches concatenate and `{0,8}` bounds nothing.
 ///
 /// A caller that has already set `x-guidance` knows what it wants and is left
-/// alone; a non-object schema (`true` / `false`) has nowhere to put the hint
-/// and passes through unchanged.
-fn with_compact_whitespace(mut schema: Value) -> Value {
+/// alone — `{"x-guidance": {"whitespace_flexible": true}}` on the request
+/// schema restores free-form pretty-printing. A non-object schema (`true` /
+/// `false`) has nowhere to put the hint and passes through unchanged.
+///
+/// Orthogonal, and worth knowing when a reply looks unhinged: a schema without
+/// `"additionalProperties": false` legitimately permits any extra key, and a
+/// model handed that freedom will invent keys until `max_tokens`. That is the
+/// schema doing what it says, so it is left to the caller — but it is the first
+/// thing to check.
+fn with_bounded_whitespace(mut schema: Value) -> Value {
     let Some(obj) = schema.as_object_mut() else {
         return schema;
     };
     if !obj.contains_key("x-guidance") {
-        obj.insert("x-guidance".into(), json!({ "whitespace_flexible": false }));
+        obj.insert(
+            "x-guidance".into(),
+            json!({
+                "whitespace_flexible": false,
+                "key_separator": ": ",
+                "item_separator": ", ",
+            }),
+        );
     }
     schema
 }
@@ -1256,24 +1280,69 @@ mod tests {
             .expect("matcher advanced past `<`, so `t` continues `<tool_call>`");
     }
 
+    /// Drive a grammar with a byte string, returning the index of the first
+    /// byte it rejects. The placeholder env maps ids to bytes, so this reads
+    /// as "what output would the grammar allow".
+    fn feed(state: &mut Gemma4GrammarState, bytes: &[u8]) -> Option<usize> {
+        for (i, b) in bytes.iter().enumerate() {
+            if state.observe(u32::from(*b)).is_err() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn city_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+        })
+    }
+
     #[test]
     fn response_format_grammar_forbids_whitespace_runs() {
         // With llguidance's default flexible whitespace, `{` may be followed by
         // an unbounded `[ \n\r\t]+` run, and greedy decode rides it until
-        // max_tokens — the observed failure was a reply of pure indentation.
-        // Compact JSON makes the next byte after `{` a quote.
+        // max_tokens — the observed failure was a reply of `{` and nothing else.
         let factory = shared_factory_placeholder();
-        let schema = json!({
-            "type": "object",
-            "properties": { "city": { "type": "string" } },
-            "required": ["city"],
-        });
-        let mut state = Gemma4GrammarState::new_json_schema(factory, &schema, GrammarMode::Eager)
-            .expect("build response_format grammar");
+        let mut state =
+            Gemma4GrammarState::new_json_schema(factory, &city_schema(), GrammarMode::Eager)
+                .expect("build response_format grammar");
         state.observe(u32::from(b'{')).expect("object opens");
         assert!(
             state.observe(u32::from(b'\n')).is_err(),
             "whitespace after `{{` must not be a legal continuation"
+        );
+    }
+
+    #[test]
+    fn response_format_grammar_keeps_the_separator_space() {
+        // The counterpart to the rule above: `"key": "value"` is what models
+        // write, and taking the space away pushes them off-distribution — the
+        // leftover `: ` ends up inside the string value. The space lives in the
+        // separator literal instead, so it is available but not paddable.
+        let factory = shared_factory_placeholder();
+        let mut state =
+            Gemma4GrammarState::new_json_schema(factory, &city_schema(), GrammarMode::Eager)
+                .expect("build response_format grammar");
+        assert_eq!(
+            feed(&mut state, br#"{"city": "Seoul"}"#),
+            None,
+            "the model's natural spacing must parse"
+        );
+    }
+
+    #[test]
+    fn response_format_grammar_rejects_a_padded_separator() {
+        let factory = shared_factory_placeholder();
+        let mut state =
+            Gemma4GrammarState::new_json_schema(factory, &city_schema(), GrammarMode::Eager)
+                .expect("build response_format grammar");
+        assert_eq!(
+            feed(&mut state, br#"{"city":  "Seoul"}"#),
+            Some(9),
+            "a second space is where the unbounded run would have started"
         );
     }
 
