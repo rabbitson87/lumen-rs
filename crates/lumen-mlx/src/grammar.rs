@@ -656,7 +656,7 @@ fn qwen35_lark_grammar_string(tools: &[Value]) -> Result<String> {
     let mut call_alts: Vec<String> = Vec::with_capacity(tools.len());
     let mut body_rules: Vec<(String, String)> = Vec::with_capacity(tools.len());
 
-    for t in tools {
+    for (i, t) in tools.iter().enumerate() {
         let function = t
             .get("function")
             .ok_or_else(|| anyhow!("tool entry missing `function` field: {t}"))?;
@@ -664,23 +664,20 @@ fn qwen35_lark_grammar_string(tools: &[Value]) -> Result<String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("tool function missing `name` string"))?;
-        if !is_safe_ident(name) {
-            return Err(anyhow!(
-                "tool name {name:?} contains non-identifier characters; \
-                 Qwen35 XML Lark generation refuses to escape"
-            ));
-        }
         let parameters = function.get("parameters").cloned().unwrap_or(json!({
             "type": "object",
             "properties": {},
         }));
-        let body_rule_name = format!("q_{name}_body");
+        // Indexed rule name — see `lark_grammar_string` for why the tool name
+        // itself may not be an identifier.
+        let body_rule_name = format!("q_{i}_body");
         let body_rule_rhs = qwen35_body_for_object_schema(&parameters)?;
         body_rules.push((body_rule_name.clone(), body_rule_rhs));
         // One alternative per tool so the `<function=NAME>` literal binds to
         // THAT tool's parameter set, not any tool's.
         call_alts.push(format!(
-            "(\"<function={name}>\\n\" {body_rule_name} \"</function>\\n\")"
+            "({} {body_rule_name} \"</function>\\n\")",
+            lark_literal(&format!("<function={name}>\n"))
         ));
     }
 
@@ -726,13 +723,12 @@ fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
     let mut rendered: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (key, _schema) in properties {
-        if !is_safe_ident(key) {
-            // Unsupported key shape — fall back to any well-formed blocks.
-            return Ok("(param_block)*".to_string());
-        }
         rendered.insert(
             key.clone(),
-            format!("(\"<parameter={key}>\\n\" param_value \"\\n</parameter>\\n\")"),
+            format!(
+                "({} param_value \"\\n</parameter>\\n\")",
+                lark_literal(&format!("<parameter={key}>\n"))
+            ),
         );
     }
     let required: std::collections::BTreeSet<String> = schema
@@ -777,7 +773,7 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
     let mut tool_body_rules: Vec<(String, String)> = Vec::with_capacity(tools.len());
     let mut extra_rules: Vec<String> = Vec::new();
 
-    for t in tools {
+    for (i, t) in tools.iter().enumerate() {
         let function = t
             .get("function")
             .ok_or_else(|| anyhow!("tool entry missing `function` field: {t}"))?;
@@ -785,17 +781,18 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("tool function missing `name` string"))?;
-        if !is_safe_ident(name) {
-            return Err(anyhow!(
-                "tool name {name:?} contains non-identifier characters; \
-                 Lark rule generation refuses to escape"
-            ));
-        }
         let parameters = function.get("parameters").cloned().unwrap_or(json!({
             "type": "object",
             "properties": {},
         }));
-        let body_rule_name = format!("tool_{}_body", name);
+        // Rule names are indexed, not derived from the tool name. A Lark rule
+        // name must be an identifier, but a tool name need not be one — and
+        // refusing those outright meant the grammar was dropped and the request
+        // fell back to free sampling, where the model invented a name no client
+        // had declared (`날씨_조회` came back as `weather_lookup`). The name
+        // itself only ever appears inside a quoted literal, where escaping is
+        // enough.
+        let body_rule_name = format!("tool_{i}_body");
         let body_rule_body = lark_body_for_object_schema(&parameters, &mut extra_rules, strict)?;
         tool_names.push(name.to_string());
         tool_body_rules.push((body_rule_name, body_rule_body));
@@ -803,7 +800,7 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
 
     let tool_name_alt = tool_names
         .iter()
-        .map(|n| format!("\"{n}\""))
+        .map(|n| lark_literal(n))
         .collect::<Vec<_>>()
         .join(" | ");
     let tool_body_alt = tool_body_rules
@@ -814,7 +811,7 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
     let tool_call_lhs = tool_names
         .iter()
         .zip(tool_body_rules.iter())
-        .map(|(n, (rule, _))| format!("(\"{n}\" \"{{\" {rule} \"}}\")"))
+        .map(|(n, (rule, _))| format!("({} \"{{\" {rule} \"}}\")", lark_literal(n)))
         .collect::<Vec<_>>()
         .join("\n          | ");
 
@@ -845,6 +842,30 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
     grammar.push_str("bool_val: \"true\" | \"false\"\n");
 
     Ok(grammar)
+}
+
+/// Render `s` as a Lark string literal, escaping what Lark's Python-style
+/// literal syntax cannot carry raw.
+///
+/// Names and keys come from the caller's tool schema and are not identifiers in
+/// general — `Playwright (Stealth)__browser_navigate`, `날씨_조회`, `도시`. They
+/// are safe *as literals* once escaped; what is not safe is using them as Lark
+/// rule names, which is why rule names are indexed instead.
+fn lark_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// True when the string is a safe `[a-zA-Z_][a-zA-Z0-9_]*` identifier —
@@ -899,14 +920,10 @@ fn lark_body_for_object_schema(
     let mut rendered: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (prop_name, prop_schema) in properties {
-        if !is_safe_ident(prop_name) {
-            // Unsupported key shape — fall back to permissive body.
-            return Ok("<[^125]>*".to_string());
-        }
         let value_rule = lark_value_for_schema(prop_schema, extra_rules, strict)?;
         rendered.insert(
             prop_name.clone(),
-            format!("(\"{prop_name}:\" {value_rule})"),
+            format!("({} {value_rule})", lark_literal(&format!("{prop_name}:"))),
         );
     }
     if !strict {
@@ -1539,16 +1556,42 @@ mod tests {
     }
 
     #[test]
-    fn lark_grammar_rejects_unsafe_tool_name() {
-        // Tool names like `foo.bar` or `foo-bar` would need Lark
-        // escaping; the builder refuses early instead of generating a
-        // grammar that won't parse.
+    fn lark_grammar_escapes_a_non_identifier_tool_name() {
+        // The builder used to refuse any name that was not a bare identifier,
+        // which dropped the grammar and let the model invent a name no client
+        // declared — `날씨_조회` came back as `weather_lookup`. Rule names are
+        // indexed now, so the tool name only has to survive as a literal.
+        for name in [
+            "foo-bar",
+            "Playwright (Stealth)__browser_navigate",
+            "날씨_조회",
+        ] {
+            let tools = vec![json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type":"object","properties":{} } }
+            })];
+            let s = lark_grammar_string(&tools, false)
+                .unwrap_or_else(|e| panic!("{name:?} must build: {e}"));
+            assert!(s.contains(name), "{name:?} must appear as a literal:\n{s}");
+            let factory = shared_factory_placeholder();
+            Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager)
+                .unwrap_or_else(|e| panic!("{name:?} must compile under llguidance: {e}"));
+        }
+    }
+
+    #[test]
+    fn lark_grammar_escapes_a_quote_in_a_tool_name() {
+        // A `"` in a name would close the Lark literal and produce a grammar
+        // that either fails to compile or matches the wrong bytes.
         let tools = vec![json!({
             "type": "function",
-            "function": { "name": "foo-bar", "parameters": { "type":"object","properties":{} } }
+            "function": { "name": "say\"hi", "parameters": { "type":"object","properties":{} } }
         })];
-        let r = build_tool_grammar_lark(&tools);
-        assert!(r.is_err(), "unsafe tool name must be rejected");
+        let s = lark_grammar_string(&tools, false).expect("quoted name must build");
+        assert!(s.contains("say\\\"hi"), "quote must be escaped:\n{s}");
+        let factory = shared_factory_placeholder();
+        Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager)
+            .expect("must compile under llguidance");
     }
 
     #[test]
@@ -1632,7 +1675,7 @@ mod tests {
         // exactly the required field with no `?` gate.
         let body_line = s
             .lines()
-            .find(|l| l.starts_with("tool_read_body:"))
+            .find(|l| l.starts_with("tool_0_body:"))
             .expect("read body rule present");
         assert!(
             body_line.contains("\"path:\" string_val"),
@@ -1655,7 +1698,7 @@ mod tests {
         // `(("summary:" string_val)) ("," (("summary:" string_val)))*`.
         let body_line = s
             .lines()
-            .find(|l| l.starts_with("tool_task_complete_body:"))
+            .find(|l| l.starts_with("tool_0_body:"))
             .expect("task_complete body present");
         assert!(
             body_line.contains("))*"),
@@ -1723,7 +1766,7 @@ mod tests {
         let s = qwen35_lark_grammar_string(&tools).unwrap();
         let body_line = s
             .lines()
-            .find(|l| l.starts_with("q_read_body:"))
+            .find(|l| l.starts_with("q_0_body:"))
             .expect("read body rule present");
         assert!(
             body_line.contains("<parameter=path>"),
@@ -1758,7 +1801,7 @@ mod tests {
         let s = qwen35_lark_grammar_string(&sample_tools()).unwrap();
         let body_line = s
             .lines()
-            .find(|l| l.starts_with("q_ask_to_user_body:"))
+            .find(|l| l.starts_with("q_1_body:"))
             .expect("ask_to_user body present");
         assert!(body_line.contains("<parameter=question>"));
         assert!(body_line.contains("<parameter=options>"));
@@ -1813,13 +1856,54 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_grammar_rejects_unsafe_tool_name() {
+    fn qwen35_grammar_escapes_a_non_identifier_tool_name() {
+        for name in ["foo-bar", "날씨_조회"] {
+            let tools = vec![json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "도시": { "type": "string" } },
+                        "required": ["도시"]
+                    }
+                }
+            })];
+            let s = qwen35_lark_grammar_string(&tools)
+                .unwrap_or_else(|e| panic!("{name:?} must build: {e}"));
+            assert!(s.contains(name), "{name:?} must appear as a literal:\n{s}");
+            assert!(
+                s.contains("<parameter=도시>"),
+                "a non-identifier key must be constrained, not dropped:\n{s}"
+            );
+            let factory = shared_factory_placeholder();
+            Gemma4GrammarState::new_qwen35_xml(factory, &tools, GrammarMode::Eager, None)
+                .unwrap_or_else(|e| panic!("{name:?} must compile under llguidance: {e}"));
+        }
+    }
+
+    #[test]
+    fn lark_grammar_constrains_a_non_identifier_property_key() {
+        // Gemma side: a non-identifier key used to collapse the whole body to
+        // the permissive `<[^125]>*` fallback, silently un-constraining every
+        // other field of that tool.
         let tools = vec![json!({
             "type": "function",
-            "function": { "name": "foo-bar", "parameters": { "type":"object","properties":{} } }
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "도시": { "type": "string" } },
+                    "required": ["도시"]
+                }
+            }
         })];
-        let r = build_qwen35_tool_grammar_lark(&tools);
-        assert!(r.is_err(), "unsafe tool name must be rejected");
+        let s = lark_grammar_string(&tools, true).expect("non-identifier key must build");
+        assert!(s.contains("도시:"), "key must be constrained:\n{s}");
+        assert!(
+            !s.contains("<[^125]>*"),
+            "must not fall back to the permissive body:\n{s}"
+        );
     }
 
     #[test]
@@ -1846,7 +1930,7 @@ mod tests {
         assert!(s.contains("limit:"));
         let body_line = s
             .lines()
-            .find(|l| l.starts_with("tool_search_body:"))
+            .find(|l| l.starts_with("tool_0_body:"))
             .expect("search body present");
         assert!(
             !body_line.contains("))*"),
