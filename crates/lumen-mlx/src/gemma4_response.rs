@@ -345,69 +345,66 @@ pub(crate) mod imp {
             rest = &after_open[close + STR_DELIM.len()..];
         }
 
-        // quote bare keys. A bare key follows '{' or ',' (after
-        // optional whitespace), consists of [\w-]+, and is terminated by ':'.
+        // Quote bare keys. A bare key follows '{' or ',' (after optional
+        // whitespace) and is terminated by ':'.
+        //
+        // Both this pass and the substitution below walk `&str` rather than
+        // bytes. They used to index bytes and rebuild with `b as char`, which
+        // is a Latin-1 reinterpretation: every byte of a multi-byte character
+        // became its own `char` and was re-encoded, so `{도시:…}` came out as
+        // `{Ã«Â\u{8f}Â\u{84}…}` and the JSON parse failed. Only text that had
+        // already been lifted into `strings` survived, which is why a non-ASCII
+        // *value* inside `<|"|>` worked while a non-ASCII *key* did not.
+        //
+        // Identifier characters are Unicode-alphanumeric for the same reason
+        // the name scanner in `parse_tool_call_body` is permissive: the model
+        // emits whatever key the tool schema declared, and a schema is free to
+        // declare `도시`. An ASCII-only class would leave such a key unquoted
+        // and produce invalid JSON even with the encoding fixed.
         let mut quoted = String::with_capacity(buf.len() + 16);
-        let bytes = buf.as_bytes();
-        let mut idx = 0usize;
-        while idx < bytes.len() {
-            let c = bytes[idx];
-            quoted.push(c as char);
-            if c == b'{' || c == b',' {
-                // Skip whitespace.
-                let mut j = idx + 1;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    quoted.push(bytes[j] as char);
-                    j += 1;
-                }
-                // Identifier?
-                let id_start = j;
-                while j < bytes.len() {
-                    let b = bytes[j];
-                    if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if j > id_start && j < bytes.len() && bytes[j] == b':' {
-                    let ident = &buf[id_start..j];
-                    quoted.push('"');
-                    quoted.push_str(ident);
-                    quoted.push('"');
-                    idx = j;
-                    continue;
-                }
+        let mut rest = buf.as_str();
+        loop {
+            let Some(pos) = rest.find(['{', ',']) else {
+                quoted.push_str(rest);
+                break;
+            };
+            quoted.push_str(&rest[..=pos]); // '{' and ',' are ASCII: safe slice
+            let after = &rest[pos + 1..];
+            let ws_end = after
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(after.len());
+            quoted.push_str(&after[..ws_end]);
+            let ident_area = &after[ws_end..];
+            let id_end = ident_area
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(ident_area.len());
+            if id_end > 0 && ident_area[id_end..].starts_with(':') {
+                quoted.push('"');
+                quoted.push_str(&ident_area[..id_end]);
+                quoted.push('"');
+                rest = &ident_area[id_end..]; // resumes on the ':'
+            } else {
+                rest = ident_area;
             }
-            idx += 1;
         }
 
-        // substitute placeholders with JSON-escaped strings.
+        // Substitute placeholders with JSON-escaped strings. The markers are
+        // NUL, which is single-byte, so every slice below lands on a character
+        // boundary and the text between them passes through untouched.
         let mut final_str = String::with_capacity(quoted.len() + 32);
-        let bytes = quoted.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == 0 {
-                // \x00 N \x00 placeholder
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != 0 {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    return Err(anyhow!("placeholder NUL mismatch"));
-                }
-                let n: usize = std::str::from_utf8(&bytes[i + 1..j])
-                    .context("placeholder utf8")?
-                    .parse()
-                    .context("placeholder index")?;
-                let s = strings.get(n).ok_or_else(|| anyhow!("placeholder oob"))?;
-                final_str.push_str(&serde_json::to_string(s).context("escape string")?);
-                i = j + 1;
-            } else {
-                final_str.push(bytes[i] as char);
-                i += 1;
-            }
+        let mut rest = quoted.as_str();
+        while let Some(open) = rest.find('\0') {
+            final_str.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('\0') else {
+                return Err(anyhow!("placeholder NUL mismatch"));
+            };
+            let n: usize = after[..close].parse().context("placeholder index")?;
+            let s = strings.get(n).ok_or_else(|| anyhow!("placeholder oob"))?;
+            final_str.push_str(&serde_json::to_string(s).context("escape string")?);
+            rest = &after[close + 1..];
         }
+        final_str.push_str(rest);
 
         serde_json::from_str(&final_str)
             .with_context(|| format!("tool-call args JSON parse: {final_str:?}"))
@@ -593,13 +590,55 @@ pub(crate) mod imp {
 
         #[test]
         fn body_parser_keeps_a_non_ascii_name_that_is_well_formed() {
-            // Argument *keys* are ASCII here on purpose: `gemma4_args_to_json`
-            // quotes bare keys byte-wise and mangles multi-byte ones, which is
-            // a separate pre-existing limitation. This pins the name handling.
             let calls = parse_tool_call_body(r#"call:날씨_조회{city:<|"|>서울<|"|>}"#)
                 .expect("non-ASCII names still round-trip");
             assert_eq!(calls[0].name, "날씨_조회");
             assert_eq!(calls[0].arguments["city"], "서울");
+        }
+
+        #[test]
+        fn args_to_json_quotes_a_non_ascii_bare_key() {
+            // A tool schema may declare any key it likes. The quoter used to
+            // rebuild the body with `byte as char`, turning `도시` into
+            // Latin-1 mojibake and failing the JSON parse; an ASCII-only
+            // identifier class would also have left the key unquoted.
+            let v = gemma4_args_to_json(r#"{도시:<|"|>서울<|"|>,count:2}"#)
+                .expect("non-ASCII bare key");
+            assert_eq!(v["도시"], "서울");
+            assert_eq!(v["count"], 2);
+        }
+
+        #[test]
+        fn args_to_json_preserves_non_ascii_outside_string_literals() {
+            // Bare (unwrapped) non-ASCII values never entered the placeholder
+            // table, so they went through the byte→char rebuild unprotected.
+            // `null`-style bare tokens are the realistic case; this pins that
+            // nothing outside `<|"|>` gets re-encoded.
+            let v = gemma4_args_to_json(r#"{"도시":"서울","n":null}"#)
+                .expect("already-quoted non-ASCII passes through");
+            assert_eq!(v["도시"], "서울");
+            assert!(v["n"].is_null());
+        }
+
+        #[test]
+        fn args_to_json_handles_non_ascii_in_nested_and_array_positions() {
+            let v = gemma4_args_to_json(
+                r#"{요청:{도시:<|"|>서울<|"|>,태그:[<|"|>맑음<|"|>,<|"|>바람<|"|>]}}"#,
+            )
+            .expect("nested non-ASCII keys");
+            assert_eq!(v["요청"]["도시"], "서울");
+            assert_eq!(v["요청"]["태그"][1], "바람");
+        }
+
+        #[test]
+        fn args_to_json_leaves_array_elements_unquoted() {
+            // The quoter only fires on `{`/`,` followed by ident + ':'. An
+            // array element after a comma is ident-shaped but has no colon, so
+            // it must pass through — a regression here would corrupt every
+            // list argument.
+            let v = gemma4_args_to_json(r#"{flags:[true,false],ns:[1,2]}"#).expect("arrays");
+            assert_eq!(v["flags"][0], true);
+            assert_eq!(v["ns"][1], 2);
         }
 
         #[test]
