@@ -110,6 +110,29 @@ pub(crate) mod imp {
         /// produces the assistant's reply. Set to false for loss-style
         /// parity tests where we want to score an existing assistant turn.
         pub add_generation_prompt: bool,
+        /// Force the empty `<|channel>thought\n<channel|>` prefill even when
+        /// [`empty_thought_on_nothink`] is off.
+        ///
+        /// Set for requests whose output is constrained by a grammar from the
+        /// first token — `response_format`. Gemma 4 opens *every* reply with
+        /// its thought channel, so an eager JSON grammar masks `<|channel>`
+        /// (id 100) at step 0: measured on the 26B-A4B checkpoint, exactly 3
+        /// of 262144 tokens survive the mask there, and the opener is not one
+        /// of them. The model is off its own distribution from the first token
+        /// and long free-form string values degenerate into repetition that
+        /// runs to `max_tokens`.
+        ///
+        /// Closing the channel in the prompt puts it back on-distribution —
+        /// the same thing Qwen 3.6's template does natively with
+        /// `<think>\n\n</think>`, which is why Qwen never showed this. A/B on
+        /// the same caption prompt: 5/5 clean sentences with the prefill,
+        /// versus repetition in most runs without it.
+        ///
+        /// Deliberately narrow. The global default stays off because it
+        /// regresses ordinary chat and tool calling (see
+        /// [`empty_thought_on_nothink`]); this only covers the case that
+        /// cannot work without it.
+        pub close_thought_channel: bool,
     }
 
     impl Default for RenderOptions {
@@ -117,6 +140,7 @@ pub(crate) mod imp {
             Self {
                 enable_thinking: false,
                 add_generation_prompt: true,
+                close_thought_channel: false,
             }
         }
     }
@@ -372,7 +396,9 @@ pub(crate) mod imp {
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking && empty_thought_on_nothink() {
+                if !opts.enable_thinking
+                    && (opts.close_thought_channel || empty_thought_on_nothink())
+                {
                     // Pre-fill empty thought channel so the model jumps
                     // straight to the visible answer. OFF by default to match
                     // Ollama's native gemma4 renderer (emptyBlockOnNothink=false);
@@ -611,7 +637,9 @@ pub(crate) mod imp {
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking && empty_thought_on_nothink() {
+                if !opts.enable_thinking
+                    && (opts.close_thought_channel || empty_thought_on_nothink())
+                {
                     // Match Ollama's native gemma4 renderer: no empty thought
                     // block on nothink (see `empty_thought_on_nothink`).
                     out.push(TOK_CHANNEL_OPEN);
@@ -713,9 +741,24 @@ pub(crate) mod imp {
             "/path/to/models/gemma-4-26b-a4b-mlx-4bit/tokenizer.json";
 
         fn load_template_if_present() -> Option<Gemma4ChatTemplate> {
+            // `LUMEN_GEMMA4_MODEL_DIR` is what the rest of the suite uses to
+            // find a checkpoint; honour it first so these tests actually run
+            // on a machine that has one, and keep the hardcoded path as a
+            // fallback for the setup it was originally written against.
+            if let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") {
+                let p = Path::new(&dir).join("tokenizer.json");
+                if p.exists() {
+                    return Some(Gemma4ChatTemplate::from_file(&p).expect("load tokenizer"));
+                }
+                eprintln!("skip: no tokenizer.json under LUMEN_GEMMA4_MODEL_DIR={dir}");
+                return None;
+            }
             let p = Path::new(LMSTUDIO_TOKENIZER_PATH);
             if !p.exists() {
-                eprintln!("skip: tokenizer not present at {LMSTUDIO_TOKENIZER_PATH}");
+                eprintln!(
+                    "skip: set LUMEN_GEMMA4_MODEL_DIR, or place a tokenizer at \
+                     {LMSTUDIO_TOKENIZER_PATH}"
+                );
                 return None;
             }
             Some(Gemma4ChatTemplate::from_file(p).expect("load tokenizer"))
@@ -955,6 +998,53 @@ pub(crate) mod imp {
 
         #[test]
         #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
+        fn close_thought_channel_prefills_the_empty_block() {
+            // Gemma 4 opens every reply with `<|channel>thought`. A grammar
+            // that constrains from token 0 masks that opener, so the model
+            // starts off its own distribution. Closing the channel in the
+            // prompt is what puts it back — this pins that the flag actually
+            // emits the block, independent of the global env default.
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
+            let msgs = [ChatMessage {
+                role: ChatRole::User,
+                content: "Hello",
+            }];
+            let plain = tpl
+                .render_to_ids(&msgs, &RenderOptions::default())
+                .expect("render");
+            assert!(
+                !plain.contains(&TOK_CHANNEL_OPEN),
+                "default must stay off — it regresses ordinary chat"
+            );
+            let closed = tpl
+                .render_to_ids(
+                    &msgs,
+                    &RenderOptions {
+                        close_thought_channel: true,
+                        ..RenderOptions::default()
+                    },
+                )
+                .expect("render");
+            let open_at = closed
+                .iter()
+                .position(|&t| t == TOK_CHANNEL_OPEN)
+                .expect("<|channel> present");
+            let close_at = closed
+                .iter()
+                .position(|&t| t == TOK_CHANNEL_CLOSE)
+                .expect("<channel|> present");
+            assert!(open_at < close_at, "the block must be opened then closed");
+            assert_eq!(
+                close_at,
+                closed.len() - 1,
+                "the closed channel must be the last thing before generation"
+            );
+        }
+
+        #[test]
+        #[ignore = "requires tokenizer.json from lmstudio shards (~5 MB)"]
         fn renders_system_and_user_with_thinking_enabled() {
             let Some(tpl) = load_template_if_present() else {
                 return;
@@ -974,6 +1064,7 @@ pub(crate) mod imp {
                     &msgs,
                     &RenderOptions {
                         enable_thinking: true,
+                        close_thought_channel: false,
                         add_generation_prompt: true,
                     },
                 )
@@ -1012,6 +1103,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: false,
                         add_generation_prompt: false,
+                        close_thought_channel: false,
                     },
                 )
                 .expect("render");
@@ -1062,8 +1154,21 @@ pub(crate) mod imp {
                 role: ChatRole::User,
                 content: "Hello",
             }];
+            // Rendered with `close_thought_channel`, because the golden ends
+            // `100, 45518, 107, 101` — `<|channel> thought \n <channel|>`. The
+            // jinja template emits that block when thinking is off; lumen's
+            // *default* deliberately does not (see `empty_thought_on_nothink`
+            // for the A/B that justifies the deviation). So this vector pins
+            // template fidelity, not the default, and the assertion below
+            // pins the deviation itself.
             let ids = tpl
-                .render_to_ids(&msgs, &RenderOptions::default())
+                .render_to_ids(
+                    &msgs,
+                    &RenderOptions {
+                        close_thought_channel: true,
+                        ..RenderOptions::default()
+                    },
+                )
                 .expect("render");
             // HuggingFace golden:
             //   apply_chat_template([user='Hello'], add_generation_prompt=True,
@@ -1072,6 +1177,15 @@ pub(crate) mod imp {
                 2, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
             ];
             assert_eq!(ids, golden, "user-only no-think parity");
+
+            let default_ids = tpl
+                .render_to_ids(&msgs, &RenderOptions::default())
+                .expect("render");
+            assert_eq!(
+                default_ids,
+                golden[..golden.len() - 4],
+                "the default drops exactly the empty thought block and nothing else"
+            );
         }
 
         #[test]
@@ -1095,6 +1209,7 @@ pub(crate) mod imp {
                     &msgs,
                     &RenderOptions {
                         enable_thinking: true,
+                        close_thought_channel: false,
                         add_generation_prompt: true,
                     },
                 )
@@ -1128,6 +1243,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: false,
                         add_generation_prompt: false,
+                        close_thought_channel: false,
                     },
                 )
                 .expect("render");

@@ -1284,7 +1284,7 @@ pub(crate) mod imp {
             messages: &[(String, String)],
             thinking: bool,
         ) -> Result<Vec<u32>> {
-            self.build_chat_input_with_tools(messages, thinking, &[])
+            self.build_chat_input_with_tools(messages, thinking, &[], false)
         }
 
         /// Prompt tokens one attached image adds — its soft-token run plus the
@@ -1310,9 +1310,15 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
             image_counts: &[Vec<usize>],
+            close_thought_channel: bool,
         ) -> Result<Vec<u32>> {
             if image_counts.iter().all(|c| c.is_empty()) {
-                return self.build_chat_input_from_history(turns, thinking, tools);
+                return self.build_chat_input_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    close_thought_channel,
+                );
             }
             if self.jinja_chat.is_some() {
                 return Err(anyhow!(
@@ -1325,6 +1331,7 @@ pub(crate) mod imp {
                 &RenderOptions {
                     enable_thinking: thinking,
                     add_generation_prompt: true,
+                    close_thought_channel,
                 },
                 tools,
                 image_counts,
@@ -1338,6 +1345,7 @@ pub(crate) mod imp {
             turns: &[crate::chat_io::ChatTurn<'_>],
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
+            close_thought_channel: bool,
         ) -> Result<Vec<u32>> {
             let ids = if let Some(j) = &self.jinja_chat {
                 j.render_to_ids(
@@ -1354,6 +1362,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: true,
+                        close_thought_channel,
                     },
                     tools,
                 )?
@@ -1383,6 +1392,9 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: false,
+                        // No generation prompt is emitted, so the thought
+                        // channel has nowhere to be prefilled.
+                        close_thought_channel: false,
                     },
                     tools,
                 )?
@@ -1400,6 +1412,7 @@ pub(crate) mod imp {
             messages: &[(String, String)],
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            close_thought_channel: bool,
         ) -> Result<Vec<u32>> {
             let ids = if let Some(j) = &self.jinja_chat {
                 let turns = pairs_to_turns(messages)?;
@@ -1418,6 +1431,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: true,
+                        close_thought_channel,
                     },
                     tools,
                 )?
@@ -1457,6 +1471,9 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: false,
+                        // No generation prompt is emitted, so the thought
+                        // channel has nowhere to be prefilled.
+                        close_thought_channel: false,
                     },
                     tools,
                 )
@@ -1567,6 +1584,7 @@ pub(crate) mod imp {
                 thinking,
                 tools,
                 tool_choice,
+                false,
             )?;
             let cfg = GenerateConfig {
                 max_new_tokens,
@@ -1630,6 +1648,7 @@ pub(crate) mod imp {
         /// the placeholder runs the renderer just emitted, which is the pairing
         /// `encode_images_for_prompt` relies on. They are carried rather than
         /// re-derived so each image is decoded and resized exactly once.
+        #[allow(clippy::too_many_arguments)]
         fn build_image_prompt(
             &self,
             messages: &[(String, String)],
@@ -1637,6 +1656,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>, Vec<crate::gemma4_vision::PreparedImage>)> {
             let mut counts: Vec<Vec<usize>> = Vec::with_capacity(images.len());
             let mut flat: Vec<crate::gemma4_vision::PreparedImage> = Vec::new();
@@ -1655,6 +1675,7 @@ pub(crate) mod imp {
                 thinking,
                 tools,
                 tool_choice,
+                close_thought_channel,
             )?;
             Ok((prompt, prefill_tokens, flat))
         }
@@ -1677,7 +1698,7 @@ pub(crate) mod imp {
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens, flat) =
-                self.build_image_prompt(messages, images, thinking, tools, tool_choice)?;
+                self.build_image_prompt(messages, images, thinking, tools, tool_choice, false)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -1725,12 +1746,21 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
-            self.build_prompt_and_prefill_with_images(messages, &[], thinking, tools, tool_choice)
+            self.build_prompt_and_prefill_with_images(
+                messages,
+                &[],
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
         }
 
         /// [`Self::build_prompt_and_prefill`] with per-message image
         /// soft-token counts. Empty `image_counts` is byte-identical.
+        #[allow(clippy::too_many_arguments)]
         fn build_prompt_and_prefill_with_images(
             &self,
             messages: &[(String, String)],
@@ -1738,6 +1768,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::gemma4_tools::imp::ToolDef<'_>] = match tool_choice {
@@ -1749,7 +1780,12 @@ pub(crate) mod imp {
             let mut prompt = if !has_images {
                 // No images → keep the untouched path, including the
                 // model-supplied jinja template when one is present.
-                self.build_chat_input_with_tools(messages, thinking, effective_tools)?
+                self.build_chat_input_with_tools(
+                    messages,
+                    thinking,
+                    effective_tools,
+                    close_thought_channel,
+                )?
             } else {
                 if self.jinja_chat.is_some() {
                     // The jinja renderer emits a single `<|image|>`; expanding it
@@ -1766,6 +1802,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: true,
+                        close_thought_channel,
                     },
                     effective_tools,
                     image_counts,
@@ -1785,6 +1822,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
             self.build_prompt_and_prefill_from_history_with_images(
                 turns,
@@ -1792,11 +1830,13 @@ pub(crate) mod imp {
                 thinking,
                 tools,
                 tool_choice,
+                close_thought_channel,
             )
         }
 
         /// [`Self::build_prompt_and_prefill_from_history`] with per-turn image
         /// soft-token counts. Empty counts are byte-identical.
+        #[allow(clippy::too_many_arguments)]
         fn build_prompt_and_prefill_from_history_with_images(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1804,6 +1844,7 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
@@ -1815,6 +1856,7 @@ pub(crate) mod imp {
                 thinking,
                 effective_tools,
                 image_counts,
+                close_thought_channel,
             )?;
             let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
             prompt.extend(prefill.iter().copied());
@@ -2016,7 +2058,7 @@ pub(crate) mod imp {
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
             }
@@ -2324,7 +2366,7 @@ pub(crate) mod imp {
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
             }
@@ -2420,8 +2462,13 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                false,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!(
                     "chat_streaming_from_history_with_prefix_cache: empty prompt"
@@ -2495,8 +2542,13 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                false,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_from_history_with_prefix_cache: empty prompt"));
             }
@@ -2582,8 +2634,13 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema.is_some(),
+            )?;
             let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
             self.decode_streaming_with_prompt(
                 prompt,
@@ -2643,8 +2700,14 @@ pub(crate) mod imp {
                 );
             }
 
-            let (prompt, prefill_tokens, flat) =
-                self.build_image_prompt(messages, images, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens, flat) = self.build_image_prompt(
+                messages,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema.is_some(),
+            )?;
             // Encode before the prefill loop starts: the runs are prompt-global
             // and every chunk needs to be able to look up any of them.
             let vision = self
@@ -2725,6 +2788,7 @@ pub(crate) mod imp {
                 thinking,
                 tools,
                 tool_choice,
+                response_schema.is_some(),
             )?;
             let vision = if prepared.is_empty() {
                 None
