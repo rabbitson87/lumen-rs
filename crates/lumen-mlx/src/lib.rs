@@ -988,6 +988,25 @@ fn effective_qwen35_mtp_k() -> Option<usize> {
     }
 }
 
+/// Should prefill stop one token short so the first *generated* token can be
+/// masked?
+///
+/// Prefill argmaxes its final position with no grammar mask, so with an active
+/// grammar the first generated token is the one token the matcher never
+/// constrains. Holding the last prompt token back and feeding it through the
+/// masked decode step fixes that — but only when a grammar is actually active,
+/// so the unconstrained path stays byte-identical, and only when the held-back
+/// token is not an image placeholder, which would tear a placeholder run out of
+/// the span the images are spliced over.
+#[cfg(feature = "mlx-native")]
+fn hold_back_last_prompt_token(
+    grammar_active: bool,
+    prompt_ids: &[u32],
+    image_token: Option<u32>,
+) -> bool {
+    grammar_active && prompt_ids.len() > 1 && image_token != prompt_ids.last().copied()
+}
+
 /// Would a Gemma 4 request get a grammar if it went through the streaming
 /// decode?
 ///
@@ -4827,9 +4846,11 @@ impl MlxQwen35Backend {
         // guard makes that explicit rather than relying on it.
         let mut grammar = grammar;
         #[cfg(feature = "mlx-native")]
-        let hold_back_last = grammar.as_ref().is_some_and(|g| g.is_active())
-            && prompt_ids.len() > 1
-            && self.runner.image_token_id() != prompt_ids.last().copied();
+        let hold_back_last = hold_back_last_prompt_token(
+            grammar.as_ref().is_some_and(|g| g.is_active()),
+            &prompt_ids,
+            self.runner.image_token_id(),
+        );
         #[cfg(not(feature = "mlx-native"))]
         let hold_back_last = false;
         let prefill_ids = if hold_back_last {
@@ -6199,6 +6220,112 @@ pub(crate) struct LoadInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // Smoke test
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression guards for the grammar-routing defects.
+///
+/// Each test names the behaviour it restores and the symptom that behaviour
+/// had before. `tools/red_green.py` re-derives the red state mechanically by
+/// reverting the fix and asserting these fail — a claim that "this was broken"
+/// is only worth as much as a way to reproduce it.
+#[cfg(all(test, feature = "mlx-native"))]
+mod grammar_routing_regressions {
+    use super::{gemma4_grammar_would_constrain, hold_back_last_prompt_token};
+    use crate::chat_io::{ResolvedToolChoice, ToolDef};
+
+    fn one_tool() -> Vec<ToolDef<'static>> {
+        vec![ToolDef {
+            name: "get_weather",
+            description: None,
+            parameters: None,
+            response: None,
+        }]
+    }
+
+    // ── Gemma 4 non-streaming ran with no grammar at all ──────────────────
+    // RED: a non-streaming `tool_choice=required` returned `迎get_weather`.
+    // Only `response_format` was re-routed to the streaming decode, so tool
+    // requests kept the batched `generate()` path, which applies no mask.
+
+    #[test]
+    fn tools_alone_must_route_through_the_grammar_aware_decode() {
+        assert!(
+            gemma4_grammar_would_constrain(None, &one_tool(), &ResolvedToolChoice::Auto),
+            "a tool request gets a grammar, so it cannot use the unmasked batched path"
+        );
+        assert!(gemma4_grammar_would_constrain(
+            None,
+            &one_tool(),
+            &ResolvedToolChoice::Required
+        ));
+    }
+
+    #[test]
+    fn requests_that_get_no_grammar_keep_the_fast_path() {
+        // The re-route costs a cold prefill, so it must not fire for requests
+        // that would not be constrained anyway.
+        assert!(
+            !gemma4_grammar_would_constrain(None, &[], &ResolvedToolChoice::Auto),
+            "no tools, no schema"
+        );
+        assert!(
+            !gemma4_grammar_would_constrain(None, &one_tool(), &ResolvedToolChoice::None),
+            "tool_choice=none builds no grammar"
+        );
+    }
+
+    #[test]
+    fn a_schema_routes_even_without_tools() {
+        let schema = serde_json::json!({ "type": "object" });
+        assert!(gemma4_grammar_would_constrain(
+            Some(&schema),
+            &[],
+            &ResolvedToolChoice::Auto
+        ));
+    }
+
+    // ── Qwen 3.6: the first generated token escaped the mask ──────────────
+    // RED: `tool_choice=required` never enforced anything. Prefill argmaxed
+    // its last position unmasked, and the caller responded to the resulting
+    // mismatch by dropping the grammar.
+
+    #[test]
+    fn an_active_grammar_holds_the_last_prompt_token_back() {
+        assert!(
+            hold_back_last_prompt_token(true, &[1, 2, 3], None),
+            "the first generated token must be produced under the mask"
+        );
+    }
+
+    #[test]
+    fn no_grammar_means_the_prefill_is_untouched() {
+        assert!(
+            !hold_back_last_prompt_token(false, &[1, 2, 3], None),
+            "the unconstrained path must stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_image_placeholder_is_never_held_back() {
+        // Splitting a placeholder off the prompt tail would tear a run out of
+        // the span the images are spliced over.
+        assert!(
+            !hold_back_last_prompt_token(true, &[1, 2, 77], Some(77)),
+            "the tail is an image placeholder"
+        );
+        assert!(
+            hold_back_last_prompt_token(true, &[77, 2, 3], Some(77)),
+            "a placeholder elsewhere in the prompt is fine"
+        );
+    }
+
+    #[test]
+    fn a_single_token_prompt_is_left_alone() {
+        assert!(
+            !hold_back_last_prompt_token(true, &[1], None),
+            "there is nothing to prefill if the only token is held back"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
