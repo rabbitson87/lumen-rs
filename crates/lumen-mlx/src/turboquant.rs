@@ -145,6 +145,7 @@
 //! At ~50 μs each, ~20 ms decode overhead on top of compute.
 //!
 //! ── Next levers (decreasing ROI) ──
+//! ```text
 //!
 //!   (1) **Fuse encode** — LANDED, NEUTRAL-positive. `lumen_tq_encode_fused`
 //!       Metal kernel collapses (cast → square → sum → divide → sqrt →
@@ -156,7 +157,7 @@
 //!       Predicted: ~12.5 ms decode savings (8 dispatches × ~50 µs × 25
 //!       layers × 2 K+V).
 //!       Actual (8K, bits=6, STEPS=64, 2 trials):
-//!           fused    39.2 ± 0.1 tok/s  (25.50 ms/step)
+//!           fused     39.2 ± 0.1 tok/s  (25.50 ms/step)
 //!           non-fused 38.4 ± 0.1 tok/s  (26.05 ms/step)
 //!           Δ = +2.1% decode (~0.55 ms saved); prefill +1.2%
 //!
@@ -192,6 +193,7 @@
 //!       register tiles would (a) avoid materializing the dequant
 //!       buffers and (b) recover the (L−W)/L block skip win for the
 //!       quant cache path. **Now top ROI item.**
+//! ```
 //!
 //! Updated combined impact estimate after (1) LANDED: NEUTRAL gain from
 //! kernel fusion alone (Tier-2C). To reach parity with the OFF path, (5)

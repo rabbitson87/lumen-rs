@@ -64,7 +64,9 @@ mod imp {
 
     /// Qwen3.5-MoE delta-net SSM gating activation:
     ///
-    ///     g = exp(-exp(A_log.astype(f32)) * softplus(a + dt_bias))
+    /// ```text
+    /// g = exp(-exp(A_log.astype(f32)) * softplus(a + dt_bias))
+    /// ```
     ///
     /// Shapes: `A_log: [Hv]`, `a: [B, S, Hv]`, `dt_bias: [Hv]`,
     /// returns `[B, S, Hv]` f32 (broadcasting over the head axis).
@@ -450,9 +452,11 @@ mod imp {
 
     /// `Qwen3NextRMSNormGated.__call__` (gate path):
     ///
-    ///     x   = mx.fast.rms_norm(hidden_states, weight, eps)
-    ///     out = silu(gate.astype(f32)) * x.astype(f32)
-    ///     out = out.astype(hidden_states.dtype)
+    /// ```text
+    /// x   = mx.fast.rms_norm(hidden_states, weight, eps)
+    /// out = silu(gate.astype(f32)) * x.astype(f32)
+    /// out = out.astype(hidden_states.dtype)
+    /// ```
     ///
     /// All three input shapes match: `hidden_states`, `gate`, both
     /// `[..., hidden]`. `weight` is `[hidden]`.
