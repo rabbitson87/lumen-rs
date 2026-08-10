@@ -816,8 +816,10 @@ impl SharedExpert {
         }
 
         // Encode through Candle's shared encoder so this CB is ordered with
-        // any pending Tensor allocations / zero-fills (no `synchronize`
-        // needed in production — Candle's hazard tracking handles it).
+        // any pending Tensor allocations / zero-fills. Candle's hazard
+        // tracking does NOT cover this: it keys off `set_input_buffer` /
+        // `set_output_buffer`, and buffers bound inside an ICB never reach
+        // it, so the surrounding barriers below have to be explicit.
         let encoder = metal_dev
             .command_encoder()
             .map_err(|e| candle_core::Error::Msg(format!("mlp_icb encoder: {e}")))?;
@@ -846,9 +848,13 @@ impl SharedExpert {
             usage,
         );
         // Three serialized executes — each call is a barrier (17.D-1e finding).
+        // Those order the ICB slots against *each other*; the barriers on the
+        // outside order the whole chain against the rest of the encoder.
+        encoder.insert_memory_barrier();
         encoder.execute_commands_in_buffer_range(&cache.icb, 0, 1);
         encoder.execute_commands_in_buffer_range(&cache.icb, 1, 1);
         encoder.execute_commands_in_buffer_range(&cache.icb, 2, 1);
+        encoder.insert_memory_barrier();
         drop(encoder);
         drop(cache_guard);
 

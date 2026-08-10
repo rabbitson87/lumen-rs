@@ -107,17 +107,22 @@ fn forward_bf16_in_bf16_out_icb_matches_standard() {
     unsafe {
         std::env::set_var("LUMEN_ICB", "1");
     }
+    // Read the reference back ONCE, before the loop. Reading it *between* the
+    // ICB dispatch and the ICB readback would drain the queue and paper over a
+    // missing barrier — the ICB output has to be the first thing touched after
+    // the dispatch for this test to mean anything.
+    let ref_cpu = y_ref
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
     let mut diffs_total = 0usize;
     let mut compared = 0usize;
     for i in 0..ITERS {
         let y_icb = linear.forward_bf16_in_bf16_out_icb(&x).unwrap();
-        let ref_cpu = y_ref
-            .flatten_all()
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
         let icb_cpu = y_icb
             .flatten_all()
             .unwrap()
@@ -446,18 +451,20 @@ fn forward_with_residual_bf16_in_bf16_out_icb_matches_standard() {
     unsafe {
         std::env::set_var("LUMEN_ICB", "1");
     }
+    // Same ordering requirement as the no-residual test above.
+    let ref_cpu = y_ref
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
     let mut diffs_total = 0usize;
     let mut compared = 0usize;
     for i in 0..ITERS {
         let y_icb = linear
             .forward_with_residual_bf16_in_bf16_out_icb(&x, &residual)
-            .unwrap();
-        let ref_cpu = y_ref
-            .flatten_all()
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .to_vec1::<f32>()
             .unwrap();
         let icb_cpu = y_icb
             .flatten_all()

@@ -122,6 +122,17 @@ pub trait BatchedEncoderExt {
         start: usize,
         length: usize,
     );
+    /// `memoryBarrierWithScope(.buffers)` on the underlying encoder.
+    ///
+    /// Candle opens its compute encoders with `MTLDispatchType::Concurrent`
+    /// and tracks RAW/WAW hazards through `set_input_buffer` /
+    /// `set_output_buffer`. Buffers bound *inside* an ICB never pass through
+    /// that tracker, so an ICB dispatch is unordered against every other
+    /// command in the same encoder — including the `Tensor::zeros` fill that
+    /// produced its output and the cast that reads it back. Call this on both
+    /// sides of `execute_commands_in_buffer*` to restore the ordering the
+    /// tracker would otherwise have supplied.
+    fn insert_memory_barrier(&self);
     /// Generic `set_bytes` — typed wrapper that uploads a single struct by
     /// reference. Matches cmk's inherent `set_bytes<T>` shape, so call sites
     /// can write `enc.set_bytes(idx, &val)` regardless of whether `enc` is a
@@ -168,6 +179,10 @@ impl<T: AsRef<ComputeCommandEncoder>> BatchedEncoderExt for T {
     ) {
         self.as_ref()
             .execute_commands_in_buffer_range(icb, start, length);
+    }
+    #[inline]
+    fn insert_memory_barrier(&self) {
+        self.as_ref().insert_memory_barrier();
     }
     #[inline]
     fn set_bytes<U>(&self, index: usize, data: &U) {

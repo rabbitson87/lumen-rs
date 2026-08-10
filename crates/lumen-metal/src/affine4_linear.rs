@@ -1209,7 +1209,13 @@ impl Affine4Linear {
             &[wp, ws, wb, x_buf, y_buf, &cache.dims_buf, &cache.batch_buf],
             usage,
         );
+        // Order the ICB dispatch against the rest of this concurrent encoder:
+        // before, so `x`'s producer and `y`'s zero-fill have landed; after, so
+        // the consumer that reads `y` back sees the finished result. Candle's
+        // hazard tracker cannot see ICB-bound buffers, so it emits neither.
+        encoder.insert_memory_barrier();
         encoder.execute_commands_in_buffer(&cache.icb_no_residual, 1);
+        encoder.insert_memory_barrier();
         drop(encoder);
         drop(cache_guard);
 
@@ -1348,7 +1354,11 @@ impl Affine4Linear {
             ],
             usage,
         );
+        // See the no-residual variant: ICB-bound buffers bypass candle's
+        // hazard tracker, so the ordering has to be stated explicitly.
+        encoder.insert_memory_barrier();
         encoder.execute_commands_in_buffer(&cache.icb_residual, 1);
+        encoder.insert_memory_barrier();
         drop(encoder);
         drop(cache_guard);
 
