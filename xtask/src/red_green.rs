@@ -17,6 +17,10 @@ use std::process::{Command, ExitCode};
 const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
+const MTL: &str = "crates/lumen-metal/src";
+/// One defect below lived in the guard itself: it drained the wrong queue and
+/// so reported a kernel broken that was exactly right.
+const MTLT: &str = "crates/lumen-metal/tests";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -31,6 +35,14 @@ struct Guard {
     package: &'static str,
     /// Full test path, matched with `--exact`.
     filter: &'static str,
+    /// `--features` value; empty selects the crate default.
+    features: &'static str,
+    /// Restrict to the lib target. Binary-only crates must leave this false.
+    lib_only: bool,
+    /// Integration test target for `--test`; empty runs every target.
+    test_target: &'static str,
+    /// The Metal guards take minutes in a debug build and seconds in release.
+    release: bool,
 }
 
 struct Defect {
@@ -50,18 +62,42 @@ const fn mlx(filter: &'static str) -> Guard {
     Guard {
         package: "lumen-mlx",
         filter,
+        features: "mlx-native",
+        lib_only: true,
+        test_target: "",
+        release: false,
     }
 }
 const fn dif(filter: &'static str) -> Guard {
     Guard {
         package: "lumen-diffusion",
         filter,
+        features: "mlx-native",
+        lib_only: false,
+        test_target: "",
+        release: false,
     }
 }
 const fn srv(filter: &'static str) -> Guard {
     Guard {
         package: "lumen-server",
         filter,
+        features: "mlx-native",
+        lib_only: false,
+        test_target: "",
+        release: false,
+    }
+}
+/// GPU guards: `model-integration` gates the Affine4/Affine3 harnesses, and
+/// they are unusably slow unoptimized.
+const fn mtl(test_target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-metal",
+        filter,
+        features: "model-integration",
+        lib_only: false,
+        test_target,
+        release: true,
     }
 }
 
@@ -380,6 +416,88 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: true,
         extra: &["--ignored"],
     },
+    Defect {
+        name: "icb-hazard-barrier",
+        symptom: "the ICB matmul raced every neighbouring command: reading its \
+                  output back produced a different wrong answer each call \
+                  (~98% of 5120 elements, non-deterministic). Candle opens its \
+                  compute encoders with MTLDispatchType::Concurrent and orders \
+                  them from set_input_buffer/set_output_buffer, which ICB-bound \
+                  buffers never reach",
+        revert: &[
+            Mutation {
+                path: MTL,
+                find: "        encoder.insert_memory_barrier();\n        \
+                       encoder.execute_commands_in_buffer(&cache.icb_no_residual, 1);\n        \
+                       encoder.insert_memory_barrier();",
+                replace: "        encoder.execute_commands_in_buffer(&cache.icb_no_residual, 1);",
+            },
+            Mutation {
+                path: MTL,
+                find: "        encoder.insert_memory_barrier();\n        \
+                       encoder.execute_commands_in_buffer(&cache.icb_residual, 1);\n        \
+                       encoder.insert_memory_barrier();",
+                replace: "        encoder.execute_commands_in_buffer(&cache.icb_residual, 1);",
+            },
+        ],
+        guards: &[
+            mtl(
+                "affine4_icb_parity",
+                "forward_bf16_in_bf16_out_icb_re_records_on_buffer_change",
+            ),
+            mtl(
+                "affine4_icb_parity",
+                "forward_bf16_in_bf16_out_icb_handles_batch_change",
+            ),
+            mtl(
+                "affine4_icb_parity",
+                "forward_bf16_in_bf16_out_icb_matches_standard",
+            ),
+        ],
+        occurrences: 1, // per mutation: the no-residual and residual variants
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "affine3-parity-drains-wrong-queue",
+        symptom: "affine3 qmv_fast parity reported max_rel_err=1 on a kernel \
+                  that is exactly right: `*_pipelined` encodes onto the shared \
+                  process_commands() scheduler, and the test committed an \
+                  empty command buffer on ctx.queue instead — waiting for \
+                  nothing, then reading an untouched buffer",
+        revert: &[Mutation {
+            path: MTLT,
+            find: "    lumen_metal::metal::process_commands()\n        .flush_and_wait()\n        \
+                   .expect(\"flush\");",
+            replace: "    let drain = lumen_metal::metal::new_command_buffer(&ctx3.ctx.queue);\n    \
+                      drain.commit();\n    drain.wait_until_completed();",
+        }],
+        guards: &[mtl("affine3_poc_bw", "affine3_qmv_fast_parity_small")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "bf16-out-dispatch",
+        symptom: "nothing user-visible — and that is the point. The bf16-in \
+                  fast path and the f32-widen detour agree bit-for-bit, so a \
+                  regression here is pure lost throughput with no functional \
+                  signal. The old guard asserted a wall-clock ratio, which \
+                  measured the machine's mood (it ran at 1.07 against a 1.10 \
+                  threshold)",
+        revert: &[Mutation {
+            path: MTL,
+            find: "        if qmv_fast_ok && x.dtype() == DType::BF16 {",
+            replace: "        if false && qmv_fast_ok && x.dtype() == DType::BF16 {",
+        }],
+        guards: &[mtl(
+            "affine4_qmv_fast_bf16_parity",
+            "bf16_input_takes_the_qmv_fast_path_not_the_f32_detour",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -399,6 +517,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
+        (MTL, "icb-hazard-barrier") | (MTL, "bf16-out-dispatch") => "affine4_linear.rs",
+        (MTLT, "affine3-parity-drains-wrong-queue") => "affine3_poc_bw.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
@@ -497,14 +617,29 @@ enum Verdict {
     Skip,
 }
 
-fn guards_pass(defect: &Defect) -> Result<bool, String> {
+/// The guards that currently FAIL, by filter.
+///
+/// Every guard runs — no short-circuit. "At least one guard went red" is too
+/// weak a bar: a defect listing three guards where only one catches it would
+/// report red→green while the other two are decoration. The red phase demands
+/// that *each* listed guard fails, and names the ones that didn't.
+fn failing_guards(defect: &Defect) -> Result<Vec<&'static str>, String> {
+    let mut failing = Vec::new();
     for g in defect.guards {
         let mut cmd = Command::new("cargo");
-        cmd.current_dir(root())
-            .args(["test", "-p", g.package, "--features", "mlx-native"]);
-        if g.package == "lumen-mlx" {
+        cmd.current_dir(root()).args(["test", "-p", g.package]);
+        if !g.features.is_empty() {
+            cmd.args(["--features", g.features]);
+        }
+        if g.release {
+            cmd.arg("--release");
+        }
+        if g.lib_only {
             // lumen-server is a binary crate; it has no lib target.
             cmd.arg("--lib");
+        }
+        if !g.test_target.is_empty() {
+            cmd.args(["--test", g.test_target]);
         }
         cmd.args([g.filter, "--", "--test-threads=1", "--exact"])
             .args(defect.extra);
@@ -516,10 +651,10 @@ fn guards_pass(defect: &Defect) -> Result<bool, String> {
             return Err(format!("guard matched no test: {}", g.filter));
         }
         if !out.status.success() {
-            return Ok(false);
+            failing.push(g.filter);
         }
     }
-    Ok(true)
+    Ok(failing)
 }
 
 fn apply(defect: &Defect, restore: &mut Restore) -> Result<(), String> {
@@ -556,28 +691,36 @@ fn check(defect: &Defect) -> Result<Verdict, String> {
     if defect.needs_checkpoint && std::env::var_os("LUMEN_GEMMA4_MODEL_DIR").is_none() {
         return Ok(Verdict::Skip);
     }
-    if !guards_pass(defect)? {
+    if !failing_guards(defect)?.is_empty() {
         return Ok(Verdict::AlreadyRed);
     }
-    let went_red = {
+    let still_green = {
         let mut restore = Restore::new();
         apply(defect, &mut restore)?;
-        let red = !guards_pass(defect)?;
+        let failing = failing_guards(defect)?;
         // `restore` drops here, putting the source back even if the call above
         // returned early with an error.
-        red
+        defect
+            .guards
+            .iter()
+            .map(|g| g.filter)
+            .filter(|f| !failing.contains(f))
+            .collect::<Vec<_>>()
     };
-    if !guards_pass(defect)? {
+    if !failing_guards(defect)?.is_empty() {
         return Err(format!(
             "{}: source not restored cleanly — run `git status` and revert by hand",
             defect.name
         ));
     }
-    Ok(if went_red {
-        Verdict::Pass
+    if still_green.is_empty() {
+        Ok(Verdict::Pass)
     } else {
-        Verdict::Vacuous
-    })
+        for f in &still_green {
+            eprintln!("  VACUOUS guard (green with the defect reintroduced): {f}");
+        }
+        Ok(Verdict::Vacuous)
+    }
 }
 
 pub fn main(args: Vec<String>) -> ExitCode {
