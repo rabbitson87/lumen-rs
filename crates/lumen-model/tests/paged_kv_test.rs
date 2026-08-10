@@ -4,8 +4,20 @@
 //! values, and verifies that store_kv + compressed_attention produce a
 //! numerically correct result (matches a CPU reference SDPA).
 //!
-//! This isolates whether the bug is in our Candle↔Metal buffer bridge vs.
-//! elsewhere in the full model integration.
+//! Two contract details this test got wrong for a long time, both of which
+//! made it report a max_diff of ~0.7 against a kernel that is exact:
+//!
+//! - **`store_kv` takes the whole cache, not the new tail.** The model calls
+//!   it with what `kv_cache.append` returned, and the backend narrows
+//!   `seq_len_before..cache_seq_len` itself. Handing it only the new token
+//!   makes `cache_seq_len < seq_len`, which the backend reads as a cache
+//!   reset: it rotates to a fresh sequence, returns `true`, and silently
+//!   drops the history. Attention then runs over 1 token instead of 5.
+//! - **The attention scale at this call site is 1.0.** Gemma 4 folds the
+//!   query scale into the weights; the SDPA fallback sitting right next to
+//!   `compressed_attention` in `quantized_gemma4` passes 1.0 too.
+//!
+//! With both fixed the kernel matches the CPU reference to 9e-5.
 
 #![cfg(feature = "paged-kv")]
 
@@ -127,8 +139,20 @@ fn test_paged_kv_backend_end_to_end() -> Result<()> {
         &device,
     )?;
 
-    let stored = backend.store_kv(0, &k_dec, &v_dec);
+    // The decode store gets the FULL cache — prefill history plus the new
+    // token — because that is what `kv_cache.append` hands the model.
+    let k_all = Tensor::cat(&[&k_prefill, &k_dec], 2)?.contiguous()?;
+    let v_all = Tensor::cat(&[&v_prefill, &v_dec], 2)?.contiguous()?;
+    let stored = backend.store_kv(0, &k_all, &v_all);
     assert!(stored, "store_kv for layer 0 decode failed");
+    // `store_kv` returns true both when it appends and when it decides the
+    // cache was reset and starts over, so the return value alone does not
+    // say the history survived. This does.
+    assert_eq!(
+        backend.seq_len(0),
+        prefill_len + 1,
+        "layer 0 lost its prefill history on the decode store"
+    );
 
     // Query for layer 0
     let q = gen_tensor(
@@ -168,7 +192,9 @@ fn test_paged_kv_backend_end_to_end() -> Result<()> {
     let nkv = n_kv_heads as usize;
     let nq = n_q_heads as usize;
     let gqa = nq / nkv;
-    let scale = 1.0 / (hd as f32).sqrt();
+    // See the module comment: the query scale is already folded into the
+    // weights by the time attention runs, so this call site uses 1.0.
+    let scale = 1.0f32;
 
     let mut max_diff: f32 = 0.0;
     for q_head in 0..nq {
@@ -186,15 +212,9 @@ fn test_paged_kv_backend_end_to_end() -> Result<()> {
         k_head.extend_from_slice(&k_dec_vec[dec_base..dec_base + hd]);
         v_head.extend_from_slice(&v_dec_vec[dec_base..dec_base + hd]);
 
-        let k_head: Vec<f32> = k_head
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_f32())
-            .collect();
-        let v_head: Vec<f32> = v_head
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_f32())
-            .collect();
-
+        // No f16 round-trip here: `store_kv` casts to f32 and the paged
+        // blocks hold f32 (`dispatch_write_kv_f32_candle`). Rounding the
+        // reference to f16 would be modelling a different backend.
         let q_slice = &q_vec[(q_head * hd)..((q_head + 1) * hd)];
 
         let ref_out = reference_attention(q_slice, &k_head, &v_head, ctx_len, hd, scale);
@@ -216,7 +236,11 @@ fn test_paged_kv_backend_end_to_end() -> Result<()> {
     }
 
     eprintln!("paged_kv end-to-end max_diff = {:.6e}", max_diff);
-    assert!(max_diff < 1e-2, "max diff {max_diff:.6e} too large (>1e-2)");
+    // 1e-2 was loose enough to accept attention over the wrong context (a
+    // one-token context lands at 8e-1, but a dropped *first* token lands at
+    // 1.8e-1 and a scale error at 2.3e-1 — none far from a threshold chosen
+    // for f16). The f32 path reproduces the reference to 9e-5.
+    assert!(max_diff < 1e-3, "max diff {max_diff:.6e} too large (>1e-3)");
 
     Ok(())
 }

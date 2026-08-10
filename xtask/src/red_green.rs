@@ -18,6 +18,7 @@ const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
 const MTL: &str = "crates/lumen-metal/src";
+const MDL: &str = "crates/lumen-model/src";
 /// One defect below lived in the guard itself: it drained the wrong queue and
 /// so reported a kernel broken that was exactly right.
 const MTLT: &str = "crates/lumen-metal/tests";
@@ -95,6 +96,16 @@ const fn mtl(test_target: &'static str, filter: &'static str) -> Guard {
         package: "lumen-metal",
         filter,
         features: "model-integration",
+        lib_only: false,
+        test_target,
+        release: true,
+    }
+}
+const fn mdl(test_target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-model",
+        filter,
+        features: "lumen-metal/model-integration",
         lib_only: false,
         test_target,
         release: true,
@@ -498,6 +509,29 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "paged-kv-context-length",
+        symptom: "the paged attention guard reported max_rel diff 0.69 against \
+                  a kernel that reproduces the CPU reference to 9e-5. It fed \
+                  store_kv only the new token — the backend takes the whole \
+                  cache and narrows the tail itself, so a shorter tensor reads \
+                  as a cache reset, silently drops the history and attends over \
+                  1 token of 5 — and its reference applied a 1/sqrt(head_dim) \
+                  scale that this call site does not use. At 1e-2 the guard \
+                  could not have caught either",
+        // Not the reverted test: an off-by-one in the context length the
+        // kernel is handed. That is the defect class the guard exists for,
+        // and it only bites once the guard actually spans the history.
+        revert: &[Mutation {
+            path: MDL,
+            find: "let cl_buf = self.fresh_context_len_buf(eff_seq_len as i32)?;",
+            replace: "let cl_buf = self.fresh_context_len_buf(eff_seq_len as i32 - 1)?;",
+        }],
+        guards: &[mdl("paged_kv_test", "test_paged_kv_backend_end_to_end")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -519,6 +553,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
         (MTL, "icb-hazard-barrier") | (MTL, "bf16-out-dispatch") => "affine4_linear.rs",
         (MTLT, "affine3-parity-drains-wrong-queue") => "affine3_poc_bw.rs",
+        (MDL, "paged-kv-context-length") => "paged_kv.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
