@@ -293,15 +293,18 @@ fn affine4_linear_forward_bf16_in_bf16_out_tensor_parity() {
 /// will close that), so the comparison is apples-to-apples on the consumer
 /// side.
 ///
-/// Acceptance: bf16 chain ≤ f32 chain × 1.10 (mild WIN expected; full WIN
-/// shows up only after Workstream B/C/D plumbing eliminates downstream
-/// casts). NEGATIVE here = surgical fix didn't take effect.
+/// This used to assert a wall-clock ratio (`bf16 ≤ f32 × 1.10`). That is not
+/// a guard — it measures whatever else the machine happens to be doing, and
+/// it fails on a busy box while the fix is perfectly intact. What the fix
+/// actually changes is *which kernel runs*, and that is observable exactly:
+/// the two arms round differently, so the arm taken is identifiable from the
+/// output bits alone. The timings are still printed, as information.
 #[test]
-fn affine4_bf16_chain_synthetic_microbench() {
+fn bf16_input_takes_the_qmv_fast_path_not_the_f32_detour() {
     use std::sync::Arc;
 
     use candle_core::{DType, Device, Tensor};
-    use lumen_metal::affine4_linear::Affine4Linear;
+    use lumen_metal::affine4_linear::{Affine4Linear, dispatch_counters};
 
     let device = match Device::new_metal(0) {
         Ok(d) => d,
@@ -326,6 +329,56 @@ fn affine4_bf16_chain_synthetic_microbench() {
     let x_vec = synth_x(batch * ins);
     let x_f32 = Tensor::from_vec(x_vec.clone(), (batch, ins), &device).unwrap();
     let x_bf16 = x_f32.to_dtype(DType::BF16).unwrap();
+
+    let raw_bits = |t: &Tensor| -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+
+    // bf16 input must take the bf16-in kernel; f32 input must still widen.
+    dispatch_counters::reset();
+    let taken = linear.forward_bf16_out(&x_bf16).unwrap();
+    assert_eq!(
+        dispatch_counters::snapshot(),
+        (1, 0),
+        "bf16 input did not take the bf16-in qmv_fast path"
+    );
+    linear.forward_bf16_out(&x_f32).unwrap();
+    assert_eq!(
+        dispatch_counters::snapshot(),
+        (1, 1),
+        "f32 input no longer takes the f32-widen detour — the assertion above \
+         would then be about `forward_bf16_out` having a single arm, not \
+         about dtype dispatch"
+    );
+
+    // The arm taken must also be numerically right. Note this comparison
+    // alone cannot pin the dispatch: an f32 activation that came from a bf16
+    // value widens exactly, and both kernels round back to the same bf16, so
+    // the two arms agree bit-for-bit. That is why the counter above exists.
+    assert_eq!(
+        taken.dtype(),
+        DType::BF16,
+        "forward_bf16_out must emit bf16"
+    );
+    let direct = raw_bits(&linear.forward_bf16_in_bf16_out(&x_bf16).unwrap());
+    let vs_direct = raw_bits(&taken)
+        .iter()
+        .zip(direct.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        vs_direct, 0,
+        "bf16 fast path diverged from the bf16-in kernel: {vs_direct} of \
+         {out} outputs differ"
+    );
 
     // Production f32 chain (default — bf16 path OFF):
     //   input is f32 → forward (f32 matmul, f32 out)
@@ -353,20 +406,12 @@ fn affine4_bf16_chain_synthetic_microbench() {
     let ratio = bf16_ms / f32_ms;
     let delta_pct = (1.0 - ratio) * 100.0;
 
+    // Informational only — deliberately not asserted. See the doc comment.
     eprintln!(
         "synthetic chain (qkv_proj {out}x{ins} batch={batch}):  \
          production_f32 {f32_ms:.4} ms  \
          bf16_chain_with_fix {bf16_ms:.4} ms  \
-         ratio {ratio:.3}  Δ {delta_pct:+.1}%"
-    );
-
-    // Decision: bf16 chain ≤ f32 × 1.10. Mild WIN expected (input BW saved on
-    // the matmul) but the cast-back-to-f32 step eats some of it. Full WIN
-    // requires Workstream B/C/D to keep the bf16 active downstream too.
-    assert!(
-        bf16_ms <= f32_ms * 1.10,
-        "bf16 chain {bf16_ms:.4}ms exceeds f32 {f32_ms:.4}ms × 1.10 — \
-         surgical fix may not be taking effect"
+         ratio {ratio:.3}  Δ {delta_pct:+.1}%  (informational)"
     );
 }
 

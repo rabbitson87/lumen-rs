@@ -125,6 +125,35 @@ fn qmv_fast_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Which arm [`Affine4Linear::forward_bf16_out`] dispatched to, counted.
+///
+/// The two arms are numerically indistinguishable — a bf16 activation widens
+/// to f32 exactly, and both kernels round back to the same bf16 — so the
+/// choice leaves no trace in the output. Without a counter the only evidence
+/// is wall-clock, which is not a guard: it fails on a busy machine and passes
+/// on a fast one regardless of whether the dispatch is correct. A relaxed
+/// increment on a path that is about to issue a multi-megabyte matmul costs
+/// nothing measurable.
+pub mod dispatch_counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static BF16_IN_FAST_PATH: AtomicU64 = AtomicU64::new(0);
+    pub(super) static F32_WIDEN_DETOUR: AtomicU64 = AtomicU64::new(0);
+
+    /// `(bf16-in fast path, f32-widen detour)` since the last [`reset`].
+    pub fn snapshot() -> (u64, u64) {
+        (
+            BF16_IN_FAST_PATH.load(Ordering::Relaxed),
+            F32_WIDEN_DETOUR.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        BF16_IN_FAST_PATH.store(0, Ordering::Relaxed);
+        F32_WIDEN_DETOUR.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Extract the Metal buffer + byte offset backing a Candle tensor. Returns `None`
 /// when the tensor is not Metal-resident. Same pattern as `mxfp4_linear::metal_buffer_of`.
 fn metal_buffer_of(t: &Tensor) -> Option<(&crate::metal::Buffer, u64)> {
@@ -573,6 +602,7 @@ impl Affine4Linear {
         // bf16-in fast-path: dispatch direct through bf16-in/bf16-out qmv_fast
         // (Workstream A), no f32 widen detour.
         if qmv_fast_ok && x.dtype() == DType::BF16 {
+            dispatch_counters::BF16_IN_FAST_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return self.forward_bf16_in_bf16_out(x);
         }
         // f32-in fast-path: qmv_fast f32 (the prior LANDED Lever P0 — fastest
@@ -583,6 +613,7 @@ impl Affine4Linear {
         // rmsnorm fusion off, BF16_RMSNORM only fires on MXFP4 input proj)
         // hitting v3 here. One extra cast dispatch ≪ v3 vs qmv_fast gap.
         if qmv_fast_ok {
+            dispatch_counters::F32_WIDEN_DETOUR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let y_f32 = self.forward(x)?;
             return y_f32
                 .to_dtype(DType::BF16)
