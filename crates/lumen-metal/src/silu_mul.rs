@@ -3,12 +3,14 @@
 //! Production 27B Dense MLP currently runs the silu*mul step as a 5-dispatch
 //! chain in `DenseMlp::forward_with_residual_bf16_in_bf16_out`:
 //!
-//!     combined_bf16 = gate_up_proj(x_bf16)        // 1 dispatch (Affine4)
-//!     combined_f32  = combined_bf16.to_dtype(F32) // 1 dispatch
-//!     gate          = narrow(combined_f32, 0)     // 0-1 dispatch (contiguous)
-//!     up            = narrow(combined_f32, inter) // 0-1 dispatch
-//!     hidden_f32    = silu(gate) * up             // 1-2 dispatch (silu + mul)
-//!     down_proj(hidden_f32, residual)             // 1 dispatch (Affine4)
+//! ```text
+//! combined_bf16 = gate_up_proj(x_bf16)        // 1 dispatch (Affine4)
+//! combined_f32  = combined_bf16.to_dtype(F32) // 1 dispatch
+//! gate          = narrow(combined_f32, 0)     // 0-1 dispatch (contiguous)
+//! up            = narrow(combined_f32, inter) // 0-1 dispatch
+//! hidden_f32    = silu(gate) * up             // 1-2 dispatch (silu + mul)
+//! down_proj(hidden_f32, residual)             // 1 dispatch (Affine4)
+//! ```
 //!
 //! This module collapses the 5 middle dispatches (cast + narrow×2 + silu*mul)
 //! into a single bf16-in / bf16-out elementwise kernel. Output goes directly
