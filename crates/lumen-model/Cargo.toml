@@ -156,3 +156,14 @@ required-features = ["qwen3_5_moe"]
 [[test]]
 name = "self_attn_trace"
 required-features = ["qwen3_5_moe"]
+
+# These call `GemmaModel::enable_turboquant`, which is `#[cfg(feature =
+# "turboquant")]`. Without the gate they break a plain `cargo test` at the
+# workspace root, which builds every example.
+[[example]]
+name = "bench_turboquant"
+required-features = ["turboquant"]
+
+[[example]]
+name = "profile_tq"
+required-features = ["turboquant"]

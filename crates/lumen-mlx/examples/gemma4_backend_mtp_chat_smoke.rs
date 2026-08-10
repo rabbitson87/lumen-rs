@@ -43,9 +43,11 @@ fn run_once(
         max_new_tokens,
         /* temperature */ 0.0,
         /* top_p */ 1.0,
+        &Default::default(),
         /* thinking */ false,
         tools,
         tool_choice,
+        /* response_schema */ None,
         |ev| {
             if let BackendStreamEvent::Text(t) = ev {
                 buf.push_str(t);

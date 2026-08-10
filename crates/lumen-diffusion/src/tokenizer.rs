@@ -119,42 +119,131 @@ mod tests {
     const VALIDATION_PROMPT: &str =
         "a photorealistic close-up of a hummingbird hovering near a red flower";
 
-    fn swift_tokens() -> Vec<i32> {
-        let raw =
-            std::fs::read_to_string("/tmp/swift_tokens.json").expect("read /tmp/swift_tokens.json");
-        let v: Vec<i32> = serde_json::from_str(&raw).expect("parse swift_tokens.json");
-        assert_eq!(v.len(), FLUX_SEQ_LEN, "swift reference must be 512 ids");
-        v
-    }
-
-    /// The gate: byte-exact match against the Swift FLUX.2 encoder output.
-    #[test]
-    fn flux_tokenize_matches_swift() {
-        let expected = swift_tokens();
-        let got = tokenize_flux_prompt(VALIDATION_PROMPT).expect("tokenize");
-        assert_eq!(got.len(), FLUX_SEQ_LEN, "must be 512 ids");
-
-        if got != expected {
-            // Surface the exact differing positions for diagnosis.
-            let diffs: Vec<(usize, i32, i32)> = got
-                .iter()
-                .zip(expected.iter())
-                .enumerate()
-                .filter(|(_, (g, e))| g != e)
-                .map(|(i, (g, e))| (i, *g, *e))
-                .collect();
-            panic!(
-                "tokenization mismatch: {} differing ids (pos, got, swift): {:?}",
-                diffs.len(),
-                diffs
-            );
+    /// Where to find a real Mistral tokenizer for the checkpoint-gated tests.
+    ///
+    /// These previously read `/tmp/swift_tokens.json` and the default HF cache
+    /// path unconditionally, so they failed on every machine that had neither —
+    /// permanently, and as hard errors rather than skips.
+    fn tokenizer_json() -> Option<std::path::PathBuf> {
+        if let Ok(dir) = std::env::var("LUMEN_DIFFUSION_TOKENIZER_DIR") {
+            let p = std::path::Path::new(&dir).join("tokenizer.json");
+            return p.exists().then_some(p);
         }
+        let p = default_tokenizer_json();
+        p.exists().then_some(p)
+    }
+
+    // ── Pure logic: runs everywhere, no artifact ──────────────────────────
+    //
+    // Left-padding and the first-real-token scan are lumen's own code; the
+    // tokenizer itself is HuggingFace's. Splitting them means the part we can
+    // actually get wrong is covered unconditionally, instead of riding along
+    // with a multi-GB download.
+
+    #[test]
+    fn first_real_index_finds_the_padding_boundary() {
+        let mut padded = vec![PAD_ID; FLUX_SEQ_LEN];
+        padded[FLUX_SEQ_LEN - 3] = 42;
+        padded[FLUX_SEQ_LEN - 2] = 43;
+        padded[FLUX_SEQ_LEN - 1] = 44;
+        assert_eq!(first_real_index(&padded), FLUX_SEQ_LEN - 3);
     }
 
     #[test]
-    fn first_real_index_is_465() {
-        let padded = tokenize_flux_prompt(VALIDATION_PROMPT).expect("tokenize");
-        // 47 real tokens, left-padded into 512 → first real at 465.
-        assert_eq!(first_real_index(&padded), FLUX_SEQ_LEN - 47);
+    fn first_real_index_handles_the_degenerate_ends() {
+        assert_eq!(
+            first_real_index(&vec![PAD_ID; 8]),
+            8,
+            "all padding → one past the end, never a panic"
+        );
+        assert_eq!(
+            first_real_index(&[7, PAD_ID, 9]),
+            0,
+            "leading token is already real"
+        );
+        assert_eq!(first_real_index(&[]), 0, "empty input");
+    }
+
+    #[test]
+    fn padding_is_on_the_left_and_preserves_order() {
+        // The encoder reads the tail, so a right-pad would silently feed it
+        // padding and drop the prompt.
+        // Deliberately not PAD_ID (11) — a real token equal to the pad byte
+        // would make `first_real_index` skip it, which is worth knowing but is
+        // not what this test is about.
+        let ids = vec![101i32, 22, 33];
+        let padded = left_pad(ids, 6, PAD_ID).expect("pad");
+        assert_eq!(padded, vec![PAD_ID, PAD_ID, PAD_ID, 101, 22, 33]);
+        assert_eq!(first_real_index(&padded), 3);
+    }
+
+    #[test]
+    fn padding_refuses_to_truncate() {
+        // Silently dropping the head of a too-long prompt would be worse than
+        // failing: the caller would get an image for a prompt it never sent.
+        assert!(
+            left_pad(vec![1, 2, 3], 2, PAD_ID).is_err(),
+            "a prompt longer than the window must error, not truncate"
+        );
+    }
+
+    // ── Checkpoint-gated ─────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "needs a Mistral tokenizer; set LUMEN_DIFFUSION_TOKENIZER_DIR"]
+    fn flux_prompt_tokenizes_to_the_padded_window() {
+        let Some(tok) = tokenizer_json() else {
+            eprintln!("skipping: set LUMEN_DIFFUSION_TOKENIZER_DIR");
+            return;
+        };
+        let got = tokenize_flux_prompt_with(VALIDATION_PROMPT, &tok).expect("tokenize");
+        assert_eq!(got.len(), FLUX_SEQ_LEN, "must be {FLUX_SEQ_LEN} ids");
+        let first = first_real_index(&got);
+        assert!(
+            first > 0 && first < FLUX_SEQ_LEN,
+            "prompt must be left-padded"
+        );
+        assert!(
+            got[..first].iter().all(|&id| id == PAD_ID),
+            "everything before the first real token must be padding"
+        );
+        assert!(
+            got[first..].iter().all(|&id| id != PAD_ID),
+            "no padding may appear inside the prompt"
+        );
+    }
+
+    /// Byte-exact match against the Swift FLUX.2 encoder, when a dump is
+    /// available. `LUMEN_DIFFUSION_SWIFT_TOKENS` points at a JSON array of
+    /// `FLUX_SEQ_LEN` ids; the old hardcoded `/tmp/swift_tokens.json` is still
+    /// honoured so an existing dump keeps working.
+    #[test]
+    #[ignore = "needs a tokenizer and a Swift dump; set LUMEN_DIFFUSION_SWIFT_TOKENS"]
+    fn flux_tokenize_matches_swift() {
+        let Some(tok) = tokenizer_json() else {
+            eprintln!("skipping: set LUMEN_DIFFUSION_TOKENIZER_DIR");
+            return;
+        };
+        let dump = std::env::var("LUMEN_DIFFUSION_SWIFT_TOKENS")
+            .unwrap_or_else(|_| "/tmp/swift_tokens.json".to_string());
+        let Ok(raw) = std::fs::read_to_string(&dump) else {
+            eprintln!("skipping: no Swift dump at {dump}");
+            return;
+        };
+        let expected: Vec<i32> = serde_json::from_str(&raw).expect("parse swift tokens");
+        assert_eq!(expected.len(), FLUX_SEQ_LEN, "reference must be 512 ids");
+        let got = tokenize_flux_prompt_with(VALIDATION_PROMPT, &tok).expect("tokenize");
+        let diffs: Vec<(usize, i32, i32)> = got
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .filter(|(_, (g, e))| g != e)
+            .map(|(i, (g, e))| (i, *g, *e))
+            .collect();
+        assert!(
+            diffs.is_empty(),
+            "tokenization mismatch: {} differing ids (pos, got, swift): {diffs:?}",
+            diffs.len()
+        );
     }
 }

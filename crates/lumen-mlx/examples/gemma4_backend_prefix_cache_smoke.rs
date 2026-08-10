@@ -80,6 +80,7 @@ fn main() -> Result<()> {
                 max_new_tokens,
                 /* temperature */ 0.0,
                 /* top_p */ 1.0,
+                &Default::default(),
                 /* thinking */ false,
                 prefix_key,
                 tools,

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const MLX: &str = "crates/lumen-mlx/src";
+const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
@@ -48,6 +49,12 @@ struct Defect {
 const fn mlx(filter: &'static str) -> Guard {
     Guard {
         package: "lumen-mlx",
+        filter,
+    }
+}
+const fn dif(filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-diffusion",
         filter,
     }
 }
@@ -324,6 +331,40 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "flux-scheduler-invariants",
+        symptom: "the scheduler test compared against /tmp/klein_sigmas.bin, a \
+                  dev-session dump that no longer exists, so it failed on every \
+                  machine",
+        revert: &[Mutation {
+            path: DIF,
+            find: r#"        let s = exp_mu / (exp_mu + (1.0 / t - 1.0));"#,
+            replace: r#"        let s = exp_mu / (exp_mu + (1.0 / t + 1.0));"#,
+        }],
+        guards: &[dif("scheduler::tests::shift_multiplies_the_odds_by_exp_mu")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "flux-left-padding",
+        symptom: "the encoder reads the tail of the window, so right-padding \
+                  would feed it padding and drop the prompt — untested because \
+                  the only coverage needed a 24GB tokenizer",
+        revert: &[Mutation {
+            path: DIF,
+            find: r#"    let mut out = vec![pad; len - ids.len()];
+    out.extend_from_slice(&ids);"#,
+            replace: r#"    let mut out = ids.clone();
+    out.extend(std::iter::repeat_n(pad, len - ids.len()));"#,
+        }],
+        guards: &[dif(
+            "tokenizer::tests::padding_is_on_the_left_and_preserves_order",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "gemma-thought-channel",
         symptom: "response_format degenerated into repetition to max_tokens — the \
                   eager grammar masked `<|channel>` at step 0, leaving 3 legal tokens",
@@ -355,6 +396,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
+        (_, "flux-scheduler-invariants") => "scheduler.rs",
+        (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };

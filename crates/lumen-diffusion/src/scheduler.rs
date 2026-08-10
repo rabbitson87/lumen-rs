@@ -79,37 +79,121 @@ impl Schedule {
 mod tests {
     use super::*;
 
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not f32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+    /// These used to compare against `/tmp/klein_sigmas.bin`, dumped from mflux
+    /// during development. The files are long gone, so the tests failed on
+    /// every machine — permanently, and without anyone noticing, because a
+    /// missing file reads the same as a red test only if you look.
+    ///
+    /// Re-deriving the expected numbers by calling `compute()` would be
+    /// circular. Instead the schedule is pinned by the properties that define
+    /// it, which need no external artifact and cannot rot.
+    /// The time-shift, stated as an odds ratio.
+    ///
+    /// `s = e^mu / (e^mu + (1/t - 1))` rearranges exactly to
+    /// `s/(1-s) = e^mu · t/(1-t)` — the shift multiplies the odds by `e^mu`.
+    /// Checking that form rather than re-running the expression means a typo in
+    /// the implementation cannot be reproduced by the test.
+    #[test]
+    fn shift_multiplies_the_odds_by_exp_mu() {
+        for (isl, steps) in [(256usize, 4usize), (1024, 8), (4096, 20), (8192, 28)] {
+            let sched = compute(isl, steps);
+            let exp_mu = (empirical_mu(isl, steps) as f64).exp();
+            let n = steps as f64;
+            // i = 0 has t = 1.0, where both sides of the identity are
+            // infinite; `schedule_shape_and_monotonicity` pins that endpoint
+            // directly as sigma == 1.
+            for i in 1..steps {
+                let t = 1.0 + (1.0 / n - 1.0) * (i as f64) / ((steps - 1) as f64);
+                let s = sched.sigmas[i] as f64;
+                let got = s / (1.0 - s);
+                let want = exp_mu * t / (1.0 - t);
+                let rel = (got - want).abs() / want.abs().max(1e-9);
+                assert!(
+                    rel < 1e-5,
+                    "isl={isl} steps={steps} i={i}: odds {got:.6} != e^mu·odds(t) {want:.6}"
+                );
+            }
+        }
     }
 
-    /// Pure-scalar test (no MLX) — safe in the sandbox.
     #[test]
-    fn scheduler_matches_reference() {
-        // 256x256 → image_seq_len = (256/16)*(256/16) = 256, steps = 4.
-        let sched = compute(256, 4);
-        let exp_sigmas = read_f32_bin("/tmp/klein_sigmas.bin");
-        let exp_timesteps = read_f32_bin("/tmp/klein_timesteps.bin");
-        assert_eq!(sched.sigmas.len(), exp_sigmas.len(), "sigmas len");
-        assert_eq!(sched.timesteps.len(), exp_timesteps.len(), "timesteps len");
+    fn schedule_shape_and_monotonicity() {
+        for (isl, steps) in [(256usize, 4usize), (1024, 8), (4096, 20)] {
+            let sched = compute(isl, steps);
+            assert_eq!(sched.sigmas.len(), steps + 1, "sigmas = steps + 1");
+            assert_eq!(sched.timesteps.len(), steps, "timesteps = steps");
+            assert_eq!(*sched.sigmas.last().unwrap(), 0.0, "terminal sigma is 0");
+            // sigma(1.0) = e^mu / (e^mu + 0) = 1 exactly, for any mu.
+            assert!(
+                (sched.sigmas[0] - 1.0).abs() < 1e-6,
+                "isl={isl}: first sigma {} != 1.0",
+                sched.sigmas[0]
+            );
+            for w in sched.sigmas.windows(2) {
+                assert!(w[1] < w[0], "isl={isl}: sigmas must strictly decrease");
+            }
+            for t in 0..steps {
+                assert!(sched.dt(t) < 0.0, "isl={isl}: dt({t}) must be negative");
+            }
+        }
+    }
 
-        let mut max_abs = 0.0f32;
-        for (&g, &e) in sched.sigmas.iter().zip(exp_sigmas.iter()) {
-            max_abs = max_abs.max((g - e).abs());
+    #[test]
+    fn timesteps_are_sigmas_scaled_by_1000() {
+        let sched = compute(1024, 8);
+        for (i, (&ts, &sg)) in sched.timesteps.iter().zip(sched.sigmas.iter()).enumerate() {
+            assert!(
+                (ts - sg * 1000.0).abs() < 1e-3,
+                "step {i}: timestep {ts} != sigma {sg} * 1000"
+            );
         }
-        for (&g, &e) in sched.timesteps.iter().zip(exp_timesteps.iter()) {
-            // timesteps are ×1000; compare in sigma units for a fair tol.
-            max_abs = max_abs.max(((g - e) / 1000.0).abs());
+    }
+
+    /// `empirical_mu` is a piecewise fit with a documented switch at
+    /// `image_seq_len > 4300`. Pin both branches and the fact that longer
+    /// sequences shift harder — that monotonicity is what the schedule relies
+    /// on, and a sign slip in the interpolation would invert it.
+    #[test]
+    fn empirical_mu_branches_and_monotonicity() {
+        // Above the cutoff the step count drops out of the formula entirely.
+        assert_eq!(
+            empirical_mu(5000, 4),
+            empirical_mu(5000, 50),
+            "isl > 4300 must ignore num_steps"
+        );
+        // Below it, it does not.
+        assert_ne!(
+            empirical_mu(1024, 4),
+            empirical_mu(1024, 50),
+            "isl <= 4300 must depend on num_steps"
+        );
+        // Monotone *within* each branch. Not across them: at steps=20 the fit
+        // steps down from mu(4096) = 2.198 to mu(8192) = 1.843. That
+        // discontinuity is mflux's, faithfully ported, and asserting global
+        // monotonicity would be asserting a bug into existence.
+        for branch in [[256usize, 1024, 4096], [4301, 8192, 16384]] {
+            let mut prev = f32::NEG_INFINITY;
+            for isl in branch {
+                let mu = empirical_mu(isl, 20);
+                assert!(
+                    mu > prev,
+                    "mu must grow with image_seq_len within a branch (isl={isl})"
+                );
+                prev = mu;
+            }
         }
-        println!("scheduler max_abs (sigma units) = {max_abs:.3e}");
-        println!("  rust sigmas    = {:?}", sched.sigmas);
-        println!("  mflux sigmas   = {exp_sigmas:?}");
-        println!("  rust timesteps = {:?}", sched.timesteps);
-        assert!(max_abs < 1e-4, "scheduler max_abs {max_abs:.3e} >= 1e-4");
+        assert!(
+            empirical_mu(4300, 20) > empirical_mu(4301, 20),
+            "the documented step down at the 4300 cutoff must survive a refactor"
+        );
+    }
+
+    #[test]
+    fn single_step_schedule_is_degenerate_but_valid() {
+        let sched = compute(256, 1);
+        assert_eq!(sched.sigmas.len(), 2);
+        assert!((sched.sigmas[0] - 1.0).abs() < 1e-6);
+        assert_eq!(sched.sigmas[1], 0.0);
+        assert!(sched.dt(0) < 0.0);
     }
 }
