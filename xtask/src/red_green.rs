@@ -510,6 +510,26 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "dense-shapes-on-qmv-fast",
+        symptom: "another wall-clock gate (`bf16 <= f32 * 1.20` per shape). It \
+                  failed a routine full-suite run at 1.21 on in_proj_comb -- \
+                  ~18% swing on a busy box -- having passed minutes earlier \
+                  and later. Ratios on an idle machine sit at 0.99-1.03, so \
+                  the gate was measuring load, not the kernel",
+        revert: &[Mutation {
+            path: MTL,
+            find: "in_features.is_multiple_of(512) && out_features.is_multiple_of(8)",
+            replace: "in_features.is_multiple_of(2048) && out_features.is_multiple_of(8)",
+        }],
+        guards: &[mtl(
+            "affine4_qmv_fast_bf16_parity",
+            "every_dense_projection_shape_stays_on_the_bf16_qmv_fast_kernel",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "paged-kv-context-length",
         symptom: "the paged attention guard reported max_rel diff 0.69 against \
                   a kernel that reproduces the CPU reference to 9e-5. It fed \
@@ -552,6 +572,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
         (MTL, "icb-hazard-barrier") | (MTL, "bf16-out-dispatch") => "affine4_linear.rs",
+        (MTL, "dense-shapes-on-qmv-fast") => "affine4_gpu.rs",
         (MTLT, "affine3-parity-drains-wrong-queue") => "affine3_poc_bw.rs",
         (MDL, "paged-kv-context-length") => "paged_kv.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
