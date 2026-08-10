@@ -494,9 +494,14 @@ fn affine3_qmv_fast_parity_small() {
 
     ctx3.qmv_fast_bf16in_bf16out_pipelined(&weight, &x_buf, &y_buf, 1)
         .unwrap();
-    let drain = lumen_metal::metal::new_command_buffer(&ctx3.ctx.queue);
-    drain.commit();
-    drain.wait_until_completed();
+    // `*_pipelined` encodes onto the shared `process_commands()` scheduler,
+    // NOT onto `ctx3.ctx.queue`. Committing an empty command buffer on that
+    // other queue waits for nothing, so the readback below would race the
+    // dispatch (and usually see the untouched buffer). Drain the queue the
+    // work was actually encoded on.
+    lumen_metal::metal::process_commands()
+        .flush_and_wait()
+        .expect("flush");
 
     let y_bf16 = ctx3.ctx.read_buffer::<u16>(&y_buf, OUT);
     let y_f32: Vec<f32> = y_bf16
