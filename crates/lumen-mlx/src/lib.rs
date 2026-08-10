@@ -44,6 +44,8 @@ mod gemma4_mtp;
 mod gemma4_response;
 mod gemma4_sampling;
 mod gemma4_thinking;
+/// Gemma 4's tool-call body grammar. Ungated on purpose — see the module docs.
+pub mod gemma4_tool_syntax;
 mod gemma4_tools;
 pub mod gemma4_vision;
 pub mod grammar;
@@ -110,6 +112,8 @@ pub mod gemma4 {
         };
     }
 }
+/// Qwen3-Embedding on mlx-rs — the `/v1/embeddings` backend.
+pub mod embedding;
 pub mod env_state;
 mod golden;
 pub mod metal_kernel;
@@ -132,6 +136,13 @@ mod native_snapshot;
 pub mod native_ssm;
 mod prefix_cache;
 mod qwen3_5_moe;
+// Unlike its `qwen3_5_moe` sibling — which keeps a `#[cfg]`'d `mod imp` inside
+// an ungated file — every item here takes or returns `mlx_rs::Array`, so the
+// whole module is gated at the declaration (same shape as
+// `native_metal_bridge` above). Without this the crate does not build under
+// its own `default = []`, which is the configuration the pure modules
+// (`grammar`, `chat_io`, `gemma4_tool_syntax`) exist to be testable in.
+#[cfg(feature = "mlx-native")]
 mod qwen3_5_mtp;
 mod qwen3_5_tools;
 // Phase 2 Step B microbench — synthetic-weight latency probe at
@@ -140,6 +151,7 @@ mod qwen3_5_tools;
 // math before investing in the HF-native loader + runner wiring.
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
+#[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
     Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
@@ -369,6 +381,10 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::prefill(self, seq_id, tokens)
     }
 
+    // Gated to match the trait declaration — `Runner::prefill_with_images`
+    // only exists under `mlx-native`, so an ungated impl is not overriding
+    // anything. The `MlxRunnerEnum` impl below already carries this gate.
+    #[cfg(feature = "mlx-native")]
     fn prefill_with_images(
         &mut self,
         seq_id: u64,
@@ -1641,6 +1657,10 @@ impl MlxBackend {
             );
         }
         match self {
+            // The variant itself is `#[cfg]`'d on `mlx-native`, so the arm has
+            // to be too — as does everything it reaches
+            // (`gemma4_grammar_would_constrain`).
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
                 // Same trick as the text path: only the streaming decode
@@ -1763,6 +1783,7 @@ impl MlxBackend {
             );
         }
         match self {
+            #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
                 m.chat_streaming_with_images(
@@ -5402,7 +5423,10 @@ impl MlxQwen35Backend {
         }
         // L2 spill: under memory pressure, drop cold in-memory snapshots (now
         // durably on disk) to free RAM; they rehydrate on next access. Off
-        // unless `LUMEN_KV_SPILL_MEM_GB` is set.
+        // unless `LUMEN_KV_SPILL_MEM_GB` is set. Gated because the pressure
+        // probe reads MLX active memory, which has no meaning — and no
+        // symbol — without `mlx-native`.
+        #[cfg(feature = "mlx-native")]
         if crate::kv_disk::under_memory_pressure() {
             let keep = crate::kv_disk::spill_keep_floor();
             let before = self.prefix_store.len();

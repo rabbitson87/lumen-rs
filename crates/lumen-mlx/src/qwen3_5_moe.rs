@@ -5417,7 +5417,7 @@ mod mrope_tests {
     /// opt-in for exotic models, it is on for every Qwen3.6 prompt we serve.
     #[test]
     fn shipped_qwen35_config_declares_mrope() {
-        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
         let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
         assert_eq!(cfg.text_config.mrope(), Some(([11, 11, 10], true)));
     }
@@ -5677,7 +5677,7 @@ mod config_tests {
 
     #[test]
     fn parses_checked_in_qwen3_5_moe_config() {
-        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
         let config: NativeModelConfig =
             serde_json::from_str(raw).expect("checked-in config.json must parse");
         config.validate_qwen3_5_moe().expect("contract must hold");
@@ -5740,7 +5740,7 @@ mod config_tests {
 
     #[test]
     fn family_validator_accepts_existing_moe_fixture_as_moe() {
-        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
         let config: NativeModelConfig = serde_json::from_str(raw).unwrap();
         let kind = config
             .validate_qwen3_5_family()

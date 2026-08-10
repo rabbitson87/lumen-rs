@@ -22,7 +22,7 @@ Match the existing log. Each commit message is:
   - `Add Qwen3.6-35B-A3B-mxfp4 A/B numbers + HF Hub fixture pipeline`
   - `fix: HF fixtures namespace rabbitson87 -> hsng95`
   - `docs: add docs/getting-started.md step-by-step walkthrough`
-  - `Pin candle + mlx-rs + mlx-c + mlx forks via git URL + commit SHA`
+  - `Pin mlx-rs + mlx-c + mlx forks via git URL + commit SHA`
 - **Blank line**, then a body that explains *why* in plain prose.
 - **Bulleted sub-sections** with `*` markers when the change touches
   multiple subsystems.
@@ -42,16 +42,22 @@ change scope.
 Before staging anything, run these — in order, fail fast:
 
 ```bash
-# 1. Default build (embedding + qwen3.6 candle path + lumen-server)
-cargo check --workspace --release
+# 1. The suite, with the features and serialization that make it
+#    representative. See xtask/src/test_all.rs for why a plain
+#    `cargo test --workspace` is not.
+cargo xtask test
+# Expected: 0 failed. Note what is *ignored* — that count is how many
+# tests did not run, and it is meant to be looked at, not scrolled past.
 
-# 2. Opt-in feature builds
-cargo check --workspace --features lumen-server/qwen3_5_moe --release
-cargo check --workspace --features lumen-server/mlx-native --release
+# 2. Every regression guard still catches its defect.
+cargo xtask red-green
+# Expected: all PASS. A VACUOUS or ALREADY-RED verdict fails the run.
 
-# 3. Bit-parity tests for the affine8 kernel (always-on validation)
-cargo test -p lumen-metal --release --test affine8_parity
-# Expected: 7 passed; 0 failed
+# 3. The GPU-free build compiles and its tests run in seconds. This is the
+#    configuration that silently rotted before (`qwen3_5_mtp` lost its
+#    feature gate and nothing noticed for months).
+cargo test -p lumen-mlx
+cargo test -p lumen-server --no-default-features --lib
 
 # 4. Personal-path leak scan
 git grep "/Users/sonheesung"
@@ -59,20 +65,22 @@ git grep "/Users/sonheesung"
 ```
 
 Anything that prints `error[E...]` blocks the commit. Compile warnings
-are acceptable (the workspace has ~50 known warnings; the perf
-A/B path is the source of most).
+are acceptable (the workspace has known warnings; the perf A/B path is
+the source of most).
 
 ---
 
 ## 3. Fork dependency management
 
-`lumen-rs` consumes four upstream forks pinned to specific commit SHAs.
+`lumen-rs` consumes three upstream forks pinned to specific commit SHAs.
 Each fork lives under `github.com/rabbitson87/<fork>` with a branch
 named `lumen-rs-patches`.
 
+The `candle-*` fork was dropped when the Candle backend was removed — a
+clean clone no longer needs a sibling `../candle` checkout to build.
+
 | Cargo dep | Fork branch | URL |
 |---|---|---|
-| `candle-*` | `rabbitson87/candle/lumen-rs-patches` | https://github.com/rabbitson87/candle |
 | `mlx-rs`, `mlx-sys` | `rabbitson87/mlx-rs/lumen-rs-patches` | https://github.com/rabbitson87/mlx-rs |
 | mlx-c submodule | `rabbitson87/mlx-c/lumen-rs-patches` | https://github.com/rabbitson87/mlx-c |
 | mlx core (FetchContent in mlx-c) | `rabbitson87/mlx/lumen-rs-patches` | https://github.com/rabbitson87/mlx |
@@ -96,7 +104,7 @@ cd ~/Documents/GitHub/lumen-rs
 # for mlx-rs / mlx-sys). For mlx-c bumps, the SHA lives in mlx-rs's
 # submodule pin; for mlx core bumps, in mlx-c's CMakeLists.txt
 # FetchContent_Declare.
-cargo check --workspace --release         # confirm rebuild succeeds
+cargo xtask test                          # confirm rebuild + suite
 git commit -am "deps: bump <fork> to <short-sha>"
 git push origin main
 ```
@@ -104,8 +112,8 @@ git push origin main
 ### Local fork-edit workflow (uncomment `[patch]` overrides)
 
 The top-level `Cargo.toml` has a commented `[patch]` block at the
-bottom. Uncomment it to redirect git deps to sibling local clones
-(`../candle/`, `../../../mlx-rs/`). For mlx-c / mlx, use the
+bottom. Uncomment it to redirect the git dep to a sibling local clone
+(`../../../mlx-rs/`). For mlx-c / mlx, use the
 `MLX_LOCAL_SOURCE_DIR` env var on the mlx-c CMakeLists.txt FetchContent
 call (set it before `cargo build`).
 
@@ -148,7 +156,6 @@ LEAN-CTX.md, ai-system-install-*.md
 claude.md                          121KB personal config
 scaffold.mjs                       personal AI installer
 scripts/*                          personal benchmarking scripts
-  !scripts/fetch_fixtures.py       allowlisted: clone-er-friendly utility
 worker-hang-investigation.html     debug artifact
 lumen-rs                           self-referential symlink (don't recreate)
 ```
@@ -182,14 +189,13 @@ should return only mid-prose references (Phase X mid-sentence is OK).
 
 | Feature | Crate | Purpose | Default? |
 |---|---|---|---|
-| `metal` | `lumen-model` | Candle Metal backend | ✅ on |
-| `turboquant-gpu` | `lumen-model`, `lumen-server` | GPU-resident affine 4/8-bit dispatch | ✅ on |
-| `paged-kv` | `lumen-model` | PagedAttention KV cache scaffolding | ✅ on |
-| `qwen3_5_moe` | `lumen-model`, `lumen-server` | Qwen3.5 / Qwen3.6 MoE Candle backend (opt-in) | ❌ off |
-| `mlx-native` | `lumen-mlx`, `lumen-server` | Native MLX runner (Gemma 4 26B-A4B + Qwen3.6-35B-A3B-mxfp4 `gather_qmm`). When compiled, this becomes the runtime default — `LUMEN_MODE` falls back to `mlx` and `LUMEN_MLX_BACKEND` to `native`. | ✅ **on** (default) |
+| `mlx-native` | `lumen-mlx`, `lumen-diffusion`, `lumen-server` | Native MLX runner (Gemma 4, Qwen 2.5/3.5/3.6 dense + MoE) plus the FLUX.2-dev diffusion backend. The only backend. | ✅ **on** (default) |
+| `mlx-native-metal` | `lumen-mlx`, `lumen-diffusion` | `mlx-native` + `mlx-rs/metal` | ❌ off |
 | `mlx-pyo3` | `lumen-mlx` | PyO3 subprocess fallback (development only) | ❌ off |
-| `turboquant` | `lumen-model`, `lumen-server` | Candle-side Gemma 4 E4B turboquant path (requires `[patch]` override — uses workspace-relative deps) | ❌ off |
-| `legacy-tests` | `lumen-metal`, `paged-attention` | Re-enable broken integration tests that drifted out of sync with current APIs | ❌ off |
+
+The Candle-era features (`metal`, `turboquant-gpu`, `paged-kv`,
+`qwen3_5_moe`, `legacy-candle`, `turboquant`, `mpsgraph`, `legacy-tests`)
+were removed with the Candle backend.
 
 When adding new features:
 
@@ -201,22 +207,6 @@ When adding new features:
 
 ---
 
-## 7. HuggingFace fixture pipeline
-
-| | |
-|---|---|
-| Dataset repo | `hsng95/lumen-rs-fixtures` |
-| Files | `layer0_moe_weights.safetensors` (3.2 GB), `layer0_linear_attn_weights.safetensors` (135 MB), `layer3_self_attn_weights.safetensors` (109 MB) |
-| Download | `python scripts/fetch_fixtures.py` (uses `DEFAULT_REPO` constant; override with `LUMEN_FIXTURES_REPO`) |
-| Upload | `hf upload hsng95/lumen-rs-fixtures <file> --repo-type dataset` (needs `hf auth login` with **Write** scope) |
-| zsh gotcha | Don't use `\` line continuation when chaining `hf upload` — zsh fights it. Run each upload as a single line. |
-
-If you add new fixtures, edit the `FIXTURES` list in
-`scripts/fetch_fixtures.py` *and* upload to the dataset in the same
-PR; otherwise clone-ers' `fetch_fixtures.py` runs error out.
-
----
-
 ## 8. Performance reference numbers (M3 Max, sanity gates)
 
 Use these as the "did I break something?" thresholds. If a perf bench
@@ -225,13 +215,16 @@ before pushing.
 
 | Workload | Expected | A/B partner |
 |---|---|---|
-| Embedding b=3, default kernel | ~19 ms/batch | naive (`LUMEN_AFFINE8_NAIVE=1`): ~35 ms |
-| Embedding quality eval (25-item KR/EN) | P@1 ≥ 0.95, MRR ≥ 0.97 | — |
+| Embedding, 25 texts warm | ~55 ms total, 2.20 ms/item | unbatched (`LUMEN_EMBEDDING_BATCH_ROWS=1`): 220 ms, 8.80 ms/item |
+| Embedding quality eval (25-item KR/EN) | P@1 ≥ 0.95, MRR ≥ 0.97 | vs the committed Candle reference: per-item cosine ≥ 0.99 |
 | Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
-| Qwen3.6-35B-A3B-mxfp4 N=1 decode (mlx-native default) | 13.9 ms/step p50, **71.6 tok/s** | Candle backend (`LUMEN_MODE=candle`): 22.0 ms / 45.5 tok/s |
-| Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode (mlx-native) | 14.85 ms/step p50, **67.3 tok/s** | Candle backend: 486 ms / 2.0 tok/s — Candle SDPA does not scale to long KV |
-| Qwen3.6-35B-A3B-mxfp4 Candle N=1 fused | 48 ms/step p50, 20 tok/s | all `LUMEN_DISABLE_*=1`: ~66 ms p50 |
-| Qwen3.6 N=1 → N=2 CB | aggregate +17% | per-seq −41% (known MoE limitation) |
+| Qwen3.6-35B-A3B-mxfp4 N=1 decode | 13.9 ms/step p50, **71.6 tok/s** | — |
+| Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode | 14.85 ms/step p50, **67.3 tok/s** | — |
+
+The Candle A/B columns are gone with the backend. Their last recorded values,
+for the record: Candle N=1 was 22.0 ms / 45.5 tok/s, and at PROMPT_LEN=2048 it
+was 486 ms / 2.0 tok/s — its SDPA did not scale to long KV, which is most of
+why MLX became the only path.
 
 **Always report `p50` for thermal-sensitive measurements** — `mean` is
 noisy after a few hot runs. The benches print both.
@@ -248,30 +241,34 @@ Update this table whenever a path graduates from "WIP" to "validated".
 
 | Path | Status | Validation evidence |
 |---|---|---|
-| `/v1/embeddings` (Qwen3-Embedding-0.6B MLX 8-bit) | ✅ validated | `embedding_smoke` runs ~19 ms; `embedding_quality` P@1 = 0.960 |
-| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit, mlx-native) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
-| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4, mlx-native **default**) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
-| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4, Candle fallback `LUMEN_MODE=candle`) | ✅ validated | `bench_cb_qwen35` p50 22 ms / 45 tok/s (short), 486 ms / 2 tok/s (PROMPT_LEN=2048) |
-| `/v1/chat/completions` (Qwen3.6-27B-4bit dense, qwen3_5_moe) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| GGUF Gemma | ⚠ exploratory | No active CI |
-| Candle Qwen legacy | ⚠ exploratory | Pre-mlx-native; left in place |
-| PagedAttention scheduler | ❌ WIP | Scaffolding only; integration tests behind `legacy-tests` |
+| `/v1/embeddings` (Qwen3-Embedding-0.6B MLX 8-bit) | ✅ validated | `embedding_parity` — worst per-item cosine 0.9988 vs the captured Candle reference, P@1 0.960 / MRR 0.980 identical, 2.20 ms/item warm (4.6× the Candle path it replaced) |
+| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
+| `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
+| `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
+| `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
+| PagedAttention | ❌ parked | `crates/paged-attention` is excluded from the workspace pending an MLX rewrite — see its README |
+
+The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
+are gone with the backend. GGUF has no MLX equivalent, so that capability was
+dropped rather than ported; it had already been unreachable in a default build,
+since `mlx-native` short-circuits backend selection before the GGUF check.
 
 ---
 
 ## 10. Common operation cheatsheet
 
 ```bash
-# Smoke before push (full matrix)
-cargo check --workspace --release
-cargo check --workspace --features lumen-server/qwen3_5_moe --release
-cargo check --workspace --features lumen-server/mlx-native --release
-cargo test -p lumen-metal --release --test affine8_parity
-git grep "/Users/sonheesung"     # must be empty
+# Smoke before push — see §2
+cargo xtask test
+cargo xtask red-green
+cargo test -p lumen-mlx                              # GPU-free tier, seconds
+git grep "/Users/sonheesung"                         # must be empty
 
-# Quick embedding A/B
-cargo run --release -p lumen-model --example embedding_smoke
-LUMEN_AFFINE8_NAIVE=1 cargo run --release -p lumen-model --example embedding_smoke
+# Embedding parity + batching A/B
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
+LUMEN_EMBEDDING_BATCH_ROWS=1 EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 
 # Gemma 4 native bench
 MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
@@ -279,13 +276,11 @@ PROMPT_LEN=4096 STEPS=32 WARMUP=8 \
   cargo run --release --features mlx-native \
   -p lumen-mlx --example bench_gemma4_native_e2e
 
-# Qwen3.6 CB bench
-SHARDS=$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-mxfp4/snapshots/*/ | head -1)
-LUMEN_QWEN35_SHARDS="$SHARDS" \
+# Qwen3.6 MLX e2e bench
 MODEL_ID=mlx-community/Qwen3.6-35B-A3B-mxfp4 \
-N=2 DECODE_STEPS=32 WARMUP=4 PROMPT_LEN=128 \
-  cargo run --release --features qwen3_5_moe \
-  -p lumen-model --example bench_cb_qwen35
+PROMPT_LEN=2048 STEPS=32 WARMUP=8 \
+  cargo run --release --features mlx-native \
+  -p lumen-mlx --example bench_mlx_e2e
 
 # Bump a fork SHA after rebasing
 cd ~/Documents/GitHub/<fork>

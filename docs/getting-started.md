@@ -54,7 +54,7 @@ cargo build --release --features mlx-native        # + Gemma 4 chat
 Add Qwen3.6 (opt-in) when you also want the Candle-based MoE backend:
 
 ```bash
-cargo build --release --features mlx-native --features lumen-server/qwen3_5_moe
+cargo build --release -p lumen-server
 ```
 
 The first build downloads dependencies and compiles ~250 crates — allow
@@ -63,7 +63,7 @@ The first build downloads dependencies and compiles ~250 crates — allow
 ### Verify
 
 ```bash
-cargo test -p lumen-metal --release --test affine8_parity
+cargo test -p lumen-mlx
 # expected: 7 passed; 0 failed
 ```
 
@@ -112,7 +112,7 @@ export LUMEN_QWEN35_SHARDS=~/models/qwen3.6-35b-a3b-mxfp4
 Loads model, embeds 3 KR/EN phrases, prints timings + cosines.
 
 ```bash
-cargo run --release -p lumen-model --example embedding_smoke
+cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 ```
 
 Expected (M3 Max):
@@ -125,7 +125,7 @@ Expected (M3 Max):
 ### Embedding quality (25-item KR/EN corpus)
 
 ```bash
-cargo run --release -p lumen-model --example embedding_quality
+cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 ```
 
 Expected:
@@ -138,11 +138,11 @@ Expected:
 
 ```bash
 # Cooperative simdgroup (default):
-cargo run --release -p lumen-model --example embedding_smoke
+cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 
 # Naive 1-thread/output (forced):
-LUMEN_AFFINE8_NAIVE=1 \
-  cargo run --release -p lumen-model --example embedding_smoke
+LUMEN_EMBEDDING_BATCH_ROWS=1 \
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 ```
 
 You should see ~19 ms vs ~35 ms — proof the kernel optimization
@@ -159,17 +159,16 @@ cargo run --release --features mlx-native \
 Expected (M3 Max): ~18.8 ms/step decode with the custom flash-attn
 primitive (vs ~19.9 ms with mlx default sdpa).
 
-### Qwen3.6 continuous-batching bench
+### Qwen3.6 MLX bench
 
 ```bash
-N=2 DECODE_STEPS=32 WARMUP=4 PROMPT_LEN=128 \
-  cargo run --release \
-    --features qwen3_5_moe \
-    -p lumen-model --example bench_cb_qwen35
+MODEL_ID=mlx-community/Qwen3.6-35B-A3B-mxfp4 \
+PROMPT_LEN=2048 STEPS=32 WARMUP=8 \
+  cargo run --release --features mlx-native \
+    -p lumen-mlx --example bench_mlx_e2e
 ```
 
-Expected (M3 Max): N=1 ≈ 48 ms/step p50, N=2 ≈ 82 ms/step with +17 %
-aggregate throughput.
+Expected (M3 Max): ~14.85 ms/step p50, 67.3 tok/s.
 
 ## 5. Run the HTTP server
 
@@ -196,11 +195,8 @@ EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
 
 ```bash
 EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
-LUMEN_QWEN35_SHARDS=~/models/qwen3.6-35b-a3b-mxfp4 \
-  cargo run --release \
-    --features mlx-native \
-    --features lumen-server/qwen3_5_moe \
-    --bin lumen-server
+MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
+  cargo run --release --bin lumen-server
 ```
 
 ### Smoke-test the endpoints
@@ -277,38 +273,11 @@ LUMEN_VISION=1 MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
   --example gemma4_vision_describe -- some-image.png "What is this?"
 ```
 
-## 6. Download integration-test fixtures (optional)
-
-For the `--features qwen3_5_moe` integration tests, fetch the
-`.safetensors` weight dumps (~3.4 GB) from HuggingFace Hub:
-
-```bash
-pip install huggingface_hub
-python scripts/fetch_fixtures.py
-```
-
-Pulls from
-[hsng95/lumen-rs-fixtures](https://huggingface.co/datasets/hsng95/lumen-rs-fixtures).
-Override with `LUMEN_FIXTURES_REPO=<USER>/<repo>` if you maintain a
-fork. Default-feature tests do not need this.
-
-The vision-tower parity fixture is **not** part of that download — it is
-2.9 MB and committed to the repo, so `gemma4_vision_parity` runs from a
-clean clone with no Python and no HF access. It only needs the
-checkpoint, for the weights:
-
-```bash
-LUMEN_GEMMA4_MODEL_DIR=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
-  cargo test -p lumen-mlx --features mlx-native --test gemma4_vision_parity -- --nocapture
-```
-
-Without that env var the test skips rather than fails.
-
 ## 7. Common A/B switches
 
 | Env | Default | Effect |
 |---|---|---|
-| `LUMEN_AFFINE8_NAIVE=1` | off | Force naive 8-bit GEMM (embedding path) |
+| `LUMEN_EMBEDDING_BATCH_ROWS=1` | off | Force naive 8-bit GEMM (embedding path) |
 | `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | on | Disable custom flash-attn primitive |
 | `KESTREL_GEMMA4_PREFILL_SYNC=0` | on | Skip explicit eval-sync after prefill |
 | `LUMEN_DISABLE_FLASH_ATTN=1` | off | Disable Qwen3.6 flash-attn |
@@ -317,9 +286,7 @@ Without that env var the test skips rather than fails.
 | `LUMEN_DISABLE_DENSE_MLP_RESIDUAL_FUSION=1` | off | Disable Qwen3.6 dense-MLP residual fusion |
 | `LUMEN_DISABLE_MOE_GATE_UP_SILU_MUL_FUSION=1` | off | Disable Qwen3.6 MoE gate/up/silu/mul fusion |
 | `LUMEN_DISABLE_MOE_WSUM_FUSION=1` | off | Disable Qwen3.6 MoE weighted-sum fusion |
-| `BATCHED_ENGINE=1` | off | Continuous-batching scheduler (GGUF / Qwen3.6) |
-| `LUMEN_MODE=mlx\|candle\|auto` | **mlx** (under `mlx-native` feature) / candle otherwise | Backend selection. `mlx` enables the +57 % tok/s gather_qmm path on Qwen3.6-35B-A3B-mxfp4 |
-| `LUMEN_MLX_BACKEND=native\|pyo3\|subprocess` | **native** (under `mlx-native`) / pyo3 otherwise | Picks the mlx runner. `native` is the Apple-silicon-optimized mlx-rs path |
+| `LUMEN_MLX_BACKEND=native\|pyo3\|subprocess` | **native** | Picks the mlx runner. `native` is the Apple-silicon-optimized mlx-rs path |
 
 ## 8. Troubleshooting
 
@@ -340,16 +307,15 @@ between A/B runs.
 
 The fixtures dataset is under the `hsng95` namespace by default. If you
 clone this repo and want to publish your own fixture builds, replace
-`hsng95` with your HF account name in `scripts/fetch_fixtures.py`
 (`DEFAULT_REPO`) and use a token with **Write + Create repos** scope.
 Fine-grained tokens need both checks; classic "Write" tokens cover
 both implicitly.
 
 ### Slow `cargo build` first time
 
-The default workspace has ~250 dependencies. With `--features
-mlx-native --features lumen-server/qwen3_5_moe` the dep graph
-approaches ~330 crates. Use `cargo build --release` with `CARGO_BUILD_JOBS`
+The default build compiles MLX from source (cmake + the Metal shader
+compiler), which dominates the first build. Use `cargo build --release`
+with `CARGO_BUILD_JOBS`
 matched to your performance cores to avoid scheduler thrash on small
 M-series machines.
 

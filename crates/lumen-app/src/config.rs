@@ -9,7 +9,13 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+// Bumped 7 -> 8 alongside the Candle removal. It had been 7 while
+// `migrate_in_place` already carried a `v7 -> v8` step, and migration only
+// runs when `schema_version < CURRENT` — so a config sitting at exactly 7
+// never received that step. Raising the constant makes it reachable and
+// re-saves those configs, which also normalizes the retired
+// `backend-mode = "candle"` to `auto`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -199,10 +205,13 @@ pub struct AdvancedConfig {
 
     /// → `LUMEN_SPEC` — speculative decoding strategy.
     pub spec_kind: SpecKind,
-    /// → `LUMEN_SPEC_DRAFT_N_MAX` — max draft tokens per step.
+    /// → `LUMEN_SPEC_K` — draft tokens per step.
     pub spec_draft_n_max: Option<u32>,
 
-    /// → `BATCHED_ENGINE=1` — enables the batched scheduler.
+    /// → `LUMEN_MLX_BATCH_DECODE=1` — enables the MLX continuous-batching
+    /// scheduler. Note it only admits greedy requests: anything with a
+    /// non-zero temperature, tools, `response_format` or stop strings is
+    /// routed to the sequential path regardless of this setting.
     #[serde(default)]
     pub batched_engine: bool,
 
@@ -214,8 +223,13 @@ pub struct AdvancedConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendMode {
+    /// `candle` is aliased here rather than removed outright: a config saved
+    /// before the Candle backend was deleted still says `backend-mode =
+    /// "candle"`, and `toml::from_str` hard-errors on an unknown variant —
+    /// which happens *before* `migrate_in_place` can rewrite anything. The
+    /// alias lets those configs load, and the v8 migration re-saves them.
+    #[serde(alias = "candle")]
     Auto,
-    Candle,
     MlxNative,
     MlxPyo3,
 }

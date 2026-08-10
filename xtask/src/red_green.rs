@@ -17,11 +17,6 @@ use std::process::{Command, ExitCode};
 const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
-const MTL: &str = "crates/lumen-metal/src";
-const MDL: &str = "crates/lumen-model/src";
-/// One defect below lived in the guard itself: it drained the wrong queue and
-/// so reported a kernel broken that was exactly right.
-const MTLT: &str = "crates/lumen-metal/tests";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -38,7 +33,9 @@ struct Guard {
     filter: &'static str,
     /// `--features` value; empty selects the crate default.
     features: &'static str,
-    /// Restrict to the lib target. Binary-only crates must leave this false.
+    /// Restrict to the lib target — skips building the crate's binaries and
+    /// examples for a guard that only needs the library. A crate with no lib
+    /// target must leave this false.
     lib_only: bool,
     /// Integration test target for `--test`; empty runs every target.
     test_target: &'static str,
@@ -79,36 +76,16 @@ const fn dif(filter: &'static str) -> Guard {
         release: false,
     }
 }
+/// `lumen-server` grew a lib target so its request types could be reached from
+/// tests and fuzzing; these guards live in `engine.rs`, which moved with it.
 const fn srv(filter: &'static str) -> Guard {
     Guard {
         package: "lumen-server",
         filter,
         features: "mlx-native",
-        lib_only: false,
+        lib_only: true,
         test_target: "",
         release: false,
-    }
-}
-/// GPU guards: `model-integration` gates the Affine4/Affine3 harnesses, and
-/// they are unusably slow unoptimized.
-const fn mtl(test_target: &'static str, filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-metal",
-        filter,
-        features: "model-integration",
-        lib_only: false,
-        test_target,
-        release: true,
-    }
-}
-const fn mdl(test_target: &'static str, filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-model",
-        filter,
-        features: "lumen-metal/model-integration",
-        lib_only: false,
-        test_target,
-        release: true,
     }
 }
 
@@ -203,21 +180,22 @@ static DEFECTS: &[Defect] = &[
         name: "tool-name-scanner",
         symptom: "`call:bad call:good{x:1}` parsed as ONE tool named \
                   \"bad call:good\" — a name no client declared",
+        // De-indented by four relative to the original entry: the parser moved
+        // out of `gemma4_response`'s `mod imp` into the ungated
+        // `gemma4_tool_syntax`, so it sits one block shallower.
         revert: &[Mutation {
             path: MLX,
-            find: r#"                if bytes[brace_start..].starts_with(b"call:") {
-                    hit_next_call = true;
-                    break;
-                }
+            find: r#"            if bytes[brace_start..].starts_with(b"call:") {
+                hit_next_call = true;
+                break;
+            }
 "#,
-            replace: "                // xtask red-green: next-call boundary removed\n",
+            replace: "            // xtask red-green: next-call boundary removed\n",
         }],
         guards: &[
-            mlx("gemma4_response::imp::tests::body_parser_stops_a_name_at_the_next_opener"),
-            mlx("gemma4_response::imp::tests::body_parser_skips_a_run_of_malformed_openers"),
-            mlx(
-                "gemma4_response::imp::tests::body_parser_stops_a_non_ascii_name_at_the_next_opener",
-            ),
+            mlx("gemma4_tool_syntax::tests::body_parser_stops_a_name_at_the_next_opener"),
+            mlx("gemma4_tool_syntax::tests::body_parser_skips_a_run_of_malformed_openers"),
+            mlx("gemma4_tool_syntax::tests::body_parser_stops_a_non_ascii_name_at_the_next_opener"),
         ],
         occurrences: 1,
         needs_checkpoint: false,
@@ -232,9 +210,9 @@ static DEFECTS: &[Defect] = &[
             replace: r#".find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))"#,
         }],
         guards: &[
-            mlx("gemma4_response::imp::tests::args_to_json_quotes_a_non_ascii_bare_key"),
+            mlx("gemma4_tool_syntax::tests::args_to_json_quotes_a_non_ascii_bare_key"),
             mlx(
-                "gemma4_response::imp::tests::args_to_json_handles_non_ascii_in_nested_and_array_positions",
+                "gemma4_tool_syntax::tests::args_to_json_handles_non_ascii_in_nested_and_array_positions",
             ),
         ],
         occurrences: 1,
@@ -427,131 +405,6 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: true,
         extra: &["--ignored"],
     },
-    Defect {
-        name: "icb-hazard-barrier",
-        symptom: "the ICB matmul raced every neighbouring command: reading its \
-                  output back produced a different wrong answer each call \
-                  (~98% of 5120 elements, non-deterministic). Candle opens its \
-                  compute encoders with MTLDispatchType::Concurrent and orders \
-                  them from set_input_buffer/set_output_buffer, which ICB-bound \
-                  buffers never reach",
-        revert: &[
-            Mutation {
-                path: MTL,
-                find: "        encoder.insert_memory_barrier();\n        \
-                       encoder.execute_commands_in_buffer(&cache.icb_no_residual, 1);\n        \
-                       encoder.insert_memory_barrier();",
-                replace: "        encoder.execute_commands_in_buffer(&cache.icb_no_residual, 1);",
-            },
-            Mutation {
-                path: MTL,
-                find: "        encoder.insert_memory_barrier();\n        \
-                       encoder.execute_commands_in_buffer(&cache.icb_residual, 1);\n        \
-                       encoder.insert_memory_barrier();",
-                replace: "        encoder.execute_commands_in_buffer(&cache.icb_residual, 1);",
-            },
-        ],
-        guards: &[
-            mtl(
-                "affine4_icb_parity",
-                "forward_bf16_in_bf16_out_icb_re_records_on_buffer_change",
-            ),
-            mtl(
-                "affine4_icb_parity",
-                "forward_bf16_in_bf16_out_icb_handles_batch_change",
-            ),
-            mtl(
-                "affine4_icb_parity",
-                "forward_bf16_in_bf16_out_icb_matches_standard",
-            ),
-        ],
-        occurrences: 1, // per mutation: the no-residual and residual variants
-        needs_checkpoint: false,
-        extra: &[],
-    },
-    Defect {
-        name: "affine3-parity-drains-wrong-queue",
-        symptom: "affine3 qmv_fast parity reported max_rel_err=1 on a kernel \
-                  that is exactly right: `*_pipelined` encodes onto the shared \
-                  process_commands() scheduler, and the test committed an \
-                  empty command buffer on ctx.queue instead — waiting for \
-                  nothing, then reading an untouched buffer",
-        revert: &[Mutation {
-            path: MTLT,
-            find: "    lumen_metal::metal::process_commands()\n        .flush_and_wait()\n        \
-                   .expect(\"flush\");",
-            replace: "    let drain = lumen_metal::metal::new_command_buffer(&ctx3.ctx.queue);\n    \
-                      drain.commit();\n    drain.wait_until_completed();",
-        }],
-        guards: &[mtl("affine3_poc_bw", "affine3_qmv_fast_parity_small")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
-    },
-    Defect {
-        name: "bf16-out-dispatch",
-        symptom: "nothing user-visible — and that is the point. The bf16-in \
-                  fast path and the f32-widen detour agree bit-for-bit, so a \
-                  regression here is pure lost throughput with no functional \
-                  signal. The old guard asserted a wall-clock ratio, which \
-                  measured the machine's mood (it ran at 1.07 against a 1.10 \
-                  threshold)",
-        revert: &[Mutation {
-            path: MTL,
-            find: "        if qmv_fast_ok && x.dtype() == DType::BF16 {",
-            replace: "        if false && qmv_fast_ok && x.dtype() == DType::BF16 {",
-        }],
-        guards: &[mtl(
-            "affine4_qmv_fast_bf16_parity",
-            "bf16_input_takes_the_qmv_fast_path_not_the_f32_detour",
-        )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
-    },
-    Defect {
-        name: "dense-shapes-on-qmv-fast",
-        symptom: "another wall-clock gate (`bf16 <= f32 * 1.20` per shape). It \
-                  failed a routine full-suite run at 1.21 on in_proj_comb -- \
-                  ~18% swing on a busy box -- having passed minutes earlier \
-                  and later. Ratios on an idle machine sit at 0.99-1.03, so \
-                  the gate was measuring load, not the kernel",
-        revert: &[Mutation {
-            path: MTL,
-            find: "in_features.is_multiple_of(512) && out_features.is_multiple_of(8)",
-            replace: "in_features.is_multiple_of(2048) && out_features.is_multiple_of(8)",
-        }],
-        guards: &[mtl(
-            "affine4_qmv_fast_bf16_parity",
-            "every_dense_projection_shape_stays_on_the_bf16_qmv_fast_kernel",
-        )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
-    },
-    Defect {
-        name: "paged-kv-context-length",
-        symptom: "the paged attention guard reported max_rel diff 0.69 against \
-                  a kernel that reproduces the CPU reference to 9e-5. It fed \
-                  store_kv only the new token — the backend takes the whole \
-                  cache and narrows the tail itself, so a shorter tensor reads \
-                  as a cache reset, silently drops the history and attends over \
-                  1 token of 5 — and its reference applied a 1/sqrt(head_dim) \
-                  scale that this call site does not use. At 1e-2 the guard \
-                  could not have caught either",
-        // Not the reverted test: an off-by-one in the context length the
-        // kernel is handed. That is the defect class the guard exists for,
-        // and it only bites once the guard actually spans the history.
-        revert: &[Mutation {
-            path: MDL,
-            find: "let cl_buf = self.fresh_context_len_buf(eff_seq_len as i32)?;",
-            replace: "let cl_buf = self.fresh_context_len_buf(eff_seq_len as i32 - 1)?;",
-        }],
-        guards: &[mdl("paged_kv_test", "test_paged_kv_backend_end_to_end")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
-    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -563,7 +416,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "json-separator-space")
         | (_, "grammar-rule-names")
         | (_, "grammar-literal-escaping") => "grammar.rs",
-        (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_response.rs",
+        // Both defects live in the tool-call body grammar, which moved out of
+        // `gemma4_response`'s feature-gated `mod imp` so it can be tested and
+        // fuzzed without `mlx-native`.
+        (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
@@ -571,10 +427,6 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
-        (MTL, "icb-hazard-barrier") | (MTL, "bf16-out-dispatch") => "affine4_linear.rs",
-        (MTL, "dense-shapes-on-qmv-fast") => "affine4_gpu.rs",
-        (MTLT, "affine3-parity-drains-wrong-queue") => "affine3_poc_bw.rs",
-        (MDL, "paged-kv-context-length") => "paged_kv.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

@@ -43,6 +43,9 @@ mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675a
 ] }
 mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true }
 
+[dev-dependencies]
+lumen-testkit = { workspace = true }
+
 [features]
 default = []
 mlx-native = ["dep:mlx-rs", "dep:mlx-sys", "mlx-rs/safetensors"]

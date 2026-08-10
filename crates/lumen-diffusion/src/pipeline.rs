@@ -181,16 +181,7 @@ mod parity_tests {
         (d[0], d[1], d[2], d[3]) // lat_h, lat_w, img_seq, txt_seq
     }
 
-    fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        assert_eq!(a.len(), b.len(), "cosine: size mismatch");
-        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b.iter()) {
-            dot += x as f64 * y as f64;
-            na += x as f64 * x as f64;
-            nb += y as f64 * y as f64;
-        }
-        dot / (na.sqrt() * nb.sqrt() + 1e-12)
-    }
+    use lumen_testkit::cosine;
 
     /// Reorder channels-first `[B,C,H,W]` flat → channels-last `[B,H,W,C]`.
     fn cf_to_cl(cf: &[f32], b: usize, c: usize, h: usize, w: usize) -> Vec<f32> {

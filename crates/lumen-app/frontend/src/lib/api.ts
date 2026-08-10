@@ -53,7 +53,7 @@ export interface ContextConfig {
   default_max_tokens: number;
 }
 
-export type BackendMode = "auto" | "candle" | "mlx-native" | "mlx-pyo3";
+export type BackendMode = "auto" | "mlx-native" | "mlx-pyo3";
 export type SpecKind = "off" | "lookup" | "mtp";
 
 export interface PagedConfig {

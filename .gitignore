@@ -20,10 +20,8 @@ __pycache__/
 models/
 assets/*.bin
 
-# ── Test fixtures (regenerate via scripts/fetch_fixtures.py) ──
-crates/lumen-model/tests/fixtures/*.safetensors
+# ── Test fixtures ──
 crates/lumen-mlx/tests/fixtures/*.safetensors
-crates/lumen-metal/tests/fixtures/
 # Exception: the vision-tower golden is 2.9 MB, not GB-scale, and is the only
 # thing standing between `gemma4_vision_parity` and a Python dependency at test
 # time. Committing it keeps that test pure Rust and runnable from a clean clone.

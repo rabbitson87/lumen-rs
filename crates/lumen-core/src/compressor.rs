@@ -190,15 +190,11 @@ mod tests {
     use rand::prelude::*;
     use rand_distr::StandardNormal;
 
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a < 1e-10 || norm_b < 1e-10 {
-            return 0.0;
-        }
-        dot / (norm_a * norm_b)
-    }
+    // Shared with every other parity test in the workspace. Accumulates in
+    // f64 rather than f32: this suite asserts thresholds like 0.99 on
+    // thousand-element dot products, where an f32 accumulator is the noisiest
+    // term in the comparison.
+    use lumen_testkit::cosine as cosine_similarity;
 
     /// Helper: generate random Gaussian vectors (not unit-normalized)
     /// matching real KV cache distributions.
@@ -211,7 +207,7 @@ mod tests {
     }
 
     /// Helper: run e2e cosine similarity test with given config.
-    fn e2e_cosine_test(config: TurboQuantConfig, n_vectors: usize, n_queries: usize) -> (f64, f32) {
+    fn e2e_cosine_test(config: TurboQuantConfig, n_vectors: usize, n_queries: usize) -> (f64, f64) {
         let dim = config.head_dim;
         let compressor = TurboQuantCompressor::new(config);
         let mut rng = StdRng::seed_from_u64(99);
@@ -219,7 +215,7 @@ mod tests {
         let vectors = generate_kv_vectors(&mut rng, n_vectors, dim);
         let compressed = compressor.compress(&vectors, n_vectors);
 
-        let mut min_cosine = f32::MAX;
+        let mut min_cosine = f64::MAX;
         let mut sum_cosine = 0.0f64;
 
         for _ in 0..n_queries {
@@ -237,7 +233,7 @@ mod tests {
             let est_scores = compressor.estimate_inner_products(&query, &compressed);
             let cos = cosine_similarity(&true_scores, &est_scores);
             min_cosine = min_cosine.min(cos);
-            sum_cosine += cos as f64;
+            sum_cosine += cos;
         }
 
         (sum_cosine / n_queries as f64, min_cosine)
@@ -273,7 +269,7 @@ mod tests {
                 })
                 .collect();
             let est_scores = compressor.estimate_inner_products_stage1(&query, &compressed);
-            sum_cosine += cosine_similarity(&true_scores, &est_scores) as f64;
+            sum_cosine += cosine_similarity(&true_scores, &est_scores);
         }
         let avg = sum_cosine / n_queries as f64;
         eprintln!("3-bit stage1-only: avg cosine={avg:.4}");

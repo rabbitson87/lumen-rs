@@ -7,9 +7,13 @@
 //! Pairs with `gemma4_tool_call_body.rs` which covers the assistant-
 //! side serializer; this file pins the inverse direction.
 
-#![cfg(feature = "mlx-native")]
+//! Needs no feature: the parser under test is `&str` in, JSON out, and lives
+//! in the ungated `gemma4_tool_syntax` module. It used to be reached through
+//! `lumen_mlx::gemma4`, which is `#[cfg(feature = "mlx-native")]`, so this
+//! whole file compiled to zero tests in the default build — the one fast
+//! enough to run on every change.
 
-use lumen_mlx::gemma4::{gemma4_args_to_json, parse_tool_call_body};
+use lumen_mlx::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
 use serde_json::json;
 
 #[test]

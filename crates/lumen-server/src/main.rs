@@ -1,18 +1,16 @@
-mod catalog;
-mod diffusion_engine;
-mod embedding;
-mod engine;
-mod load_stats;
-mod routes;
-mod types;
-
+// The modules moved to `lib.rs` so tests and fuzz targets can reach them; see
+// the module docs there. This binary is the same code it always was, one
+// crate boundary further out.
 use atomic_http::external::http::{Response, StatusCode};
 use atomic_http::*;
 
-use diffusion_engine::DiffusionHandle;
-use embedding::{EmbeddingHandle, EmbeddingService};
-use engine::{EngineHandle, InferenceEngine};
-use types::ErrorResponse;
+use lumen_server::diffusion_engine::{self, DiffusionHandle};
+use lumen_server::embedding::EmbeddingHandle;
+#[cfg(feature = "mlx-native")]
+use lumen_server::embedding::EmbeddingService;
+use lumen_server::engine::{EngineHandle, InferenceEngine};
+use lumen_server::types::ErrorResponse;
+use lumen_server::{catalog, routes};
 
 /// Default image model id surfaced in `/v1/models` and image responses.
 const DEFAULT_IMAGE_MODEL: &str = "flux2-dev";
@@ -348,11 +346,22 @@ async fn main() -> Result<(), SendableError> {
         None
     };
 
-    // Optional embedding model. Only spawn the subprocess when
-    // `EMBEDDING_MODEL_ID` is set — otherwise `/v1/embeddings` returns
-    // 503 with an actionable message. The service runs on a dedicated
-    // blocking thread because the underlying subprocess pipe is
-    // synchronous (blocking_recv inside the loop).
+    // Optional embedding model. Only load when `EMBEDDING_MODEL_ID` is set —
+    // otherwise `/v1/embeddings` returns 503 with an actionable message. The
+    // service runs on a dedicated blocking thread because the forward pass is
+    // synchronous GPU work (blocking_recv inside the loop).
+    #[cfg(not(feature = "mlx-native"))]
+    let embedding_handle: Option<EmbeddingHandle> = {
+        if std::env::var("EMBEDDING_MODEL_ID").is_ok_and(|v| !v.is_empty()) {
+            eprintln!(
+                "[embedding] EMBEDDING_MODEL_ID is set but this binary was built without \
+                 `mlx-native`, which is what runs the embedding model — /v1/embeddings will \
+                 return 503."
+            );
+        }
+        None
+    };
+    #[cfg(feature = "mlx-native")]
     let embedding_handle: Option<EmbeddingHandle> = match std::env::var("EMBEDDING_MODEL_ID") {
         Ok(model_id) if !model_id.is_empty() => {
             eprintln!("Loading embedding model: {model_id}");

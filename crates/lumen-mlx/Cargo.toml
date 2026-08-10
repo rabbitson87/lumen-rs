@@ -93,6 +93,63 @@ mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
-# A/B benchmark only: compares the custom Nvfp4 Metal kernel against the mlx FFI
-# quantized_matmul(NVFP4) path. Not a production dependency of lumen-mlx.
-lumen-metal = { path = "../lumen-metal" }
+
+# ── Examples that cannot build under `default = []` ───────────────────────────
+#
+# Most examples here handle the featureless build themselves, with a
+# `#[cfg(feature = "mlx-native")] fn main()` and a stub for the other side.
+# These twelve name `mlx_rs` types (or `lumen_mlx` re-exports that are gated on
+# it) at module scope, where a `cfg` on `main` cannot help. Per
+# `docs/maintainer-workflow.md` §6 they declare the feature instead, so a plain
+# `cargo test -p lumen-mlx` skips them rather than failing to compile.
+#
+# Without these entries the crate's own default configuration does not build,
+# which is how `qwen3_5_mtp` silently lost its feature gate: nothing ever ran
+# the build that would have caught it.
+[[example]]
+name = "bench_affine4_qmv_decode"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_mtp_headinternal_poc"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_mtp_ref_compare"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_ab"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_decode_smoke"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_loader_smoke"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_realprompt"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_step_b"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m1_affine4_qmv_custom"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2a_conv_silu_fused"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2b_qk_rmsnorm_fused"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2c_inproj_tail_fused"
+required-features = ["mlx-native"]

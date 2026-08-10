@@ -2547,7 +2547,7 @@ mod imp {
 
         #[test]
         fn native_model_config_accepts_checked_in_qwen3_5_moe_fixture() -> Result<()> {
-            let fixture = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+            let fixture = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
             let config: NativeModelConfig = serde_json::from_str(fixture)?;
             let text = config.validate_qwen3_5_moe_contract()?;
 
@@ -3053,6 +3053,30 @@ mod imp {
             Err(anyhow!(
                 "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
             ))
+        }
+
+        // L2 disk tier. Both mirror what the real runner does when no disk
+        // tier is configured (`self.disk.is_none()`): persisting is a no-op
+        // and a lookup is a miss. Erroring instead would be louder but wrong —
+        // the caller treats a failure as "the disk write broke", and nothing
+        // broke here; there is simply no state. Unreachable in practice, since
+        // `load()` above fails long before anything holds a snapshot id.
+        pub(crate) fn persist_snapshot_disk(
+            &mut self,
+            _snapshot_id: u64,
+            _key: &str,
+            _prefix_tokens: &[u32],
+            _last_token: Option<u32>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        pub(crate) fn load_persisted_disk(
+            &mut self,
+            _key: &str,
+            _prompt_ids: &[u32],
+        ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+            Ok(None)
         }
 
         pub(crate) fn take_decode_timing_log(&mut self) -> Option<Vec<(f64, f64)>> {

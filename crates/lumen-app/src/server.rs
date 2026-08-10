@@ -872,9 +872,6 @@ fn apply_env(
     // ── Advanced ───────────────────────────────────────────────────
     match cfg.advanced.backend_mode {
         BackendMode::Auto => {}
-        BackendMode::Candle => {
-            cmd.env("LUMEN_MLX_BACKEND", "candle");
-        }
         BackendMode::MlxNative => {
             cmd.env("LUMEN_MLX_BACKEND", "mlx-native");
         }
@@ -892,10 +889,20 @@ fn apply_env(
         }
     }
     if let Some(n) = cfg.advanced.spec_draft_n_max {
-        cmd.env("LUMEN_SPEC_DRAFT_N_MAX", n.to_string());
+        // `LUMEN_SPEC_DRAFT_N_MAX` was never read by anything; the runner's
+        // knob is `LUMEN_SPEC_K`.
+        cmd.env("LUMEN_SPEC_K", n.to_string());
     }
     if cfg.advanced.batched_engine {
-        cmd.env("BATCHED_ENGINE", "1");
+        // `BATCHED_ENGINE` drove the Candle scheduler, which is gone. MLX has
+        // its own, behind this flag.
+        cmd.env("LUMEN_MLX_BATCH_DECODE", "1");
+    }
+    // Batch width for the MLX scheduler above. Historically grouped under
+    // "paged attention" and therefore only sent when *that* was enabled —
+    // but nothing paged reads it, and the MLX scheduler does.
+    if let Some(n) = cfg.advanced.paged_attention.max_batch {
+        cmd.env("PAGED_MAX_BATCH", n.to_string());
     }
 
     // ── Paged attention ────────────────────────────────────────────
@@ -916,9 +923,6 @@ fn apply_env(
         }
         if let Some(n) = p.global_every {
             cmd.env("PAGED_GLOBAL_EVERY", n.to_string());
-        }
-        if let Some(n) = p.max_batch {
-            cmd.env("PAGED_MAX_BATCH", n.to_string());
         }
     }
 
@@ -970,8 +974,8 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_WIRED_LIMIT_BYTES",
     "LUMEN_MLX_BACKEND",
     "LUMEN_SPEC",
-    "LUMEN_SPEC_DRAFT_N_MAX",
-    "BATCHED_ENGINE",
+    "LUMEN_SPEC_K",
+    "LUMEN_MLX_BATCH_DECODE",
     "PAGED_KV",
     "PAGED_LAYERS",
     "PAGED_KV_HEADS",

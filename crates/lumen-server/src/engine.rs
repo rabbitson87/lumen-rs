@@ -1,128 +1,23 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::load_stats::ServerLoadStats;
+use crate::types::*;
 use anyhow::Result;
 use lumen_mlx::SamplingOverrides;
 use lumen_mlx::chat_io::{
     AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
     ResolvedToolChoice, ToolDef,
 };
-use lumen_model::gemma::GemmaModel;
-use lumen_model::gemma_gguf::GemmaGgufModel;
-use lumen_model::qwen::QwenModel;
-
-#[cfg(feature = "qwen3_5_moe")]
-use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
-
-/// Gemma 4 26B-A4B native MLX backend wrapper. See
-/// `crates/lumen-mlx/src/gemma4_backend.rs` for the trait-shape API
-/// this dispatches into.
-use crate::load_stats::ServerLoadStats;
-use crate::types::*;
-
-/// Adaptive routing mode (selected at startup; cannot switch at runtime
-/// without cold-load due to ~22.79 GB active memory per backend on 36 GB
-/// unified-memory Mac → simultaneous hot-load OOMs).
-///
-/// See `notes/adaptive_backend_routing_plan.md` and
-/// `notes/phase_a_profile_gap_analysis.md` for the deployment guide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendMode {
-    /// Single-tenant: MLX standalone 71-72 tok/s @ 35B-A3B mxfp4 (1.51× Candle).
-    Mlx,
-    /// Multi-tenant: Candle CB N=8 1.89× wallclock aggregate (~89 tok/s).
-    Candle,
-}
-
-/// Resolve the adaptive routing mode from env. Precedence:
-///   1. `LUMEN_MODE=mlx|candle|auto`  — explicit selection
-///   2. `USE_MLX=1`                     — legacy alias for `LUMEN_MODE=mlx`
-///   3. default                         — Mlx when the `mlx-native` feature is
-///                                        compiled in (mlx-rs gather_qmm path
-///                                        is +57% tok/s vs Candle at short
-///                                        prompts and 33× vs Candle at
-///                                        PROMPT_LEN=2048); otherwise Candle.
-///
-/// `auto` follows the same rule as the unset case.
-fn resolve_backend_mode() -> BackendMode {
-    resolve_backend_mode_from(|name| std::env::var(name).ok())
-}
-
-/// Token-chunk size for the experimental batched engine's eager prefill.
-///
-/// Only consulted on the `BATCHED_ENGINE=1` + GemmaGguf path. Prompts whose
-/// prefix is `<= chunk` keep the single-forward path unchanged; longer prompts
-/// are forwarded in chunks of this size so one sequence's long prefill does not
-/// monopolize a single giant forward and stall other batched sequences.
-/// `0` or an unparseable value falls back to the default. Default: 512.
-fn batched_prefill_chunk() -> usize {
-    std::env::var("LUMEN_BATCHED_PREFILL_CHUNK")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(512)
-}
-
-/// Iteration-level chunked prefill gate (WS-E Lever 1 — head-of-line removal).
-///
-/// When set (`LUMEN_PAGED_BATCH_DECODE=1`), `start_streaming_seq` defers a
-/// long prompt's prefill into the main batched loop: one chunk per iteration,
-/// so already-decoding sequences keep advancing between chunks instead of
-/// stalling for the full prefill. Default OFF → prefill runs synchronously
-/// inside `start_streaming_seq` exactly as before (decode loop byte-identical).
-#[inline]
-fn iter_level_prefill_enabled() -> bool {
-    std::env::var("LUMEN_PAGED_BATCH_DECODE").ok().as_deref() == Some("1")
-}
-
-/// Default backend when no env is set. mlx-native build → Mlx, otherwise Candle.
-#[inline]
-fn default_backend_mode() -> BackendMode {
-    #[cfg(feature = "mlx-native")]
-    {
-        BackendMode::Mlx
-    }
-    #[cfg(not(feature = "mlx-native"))]
-    {
-        BackendMode::Candle
-    }
-}
-
-/// Pure-function variant for unit testing — env access is injected so tests
-/// don't race on the global env.
-fn resolve_backend_mode_from<F>(get: F) -> BackendMode
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(raw) = get("LUMEN_MODE") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "mlx" => return BackendMode::Mlx,
-            "candle" => return BackendMode::Candle,
-            "auto" => return default_backend_mode(),
-            other => {
-                eprintln!(
-                    "warn: LUMEN_MODE={other:?} unrecognized; falling back to default. \
-                     Valid: mlx | candle | auto."
-                );
-                return default_backend_mode();
-            }
-        }
-    }
-    if matches!(get("USE_MLX").as_deref(), Some("1")) {
-        return BackendMode::Mlx;
-    }
-    default_backend_mode()
-}
 
 /// Model backend — supports multiple architectures.
+/// The engine's model backend.
+///
+/// A single variant since the Candle backends were removed (task 006). It is
+/// kept as an enum rather than collapsed into the inner type because this is
+/// the seam a second backend would plug into, and because collapsing it would
+/// churn every call site for no behavior change.
 enum ModelBackend {
-    Qwen(QwenModel),
-    Gemma(GemmaModel),
-    GemmaGguf(GemmaGgufModel),
-    #[cfg(feature = "qwen3_5_moe")]
-    Qwen35Moe(Qwen35MoeBackend),
-    /// Track B Phase 1: MLX backend via Python subprocess + JSON-RPC. Greedy
-    /// only at B1; sampling lands in B2.
     /// Unified mlx-native backend — covers Qwen 2.5 / 3.5 / 3.6 dense + MoE
     /// AND Gemma 4 26B-A4B. Family-specific dispatch happens inside
     /// `MlxBackend`; the engine sees one variant.
@@ -161,22 +56,12 @@ impl ModelBackend {
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
-            Self::Qwen(m) => m.encode(text),
-            Self::Gemma(m) => m.encode(text),
-            Self::GemmaGguf(m) => m.encode(text),
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => m.encode(text),
             Self::Mlx(m) => m.encode(text),
         }
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String> {
         match self {
-            Self::Qwen(m) => m.decode(tokens),
-            Self::Gemma(m) => m.decode(tokens),
-            Self::GemmaGguf(m) => m.decode(tokens),
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => m.decode(tokens),
             Self::Mlx(m) => m.decode(tokens),
         }
     }
@@ -185,11 +70,6 @@ impl ModelBackend {
     /// back to a `len/4` heuristic only if the backend errors during encode.
     fn count_chat_prompt_tokens(&self, messages: &[(String, String)], thinking: bool) -> u32 {
         let res: Result<Vec<u32>> = match self {
-            Self::Qwen(m) => m.build_chat_input(messages),
-            Self::Gemma(m) => m.build_chat_input(messages),
-            Self::GemmaGguf(m) => m.build_chat_input(messages, thinking),
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => m.build_chat_input(messages, thinking),
             Self::Mlx(m) => m.build_chat_input(messages, thinking),
         };
         match res {
@@ -210,19 +90,16 @@ impl ModelBackend {
     fn image_prompt_tokens(&self, images: &[Vec<Vec<u8>>]) -> u32 {
         match self {
             Self::Mlx(m) => m.image_prompt_tokens(images) as u32,
-            _ => 0,
         }
     }
 
     /// Hard model context ceiling (tokens), when the backend exposes one.
     /// Used by the prompt-size guard as an absolute reject limit: a prompt
     /// over this can't fit the KV and OOM-aborts MLX, so it must be rejected
-    /// regardless of `LUMEN_MAX_PROMPT_TOKENS`. Only MLX backends report a
-    /// value today.
+    /// regardless of `LUMEN_MAX_PROMPT_TOKENS`.
     fn max_context(&self) -> Option<u32> {
         match self {
             Self::Mlx(m) => m.max_context().map(|c| c as u32),
-            _ => None,
         }
     }
 
@@ -235,37 +112,7 @@ impl ModelBackend {
         ov: &SamplingOverrides,
         session_id: Option<&str>,
     ) -> Result<Vec<u32>> {
-        // Speculative decoding for GGUF models when SPEC_DRAFT_LAYERS is set
-        if let Self::GemmaGguf(m) = self {
-            static SPEC_CONFIG: std::sync::OnceLock<Option<(usize, usize)>> =
-                std::sync::OnceLock::new();
-            let spec = SPEC_CONFIG.get_or_init(|| {
-                std::env::var("SPEC_DRAFT_LAYERS").ok().and_then(|s| {
-                    let layers: usize = s.parse().ok()?;
-                    let tokens: usize = std::env::var("SPEC_DRAFT_TOKENS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(4);
-                    Some((layers, tokens))
-                })
-            });
-            if let Some((draft_layers, draft_tokens)) = spec {
-                return m.generate_speculative(
-                    input_ids,
-                    max_new_tokens,
-                    temperature,
-                    top_p,
-                    *draft_layers,
-                    *draft_tokens,
-                );
-            }
-        }
         match self {
-            Self::Qwen(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
-            Self::Gemma(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
-            Self::GemmaGguf(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => m.generate(input_ids, max_new_tokens, temperature, top_p),
             Self::Mlx(m) => m.generate(
                 input_ids,
                 max_new_tokens,
@@ -283,7 +130,6 @@ impl ModelBackend {
     fn drop_session(&mut self, session_id: &str) -> bool {
         match self {
             Self::Mlx(m) => m.drop_session(session_id),
-            _ => false,
         }
     }
 
@@ -292,7 +138,6 @@ impl ModelBackend {
     fn drop_prefix_cache(&mut self, key: &str) -> bool {
         match self {
             Self::Mlx(m) => m.drop_prefix_cache(key),
-            _ => false,
         }
     }
 
@@ -300,7 +145,6 @@ impl ModelBackend {
     fn clear_prefix_cache(&mut self) -> usize {
         match self {
             Self::Mlx(m) => m.clear_prefix_cache(),
-            _ => 0,
         }
     }
 
@@ -318,28 +162,6 @@ impl ModelBackend {
         response_schema: Option<&serde_json::Value>,
     ) -> Result<ParsedResponse> {
         match self {
-            Self::Qwen(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let visible = m.chat(messages, max_new_tokens, temperature)?;
-                Ok(text_only_response(visible))
-            }
-            Self::Gemma(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let visible = m.chat(messages, max_new_tokens, temperature)?;
-                Ok(text_only_response(visible))
-            }
-            Self::GemmaGguf(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let visible =
-                    m.chat_with_options(messages, max_new_tokens, temperature, thinking)?;
-                Ok(text_only_response(visible))
-            }
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let visible = m.chat(messages, max_new_tokens, temperature, thinking)?;
-                Ok(text_only_response(visible))
-            }
             Self::Mlx(m) => m.chat(
                 messages,
                 max_new_tokens,
@@ -356,9 +178,9 @@ impl ModelBackend {
     }
 
     /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
-    /// Only a vision-capable MLX backend (Gemma 4 or Qwen 3.6, with
-    /// `LUMEN_VISION=1`) can consume them; every other backend rejects the
-    /// request rather than silently answering without the image.
+    /// Requires a vision-capable model (Gemma 4 or Qwen 3.6, with
+    /// `LUMEN_VISION=1`); the backend rejects the request rather than silently
+    /// answering without the image.
     #[allow(clippy::too_many_arguments)]
     fn chat_with_images(
         &mut self,
@@ -388,11 +210,6 @@ impl ModelBackend {
                 tool_choice,
                 response_schema,
             ),
-            _ => Err(anyhow::anyhow!(
-                "this backend has no image support; image input requires an \
-                 mlx-native vision-capable backend (Gemma 4 or Qwen 3.6) with \
-                 LUMEN_VISION=1"
-            )),
         }
     }
 
@@ -408,54 +225,12 @@ impl ModelBackend {
         tools: &[ToolDef<'_>],
         tool_choice: &ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<ParsedResponse>
     where
         F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
     {
         match self {
-            Self::GemmaGguf(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let mut adapter = |chunk: &str| {
-                    let _ = on_event(BackendStreamEvent::Text(chunk));
-                };
-                let visible = m.chat_streaming(
-                    messages,
-                    max_new_tokens,
-                    temperature,
-                    thinking,
-                    &mut adapter,
-                )?;
-                Ok(text_only_response(visible))
-            }
-            // Fallback: generate all, send as one chunk
-            Self::Qwen(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let text = m.chat(messages, max_new_tokens, temperature)?;
-                on_event(BackendStreamEvent::Text(&text))?;
-                Ok(text_only_response(text))
-            }
-            Self::Gemma(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let text = m.chat(messages, max_new_tokens, temperature)?;
-                on_event(BackendStreamEvent::Text(&text))?;
-                Ok(text_only_response(text))
-            }
-            #[cfg(feature = "qwen3_5_moe")]
-            Self::Qwen35Moe(m) => {
-                let _ = (top_p, tools, tool_choice, response_schema);
-                let mut adapter = |chunk: &str| {
-                    let _ = on_event(BackendStreamEvent::Text(chunk));
-                };
-                let visible = m.chat_streaming(
-                    messages,
-                    max_new_tokens,
-                    temperature,
-                    thinking,
-                    &mut adapter,
-                )?;
-                Ok(text_only_response(visible))
-            }
             Self::Mlx(m) => m.chat_streaming(
                 messages,
                 max_new_tokens,
@@ -503,10 +278,6 @@ impl ModelBackend {
                 tool_choice,
                 response_schema,
             ),
-            _ => Err(anyhow::anyhow!(
-                "this backend has no image support; image input requires an \
-                 mlx-native vision-capable backend with LUMEN_VISION=1"
-            )),
         }
     }
 
@@ -545,10 +316,6 @@ impl ModelBackend {
                 response_schema,
                 on_event,
             ),
-            _ => Err(anyhow::anyhow!(
-                "this backend has no image support; image input requires an \
-                 mlx-native vision-capable backend with LUMEN_VISION=1"
-            )),
         }
     }
 
@@ -589,23 +356,7 @@ impl ModelBackend {
                 response_schema,
                 on_event,
             ),
-            _ => Err(anyhow::anyhow!(
-                "this backend has no image support; image input requires an \
-                 mlx-native vision-capable backend (Gemma 4 or Qwen 3.6) with \
-                 LUMEN_VISION=1"
-            )),
         }
-    }
-}
-
-/// Wrap a plain visible-text response for backends that don't yet emit
-/// structured tool_calls. Phase 1.3 keeps the API uniform; Phase 2 wires
-/// Qwen 3.6 tool-call parsing to populate `tool_calls` for that family.
-fn text_only_response(visible: String) -> ParsedResponse {
-    ParsedResponse {
-        visible,
-        reasoning: String::new(),
-        tool_calls: Vec::new(),
     }
 }
 
@@ -632,24 +383,9 @@ impl ModelBackend {
         tool_choice: &ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<ParsedResponse> {
-        if let Self::Mlx(m) = self {
-            return m.chat_from_history(
-                turns,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                thinking,
-                session_id,
-                tools,
-                tool_choice,
-                response_schema,
-            );
-        }
-        // Legacy backends: flatten + delegate to plain chat.
-        let plain = flatten_turns_for_plain_backend(turns);
-        self.chat(
-            &plain,
+        let Self::Mlx(m) = self;
+        m.chat_from_history(
+            turns,
             max_new_tokens,
             temperature,
             top_p,
@@ -683,24 +419,9 @@ impl ModelBackend {
     where
         F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
     {
-        if let Self::Mlx(m) = self {
-            return m.chat_streaming_from_history(
-                turns,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                thinking,
-                session_id,
-                tools,
-                tool_choice,
-                response_schema,
-                on_event,
-            );
-        }
-        let plain = flatten_turns_for_plain_backend(turns);
-        self.chat_streaming(
-            &plain,
+        let Self::Mlx(m) = self;
+        m.chat_streaming_from_history(
+            turns,
             max_new_tokens,
             temperature,
             top_p,
@@ -715,20 +436,6 @@ impl ModelBackend {
     }
 }
 
-fn flatten_turns_for_plain_backend(turns: &[ChatTurn<'_>]) -> Vec<(String, String)> {
-    turns
-        .iter()
-        .map(|t| match t {
-            ChatTurn::System(s) => ("system".to_string(), (*s).to_string()),
-            ChatTurn::User(s) => ("user".to_string(), (*s).to_string()),
-            ChatTurn::Assistant { text, .. } => ("assistant".to_string(), (*text).to_string()),
-            ChatTurn::Tool { content, .. } => {
-                ("user".to_string(), format!("[tool result] {}", *content))
-            }
-        })
-        .collect()
-}
-
 /// Inference engine wrapping a model backend and tokenizer.
 pub struct InferenceEngine {
     backend: ModelBackend,
@@ -739,256 +446,22 @@ pub struct InferenceEngine {
     load_stats: Arc<ServerLoadStats>,
 }
 
-/// Detect model architecture from model_id string.
-///
-/// The Qwen3.5 family (Qwen3.6-35B-A3B-mxfp4, Qwen3.6-27B Dense, Qwen3-Next, …) shares a
-/// common hybrid linear+full-attention backbone but splits on the per-layer MLP variant:
-///
-///   * `qwen3_5_moe`   — 256-expert routed MoE (35B-A3B-mxfp4). Production path.
-///   * `qwen3_5_dense` — Standard SwiGLU MLP (27B). Same backbone, dense MLP.
-///
-/// Both share KV cache, snapshot/restore, TurboQuant hooks. Routing is name-based here;
-/// the loader subsequently confirms via `text_config.mlp_kind()` against the config.json.
-fn detect_architecture(model_id: &str) -> &'static str {
-    let lower = model_id.to_lowercase();
-    if is_qwen3_5_dense(&lower) {
-        "qwen3_5_dense"
-    } else if lower.contains("qwen3.6")
-        || lower.contains("qwen3_5")
-        || lower.contains("qwen3-next")
-        || lower.contains("a3b-mxfp4")
-    {
-        "qwen3_5_moe"
-    } else if is_gemma4_native(&lower) {
-        // Gemma 4 26B-A4B MoE via the native MLX backend.
-        // Distinct from `"gemma4"` below (which historically routes Gemma
-        // 1/2 through Candle).
-        "gemma4_native"
-    } else if lower.contains("gemma") {
-        "gemma4"
-    } else if lower.contains("qwen") {
-        "qwen2"
-    } else {
-        // Default: try to load config.json and detect model_type
-        "qwen2"
-    }
-}
-
-/// Match Gemma 4 26B-A4B MoE checkpoints by repo / dir name. The pattern
-/// `"gemma-4"` (or `gemma4-26b` / `gemma_4` / `gemma4_text`) is intentional
-/// — the legacy `"gemma"` substring also matches Gemma 1/2 paths
-/// (`google/gemma-2b` etc.) which route to the Candle `GemmaModel` instead.
-fn is_gemma4_native(lower_id: &str) -> bool {
-    lower_id.contains("gemma-4")
-        || lower_id.contains("gemma4-")
-        || lower_id.contains("gemma_4")
-        || lower_id.contains("gemma4_")
-}
-
-/// Match Qwen3.5/3.6 dense (non-MoE) variants by repo-name conventions.
-/// Currently covers Qwen3.6-27B (the only published dense variant of the family).
-/// Future dense releases (e.g. hypothetical Qwen3.6-14B Dense) extend this list.
-fn is_qwen3_5_dense(lower_id: &str) -> bool {
-    let qwen35_family = lower_id.contains("qwen3.6") || lower_id.contains("qwen3_5");
-    if !qwen35_family {
-        return false;
-    }
-    // Explicit "-dense" tag wins.
-    if lower_id.contains("-dense") || lower_id.contains("_dense") {
-        return true;
-    }
-    // 27B is the published dense variant. A3B / MoE markers are MoE — bail.
-    if lower_id.contains("a3b") || lower_id.contains("moe") {
-        return false;
-    }
-    lower_id.contains("27b") || lower_id.contains("-27-")
-}
-
 impl InferenceEngine {
-    /// Load a model, auto-detecting architecture from model_id.
+    /// Load a model, auto-detecting architecture from `model_id`.
     ///
-    /// If model_id ends with `.gguf`, loads as GGUF quantized model.
-    /// Set `TQ_BITS` env var (e.g. "4") to enable TurboQuant compressed KV cache.
-    /// Set `TOKENIZER_ID` for GGUF models (default: "google/gemma-4-31B-it").
+    /// `MlxBackend::load` does the detection internally — Qwen 2.5 / 3.5 / 3.6
+    /// dense and MoE, Gemma 4, and whatever is added next — so the engine only
+    /// ever sees one backend variant.
     pub fn load(model_id: &str) -> Result<Self> {
-        // Backend selection (precedence: LUMEN_MODE > USE_MLX legacy):
-        //
-        //   LUMEN_MODE=mlx     — N=1 single-tenant. MLX 60-72 tok/s standalone.
-        //   LUMEN_MODE=candle  — N≥2 multi-tenant. Continuous batching (N=8 1.89× wallclock).
-        //   LUMEN_MODE=auto    — default = candle (safest for unknown workload).
-        //   USE_MLX=1            — legacy. Equivalent to LUMEN_MODE=mlx.
-        //
-        // 36 GB Mac unified memory cap (~22.79 GB active per backend) prevents
-        // simultaneous hot-load of both — pick at startup. See
-        // `notes/adaptive_backend_routing_plan.md` for deployment guide.
-        let mode = resolve_backend_mode();
-        if mode == BackendMode::Mlx {
-            // MlxBackend::load now handles arch detection internally —
-            // Qwen3.5 family vs Gemma 4 vs (future) any other mlx-native
-            // model. The engine only sees one variant.
-            eprintln!("Loading MLX backend (mode={mode:?}): {model_id}");
-            let backend = lumen_mlx::MlxBackend::load(model_id)?;
-            eprintln!("[mlx] family={:?}", backend.kind());
-            let cfg_summary = backend.runtime_config_summary();
-            if !cfg_summary.is_empty() {
-                eprintln!("[mlx-config] {cfg_summary}");
-            }
-            return Ok(Self {
-                backend: ModelBackend::Mlx(backend),
-                model_id: model_id.to_string(),
-                load_stats: ServerLoadStats::new_arc(model_id),
-            });
+        eprintln!("Loading MLX backend: {model_id}");
+        let backend = lumen_mlx::MlxBackend::load(model_id)?;
+        eprintln!("[mlx] family={:?}", backend.kind());
+        let cfg_summary = backend.runtime_config_summary();
+        if !cfg_summary.is_empty() {
+            eprintln!("[mlx-config] {cfg_summary}");
         }
-        eprintln!("Loading Candle backend (mode={mode:?}): {model_id}");
-
-        // GGUF path detection
-        if model_id.ends_with(".gguf") {
-            let tokenizer_id = std::env::var("TOKENIZER_ID")
-                .unwrap_or_else(|_| "google/gemma-4-E4B-it".to_string());
-            eprintln!("Loading GGUF model: {model_id}");
-            let mut model = GemmaGgufModel::load(model_id, &tokenizer_id)?;
-
-            // Enable TurboQuant GPU compressed KV cache if TQ_BITS is set.
-            // Recommended for 27B+ models with long context (8K+).
-            // NOT recommended for small models (E4B) with short context — use SDPA instead.
-            //
-            // Environment variables:
-            //   TQ_BITS=3       — quantization bits (2, 3, or 4). 3-bit recommended.
-            //   TQ_LAYERS=42    — number of transformer layers (auto: model-dependent)
-            //   TQ_KV_HEADS=4   — number of KV attention heads (auto: model-dependent)
-            //   TQ_HEAD_DIM=256 — attention head dimension (auto: model-dependent)
-            //   TQ_MAX_SEQ=8192 — max sequence length for KV cache pool
-            #[cfg(feature = "turboquant-gpu")]
-            if let Ok(bits_str) = std::env::var("TQ_BITS") {
-                let bits: u32 = bits_str.parse().unwrap_or(3);
-                let n_layers = std::env::var("TQ_LAYERS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(42);
-                let n_kv_heads = std::env::var("TQ_KV_HEADS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(4);
-                let head_dim = std::env::var("TQ_HEAD_DIM")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(256);
-                model.enable_compressed_kv(bits, n_layers, n_kv_heads, head_dim)?;
-            }
-
-            // Optional: vLLM-style PagedAttention (single-sequence for now).
-            //   PAGED_KV=1                    — enable
-            //   PAGED_KV_MB=2048              — pool budget in MB (default 2048)
-            //   PAGED_BLOCK_SIZE=16           — tokens per block
-            //   PAGED_LAYERS=48               — transformer layers
-            //   PAGED_KV_HEADS=8              — KV heads per layer
-            //   PAGED_HEAD_DIM_SLIDING=256    — sliding window head dim
-            //   PAGED_HEAD_DIM_GLOBAL=512     — global layer head dim
-            //   PAGED_GLOBAL_EVERY=6          — global layer pattern
-            if std::env::var("PAGED_KV")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false)
-            {
-                let n_layers: u32 = std::env::var("PAGED_LAYERS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(48);
-                let n_kv_heads: u32 = std::env::var("PAGED_KV_HEADS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(8);
-                let hd_sliding: u32 = std::env::var("PAGED_HEAD_DIM_SLIDING")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(256);
-                let hd_global: u32 = std::env::var("PAGED_HEAD_DIM_GLOBAL")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(512);
-                let global_every: u32 = std::env::var("PAGED_GLOBAL_EVERY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(6);
-                model.enable_paged_kv(n_layers, n_kv_heads, hd_sliding, hd_global, global_every)?;
-            }
-
-            return Ok(Self {
-                backend: ModelBackend::GemmaGguf(model),
-                model_id: model_id.to_string(),
-                load_stats: ServerLoadStats::new_arc(model_id),
-            });
-        }
-
-        let arch = detect_architecture(model_id);
-        eprintln!("Detected architecture: {arch}");
-
-        // Both `qwen3_5_moe` (35B-A3B-mxfp4) and `qwen3_5_dense` (Qwen3.6-27B) share
-        // the same Candle backend path. The loader inspects `text_config.mlp_kind()`
-        // and constructs either a `SparseMoeBlock` or a `DenseMlp`, packed into the
-        // common `MlpBlock` enum that `DecoderLayer.forward` dispatches on.
-        #[cfg(feature = "qwen3_5_moe")]
-        if arch == "qwen3_5_moe" || arch == "qwen3_5_dense" {
-            use lumen_metal::affine4_gpu::Affine4Context;
-            use lumen_metal::mxfp4_gpu::MxFp4Context;
-            use lumen_model::qwen3_5_moe::backend::Qwen35MoeBackend;
-            use std::path::PathBuf;
-
-            let shard_dir = std::env::var("LUMEN_QWEN35_SHARDS")
-                .map(PathBuf::from)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "{arch} requires LUMEN_QWEN35_SHARDS=<dir> pointing to the \
-                     shard directory (config.json + model.safetensors.index.json + shards)"
-                    )
-                })?;
-            let gpu_ctx = Arc::new(MxFp4Context::new()?);
-            let mut backend = if arch == "qwen3_5_dense" {
-                // 27B dense ships uniform 4-bit affine quantization → also wire up
-                // the GPU-resident Affine4Context so projections stay on device.
-                let affine4_ctx = Arc::new(Affine4Context::new()?);
-                Qwen35MoeBackend::load_with_affine4(model_id, &shard_dir, gpu_ctx, affine4_ctx)?
-            } else {
-                Qwen35MoeBackend::load(model_id, &shard_dir, gpu_ctx)?
-            };
-
-            return Ok(Self {
-                backend: ModelBackend::Qwen35Moe(backend),
-                model_id: model_id.to_string(),
-                load_stats: ServerLoadStats::new_arc(model_id),
-            });
-        }
-
-        // Note: `arch == "gemma4_native"` is now handled by `MlxBackend::load`
-        // upstream (see the `if mode == BackendMode::Mlx` early-return). The
-        // Candle fallback path below only sees non-mlx arches.
-
-        let backend = match arch {
-            "gemma4" => {
-                let mut model = GemmaModel::load(model_id)?;
-
-                // Enable TurboQuant if TQ_BITS is set. The hook lives on the
-                // candle-side Gemma 4 E4B path and only compiles when the
-                // optional `turboquant` feature on `lumen-model` is enabled
-                // (it pulls in the candle-transformers turboquant cfg
-                // block and reactivates the circular workspace deps via
-                // the workspace `[patch]` override).
-                #[cfg(feature = "turboquant")]
-                if let Ok(bits_str) = std::env::var("TQ_BITS") {
-                    let bits: u32 = bits_str.parse().unwrap_or(4);
-                    let text_cfg = model.text_config();
-                    let head_dim = text_cfg.head_dim;
-                    let n_layers = text_cfg.num_hidden_layers;
-                    let n_kv_heads = text_cfg.num_key_value_heads;
-                    model.enable_turboquant(bits, n_layers, n_kv_heads, head_dim);
-                }
-
-                ModelBackend::Gemma(model)
-            }
-            _ => ModelBackend::Qwen(QwenModel::load(model_id)?),
-        };
-
         Ok(Self {
-            backend,
+            backend: ModelBackend::Mlx(backend),
             model_id: model_id.to_string(),
             load_stats: ServerLoadStats::new_arc(model_id),
         })
@@ -3577,11 +3050,14 @@ pub(crate) fn mlx_feature_on(specific: &str) -> bool {
 }
 
 impl InferenceEngine {
-    /// Run the engine loop. When `BATCHED_ENGINE=1` and backend is GemmaGguf or Qwen35Moe,
-    /// streaming chat/anthropic requests go through a continuous-batching
-    /// scheduler. All other paths remain sequential.
+    /// Run the engine loop. Streaming requests go through the MLX
+    /// continuous-batching scheduler when `LUMEN_MLX_BATCH_DECODE` is on;
+    /// everything else is sequential.
+    ///
+    /// `BATCHED_ENGINE=1` used to select a Candle continuous-batching
+    /// scheduler for the GGUF and Qwen3.5-MoE backends. Those backends are
+    /// gone, and so is the variable — MLX batching has its own switch.
     pub async fn run(mut self, mut rx: mpsc::Receiver<EngineRequest>) {
-        let batched = std::env::var("BATCHED_ENGINE").ok().as_deref() == Some("1");
         // Wraps the per-feature gate below — `mlx_feature_on` lets a single
         // `LUMEN_MLX_SERVER_MODE=1` switch enable the whole multi-request path
         // (batched decode + shared-prefix dedup), while a per-feature var still
@@ -3605,12 +3081,7 @@ impl InferenceEngine {
             self.run_batched_mlx(&mut rx).await;
             return;
         }
-        match &self.backend {
-            ModelBackend::GemmaGguf(_) if batched => self.run_batched(&mut rx).await,
-            #[cfg(feature = "qwen3_5_moe")]
-            ModelBackend::Qwen35Moe(_) if batched => self.run_batched_qwen35(&mut rx).await,
-            _ => self.run_sequential(&mut rx).await,
-        }
+        self.run_sequential(&mut rx).await;
     }
 
     async fn run_sequential(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
@@ -3655,1083 +3126,10 @@ impl InferenceEngine {
     /// One decode step processes up to `PAGED_MAX_BATCH` active seqs at once
     /// via `forward_batched_decode_v2`. Non-streaming requests are serviced
     /// between decode steps (they temporarily pause the batch).
-    async fn run_batched(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
-        use candle_core::{DType, Tensor};
-        use std::collections::HashMap;
-
-        let max_batch: usize = std::env::var("PAGED_MAX_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
-
-        let mut active: HashMap<u64, ActiveSeqState> = HashMap::new();
-        let mut next_seq_id: u64 = 1;
-        // Seqs whose local kv_cache has advanced past their paged state
-        // (i.e. they ran a step with paged_store_enabled = false). Must be
-        // migrated into paged before joining a batched (N>=2) decode step.
-        let mut dirty_paged: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-        // Overlap scheduling (default ON): defer each token's detokenize +
-        // channel-send by one decode step so the main loop can issue the next
-        // forward (enqueue GPU work) before paying the CPU post-processing
-        // cost. `LUMEN_BATCHED_NO_OVERLAP=1` falls back to the original fully
-        // synchronous detok-in-place behavior — a field kill-switch for
-        // regressions, no rebuild required.
-        let overlap_enabled = std::env::var("LUMEN_BATCHED_NO_OVERLAP").is_err();
-
-        eprintln!(
-            "[batched engine] active scheduler (max_batch={max_batch}, overlap={})",
-            if overlap_enabled { "on" } else { "off" },
-        );
-
-        loop {
-            // 1. Admit new streaming requests non-blockingly, up to max_batch.
-            while active.len() < max_batch {
-                match rx.try_recv() {
-                    Ok(EngineRequest::StreamingChatCompletion { req, token_tx }) => {
-                        match self.start_streaming_seq(
-                            next_seq_id,
-                            &req.messages,
-                            req.max_tokens,
-                            req.temperature,
-                            req.top_p,
-                            req.enable_thinking_with_backend_default(
-                                self.backend.is_reasoning_first_family(),
-                            ),
-                            token_tx.clone(),
-                        ) {
-                            Ok(seq) => {
-                                active.insert(next_seq_id, seq);
-                                next_seq_id += 1;
-                            }
-                            Err(e) => {
-                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    Ok(EngineRequest::StreamingAnthropicMessages { req, token_tx }) => {
-                        let mut messages: Vec<ChatMessage> = Vec::new();
-                        if let Some(ref system) = req.system {
-                            let system_text = match system {
-                                AnthropicSystem::Text(s) => s.clone(),
-                                AnthropicSystem::Blocks(blocks) => blocks
-                                    .iter()
-                                    .filter_map(|b| b.text.clone())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            };
-                            if !system_text.is_empty() {
-                                messages.push(ChatMessage::new_text("system", system_text));
-                            }
-                        }
-                        for msg in &req.messages {
-                            messages.push(ChatMessage::new_text(
-                                msg.role.clone(),
-                                msg.content.as_text(),
-                            ));
-                        }
-                        match self.start_streaming_seq(
-                            next_seq_id,
-                            &messages,
-                            req.max_tokens,
-                            req.temperature,
-                            0.95, // AnthropicRequest has no top_p; use Gemma 4 default (matches default_top_p)
-                            req.enable_thinking_with_backend_default(
-                                self.backend.is_reasoning_first_family(),
-                            ),
-                            token_tx.clone(),
-                        ) {
-                            Ok(seq) => {
-                                active.insert(next_seq_id, seq);
-                                next_seq_id += 1;
-                            }
-                            Err(e) => {
-                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    Ok(other) => {
-                        // Non-streaming: service sequentially (pauses batch).
-                        self.dispatch_request_sequential(other);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => return,
-                }
-            }
-
-            if active.is_empty() {
-                // No active seqs — block until a request arrives.
-                match rx.recv().await {
-                    Some(req) => {
-                        if matches!(
-                            req,
-                            EngineRequest::StreamingChatCompletion { .. }
-                                | EngineRequest::StreamingAnthropicMessages { .. }
-                        ) {
-                            // Re-insert into rx via self-send isn't possible; handle inline.
-                            match req {
-                                EngineRequest::StreamingChatCompletion { req, token_tx } => {
-                                    match self.start_streaming_seq(
-                                        next_seq_id,
-                                        &req.messages,
-                                        req.max_tokens,
-                                        req.temperature,
-                                        req.top_p,
-                                        req.enable_thinking_with_backend_default(
-                                            self.backend.is_reasoning_first_family(),
-                                        ),
-                                        token_tx.clone(),
-                                    ) {
-                                        Ok(seq) => {
-                                            active.insert(next_seq_id, seq);
-                                            next_seq_id += 1;
-                                        }
-                                        Err(e) => {
-                                            let _ = token_tx
-                                                .try_send(StreamEvent::Error(e.to_string()));
-                                        }
-                                    }
-                                }
-                                EngineRequest::StreamingAnthropicMessages { req, token_tx } => {
-                                    let mut messages: Vec<ChatMessage> = Vec::new();
-                                    if let Some(ref system) = req.system {
-                                        let system_text = match system {
-                                            AnthropicSystem::Text(s) => s.clone(),
-                                            AnthropicSystem::Blocks(blocks) => blocks
-                                                .iter()
-                                                .filter_map(|b| b.text.clone())
-                                                .collect::<Vec<_>>()
-                                                .join("\n"),
-                                        };
-                                        if !system_text.is_empty() {
-                                            messages
-                                                .push(ChatMessage::new_text("system", system_text));
-                                        }
-                                    }
-                                    for msg in &req.messages {
-                                        messages.push(ChatMessage::new_text(
-                                            msg.role.clone(),
-                                            msg.content.as_text(),
-                                        ));
-                                    }
-                                    match self.start_streaming_seq(
-                                        next_seq_id,
-                                        &messages,
-                                        req.max_tokens,
-                                        req.temperature,
-                                        0.95, // Gemma 4 default top_p (matches default_top_p)
-                                        req.enable_thinking_with_backend_default(
-                                            self.backend.is_reasoning_first_family(),
-                                        ),
-                                        token_tx.clone(),
-                                    ) {
-                                        Ok(seq) => {
-                                            active.insert(next_seq_id, seq);
-                                            next_seq_id += 1;
-                                        }
-                                        Err(e) => {
-                                            let _ = token_tx
-                                                .try_send(StreamEvent::Error(e.to_string()));
-                                        }
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            self.dispatch_request_sequential(req);
-                        }
-                    }
-                    None => return,
-                }
-                continue;
-            }
-
-            // 1b. WS-E Lever 1: advance iteration-level prefill by ONE chunk for
-            //     ONE prefilling seq, then FALL THROUGH to decode the ready
-            //     seqs. This interleaves a new (possibly very long) prompt's
-            //     prefill with the ongoing decode of established sequences:
-            //     each loop turn does (≤1 prefill chunk) + (decode of ready
-            //     seqs) instead of monopolizing the engine for an entire
-            //     multi-second prefill. A seq whose prefix completes this turn
-            //     is seeded and joins the decode batch from the next turn (its
-            //     first decode token comes from the standard decode path, so
-            //     seeding semantics match the synchronous-prefill case).
-            //
-            //     Only reachable when LUMEN_PAGED_BATCH_DECODE=1 (else
-            //     `prefill_remaining` is always None → this block is skipped and
-            //     the decode path below is byte-identical to today).
-            if iter_level_prefill_enabled() {
-                // Round-robin: pick the lowest-id prefilling seq this turn so
-                // multiple concurrent prefills make steady, fair progress.
-                let next_prefill: Option<u64> = active
-                    .iter()
-                    .filter(|(_, s)| s.prefill_remaining.is_some())
-                    .map(|(id, _)| *id)
-                    .min();
-                if let Some(id) = next_prefill {
-                    let chunk = batched_prefill_chunk();
-                    let device = match &self.backend {
-                        ModelBackend::GemmaGguf(g) => g.device().clone(),
-                        _ => {
-                            eprintln!("[batched engine] non-Gemma backend unreachable (prefill)");
-                            return;
-                        }
-                    };
-                    // Take cursor out so no borrow of `active` is held across
-                    // the model forward.
-                    let (prompt_ids, cursor) = active
-                        .get_mut(&id)
-                        .and_then(|s| s.prefill_remaining.take())
-                        .expect("prefilling seq has cursor");
-                    let prefix_len = prompt_ids.len() - 1;
-                    let start = cursor;
-                    let end = (start + chunk).min(prefix_len);
-
-                    let gem = match &mut self.backend {
-                        ModelBackend::GemmaGguf(g) => g,
-                        _ => return,
-                    };
-                    gem.model_mut().set_current_seq_id(id);
-                    gem.model_mut().set_paged_store_enabled(true);
-                    let chunk_ok = match Tensor::new(&prompt_ids[start..end], &device)
-                        .and_then(|t| t.unsqueeze(0))
-                    {
-                        Ok(t) => gem.model_mut().forward(&t, start).map(|_| ()),
-                        Err(e) => Err(e),
-                    };
-                    match chunk_ok {
-                        Ok(()) => {
-                            if let Some(s) = active.get_mut(&id) {
-                                if end >= prefix_len {
-                                    s.position = prefix_len;
-                                    s.last_token = *prompt_ids.last().unwrap();
-                                    s.prefill_remaining = None;
-                                    eprintln!(
-                                        "[batched engine] seq {id} prefill complete: {} tokens (iter-chunked)",
-                                        prompt_ids.len(),
-                                    );
-                                } else {
-                                    s.prefill_remaining = Some((prompt_ids, end));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[batched engine] prefill chunk err seq {id}: {e}");
-                            if let Some(s) = active.remove(&id) {
-                                let _ = s.token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    // Fall through to decode the ready seqs this same turn.
-                }
-            }
-
-            // 2. Decode step. N=1 → single-seq SDPA path (faster at short ctx).
-            //    N≥2 → batched paged kernel.
-            //    Prefilling seqs are excluded (handled in 1b above); when the
-            //    flag is off, no seq is ever prefilling so `ids` == all active.
-            let ids: Vec<u64> = active
-                .iter()
-                .filter(|(_, s)| s.prefill_remaining.is_none())
-                .map(|(id, _)| *id)
-                .collect();
-            if ids.is_empty() {
-                // Every active seq is still prefilling — loop back to 1b.
-                continue;
-            }
-            let last_tokens: Vec<u32> = ids.iter().map(|id| active[id].last_token).collect();
-            let positions: Vec<usize> = ids.iter().map(|id| active[id].position).collect();
-
-            let gem = match &mut self.backend {
-                ModelBackend::GemmaGguf(g) => g,
-                _ => {
-                    eprintln!("[batched engine] non-Gemma backend unreachable");
-                    return;
-                }
-            };
-            let device = gem.device().clone();
-
-            let t_step = std::time::Instant::now();
-            let debug_timing = std::env::var("BATCHED_TIMING").is_ok();
-            // N=1 GPU fast path: keep logits on device, sample on GPU, emit a
-            // single u32 — avoids the 1 MB F16→F32 materialization that
-            // dominates CPU sampling. Returns Some(next_tok) on success.
-            let n1_gpu_tok: Option<u32> = if ids.len() == 1 {
-                let t_flags = std::time::Instant::now();
-                gem.model_mut().set_current_seq_id(ids[0]);
-                gem.model_mut().set_use_compressed_for_attn(false);
-                gem.model_mut().set_paged_store_enabled(false);
-                dirty_paged.insert(ids[0]);
-                // Snapshot sampling params before the forward so we don't hold
-                // an immutable borrow of `active` across the forward + the
-                // overlap flush (which needs a mutable borrow). `generated` is
-                // cloned for the GPU repeat-penalty / CPU sampler input.
-                let (s_top_p, s_temperature, s_repeat_penalty, s_generated) = {
-                    let seq = active.get(&ids[0]).unwrap();
-                    (
-                        seq.top_p,
-                        seq.temperature,
-                        seq.repeat_penalty,
-                        seq.generated.clone(),
-                    )
-                };
-                // GPU sampler skips top-p and n-gram penalty. Default behavior
-                // is to use it whenever top_p>=1 (no nucleus filter needed).
-                // `FORCE_GPU_SAMPLE=1` forces it on even when top_p<1 (slight
-                // quality trade-off: nucleus filter skipped).
-                let force_gpu = std::env::var("FORCE_GPU_SAMPLE").is_ok();
-                let gpu_ok = force_gpu || s_top_p >= 1.0;
-                let t_tok = std::time::Instant::now();
-                let tok = match Tensor::new(&[last_tokens[0]], &device).and_then(|t| t.unsqueeze(0))
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[batched engine] tok tensor err: {e}");
-                        continue;
-                    }
-                };
-                let t_fwd = std::time::Instant::now();
-                let logits = match gem.model_mut().forward(&tok, positions[0]) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("[batched engine] single-seq forward failed: {e}");
-                        for (_id, seq) in active.drain() {
-                            let _ = seq.token_tx.try_send(StreamEvent::Error(e.to_string()));
-                        }
-                        continue;
-                    }
-                };
-                // Overlap: `forward` has enqueued this step's GPU kernels but the
-                // device→host sync only happens at sampling time below. Detok +
-                // emit the *previous* step's deferred token now so that CPU work
-                // hides behind the in-flight GPU forward.
-                if overlap_enabled {
-                    if let Some(seq) = active.get_mut(&ids[0]) {
-                        flush_pending_emit(gem, seq);
-                    }
-                }
-                if gpu_ok {
-                    let t_sample = std::time::Instant::now();
-                    let logits1d = match logits.squeeze(0) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("[batched engine] logits squeeze err: {e}");
-                            continue;
-                        }
-                    };
-                    let sampled = lumen_model::sampling::sample_token_gpu(
-                        &logits1d,
-                        s_temperature,
-                        s_repeat_penalty,
-                        &s_generated,
-                    );
-                    match sampled {
-                        Ok(t) => {
-                            if debug_timing {
-                                eprintln!(
-                                    "  N=1 GPU: flags={:.2}ms tok={:.2}ms fwd={:.2}ms gpu_sample={:.2}ms",
-                                    (t_tok - t_flags).as_secs_f64() * 1000.0,
-                                    (t_fwd - t_tok).as_secs_f64() * 1000.0,
-                                    (t_sample - t_fwd).as_secs_f64() * 1000.0,
-                                    t_sample.elapsed().as_secs_f64() * 1000.0,
-                                );
-                            }
-                            Some(t)
-                        }
-                        Err(e) => {
-                            eprintln!("[batched engine] gpu sample err seq {}: {e}", ids[0]);
-                            continue;
-                        }
-                    }
-                } else {
-                    // CPU fallback: materialize full vocab.
-                    let t_cpu = std::time::Instant::now();
-                    let _out = match logits
-                        .squeeze(0)
-                        .and_then(|t| t.to_dtype(DType::F32))
-                        .and_then(|t| t.to_vec1::<f32>())
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("[batched engine] single logits cpu err: {e}");
-                            continue;
-                        }
-                    };
-                    if debug_timing {
-                        eprintln!(
-                            "  N=1 CPU: flags={:.2}ms tok={:.2}ms fwd={:.2}ms cpu={:.2}ms",
-                            (t_tok - t_flags).as_secs_f64() * 1000.0,
-                            (t_fwd - t_tok).as_secs_f64() * 1000.0,
-                            (t_cpu - t_fwd).as_secs_f64() * 1000.0,
-                            t_cpu.elapsed().as_secs_f64() * 1000.0,
-                        );
-                    }
-                    // Hand the flat logits through the shared path below by
-                    // stashing into a one-element Vec — re-enter via flat.
-                    // To keep control-flow simple, just emit via the legacy
-                    // sampler inline here and skip the shared path.
-                    let next_tok = match lumen_model::sampling::sample_token_cpu(
-                        &_out,
-                        s_temperature,
-                        s_top_p,
-                        s_repeat_penalty,
-                        &s_generated,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("[batched engine] cpu sample err seq {}: {e}", ids[0]);
-                            continue;
-                        }
-                    };
-                    Some(next_tok)
-                }
-            } else {
-                None
-            };
-
-            let flat: Vec<f32> = if let Some(_tok) = n1_gpu_tok {
-                // Single-seq path already sampled; skip shared flat/sample.
-                Vec::new()
-            } else if ids.len() == 1 {
-                // unreachable (kept for type exhaustiveness)
-                Vec::new()
-            } else {
-                // Promotion: any seq that was running under SDPA-only with
-                // paged_store_enabled=false has stale paged state. Bulk-copy
-                // its kv_cache into paged before the batched dispatch.
-                for id in &ids {
-                    if dirty_paged.remove(id) {
-                        if let Err(e) = gem.model_mut().migrate_seq_to_paged(*id) {
-                            eprintln!("[batched engine] migrate_seq_to_paged({id}) failed: {e}");
-                        }
-                    }
-                }
-                gem.model_mut().set_use_compressed_for_attn(true);
-                gem.model_mut().set_paged_store_enabled(true);
-                let toks = match Tensor::new(last_tokens.as_slice(), &device)
-                    .and_then(|t| t.reshape((ids.len(), 1)))
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[batched engine] input tensor err: {e}");
-                        continue;
-                    }
-                };
-                let logits = match gem
-                    .model_mut()
-                    .forward_batched_decode_v2(&toks, &ids, &positions)
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("[batched engine] forward_batched_decode_v2 failed: {e}");
-                        for (_id, seq) in active.drain() {
-                            let _ = seq.token_tx.try_send(StreamEvent::Error(e.to_string()));
-                        }
-                        continue;
-                    }
-                };
-                // Overlap: the batched forward has enqueued this step's GPU
-                // kernels; the device→host sync happens at `to_vec1` below.
-                // Detok + emit every seq's previous-step deferred token now so
-                // the CPU work overlaps the in-flight GPU forward. FIFO per seq
-                // (size-1 pending) preserves exact token order.
-                if overlap_enabled {
-                    for id in &ids {
-                        if let Some(seq) = active.get_mut(id) {
-                            flush_pending_emit(gem, seq);
-                        }
-                    }
-                }
-                match logits
-                    .to_dtype(DType::F32)
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1())
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[batched engine] logits cpu err: {e}");
-                        continue;
-                    }
-                }
-            };
-            let vocab = if flat.is_empty() || ids.is_empty() {
-                0
-            } else {
-                flat.len() / ids.len()
-            };
-
-            // 3. Per-seq sampling: N=1 fast path already has a token in
-            //    `n1_gpu_tok`; N>=2 materialized logits into `flat` for CPU
-            //    sampling. Emit Delta and check termination per seq.
-            let mut to_remove: Vec<u64> = Vec::new();
-            for (row, &id) in ids.iter().enumerate() {
-                let seq = active.get_mut(&id).unwrap();
-                let next_tok = if let Some(tok) = n1_gpu_tok {
-                    tok
-                } else {
-                    let row_slice = &flat[row * vocab..(row + 1) * vocab];
-                    match lumen_model::sampling::sample_token_cpu(
-                        row_slice,
-                        seq.temperature,
-                        seq.top_p,
-                        seq.repeat_penalty,
-                        &seq.generated,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("[batched engine] sample err seq {id}: {e}");
-                            continue;
-                        }
-                    }
-                };
-                seq.generated.push(next_tok);
-                seq.last_token = next_tok;
-                seq.position += 1;
-
-                // Sampling + state advance + stop-check stay fully synchronous.
-                // Only the expensive detokenize + channel-send is deferred:
-                //   - overlap ON: stash `next_tok` in `pending_emit`; it is
-                //     flushed at the top of the NEXT decode step (after that
-                //     step's forward is issued) so the detok hides behind the
-                //     in-flight GPU forward. On completion we flush it
-                //     synchronously below so the final text precedes `Done`.
-                //   - overlap OFF: detok + emit inline, exactly as before.
-                if overlap_enabled {
-                    seq.pending_emit = Some(next_tok);
-                } else if let Ok(text) = gem.decode(&seq.generated) {
-                    if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
-                        let delta = text[seq.prev_text.len()..].to_string();
-                        if !delta.is_empty() {
-                            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-                            seq.prev_text = text;
-                        }
-                    }
-                }
-
-                if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
-                    // Flush any deferred text before `Done` so the stream is
-                    // complete and correctly truncated at the stop token (no
-                    // token sampled after the stop is ever emitted — we stop
-                    // sampling here). No-op when overlap is off.
-                    flush_pending_emit(gem, seq);
-                    let decode_ms = seq.decode_start.elapsed().as_secs_f64() * 1000.0;
-                    let n_gen = seq.generated.len();
-                    let per_seq_tps = n_gen as f64 / (decode_ms / 1000.0);
-                    eprintln!(
-                        "[batched engine] seq {id} done: {n_gen} tokens in {decode_ms:.0}ms ({per_seq_tps:.1} tok/s)",
-                    );
-                    let _ = seq.token_tx.try_send(StreamEvent::Done {
-                        prompt_tokens: seq.prompt_tokens,
-                        completion_tokens: n_gen as u32,
-                        finish_reason: FinishReason::Stop,
-                    });
-                    to_remove.push(id);
-                }
-            }
-            for id in to_remove {
-                active.remove(&id);
-                dirty_paged.remove(&id);
-            }
-
-            let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-            let agg_tps = ids.len() as f64 / (step_ms / 1000.0);
-            eprintln!(
-                "[batched engine] step: N={} latency={:.1}ms aggregate={:.1} tok/s",
-                ids.len(),
-                step_ms,
-                agg_tps,
-            );
-        }
-    }
-
-    // ── Qwen35Moe continuous-batching scheduler ──────────────────────────────
-
-    /// Continuous-batching scheduler for Qwen35Moe streaming requests.
-    /// N=1 → single-seq SDPA path via `decode_step_batch([1, …])`;
-    /// N≥2 → sequential-per-seq batch (Phase 1 — SSM state clobbered, known limitation).
-    #[cfg(feature = "qwen3_5_moe")]
-    async fn run_batched_qwen35(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
-        use candle_core::DType;
-        use std::collections::HashMap;
-
-        let max_batch: usize = std::env::var("PAGED_MAX_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
-
-        let mut active: HashMap<u64, ActiveSeqState> = HashMap::new();
-        let mut next_seq_id: u64 = 1;
-
-        eprintln!("[qwen35 batched] active scheduler (max_batch={max_batch})");
-
-        loop {
-            // 1. Admit new streaming requests, up to max_batch.
-            while active.len() < max_batch {
-                match rx.try_recv() {
-                    Ok(EngineRequest::StreamingChatCompletion { req, token_tx }) => {
-                        match self.start_streaming_seq_qwen35(
-                            next_seq_id,
-                            &req.messages,
-                            req.max_tokens,
-                            req.temperature,
-                            req.top_p,
-                            req.enable_thinking_with_backend_default(
-                                self.backend.is_reasoning_first_family(),
-                            ),
-                            token_tx.clone(),
-                        ) {
-                            Ok(seq) => {
-                                active.insert(next_seq_id, seq);
-                                next_seq_id += 1;
-                            }
-                            Err(e) => {
-                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    Ok(EngineRequest::StreamingAnthropicMessages { req, token_tx }) => {
-                        let mut messages: Vec<ChatMessage> = Vec::new();
-                        if let Some(ref system) = req.system {
-                            let system_text = match system {
-                                AnthropicSystem::Text(s) => s.clone(),
-                                AnthropicSystem::Blocks(blocks) => blocks
-                                    .iter()
-                                    .filter_map(|b| b.text.clone())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            };
-                            if !system_text.is_empty() {
-                                messages.push(ChatMessage::new_text("system", system_text));
-                            }
-                        }
-                        for msg in &req.messages {
-                            messages.push(ChatMessage::new_text(
-                                msg.role.clone(),
-                                msg.content.as_text(),
-                            ));
-                        }
-                        match self.start_streaming_seq_qwen35(
-                            next_seq_id,
-                            &messages,
-                            req.max_tokens,
-                            req.temperature,
-                            0.95, // Gemma 4 default top_p (matches default_top_p)
-                            req.enable_thinking_with_backend_default(
-                                self.backend.is_reasoning_first_family(),
-                            ),
-                            token_tx.clone(),
-                        ) {
-                            Ok(seq) => {
-                                active.insert(next_seq_id, seq);
-                                next_seq_id += 1;
-                            }
-                            Err(e) => {
-                                let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    Ok(other) => {
-                        self.dispatch_request_sequential(other);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => return,
-                }
-            }
-
-            if active.is_empty() {
-                match rx.recv().await {
-                    Some(req) => {
-                        if matches!(
-                            req,
-                            EngineRequest::StreamingChatCompletion { .. }
-                                | EngineRequest::StreamingAnthropicMessages { .. }
-                        ) {
-                            match req {
-                                EngineRequest::StreamingChatCompletion { req, token_tx } => {
-                                    match self.start_streaming_seq_qwen35(
-                                        next_seq_id,
-                                        &req.messages,
-                                        req.max_tokens,
-                                        req.temperature,
-                                        req.top_p,
-                                        req.enable_thinking_with_backend_default(
-                                            self.backend.is_reasoning_first_family(),
-                                        ),
-                                        token_tx.clone(),
-                                    ) {
-                                        Ok(seq) => {
-                                            active.insert(next_seq_id, seq);
-                                            next_seq_id += 1;
-                                        }
-                                        Err(e) => {
-                                            let _ = token_tx
-                                                .try_send(StreamEvent::Error(e.to_string()));
-                                        }
-                                    }
-                                }
-                                EngineRequest::StreamingAnthropicMessages { req, token_tx } => {
-                                    let mut messages: Vec<ChatMessage> = Vec::new();
-                                    if let Some(ref system) = req.system {
-                                        let system_text = match system {
-                                            AnthropicSystem::Text(s) => s.clone(),
-                                            AnthropicSystem::Blocks(blocks) => blocks
-                                                .iter()
-                                                .filter_map(|b| b.text.clone())
-                                                .collect::<Vec<_>>()
-                                                .join("\n"),
-                                        };
-                                        if !system_text.is_empty() {
-                                            messages
-                                                .push(ChatMessage::new_text("system", system_text));
-                                        }
-                                    }
-                                    for msg in &req.messages {
-                                        messages.push(ChatMessage::new_text(
-                                            msg.role.clone(),
-                                            msg.content.as_text(),
-                                        ));
-                                    }
-                                    match self.start_streaming_seq_qwen35(
-                                        next_seq_id,
-                                        &messages,
-                                        req.max_tokens,
-                                        req.temperature,
-                                        0.95, // Gemma 4 default top_p (matches default_top_p)
-                                        req.enable_thinking_with_backend_default(
-                                            self.backend.is_reasoning_first_family(),
-                                        ),
-                                        token_tx.clone(),
-                                    ) {
-                                        Ok(seq) => {
-                                            active.insert(next_seq_id, seq);
-                                            next_seq_id += 1;
-                                        }
-                                        Err(e) => {
-                                            let _ = token_tx
-                                                .try_send(StreamEvent::Error(e.to_string()));
-                                        }
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            self.dispatch_request_sequential(req);
-                        }
-                    }
-                    None => return,
-                }
-                continue;
-            }
-
-            // 2. Decode step.
-            let ids: Vec<u64> = active.keys().copied().collect();
-            let last_tokens: Vec<u32> = ids.iter().map(|id| active[id].last_token).collect();
-            let positions: Vec<usize> = ids.iter().map(|id| active[id].position).collect();
-
-            let q = match &mut self.backend {
-                #[cfg(feature = "turboquant-gpu")]
-                ModelBackend::Qwen35Moe(q) => q,
-                _ => {
-                    eprintln!("[qwen35 batched] non-Qwen35 backend unreachable");
-                    return;
-                }
-            };
-
-            let t_step = std::time::Instant::now();
-            let breakdown = std::env::var("LUMEN_HTTP_BREAKDOWN")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-
-            // Both N=1 and N≥2 go through decode_step_batch → [B, vocab] for CPU sampling.
-            // N=1 keeps the single-seq KV path (no SSM pollution); N≥2 is sequential-per-seq.
-            let logits = match q.decode_step_batch(&ids, &last_tokens, &positions) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[qwen35 batched] decode_step_batch failed: {e}");
-                    for (_id, seq) in active.drain() {
-                        let _ = seq.token_tx.try_send(StreamEvent::Error(e.to_string()));
-                    }
-                    continue;
-                }
-            };
-            let t_decode = if breakdown {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-
-            // Greedy fast path: when ALL seqs in this step are temperature==0 +
-            // repeat_penalty==1.0 (no penalty), do GPU argmax over `[B, vocab]`
-            // and transfer just `B*4` bytes instead of `B*vocab*4` bytes (~1MB
-            // per seq). This was the dominant 60% of step latency at HTTP path.
-            let all_greedy = ids.iter().all(|id| {
-                let s = &active[id];
-                s.temperature == 0.0 && (s.repeat_penalty - 1.0).abs() < 1e-9
-            });
-
-            // For mixed/non-greedy seqs we still need full logits on CPU.
-            // For all-greedy: skip the full transfer entirely.
-            let (flat, argmax_idx): (Vec<f32>, Option<Vec<u32>>) = if all_greedy {
-                let am = match logits
-                    .argmax(candle_core::D::Minus1)
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1::<u32>())
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[qwen35 batched] argmax err: {e}");
-                        continue;
-                    }
-                };
-                if std::env::var("LUMEN_DECODE_TRACE").is_ok() {
-                    eprintln!(
-                        "[batch_decode_trace] positions={positions:?} last_tokens={last_tokens:?} argmax={am:?}"
-                    );
-                }
-                (Vec::new(), Some(am))
-            } else {
-                let v = match logits
-                    .to_dtype(DType::F32)
-                    .and_then(|t| t.flatten_all())
-                    .and_then(|t| t.to_vec1())
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[qwen35 batched] logits cpu err: {e}");
-                        continue;
-                    }
-                };
-                (v, None)
-            };
-            let t_xfer = if breakdown {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let vocab = if all_greedy {
-                logits.dims().last().copied().unwrap_or(0)
-            } else if flat.is_empty() || ids.is_empty() {
-                0
-            } else {
-                flat.len() / ids.len()
-            };
-
-            // 3. Per-seq CPU sampling + emit + EOS check.
-            let mut sample_ms = 0.0f64;
-            let mut decode_text_ms = 0.0f64;
-            let mut send_ms = 0.0f64;
-            let mut to_remove: Vec<u64> = Vec::new();
-            for (row, &id) in ids.iter().enumerate() {
-                let seq = active.get_mut(&id).unwrap();
-                let _ = vocab; // suppress unused warning when all_greedy path skips slicing
-                let ts0 = if breakdown {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                let next_tok = if let Some(ref am) = argmax_idx {
-                    am[row]
-                } else {
-                    let row_slice = &flat[row * vocab..(row + 1) * vocab];
-                    match lumen_model::sampling::sample_token_cpu(
-                        row_slice,
-                        seq.temperature,
-                        seq.top_p,
-                        seq.repeat_penalty,
-                        &seq.generated,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("[qwen35 batched] sample err seq {id}: {e}");
-                            continue;
-                        }
-                    }
-                };
-                let ts1 = if breakdown {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                seq.generated.push(next_tok);
-                seq.last_token = next_tok;
-                seq.position += 1;
-
-                let q2 = match &self.backend {
-                    #[cfg(feature = "turboquant-gpu")]
-                    ModelBackend::Qwen35Moe(q) => q,
-                    _ => unreachable!(),
-                };
-                if let Ok(text) = q2.decode(&seq.generated) {
-                    if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
-                        let delta = text[seq.prev_text.len()..].to_string();
-                        if !delta.is_empty() {
-                            let ts2 = if breakdown {
-                                Some(std::time::Instant::now())
-                            } else {
-                                None
-                            };
-                            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-                            seq.prev_text = text;
-                            if let (Some(a), Some(b)) = (ts1, ts2) {
-                                decode_text_ms += b.duration_since(a).as_secs_f64() * 1000.0;
-                                send_ms += ts2.unwrap().elapsed().as_secs_f64() * 1000.0;
-                            }
-                        }
-                    }
-                }
-                if let (Some(a), Some(b)) = (ts0, ts1) {
-                    sample_ms += b.duration_since(a).as_secs_f64() * 1000.0;
-                }
-
-                if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
-                    let decode_ms = seq.decode_start.elapsed().as_secs_f64() * 1000.0;
-                    let n_gen = seq.generated.len();
-                    eprintln!(
-                        "[qwen35 batched] seq {id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
-                        n_gen as f64 / (decode_ms / 1000.0),
-                    );
-                    let _ = seq.token_tx.try_send(StreamEvent::Done {
-                        prompt_tokens: seq.prompt_tokens,
-                        completion_tokens: n_gen as u32,
-                        finish_reason: FinishReason::Stop,
-                    });
-                    to_remove.push(id);
-                }
-            }
-            let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-            if breakdown {
-                let decode_ms = t_decode.unwrap().duration_since(t_step).as_secs_f64() * 1000.0;
-                let xfer_ms = t_xfer
-                    .unwrap()
-                    .duration_since(t_decode.unwrap())
-                    .as_secs_f64()
-                    * 1000.0;
-                eprintln!(
-                    "[qwen35 batched] step: N={} total={:.1}ms (decode={:.1} xfer={:.1} sample={:.1} decode_text={:.1} send={:.1})",
-                    ids.len(),
-                    step_ms,
-                    decode_ms,
-                    xfer_ms,
-                    sample_ms,
-                    decode_text_ms,
-                    send_ms,
-                );
-            } else {
-                eprintln!(
-                    "[qwen35 batched] step: N={} latency={:.1}ms agg={:.1} tok/s",
-                    ids.len(),
-                    step_ms,
-                    ids.len() as f64 / (step_ms / 1000.0),
-                );
-            }
-            for id in to_remove {
-                active.remove(&id);
-                if let ModelBackend::Qwen35Moe(q) = &mut self.backend {
-                    q.remove_sequence(id);
-                }
-            }
-        }
-    }
-
-    /// Prefill a new Qwen35Moe streaming sequence under `seq_id`.
-    #[cfg(feature = "qwen3_5_moe")]
-    fn start_streaming_seq_qwen35(
-        &mut self,
-        seq_id: u64,
-        messages: &[ChatMessage],
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        thinking: bool,
-        token_tx: mpsc::Sender<StreamEvent>,
-    ) -> Result<ActiveSeqState> {
-        use candle_core::Tensor;
-
-        let q = match &mut self.backend {
-            ModelBackend::Qwen35Moe(q) => q,
-            _ => return Err(anyhow::anyhow!("start_streaming_seq_qwen35: wrong backend")),
-        };
-        let device = q.device().clone();
-        let eos_tokens = q.eos_tokens().to_vec();
-
-        let msg_pairs: Vec<(String, String)> = messages
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect();
-        let prompt_ids = q.build_chat_input(&msg_pairs, thinking)?;
-        let prompt_tokens = prompt_ids.len() as u32;
-        let max_new = if max_tokens == 0 { 256 } else { max_tokens };
-        let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
-
-        q.init_sequence(seq_id);
-        q.model_mut().set_current_seq_id(seq_id);
-
-        // Prefill: feed prompt[..len-1] for KV warmup; last token enters the decode loop.
-        // On any error, clean up the allocated sequence state before propagating.
-        let t_prefill = std::time::Instant::now();
-        let prefix = &prompt_ids[..prompt_ids.len().saturating_sub(1)];
-        if !prefix.is_empty() {
-            let result = Tensor::new(prefix, &device)
-                .and_then(|t| t.unsqueeze(0))
-                .and_then(|t| q.model_mut().forward_with_offset(&t, 0));
-            if let Err(e) = result {
-                q.remove_sequence(seq_id);
-                return Err(anyhow::anyhow!("prefill seq {seq_id}: {e}"));
-            }
-        }
-        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        let position = prefix.len();
-        let last_token = *prompt_ids.last().unwrap();
-
-        eprintln!(
-            "[qwen35 batched] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s)",
-            prompt_ids.len(),
-            prompt_ids.len() as f64 / (prefill_ms / 1000.0),
-        );
-
-        Ok(ActiveSeqState {
-            seq_id,
-            token_tx,
-            prompt_len: prompt_ids.len(),
-            generated: Vec::new(),
-            max_new,
-            last_token,
-            position,
-            prev_text: String::new(),
-            prev_reasoning: String::new(),
-            prompt_tokens,
-            decode_start: std::time::Instant::now(),
-            temperature,
-            top_p: if top_p <= 0.0 { 0.95 } else { top_p },
-            repeat_penalty,
-            eos_tokens,
-            pending_emit: None,
-            // Qwen35 has no paged backend; prefill is always synchronous here.
-            prefill_remaining: None,
-        })
-    }
-
-    /// Phase 2: opt-in multi-seq scheduler for the MLX-native Qwen3.6 path.
-    /// Mirrors `run_batched_qwen35` but drives `MlxQwen35Backend::decode_step_batch`
-    /// (greedy argmax — already sampled) via `as_qwen35_mut()`, so it needs NO
-    /// backend API additions. Only PLAIN GREEDY chat is batched; any request with
-    /// tools, `response_format`, custom stop sequences, non-zero temperature, or
-    /// thinking enabled falls back to the sequential path. Default OFF
-    /// (`LUMEN_MLX_BATCH_DECODE=1` to enable). Currently uses the loop-based
-    /// `decode_step_batch` (Phase 1a) — bit-identical to N sequential decodes,
-    /// so this delivers multi-user latency fairness; Phase 1b swaps in the true
-    /// batched forward for throughput scaling with no change here.
-    /// Family-agnostic `&mut dyn` driver for the batched MLX scheduler — Some for
-    /// any MLX backend (Qwen 3.6 or Gemma 4), None otherwise. Phase 3 generalized
-    /// this from the Qwen-only accessor so `run_batched_mlx` serves both families.
     #[cfg(feature = "mlx-native")]
     fn mlx_batched_driver(&mut self) -> Option<&mut dyn lumen_mlx::MlxBatchedSeqDriver> {
         match &mut self.backend {
             ModelBackend::Mlx(b) => Some(b.batched_seq_driver_mut()),
-            _ => None,
         }
     }
 
@@ -4988,9 +3386,7 @@ impl InferenceEngine {
         let done = eos_tokens.contains(&first_tok) || generated.len() >= max_new;
 
         let state = ActiveSeqState {
-            seq_id,
             token_tx,
-            prompt_len: prompt_ids.len(),
             generated,
             max_new,
             last_token: first_tok,
@@ -4998,136 +3394,9 @@ impl InferenceEngine {
             prev_text,
             prev_reasoning,
             prompt_tokens,
-            decode_start: std::time::Instant::now(),
-            temperature: 0.0,
-            top_p: 0.95,
-            repeat_penalty: 1.0,
             eos_tokens,
-            pending_emit: None,
-            prefill_remaining: None,
         };
         Ok((state, done))
-    }
-
-    /// Prefill a new streaming seq under `seq_id`; returns the active-state
-    /// struct ready for the batched decode loop (caller inserts into the map).
-    fn start_streaming_seq(
-        &mut self,
-        seq_id: u64,
-        messages: &[ChatMessage],
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        thinking: bool,
-        token_tx: mpsc::Sender<StreamEvent>,
-    ) -> Result<ActiveSeqState> {
-        use candle_core::Tensor;
-
-        let gem = match &mut self.backend {
-            ModelBackend::GemmaGguf(g) => g,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "batched scheduler requires GemmaGguf backend"
-                ));
-            }
-        };
-        let device = gem.device().clone();
-
-        let msg_pairs: Vec<(String, String)> = messages
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect();
-        let prompt_ids = gem.build_chat_input(&msg_pairs, thinking)?;
-        let prompt_tokens = prompt_ids.len() as u32;
-        let max_new = if max_tokens == 0 { 256 } else { max_tokens };
-        let repeat_penalty: f32 = std::env::var("REPEAT_PENALTY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
-
-        gem.model_mut().set_current_seq_id(seq_id);
-        // Prefill always seeds paged state for this seq, regardless of the
-        // batched-loop's current store-gating. Re-enable explicitly in case
-        // a previous N=1 decode step turned it off.
-        gem.model_mut().set_paged_store_enabled(true);
-
-        // Prefill: feed prompt[..len-1], sample first token from logits[len-1].
-        //
-        // OPT-IN chunked prefill (BATCHED_ENGINE=1 only): rather than one giant
-        // forward over the whole prompt — which monopolizes a single forward and
-        // stalls every other batched sequence at head-of-line — split the prefix
-        // into fixed token chunks and forward each at its running position offset.
-        // The GGUF model is stateful: forwarding prefix[start..end] at index_pos
-        // = start grows the KV cache exactly as a single forward would, so the
-        // final KV state (and thus the seeded first token) is bit-identical.
-        // Earlier chunks' logits are discarded; the prefill logits are unused
-        // here regardless (last_token comes from prompt_ids.last()), so no
-        // logits need to be returned from the loop.
-        let prefix_len = prompt_ids.len() - 1;
-
-        // WS-E Lever 1: when iteration-level prefill is enabled AND the prompt
-        // is long enough to actually stall the batch, defer prefill into the
-        // main loop. The seq is admitted with a `prefill_remaining` cursor; the
-        // loop forwards one chunk per iteration so other active seqs keep
-        // decoding. The KV cache is grown identically chunk-by-chunk (the GGUF
-        // model is stateful: forwarding prefix[start..end] at index_pos=start
-        // produces a bit-identical final KV state vs a single forward), so the
-        // seeded first token is unchanged. Short prompts and the flag-off case
-        // fall through to the original synchronous path below (byte-identical).
-        let chunk = batched_prefill_chunk();
-        let defer_prefill = iter_level_prefill_enabled() && prefix_len > chunk;
-
-        let (position, last_token, prefill_remaining) = if defer_prefill {
-            // Admit immediately; the loop advances the cursor. position is the
-            // *committed* prefill length (0 until the first chunk runs).
-            (0usize, prompt_ids[0], Some((prompt_ids.clone(), 0usize)))
-        } else {
-            let t_prefill = std::time::Instant::now();
-            let prefix = &prompt_ids[..prefix_len];
-            if !prefix.is_empty() {
-                if prefix.len() > chunk {
-                    // Long prompt: chunk to bound per-forward attention cost.
-                    let mut start = 0usize;
-                    while start < prefix.len() {
-                        let end = (start + chunk).min(prefix.len());
-                        let t = Tensor::new(&prefix[start..end], &device)?.unsqueeze(0)?;
-                        let _ = gem.model_mut().forward(&t, start)?;
-                        start = end;
-                    }
-                } else {
-                    // Short prompt: EXACT current single-forward path (byte-identical).
-                    let t = Tensor::new(prefix, &device)?.unsqueeze(0)?;
-                    let _ = gem.model_mut().forward(&t, 0)?;
-                }
-            }
-            let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "[batched engine] seq {seq_id} prefill: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s)",
-                prompt_ids.len(),
-                prompt_ids.len() as f64 / (prefill_ms / 1000.0),
-            );
-            (prefix.len(), *prompt_ids.last().unwrap(), None)
-        };
-
-        Ok(ActiveSeqState {
-            seq_id,
-            token_tx,
-            prompt_len: prompt_ids.len(),
-            generated: Vec::new(),
-            max_new,
-            last_token,
-            position,
-            prev_text: String::new(),
-            prev_reasoning: String::new(),
-            prompt_tokens,
-            decode_start: std::time::Instant::now(),
-            temperature,
-            top_p: if top_p <= 0.0 { 0.95 } else { top_p },
-            repeat_penalty,
-            eos_tokens: vec![1, 106], // Gemma: <eos>=1, <end_of_turn>=106
-            pending_emit: None,
-            prefill_remaining,
-        })
     }
 }
 
@@ -5197,198 +3466,16 @@ mod tool_name_resolve_tests {
     }
 }
 
-#[cfg(test)]
-mod backend_mode_tests {
-    use super::{BackendMode, resolve_backend_mode_from};
-    use std::collections::HashMap;
-
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |name: &str| map.get(name).cloned()
-    }
-
-    #[cfg(feature = "mlx-native")]
-    const DEFAULT: BackendMode = BackendMode::Mlx;
-    #[cfg(not(feature = "mlx-native"))]
-    const DEFAULT: BackendMode = BackendMode::Candle;
-
-    #[test]
-    fn default_matches_compiled_feature() {
-        assert_eq!(resolve_backend_mode_from(env(&[])), DEFAULT);
-    }
-
-    #[test]
-    fn explicit_mlx() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "mlx")])),
-            BackendMode::Mlx
-        );
-    }
-
-    #[test]
-    fn explicit_candle() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "candle")])),
-            BackendMode::Candle
-        );
-    }
-
-    #[test]
-    fn auto_resolves_to_default() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "auto")])),
-            DEFAULT
-        );
-    }
-
-    #[test]
-    fn case_and_whitespace_insensitive() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "  MLX  ")])),
-            BackendMode::Mlx
-        );
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "Candle")])),
-            BackendMode::Candle
-        );
-    }
-
-    #[test]
-    fn invalid_value_falls_back_to_default() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "gpt-5")])),
-            DEFAULT
-        );
-    }
-
-    #[test]
-    fn legacy_use_mlx_one() {
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("USE_MLX", "1")])),
-            BackendMode::Mlx
-        );
-    }
-
-    #[test]
-    fn legacy_use_mlx_other_values_fall_through_to_default() {
-        // Only USE_MLX=1 historically meant "on". Other values fall through.
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("USE_MLX", "true")])),
-            DEFAULT
-        );
-        assert_eq!(resolve_backend_mode_from(env(&[("USE_MLX", "0")])), DEFAULT);
-    }
-
-    #[test]
-    fn lumen_mode_takes_precedence_over_use_mlx() {
-        // Explicit candle overrides legacy USE_MLX=1.
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "candle"), ("USE_MLX", "1"),])),
-            BackendMode::Candle
-        );
-        // And the inverse — LUMEN_MODE=mlx without USE_MLX.
-        assert_eq!(
-            resolve_backend_mode_from(env(&[("LUMEN_MODE", "mlx")])),
-            BackendMode::Mlx
-        );
-    }
-}
-
-#[cfg(test)]
-mod arch_detection_tests {
-    use super::detect_architecture;
-
-    #[test]
-    fn moe_checkpoints_route_to_qwen3_5_moe() {
-        assert_eq!(
-            detect_architecture("mlx-community/Qwen3.6-35B-A3B-mxfp4"),
-            "qwen3_5_moe"
-        );
-        assert_eq!(detect_architecture("Qwen/Qwen3.6-35B-A3B"), "qwen3_5_moe");
-        assert_eq!(
-            detect_architecture("Qwen/Qwen3-Next-80B-A3B"),
-            "qwen3_5_moe"
-        );
-    }
-
-    #[test]
-    fn dense_27b_routes_to_qwen3_5_dense() {
-        assert_eq!(
-            detect_architecture("mlx-community/Qwen3.6-27B-4bit"),
-            "qwen3_5_dense"
-        );
-        assert_eq!(detect_architecture("Qwen/Qwen3.6-27B"), "qwen3_5_dense");
-        assert_eq!(
-            detect_architecture("mlx-community/Qwen3.6-27B-bf16"),
-            "qwen3_5_dense"
-        );
-    }
-
-    #[test]
-    fn explicit_dense_tag_wins_for_qwen3_5_family() {
-        assert_eq!(
-            detect_architecture("user/Qwen3.6-Some-Dense-variant"),
-            "qwen3_5_dense"
-        );
-        assert_eq!(
-            detect_architecture("user/Qwen3_5_dense_experimental"),
-            "qwen3_5_dense"
-        );
-    }
-
-    #[test]
-    fn moe_marker_overrides_27b_substring() {
-        // Defensive: if a MoE checkpoint happens to contain "27b" elsewhere in the
-        // name (unlikely but possible), the explicit moe/a3b marker should still win.
-        assert_eq!(
-            detect_architecture("user/Qwen3.6-A3B-MoE-variant-rev27b"),
-            "qwen3_5_moe"
-        );
-    }
-
-    #[test]
-    fn non_qwen35_models_keep_existing_routing() {
-        // `gemma-4` strings now route to the new
-        // native MLX path; the legacy Candle Gemma 1/2 path still wins
-        // for `gemma-2b` / `gemma-7b` / `gemma-2-9b` etc.
-        assert_eq!(
-            detect_architecture("google/gemma-4-26B-A4B-it"),
-            "gemma4_native"
-        );
-        assert_eq!(detect_architecture("google/gemma-2b"), "gemma4");
-        assert_eq!(detect_architecture("google/gemma-2-9b-it"), "gemma4");
-        assert_eq!(detect_architecture("Qwen/Qwen2.5-1.5B-Instruct"), "qwen2");
-        assert_eq!(
-            detect_architecture("meta-llama/Llama-3-8B-Instruct"),
-            "qwen2"
-        );
-    }
-
-    #[test]
-    fn gemma4_native_routing_variants() {
-        // All four canonical Gemma 4 26B-A4B name patterns route to the
-        // native MLX backend.
-        assert_eq!(
-            detect_architecture("/Users/me/models/gemma-4-26b-a4b-mlx-4bit"),
-            "gemma4_native"
-        );
-        assert_eq!(
-            detect_architecture("lmstudio-community/gemma4-26b-a4b"),
-            "gemma4_native"
-        );
-        assert_eq!(detect_architecture("Gemma_4_text"), "gemma4_native");
-        assert_eq!(detect_architecture("gemma4_26b"), "gemma4_native");
-    }
-}
-
-/// Mirror of the in-loop struct so `start_streaming_seq` can return it.
+/// Per-sequence state carried by the MLX batched decode loop.
+///
+/// Several fields (`seq_id`, `prompt_len`, `decode_start`, `temperature`,
+/// `top_p`, `repeat_penalty`, `pending_emit`, `prefill_remaining`) were read
+/// only by the Candle continuous-batching scheduler and went with it. The MLX
+/// scheduler admits greedy requests only — anything with a non-zero
+/// temperature, tools, `response_format` or stop strings is routed to the
+/// sequential path — so the sampling fields were constants it never consulted.
 pub(crate) struct ActiveSeqState {
-    pub seq_id: u64,
     pub token_tx: mpsc::Sender<StreamEvent>,
-    pub prompt_len: usize,
     pub generated: Vec<u32>,
     pub max_new: usize,
     pub last_token: u32,
@@ -5396,37 +3483,11 @@ pub(crate) struct ActiveSeqState {
     pub prev_text: String,
     /// Channel-aware streaming: cumulative reasoning-channel text already
     /// emitted as `ReasoningDelta`. Mirrors `prev_text` for the visible
-    /// channel. Only the MLX batched path (Gemma 4) populates this; the
-    /// flat-decode paths leave it empty.
+    /// channel.
     pub prev_reasoning: String,
     pub prompt_tokens: u32,
-    pub decode_start: std::time::Instant,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub repeat_penalty: f32,
-    /// EOS token IDs used by the batched decode loop for this sequence's backend.
+    /// EOS token IDs used by the batched decode loop for this sequence.
     pub eos_tokens: Vec<u32>,
-    /// Overlap scheduling: a token that has been sampled, appended to
-    /// `generated`, and stop-checked in a *previous* decode step, but whose
-    /// detokenize + channel-send was deferred by one iteration so the main
-    /// loop could issue the next forward before paying the CPU post-processing
-    /// cost. `None` until the seq has produced at least one token (or after a
-    /// flush). Per-seq FIFO of size 1 → strict token order is preserved.
-    pub pending_emit: Option<u32>,
-    /// Iteration-level chunked prefill cursor (Lever 1 — head-of-line removal).
-    ///
-    /// When `Some((prompt_ids, cursor))`, this sequence has NOT finished its
-    /// prefill: the main loop forwards one chunk (`min(remaining, chunk)`
-    /// tokens of `prompt_ids[..len-1]`) per iteration at running position
-    /// `cursor`, so already-decoding sequences keep advancing between this
-    /// seq's prefill chunks instead of stalling behind a single monolithic
-    /// prefill forward. When the cursor reaches `len-1`, `last_token`/`position`
-    /// are seeded and this field is set to `None` (seq becomes decode-ready).
-    ///
-    /// Only populated when `LUMEN_PAGED_BATCH_DECODE=1` (default OFF). With the
-    /// flag off, prefill completes synchronously in `start_streaming_seq` and
-    /// this stays `None`, so the decode loop is byte-identical to today.
-    pub prefill_remaining: Option<(Vec<u32>, usize)>,
 }
 
 /// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
@@ -5462,23 +3523,6 @@ fn emit_channel_delta(seq: &mut ActiveSeqState, visible: String, reasoning: Stri
             seq.prev_reasoning = reasoning;
         }
     }
-}
-
-#[inline]
-fn flush_pending_emit(gem: &GemmaGgufModel, seq: &mut ActiveSeqState) {
-    if seq.pending_emit.is_none() {
-        return;
-    }
-    if let Ok(text) = gem.decode(&seq.generated) {
-        if !text.contains('\u{FFFD}') && text.len() > seq.prev_text.len() {
-            let delta = text[seq.prev_text.len()..].to_string();
-            if !delta.is_empty() {
-                let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-                seq.prev_text = text;
-            }
-        }
-    }
-    seq.pending_emit = None;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -5718,49 +3762,5 @@ mod phase_1_4_dispatch_tests {
         // is just a normal text turn — the structured path would add
         // no value here.
         assert!(!needs_structured_history(&msgs));
-    }
-
-    #[test]
-    fn flatten_turns_preserves_text_roles() {
-        let turns = vec![
-            ChatTurn::System("be brief"),
-            ChatTurn::User("hi"),
-            ChatTurn::Assistant {
-                text: "hello",
-                tool_calls: &[],
-            },
-        ];
-        let flat = flatten_turns_for_plain_backend(&turns);
-        assert_eq!(
-            flat,
-            vec![
-                ("system".to_string(), "be brief".to_string()),
-                ("user".to_string(), "hi".to_string()),
-                ("assistant".to_string(), "hello".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn flatten_turns_maps_tool_to_user_marker() {
-        // Tool turns must NOT propagate as role="tool" to legacy backends
-        // (they reject unknown roles). They get wrapped as user-role text
-        // with a marker so the chat-template still accepts them.
-        let turns = vec![
-            ChatTurn::User("weather"),
-            ChatTurn::Assistant {
-                text: "",
-                tool_calls: &[],
-            },
-            ChatTurn::Tool {
-                tool_call_id: "call_abc",
-                name: Some("get_weather"),
-                content: "20C sunny",
-            },
-        ];
-        let flat = flatten_turns_for_plain_backend(&turns);
-        assert_eq!(flat[2].0, "user");
-        assert!(flat[2].1.contains("20C sunny"));
-        assert!(flat[2].1.contains("[tool result]"));
     }
 }

@@ -1,29 +1,30 @@
 [workspace]
 members = [
     "crates/lumen-core",
+    "crates/lumen-testkit",
     "crates/turboquant-cache",
-    "crates/lumen-metal",
     "crates/lumen-mlx",
     "crates/lumen-diffusion",
-    "crates/lumen-model",
     "crates/lumen-server",
-    "crates/paged-attention",
     "crates/lumen-app",
     "xtask",
 ]
+# Candle-era PagedAttention. Not a member: its Metal buffer pool and kernel
+# dispatch are written against candle-metal-kernels, which is gone. The pure
+# scheduler / page-table / sequence logic and the 480-line MSL kernel are kept
+# on disk as the starting point for an MLX rewrite — see the crate's README.
+exclude = ["crates/paged-attention"]
 # lumen-app pulls in the Tauri + webview stack (~hundreds of crates). Excluding
 # it from `default-members` keeps `cargo build` / `cargo test` at the workspace
 # root fast — build the desktop app explicitly with `cargo build -p lumen-app`
 # (dev) or `cargo tauri build` (release bundle).
 default-members = [
     "crates/lumen-core",
+    "crates/lumen-testkit",
     "crates/turboquant-cache",
-    "crates/lumen-metal",
     "crates/lumen-mlx",
     "crates/lumen-diffusion",
-    "crates/lumen-model",
     "crates/lumen-server",
-    "crates/paged-attention",
 ]
 resolver = "2"
 
@@ -35,31 +36,16 @@ license = "MIT"
 [workspace.dependencies]
 # TurboQuant workspace crates
 lumen-core = { path = "crates/lumen-core" }
+# Test-only; add under `[dev-dependencies]`, never `[dependencies]`.
+lumen-testkit = { path = "crates/lumen-testkit" }
 turboquant-cache = { path = "crates/turboquant-cache" }
-lumen-metal = { path = "crates/lumen-metal" }
-lumen-model = { path = "crates/lumen-model" }
-paged-attention = { path = "crates/paged-attention" }
 
 # Linear algebra & numerics
 faer = "0.24"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 
-# ── ML inference (Candle) ──────────────────────────────────────────────
-# Pinned to the `lumen-rs-patches` branch of rabbitson87/candle, a fork
-# of huggingface/candle carrying the small set of patches required by
-# lumen-rs (notably `pub fn clear_kv_cache` on the Qwen3 transformer
-# model + supporting Metal / quantized helpers). The branch is a single
-# squashed commit on top of `huggingface/candle` main so future rebases
-# are atomic. Local devs can override these git deps with a sibling
-# `../candle/` checkout via the workspace `[patch]` section at the
-# bottom of this file.
-candle-core = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
-candle-nn = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
-candle-transformers = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
-candle-metal-kernels = { git = "https://github.com/rabbitson87/candle", rev = "49171fc24df3ead1aca31f8b96de890dc09fda41" }
-
-# Metal GPU (objc2 stack — matches Candle's Metal backend)
+# Metal GPU (objc2 stack)
 objc2-metal = "0.3.2"
 objc2-metal-performance-shaders = "0.3.2"
 objc2-metal-performance-shaders-graph = "0.3.2"
@@ -83,16 +69,10 @@ tokio = { version = "1.52.3", features = ["full"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 
-# ── Local-dev override (uncomment when you want to edit the candle /
-#    mlx-rs forks in place instead of going through the git URL pin).
-#    A clean clone of lumen-rs uses the git refs above; only enable
-#    these path overrides if you have the sibling checkouts.
-# [patch."https://github.com/rabbitson87/candle"]
-# candle-core          = { path = "../candle/candle-core" }
-# candle-nn            = { path = "../candle/candle-nn" }
-# candle-transformers  = { path = "../candle/candle-transformers" }
-# candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
-#
+# ── Local-dev override (uncomment when you want to edit the mlx-rs fork
+#    in place instead of going through the git URL pin). A clean clone of
+#    lumen-rs uses the git refs above; only enable this path override if
+#    you have the sibling checkout.
 # [patch."https://github.com/rabbitson87/mlx-rs"]
 # mlx-rs  = { path = "../../../mlx-rs/mlx-rs" }
 # mlx-sys = { path = "../../../mlx-rs/mlx-sys" }

@@ -2,23 +2,24 @@
 //!
 //! Two things make a plain `cargo test --workspace` unrepresentative:
 //!
-//! 1. **Feature gates.** The Metal harnesses live behind `model-integration`
-//!    and the MLX ones behind `mlx-native`. Without both, the interesting
-//!    targets compile to zero tests and the run is green by omission.
+//! 1. **Feature gates.** The interesting harnesses live behind `mlx-native`.
+//!    Without it they compile to zero tests and the run is green by omission.
 //! 2. **Parallel test threads share one Metal command buffer.** libtest's
-//!    default is one thread per core, and Candle hands every thread the *same*
-//!    command buffer. Two tests encoding at once trips
+//!    default is one thread per core. Two tests encoding at once trips
 //!    `A command encoder is already encoding to this command buffer` and takes
 //!    the whole process down with SIGABRT — intermittently, so a green run
 //!    proves nothing about the next one. `--test-threads=1` removes the
 //!    contention; the GPU work here is dominated by compilation anyway.
 //!
-//! Release is not an optimization preference: several Metal harnesses take
+//! Release is not an optimization preference: several GPU harnesses take
 //! minutes unoptimized and seconds otherwise.
+//!
+//! `lumen-metal/model-integration` used to be in `FEATURES` alongside
+//! `mlx-native`; that crate went with the Candle backend.
 
 use std::process::{Command, ExitCode};
 
-const FEATURES: &str = "lumen-mlx/mlx-native,lumen-metal/model-integration";
+const FEATURES: &str = "lumen-mlx/mlx-native";
 
 pub fn main(args: Vec<String>) -> ExitCode {
     let mut cmd = Command::new("cargo");

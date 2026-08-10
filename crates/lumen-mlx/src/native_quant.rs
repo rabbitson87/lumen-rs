@@ -667,148 +667,18 @@ mod mxfp4_3d_expert_triage {
     }
 }
 
-// NVFP4 kernel-vs-FFI A/B — does a custom fused Metal kernel have any headroom over
-// mlx's quantized_matmul(NVFP4) for Gemma4-26B-A4B MoE shapes?
-//
-// Gate-check before committing to a fused gate_up_silu_mul kernel + forward wiring: if the
-// EXISTING custom matvec is already slower per-matmul than the mlx FFI path, fusion (which only
-// trims dispatch count while ADDING register pressure) cannot recover the deficit. Both sides
-// run device-resident weights in ONE process at the real Gemma4 MoE shape so the comparison is
-// within-run (no cross-session thermal drift).
-//
-//   cargo test -p lumen-mlx --features mlx-native-metal nvfp4_kernel_vs_ffi -- --ignored --nocapture
-#[cfg(all(test, feature = "mlx-native"))]
-mod nvfp4_kernel_vs_ffi_ab {
-    use super::imp::{MODE_NVFP4, quantize_with_mode, quantized_matmul_with_mode};
-    use lumen_metal::nvfp4::dequantize_f32;
-    use lumen_metal::nvfp4_gpu::Nvfp4Context;
-    use mlx_rs::Array;
-    use std::time::Instant;
-
-    /// Run one (out, in) shape: quantize once, then time mlx FFI matmul vs the custom kernel,
-    /// both with device-resident weights. Returns (mlx_ms, custom_ms).
-    fn ab_one(
-        ctx: &Nvfp4Context,
-        out: usize,
-        in_f: usize,
-        warmup: usize,
-        iters: usize,
-    ) -> (f64, f64) {
-        assert_eq!(in_f % 16, 0, "in must be group-aligned");
-        // Deterministic pseudo-random weight in row-major [out, in].
-        let wdata: Vec<f32> = (0..out * in_f)
-            .map(|i| ((i as f32) * 0.0007).sin() * 1.5)
-            .collect();
-        let w = Array::from_slice(&wdata, &[out as i32, in_f as i32]);
-        let (packed, scales, biases) =
-            quantize_with_mode(&w, 16, 4, MODE_NVFP4).expect("quantize nvfp4");
-        assert!(biases.is_none());
-        packed.eval().unwrap();
-        scales.eval().unwrap();
-        let packed_host: Vec<u32> = packed.as_slice::<u32>().to_vec();
-        let scales_host: Vec<u8> = scales.as_slice::<u8>().to_vec();
-
-        // Shared decode-time activation: batch=1.
-        let xdata: Vec<f32> = (0..in_f)
-            .map(|i| ((i as f32) * 0.013).cos() * 0.8)
-            .collect();
-
-        // --- mlx FFI path (weights resident as Arrays after first eval) ---
-        let x = Array::from_slice(&xdata, &[1, in_f as i32]);
-        let mlx_call = || {
-            let y = quantized_matmul_with_mode(&x, &packed, &scales, None, true, 16, 4, MODE_NVFP4)
-                .expect("mlx qmm nvfp4");
-            y.eval().unwrap();
-            y
-        };
-        for _ in 0..warmup {
-            mlx_call();
-        }
-        let t0 = Instant::now();
-        let mut last_mlx = None;
-        for _ in 0..iters {
-            last_mlx = Some(mlx_call());
-        }
-        let mlx_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-        // --- custom Metal kernel (weights resident, dispatch-only timing) ---
-        let (custom_ms, custom_y) = ctx
-            .bench_matvec(&packed_host, &scales_host, &xdata, out, in_f, warmup, iters)
-            .expect("bench_matvec");
-
-        // --- correctness: both vs CPU dequant-then-dot reference ---
-        let mut wref = vec![0.0f32; out * in_f];
-        dequantize_f32(&packed_host, &scales_host, &mut wref).unwrap();
-        let yref: Vec<f32> = (0..out)
-            .map(|o| (0..in_f).map(|k| wref[o * in_f + k] * xdata[k]).sum())
-            .collect();
-        let rel = |got: &[f32]| -> f32 {
-            got.iter()
-                .zip(&yref)
-                .map(|(g, r)| (g - r).abs() / r.abs().max(1e-3))
-                .fold(0.0f32, f32::max)
-        };
-        let mlx_y = last_mlx.unwrap();
-        let mlx_yf = mlx_y.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-        mlx_yf.eval().unwrap();
-        let mlx_rel = rel(mlx_yf.as_slice::<f32>());
-        let custom_rel = rel(&custom_y);
-        assert!(mlx_rel < 0.05, "mlx diverged: {mlx_rel}");
-        assert!(custom_rel < 0.05, "custom kernel diverged: {custom_rel}");
-
-        eprintln!(
-            "  shape out={out:>5} in={in_f:>5}  mlx={mlx_ms:.4} ms  custom={custom_ms:.4} ms  \
-             custom/mlx={:.2}x  (rel mlx={mlx_rel:.4} custom={custom_rel:.4})",
-            custom_ms / mlx_ms
-        );
-        (mlx_ms, custom_ms)
-    }
-
-    #[test]
-    #[ignore = "requires Metal device; run manually with --ignored on Apple Silicon"]
-    fn nvfp4_kernel_vs_ffi() {
-        let ctx = match Nvfp4Context::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no Metal device, skipping: {e}");
-                return;
-            }
-        };
-        let (warmup, iters) = (30usize, 300usize);
-        // Gemma4-26B-A4B MoE expert projections (hidden=2816, moe_intermediate=704, nvfp4 g16):
-        //   gate/up: out=704  in=2816   |   down: out=2816 in=704
-        // Plus the dense MLP (intermediate=4304) and a square baseline for context.
-        eprintln!("NVFP4 custom-kernel vs mlx-FFI quantized_matmul, batch=1 decode:");
-        let shapes = [
-            (704usize, 2816usize),
-            (2816, 704),
-            (4304, 2816),
-            (2816, 4304),
-            (2816, 2816),
-        ];
-        let mut tot_mlx = 0.0;
-        let mut tot_custom = 0.0;
-        for (o, i) in shapes {
-            let (m, c) = ab_one(&ctx, o, i, warmup, iters);
-            tot_mlx += m;
-            tot_custom += c;
-        }
-        eprintln!(
-            "TOTAL  mlx={tot_mlx:.3} ms  custom={tot_custom:.3} ms  custom/mlx={:.2}x",
-            tot_custom / tot_mlx
-        );
-        eprintln!(
-            "VERDICT: a fused gate_up_silu_mul kernel only saves DISPATCH count; if custom/mlx>1 \
-             per-matmul, fusion cannot win (it adds register pressure). custom/mlx<1 would justify \
-             building the fused kernel."
-        );
-    }
-}
+// The NVFP4 kernel-vs-FFI A/B lived here: it timed lumen-metal's custom fused
+// matvec against mlx's `quantized_matmul(NVFP4)` at Gemma4-26B-A4B MoE shapes,
+// as a gate-check before investing in a fused gate_up_silu_mul kernel. Its
+// recorded verdict was that the custom kernel was already slower per-matmul, so
+// fusion could not recover the deficit. `lumen-metal` was removed with the
+// Candle backend (task 006), which leaves this benchmark with nothing to
+// compare against — and its question already answered.
 
 // Single-tensor MXFP4 dequant parity tests against MLX's reference.
 //
 // These reuse the pre-baked MXFP4 fixtures under
-// `crates/lumen-metal/tests/fixtures/` (produced by
+// a fixture directory that went with `lumen-metal` (produced by
 // `scripts/generate_mxfp4_fixture.py` via `mx.dequantize(..., mode="mxfp4")`).
 // The reference `.ref` payloads come from MLX itself, so a successful
 // FFI round-trip through `dequantize_with_mode(..., MODE_MXFP4)` must be
