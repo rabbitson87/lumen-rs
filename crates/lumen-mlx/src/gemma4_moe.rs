@@ -8382,13 +8382,26 @@ pub(crate) mod imp {
                     .expect("non-empty mask");
             assert_eq!(m.shape(), &[4, 4]);
             m.eval().expect("eval");
-            // Inspect last row: query at position 3 with window 2 attends to keys 2..=3 only.
-            let v = m.as_slice::<f32>();
-            let last_row = &v[3 * 4..4 * 4];
-            assert!(!last_row[0].is_finite(), "key 0 masked");
-            assert!(!last_row[1].is_finite(), "key 1 masked");
-            assert!(last_row[2].is_finite(), "key 2 attended");
-            assert!(last_row[3].is_finite(), "key 3 attended");
+            // Read the mask as "may attend", not as f32. The default builder
+            // returns a bool array and the `LUMEN_LEGACY_MASK_BUILDER` path a
+            // bf16 `0.0`/`-inf` one; this test asserted `as_slice::<f32>()`,
+            // which panicked on both, and being `#[ignore]`d it never said so.
+            let attendable: Vec<bool> = match m.dtype() {
+                mlx_rs::Dtype::Bool => m.as_slice::<bool>().to_vec(),
+                _ => m
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .expect("cast mask to f32")
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|v| v.is_finite())
+                    .collect(),
+            };
+            // Query at position 3 with window 2 attends to keys 2..=3 only.
+            assert_eq!(
+                &attendable[3 * 4..4 * 4],
+                &[false, false, true, true],
+                "sliding window must clamp the last row to keys 2..=3"
+            );
         }
 
         #[test]

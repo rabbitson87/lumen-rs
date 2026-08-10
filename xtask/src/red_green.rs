@@ -267,6 +267,63 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "causal-mask-coverage",
+        symptom: "the sliding-window mask tests asserted an f32 dtype neither \
+                  builder had produced for months; #[ignore]d, they panicked in \
+                  silence instead of guarding the window clamp",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            let window_mask = linds
+                .lt_device(&rinds_plus_w, &stream)"#,
+            replace: r#"            let window_mask = linds
+                .ge_device(&rinds_plus_w, &stream)"#,
+        }],
+        guards: &[
+            mlx("native_attention::parity_tests::causal_mask_prefill_window_truncates_past_window"),
+            mlx("native_attention::parity_tests::causal_mask_decode_with_offset_and_window"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "causal-mask-builders-agree",
+        symptom: "LUMEN_LEGACY_MASK_BUILDER is a live escape hatch, but nothing \
+                  compared the two mask representations against each other",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            let valid_min_abs = std::cmp::max(window_min, cache_first_held_pos);"#,
+            replace: r#"            let valid_min_abs = cache_first_held_pos;"#,
+        }],
+        guards: &[mlx(
+            "native_attention::parity_tests::causal_mask_prefill_window_truncates_past_window",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "rotating-cache-both-paths",
+        symptom: "the rotating-cache growth test asserted cached_len == fetch, \
+                  false for the default path since step-prealloc landed; and the \
+                  legacy path was unreachable from any test (OnceLock over env)",
+        // Drops a token from the legacy concat path. Before the thread-local
+        // override this mutation was invisible: the flag is a OnceLock over an
+        // env var, so every test in the binary ran the default path — and
+        // before the content assertions, nothing compared what came back out.
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                    let cached = self.offset;"#,
+            replace: r#"                    let cached = self.offset.saturating_sub(1);"#,
+        }],
+        guards: &[mlx(
+            "native_cache::lifecycle_tests::rotating_cache_growth_within_max_size",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "gemma-thought-channel",
         symptom: "response_format degenerated into repetition to max_tokens — the \
                   eager grammar masked `<|channel>` at step 0, leaving 3 legal tokens",
@@ -296,6 +353,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_response.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
+        (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
+        (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };

@@ -47,12 +47,54 @@ mod imp {
     /// Set `LUMEN_NATIVE_KV_STEP_PREALLOC=0` to force legacy per-step
     /// `concatenate_axis` for emergency revert / A/B comparison.
     fn use_step_prealloc() -> bool {
+        #[cfg(test)]
+        if let Some(forced) = test_support::forced_step_prealloc() {
+            return forced;
+        }
         static FLAG: OnceLock<bool> = OnceLock::new();
         *FLAG.get_or_init(|| {
             std::env::var("LUMEN_NATIVE_KV_STEP_PREALLOC")
                 .map(|v| v != "0")
                 .unwrap_or(true)
         })
+    }
+
+    /// Lets tests exercise both sides of the step-prealloc switch.
+    ///
+    /// The production flag is a `OnceLock` over an env var, read once per
+    /// process — which means the legacy `concatenate_axis` path, kept as a live
+    /// emergency revert, could not be reached from any test at all. Setting the
+    /// env from a test would not work (the `OnceLock` may already be
+    /// initialised) and would race every other test in the binary.
+    ///
+    /// The override is thread-local, so `cargo test`'s per-test threads cannot
+    /// interfere with each other, and `#[cfg(test)]` keeps it out of release
+    /// builds entirely.
+    #[cfg(test)]
+    pub(crate) mod test_support {
+        use std::cell::Cell;
+
+        thread_local! {
+            static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+        }
+
+        pub(crate) fn forced_step_prealloc() -> Option<bool> {
+            FORCED.with(Cell::get)
+        }
+
+        /// Run `f` with the step-prealloc switch pinned, restoring the previous
+        /// setting afterwards even if `f` panics.
+        pub(crate) fn with_step_prealloc<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+            struct Reset(Option<bool>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    FORCED.with(|c| c.set(self.0));
+                }
+            }
+            let _reset = Reset(FORCED.with(Cell::get));
+            FORCED.with(|c| c.set(Some(enabled)));
+            f()
+        }
     }
 
     /// Slice helper for `arr[..., start:end, :]` on 4D arrays.
@@ -2842,6 +2884,7 @@ pub(crate) use imp::{
 //       native_cache::lifecycle_tests:: -- --ignored
 #[cfg(all(test, feature = "mlx-native"))]
 mod lifecycle_tests {
+
     use super::imp::{
         NativeArraysCache, NativeKvCache, NativeLayerCache, NativePromptCache,
         NativeRotatingKvCache,
@@ -2960,25 +3003,71 @@ mod lifecycle_tests {
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn rotating_cache_growth_within_max_size() {
-        let mut c = NativeRotatingKvCache::new(8, 0);
-        // Push 1 token at a time up to (max_size - 1) → no eviction yet.
-        for step in 0..7 {
-            let k = make_kv_block(1, 2, 1, 8, step as f32);
-            let v = make_kv_block(1, 2, 1, 8, step as f32 + 100.0);
-            let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
-            let expected_len = step as i32 + 1;
-            assert_eq!(kf.shape()[2], expected_len, "growth step {step}");
-            assert_eq!(c.cached_len(), expected_len as usize);
-            assert_eq!(c.offset(), step + 1);
+        // Run the whole sequence under BOTH sides of the step-prealloc switch.
+        // The logical contract — how many tokens the cache holds and where the
+        // next one lands — is identical; only the physical buffer differs.
+        // This test used to assert the physical shape, which the default path
+        // stopped matching when it began growing in blocks: `kf.shape()[2]` is
+        // the buffer, not the fill. Being `#[ignore]`d, it failed unseen.
+        for prealloc in [false, true] {
+            super::imp::test_support::with_step_prealloc(prealloc, || {
+                let mut c = NativeRotatingKvCache::new(8, 0);
+                // Push 1 token at a time up to (max_size - 1) → no eviction yet.
+                for step in 0..7 {
+                    let k = make_kv_block(1, 2, 1, 8, step as f32);
+                    let v = make_kv_block(1, 2, 1, 8, step as f32 + 100.0);
+                    let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
+                    let expected_len = step + 1;
+                    // The *fetched* K is the logical fill, and `offset()` is
+                    // the running token count. Both are identical under either
+                    // path — that is the contract SDPA depends on.
+                    assert_eq!(
+                        kf.shape()[2] as usize,
+                        expected_len,
+                        "prealloc={prealloc} step={step}: fetch is the logical fill"
+                    );
+                    assert_eq!(c.offset(), expected_len, "prealloc={prealloc} step={step}");
+                    // `cached_len()` is by definition `keys.shape()[2]`, the
+                    // *allocation*: legacy grows one token at a time, prealloc
+                    // takes the whole window up front. The original test
+                    // asserted these were equal, which has been false for the
+                    // default path since prealloc landed — and `#[ignore]`d, it
+                    // never said so. Only the invariant is shared.
+                    let buf = c.cached_len();
+                    assert!(
+                        (expected_len..=8).contains(&buf),
+                        "prealloc={prealloc} step={step}: allocation {buf} outside \
+                         [{expected_len}, 8]"
+                    );
+                    // …and the fetched rows must be the pushed blocks, in
+                    // order. Neither the shape nor the counters catch a block
+                    // landing in the wrong slot, or padding leaking in from an
+                    // untrimmed buffer — which is the whole risk of having two
+                    // append strategies.
+                    kf.eval().expect("eval fetched K");
+                    let got = kf.as_slice::<f32>();
+                    for j in 0..=step {
+                        // `make_kv_block` fills element 0 of each block with
+                        // the step number; element 0 of row j sits at j*d
+                        // within each (b,h) plane, and b=h=1 here.
+                        let first = got[j * 8];
+                        assert!(
+                            (first - j as f32).abs() < 1e-3,
+                            "prealloc={prealloc} step={step}: row {j} holds {first}, \
+                             expected the block pushed at step {j}"
+                        );
+                    }
+                }
+                // Next push hits max_size exactly — still no trim (cached 7,
+                // trim_size = 7 - 8 + 1 = 0, append → cached 8).
+                let k = make_kv_block(1, 2, 1, 8, 7.0);
+                let v = make_kv_block(1, 2, 1, 8, 107.0);
+                let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
+                assert_eq!(c.offset(), 8, "prealloc={prealloc}");
+                assert_eq!(c.cached_len(), 8, "prealloc={prealloc}: buffer full");
+                assert_eq!(kf.shape()[2], 8, "prealloc={prealloc}: full buffer");
+            });
         }
-        // Next push hits max_size exactly — still no trim (cached size 7,
-        // trim_size = 7 - 8 + 1 = 0, append → cached size 8).
-        let k = make_kv_block(1, 2, 1, 8, 7.0);
-        let v = make_kv_block(1, 2, 1, 8, 107.0);
-        let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
-        assert_eq!(kf.shape()[2], 8);
-        assert_eq!(c.cached_len(), 8);
-        assert_eq!(c.offset(), 8);
     }
 
     #[test]
