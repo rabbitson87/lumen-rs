@@ -159,6 +159,13 @@ pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_kv_store_bf16;
 
+/// Qwen 3.5/3.6 `config.json` parsing. Public so the Phase 3 fault sweep can
+/// drive the loader that every downloaded checkpoint hits first.
+#[cfg(feature = "mlx-native")]
+pub mod qwen3_5_moe_config {
+    pub use crate::qwen3_5_moe::{NativeLayerType, NativeModelConfig, NativeTextConfig};
+}
+
 /// Link anchor for `examples/dump_flags.rs`. The flag registry is collected by
 /// linkme at link time, but an rlib's objects are only linked when referenced —
 /// a binary that touches nothing in this crate sees an empty registry. Calling

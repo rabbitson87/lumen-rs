@@ -183,9 +183,41 @@ impl ArrayRecord {
         for _ in 0..ndim {
             let mut sb = [0u8; 4];
             r.read_exact(&mut sb)?;
-            shape.push(i32::from_le_bytes(sb));
+            let d = i32::from_le_bytes(sb);
+            if d < 0 {
+                bail!("kv_disk: negative dimension {d} (corrupt record)");
+            }
+            shape.push(d);
         }
+
+        // Derive the payload size from shape × dtype and require the stored
+        // length to match it EXACTLY, before allocating anything.
+        //
+        // This is a memory-safety boundary, not a tidiness check. `data_len`
+        // arrives from a file that a previous process may have written
+        // partially (power loss, full disk, SIGKILL mid-flush) or that disk rot
+        // has touched; allocating it unvalidated turns a corrupt 8-byte field
+        // into a multi-terabyte request, and an allocation failure *aborts* —
+        // it is not a catchable panic, so no amount of caller-side error
+        // handling saves the process. Observed as SIGABRT on a 280 TB request.
+        //
+        // `ndim` was already bounded above; this closes the same hole for the
+        // payload. No heuristic cap is needed because the format is
+        // self-describing: shape and dtype determine the size exactly, and a
+        // record whose declared length disagrees is corrupt by definition.
+        let expected = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+            .and_then(|n| n.checked_mul(dtype.stored_elem_size()))
+            .filter(|_| !shape.is_empty())
+            .unwrap_or(0);
         let data_len = read_u64(r)? as usize;
+        if data_len != expected {
+            bail!(
+                "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
+                 with dtype {dtype:?} implies {expected} (corrupt record)"
+            );
+        }
         let mut data = vec![0u8; data_len];
         r.read_exact(&mut data)?;
 

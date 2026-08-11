@@ -210,6 +210,25 @@ mod imp {
         pub vision_end_token_id: Option<u32>,
     }
 
+    /// `#[serde(default)]` covers a **missing** key; it does not cover an
+    /// explicit `null`. Upstream exporters routinely spell an inapplicable
+    /// field as `null` rather than omitting it — a dense checkpoint carrying
+    /// `"num_experts": null` is the JGOS-31B shape — and a plain
+    /// `#[serde(default)] usize` hard-fails on it with `invalid type: null,
+    /// expected usize at line N column M`, an error that names neither the
+    /// field nor the file's architecture.
+    ///
+    /// Applied to every field that is legitimately absent on *some*
+    /// architecture (the MoE group on a dense config, the dense group on a
+    /// MoE one), so null and missing mean the same thing: the default.
+    fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: serde::Deserialize<'de> + Default,
+    {
+        Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    }
+
     /// `text_config` block — all fields the forward path needs.
     #[derive(Debug, Clone, Deserialize)]
     pub struct NativeTextConfig {
@@ -244,32 +263,32 @@ mod imp {
         pub rope_parameters: Option<NativeRopeParameters>,
 
         // Linear (delta-net) attention dims
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub linear_num_value_heads: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub linear_num_key_heads: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub linear_key_head_dim: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub linear_value_head_dim: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub linear_conv_kernel_dim: usize,
 
         // MoE
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub num_experts: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub num_experts_per_tok: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub moe_intermediate_size: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub shared_expert_intermediate_size: usize,
         #[serde(default = "default_norm_topk_prob")]
         pub norm_topk_prob: bool,
 
         // Dense SwiGLU intermediate dim (Qwen3.6-27B: 17408). Absent from MoE configs
         // (35B-A3B uses moe_intermediate_size + shared_expert_intermediate_size instead).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         pub intermediate_size: usize,
 
         // Tied embedding → lm_head reuses embed_tokens. Defaults to false for
@@ -5472,9 +5491,20 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by runner_native.rs Phase 3d wiring.
 pub(crate) use imp::{
-    NativeLayerType, NativeModelConfig, NativeQuantizationConfig, NativeQuantizationOverride,
-    NativeQwen3_5MoeModel, NativeTextConfig, NativeWeights,
+    NativeQuantizationConfig, NativeQuantizationOverride, NativeQwen3_5MoeModel, NativeWeights,
 };
+
+/// Config parsing is pure serde over `config.json` — no MLX, no GPU — and it
+/// is the first code a downloaded checkpoint touches, so the Phase 3 fault
+/// sweep (`tests/config_faults.rs`) drives it directly.
+///
+/// Still behind `mlx-native` only because it lives inside this file's gated
+/// `mod imp`. Hoisting it out — the way `gemma4_tool_syntax` was hoisted for
+/// exactly this reason — would let it be fuzzed and coverage-measured in the
+/// default build; that is a follow-up, noted in 005's checklist rather than
+/// bundled into the sweep.
+#[cfg(feature = "mlx-native")]
+pub use imp::{NativeLayerType, NativeModelConfig, NativeTextConfig};
 
 // MTP types are part of the public surface (Phase 2 S3) — re-exported from
 // the crate root via `lumen_mlx::MtpStepOutput`.

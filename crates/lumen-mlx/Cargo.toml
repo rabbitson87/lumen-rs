@@ -181,3 +181,7 @@ required-features = ["mlx-native"]
 [[example]]
 name = "dump_flags"
 required-features = ["mlx-native"]
+
+[[test]]
+name = "config_faults"
+required-features = ["mlx-native"]

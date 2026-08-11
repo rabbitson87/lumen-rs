@@ -81,12 +81,27 @@ const fn dif(filter: &'static str) -> Guard {
 /// No feature and no GPU: `gemma4_tool_syntax` and `grammar` both compile under
 /// `default = []`, which is the entire reason they were hoisted out of the
 /// `mlx-native` gate — so this guard builds in seconds where an `mlx-native`
-/// one takes minutes.
-const fn mlx_fuzz(target: &'static str, filter: &'static str) -> Guard {
+/// one takes minutes. Also used by the fault sweeps, which are pure
+/// bytes-in/`Result`-out and equally GPU-free.
+const fn mlx_ungated_test(target: &'static str, filter: &'static str) -> Guard {
     Guard {
         package: "lumen-mlx",
         filter,
         features: "",
+        lib_only: false,
+        test_target: target,
+        release: false,
+    }
+}
+
+/// Integration-test guard that DOES need `mlx-native` — the config parser
+/// still lives inside this crate's gated `mod imp`. Hoisting it out (as
+/// `gemma4_tool_syntax` was) would move these guards to `mlx_ungated_test`.
+const fn mlx_native_test(target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-mlx",
+        filter,
+        features: "mlx-native",
         lib_only: false,
         test_target: target,
         release: false,
@@ -218,11 +233,56 @@ static DEFECTS: &[Defect] = &[
             // shapes someone thought of; this one walks 600 seeded streams
             // built against a declared tool set and asserts no parsed name
             // escapes it.
-            mlx_fuzz(
+            mlx_ungated_test(
                 "tool_surface_fuzz",
                 "parser_survives_generated_tool_call_streams",
             ),
         ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "config-null-moe-fields",
+        symptom: "a dense checkpoint spelling its absent MoE fields as \
+                  `\"num_experts\": null` failed to load — `#[serde(default)]` \
+                  covers a MISSING key, not an explicit null (the JGOS-31B shape)",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        #[serde(default, deserialize_with = "null_as_default")]
+        pub num_experts: usize,"#,
+            replace: r#"        #[serde(default)]
+        pub num_experts: usize,"#,
+        }],
+        guards: &[mlx_native_test(
+            "config_faults",
+            "explicit_null_moe_fields_on_a_dense_config",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "kv-disk-alloc-bomb",
+        symptom: "a corrupt KV-disk record's u64 payload length was allocated \
+                  unvalidated — a 280 TB request that ABORTS the process \
+                  (allocation failure is not a catchable panic)",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        let data_len = read_u64(r)? as usize;
+        if data_len != expected {
+            bail!(
+                "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
+                 with dtype {dtype:?} implies {expected} (corrupt record)"
+            );
+        }
+"#,
+            replace: "        let data_len = read_u64(r)? as usize;\n",
+        }],
+        guards: &[mlx_ungated_test(
+            "kv_disk_faults",
+            "implausible_record_length_is_rejected_not_allocated",
+        )],
         occurrences: 1,
         needs_checkpoint: false,
         extra: &[],
@@ -446,6 +506,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // `gemma4_response`'s feature-gated `mod imp` so it can be tested and
         // fuzzed without `mlx-native`.
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
+        (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
+        (_, "config-null-moe-fields") => "qwen3_5_moe.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",

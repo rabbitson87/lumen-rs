@@ -13,6 +13,7 @@
 //! This crate also hosts the `arbitrary` input generators and fault-injection
 //! fixtures the fuzz targets share; see [`generators`].
 
+pub mod faults;
 pub mod generators;
 
 /// Re-exported so replay tests drive `Unstructured` at the exact version the
