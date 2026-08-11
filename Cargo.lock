@@ -3017,6 +3017,7 @@ dependencies = [
  "image",
  "llguidance",
  "lumen-core",
+ "lumen-testkit",
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",
@@ -3052,6 +3053,10 @@ dependencies = [
 [[package]]
 name = "lumen-testkit"
 version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "serde_json",
+]
 
 [[package]]
 name = "mach-sys"

@@ -11,7 +11,9 @@
 //! see the note in `Cargo.toml`.
 //!
 //! This crate also hosts the `arbitrary` input generators and fault-injection
-//! fixtures the fuzz targets share; those land alongside these helpers.
+//! fixtures the fuzz targets share; see [`generators`].
+
+pub mod generators;
 
 /// Cosine similarity of two equal-length vectors.
 ///

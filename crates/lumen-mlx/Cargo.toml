@@ -93,6 +93,10 @@ mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
+# Structure-aware generators for the tool-calling text surface. Shared with the
+# libFuzzer targets so the deterministic driver and the soak driver walk the
+# same inputs.
+lumen-testkit = { path = "../lumen-testkit" }
 
 # ── Examples that cannot build under `default = []` ───────────────────────────
 #

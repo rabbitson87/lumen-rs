@@ -16,4 +16,11 @@ publish = false
 # removed. Callers hold slices already, or reach them with one `to_vec1()` /
 # `as_slice()`; that conversion belongs at the call site where the tensor type
 # is known.
+#
+# The two dependencies below are the exception the note above anticipates:
+# `arbitrary` and `serde_json` are what the structure-aware generators in
+# `generators.rs` are made of, and neither is a framework tensor type — they are the
+# vocabulary the crates under test already speak at their boundaries.
 [dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+serde_json = "1.0.149"

@@ -76,6 +76,23 @@ const fn dif(filter: &'static str) -> Guard {
         release: false,
     }
 }
+/// Guard on an integration-test target over the ungated tool-calling surface.
+///
+/// No feature and no GPU: `gemma4_tool_syntax` and `grammar` both compile under
+/// `default = []`, which is the entire reason they were hoisted out of the
+/// `mlx-native` gate — so this guard builds in seconds where an `mlx-native`
+/// one takes minutes.
+const fn mlx_fuzz(target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-mlx",
+        filter,
+        features: "",
+        lib_only: false,
+        test_target: target,
+        release: false,
+    }
+}
+
 /// `lumen-server` grew a lib target so its request types could be reached from
 /// tests and fuzzing; these guards live in `engine.rs`, which moved with it.
 const fn srv(filter: &'static str) -> Guard {
@@ -196,6 +213,15 @@ static DEFECTS: &[Defect] = &[
             mlx("gemma4_tool_syntax::tests::body_parser_stops_a_name_at_the_next_opener"),
             mlx("gemma4_tool_syntax::tests::body_parser_skips_a_run_of_malformed_openers"),
             mlx("gemma4_tool_syntax::tests::body_parser_stops_a_non_ascii_name_at_the_next_opener"),
+            // The generated driver, registered here so `red-green` proves it
+            // is not vacuous. Its hand-written siblings above encode the three
+            // shapes someone thought of; this one walks 600 seeded streams
+            // built against a declared tool set and asserts no parsed name
+            // escapes it.
+            mlx_fuzz(
+                "tool_surface_fuzz",
+                "parser_survives_generated_tool_call_streams",
+            ),
         ],
         occurrences: 1,
         needs_checkpoint: false,
