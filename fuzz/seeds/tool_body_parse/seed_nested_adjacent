@@ -1,0 +1,1 @@
+call:a{x:<|"|>call:inner{y:1}<|"|>} call:b{}

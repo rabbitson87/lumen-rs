@@ -15,6 +15,11 @@
 
 pub mod generators;
 
+/// Re-exported so replay tests drive `Unstructured` at the exact version the
+/// generators were compiled against — a skew there changes what bytes decode
+/// to, which would silently re-interpret every committed fuzz input.
+pub use arbitrary;
+
 /// Cosine similarity of two equal-length vectors.
 ///
 /// Accumulates in `f64`. The `f32` accumulators the copies used lose the low

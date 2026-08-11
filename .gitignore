@@ -1,5 +1,12 @@
 # ── Rust ──
 /target/
+# Fuzzing state. COMMITTED: fuzz/seeds/ (hand-written inputs + every promoted
+# crasher — the permanent tier-0 replay set) and fuzz/artifacts/ (raw crash
+# inputs as the soak found them). LOCAL: fuzz/corpus/ is libFuzzer's working
+# state — thousands of coverage-minimized blobs meaningful only to its own
+# coverage map, regrown from the seeds on any machine.
+/fuzz/target/
+/fuzz/corpus/
 
 # ── OS ──
 .DS_Store
