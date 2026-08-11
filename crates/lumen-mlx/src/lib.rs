@@ -201,6 +201,17 @@ pub struct SamplingOverrides {
 pub struct ProbeRows {
     pub row_argmaxes: Vec<u32>,
     pub row_max_abs: Vec<f32>,
+    /// Per-row `top1 - top2` logit gap — how decisively the argmax won.
+    ///
+    /// Needed to interpret an argmax disagreement between two numeric
+    /// configurations: a flip where the gap was ~0 is a tie broken differently,
+    /// which is what any perturbation is expected to do and says nothing about
+    /// quality; a flip at a large gap is a genuinely changed prediction. Used
+    /// by `examples/kv_bf16_quality.rs` to tell those apart.
+    ///
+    /// Empty when the runner does not compute it (the PyO3 path); check the
+    /// length before indexing.
+    pub row_top2_gap: Vec<f32>,
     pub position: usize,
 }
 
@@ -6785,9 +6796,13 @@ mod tests {
         fn forward_probe(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
             let row_argmaxes: Vec<u32> = tokens.iter().map(|t| t + 1).collect();
             let row_max_abs = vec![1.0_f32; tokens.len()];
+            // A wide, uniform gap: this fake never produces a near-tie, so a
+            // consumer that treats small gaps specially takes its ordinary path.
+            let row_top2_gap = vec![1.0_f32; tokens.len()];
             Ok(ProbeRows {
                 row_argmaxes,
                 row_max_abs,
+                row_top2_gap,
                 position: tokens.len(),
             })
         }

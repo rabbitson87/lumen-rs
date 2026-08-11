@@ -358,12 +358,52 @@ and it is worth knowing why:
   272/272, so MLX is deterministic there and that 3% is genuinely bf16
   rounding rather than scheduling noise.
 
-**Default is off.** Memory and speed are unambiguous, but greedy output can
-change, and four points × 32 tokens is not enough evidence to change what every
-request returns. Flipping the default wants a broader quality pass — the tier-2
-golden transcripts are the natural gate. Until then it is the right switch for
-a memory-tight machine: at N=8 with 2.5K prompts it returns 680 MB *and* runs
-faster.
+#### Quality: 6,300 teacher-forced positions, two models
+
+The four-point A/B above measured quality with free-running greedy decode over
+random filler prompts, which is weak twice over — filler leaves the next-token
+distribution flat, so argmax flips more readily than on real text, and once one
+argmax flips every later token is a *different* continuation rather than a
+worse one, so the match rate stops meaning anything.
+
+`examples/kv_bf16_quality.rs` fixes both. Six realistic seed prompts (code,
+prose EN/KO, reasoning, technical KO, structured JSON) are each extended by the
+model's own greedy continuation — in-distribution by construction — and then
+both conditions are **teacher-forced** over the identical token sequence, with
+per-position argmax compared via `forward_probe`. One sequence yields hundreds
+of independent comparisons instead of one cascading trajectory.
+
+| model | positions | f32-vs-f32 control | bf16 agreement | flips |
+|---|---|---|---|---|
+| Qwen3.5-9B, 6-bit | 4,050 | **100.000%** | 99.827% | 7 |
+| Qwen3.6-27B, 4-bit | 2,250 | **100.000%** | 99.733% | 6 |
+
+The control is exactly 100% on both, so every flip is real rather than
+scheduling noise. Agreement is flat across context depth — 99.90 / 99.75 /
+99.90 on the 9B and 99.65 / 99.73 / 99.82 on the 27B for shallow / mid / deep
+thirds — so bf16 error does **not** accumulate as the cache fills, which was
+the failure mode that would have ruled out a default flip outright.
+
+**Every flip was a statistical tie.** `ProbeRows` now carries the per-position
+`top1 - top2` logit gap, which is what separates "broke a tie differently" from
+"changed a confident prediction":
+
+| model | gap at flipped positions | all positions (p1 / p50 / p90) | largest flip's percentile |
+|---|---|---|---|
+| 9B | 0.0009 – 0.0132 | 0.026 / 2.93 / 13.08 | **0.5th** |
+| 27B | 0.0005 – 0.0688 | 0.050 / 3.85 / 11.86 | **1.5th** |
+
+Against a median gap of 3-4 logits, every disagreement sat below the 1.5th
+percentile. bf16 did not change a single prediction the model held with any
+confidence; it re-broke ties that were numerically ambiguous already, where the
+f32 winner has no claim to being the more correct one.
+
+**Default is still off** — that is a decision, not a gap in the evidence.
+Memory, speed and quality all point the same way, but flipping it changes what
+every request returns (a 600-token reply would differ from today's roughly a
+third of the time, at tied positions), and that is a call to make deliberately.
+The measurements needed to make it are above; reproduce with
+`kv_bf16_quality --control` then without.
 
 The other lever 007 named — `LUMEN_QWEN35_PREFILL_CHUNK` — is covered above; it
 is a knob, not a default change.

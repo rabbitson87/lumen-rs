@@ -2216,6 +2216,17 @@ mod imp {
                 mlx_rs::ops::abs(&kv).context("native mlx-rs runner: forward_probe abs failed")?;
             let max_abs = mlx_rs::ops::max_axis(&abs_kv, -1, /* keep_dims */ false)
                 .context("native mlx-rs runner: forward_probe max_axis failed")?;
+            // Per-row `top1 - top2` gap → [K] f32. `topk_axis` does not sort
+            // its output, so the gap is the spread of the two values rather
+            // than a subtraction in index order.
+            let top2 = mlx_rs::ops::indexing::topk_axis(&kv, 2, -1)
+                .context("native mlx-rs runner: forward_probe topk_axis failed")?;
+            let top2_hi = mlx_rs::ops::max_axis(&top2, -1, /* keep_dims */ false)
+                .context("native mlx-rs runner: forward_probe top2 max failed")?;
+            let top2_lo = mlx_rs::ops::min_axis(&top2, -1, /* keep_dims */ false)
+                .context("native mlx-rs runner: forward_probe top2 min failed")?;
+            let top2_gap = mlx_rs::ops::subtract(&top2_hi, &top2_lo)
+                .context("native mlx-rs runner: forward_probe top2 gap failed")?;
 
             argmaxes
                 .eval()
@@ -2223,14 +2234,19 @@ mod imp {
             max_abs
                 .eval()
                 .context("native mlx-rs runner: forward_probe eval(max_abs) failed")?;
+            top2_gap
+                .eval()
+                .context("native mlx-rs runner: forward_probe eval(top2_gap) failed")?;
 
             let row_argmaxes: Vec<u32> = argmaxes.as_slice::<u32>().to_vec();
             let row_max_abs: Vec<f32> = max_abs.as_slice::<f32>().to_vec();
+            let row_top2_gap: Vec<f32> = top2_gap.as_slice::<f32>().to_vec();
 
             state.position += k;
             Ok(ProbeRows {
                 row_argmaxes,
                 row_max_abs,
+                row_top2_gap,
                 position: state.position,
             })
         }
