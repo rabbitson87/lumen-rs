@@ -326,9 +326,9 @@ M-series machines.
 - PagedAttention is **not** on the roadmap. It was measured before being
   built and would reclaim under 1% of process memory on this workload;
   the scaffolding crate was deleted. `docs/maintainer-workflow.md` §9 has
-  the numbers, and names the two memory levers that are worth taking
-  instead (bf16 KV storage, and lowering the prefill chunk default —
-  prefill chunking already ships, `LUMEN_QWEN35_PREFILL_CHUNK`).
+  the numbers. The remaining memory lever is bf16 KV storage; prefill
+  chunking already ships (`LUMEN_QWEN35_PREFILL_CHUNK`, default 2048) and
+  §9 gives its memory-versus-latency exchange rate.
 - Spec-decode + MTP draft heads are partially implemented for the
   Qwen3.6 path; see `LUMEN_SPEC=mtp` and `LUMEN_QWEN35_HF_ORIGINAL`.
 

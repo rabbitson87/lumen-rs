@@ -92,11 +92,13 @@
 //!
 //! That prefill peak is **per-chunk activations**, not a function of prompt
 //! length: prefill is always chunked (`LUMEN_QWEN35_PREFILL_CHUNK`, default
-//! 2048) and the peak tracks the chunk. Measured on one 8004-token prompt —
-//! chunk 4096/2048/1024/512/256 gives a peak of 3663/2054/1250/845/643 MB for a
-//! prefill time of 20.6/21.0/22.5/22.2/21.6 s, i.e. the peak moves ~5.7x while
-//! the time does not move monotonically at all. Resident KV was 593 MB at every
-//! chunk size.
+//! 2048) and the peak tracks the chunk. Lowering it is a memory/latency trade
+//! whose price depends on the prompt: free at 8K, expensive at 20K (+54 to
+//! +118% prefill at chunk 512, because the cost tracks chunk *count* and each
+//! chunk is `eval`'d before the next). `examples/prefill_chunk_equivalence.rs`
+//! measures the exchange rate and proves the output is bit-identical across
+//! chunk sizes; `docs/maintainer-workflow.md` §9 has the table. The default is
+//! right — do not lower it globally.
 //!
 //! `docs/maintainer-workflow.md` §9 carries the summary and the commit to
 //! recover the deleted crate from. Re-run this harness before reopening the

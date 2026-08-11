@@ -281,42 +281,47 @@ long against a 3.1 GB decode peak). There was no throughput gap either (batched
 decode already scales ~2.4× from N=1 to N=8) and no leak (0.0 MB residual after
 `remove_seq` + `clear_cache` at every width).
 
-### The prefill peak is a tuning knob, not a missing feature
+### The prefill peak is a tuning knob — with a real price at long prompts
 
 Prefill is **already chunked** — `qwen35_prefill_chunk()`, default 2048 tokens,
 with an always-chunk invariant — and `last_only` already collapses the lm_head
 to a single row, so no `[1, prompt_len, vocab]` tensor is ever materialized. The
 prefill peak is per-chunk activations, and it tracks the chunk rather than the
-prompt. Measured on one 8004-token prompt via `kv_concurrency_ab --lens 8000
---n 1`:
+prompt.
 
-| `LUMEN_QWEN35_PREFILL_CHUNK` | prefill | peak over baseline | resident KV |
+**Output is chunk-invariant.** `forward_chunked`'s equivalence argument (RoPE
+and the causal sentinel key off `cache.offset()`; linear-attn layers carry conv/
+SSM state through the cache) is now tested, not just reasoned:
+`examples/prefill_chunk_equivalence.rs` prefills one prompt at several chunk
+sizes against the same loaded weights — `qwen35_prefill_chunk()` re-reads the
+env on every call, so the A/B shares a process — and compares greedy token ids.
+Bit-identical at 256/512/1024/2048 across every run, at 8K and 20K prompts.
+
+**The chunk is a memory/latency trade, and the price is not flat.** Measured on
+Qwen3.5-9B / M3 Max, `--gen 8..32`, active memory sampled immediately after
+prefill returns:
+
+| prompt | chunk | prefill | memory after prefill |
 |---|---|---|---|
-| 4096 | 20.6 s | 3,663 MB | 593 MB |
-| **2048 (current default)** | 21.0 s | **2,054 MB** | 593 MB |
-| 1024 | 22.5 s | 1,250 MB | 593 MB |
-| 512 | 22.2 s | 845 MB | 593 MB |
-| 256 | 21.6 s | 643 MB | 593 MB |
+| 8,007 tok | 2048 | baseline | 2,055 MB |
+| | 1024 | no detectable Δ | 1,250 MB |
+| | 512 | no detectable Δ | 849 MB |
+| | 256 | no detectable Δ | 646 MB |
+| 20,000 tok | 2048 | baseline (52–59 s) | 2,556–2,621 MB |
+| | 1024 | **+9 to +17%** | 1,750–1,816 MB |
+| | 512 | **+54 to +118%** | 1,348–1,414 MB |
 
-The peak moves 5.7× across that range while prefill time does not move
-monotonically — the 20.6–22.5 s spread has 512 faster than 1024 and 256 faster
-than 512, which is noise, not a cost curve. Lowering the default is therefore a
-near-free way to buy headroom on a memory-tight machine; it is worth landing
-behind a bit-identical check across chunk sizes, since the chunking-equivalence
-argument in `forward_chunked`'s doc comment is reasoned rather than tested.
+At 8K the time deltas over five runs average ~0 against a ±11% run-to-run noise
+floor, so there is nothing to detect. At 20K the cost is unmistakable and
+reproduces with the sweep order reversed (512 first: 113 s, 2048 second: 52 s),
+so it is not a thermal or ordering artifact. The cost tracks chunk **count** —
+each chunk is `eval`'d before the next, and 40 serialization points cost more
+than 10.
 
-**The two larger memory levers this surfaced**, both bigger than paging and
-needing no custom kernel:
-
-- **Store KV in bf16 rather than f32.** The measured 67 KB/slot matches the f32
-  arithmetic (8 × 4 heads × 256 head_dim × 2 × 4 B = 64.0 KB) and rules out
-  bf16's 32.0 KB; `qwen3_5_moe.rs` casts `k_proj`/`v_proj` to f32 to mirror the
-  `qwen3_next` reference. Halving it is ~1.5 GB at N=8 long-context versus
-  paging's 35 MB — but it is a storage-vs-compute dtype change and needs its own
-  parity gate.
-- **Lower the prefill chunk default** — see the table above. 2048 → 512 buys
-  1.2 GB of peak headroom on an 8K prompt at no measurable time cost, and it is
-  a default change rather than a feature.
+**So the default stays at 2048.** Lowering it globally would tax exactly the
+long agentic prompts that matter most. `LUMEN_QWEN35_PREFILL_CHUNK` remains the
+escape hatch for a memory-tight machine that would rather pay latency, and the
+table above is the exchange rate.
 
 **To recover the deleted code**, `git log --diff-filter=D -- crates/paged-attention`
 finds the removal commit; the crate is intact in its parent (571 LOC of
