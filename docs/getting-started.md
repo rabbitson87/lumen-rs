@@ -323,9 +323,11 @@ M-series machines.
 
 - The TurboQuant codec (`lumen-core`) is hardware-agnostic — a CUDA
   backend would only need a new dispatcher.
-- PagedAttention scaffolding lives in `paged-attention/`. Not yet wired
-  to the server; an experimental kernel-level test exists behind
-  `--features legacy-tests`.
+- PagedAttention is **not** on the roadmap. It was measured before being
+  built and would reclaim under 1% of process memory on this workload;
+  the scaffolding crate was deleted. `docs/maintainer-workflow.md` §9 has
+  the numbers, and names the two memory levers that are worth taking
+  instead (bf16 KV storage, chunked prefill).
 - Spec-decode + MTP draft heads are partially implemented for the
   Qwen3.6 path; see `LUMEN_SPEC=mtp` and `LUMEN_QWEN35_HF_ORIGINAL`.
 

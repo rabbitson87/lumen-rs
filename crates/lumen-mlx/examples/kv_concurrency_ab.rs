@@ -81,11 +81,20 @@
 //! ## Result on record
 //!
 //! Run on M3 Max / 36 GiB against Qwen3.5-9B at all three profiles, this said
-//! **no** to the PagedAttention port: reclaimable block-rounding slack tops out
-//! at 0.91% of process memory, 40-63% of per-sequence residency is
-//! linear-attention state paging cannot compact, and the binding constraint is
-//! the prefill logits tensor rather than the KV. See
-//! `crates/paged-attention/README.md` for the tables.
+//! **no** to the PagedAttention port that was going to consume it, and
+//! `crates/paged-attention` was deleted rather than revived. Reclaimable
+//! block-rounding slack topped out at **0.91% of process memory** (72.2 MB
+//! short-turn / 65.8 MB mixed / 35.4 MB long, at N=8); 40-63% of per-sequence
+//! residency is linear-attention conv/SSM state that paging cannot compact;
+//! and the binding constraint is the prefill `[1, prompt_len, vocab]` logits
+//! tensor (11.5 GB at N=8 long) rather than the KV. Resident memory fits
+//! `53 MB * N + 67 KB * slots` at R² >= 0.998 across all three profiles.
+//!
+//! `docs/maintainer-workflow.md` §9 carries the summary and the commit to
+//! recover the deleted crate from. Re-run this harness before reopening the
+//! question — the answer would change for a non-hybrid model, where every
+//! layer holds full-attention KV, or for very high concurrency on very short
+//! turns (`--profile short --n 16,32`).
 
 use std::time::Instant;
 

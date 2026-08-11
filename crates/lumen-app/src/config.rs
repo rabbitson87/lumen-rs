@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
-// Bumped 7 -> 8 alongside the Candle removal. It had been 7 while
-// `migrate_in_place` already carried a `v7 -> v8` step, and migration only
-// runs when `schema_version < CURRENT` — so a config sitting at exactly 7
-// never received that step. Raising the constant makes it reachable and
-// re-saves those configs, which also normalizes the retired
-// `backend-mode = "candle"` to `auto`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+// 8 -> 9 with the PagedAttention removal: `[advanced.paged_attention]` is gone
+// and its one live field became `advanced.mlx_batch_max`.
+//
+// Earlier, 7 -> 8 alongside the Candle removal — a cautionary note worth
+// keeping. The constant had been left at 7 while `migrate_in_place` already
+// carried a `v7 -> v8` step, and migration only runs when `schema_version <
+// CURRENT`, so a config sitting at exactly 7 never received that step. Bumping
+// the constant is not optional bookkeeping; it is what makes the step run.
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -215,9 +217,31 @@ pub struct AdvancedConfig {
     #[serde(default)]
     pub batched_engine: bool,
 
-    /// → `PAGED_KV=1` (+ `PAGED_LAYERS` / `PAGED_KV_HEADS` / `PAGED_HEAD_DIM_*`
-    /// / `PAGED_GLOBAL_EVERY` / `PAGED_MAX_BATCH`). Off by default; Phase 3.
-    pub paged_attention: PagedConfig,
+    /// → `LUMEN_MLX_BATCH_MAX` — how many sequences the MLX scheduler above
+    /// decodes in one step. `None` leaves the server's own default (8).
+    ///
+    /// Lived under `[advanced.paged_attention]` as `max_batch` until v9, which
+    /// was always a misnomer: nothing paged ever read it, and the MLX scheduler
+    /// always did.
+    #[serde(default)]
+    pub mlx_batch_max: Option<u32>,
+
+    /// Retired in v9 along with the PagedAttention crate. Kept only so a config
+    /// written by an older build still parses its `max_batch` — the v9
+    /// migration lifts that value into `mlx_batch_max` and this is never
+    /// written back (`skip_serializing`). Delete once no v8 configs remain in
+    /// the wild. Same reasoning as the `candle` alias on [`BackendMode`].
+    #[serde(default, skip_serializing)]
+    paged_attention: Option<LegacyPagedConfig>,
+}
+
+/// v8 shape of `[advanced.paged_attention]`, read once by the v9 migration.
+/// Every field except `max_batch` drove env vars that no code has read since
+/// the Candle backend was removed.
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyPagedConfig {
+    #[serde(default)]
+    max_batch: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,18 +264,6 @@ pub enum SpecKind {
     Off,
     Lookup,
     Mtp,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PagedConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub layers: Option<u32>,
-    pub kv_heads: Option<u32>,
-    pub head_dim_sliding: Option<u32>,
-    pub head_dim_global: Option<u32>,
-    pub global_every: Option<u32>,
-    pub max_batch: Option<u32>,
 }
 
 impl Default for PersistentConfig {
@@ -307,15 +319,8 @@ impl Default for PersistentConfig {
                 spec_kind: SpecKind::Off,
                 spec_draft_n_max: None,
                 batched_engine: false,
-                paged_attention: PagedConfig {
-                    enabled: false,
-                    layers: None,
-                    kv_heads: None,
-                    head_dim_sliding: None,
-                    head_dim_global: None,
-                    global_every: None,
-                    max_batch: None,
-                },
+                mlx_batch_max: None,
+                paged_attention: None,
             },
             env_overrides: BTreeMap::new(),
             active_model: None,
@@ -477,6 +482,20 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
         }
         cfg.schema_version = 8;
     }
+    // v8 -> v9: PagedAttention was deleted, so `[advanced.paged_attention]`
+    // went with it. Six of its seven fields drove env vars that nothing had
+    // read since the Candle backend was removed; the seventh, `max_batch`, was
+    // never a paged setting at all — it is the MLX scheduler's batch width, and
+    // is lifted here into `mlx_batch_max` rather than dropped. `take()` clears
+    // the shim so it is not carried forward once this has run.
+    if cfg.schema_version < 9 {
+        if let Some(legacy) = cfg.advanced.paged_attention.take() {
+            if cfg.advanced.mlx_batch_max.is_none() {
+                cfg.advanced.mlx_batch_max = legacy.max_batch;
+            }
+        }
+        cfg.schema_version = 9;
+    }
     // Future migrations append here.
 }
 
@@ -509,4 +528,114 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn config_dir() -> Result<PathBuf> {
     let dirs = project_dirs().context("locate application support dir")?;
     Ok(dirs.config_dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v8 config, as the app wrote them before PagedAttention was removed.
+    /// `max_batch` is the only field here that anything ever read.
+    const V8_TOML: &str = r#"
+schema_version = 8
+models_dir = "/tmp/models"
+
+[server]
+host = "127.0.0.1"
+port = 41110
+cors = "localhost"
+
+[quant]
+kv_mode = "off"
+kv_auto_threshold_tokens = 16384
+bits = 4
+
+[context]
+max = 81920
+sliding = 1024
+prefill = 40960
+default_max_tokens = 2048
+
+[advanced]
+backend_mode = "auto"
+spec_kind = "off"
+batched_engine = true
+
+[advanced.paged_attention]
+enabled = true
+layers = 32
+kv_heads = 4
+head_dim_sliding = 128
+head_dim_global = 256
+global_every = 4
+max_batch = 6
+
+[env_overrides]
+"#;
+
+    fn migrated_v8() -> PersistentConfig {
+        let mut cfg: PersistentConfig =
+            toml::from_str(V8_TOML).expect("a v8 config must still deserialize");
+        migrate_in_place(&mut cfg);
+        cfg
+    }
+
+    /// The whole point of the shim: a batch width the user chose must survive
+    /// the rename instead of being silently reset to the server default.
+    #[test]
+    fn v9_migration_carries_max_batch_into_mlx_batch_max() {
+        let cfg = migrated_v8();
+        assert_eq!(cfg.advanced.mlx_batch_max, Some(6));
+        assert_eq!(cfg.schema_version, 9);
+    }
+
+    /// The six retired fields drove env vars nothing reads. They must be
+    /// tolerated on the way in — serde has no `deny_unknown_fields` here, so
+    /// this guards against someone adding it and breaking every old config.
+    #[test]
+    fn v9_migration_ignores_the_retired_paged_fields() {
+        let cfg = migrated_v8();
+        assert!(cfg.advanced.batched_engine, "unrelated fields survive");
+        let out = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            !out.contains("paged"),
+            "the legacy table must not be written back out:\n{out}"
+        );
+    }
+
+    /// `migrate_in_place` promises idempotence, and this step reads a field it
+    /// then clears — exactly the shape that breaks when run twice.
+    #[test]
+    fn v9_migration_is_idempotent() {
+        let mut cfg = migrated_v8();
+        let once = cfg.advanced.mlx_batch_max;
+        migrate_in_place(&mut cfg);
+        assert_eq!(cfg.advanced.mlx_batch_max, once);
+        assert_eq!(cfg.schema_version, 9);
+    }
+
+    /// A config already on v9 has no legacy table; the step must not clobber a
+    /// value the user set under the new name.
+    #[test]
+    fn v9_migration_does_not_overwrite_an_existing_mlx_batch_max() {
+        let mut cfg = PersistentConfig::default();
+        cfg.schema_version = 8;
+        cfg.advanced.mlx_batch_max = Some(2);
+        cfg.advanced.paged_attention = Some(LegacyPagedConfig { max_batch: Some(6) });
+        migrate_in_place(&mut cfg);
+        assert_eq!(cfg.advanced.mlx_batch_max, Some(2));
+    }
+
+    /// Guards the 7 -> 8 class of bug: a migration step that exists but is
+    /// unreachable because the constant was never bumped past it.
+    #[test]
+    fn current_schema_version_reaches_the_last_migration_step() {
+        let mut cfg = PersistentConfig::default();
+        cfg.schema_version = 0;
+        migrate_in_place(&mut cfg);
+        assert_eq!(
+            cfg.schema_version, CURRENT_SCHEMA_VERSION,
+            "migrate_in_place must land exactly on CURRENT_SCHEMA_VERSION"
+        );
+    }
 }

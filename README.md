@@ -654,7 +654,6 @@ crates/
                       /v1/messages, /v1/images/generations)
   lumen-testkit/      test-only helpers (numeric comparison, deterministic data)
   turboquant-cache/   KVCache trait + SimpleCache
-  paged-attention/    parked — excluded from the workspace, see its README
 
 deploy/               example .env + launchd plist for macOS service install
 examples/             end-to-end demo binaries

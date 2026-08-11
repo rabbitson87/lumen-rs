@@ -144,7 +144,9 @@
 - `lumen-metal` buffer/pipeline/device — MXFP4 커널 추가 시 인프라 재사용
 - `lumen-server` HTTP/OpenAI 타입 — 멀티모달 content block만 추가
 - `tokenizers` + `hf-hub` — 버전 그대로
-- `paged-attention` crate — Stage 5 이후 full attention 레이어에 연결 검토
+- ~~`paged-attention` crate — Stage 5 이후 full attention 레이어에 연결 검토~~
+  → 크레이트 삭제됨(2026-08-11). 측정 결과 되찾을 메모리가 프로세스의 1% 미만.
+  `docs/maintainer-workflow.md` §9 참조.
 
 ---
 

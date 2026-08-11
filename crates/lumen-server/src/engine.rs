@@ -3123,9 +3123,9 @@ impl InferenceEngine {
     }
 
     /// Continuous-batching scheduler for streaming chat / anthropic requests.
-    /// One decode step processes up to `PAGED_MAX_BATCH` active seqs at once
-    /// via `forward_batched_decode_v2`. Non-streaming requests are serviced
-    /// between decode steps (they temporarily pause the batch).
+    /// One decode step processes up to `LUMEN_MLX_BATCH_MAX` active seqs at
+    /// once via `forward_batched_decode_v2`. Non-streaming requests are
+    /// serviced between decode steps (they temporarily pause the batch).
     #[cfg(feature = "mlx-native")]
     fn mlx_batched_driver(&mut self) -> Option<&mut dyn lumen_mlx::MlxBatchedSeqDriver> {
         match &mut self.backend {
@@ -3191,7 +3191,12 @@ impl InferenceEngine {
     async fn run_batched_mlx(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
         use std::collections::HashMap;
 
-        let max_batch: usize = std::env::var("PAGED_MAX_BATCH")
+        // `PAGED_MAX_BATCH` is the pre-v9 spelling, kept as a fallback so
+        // existing launch scripts keep working. It never had anything to do
+        // with PagedAttention — that crate was deleted without ever having read
+        // it — so the name it is read under now says what it configures.
+        let max_batch: usize = std::env::var("LUMEN_MLX_BATCH_MAX")
+            .or_else(|_| std::env::var("PAGED_MAX_BATCH"))
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);

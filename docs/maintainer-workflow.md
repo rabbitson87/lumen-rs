@@ -246,12 +246,68 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
-| PagedAttention | ❌ parked, **measured** | `crates/paged-attention` stays excluded from the workspace. `kv_concurrency_ab` (M3 Max, Qwen3.5-9B, N=1/2/4/8, three length profiles) puts the reclaimable block-rounding slack at 72 MB / 66 MB / 35 MB for short / mixed / long prompts — **0.35–0.91% of process memory**. 40–63% of per-sequence resident memory is linear-attention SSM state that paging cannot compact, and the real ceiling is the prefill `[1, prompt_len, vocab]` logits tensor (11.5 GB at N=8 long) which it also cannot touch. See the crate README for the full table and the two larger levers it surfaced |
+| PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
 The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
 are gone with the backend. GGUF has no MLX equivalent, so that capability was
 dropped rather than ported; it had already been unreachable in a default build,
 since `mlx-native` short-circuits backend selection before the GGUF check.
+
+### PagedAttention: measured, then deleted
+
+`crates/paged-attention` was parked by task 006 and **deleted** after task 007
+measured what it would buy. The measurement is the reason; it is recorded here
+rather than in the crate, because the crate is gone.
+
+Reproduce with `cargo run --release -p lumen-mlx --features mlx-native
+--example kv_concurrency_ab`. On M3 Max / 36 GiB against Qwen3.5-9B (8
+full-attention layers of 32), at N = 1/2/4/8 over three prompt-length profiles,
+resident memory fits `~53 MB x N + ~67 KB x allocated_slots` with no intercept
+at R² ≥ 0.998, the three profiles agreeing to ~10%. Replacing the 256-token
+`KV_CACHE_STEP` blocks with 16-token paged blocks would reclaim:
+
+| prompt profile (N=8) | resident | reclaimable | % of process |
+|---|---|---|---|
+| short, 120–480 tok | 661.8 MB | 72.2 MB | **0.91%** |
+| mixed, 200–3000 tok | 1,064.8 MB | 65.8 MB | **0.79%** |
+| long, 2000–8000 tok | 2,960.3 MB | 35.4 MB | **0.35%** |
+
+Short turns are paging's best case and it is still 72 MB against a 7.9 GB
+process. Two structural reasons, neither visible without measuring: **40–63% of
+per-sequence residency is linear-attention conv/SSM state**, which is
+length-independent and which paging — a full-attention KV technique — cannot
+compact; and **the binding constraint is prefill, not KV**, since prefill
+materializes a `[1, prompt_len, vocab]` tensor peaking at 11.5 GB against a
+3.1 GB decode peak. There was no throughput gap either (batched decode already
+scales ~2.4× from N=1 to N=8) and no leak (0.0 MB residual after `remove_seq` +
+`clear_cache` at every width).
+
+**The two larger memory levers this surfaced**, both bigger than paging and
+needing no custom kernel:
+
+- **Store KV in bf16 rather than f32.** The measured 67 KB/slot matches the f32
+  arithmetic (8 × 4 heads × 256 head_dim × 2 × 4 B = 64.0 KB) and rules out
+  bf16's 32.0 KB; `qwen3_5_moe.rs` casts `k_proj`/`v_proj` to f32 to mirror the
+  `qwen3_next` reference. Halving it is ~1.5 GB at N=8 long-context versus
+  paging's 35 MB — but it is a storage-vs-compute dtype change and needs its own
+  parity gate.
+- **Chunked prefill**, which caps the logits peak that actually bounds usable
+  context on a 36 GB machine.
+
+**To recover the deleted code**, `git log --diff-filter=D -- crates/paged-attention`
+finds the removal commit; the crate is intact in its parent (571 LOC of
+scheduler / page-table / sequence logic with no GPU API, plus a 480-line MSL
+kernel file). Reopen the question only if the serving profile moves to very high
+concurrency on very short turns, or to a non-hybrid model where every layer
+holds full-attention KV — re-run `kv_concurrency_ab` first either way.
+
+Six `PAGED_*` env vars went with it (`PAGED_KV`, `PAGED_LAYERS`,
+`PAGED_KV_HEADS`, `PAGED_HEAD_DIM_SLIDING`, `PAGED_HEAD_DIM_GLOBAL`,
+`PAGED_GLOBAL_EVERY`): the desktop app still emitted them, but nothing had read
+them since the Candle backend was removed, so the settings silently did nothing.
+The seventh, `PAGED_MAX_BATCH`, was never a paged setting — it is the MLX
+scheduler's batch width — and is now `LUMEN_MLX_BATCH_MAX`, with the old name
+still accepted as a fallback.
 
 ---
 

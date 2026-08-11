@@ -9,11 +9,6 @@ members = [
     "crates/lumen-app",
     "xtask",
 ]
-# Candle-era PagedAttention. Not a member: its Metal buffer pool and kernel
-# dispatch are written against candle-metal-kernels, which is gone. The pure
-# scheduler / page-table / sequence logic and the 480-line MSL kernel are kept
-# on disk as the starting point for an MLX rewrite — see the crate's README.
-exclude = ["crates/paged-attention"]
 # lumen-app pulls in the Tauri + webview stack (~hundreds of crates). Excluding
 # it from `default-members` keeps `cargo build` / `cargo test` at the workspace
 # root fast — build the desktop app explicitly with `cargo build -p lumen-app`
