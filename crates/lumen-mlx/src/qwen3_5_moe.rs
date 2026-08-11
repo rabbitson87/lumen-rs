@@ -632,6 +632,109 @@ mod imp {
 
     // ───────────────────────── safetensors weights ─────────────────────────
 
+    /// Reject a `.safetensors` file whose data section is shorter than its own
+    /// header says it should be.
+    ///
+    /// This is a **silent-corruption** guard, and the silence is the problem.
+    /// A file truncated inside its data section — the shape every interrupted
+    /// download, full disk and killed `hf download` leaves behind — loads
+    /// through `Array::load_safetensors` **without error** and yields wrong
+    /// values: measured on a 4x4 f32 tensor missing its last 16 bytes, the
+    /// load succeeded and the final element read 3.0 where the file had
+    /// written 15.0. Nothing downstream can notice; the model simply serves
+    /// plausible, wrong output forever.
+    ///
+    /// Header truncation, a bad length prefix and a garbled header are all
+    /// already clean errors from upstream, so this checks only what upstream
+    /// does not: that the bytes the header promises are actually present.
+    /// Costs one `metadata()` plus a header parse per shard, once per load.
+    fn validate_safetensors_complete(path: &Path) -> Result<()> {
+        use std::io::Read;
+
+        let mut f = std::fs::File::open(path)
+            .with_context(|| format!("open({}) failed", path.display()))?;
+        let file_len = f
+            .metadata()
+            .with_context(|| format!("metadata({}) failed", path.display()))?
+            .len();
+
+        let mut len_buf = [0u8; 8];
+        if f.read_exact(&mut len_buf).is_err() {
+            // Too short to even hold a header length; upstream reports this
+            // clearly, so let it.
+            return Ok(());
+        }
+        let header_len = u64::from_le_bytes(len_buf);
+        let Some(data_start) = 8u64.checked_add(header_len) else {
+            return Ok(()); // absurd length — upstream rejects it
+        };
+        if data_start > file_len {
+            return Ok(()); // header itself truncated — upstream rejects it
+        }
+
+        let mut header_bytes = vec![0u8; header_len as usize];
+        if f.read_exact(&mut header_bytes).is_err() {
+            return Ok(());
+        }
+
+        // A header region that is present but does not parse as exactly one
+        // JSON object is itself the corruption signal, and this is NOT
+        // deferrable to upstream.
+        //
+        // Flipping one byte of the length prefix (120 -> 135 on the test
+        // fixture) makes the declared region a valid JSON object followed by
+        // 15 bytes of the data section. nlohmann — upstream's parser — stops
+        // at the closing brace and ignores the trailing bytes, so the load
+        // succeeds, but it then computes the data section as starting at
+        // `8 + 135` instead of `8 + 120`: every tensor is read 15 bytes off
+        // and every value is wrong, silently. serde_json rejects trailing
+        // content, which is what makes this check able to see it at all.
+        let parsed = serde_json::from_slice::<serde_json::Value>(&header_bytes);
+        let Ok(header) = parsed else {
+            return Err(anyhow!(
+                "{}: the {header_len}-byte header region is not a single JSON object. The \
+                 declared header length is wrong, which shifts the data section and makes \
+                 every tensor read from the wrong offset. Re-download the shard.",
+                path.display(),
+            ));
+        };
+        let Some(entries) = header.as_object() else {
+            return Err(anyhow!(
+                "{}: safetensors header is not a JSON object",
+                path.display()
+            ));
+        };
+
+        // Largest `data_offsets[1]` across all tensors is the data section's
+        // required extent. `__metadata__` carries no offsets and is skipped.
+        let mut required_end = 0u64;
+        for (name, spec) in entries {
+            if name == "__metadata__" {
+                continue;
+            }
+            if let Some(end) = spec
+                .get("data_offsets")
+                .and_then(|o| o.get(1))
+                .and_then(serde_json::Value::as_u64)
+            {
+                required_end = required_end.max(end);
+            }
+        }
+
+        let required_len = data_start.saturating_add(required_end);
+        if file_len < required_len {
+            return Err(anyhow!(
+                "{} is truncated: header declares {required_len} bytes ({data_start} header + \
+                 {required_end} data) but the file is {file_len} — {} bytes short. A partial \
+                 download loads without error and silently yields wrong weights, so it is \
+                 rejected here. Re-download the shard.",
+                path.display(),
+                required_len - file_len,
+            ));
+        }
+        Ok(())
+    }
+
     /// Multi-shard safetensors weight bag, keyed by tensor name.
     /// Mirrors mlx_lm's `weights = mx.load(path)` dict but covers all shards
     /// in a model directory.
@@ -654,6 +757,7 @@ mod imp {
             }
             let mut tensors: HashMap<String, Array> = HashMap::new();
             for shard in shard_paths {
+                validate_safetensors_complete(&shard)?;
                 let map = Array::load_safetensors(&shard).map_err(|err| {
                     anyhow!("load_safetensors({}) failed: {err}", shard.display())
                 })?;
@@ -5490,9 +5594,7 @@ mod imp {
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by runner_native.rs Phase 3d wiring.
-pub(crate) use imp::{
-    NativeQuantizationConfig, NativeQuantizationOverride, NativeQwen3_5MoeModel, NativeWeights,
-};
+pub(crate) use imp::{NativeQuantizationConfig, NativeQuantizationOverride, NativeQwen3_5MoeModel};
 
 /// Config parsing is pure serde over `config.json` — no MLX, no GPU — and it
 /// is the first code a downloaded checkpoint touches, so the Phase 3 fault
@@ -5504,7 +5606,7 @@ pub(crate) use imp::{
 /// default build; that is a follow-up, noted in 005's checklist rather than
 /// bundled into the sweep.
 #[cfg(feature = "mlx-native")]
-pub use imp::{NativeLayerType, NativeModelConfig, NativeTextConfig};
+pub use imp::{NativeLayerType, NativeModelConfig, NativeTextConfig, NativeWeights};
 
 // MTP types are part of the public surface (Phase 2 S3) — re-exported from
 // the crate root via `lumen_mlx::MtpStepOutput`.

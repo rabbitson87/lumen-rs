@@ -243,6 +243,26 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "safetensors-silent-truncation",
+        symptom: "a shard truncated inside its DATA section loaded with NO error \
+                  and returned wrong weights (4x4 f32 missing 16 bytes read 3.0 \
+                  where the file wrote 15.0) — a partial download served \
+                  plausible, wrong output forever",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                validate_safetensors_complete(&shard)?;
+"#,
+            replace: "                // xtask red-green: completeness guard removed\n",
+        }],
+        guards: &[mlx_native_test(
+            "weights_faults",
+            "data_section_truncation_is_rejected_not_silently_wrong",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "config-null-moe-fields",
         symptom: "a dense checkpoint spelling its absent MoE fields as \
                   `\"num_experts\": null` failed to load — `#[serde(default)]` \
@@ -507,7 +527,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // fuzzed without `mlx-native`.
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
-        (_, "config-null-moe-fields") => "qwen3_5_moe.rs",
+        (_, "config-null-moe-fields") | (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",

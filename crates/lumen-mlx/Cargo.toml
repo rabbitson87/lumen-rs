@@ -185,3 +185,7 @@ required-features = ["mlx-native"]
 [[test]]
 name = "config_faults"
 required-features = ["mlx-native"]
+
+[[test]]
+name = "weights_faults"
+required-features = ["mlx-native"]

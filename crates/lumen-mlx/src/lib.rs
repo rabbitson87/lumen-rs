@@ -163,7 +163,9 @@ pub use qwen3_5_moe::set_kv_store_bf16;
 /// drive the loader that every downloaded checkpoint hits first.
 #[cfg(feature = "mlx-native")]
 pub mod qwen3_5_moe_config {
-    pub use crate::qwen3_5_moe::{NativeLayerType, NativeModelConfig, NativeTextConfig};
+    pub use crate::qwen3_5_moe::{
+        NativeLayerType, NativeModelConfig, NativeTextConfig, NativeWeights,
+    };
 }
 
 /// Link anchor for `examples/dump_flags.rs`. The flag registry is collected by
