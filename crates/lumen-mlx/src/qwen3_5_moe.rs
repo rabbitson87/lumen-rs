@@ -109,9 +109,18 @@ mod imp {
     /// This is a **numerics change, not a lossless one**. The cast lands after
     /// k_norm and RoPE, so stored keys/values are rounded to bf16 and the
     /// attention then runs in bf16 end-to-end — which is what mlx-lm does for a
-    /// bf16 checkpoint, but it is not what this path did before. Default off
-    /// until a quality gate says otherwise; see
-    /// `examples/kv_bf16_ab.rs`.
+    /// bf16 checkpoint, but it is not what this path did before.
+    ///
+    /// **Default on since the quality pass.** 6,300 teacher-forced positions
+    /// across Qwen3.5-9B (6-bit) and Qwen3.6-27B (4-bit), six realistic prompts
+    /// in two languages: top-1 agreement 99.83% and 99.73% against an
+    /// f32-vs-f32 control of exactly 100.000%, flat across context depth, and
+    /// **every single disagreement sat below the 1.5th percentile of the
+    /// top1-minus-top2 logit gap** — bf16 re-broke numerical ties and never
+    /// moved a prediction the model held with confidence. Set
+    /// `LUMEN_MLX_KV_BF16=0` to restore f32 storage. Harnesses:
+    /// `examples/kv_bf16_ab.rs` (memory, throughput) and
+    /// `examples/kv_bf16_quality.rs` (teacher-forced agreement).
     ///
     /// Backed by an atomic rather than the usual `OnceLock` so a harness can
     /// exercise both sides in one process against one set of loaded weights. A
@@ -125,7 +134,7 @@ mod imp {
             _ => {
                 let on = std::env::var("LUMEN_MLX_KV_BF16")
                     .map(|v| v != "0")
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 KV_BF16.store(u8::from(on), Ordering::Relaxed);
                 on
             }

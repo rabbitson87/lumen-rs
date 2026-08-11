@@ -322,6 +322,37 @@ fn active_bytes() -> usize {
     get_active_memory().unwrap_or(0)
 }
 
+/// Active memory once the reusable pool has stopped shrinking.
+///
+/// A single `clear_cache()` is not enough. It frees already-released buffers,
+/// and MLX does not always release everything before the call returns, so the
+/// same condition at the same shape reports either its true value or that value
+/// plus a fixed ~127 MB. On a resident figure of a few hundred MB that is large
+/// enough to invert an A/B. Loop until two readings agree; the minimum is
+/// correct because the contaminant only ever adds.
+fn settled_active() -> usize {
+    // The wait is load-bearing, not defensive. `LUMEN_NATIVE_DEFER_CLEAR_CACHE`
+    // is on by default, so `remove_seq` hands the clear to a background worker
+    // (~45 ms). Two back-to-back readings taken before that worker runs are
+    // equal to each other and both wrong, which is how a settle loop without a
+    // sleep exits early on the contaminated value.
+    let mut best = usize::MAX;
+    let mut prev = usize::MAX;
+    let mut stable = 0;
+    for _ in 0..12 {
+        let _ = clear_cache();
+        let now = active_bytes();
+        best = best.min(now);
+        stable = if now == prev { stable + 1 } else { 0 };
+        if stable >= 2 {
+            break;
+        }
+        prev = now;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    best
+}
+
 fn gb(bytes: usize) -> f64 {
     bytes as f64 / 1e9
 }
@@ -434,8 +465,7 @@ fn run_width(
         last_tokens[row] = tok;
         positions[row] = pos;
     }
-    let _ = clear_cache();
-    let post_prefill = active_bytes().saturating_sub(baseline);
+    let post_prefill = settled_active().saturating_sub(baseline);
 
     // Sampled inside the decode loop only, so it measures decode's own
     // high-water mark rather than inheriting prefill's.
@@ -468,14 +498,12 @@ fn run_width(
     }
     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
 
-    let _ = clear_cache();
-    let kv_final = active_bytes().saturating_sub(baseline);
+    let kv_final = settled_active().saturating_sub(baseline);
 
     for &id in &ids {
         driver.remove_seq(id)?;
     }
-    let _ = clear_cache();
-    let residual = active_bytes().saturating_sub(baseline);
+    let residual = settled_active().saturating_sub(baseline);
 
     let prompt_tokens: usize = prompts.iter().map(Vec::len).sum();
     // `+ 1` for the untimed settle step, which is a real cached token.
@@ -696,8 +724,7 @@ fn main() -> Result<()> {
         &mut next_id,
         "  prime  ",
     )?;
-    let _ = clear_cache();
-    let baseline = active_bytes();
+    let baseline = settled_active();
     println!(
         "active memory: post-load={:.2} GB → post-prime={:.2} GB (baseline: weights + runtime)",
         gb(post_load),

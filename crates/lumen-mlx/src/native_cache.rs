@@ -284,6 +284,25 @@ mod imp {
                 ));
             }
 
+            // A buffer built under one KV dtype must not be extended under
+            // another. This is reachable in exactly one way: `LUMEN_MLX_KV_BF16`
+            // changed between the run that persisted or snapshotted a cache and
+            // the run resuming it, leaving an f32 prefix under a bf16 suffix (or
+            // the reverse). Concatenating those would either promote silently or
+            // fail somewhere far from the cause.
+            if let Some(k) = self.keys.as_ref() {
+                if k.dtype() != keys.dtype() {
+                    return Err(anyhow!(
+                        "NativeKvCache: cache holds {:?} keys but received {:?}. A KV cache built \
+                         under a different LUMEN_MLX_KV_BF16 setting cannot be extended — discard \
+                         the persisted cache (LUMEN_KV_DISK directory / prefix cache) or restore \
+                         the previous setting.",
+                        k.dtype(),
+                        keys.dtype(),
+                    ));
+                }
+            }
+
             let prev = self.offset;
             let new_total = prev + s;
 

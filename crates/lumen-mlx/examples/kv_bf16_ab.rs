@@ -134,16 +134,24 @@ struct Cond {
 /// Looping until two consecutive readings agree collapses it. The minimum is
 /// returned because the contaminant only ever adds.
 fn settled_active() -> usize {
+    // The wait is load-bearing, not defensive. `LUMEN_NATIVE_DEFER_CLEAR_CACHE`
+    // is on by default, so `remove_seq` hands the clear to a background worker
+    // (~45 ms). Two back-to-back readings taken before that worker runs are
+    // equal to each other and both wrong, which is how a settle loop without a
+    // sleep exits early on the contaminated value.
     let mut best = usize::MAX;
     let mut prev = usize::MAX;
-    for _ in 0..8 {
+    let mut stable = 0;
+    for _ in 0..12 {
         let _ = clear_cache();
         let now = get_active_memory().unwrap_or(0);
         best = best.min(now);
-        if now == prev {
+        stable = if now == prev { stable + 1 } else { 0 };
+        if stable >= 2 {
             break;
         }
         prev = now;
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     best
 }

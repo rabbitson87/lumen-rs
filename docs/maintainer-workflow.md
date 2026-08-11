@@ -323,7 +323,7 @@ long agentic prompts that matter most. `LUMEN_QWEN35_PREFILL_CHUNK` remains the
 escape hatch for a memory-tight machine that would rather pay latency, and the
 table above is the exchange rate.
 
-### bf16 KV storage — measured, shipped default-off (`LUMEN_MLX_KV_BF16`)
+### bf16 KV storage — DEFAULT ON (`LUMEN_MLX_KV_BF16=0` to revert)
 
 The largest memory lever 007 surfaced is now implemented and measured.
 `examples/kv_bf16_ab.rs` flips an atomic (`set_kv_store_bf16`) so both
@@ -398,15 +398,45 @@ percentile. bf16 did not change a single prediction the model held with any
 confidence; it re-broke ties that were numerically ambiguous already, where the
 f32 winner has no claim to being the more correct one.
 
-**Default is still off** — that is a decision, not a gap in the evidence.
-Memory, speed and quality all point the same way, but flipping it changes what
-every request returns (a 600-token reply would differ from today's roughly a
-third of the time, at tied positions), and that is a call to make deliberately.
-The measurements needed to make it are above; reproduce with
-`kv_bf16_quality --control` then without.
+#### Default flipped on
+
+Memory, speed and quality all point the same way, so bf16 is now the default
+storage dtype for the full-attention KV cache. `LUMEN_MLX_KV_BF16=0` restores
+f32.
+
+What changes for a user: generated text can differ from a pre-flip build. Every
+divergence measured sat at a logit tie below the 1.5th percentile, so this is a
+different-but-equivalent continuation rather than a worse one — but a 600-token
+reply will differ from the old build's a fair fraction of the time, and anything
+pinned to exact historical output (recorded transcripts, `LUMEN_MLX_GOLDEN_IN`
+parity fixtures captured under f32) needs regenerating or running with the flag
+off.
+
+One hazard worth knowing: a KV cache **persisted** under one setting cannot be
+extended under the other. `LUMEN_KV_DISK` is off by default so the exposure is
+narrow, but `NativeKvCache::update_and_fetch` now rejects a dtype mismatch with
+an actionable message rather than silently promoting — the failure would
+otherwise surface far from its cause.
+
+Scope: this is the Qwen3.5/3.6 full-attention path. Gemma 4 has its own cache
+(`NativeKvCacheQuantized` and friends) and is untouched, as is the TurboQuant
+full-attn variant.
 
 The other lever 007 named — `LUMEN_QWEN35_PREFILL_CHUNK` — is covered above; it
 is a knob, not a default change.
+
+> **Measurement note on the tables above.** `get_active_memory()` after a
+> single `clear_cache()` is not settled: `LUMEN_NATIVE_DEFER_CLEAR_CACHE` is on
+> by default, so `remove_seq` hands the clear to a background worker (~45 ms)
+> and a reading taken before it runs is high by a fixed ~127 MB. Both harnesses
+> now loop with a 25 ms wait until two readings agree. The 007 per-run absolute
+> figures were taken before that fix and carry the quantum as noise — which is
+> why the fit reports a worst point 4.5-7.2% off. The fitted constants are
+> unaffected and were confirmed independently: the settled harness reads
+> 188.6 MB at N=1 / 2,048 slots against the fit's 191.4 MB prediction.
+>
+> Verified after the default flip, two passes each: unset → 121.4 / 121.5 MB
+> (bf16), `LUMEN_MLX_KV_BF16=0` → 188.6 / 188.6 MB (f32), residual 0.0 MB.
 
 **To recover the deleted code**, `git log --diff-filter=D -- crates/paged-attention`
 finds the removal commit; the crate is intact in its parent (571 LOC of
