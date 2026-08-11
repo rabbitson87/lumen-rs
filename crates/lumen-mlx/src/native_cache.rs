@@ -2868,6 +2868,12 @@ mod imp {
     }
 }
 
+/// Re-exported at crate root so measurement harnesses can compute the cache's
+/// allocation rounding without hard-coding 256 — a duplicated constant here is
+/// a silent-drift hazard the moment the block size is ever tuned.
+#[cfg(feature = "mlx-native")]
+pub use imp::KV_CACHE_STEP;
+
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d decode loop in runner_native.rs.
 pub(crate) use imp::{

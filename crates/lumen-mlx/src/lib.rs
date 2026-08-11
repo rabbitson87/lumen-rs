@@ -119,6 +119,11 @@ mod golden;
 pub mod metal_kernel;
 pub mod native_attention;
 mod native_cache;
+/// Block granularity the per-sequence full-attention KV cache grows in
+/// (`mlx_lm.cache.KVCache(step=256)` semantics). Exposed for harnesses that
+/// reason about allocation rounding — see `examples/kv_concurrency_ab.rs`.
+#[cfg(feature = "mlx-native")]
+pub use native_cache::KV_CACHE_STEP;
 mod native_compile_cache;
 mod native_conv1d;
 mod native_embedding;

@@ -153,3 +153,7 @@ required-features = ["mlx-native"]
 [[example]]
 name = "m2c_inproj_tail_fused"
 required-features = ["mlx-native"]
+
+[[example]]
+name = "kv_concurrency_ab"
+required-features = ["mlx-native"]

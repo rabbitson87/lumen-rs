@@ -246,7 +246,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
-| PagedAttention | ❌ parked | `crates/paged-attention` is excluded from the workspace pending an MLX rewrite — see its README |
+| PagedAttention | ❌ parked, **measured** | `crates/paged-attention` stays excluded from the workspace. `kv_concurrency_ab` (M3 Max, Qwen3.5-9B, N=1/2/4/8, three length profiles) puts the reclaimable block-rounding slack at 72 MB / 66 MB / 35 MB for short / mixed / long prompts — **0.35–0.91% of process memory**. 40–63% of per-sequence resident memory is linear-attention SSM state that paging cannot compact, and the real ceiling is the prefill `[1, prompt_len, vocab]` logits tensor (11.5 GB at N=8 long) which it also cannot touch. See the crate README for the full table and the two larger levers it surfaced |
 
 The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
 are gone with the backend. GGUF has no MLX equivalent, so that capability was
