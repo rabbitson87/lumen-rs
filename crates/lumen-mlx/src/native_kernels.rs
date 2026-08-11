@@ -48,10 +48,20 @@ mod imp {
     /// as an opt-in for future shapes where fire count rises above the
     /// break-even (e.g., expanded MoE shared-expert pattern). See
     /// `notes/sigmoid_mul_fuse_regression.md`.
+    lumen_flags::flag! {
+        /// Compile-wrapped `sigmoid(gate) * other`, bit-identical to the
+        /// two-op composition. Default OFF (anti-pattern #30 calibration).
+        /// (Parse note: previously only `=1` enabled this; the uniform rule
+        /// now accepts any non-`"0"`.)
+        pub(crate) sigmoid_mul_fuse {
+            env: "LUMEN_NATIVE_FUSE_SIGMOID_MUL",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     pub fn sigmoid_mul_fuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_FUSE_SIGMOID_MUL")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        sigmoid_mul_fuse::get()
     }
 
     /// Compile-wrapped `sigmoid(gate) * other` (shapeless). One mlx-c compile

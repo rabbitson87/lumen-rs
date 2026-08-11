@@ -48,6 +48,10 @@ minijinja-contrib = { version = "2.13", features = ["pycompat"] }
 # Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
 # sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).
 lumen-core = { path = "../lumen-core" }
+# Env-flag macro + link-time registry (005 Phase 2). Every boolean LUMEN_* gate
+# migrates to `lumen_flags::flag!` so `cargo xtask flags` can enumerate, doc
+# and equivalence-test them.
+lumen-flags = { path = "../lumen-flags" }
 # Native MLX runner scaffold. This stays opt-in (off by default; gate
 # via `--features mlx-native`) because the dependency tree includes a
 # patched mlx-rs / mlx-sys fork with our Kestrel custom primitives
@@ -172,4 +176,8 @@ required-features = ["mlx-native"]
 
 [[example]]
 name = "kv_bf16_quality"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "dump_flags"
 required-features = ["mlx-native"]

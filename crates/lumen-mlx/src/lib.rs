@@ -158,6 +158,13 @@ mod qwen3_5_tools;
 pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_kv_store_bf16;
+
+/// Link anchor for `examples/dump_flags.rs`. The flag registry is collected by
+/// linkme at link time, but an rlib's objects are only linked when referenced —
+/// a binary that touches nothing in this crate sees an empty registry. Calling
+/// this (a no-op) forces the linkage.
+#[cfg(feature = "mlx-native")]
+pub fn flags_link_anchor() {}
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,

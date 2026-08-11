@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lumen-core",
+    "crates/lumen-flags",
     "crates/lumen-testkit",
     "crates/turboquant-cache",
     "crates/lumen-mlx",
@@ -20,6 +21,7 @@ exclude = ["fuzz"]
 # (dev) or `cargo tauri build` (release bundle).
 default-members = [
     "crates/lumen-core",
+    "crates/lumen-flags",
     "crates/lumen-testkit",
     "crates/turboquant-cache",
     "crates/lumen-mlx",

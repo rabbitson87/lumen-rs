@@ -93,57 +93,43 @@ mod imp {
         sigmoid_mul_fuse_enabled()
     }
 
-    /// Sentinel for "the env has not been consulted yet".
-    const KV_BF16_UNSET: u8 = 2;
-    static KV_BF16: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(KV_BF16_UNSET);
-
-    /// Store the full-attention KV cache in bf16 rather than f32.
-    ///
-    /// Task 007 measured the cache at ~67 KB per allocated slot on Qwen3.5-9B,
-    /// which matches the f32 arithmetic exactly (8 full-attn layers × 4 KV
-    /// heads × 256 head_dim × 2 for K+V × 4 bytes = 64.0 KB) and rules out
-    /// bf16's 32.0 KB. Halving it is the largest memory lever left after that
-    /// task ruled out PagedAttention — worth ~1.5 GB at eight concurrent
-    /// long-context sequences, against paging's 35 MB.
-    ///
-    /// This is a **numerics change, not a lossless one**. The cast lands after
-    /// k_norm and RoPE, so stored keys/values are rounded to bf16 and the
-    /// attention then runs in bf16 end-to-end — which is what mlx-lm does for a
-    /// bf16 checkpoint, but it is not what this path did before.
-    ///
-    /// **Default on since the quality pass.** 6,300 teacher-forced positions
-    /// across Qwen3.5-9B (6-bit) and Qwen3.6-27B (4-bit), six realistic prompts
-    /// in two languages: top-1 agreement 99.83% and 99.73% against an
-    /// f32-vs-f32 control of exactly 100.000%, flat across context depth, and
-    /// **every single disagreement sat below the 1.5th percentile of the
-    /// top1-minus-top2 logit gap** — bf16 re-broke numerical ties and never
-    /// moved a prediction the model held with confidence. Set
-    /// `LUMEN_MLX_KV_BF16=0` to restore f32 storage. Harnesses:
-    /// `examples/kv_bf16_ab.rs` (memory, throughput) and
-    /// `examples/kv_bf16_quality.rs` (teacher-forced agreement).
-    ///
-    /// Backed by an atomic rather than the usual `OnceLock` so a harness can
-    /// exercise both sides in one process against one set of loaded weights. A
-    /// relaxed load is nanoseconds against the matmul it precedes, and an
-    /// alternate path that no test can reach is a failure mode this project has
-    /// hit repeatedly.
-    pub(crate) fn kv_store_bf16() -> bool {
-        match KV_BF16.load(Ordering::Relaxed) {
-            0 => false,
-            1 => true,
-            _ => {
-                let on = std::env::var("LUMEN_MLX_KV_BF16")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
-                KV_BF16.store(u8::from(on), Ordering::Relaxed);
-                on
-            }
+    lumen_flags::flag! {
+        /// Store the full-attention KV cache in bf16 rather than f32.
+        ///
+        /// Task 007 measured the cache at ~67 KB per allocated slot on
+        /// Qwen3.5-9B, which matches the f32 arithmetic exactly (8 full-attn
+        /// layers × 4 KV heads × 256 head_dim × 2 for K+V × 4 bytes =
+        /// 64.0 KB). Halving it is the largest memory lever left after that
+        /// task ruled out PagedAttention — worth ~1.5 GB at eight concurrent
+        /// long-context sequences, against paging's 35 MB — and decode gets
+        /// +1.6–4.1% faster because attention reads half the bytes.
+        ///
+        /// **`Behavior`, not `Optimization`: this is a numerics change.** The
+        /// cast lands after k_norm and RoPE, so attention runs in bf16
+        /// end-to-end and greedy output may differ from f32 — the equivalence
+        /// matrix must never flip it expecting identical output. Default ON
+        /// since the quality pass: 6,300 teacher-forced positions across two
+        /// models, 99.73–99.83% top-1 agreement against an f32-vs-f32 control
+        /// of exactly 100.000%, flat across context depth, every disagreement
+        /// below the 1.5th percentile of the top1−top2 logit gap. `=0`
+        /// restores f32. Harnesses: `examples/kv_bf16_ab.rs`,
+        /// `examples/kv_bf16_quality.rs`.
+        pub(crate) kv_bf16 {
+            env: "LUMEN_MLX_KV_BF16",
+            default: true,
+            kind: Behavior,
         }
     }
 
-    /// Pin [`kv_store_bf16`] for an A/B harness, bypassing the env read.
+    pub(crate) fn kv_store_bf16() -> bool {
+        kv_bf16::get()
+    }
+
+    /// Pin [`kv_store_bf16`] process-wide for an A/B harness, bypassing the
+    /// env read. Thin wrapper over the flag module's `set` so the examples
+    /// that predate `lumen_flags` keep their entry point.
     pub fn set_kv_store_bf16(on: bool) {
-        KV_BF16.store(u8::from(on), Ordering::Relaxed);
+        kv_bf16::set(on);
     }
 
     /// Top-`k` softmax over a full logits row → `(ids, probs)` where `probs` are
@@ -1347,10 +1333,20 @@ mod imp {
     /// Cached LinearAttnConstants (ones_w + scale_q/k + keep_indices + scaled_w_q/k).
     /// Bit-identical to per-call construction (same dtype/shape/value).
     /// Opt out with `LUMEN_NATIVE_ALLOC_REUSE=0`.
+    lumen_flags::flag! {
+        /// Reuse per-layer scratch allocations across decode steps instead of
+        /// reallocating. Default ON (LANDED 2026-05-11). Prerequisite for
+        /// `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` (the fused-weight constants
+        /// live in the reused `LinearAttnConstants`).
+        pub(crate) alloc_reuse {
+            env: "LUMEN_NATIVE_ALLOC_REUSE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn alloc_reuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_ALLOC_REUSE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        alloc_reuse::get()
     }
 
     /// Linear-attn scale fuse: absorb `scale_q/k` into rms_norm weight.
@@ -1363,10 +1359,20 @@ mod imp {
     /// Identified via op-by-op forward divergence audit 2026-05-11 — 42 ops/step
     /// removed (highest single divergence). Bit-identical by linearity of rms_norm
     /// weight scaling.
+    lumen_flags::flag! {
+        /// Absorb `scale_q/k` into the rms_norm weight (bit-identical by
+        /// linearity of rms_norm weight scaling). Default ON 2026-05-11:
+        /// thermal-clean A/B (n=10, STEPS=100) Δ=−0.315 ms, Welch t=−3.33σ.
+        /// Only active when `LUMEN_NATIVE_ALLOC_REUSE` is also on.
+        pub(crate) linear_attn_scale_fuse {
+            env: "LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn linear_attn_scale_fuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        linear_attn_scale_fuse::get()
     }
 
     /// Divergence #4: conv-state advance via `slice` (mlx_slice view/copy)
@@ -1374,10 +1380,19 @@ mod imp {
     /// `mx.contiguous(conv_input[:, -n_keep:, :])`. Bit-identical for s==1
     /// decode regime — same indices `[s, s+1, ..., total_len-1]` but cheaper
     /// Metal kernel. Opt out with `LUMEN_NATIVE_CONV_SLICE=0`.
+    lumen_flags::flag! {
+        /// Conv-state advance via `slice` (view/copy) instead of `take_axis`
+        /// (gather kernel). Bit-identical for the s==1 decode regime — same
+        /// indices, cheaper Metal kernel. Default OFF (A/B WASH).
+        pub(crate) conv_slice {
+            env: "LUMEN_NATIVE_CONV_SLICE",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn conv_slice_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_CONV_SLICE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
+        conv_slice::get()
     }
 
     /// PROBE (timing only, NOT correct — `LUMEN_PROBE_SKIP_LINCOMPUTE=1`):
@@ -1414,10 +1429,21 @@ mod imp {
     /// non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
     /// default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
     /// the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
+    lumen_flags::flag! {
+        /// Fused input-side linear-attn kernel (conv+silu+q/k-norm). Built to
+        /// completion, output bit-identical, measured 0 speedup — MLX async
+        /// already overlaps the small launches. Kept as a reusable artifact;
+        /// default OFF. (Parse note: previously only `=1` enabled this; the
+        /// registry's uniform rule now accepts any non-`"0"` value.)
+        pub(crate) fuse_linattn_in {
+            env: "LUMEN_NATIVE_FUSE_LINATTN_IN",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn fuse_linattn_in_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_FUSE_LINATTN_IN")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_linattn_in::get()
     }
 
     /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.

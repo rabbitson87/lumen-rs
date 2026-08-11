@@ -30,71 +30,36 @@ mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
     use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
-    use std::sync::OnceLock;
 
     /// Block size for KV-cache pre-allocation. Mirrors `mlx_lm.cache.KVCache.step`.
     /// Decode appends in steps of 1 token; the underlying buffer grows by this
     /// many tokens at a time so concat / fresh alloc is amortized 1:KV_CACHE_STEP.
     pub const KV_CACHE_STEP: usize = 256;
 
-    /// Default ON since 2026-05-07 (Phase G2 LANDED): microbench long-prompt
-    /// 35B-mxfp4 n=12 interleaved A/B (PROMPT_LEN=2048, STEPS=1500) showed
-    /// Δ tps +4.67 tok/s (Welch t = +4.33σ), Δ p50 −1.02 ms/step (t = −4.68σ).
-    /// 32-step PyO3 golden bit-identical PASS for both paths. The prior
-    /// 2026-05-06 35B server-level WASH (-0.06σ) reflected dilution at the
-    /// server step (107ms/step → KV concat 0.7ms = 0.65%); microbench
-    /// 17ms/step exposes the same lever at 4% magnitude.
-    /// Set `LUMEN_NATIVE_KV_STEP_PREALLOC=0` to force legacy per-step
-    /// `concatenate_axis` for emergency revert / A/B comparison.
-    fn use_step_prealloc() -> bool {
-        #[cfg(test)]
-        if let Some(forced) = test_support::forced_step_prealloc() {
-            return forced;
+    lumen_flags::flag! {
+        /// Grow the full-attn KV buffer in `KV_CACHE_STEP` (256) token blocks
+        /// and fill via `slice_update`, instead of a per-step
+        /// `concatenate_axis`. The legacy concat path stays live as the `=0`
+        /// emergency revert.
+        ///
+        /// Default ON since Phase G2: microbench long-prompt 35B-mxfp4 n=12
+        /// interleaved A/B (PROMPT_LEN=2048, STEPS=1500) showed Δtps
+        /// +4.67 tok/s (Welch t = +4.33σ), Δp50 −1.02 ms/step (t = −4.68σ),
+        /// with a 32-step PyO3 golden bit-identical PASS for both paths.
+        ///
+        /// This flag is the ancestor of the whole `lumen_flags` design: it was
+        /// the only one of the audited 370 env gates whose alternate path a
+        /// test could reach, via a hand-rolled thread-local override that the
+        /// macro now generates for every flag.
+        pub(crate) kv_step_prealloc {
+            env: "LUMEN_NATIVE_KV_STEP_PREALLOC",
+            default: true,
+            kind: Optimization,
         }
-        static FLAG: OnceLock<bool> = OnceLock::new();
-        *FLAG.get_or_init(|| {
-            std::env::var("LUMEN_NATIVE_KV_STEP_PREALLOC")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        })
     }
 
-    /// Lets tests exercise both sides of the step-prealloc switch.
-    ///
-    /// The production flag is a `OnceLock` over an env var, read once per
-    /// process — which means the legacy `concatenate_axis` path, kept as a live
-    /// emergency revert, could not be reached from any test at all. Setting the
-    /// env from a test would not work (the `OnceLock` may already be
-    /// initialised) and would race every other test in the binary.
-    ///
-    /// The override is thread-local, so `cargo test`'s per-test threads cannot
-    /// interfere with each other, and `#[cfg(test)]` keeps it out of release
-    /// builds entirely.
-    #[cfg(test)]
-    pub(crate) mod test_support {
-        use std::cell::Cell;
-
-        thread_local! {
-            static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
-        }
-
-        pub(crate) fn forced_step_prealloc() -> Option<bool> {
-            FORCED.with(Cell::get)
-        }
-
-        /// Run `f` with the step-prealloc switch pinned, restoring the previous
-        /// setting afterwards even if `f` panics.
-        pub(crate) fn with_step_prealloc<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
-            struct Reset(Option<bool>);
-            impl Drop for Reset {
-                fn drop(&mut self) {
-                    FORCED.with(|c| c.set(self.0));
-                }
-            }
-            let _reset = Reset(FORCED.with(Cell::get));
-            FORCED.with(|c| c.set(Some(enabled)));
-            f()
-        }
+    fn use_step_prealloc() -> bool {
+        kv_step_prealloc::get()
     }
 
     /// Slice helper for `arr[..., start:end, :]` on 4D arrays.
@@ -3035,7 +3000,7 @@ mod lifecycle_tests {
         // stopped matching when it began growing in blocks: `kf.shape()[2]` is
         // the buffer, not the fill. Being `#[ignore]`d, it failed unseen.
         for prealloc in [false, true] {
-            super::imp::test_support::with_step_prealloc(prealloc, || {
+            super::imp::kv_step_prealloc::with(prealloc, || {
                 let mut c = NativeRotatingKvCache::new(8, 0);
                 // Push 1 token at a time up to (max_size - 1) → no eviction yet.
                 for step in 0..7 {

@@ -52,14 +52,20 @@ mod imp {
 
     static COMPUTE_G_SLOT: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// compute_g persistent compile cache. Default ON (LANDED Phase 3):
+        /// wins σ-significantly across a 12-run 4-condition matrix
+        /// (Δp50=−0.33 ms, Δtps=+1.96 vs legacy direct dispatch). `=0` falls
+        /// back to the legacy direct-ops path.
+        pub(crate) ssm_compile {
+            env: "LUMEN_NATIVE_COMPILE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn compile_enabled() -> bool {
-        // Default ON (LANDED 2026-05-01 Phase 3): compute_g persistent compile
-        // cache wins σ-significantly across 12-run 4-condition matrix
-        // (Δp50=-0.33ms, Δtps=+1.96 vs legacy direct dispatch). Set
-        // `LUMEN_NATIVE_COMPILE=0` to fall back to the legacy direct-ops path.
-        std::env::var("LUMEN_NATIVE_COMPILE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        ssm_compile::get()
     }
 
     /// Qwen3.5-MoE delta-net SSM gating activation:
@@ -505,10 +511,19 @@ mod imp {
             .context("rms_norm_gated: output → hidden_states dtype cast failed")
     }
 
+    lumen_flags::flag! {
+        /// Fused rms_norm + silu(gate) + multiply Metal kernel. Default OFF —
+        /// reserved for super-kernel composition. (Parse note: previously only
+        /// `=1` enabled this; the uniform rule now accepts any non-`"0"`.)
+        pub(crate) rms_norm_gated_fused {
+            env: "LUMEN_NATIVE_RMS_NORM_GATED_FUSED",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn rms_norm_gated_fused_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_RMS_NORM_GATED_FUSED")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        rms_norm_gated_fused::get()
     }
 
     // ─── Phase G5-A: fused rms_norm + silu(gate) + multiply ──────────────
