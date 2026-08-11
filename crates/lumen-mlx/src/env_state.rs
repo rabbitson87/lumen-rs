@@ -73,6 +73,11 @@ const KNOWN_DEFAULTS: &[(&str, &str)] = &[
     ),
     ("LUMEN_NATIVE_NO_CLEAR_CACHE", "0 (clear_cache fix opt-out)"),
     (
+        "LUMEN_MLX_KV_BF16",
+        "0 (halves full-attn KV: -33 KB/slot, +2-4% decode, but output can \
+         change — see examples/kv_bf16_ab.rs)",
+    ),
+    (
         "LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS",
         "0 (opt-in; mirrors Gemma 4 — A/B WASH expected per MLX lazy dedup)",
     ),

@@ -93,6 +93,50 @@ mod imp {
         sigmoid_mul_fuse_enabled()
     }
 
+    /// Sentinel for "the env has not been consulted yet".
+    const KV_BF16_UNSET: u8 = 2;
+    static KV_BF16: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(KV_BF16_UNSET);
+
+    /// Store the full-attention KV cache in bf16 rather than f32.
+    ///
+    /// Task 007 measured the cache at ~67 KB per allocated slot on Qwen3.5-9B,
+    /// which matches the f32 arithmetic exactly (8 full-attn layers × 4 KV
+    /// heads × 256 head_dim × 2 for K+V × 4 bytes = 64.0 KB) and rules out
+    /// bf16's 32.0 KB. Halving it is the largest memory lever left after that
+    /// task ruled out PagedAttention — worth ~1.5 GB at eight concurrent
+    /// long-context sequences, against paging's 35 MB.
+    ///
+    /// This is a **numerics change, not a lossless one**. The cast lands after
+    /// k_norm and RoPE, so stored keys/values are rounded to bf16 and the
+    /// attention then runs in bf16 end-to-end — which is what mlx-lm does for a
+    /// bf16 checkpoint, but it is not what this path did before. Default off
+    /// until a quality gate says otherwise; see
+    /// `examples/kv_bf16_ab.rs`.
+    ///
+    /// Backed by an atomic rather than the usual `OnceLock` so a harness can
+    /// exercise both sides in one process against one set of loaded weights. A
+    /// relaxed load is nanoseconds against the matmul it precedes, and an
+    /// alternate path that no test can reach is a failure mode this project has
+    /// hit repeatedly.
+    pub(crate) fn kv_store_bf16() -> bool {
+        match KV_BF16.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = std::env::var("LUMEN_MLX_KV_BF16")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+                KV_BF16.store(u8::from(on), Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Pin [`kv_store_bf16`] for an A/B harness, bypassing the env read.
+    pub fn set_kv_store_bf16(on: bool) {
+        KV_BF16.store(u8::from(on), Ordering::Relaxed);
+    }
+
     /// Top-`k` softmax over a full logits row → `(ids, probs)` where `probs` are
     /// TRUE marginals `exp(logit - logsumexp(full row))` (NOT renormalized over
     /// the top-k). The dropped tail is tiny for a peaked next-token dist, so the
@@ -1786,6 +1830,21 @@ mod imp {
                 .with_context(|| format!("{what}: cast to f32 failed"))
         }
 
+        /// Cast to the KV-cache storage dtype. A no-op clone (refcount bump)
+        /// when bf16 storage is off, so the default path keeps its exact
+        /// previous graph.
+        ///
+        /// Queries go through here too: `NativeKvCache` stores whatever dtype
+        /// it is handed, so once K/V are bf16 the queries must match or
+        /// `scaled_dot_product_attention` sees mixed dtypes.
+        fn to_kv_dtype(arr: &Array, what: &str) -> Result<Array> {
+            if !kv_store_bf16() {
+                return Ok(arr.clone());
+            }
+            arr.as_dtype(mlx_rs::Dtype::Bfloat16)
+                .with_context(|| format!("{what}: cast to bf16 failed"))
+        }
+
         /// Full-attn layer body. Mirrors
         /// `qwen3_next.Qwen3NextAttention.__call__` for the production
         /// MXFP4-quantized weights:
@@ -1813,10 +1872,18 @@ mod imp {
             positions: RopePlan<'_>,
         ) -> Result<Array> {
             let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
-            // (5) Append to KV cache and fetch full history.
-            let (k_full, v_full) = cache.update_and_fetch(&p.k_rope, &p.v_t)?;
+            // (5) Append to KV cache and fetch full history. Under bf16 storage
+            // the cast happens here, after k_norm and RoPE, so the cache holds
+            // exactly what attention will read.
+            let k_store = Self::to_kv_dtype(&p.k_rope, "layer_full_attn_forward: k")?;
+            let v_store = Self::to_kv_dtype(&p.v_t, "layer_full_attn_forward: v")?;
+            let (k_full, v_full) = cache.update_and_fetch(&k_store, &v_store)?;
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
-            let attn_out = sdpa(&p.q_rope, &k_full, &v_full, p.scale, causal)?;
+            let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward: q")?;
+            let attn_out = sdpa(&q, &k_full, &v_full, p.scale, causal)?;
+            // Back to f32 before the gate: `full_attn_finish` multiplies by an
+            // f32 gate through a fused kernel that expects matching dtypes.
+            let attn_out = Self::to_f32(attn_out, "layer_full_attn_forward: attn_out")?;
             self.full_attn_finish(
                 &attn_out,
                 &p.gate,
@@ -2186,14 +2253,23 @@ mod imp {
                 // `sdpa_split` merges the single shared prefix segment via
                 // log-sum-exp), or the full history when unattached (plain SDPA,
                 // byte-identical to the pre-dedup path).
-                let (k_view, v_view) = kv.update_and_fetch(&k_rope, &v_i)?;
+                let k_store = Self::to_kv_dtype(&k_rope, "layer_full_attn_forward_batch: k")?;
+                let v_store = Self::to_kv_dtype(&v_i, "layer_full_attn_forward_batch: v")?;
+                let (k_view, v_view) = kv.update_and_fetch(&k_store, &v_store)?;
+                let q_store = Self::to_kv_dtype(&q_rope, "layer_full_attn_forward_batch: q")?;
                 let attn_i = match (attached, shared_layer) {
+                    // The shared prefix was written through this same cast, so
+                    // prefix and suffix agree on dtype and `sdpa_split`'s
+                    // log-sum-exp merge sees one dtype throughout.
                     (true, Some((pk, pv))) => {
-                        sdpa_split(&q_rope, pk, pv, &k_view, &v_view, p.scale)?
+                        sdpa_split(&q_store, pk, pv, &k_view, &v_view, p.scale)?
                     }
-                    _ => sdpa(&q_rope, &k_view, &v_view, p.scale, /* causal */ false)?,
+                    _ => sdpa(&q_store, &k_view, &v_view, p.scale, /* causal */ false)?,
                 };
-                attn_parts.push(attn_i);
+                attn_parts.push(Self::to_f32(
+                    attn_i,
+                    "layer_full_attn_forward_batch: attn_out",
+                )?);
             }
             let refs: Vec<&Array> = attn_parts.iter().collect();
             let attn_stacked = mlx_rs::ops::concatenate_axis(&refs, 0)
@@ -5369,6 +5445,12 @@ pub(crate) use imp::{
 // the crate root via `lumen_mlx::MtpStepOutput`.
 #[cfg(feature = "mlx-native")]
 pub use imp::MtpStepOutput;
+
+/// bf16 KV storage toggle. Public so an A/B harness can flip it between runs in
+/// one process rather than relying on a per-process env read — see
+/// `examples/kv_bf16_ab.rs`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_kv_store_bf16;
 
 // ───────────────────────── unit tests ─────────────────────────
 //

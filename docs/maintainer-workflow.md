@@ -323,6 +323,51 @@ long agentic prompts that matter most. `LUMEN_QWEN35_PREFILL_CHUNK` remains the
 escape hatch for a memory-tight machine that would rather pay latency, and the
 table above is the exchange rate.
 
+### bf16 KV storage — measured, shipped default-off (`LUMEN_MLX_KV_BF16`)
+
+The largest memory lever 007 surfaced is now implemented and measured.
+`examples/kv_bf16_ab.rs` flips an atomic (`set_kv_store_bf16`) so both
+conditions run against one set of loaded weights in one process. Four operating
+points, Qwen3.5-9B / M3 Max, 32 greedy tokens each:
+
+| N | prompt | KV f32 | KV bf16 | saved | KB/slot | 1st-token | sequence | decode Δ |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 2,002 | 190.7 MB | 123.5 MB | 35.3% | 32.8 | 1/1 | 100% | +2.9% |
+| 1 | 8,004 | 593.6 MB | 323.1 MB | 45.6% | 33.0 | 1/1 | 100% | +3.0% |
+| 8 | 803 | 980.6 MB | 696.3 MB | 29.0% | 34.7 | 8/8 | 97% | +4.1% |
+| 8 | 2,519 | 1,802.7 MB | 1,123.3 MB | 37.7% | 32.8 | 8/8 | 100% | +1.6% |
+
+The per-slot saving lands at 32.8–34.7 KB against a physical prediction of
+33.7 KB (f32 minus bf16 per-slot cost) on all four shapes. The headline
+percentage varies only because total resident also carries the ~53 MB/sequence
+linear-attention state, which no KV dtype touches. **Decode gets faster**, +1.6
+to +4.1%, since attention reads half the bytes.
+
+Two controls, because the first run of this sweep produced a nonsense result
+and it is worth knowing why:
+
+- **Memory readings need settling.** One `clear_cache()` is not enough — the
+  same condition at the same point reported either 190.6 MB or 317.9 MB, a
+  fixed ~127 MB quantum present or absent. Pairing a clean reading of one
+  condition with a contaminated reading of the other turned a real 32.8 KB/slot
+  saving into an apparent 29.4 KB/slot *regression*. The harness now loops
+  `clear_cache` until two readings agree; an f32-vs-f32 control puts residual
+  measurement noise at 1.9 KB/slot, ~17× below the signal.
+- **`--control` runs both conditions in f32**, so output mismatches can be
+  attributed. At the one point showing 97% sequence match the control is
+  272/272, so MLX is deterministic there and that 3% is genuinely bf16
+  rounding rather than scheduling noise.
+
+**Default is off.** Memory and speed are unambiguous, but greedy output can
+change, and four points × 32 tokens is not enough evidence to change what every
+request returns. Flipping the default wants a broader quality pass — the tier-2
+golden transcripts are the natural gate. Until then it is the right switch for
+a memory-tight machine: at N=8 with 2.5K prompts it returns 680 MB *and* runs
+faster.
+
+The other lever 007 named — `LUMEN_QWEN35_PREFILL_CHUNK` — is covered above; it
+is a knob, not a default change.
+
 **To recover the deleted code**, `git log --diff-filter=D -- crates/paged-attention`
 finds the removal commit; the crate is intact in its parent (571 LOC of
 scheduler / page-table / sequence logic with no GPU API, plus a 480-line MSL

@@ -161,3 +161,7 @@ required-features = ["mlx-native"]
 [[example]]
 name = "prefill_chunk_equivalence"
 required-features = ["mlx-native"]
+
+[[example]]
+name = "kv_bf16_ab"
+required-features = ["mlx-native"]

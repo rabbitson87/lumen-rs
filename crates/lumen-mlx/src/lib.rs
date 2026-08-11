@@ -157,6 +157,8 @@ mod qwen3_5_tools;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_kv_store_bf16;
+#[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
     Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
