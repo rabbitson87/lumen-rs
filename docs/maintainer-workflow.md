@@ -276,11 +276,34 @@ Short turns are paging's best case and it is still 72 MB against a 7.9 GB
 process. Two structural reasons, neither visible without measuring: **40–63% of
 per-sequence residency is linear-attention conv/SSM state**, which is
 length-independent and which paging — a full-attention KV technique — cannot
-compact; and **the binding constraint is prefill, not KV**, since prefill
-materializes a `[1, prompt_len, vocab]` tensor peaking at 11.5 GB against a
-3.1 GB decode peak. There was no throughput gap either (batched decode already
-scales ~2.4× from N=1 to N=8) and no leak (0.0 MB residual after `remove_seq` +
-`clear_cache` at every width).
+compact; and **the binding constraint is prefill, not KV** (11.5 GB peak at N=8
+long against a 3.1 GB decode peak). There was no throughput gap either (batched
+decode already scales ~2.4× from N=1 to N=8) and no leak (0.0 MB residual after
+`remove_seq` + `clear_cache` at every width).
+
+### The prefill peak is a tuning knob, not a missing feature
+
+Prefill is **already chunked** — `qwen35_prefill_chunk()`, default 2048 tokens,
+with an always-chunk invariant — and `last_only` already collapses the lm_head
+to a single row, so no `[1, prompt_len, vocab]` tensor is ever materialized. The
+prefill peak is per-chunk activations, and it tracks the chunk rather than the
+prompt. Measured on one 8004-token prompt via `kv_concurrency_ab --lens 8000
+--n 1`:
+
+| `LUMEN_QWEN35_PREFILL_CHUNK` | prefill | peak over baseline | resident KV |
+|---|---|---|---|
+| 4096 | 20.6 s | 3,663 MB | 593 MB |
+| **2048 (current default)** | 21.0 s | **2,054 MB** | 593 MB |
+| 1024 | 22.5 s | 1,250 MB | 593 MB |
+| 512 | 22.2 s | 845 MB | 593 MB |
+| 256 | 21.6 s | 643 MB | 593 MB |
+
+The peak moves 5.7× across that range while prefill time does not move
+monotonically — the 20.6–22.5 s spread has 512 faster than 1024 and 256 faster
+than 512, which is noise, not a cost curve. Lowering the default is therefore a
+near-free way to buy headroom on a memory-tight machine; it is worth landing
+behind a bit-identical check across chunk sizes, since the chunking-equivalence
+argument in `forward_chunked`'s doc comment is reasoned rather than tested.
 
 **The two larger memory levers this surfaced**, both bigger than paging and
 needing no custom kernel:
@@ -291,8 +314,9 @@ needing no custom kernel:
   `qwen3_next` reference. Halving it is ~1.5 GB at N=8 long-context versus
   paging's 35 MB — but it is a storage-vs-compute dtype change and needs its own
   parity gate.
-- **Chunked prefill**, which caps the logits peak that actually bounds usable
-  context on a 36 GB machine.
+- **Lower the prefill chunk default** — see the table above. 2048 → 512 buys
+  1.2 GB of peak headroom on an 8K prompt at no measurable time cost, and it is
+  a default change rather than a feature.
 
 **To recover the deleted code**, `git log --diff-filter=D -- crates/paged-attention`
 finds the removal commit; the crate is intact in its parent (571 LOC of

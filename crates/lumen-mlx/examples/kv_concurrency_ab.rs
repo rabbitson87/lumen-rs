@@ -86,9 +86,17 @@
 //! block-rounding slack topped out at **0.91% of process memory** (72.2 MB
 //! short-turn / 65.8 MB mixed / 35.4 MB long, at N=8); 40-63% of per-sequence
 //! residency is linear-attention conv/SSM state that paging cannot compact;
-//! and the binding constraint is the prefill `[1, prompt_len, vocab]` logits
-//! tensor (11.5 GB at N=8 long) rather than the KV. Resident memory fits
-//! `53 MB * N + 67 KB * slots` at R² >= 0.998 across all three profiles.
+//! and the peak is set by prefill (11.5 GB at N=8 long, against a 3.1 GB decode
+//! peak) rather than by the KV. Resident memory fits `53 MB * N + 67 KB * slots`
+//! at R² >= 0.998 across all three profiles.
+//!
+//! That prefill peak is **per-chunk activations**, not a function of prompt
+//! length: prefill is always chunked (`LUMEN_QWEN35_PREFILL_CHUNK`, default
+//! 2048) and the peak tracks the chunk. Measured on one 8004-token prompt —
+//! chunk 4096/2048/1024/512/256 gives a peak of 3663/2054/1250/845/643 MB for a
+//! prefill time of 20.6/21.0/22.5/22.2/21.6 s, i.e. the peak moves ~5.7x while
+//! the time does not move monotonically at all. Resident KV was 593 MB at every
+//! chunk size.
 //!
 //! `docs/maintainer-workflow.md` §9 carries the summary and the commit to
 //! recover the deleted crate from. Re-run this harness before reopening the
@@ -641,6 +649,12 @@ fn main() -> Result<()> {
         "LUMEN_MLX_KV_QUANT             = {}",
         env_str("LUMEN_MLX_KV_QUANT")
     );
+    // First-order control on the prefill peak: prefill is always chunked, and
+    // the peak scales with the chunk, not with prompt length.
+    println!(
+        "LUMEN_QWEN35_PREFILL_CHUNK     = {} (default 2048)",
+        env_str("LUMEN_QWEN35_PREFILL_CHUNK")
+    );
     match physical_memory() {
         Some(m) => println!(
             "memory budget                  = {:.2} GB of {:.2} GB physical ({:.0}%)",
@@ -888,10 +902,13 @@ fn main() -> Result<()> {
             ),
         }
         println!(
-            "Prefill peaks at {:.1} MB over baseline against a decode peak of {:.1} MB — \
-             paging does not address the prefill peak (vocab-sized logits), only the KV.",
+            "Prefill peaks at {:.1} MB over baseline against a decode peak of {:.1} MB. \
+             The prefill peak is per-chunk activations — it scales with \
+             LUMEN_QWEN35_PREFILL_CHUNK (currently {}), not with prompt length, and paging \
+             does not address it either way.",
             top.peak_prefill as f64 / 1e6,
             top.peak_decode as f64 / 1e6,
+            env_str("LUMEN_QWEN35_PREFILL_CHUNK"),
         );
         println!(
             "Decision rule: if that recoverable fraction is small at the lengths this server \
