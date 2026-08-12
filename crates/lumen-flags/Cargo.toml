@@ -6,6 +6,9 @@ license.workspace = true
 description = "Env-flag macro + registry: every LUMEN_* boolean gate declares its default, kind and doc in one place"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # Distributed-slice registry. The alternative is per-crate manual registration
 # lists, and a list maintained next to — but separately from — the `flag!`

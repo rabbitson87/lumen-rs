@@ -35,6 +35,14 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 
+# `coverage` is set by `cargo llvm-cov`, and `lumen_core::always!()` /
+# `never!()` expand a `#[cfg(coverage)]` arm at every call site — including in
+# other crates — so the cfg has to be known workspace-wide or every consumer
+# warns. Declared here rather than allowed, so a genuine typo in a cfg name is
+# still caught.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
+
 [workspace.dependencies]
 # TurboQuant workspace crates
 lumen-core = { path = "crates/lumen-core" }

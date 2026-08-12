@@ -20,6 +20,9 @@ license.workspace = true
 # Design docs: .ai/memory/active/flux2-dev-diffusion-port/{PLAN,CONTEXT,CHECKLIST}.md
 # ─────────────────────────────────────────────────────────────────────────────
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.102"
 

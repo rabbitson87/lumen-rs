@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "OpenAI-compatible HTTP server for TurboQuant LLM inference"
 
+[lints]
+workspace = true
+
 [dependencies]
 lumen-core = { workspace = true }
 turboquant-cache = { workspace = true }

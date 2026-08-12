@@ -1,3 +1,7 @@
+/// `always!()` / `never!()` — defensive conditions that leave the coverage
+/// denominator. See the module docs for the three-build behaviour.
+pub mod defensive;
+
 pub mod bitpack;
 pub mod compressor;
 pub mod config;
