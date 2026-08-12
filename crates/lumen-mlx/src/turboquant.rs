@@ -1917,7 +1917,7 @@ mod qjl_correctness_tests {
     /// the ratio; not a unit-test assertion (`#[ignore]` by default — opt in
     /// via `cargo test --release -- --ignored bench_packed4_vs_unpacked_qk`).
     #[test]
-    #[ignore]
+    #[ignore = "microbenchmark, not an assertion; needs Metal — run with --ignored"]
     fn bench_packed4_vs_unpacked_qk() {
         use mlx_rs::random;
         use std::time::Instant;

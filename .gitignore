@@ -57,7 +57,17 @@ worker-hang-investigation.html
 
 # ── Personal benchmarking + dev scripts (kept local; not part of the
 #    public project). ──
-scripts/
+# `scripts/*` and not `scripts/`: git does not descend into an excluded
+# DIRECTORY, so a `!scripts/golden/` re-include below would never be consulted.
+scripts/*
+# ...except the ORACLES. A golden nobody can regenerate rots the moment the
+# model or the reference implementation moves — `flux-scheduler-invariants` was
+# exactly that, a test comparing against a /tmp dump that had ceased to exist.
+# So the scripts that PRODUCE or COMPARE-AGAINST a reference are committed
+# alongside the goldens they make. The other ~47 files here are one-shot A/B and
+# profiling artifacts and stay local. See crates/lumen-mlx/tests/golden/README.md.
+!scripts/golden/
+!scripts/golden/*.py
 
 # ── Moltis 협조 데이터 (외부 프로젝트 reference data + raw 입력 로그).
 #    Personal eval / pruning ground truth 용도. Public repo 업로드 금지. ──

@@ -107,6 +107,16 @@ const STEPS: &[Step] = &[
         optional: false,
     },
     Step {
+        name: "tiers",
+        rationale: "an `#[ignore]` with no reason cannot be classified, scheduled \
+                    or decided about — it is the shape that quietly becomes \
+                    permanent, and one already had (a microbenchmark nobody could \
+                    tell from a skipped assertion)",
+        program: "cargo",
+        args: &["run", "-q", "-p", "xtask", "--", "tiers"],
+        optional: false,
+    },
+    Step {
         name: "flags --check",
         rationale: "docs/env-flags.md is generated; a stale copy is a lie about what \
                     the binary reads",
@@ -123,29 +133,33 @@ const STEPS: &[Step] = &[
 /// correctness, but they are the kind of policy that is only ever violated by
 /// accident — and once pushed, a personal path in a committed file is in the
 /// history for good.
-const HYGIENE: &[(&str, &str, &[&str])] = &[
+/// Files that **define** the hygiene rules, and therefore have to contain the
+/// patterns they forbid. Exempting them individually per rule went wrong twice
+/// — first the docs that document the grep, then the gate source that runs it —
+/// so it is one list with one reason.
+///
+/// A rule that fails on its own definition is a rule people learn to route
+/// around, which is worse than not having it.
+const RULE_DEFINITIONS: &[&str] = &[
+    "docs/maintainer-workflow.md",
+    "docs/release-checklist.md",
+    "xtask/src/gate.rs",
+    "LICENSE",
+    ".ai/",
+    "target/",
+];
+
+const HYGIENE: &[(&str, &str)] = &[
     (
-        // `docs/maintainer-workflow.md` §5 names this exactly: no
-        // `/Users/sonheesung` paths. Grepping for `/Users/` generally would
-        // also flag `/Users/dev` in a deploy example and `/Users/foo` in a UI
-        // string — placeholders that are the DOCUMENTED replacement, so a rule
-        // that fails on them teaches people to ignore the rule.
+        // §5 names this exactly: no `/Users/sonheesung` paths. Grepping for
+        // `/Users/` generally would also flag `/Users/dev` in a deploy example
+        // and `/Users/foo` in a UI string — placeholders that are the
+        // DOCUMENTED replacement, so a rule that fails on them teaches people
+        // to ignore the rule.
         "personal home paths",
         "/Users/sonheesung",
-        // The workflow doc quotes the pattern in order to define it, and the
-        // grep for it lives there too.
-        &[
-            "docs/maintainer-workflow.md",
-            ".ai/",
-            "target/",
-            "xtask/src/gate.rs",
-        ],
     ),
-    (
-        "personal email",
-        "hsng95@gmail.com",
-        &["LICENSE", "docs/maintainer-workflow.md", ".ai/"],
-    ),
+    ("personal email", "hsng95@gmail.com"),
 ];
 
 pub fn main(args: Vec<String>) -> ExitCode {
@@ -226,7 +240,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
 /// produce a false positive.
 fn hygiene_violations() -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
-    for (what, pattern, allowed) in HYGIENE {
+    for (what, pattern) in HYGIENE {
         let res = Command::new("git")
             .args(["grep", "-nI", "--", pattern])
             .output()?;
@@ -234,7 +248,7 @@ fn hygiene_violations() -> std::io::Result<Vec<String>> {
         let text = String::from_utf8_lossy(&res.stdout);
         for line in text.lines() {
             let path = line.split(':').next().unwrap_or(line);
-            if allowed.iter().any(|a| path.contains(a)) {
+            if RULE_DEFINITIONS.iter().any(|a| path.contains(a)) {
                 continue;
             }
             out.push(format!("{what}: {line}"));
@@ -261,9 +275,16 @@ mod tests {
                 s.rationale
             );
         }
-        for (what, pattern, _) in HYGIENE {
+        for (what, pattern) in HYGIENE {
             assert!(!what.trim().is_empty() && !pattern.trim().is_empty());
         }
+        // The exemption list must cover this file: it necessarily contains
+        // every pattern it forbids.
+        assert!(
+            RULE_DEFINITIONS.iter().any(|d| *d == "xtask/src/gate.rs"),
+            "the gate source defines the patterns, so it must be exempt or the \
+             gate can never pass"
+        );
     }
 
     /// Cheap steps must come before expensive ones, or the gate spends minutes
