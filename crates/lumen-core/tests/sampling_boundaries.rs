@@ -449,3 +449,154 @@ fn identical_distributions_always_accept() {
         assert_eq!(out.token, 2);
     }
 }
+
+// ───────────── degenerate inputs to the in-place transforms ─────────────
+//
+// These four guards all handle a logit buffer that is already degenerate —
+// every entry masked, nothing summing, a token id past the end. Reaching them
+// means something upstream went wrong, and every one of them chooses to
+// *recover* rather than fail, which is right for a sampler and is exactly why
+// they need pinning: a broken recovery produces tokens, not an error.
+
+/// The repeat penalty's own no-op guard. Its callers already check
+/// `repeat_penalty != 1.0`, so this path is only reached by a direct caller —
+/// and it must be a true no-op, not a pass through the loop with a factor of 1
+/// (which would still perturb signs).
+#[test]
+fn a_unit_repeat_penalty_leaves_the_logits_untouched() {
+    let original = vec![2.0_f32, -1.0, 0.0, 5.0];
+    for penalty in [1.0_f32, 1.0 + 1e-9, 1.0 - 1e-9] {
+        let mut logits = original.clone();
+        lumen_core::sampling::apply_repeat_penalty(&mut logits, &[0, 1, 2, 3], penalty);
+        assert_eq!(logits, original, "penalty {penalty} must be a no-op");
+    }
+}
+
+/// An out-of-range token id in the repeat window must be skipped. Same shape as
+/// the presence/frequency case above, different function — and a `logits[i]`
+/// without the guard is an index panic on a live request.
+#[test]
+fn the_repeat_penalty_skips_out_of_range_token_ids() {
+    let mut logits = vec![2.0_f32, -2.0];
+    lumen_core::sampling::apply_repeat_penalty(&mut logits, &[0, 1, 99, u32::MAX], 2.0);
+    // Sign-aware: positive divided, negative multiplied.
+    assert!(logits[0] < 2.0, "a positive logit is pushed down");
+    assert!(logits[1] < -2.0, "a negative logit is pushed further down");
+}
+
+/// Every logit `-inf` — what a grammar mask leaves when nothing is allowed.
+/// `min_p` has no finite peak to measure against, so it must bail rather than
+/// compute `max + ln(min_p)` on an infinity and mask the buffer into NaN.
+#[test]
+fn min_p_bails_when_no_logit_is_finite() {
+    for fill in [f32::NEG_INFINITY, f32::NAN] {
+        let mut logits = vec![fill; 4];
+        lumen_core::sampling::apply_min_p(&mut logits, 0.5);
+        assert_eq!(logits.len(), 4);
+        assert!(
+            logits.iter().all(|v| v.is_infinite() || v.is_nan()),
+            "the buffer must be left as it was, not turned into something worse"
+        );
+    }
+    // A single finite entry is enough to proceed, and it must survive.
+    let mut logits = vec![f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY];
+    lumen_core::sampling::apply_min_p(&mut logits, 0.5);
+    assert_eq!(logits[1], 1.0, "the peak always survives min_p");
+}
+
+/// A softmax whose exponentials all underflow to zero has no distribution to
+/// return. Falling back to uniform keeps the sampler able to draw *something*;
+/// returning all-zeros would make every downstream mass check fail and the
+/// draw degenerate.
+#[test]
+fn a_softmax_that_underflows_falls_back_to_uniform() {
+    // All -inf: every exp() is 0, so the sum is 0.
+    let mut logits = vec![f32::NEG_INFINITY; 4];
+    lumen_core::sampling::softmax_inplace(&mut logits);
+    let sum: f32 = logits.iter().sum();
+    assert!(
+        (sum - 1.0).abs() < 1e-5,
+        "must still be a distribution: {logits:?}"
+    );
+    assert!(
+        logits.iter().all(|&p| (p - 0.25).abs() < 1e-6),
+        "and a uniform one: {logits:?}"
+    );
+
+    // Sanity: a normal buffer is unaffected by the fallback.
+    let mut logits = vec![1.0_f32, 2.0, 3.0];
+    lumen_core::sampling::softmax_inplace(&mut logits);
+    assert!(logits[2] > logits[1] && logits[1] > logits[0]);
+}
+
+/// The penalty block's guards have false sides too: a window exists, but the
+/// penalty is disabled. Both pipelines, both guards — a config that sets
+/// `repeat_penalty_last_n` while leaving the penalties at their defaults is
+/// the ordinary case, and it must cost nothing.
+#[test]
+fn a_window_with_disabled_penalties_changes_nothing() {
+    let recent = [1u32, 1, 1];
+    let cfg = SamplingConfig {
+        temperature: 1.0,
+        repeat_penalty: 1.0,   // disabled
+        presence_penalty: 0.0, // disabled
+        frequency_penalty: 0.0,
+        repeat_penalty_last_n: 8, // but the window exists
+        ..Default::default()
+    };
+    let mut a = vec![1.0_f32, 1.0, 1.0];
+    let with_window = sampling_distribution(&mut a, &recent, &cfg);
+    let mut b = vec![1.0_f32, 1.0, 1.0];
+    let without = sampling_distribution(&mut b, &[], &cfg);
+    assert_eq!(
+        with_window, without,
+        "a window with every penalty disabled must be indistinguishable from no window"
+    );
+
+    // Frequency-only through the pipeline reaches the second operand of the
+    // `presence != 0 || frequency != 0` guard, which presence-only cannot.
+    let cfg = SamplingConfig {
+        frequency_penalty: 0.5,
+        ..cfg
+    };
+    let mut c = vec![1.0_f32, 1.0, 1.0];
+    let dist = sampling_distribution(&mut c, &recent, &cfg);
+    assert!(
+        dist[1] < dist[0],
+        "frequency-only must still apply: {dist:?}"
+    );
+}
+
+/// `sampling_distribution` has its own top-p loop, separate from
+/// `sample_top_p`'s. Its cutoff-never-reached and zero-mass arms are therefore
+/// separate branches, and an all-masked distribution must not divide by zero.
+#[test]
+fn the_distribution_top_p_survives_a_distribution_with_no_mass() {
+    let cfg = SamplingConfig {
+        temperature: 1.0,
+        top_p: 0.9,
+        min_p: 0.0,
+        ..Default::default()
+    };
+    // Every logit -inf → softmax falls back to uniform → top_p still applies.
+    let mut logits = vec![f32::NEG_INFINITY; 4];
+    let dist = sampling_distribution(&mut logits, &[], &cfg);
+    assert_eq!(dist.len(), 4);
+    assert!(
+        dist.iter().all(|p| p.is_finite() && *p >= 0.0),
+        "a degenerate input must not produce NaN probabilities: {dist:?}"
+    );
+
+    // A distribution whose mass never reaches top_p keeps every entry.
+    let cfg = SamplingConfig {
+        temperature: 1.0,
+        top_p: 0.999_999,
+        ..Default::default()
+    };
+    let mut logits = vec![1.0_f32; 8];
+    let dist = sampling_distribution(&mut logits, &[], &cfg);
+    assert!(
+        dist.iter().all(|&p| p > 0.0),
+        "no cutoff reached means nothing is masked: {dist:?}"
+    );
+}
