@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use lumen_mlx::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
-use lumen_mlx::grammar::build_qwen35_tool_grammar_lark;
+use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::arbitrary;
 use lumen_testkit::generators::{GrammarAndOutput, ToolSet};
 
@@ -103,7 +103,7 @@ fn replay_grammar_build() {
             continue;
         };
         if !tools.tools.is_empty() {
-            let _ = build_qwen35_tool_grammar_lark(&tools.tools);
+            let _ = build_qwen35_tool_grammar_lark(&tools.tools, ToolCalls::OneOrMore);
         }
     }
 }
@@ -116,7 +116,7 @@ fn replay_grammar_x_output() {
             continue;
         };
         if !g.tools.tools.is_empty() {
-            let _ = build_qwen35_tool_grammar_lark(&g.tools.tools);
+            let _ = build_qwen35_tool_grammar_lark(&g.tools.tools, ToolCalls::OneOrMore);
         }
         let Ok(calls) = parse_tool_call_body(&g.output.text) else {
             continue;

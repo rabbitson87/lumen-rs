@@ -75,6 +75,64 @@ pub enum GrammarMode {
     Eager,
 }
 
+/// How many tool calls one constrained turn may contain.
+///
+/// OpenAI keeps this **separate from `tool_choice` on purpose**: `tool_choice`
+/// decides *whether* a tool is called, `parallel_tool_calls` (default `true`)
+/// decides *how many*. Anthropic splits it the same way, with
+/// `disable_parallel_tool_use` inside `tool_choice`.
+///
+/// Reading only the first is how `required` came to mean "one call, then
+/// whatever the model feels like". The grammar used to be `start: tool_call` —
+/// exactly one — so the matcher terminated after a single call and *released*,
+/// handing an unconstrained model a context consisting of a system prompt, a
+/// tool list, and a tool call it had just made. The overwhelmingly likely
+/// continuation there is another tool call, so it emitted the same one four
+/// times. That was never the model choosing to call four tools; it was
+/// momentum after the constraint lifted.
+///
+/// [`OneOrMore`] is the fix and the standard shape: the grammar spans the whole
+/// call *list*, so termination is grammar-driven — the model stays constrained
+/// and decides for itself when to stop, exactly as `minItems: 1` does for the
+/// JSON-array grammars vLLM and SGLang build for `required`.
+///
+/// [`OneOrMore`]: ToolCalls::OneOrMore
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ToolCalls {
+    /// `parallel_tool_calls: true` — the OpenAI default. Grammar is
+    /// `start: tool_call+`: at least one, then the model chooses.
+    ///
+    /// Safe to leave constrained because the token environment registers both
+    /// terminators — `tok_eos` = `<eos>` and `tok_end_of_turn` = `<turn|>` (see
+    /// [`build_tok_env_from_tokenizer_json`]) — so llguidance admits a stop
+    /// token whenever the parse is in an accepting state.
+    #[default]
+    OneOrMore,
+    /// `parallel_tool_calls: false`, or Anthropic's
+    /// `disable_parallel_tool_use: true`. Grammar is `start: tool_call`:
+    /// exactly one, and the turn ends there.
+    ExactlyOne,
+}
+
+impl ToolCalls {
+    /// The Lark repetition suffix for the `start` rule.
+    fn start_suffix(self) -> &'static str {
+        match self {
+            Self::OneOrMore => "+",
+            Self::ExactlyOne => "",
+        }
+    }
+
+    /// Resolve from OpenAI's `parallel_tool_calls`, whose absence means the
+    /// documented default of `true`.
+    pub fn from_parallel_flag(parallel: Option<bool>) -> Self {
+        match parallel {
+            Some(false) => Self::ExactlyOne,
+            _ => Self::OneOrMore,
+        }
+    }
+}
+
 /// Per-request grammar guard. Built once at the start of a chat completion
 /// (after the prompt is rendered) and stepped per sampled token.
 pub struct Gemma4GrammarState {
@@ -184,8 +242,9 @@ impl Gemma4GrammarState {
         factory: Arc<ParserFactory>,
         tools: &[Value],
         mode: GrammarMode,
+        calls: ToolCalls,
     ) -> Result<Self> {
-        Self::new_lark_inner(factory, tools, mode, false)
+        Self::new_lark_inner(factory, tools, mode, false, calls)
     }
 
     /// Strict, dup-free Lark variant — same native `call:NAME{…}` output as
@@ -206,8 +265,9 @@ impl Gemma4GrammarState {
         factory: Arc<ParserFactory>,
         tools: &[Value],
         mode: GrammarMode,
+        calls: ToolCalls,
     ) -> Result<Self> {
-        Self::new_lark_inner(factory, tools, mode, true)
+        Self::new_lark_inner(factory, tools, mode, true, calls)
     }
 
     fn new_lark_inner(
@@ -215,6 +275,7 @@ impl Gemma4GrammarState {
         tools: &[Value],
         mode: GrammarMode,
         strict: bool,
+        calls: ToolCalls,
     ) -> Result<Self> {
         if tools.is_empty() {
             return Err(anyhow!(
@@ -222,9 +283,9 @@ impl Gemma4GrammarState {
             ));
         }
         let schema = if strict {
-            build_tool_grammar_lark_strict(tools)?
+            build_tool_grammar_lark_strict(tools, calls)?
         } else {
-            build_tool_grammar_lark(tools)?
+            build_tool_grammar_lark(tools, calls)?
         };
         let mut state = Self {
             factory,
@@ -281,13 +342,14 @@ impl Gemma4GrammarState {
         tools: &[Value],
         mode: GrammarMode,
         opener_token: Option<u32>,
+        calls: ToolCalls,
     ) -> Result<Self> {
         if tools.is_empty() {
             return Err(anyhow!(
                 "Gemma4GrammarState::new_qwen35_xml called with empty tools"
             ));
         }
-        let schema = build_qwen35_tool_grammar_lark(tools)?;
+        let schema = build_qwen35_tool_grammar_lark(tools, calls)?;
         let mut state = Self {
             factory,
             schema,
@@ -608,8 +670,8 @@ fn build_tool_grammar(tools: &[Value]) -> Result<TopLevelGrammar> {
 /// dropped. Schemas not in the supported subset fall back to an
 /// unconstrained body `<[^125]>*` (anything except `}` id 125) so the
 /// matcher still terminates correctly.
-fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
-    build_tool_grammar_lark_with_mode(tools, false)
+fn build_tool_grammar_lark(tools: &[Value], calls: ToolCalls) -> Result<TopLevelGrammar> {
+    build_tool_grammar_lark_with_mode(tools, false, calls)
 }
 
 /// Strict, dup-free variant of [`build_tool_grammar_lark`]: emits the same
@@ -619,13 +681,17 @@ fn build_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
 /// **Eager** mode, where a prefill-forced `<|tool_call>` would otherwise
 /// leave the args body unconstrained (the empty-param defect). See
 /// [`lark_body_for_object_schema`] for the `strict` body shape.
-fn build_tool_grammar_lark_strict(tools: &[Value]) -> Result<TopLevelGrammar> {
-    build_tool_grammar_lark_with_mode(tools, true)
+fn build_tool_grammar_lark_strict(tools: &[Value], calls: ToolCalls) -> Result<TopLevelGrammar> {
+    build_tool_grammar_lark_with_mode(tools, true, calls)
 }
 
-fn build_tool_grammar_lark_with_mode(tools: &[Value], strict: bool) -> Result<TopLevelGrammar> {
+fn build_tool_grammar_lark_with_mode(
+    tools: &[Value],
+    strict: bool,
+    calls: ToolCalls,
+) -> Result<TopLevelGrammar> {
     Ok(TopLevelGrammar::from_lark(lark_grammar_string(
-        tools, strict,
+        tools, strict, calls,
     )?))
 }
 
@@ -641,15 +707,18 @@ fn build_tool_grammar_lark_with_mode(tools: &[Value], strict: bool) -> Result<To
 /// [`crate::qwen3_5_tools::parse_param_value`] decodes. Constraining the value
 /// shape would risk diverging from what the Qwen parser accepts; the
 /// load-bearing win is "every required key present, each at most once".
-pub fn build_qwen35_tool_grammar_lark(tools: &[Value]) -> Result<TopLevelGrammar> {
+pub fn build_qwen35_tool_grammar_lark(
+    tools: &[Value],
+    calls: ToolCalls,
+) -> Result<TopLevelGrammar> {
     Ok(TopLevelGrammar::from_lark(qwen35_lark_grammar_string(
-        tools,
+        tools, calls,
     )?))
 }
 
 /// Render the raw Lark text for [`build_qwen35_tool_grammar_lark`]. Split out
 /// so tests can substring-match the unescaped grammar.
-fn qwen35_lark_grammar_string(tools: &[Value]) -> Result<String> {
+fn qwen35_lark_grammar_string(tools: &[Value], calls: ToolCalls) -> Result<String> {
     if tools.is_empty() {
         return Err(anyhow!("build_qwen35_tool_grammar_lark: empty tools"));
     }
@@ -683,7 +752,10 @@ fn qwen35_lark_grammar_string(tools: &[Value]) -> Result<String> {
 
     let call_alt = call_alts.join("\n          | ");
     let mut grammar = String::new();
-    grammar.push_str("start: tool_call\n");
+    // Same list-spanning shape as the Gemma 4 grammar — see [`ToolCalls`]. Qwen
+    // 3.6 concatenates `<tool_call>…</tool_call>` blocks, so the repetition
+    // needs no separator here either.
+    grammar.push_str(&format!("start: tool_call{}\n", calls.start_suffix()));
     grammar.push_str("tool_call: \"<tool_call>\\n\" function_block \"</tool_call>\"\n");
     grammar.push_str(&format!("function_block: {call_alt}\n"));
     for (rule_name, rule_rhs) in &body_rules {
@@ -768,7 +840,7 @@ fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
 /// of [`build_tool_grammar_lark_with_mode`] so tests can assert on the
 /// unescaped grammar string (the `TopLevelGrammar` wrapper serializes the
 /// Lark text with JSON escaping, which is awkward to substring-match).
-fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
+fn lark_grammar_string(tools: &[Value], strict: bool, calls: ToolCalls) -> Result<String> {
     if tools.is_empty() {
         return Err(anyhow!("build_tool_grammar_lark: empty tools"));
     }
@@ -826,7 +898,10 @@ fn lark_grammar_string(tools: &[Value], strict: bool) -> Result<String> {
     let _ = (tool_name_alt, tool_body_alt); // diagnostics: also reachable as fallback
 
     let mut grammar = String::new();
-    grammar.push_str("start: tool_call\n");
+    // `tool_call+`, not `tool_call`. The list is the grammar, so the matcher
+    // stays live across calls and the model picks the stop token itself
+    // instead of being released into a tool-biased context. See [`ToolCalls`].
+    grammar.push_str(&format!("start: tool_call{}\n", calls.start_suffix()));
     grammar.push_str(&format!("tool_call: \"call:\" ({tool_call_lhs})\n"));
     for (rule_name, rule_body) in &tool_body_rules {
         grammar.push_str(&format!("{rule_name}: {rule_body}\n"));
@@ -1174,9 +1249,29 @@ mod tests {
     #[test]
     fn every_state_constructor_rejects_an_empty_tool_list() {
         let f = shared_factory_placeholder();
-        assert!(Gemma4GrammarState::new_lark(f.clone(), &[], GrammarMode::Eager).is_err());
-        assert!(Gemma4GrammarState::new_lark_strict(f.clone(), &[], GrammarMode::Eager).is_err());
-        assert!(Gemma4GrammarState::new_qwen35_xml(f, &[], GrammarMode::Eager, None).is_err());
+        assert!(
+            Gemma4GrammarState::new_lark(f.clone(), &[], GrammarMode::Eager, ToolCalls::OneOrMore)
+                .is_err()
+        );
+        assert!(
+            Gemma4GrammarState::new_lark_strict(
+                f.clone(),
+                &[],
+                GrammarMode::Eager,
+                ToolCalls::OneOrMore
+            )
+            .is_err()
+        );
+        assert!(
+            Gemma4GrammarState::new_qwen35_xml(
+                f,
+                &[],
+                GrammarMode::Eager,
+                None,
+                ToolCalls::OneOrMore
+            )
+            .is_err()
+        );
     }
 
     /// A logits buffer SHORTER than the mask means the tokenizer env and the
@@ -1190,6 +1285,7 @@ mod tests {
             shared_factory_placeholder(),
             &sample_tools(),
             GrammarMode::Eager,
+            ToolCalls::OneOrMore,
         )
         .expect("eager state");
         assert!(g.is_active());
@@ -1222,6 +1318,7 @@ mod tests {
             shared_factory_placeholder(),
             &sample_tools(),
             GrammarMode::Eager,
+            ToolCalls::OneOrMore,
         )
         .expect("eager state");
         g.release();
@@ -1251,6 +1348,7 @@ mod tests {
             shared_factory_placeholder(),
             &sample_tools(),
             GrammarMode::Lazy,
+            ToolCalls::OneOrMore,
         )
         .expect("lazy state");
         assert!(!g.is_active(), "lazy grammars start without a matcher");
@@ -1275,9 +1373,13 @@ mod tests {
                 "parameters": { "type": "object", "properties": {} }
             }
         })];
-        let mut g =
-            Gemma4GrammarState::new_lark(shared_factory_placeholder(), &tools, GrammarMode::Eager)
-                .expect("eager state");
+        let mut g = Gemma4GrammarState::new_lark(
+            shared_factory_placeholder(),
+            &tools,
+            GrammarMode::Eager,
+            ToolCalls::OneOrMore,
+        )
+        .expect("eager state");
 
         // Replay the whole deterministic opener plus body. The single-byte
         // env makes every ASCII byte its own token, so the grammar's literal
@@ -1319,10 +1421,12 @@ mod tests {
     /// masked into silence with no explanation.
     #[test]
     fn every_builder_rejects_an_empty_tool_list() {
-        let err = qwen35_lark_grammar_string(&[]).expect_err("qwen35 builder");
+        let err =
+            qwen35_lark_grammar_string(&[], ToolCalls::OneOrMore).expect_err("qwen35 builder");
         assert!(format!("{err:#}").contains("empty tools"), "{err:#}");
         for strict in [false, true] {
-            let err = lark_grammar_string(&[], strict).expect_err("gemma builder");
+            let err =
+                lark_grammar_string(&[], strict, ToolCalls::OneOrMore).expect_err("gemma builder");
             assert!(format!("{err:#}").contains("empty tools"), "{err:#}");
         }
     }
@@ -1488,10 +1592,13 @@ mod tests {
     /// there would make a no-parameter tool unmatchable.
     #[test]
     fn the_qwen_param_renderer_has_a_repeat_fallback_when_nothing_renders() {
-        let s = qwen35_lark_grammar_string(&[json!({
-            "type": "function",
-            "function": { "name": "noop", "parameters": { "type": "object" } }
-        })])
+        let s = qwen35_lark_grammar_string(
+            &[json!({
+                "type": "function",
+                "function": { "name": "noop", "parameters": { "type": "object" } }
+            })],
+            ToolCalls::OneOrMore,
+        )
         .expect("a no-parameter tool must still build");
         assert!(s.contains("noop"), "the tool name must survive: {s}");
     }
@@ -1587,8 +1694,13 @@ mod tests {
         // rather than `<|tool_call>` — either way it is a byte the grammar does
         // not accept at position 0, which is exactly the condition under test.
         let factory = shared_factory_placeholder();
-        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Lazy)
-            .expect("build lazy lark state");
+        let mut state = Gemma4GrammarState::new_lark(
+            factory,
+            &sample_tools(),
+            GrammarMode::Lazy,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build lazy lark state");
         state
             .observe(TOK_TOOL_CALL_OPEN)
             .expect("the trigger token activates the grammar without being parsed by it");
@@ -1605,8 +1717,13 @@ mod tests {
         // first constrained token must be the start of `call:`. `'c'` is
         // accepted; the trigger id is not.
         let factory = shared_factory_placeholder();
-        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Lazy)
-            .expect("build lazy lark state");
+        let mut state = Gemma4GrammarState::new_lark(
+            factory,
+            &sample_tools(),
+            GrammarMode::Lazy,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build lazy lark state");
         state.observe(TOK_TOOL_CALL_OPEN).expect("activate");
         state
             .observe(u32::from(b'c'))
@@ -1625,9 +1742,14 @@ mod tests {
         // meant the ordinary letter `Q` woke the XML grammar mid-sentence and
         // desynced it. With no trigger configured, Lazy simply never activates.
         let factory = shared_factory_placeholder();
-        let mut state =
-            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Lazy, None)
-                .expect("build lazy qwen35 state");
+        let mut state = Gemma4GrammarState::new_qwen35_xml(
+            factory,
+            &sample_tools(),
+            GrammarMode::Lazy,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build lazy qwen35 state");
         state.observe(TOK_TOOL_CALL_OPEN).expect("no trigger set");
         assert!(
             !state.is_active(),
@@ -1647,6 +1769,7 @@ mod tests {
             &sample_tools(),
             GrammarMode::Lazy,
             Some(u32::from(b'<')),
+            ToolCalls::OneOrMore,
         )
         .expect("build lazy qwen35 state with an explicit opener");
         state
@@ -1751,9 +1874,13 @@ mod tests {
         // grammar — so `required` never actually enforced anything. The opener
         // must pass through untouched while the rest still parses.
         let factory = shared_factory_placeholder();
-        let mut state =
-            Gemma4GrammarState::new_lark_strict(factory, &sample_tools(), GrammarMode::Eager)
-                .expect("build eager strict lark state");
+        let mut state = Gemma4GrammarState::new_lark_strict(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build eager strict lark state");
         state
             .observe_prefill(TOK_TOOL_CALL_OPEN)
             .expect("the opener is context, not grammar");
@@ -1769,8 +1896,13 @@ mod tests {
     #[test]
     fn release_stops_constraining() {
         let factory = shared_factory_placeholder();
-        let mut state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Eager)
-            .expect("build eager lark state");
+        let mut state = Gemma4GrammarState::new_lark(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build eager lark state");
         assert!(state.is_active());
         state.release();
         assert!(!state.is_active(), "released grammar must not constrain");
@@ -1804,9 +1936,101 @@ mod tests {
         );
     }
 
+    // ─────────────────── parallel_tool_calls / ToolCalls ───────────────────
+
+    /// The default grammar spans the call **list**, not one call.
+    ///
+    /// `start: tool_call` was the whole defect: the matcher terminated after a
+    /// single call and released, and an unconstrained model looking at a tool
+    /// list plus a tool call it had just made emitted the same call three more
+    /// times. With `+` the matcher stays live, so stopping is the model's
+    /// decision under constraint rather than momentum after the constraint
+    /// lifted.
+    #[test]
+    fn the_default_grammar_spans_the_whole_call_list() {
+        for (label, s) in [
+            (
+                "gemma4",
+                lark_grammar_string(&sample_tools(), false, ToolCalls::OneOrMore).unwrap(),
+            ),
+            (
+                "gemma4-strict",
+                lark_grammar_string(&sample_tools(), true, ToolCalls::OneOrMore).unwrap(),
+            ),
+            (
+                "qwen35",
+                qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore).unwrap(),
+            ),
+        ] {
+            assert!(
+                s.contains("start: tool_call+"),
+                "{label}: default must be one-or-more, got:\n{s}"
+            );
+        }
+    }
+
+    /// `parallel_tool_calls: false` pins it back to exactly one.
+    #[test]
+    fn disabling_parallel_calls_pins_the_grammar_to_exactly_one() {
+        for (label, s) in [
+            (
+                "gemma4",
+                lark_grammar_string(&sample_tools(), false, ToolCalls::ExactlyOne).unwrap(),
+            ),
+            (
+                "qwen35",
+                qwen35_lark_grammar_string(&sample_tools(), ToolCalls::ExactlyOne).unwrap(),
+            ),
+        ] {
+            assert!(
+                s.contains("start: tool_call\n"),
+                "{label}: expected a single call, got:\n{s}"
+            );
+            assert!(
+                !s.contains("start: tool_call+"),
+                "{label}: ExactlyOne must not admit a second call"
+            );
+        }
+    }
+
+    /// Absence means `true`. OpenAI documents `parallel_tool_calls` as
+    /// defaulting to `true`, so a request that never mentions it must behave
+    /// like one that asked for it — not like one that disabled it.
+    #[test]
+    fn an_absent_parallel_flag_is_the_documented_default_of_true() {
+        assert_eq!(ToolCalls::from_parallel_flag(None), ToolCalls::OneOrMore);
+        assert_eq!(
+            ToolCalls::from_parallel_flag(Some(true)),
+            ToolCalls::OneOrMore
+        );
+        assert_eq!(
+            ToolCalls::from_parallel_flag(Some(false)),
+            ToolCalls::ExactlyOne
+        );
+        assert_eq!(ToolCalls::default(), ToolCalls::OneOrMore);
+    }
+
+    /// Both shapes have to compile under llguidance, not merely read right.
+    /// `+` on the start rule is the kind of change that produces a valid-looking
+    /// string and an unbuildable parser.
+    #[test]
+    fn both_call_counts_compile_under_llguidance() {
+        for calls in [ToolCalls::OneOrMore, ToolCalls::ExactlyOne] {
+            let factory = shared_factory_placeholder();
+            Gemma4GrammarState::new_lark_strict(
+                factory,
+                &sample_tools(),
+                GrammarMode::Eager,
+                calls,
+            )
+            .unwrap_or_else(|e| panic!("{calls:?} must compile: {e}"));
+        }
+    }
+
     #[test]
     fn lark_grammar_builds_for_two_tools() {
-        let g = build_tool_grammar_lark(&sample_tools()).expect("build lark grammar");
+        let g = build_tool_grammar_lark(&sample_tools(), ToolCalls::OneOrMore)
+            .expect("build lark grammar");
         let s = serde_json::to_string(&g).expect("serialise lark grammar");
         assert!(s.contains("task_complete"), "task_complete name in grammar");
         assert!(s.contains("ask_to_user"), "ask_to_user name in grammar");
@@ -1861,7 +2085,8 @@ mod tests {
                 }
             }),
         ];
-        let g = build_tool_grammar_lark(&tools).expect("build ayla lark grammar");
+        let g =
+            build_tool_grammar_lark(&tools, ToolCalls::OneOrMore).expect("build ayla lark grammar");
         let s = serde_json::to_string(&g).expect("serialise grammar");
         assert!(s.contains("summary"));
         assert!(s.contains("context_keys"));
@@ -1894,7 +2119,8 @@ mod tests {
                 }
             }
         })];
-        let s = lark_grammar_string(&tools, false).expect("build multi-type lark grammar");
+        let s = lark_grammar_string(&tools, false, ToolCalls::OneOrMore)
+            .expect("build multi-type lark grammar");
         assert!(
             s.contains("string_val | \"null\""),
             "nullable string should union string_val and the null literal; got:\n{s}"
@@ -1908,8 +2134,13 @@ mod tests {
     #[test]
     fn lark_grammar_state_starts_active_in_eager() {
         let factory = shared_factory_placeholder();
-        let state = Gemma4GrammarState::new_lark(factory, &sample_tools(), GrammarMode::Eager)
-            .expect("build eager lark state");
+        let state = Gemma4GrammarState::new_lark(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build eager lark state");
         assert!(
             state.is_active(),
             "eager Lark grammar constrains from step 0"
@@ -1931,11 +2162,11 @@ mod tests {
                 "type": "function",
                 "function": { "name": name, "parameters": { "type":"object","properties":{} } }
             })];
-            let s = lark_grammar_string(&tools, false)
+            let s = lark_grammar_string(&tools, false, ToolCalls::OneOrMore)
                 .unwrap_or_else(|e| panic!("{name:?} must build: {e}"));
             assert!(s.contains(name), "{name:?} must appear as a literal:\n{s}");
             let factory = shared_factory_placeholder();
-            Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager)
+            Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager, ToolCalls::OneOrMore)
                 .unwrap_or_else(|e| panic!("{name:?} must compile under llguidance: {e}"));
         }
     }
@@ -1948,10 +2179,11 @@ mod tests {
             "type": "function",
             "function": { "name": "say\"hi", "parameters": { "type":"object","properties":{} } }
         })];
-        let s = lark_grammar_string(&tools, false).expect("quoted name must build");
+        let s = lark_grammar_string(&tools, false, ToolCalls::OneOrMore)
+            .expect("quoted name must build");
         assert!(s.contains("say\\\"hi"), "quote must be escaped:\n{s}");
         let factory = shared_factory_placeholder();
-        Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager)
+        Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager, ToolCalls::OneOrMore)
             .expect("must compile under llguidance");
     }
 
@@ -1975,7 +2207,8 @@ mod tests {
         // Strict still emits the native `call:NAME{…}` format the Gemma
         // response parser understands — NOT JSON. This is the load-bearing
         // invariant: switching to JSON-union would break the parser.
-        let s = lark_grammar_string(&sample_tools(), true).expect("build strict lark");
+        let s = lark_grammar_string(&sample_tools(), true, ToolCalls::OneOrMore)
+            .expect("build strict lark");
         assert!(
             s.contains("call:"),
             "native opener preserved in strict mode"
@@ -1994,8 +2227,8 @@ mod tests {
         // body `(field) ("," (field))*` — a Kleene star over the field
         // alternation, which lets the model repeat `summary:…,summary:…`
         // forever. The strict body must NOT contain that field-repeat.
-        let permissive = lark_grammar_string(&sample_tools(), false).unwrap();
-        let strict = lark_grammar_string(&sample_tools(), true).unwrap();
+        let permissive = lark_grammar_string(&sample_tools(), false, ToolCalls::OneOrMore).unwrap();
+        let strict = lark_grammar_string(&sample_tools(), true, ToolCalls::OneOrMore).unwrap();
         // Permissive: body is `(...) ("," (...))*` — the `))*` field-repeat.
         assert!(
             permissive.contains("))*"),
@@ -2030,7 +2263,7 @@ mod tests {
                 }
             }
         })];
-        let s = lark_grammar_string(&tools, true).unwrap();
+        let s = lark_grammar_string(&tools, true, ToolCalls::OneOrMore).unwrap();
         // The sole required field is emitted as a bare (non-`?`) body, so the
         // body cannot be empty. Locate the body rule line and assert it is
         // exactly the required field with no `?` gate.
@@ -2053,7 +2286,7 @@ mod tests {
         // Guard: the auto/Lazy path must be byte-identical to the pre-fix
         // grammar. The permissive body keeps the `(field) ("," (field))*`
         // shape with the field alternation and the Kleene star.
-        let s = lark_grammar_string(&sample_tools(), false).unwrap();
+        let s = lark_grammar_string(&sample_tools(), false, ToolCalls::OneOrMore).unwrap();
         assert!(s.contains("call:"));
         // task_complete has a single property `summary`, so its body is
         // `(("summary:" string_val)) ("," (("summary:" string_val)))*`.
@@ -2070,9 +2303,13 @@ mod tests {
     #[test]
     fn strict_lark_state_starts_active_in_eager() {
         let factory = shared_factory_placeholder();
-        let state =
-            Gemma4GrammarState::new_lark_strict(factory, &sample_tools(), GrammarMode::Eager)
-                .expect("build eager strict lark state");
+        let state = Gemma4GrammarState::new_lark_strict(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build eager strict lark state");
         assert!(
             state.is_active(),
             "eager strict Lark grammar constrains from step 0 (required tool_choice path)"
@@ -2087,7 +2324,8 @@ mod tests {
         // `call:NAME{…}` (Gemma) nor JSON-union. This is the load-bearing
         // invariant: a wrong format would make the matcher reject every
         // model token.
-        let s = qwen35_lark_grammar_string(&sample_tools()).expect("build qwen35 grammar");
+        let s = qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore)
+            .expect("build qwen35 grammar");
         assert!(s.contains("<tool_call>"), "tool_call opener tag");
         assert!(s.contains("</tool_call>"), "tool_call closer tag");
         assert!(
@@ -2124,7 +2362,7 @@ mod tests {
                 }
             }
         })];
-        let s = qwen35_lark_grammar_string(&tools).unwrap();
+        let s = qwen35_lark_grammar_string(&tools, ToolCalls::OneOrMore).unwrap();
         let body_line = s
             .lines()
             .find(|l| l.starts_with("q_0_body:"))
@@ -2144,7 +2382,7 @@ mod tests {
         // No Kleene star over the parameter-block alternation in a body rule
         // ⇒ no duplicate-parameter n-gram cycle (the failure mode that kept
         // Gemma's Eager Lark disabled).
-        let s = qwen35_lark_grammar_string(&sample_tools()).unwrap();
+        let s = qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore).unwrap();
         for line in s.lines() {
             if line.starts_with("q_") && line.contains("_body:") {
                 assert!(
@@ -2159,7 +2397,7 @@ mod tests {
     fn qwen35_grammar_optional_params_are_gated() {
         // ask_to_user: `question` required, `options` optional → options must
         // be `?`-gated, question must not be.
-        let s = qwen35_lark_grammar_string(&sample_tools()).unwrap();
+        let s = qwen35_lark_grammar_string(&sample_tools(), ToolCalls::OneOrMore).unwrap();
         let body_line = s
             .lines()
             .find(|l| l.starts_with("q_1_body:"))
@@ -2175,9 +2413,14 @@ mod tests {
     #[test]
     fn qwen35_grammar_state_active_in_eager() {
         let factory = shared_factory_placeholder();
-        let state =
-            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Eager, None)
-                .expect("build eager qwen35 xml state");
+        let state = Gemma4GrammarState::new_qwen35_xml(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("build eager qwen35 xml state");
         assert!(
             state.is_active(),
             "eager qwen35 grammar constrains from step 0 (required tool_choice path)"
@@ -2193,9 +2436,14 @@ mod tests {
         // actually compiles under llguidance, not just that the string looks
         // right. Uses the placeholder single-byte factory.
         let factory = shared_factory_placeholder();
-        let state =
-            Gemma4GrammarState::new_qwen35_xml(factory, &sample_tools(), GrammarMode::Eager, None)
-                .expect("eager qwen35 grammar must compile under llguidance");
+        let state = Gemma4GrammarState::new_qwen35_xml(
+            factory,
+            &sample_tools(),
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("eager qwen35 grammar must compile under llguidance");
         assert!(state.is_active());
     }
 
@@ -2208,11 +2456,17 @@ mod tests {
             "type": "function",
             "function": { "name": "raw", "parameters": { "type": "string" } }
         })];
-        let s = qwen35_lark_grammar_string(&tools).unwrap();
+        let s = qwen35_lark_grammar_string(&tools, ToolCalls::OneOrMore).unwrap();
         assert!(s.contains("param_block"), "fallback uses param_block: {s}");
         let factory = shared_factory_placeholder();
-        let state = Gemma4GrammarState::new_qwen35_xml(factory, &tools, GrammarMode::Eager, None)
-            .expect("fallback qwen35 grammar must compile under llguidance");
+        let state = Gemma4GrammarState::new_qwen35_xml(
+            factory,
+            &tools,
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("fallback qwen35 grammar must compile under llguidance");
         assert!(state.is_active());
     }
 
@@ -2230,7 +2484,7 @@ mod tests {
                     }
                 }
             })];
-            let s = qwen35_lark_grammar_string(&tools)
+            let s = qwen35_lark_grammar_string(&tools, ToolCalls::OneOrMore)
                 .unwrap_or_else(|e| panic!("{name:?} must build: {e}"));
             assert!(s.contains(name), "{name:?} must appear as a literal:\n{s}");
             assert!(
@@ -2238,8 +2492,14 @@ mod tests {
                 "a non-identifier key must be constrained, not dropped:\n{s}"
             );
             let factory = shared_factory_placeholder();
-            Gemma4GrammarState::new_qwen35_xml(factory, &tools, GrammarMode::Eager, None)
-                .unwrap_or_else(|e| panic!("{name:?} must compile under llguidance: {e}"));
+            Gemma4GrammarState::new_qwen35_xml(
+                factory,
+                &tools,
+                GrammarMode::Eager,
+                None,
+                ToolCalls::OneOrMore,
+            )
+            .unwrap_or_else(|e| panic!("{name:?} must compile under llguidance: {e}"));
         }
     }
 
@@ -2259,7 +2519,8 @@ mod tests {
                 }
             }
         })];
-        let s = lark_grammar_string(&tools, true).expect("non-identifier key must build");
+        let s = lark_grammar_string(&tools, true, ToolCalls::OneOrMore)
+            .expect("non-identifier key must build");
         assert!(s.contains("도시:"), "key must be constrained:\n{s}");
         assert!(
             !s.contains("<[^125]>*"),
@@ -2286,7 +2547,8 @@ mod tests {
                 }
             }
         })];
-        let s = lark_grammar_string(&tools, true).expect("build no-required strict lark");
+        let s = lark_grammar_string(&tools, true, ToolCalls::OneOrMore)
+            .expect("build no-required strict lark");
         assert!(s.contains("query:"));
         assert!(s.contains("limit:"));
         let body_line = s

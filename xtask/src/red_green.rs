@@ -125,6 +125,33 @@ const fn srv(filter: &'static str) -> Guard {
     }
 }
 
+/// `lumen-mlx` lib guard that needs **no** feature — `grammar` is ungated
+/// (pure llguidance + serde_json), so this builds in seconds where an
+/// `mlx-native` lib guard takes minutes.
+const fn core_mlx_lib(filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-mlx",
+        filter,
+        features: "",
+        lib_only: true,
+        test_target: "",
+        release: false,
+    }
+}
+
+/// `lumen-server` integration-test guard. Its lib target carries the request
+/// types, so no feature is needed for the pure request-policy checks.
+const fn srv_test(target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-server",
+        filter,
+        features: "",
+        lib_only: false,
+        test_target: target,
+        release: false,
+    }
+}
+
 /// `lumen-core` is the FFI-free crate: no feature, no GPU, and the fastest
 /// guards in the catalogue.
 const fn core(filter: &'static str) -> Guard {
@@ -139,6 +166,44 @@ const fn core(filter: &'static str) -> Guard {
 }
 
 static DEFECTS: &[Defect] = &[
+    Defect {
+        name: "tool-calls-grammar-spans-one-call",
+        symptom: "`tool_choice=\"required\"` returned FOUR identical tool calls \
+                  where `\"auto\"` returned one — the same call repeated, so a \
+                  client executing them ran the same tool four times",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    grammar.push_str(&format!("start: tool_call{}\n", calls.start_suffix()));
+    grammar.push_str(&format!("tool_call: \"call:\" ({tool_call_lhs})\n"));"#,
+            replace: r#"    grammar.push_str("start: tool_call\n");
+    grammar.push_str(&format!("tool_call: \"call:\" ({tool_call_lhs})\n"));"#,
+        }],
+        guards: &[core_mlx_lib(
+            "grammar::tests::the_default_grammar_spans_the_whole_call_list",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "parallel-tool-calls-ignored",
+        symptom: "a client sending `parallel_tool_calls: false` got HTTP 200 and \
+                  as many calls as the model produced — the field was never \
+                  declared, and with no `deny_unknown_fields` serde dropped it \
+                  silently, so nothing said the parameter had not been honoured",
+        revert: &[Mutation {
+            path: SRV,
+            find: r#"            parallel_tool_calls: self.parallel_tool_calls,"#,
+            replace: r#"            parallel_tool_calls: None, // defect: drop the client's request"#,
+        }],
+        guards: &[srv_test(
+            "request_policy",
+            "an_explicit_parallel_tool_calls_reaches_the_backend",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
     Defect {
         name: "scratch-path-collision",
         symptom: "three save/load round-trip tests wrote to a fixed name under \
@@ -661,6 +726,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.
         (_, "scratch-path-collision") => "lib.rs",
+        (_, "tool-calls-grammar-spans-one-call") => "grammar.rs",
+        (_, "parallel-tool-calls-ignored") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

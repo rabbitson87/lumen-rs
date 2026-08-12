@@ -2659,10 +2659,14 @@ fn resolve_anthropic_tool_choice<'a>(
 ) -> ResolvedToolChoice<'a> {
     let resolved = match tool_choice {
         None => ResolvedToolChoice::Auto,
-        Some(AnthropicToolChoice::Auto) => ResolvedToolChoice::Auto,
-        Some(AnthropicToolChoice::Any) if has_tools => ResolvedToolChoice::Required,
-        Some(AnthropicToolChoice::Any) => ResolvedToolChoice::Auto,
-        Some(AnthropicToolChoice::Tool { name }) if has_tools => {
+        // `disable_parallel_tool_use` rides on each variant but says nothing
+        // about *whether* a tool is called, so it is deliberately ignored here
+        // and read separately via `AnthropicToolChoice::parallel_tool_calls`.
+        // Conflating the two is the mistake this whole change undoes.
+        Some(AnthropicToolChoice::Auto { .. }) => ResolvedToolChoice::Auto,
+        Some(AnthropicToolChoice::Any { .. }) if has_tools => ResolvedToolChoice::Required,
+        Some(AnthropicToolChoice::Any { .. }) => ResolvedToolChoice::Auto,
+        Some(AnthropicToolChoice::Tool { name, .. }) if has_tools => {
             ResolvedToolChoice::Tool(name.as_str())
         }
         Some(AnthropicToolChoice::Tool { .. }) => ResolvedToolChoice::Auto,

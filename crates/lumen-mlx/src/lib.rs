@@ -219,6 +219,17 @@ pub struct SamplingOverrides {
     /// Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Matched
     /// incrementally in the streaming loop, not in `build_sampling_config`.
     pub stop: Vec<String>,
+    /// OpenAI `parallel_tool_calls` (default `true` when absent), or the
+    /// inverse of Anthropic's `disable_parallel_tool_use`. `Some(false)` caps
+    /// the turn at exactly one tool call.
+    ///
+    /// Not a sampling knob, and it rides here for the reason `stop` does: this
+    /// is the per-request channel that already reaches every streaming
+    /// entrypoint, and the alternative was a sixth parameter on five public
+    /// signatures. Read by `select_grammar_state`, which turns it into a
+    /// [`grammar::ToolCalls`] — see that type for why the count is separate
+    /// from `tool_choice` in the first place.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
@@ -1584,6 +1595,7 @@ impl MlxBackend {
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     );
                 }
                 let _ = tool_choice;
@@ -1763,6 +1775,7 @@ impl MlxBackend {
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     );
                 }
                 let _ = tool_choice;
@@ -1873,6 +1886,7 @@ impl MlxBackend {
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
                     );
                 }
@@ -1995,6 +2009,7 @@ impl MlxBackend {
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                 )
             }
             #[allow(unreachable_patterns)]
@@ -2053,6 +2068,7 @@ impl MlxBackend {
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -2173,6 +2189,7 @@ impl MlxBackend {
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
                     );
                 }
@@ -2334,6 +2351,7 @@ impl MlxBackend {
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
                 )
             }
@@ -2398,6 +2416,7 @@ impl MlxBackend {
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
                 )
             }
@@ -3776,6 +3795,7 @@ impl MlxQwen35Backend {
         &self,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Option<crate::grammar::Gemma4GrammarState> {
         use crate::chat_io::ResolvedToolChoice;
         use crate::grammar::{Gemma4GrammarState, GrammarMode};
@@ -3785,7 +3805,7 @@ impl MlxQwen35Backend {
         // build a grammar that would be inert.
         #[cfg(not(feature = "mlx-native"))]
         {
-            let _ = (tools, tool_choice);
+            let _ = (tools, tool_choice, calls);
             return None;
         }
         #[cfg(feature = "mlx-native")]
@@ -3830,10 +3850,10 @@ impl MlxQwen35Backend {
                     serde_json::json!({ "type": "function", "function": func })
                 })
                 .collect();
-            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None) {
+            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None, calls) {
                 Ok(state) => {
                     eprintln!(
-                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?})",
+                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?}, calls={calls:?})",
                         tools.len()
                     );
                     Some(state)
@@ -4562,6 +4582,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_flat(
             messages,
@@ -4571,6 +4592,7 @@ impl MlxQwen35Backend {
             seq_id,
             tools,
             tool_choice,
+            calls,
             |_ev| Ok(()),
         )
     }
@@ -4589,6 +4611,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4602,6 +4625,7 @@ impl MlxQwen35Backend {
             seq_id,
             tools,
             tool_choice,
+            calls,
             on_event,
         )
     }
@@ -4616,6 +4640,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_history(
             turns,
@@ -4625,6 +4650,7 @@ impl MlxQwen35Backend {
             seq_id,
             tools,
             tool_choice,
+            calls,
             |_ev| Ok(()),
         )
     }
@@ -4640,6 +4666,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4653,6 +4680,7 @@ impl MlxQwen35Backend {
             seq_id,
             tools,
             tool_choice,
+            calls,
             on_event,
         )
     }
@@ -4673,6 +4701,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4704,7 +4733,7 @@ impl MlxQwen35Backend {
                 self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
         let prefix_key = if has_images {
             None
         } else {
@@ -4747,6 +4776,7 @@ impl MlxQwen35Backend {
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4788,7 +4818,7 @@ impl MlxQwen35Backend {
                 )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
         let prefix_key = if has_images {
             None
         } else {

@@ -848,6 +848,7 @@ pub(crate) mod imp {
             &self,
             tools: &[crate::chat_io::ToolDef<'_>],
             choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            calls: crate::grammar::ToolCalls,
         ) -> Option<Gemma4GrammarState> {
             use crate::chat_io::ResolvedToolChoice;
             if !gemma4_grammar_lark_enabled() {
@@ -934,14 +935,14 @@ pub(crate) mod imp {
                 return None;
             }
             let built = if strict {
-                Gemma4GrammarState::new_lark_strict(factory, &tools_json, mode)
+                Gemma4GrammarState::new_lark_strict(factory, &tools_json, mode, calls)
             } else {
-                Gemma4GrammarState::new_lark(factory, &tools_json, mode)
+                Gemma4GrammarState::new_lark(factory, &tools_json, mode, calls)
             };
             match built {
                 Ok(s) => {
                     eprintln!(
-                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?}, strict={strict})",
+                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?}, strict={strict}, calls={calls:?})",
                         tools.len()
                     );
                     Some(s)
@@ -1010,6 +1011,7 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             choice: &crate::chat_io::ResolvedToolChoice<'_>,
             response_schema: Option<&serde_json::Value>,
+            calls: crate::grammar::ToolCalls,
         ) -> Option<Gemma4GrammarState> {
             if let Some(schema) = response_schema {
                 if !tools.is_empty() {
@@ -1020,7 +1022,7 @@ pub(crate) mod imp {
                 }
                 return self.build_response_format_grammar(schema);
             }
-            self.build_grammar_state(tools, choice)
+            self.build_grammar_state(tools, choice, calls)
         }
 
         pub fn model_id(&self) -> &str {
@@ -2427,7 +2429,12 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}",
                 cache.offset()
             );
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2509,7 +2516,12 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)",
                 cache.offset()
             );
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2641,7 +2653,12 @@ pub(crate) mod imp {
                 tool_choice,
                 response_schema.is_some(),
             )?;
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2714,7 +2731,12 @@ pub(crate) mod imp {
                 .model
                 .encode_images_for_prompt(&prompt, &flat)
                 .context("chat_streaming: encode images")?;
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2799,7 +2821,12 @@ pub(crate) mod imp {
                         .context("chat_streaming_from_history: encode images")?,
                 )
             };
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,

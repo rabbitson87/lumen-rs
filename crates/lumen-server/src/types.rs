@@ -105,6 +105,16 @@ pub struct ChatCompletionRequest {
     /// Qwen 3.6 has a native `required` mode in its template. Wire-up TBD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// OpenAI `parallel_tool_calls`. Absent means `true`, which is the
+    /// documented default.
+    ///
+    /// `tool_choice` decides *whether* a tool is called; this decides *how
+    /// many*. Until it was added the field was accepted and silently dropped —
+    /// no `deny_unknown_fields` here — so a client asking for one call got
+    /// however many the model produced, with a 200 and nothing to indicate the
+    /// parameter had not been honoured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 
     // ── OpenAI structured outputs ──────────────────────────────────
     /// OpenAI `response_format`. When `json_object` / `json_schema`, the
@@ -164,6 +174,7 @@ impl ChatCompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            parallel_tool_calls: self.parallel_tool_calls,
         }
     }
 
@@ -786,9 +797,41 @@ pub struct AnthropicTool {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolChoice {
-    Auto,
-    Any,
-    Tool { name: String },
+    Auto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Tool {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+}
+
+impl AnthropicToolChoice {
+    /// Anthropic hangs `disable_parallel_tool_use` off `tool_choice` itself
+    /// rather than off the request, and it appears on every variant. Reported
+    /// as OpenAI's `parallel_tool_calls` so one representation reaches the
+    /// grammar — see [`lumen_mlx::grammar::ToolCalls`].
+    pub fn parallel_tool_calls(&self) -> Option<bool> {
+        let disabled = match self {
+            Self::Auto {
+                disable_parallel_tool_use,
+            }
+            | Self::Any {
+                disable_parallel_tool_use,
+            }
+            | Self::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+        };
+        disabled.map(|d| !d)
+    }
 }
 
 /// Anthropic Extended Thinking flag, polymorphic on the wire.
@@ -837,6 +880,8 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            // /v1/completions has no tools, so no tool-call count to cap.
+            parallel_tool_calls: None,
         }
     }
 }
@@ -854,6 +899,11 @@ impl AnthropicRequest {
             presence_penalty: None,
             frequency_penalty: None,
             stop: self.stop_sequences.clone().unwrap_or_default(),
+            // Anthropic hangs the knob off `tool_choice`, inverted.
+            parallel_tool_calls: self
+                .tool_choice
+                .as_ref()
+                .and_then(|c| c.parallel_tool_calls()),
         }
     }
 }
@@ -1708,7 +1758,10 @@ mod tool_calling_serde {
         let tools = req.tools.unwrap();
         assert_eq!(tools[0].name, "get_weather");
         assert_eq!(tools[0].input_schema["required"][0], "location");
-        assert!(matches!(req.tool_choice, Some(AnthropicToolChoice::Auto)));
+        assert!(matches!(
+            req.tool_choice,
+            Some(AnthropicToolChoice::Auto { .. })
+        ));
     }
 
     #[test]
@@ -1716,7 +1769,7 @@ mod tool_calling_serde {
         let raw = json!({"type": "tool", "name": "get_weather"});
         let tc: AnthropicToolChoice = serde_json::from_value(raw).unwrap();
         match tc {
-            AnthropicToolChoice::Tool { name } => assert_eq!(name, "get_weather"),
+            AnthropicToolChoice::Tool { name, .. } => assert_eq!(name, "get_weather"),
             _ => panic!("expected Tool"),
         }
     }
@@ -1848,6 +1901,7 @@ mod tool_calling_serde {
             model: "x".into(),
             messages: vec![],
             max_tokens: 16,
+            parallel_tool_calls: None,
             temperature: 0.7,
             top_p: 0.9,
             top_k: None,

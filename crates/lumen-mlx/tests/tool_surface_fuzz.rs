@@ -31,7 +31,7 @@
 //! corruption rather than a rejection.
 
 use lumen_mlx::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
-use lumen_mlx::grammar::build_qwen35_tool_grammar_lark;
+use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::generators::{ChatRequest, GrammarAndOutput, Mutation, ToolSet, seeded_inputs};
 
 /// Every entry point below is reached with both well-formed and malformed
@@ -167,7 +167,7 @@ fn grammar_builder_survives_generated_tool_sets() {
         if t.tools.is_empty() {
             return;
         }
-        match build_qwen35_tool_grammar_lark(&t.tools) {
+        match build_qwen35_tool_grammar_lark(&t.tools, ToolCalls::OneOrMore) {
             Ok(_) => built += 1,
             Err(_) => rejected += 1,
         }

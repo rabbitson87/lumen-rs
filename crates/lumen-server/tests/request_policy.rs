@@ -282,3 +282,80 @@ fn every_invalid_size_is_rejected_with_a_reason() {
         );
     }
 }
+
+// ─────────────── parallel_tool_calls, both API surfaces ───────────────
+//
+// `tool_choice` decides *whether* a tool is called; `parallel_tool_calls`
+// decides *how many*. Before these landed the second question had no answer on
+// either surface: the field was not declared, `ChatCompletionRequest` has no
+// `deny_unknown_fields`, and serde dropped it. A client asking for one call got
+// a 200, however many calls the model produced, and no indication that what it
+// asked for had been discarded.
+
+/// Absent means `true` — the documented OpenAI default. This is the assertion
+/// that keeps a future `#[serde(default)]` edit from quietly making absence
+/// mean `false`.
+#[test]
+fn an_absent_parallel_tool_calls_is_none_not_false() {
+    let req = chat(openai_base("m"));
+    assert_eq!(req.parallel_tool_calls, None);
+    assert_eq!(req.sampling_overrides().parallel_tool_calls, None);
+}
+
+/// Both explicit values survive deserialization and reach the overrides the
+/// backend actually reads.
+#[test]
+fn an_explicit_parallel_tool_calls_reaches_the_backend() {
+    for want in [true, false] {
+        let mut v = openai_base("m");
+        v["parallel_tool_calls"] = serde_json::json!(want);
+        let req = chat(v);
+        assert_eq!(req.parallel_tool_calls, Some(want));
+        assert_eq!(
+            req.sampling_overrides().parallel_tool_calls,
+            Some(want),
+            "parallel_tool_calls={want} must not be dropped between request and backend"
+        );
+    }
+}
+
+/// Anthropic spells it inverted and hangs it off `tool_choice` rather than off
+/// the request, on every variant. It has to arrive as the same value.
+#[test]
+fn anthropic_disable_parallel_tool_use_is_inverted_into_the_same_field() {
+    for (tc, want) in [
+        (
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+            Some(false),
+        ),
+        (
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": false}),
+            Some(true),
+        ),
+        (
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+            Some(false),
+        ),
+        (
+            serde_json::json!({"type": "tool", "name": "t", "disable_parallel_tool_use": true}),
+            Some(false),
+        ),
+        // Unspecified stays unspecified rather than defaulting to either side.
+        (serde_json::json!({"type": "any"}), None),
+    ] {
+        let mut v = anthropic_base("m");
+        v["tool_choice"] = tc.clone();
+        assert_eq!(
+            anthropic(v).sampling_overrides().parallel_tool_calls,
+            want,
+            "tool_choice={tc}"
+        );
+    }
+}
+
+/// A request that never mentions tool_choice has nothing to invert.
+#[test]
+fn anthropic_without_a_tool_choice_leaves_the_count_unspecified() {
+    let req = anthropic(anthropic_base("m"));
+    assert_eq!(req.sampling_overrides().parallel_tool_calls, None);
+}
