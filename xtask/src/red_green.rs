@@ -94,9 +94,12 @@ const fn mlx_ungated_test(target: &'static str, filter: &'static str) -> Guard {
     }
 }
 
-/// Integration-test guard that DOES need `mlx-native` — the config parser
-/// still lives inside this crate's gated `mod imp`. Hoisting it out (as
-/// `gemma4_tool_syntax` was) would move these guards to `mlx_ungated_test`.
+/// Integration-test guard that DOES need `mlx-native`.
+///
+/// Both config parsers have since been hoisted to ungated `qwen35_config` /
+/// `gemma4_config`, so their sweeps moved to `mlx_ungated_test`. What is left
+/// here genuinely needs the feature — `NativeWeights` holds `Array`, so the
+/// safetensors sweep cannot be built without MLX.
 const fn mlx_native_test(target: &'static str, filter: &'static str) -> Guard {
     Guard {
         package: "lumen-mlx",
@@ -269,12 +272,12 @@ static DEFECTS: &[Defect] = &[
                   covers a MISSING key, not an explicit null (the JGOS-31B shape)",
         revert: &[Mutation {
             path: MLX,
-            find: r#"        #[serde(default, deserialize_with = "null_as_default")]
-        pub num_experts: usize,"#,
-            replace: r#"        #[serde(default)]
-        pub num_experts: usize,"#,
+            find: r#"    #[serde(default, deserialize_with = "null_as_default")]
+    pub num_experts: usize,"#,
+            replace: r#"    #[serde(default)]
+    pub num_experts: usize,"#,
         }],
-        guards: &[mlx_native_test(
+        guards: &[mlx_ungated_test(
             "config_faults",
             "explicit_null_moe_fields_on_a_dense_config",
         )],
@@ -291,12 +294,12 @@ static DEFECTS: &[Defect] = &[
                   in the Qwen parser",
         revert: &[Mutation {
             path: MLX,
-            find: r#"        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
-        pub num_experts: usize,"#,
-            replace: r#"        #[serde(default)]
-        pub num_experts: usize,"#,
+            find: r#"    #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
+    pub num_experts: usize,"#,
+            replace: r#"    #[serde(default)]
+    pub num_experts: usize,"#,
         }],
-        guards: &[mlx_native_test(
+        guards: &[mlx_ungated_test(
             "gemma4_config_faults",
             "explicit_null_moe_fields_on_a_dense_config",
         )],
@@ -572,9 +575,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // fuzzed without `mlx-native`.
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
-        (_, "config-null-moe-fields") | (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
+        (_, "config-null-moe-fields") => "qwen35_config.rs",
+        (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
-        (_, "gemma4-config-null-moe-fields") => "gemma4_moe.rs",
+        (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",

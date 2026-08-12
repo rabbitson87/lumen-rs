@@ -22,9 +22,7 @@
 //! `sliding_window` to 0 would not fail — it would build a model with the wrong
 //! attention window, which is the invisible-wrongness class 005 exists for.
 
-#![cfg(feature = "mlx-native")]
-
-use lumen_mlx::gemma4::NativeGemma4Config;
+use lumen_mlx::gemma4_config::NativeGemma4Config;
 use lumen_testkit::faults::{ConfigMutation, mutate_config};
 use serde_json::{Value, json};
 

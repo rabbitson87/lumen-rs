@@ -32,85 +32,10 @@ pub mod imp {
 
     // ───────────────────────────── config ─────────────────────────────
 
-    /// `vision_config` block of Gemma 4's config.json.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4VisionConfig {
-        pub model_type: String,
-        pub hidden_size: usize,
-        pub num_hidden_layers: usize,
-        pub num_attention_heads: usize,
-        pub head_dim: usize,
-        pub intermediate_size: usize,
-        pub patch_size: usize,
-        pub pooling_kernel_size: usize,
-        pub position_embedding_size: usize,
-        pub rms_norm_eps: f32,
-        pub rope_parameters: NativeGemma4VisionRope,
-        #[serde(default)]
-        pub standardize: bool,
-        #[serde(default)]
-        pub use_clipped_linears: bool,
-        #[serde(default = "default_vision_activation")]
-        pub hidden_activation: String,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4VisionRope {
-        pub rope_theta: f32,
-    }
-
-    fn default_vision_activation() -> String {
-        "gelu_pytorch_tanh".to_string()
-    }
-
-    impl NativeGemma4VisionConfig {
-        pub fn validate(&self) -> Result<()> {
-            if self.model_type != "gemma4_vision" {
-                return Err(anyhow!(
-                    "expected vision_config.model_type='gemma4_vision', got '{}'",
-                    self.model_type
-                ));
-            }
-            if self.hidden_size == 0
-                || self.num_hidden_layers == 0
-                || self.num_attention_heads == 0
-                || self.head_dim == 0
-                || self.patch_size == 0
-                || self.pooling_kernel_size == 0
-            {
-                return Err(anyhow!("vision_config has zero-valued core dims"));
-            }
-            if self.head_dim % 4 != 0 {
-                // 2-D RoPE splits head_dim into 2 halves and each half into
-                // sin/cos pairs, so head_dim must be a multiple of 4.
-                return Err(anyhow!(
-                    "vision head_dim ({}) must be a multiple of 4 for 2-D RoPE",
-                    self.head_dim
-                ));
-            }
-            if self.num_attention_heads * self.head_dim != self.hidden_size {
-                return Err(anyhow!(
-                    "vision heads×head_dim ({}×{}) != hidden_size ({})",
-                    self.num_attention_heads,
-                    self.head_dim,
-                    self.hidden_size
-                ));
-            }
-            if self.use_clipped_linears {
-                // The checkpoint would ship input_min/max buffers we don't read.
-                return Err(anyhow!(
-                    "vision_config.use_clipped_linears=true is not supported"
-                ));
-            }
-            if self.hidden_activation != "gelu_pytorch_tanh" {
-                return Err(anyhow!(
-                    "unsupported vision hidden_activation '{}'",
-                    self.hidden_activation
-                ));
-            }
-            Ok(())
-        }
-    }
+    // The `vision_config` block is pure serde + arithmetic validation, so it
+    // lives in the ungated `gemma4_config` module alongside the rest of this
+    // config.json. Re-exported here so call sites are untouched.
+    pub use crate::gemma4_config::{NativeGemma4VisionConfig, NativeGemma4VisionRope};
 
     /// Run the tower in float32 instead of the checkpoint's bf16.
     /// Used by the golden-tensor parity test, which compares against a

@@ -40,6 +40,8 @@ pub mod chat_io;
 pub mod config_serde;
 mod gemma4_backend;
 mod gemma4_chat;
+/// Gemma 4 `config.json` parsing. Ungated on purpose — see the module docs.
+pub mod gemma4_config;
 mod gemma4_critical_correction;
 mod gemma4_moe;
 mod gemma4_mtp;
@@ -56,6 +58,8 @@ mod jinja_chat;
 /// docs: it is the OOM guard's arithmetic, and it is only testable at tier 0
 /// because it is separated from the backend that consumes it.
 pub mod prefill_budget;
+/// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
+pub mod qwen35_config;
 pub mod qwen36_vision;
 /// Resource-bounded image decoding shared by both image towers.
 mod vision_image;

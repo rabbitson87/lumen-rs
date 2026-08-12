@@ -14,7 +14,7 @@
 //! That was fixed for Gemma 4; this sweep asks the same question of the
 //! Qwen 3.5/3.6 parser and pins whatever the answer is.
 
-use lumen_mlx::qwen3_5_moe_config::NativeModelConfig;
+use lumen_mlx::qwen35_config::NativeModelConfig;
 use lumen_testkit::faults::{ConfigMutation, mutate_config};
 use serde_json::{Value, json};
 

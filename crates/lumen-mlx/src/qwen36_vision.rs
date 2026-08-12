@@ -33,28 +33,10 @@ pub mod imp {
 
     // ───────────────────────────── config ─────────────────────────────
 
-    /// `vision_config` block of Qwen 3.6's config.json.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeQwen36VisionConfig {
-        pub depth: usize,
-        pub hidden_size: usize,
-        pub num_heads: usize,
-        pub intermediate_size: usize,
-        pub in_channels: usize,
-        pub patch_size: usize,
-        pub temporal_patch_size: usize,
-        pub spatial_merge_size: usize,
-        pub num_position_embeddings: usize,
-        pub out_hidden_size: usize,
-        #[serde(default)]
-        pub deepstack_visual_indexes: Vec<usize>,
-        #[serde(default = "default_vision_activation")]
-        pub hidden_act: String,
-    }
-
-    fn default_vision_activation() -> String {
-        "gelu_pytorch_tanh".to_string()
-    }
+    // The `vision_config` block is pure serde + arithmetic validation, so it
+    // lives in the ungated `qwen35_config` module alongside the rest of this
+    // config.json. Re-exported here so call sites are untouched.
+    pub use crate::qwen35_config::NativeQwen36VisionConfig;
 
     /// LayerNorm epsilon. Hard-coded upstream (`nn.LayerNorm(..., eps=1e-6)`)
     /// rather than read from the config, so it is hard-coded here too.
@@ -64,73 +46,6 @@ pub mod imp {
     /// (`Qwen3VLVisionRotaryEmbedding(head_dim // 2)` takes `theta=10000.0` by
     /// default) — the text tower's much larger `rope_theta` does not apply.
     const VISION_ROPE_THETA: f32 = 10_000.0;
-
-    impl NativeQwen36VisionConfig {
-        pub fn head_dim(&self) -> usize {
-            self.hidden_size / self.num_heads
-        }
-
-        /// Patches folded into one language-model token (`merge²`).
-        pub fn merge_unit(&self) -> usize {
-            self.spatial_merge_size * self.spatial_merge_size
-        }
-
-        /// Side length of the learned position grid (`√num_position_embeddings`).
-        pub fn grid_per_side(&self) -> usize {
-            (self.num_position_embeddings as f64).sqrt() as usize
-        }
-
-        pub fn validate(&self) -> Result<()> {
-            if self.depth == 0
-                || self.hidden_size == 0
-                || self.num_heads == 0
-                || self.patch_size == 0
-                || self.spatial_merge_size == 0
-                || self.temporal_patch_size == 0
-            {
-                return Err(anyhow!("vision_config has zero-valued core dims"));
-            }
-            if self.hidden_size % self.num_heads != 0 {
-                return Err(anyhow!(
-                    "vision hidden_size ({}) is not divisible by num_heads ({})",
-                    self.hidden_size,
-                    self.num_heads
-                ));
-            }
-            // The rotary table is built over `head_dim / 2` and split in half
-            // again for the (h, w) pair, so head_dim must be a multiple of 4.
-            if self.head_dim() % 4 != 0 {
-                return Err(anyhow!(
-                    "vision head_dim ({}) must be a multiple of 4 for 2-D RoPE",
-                    self.head_dim()
-                ));
-            }
-            let side = self.grid_per_side();
-            if side * side != self.num_position_embeddings {
-                return Err(anyhow!(
-                    "num_position_embeddings ({}) is not a perfect square",
-                    self.num_position_embeddings
-                ));
-            }
-            if !self.deepstack_visual_indexes.is_empty() {
-                // Deepstack injects intermediate ViT features into the first N
-                // decoder layers. The checkpoints we serve ship an empty list;
-                // supporting it means plumbing extra tensors into the text
-                // stack, which is a separate change.
-                return Err(anyhow!(
-                    "vision_config.deepstack_visual_indexes {:?} is not supported",
-                    self.deepstack_visual_indexes
-                ));
-            }
-            if self.hidden_act != "gelu_pytorch_tanh" {
-                return Err(anyhow!(
-                    "unsupported vision hidden_act '{}'",
-                    self.hidden_act
-                ));
-            }
-            Ok(())
-        }
-    }
 
     /// Run the tower in float32 instead of the checkpoint's bf16.
     fn vision_f32_enabled() -> bool {

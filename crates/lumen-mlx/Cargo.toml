@@ -184,7 +184,13 @@ required-features = ["mlx-native"]
 
 [[test]]
 name = "config_faults"
-required-features = ["mlx-native"]
+# No feature: the Qwen config parser was hoisted to ungated `qwen35_config`
+# precisely so this sweep runs in the default build.
+
+[[test]]
+name = "gemma4_config_faults"
+# No feature: the Gemma 4 config parser was hoisted to ungated `gemma4_config`
+# for the same reason its Qwen counterpart was.
 
 [[test]]
 name = "weights_faults"
