@@ -320,7 +320,8 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         let cb = LloydMaxCodebook::compute(3, 1000).unwrap();
-        let path = "/tmp/tq_codebook_test.bin";
+        let scratch = crate::testpath::TempPath::new("codebook");
+        let path = scratch.as_str();
         cb.save(path).unwrap();
         let loaded = LloydMaxCodebook::load(path).unwrap();
         assert_eq!(cb.bits, loaded.bits);

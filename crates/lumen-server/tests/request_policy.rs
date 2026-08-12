@@ -58,7 +58,11 @@ fn the_imatrix_awq_override_beats_every_client_opt_in() {
         "hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq",
         "some/model-AWQ",
         "IMATRIX-flavoured-build",
-        "/Users/x/models/local-imatrix3plus-awq-4bit",
+        // A local-path spelling of the id — the matcher has to see through it
+        // too. Written without a home directory on purpose: a `/Users/...`
+        // literal in a committed file reads as someone's machine, which is the
+        // thing `cargo xtask gate`'s hygiene rule exists to keep out.
+        "/models/local-imatrix3plus-awq-4bit",
     ];
 
     for m in awq_models {

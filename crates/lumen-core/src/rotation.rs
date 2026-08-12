@@ -255,11 +255,11 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         let r = RotationMatrix::random(64, 42);
-        let path = "/tmp/tq_rotation_test.bin";
+        let scratch = crate::testpath::TempPath::new("rotation");
+        let path = scratch.as_str();
         r.save(path).unwrap();
         let loaded = RotationMatrix::load(path).unwrap();
         assert_eq!(r.dim, loaded.dim);
         assert_eq!(r.matrix, loaded.matrix);
-        std::fs::remove_file(path).ok();
     }
 }

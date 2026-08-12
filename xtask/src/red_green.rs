@@ -17,6 +17,7 @@ use std::process::{Command, ExitCode};
 const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
+const CORE: &str = "crates/lumen-core/src";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -124,7 +125,43 @@ const fn srv(filter: &'static str) -> Guard {
     }
 }
 
+/// `lumen-core` is the FFI-free crate: no feature, no GPU, and the fastest
+/// guards in the catalogue.
+const fn core(filter: &'static str) -> Guard {
+    Guard {
+        package: "lumen-core",
+        filter,
+        features: "",
+        lib_only: true,
+        test_target: "",
+        release: false,
+    }
+}
+
 static DEFECTS: &[Defect] = &[
+    Defect {
+        name: "scratch-path-collision",
+        symptom: "three save/load round-trip tests wrote to a fixed name under \
+                  /tmp (`tq_codebook_test.bin` and friends). Two checkouts \
+                  testing at once — or one `cargo test` racing a `cargo xtask \
+                  gate` — write the same file and read back each other's bytes; \
+                  the loser reports a corrupted codebook, and it passes when \
+                  rerun alone",
+        revert: &[Mutation {
+            path: CORE,
+            find: r#"            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lumen-core-{stem}-{}-{n}.bin",
+                std::process::id()
+            )))"#,
+            replace: r#"            let _ = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!("lumen-core-{stem}.bin")))"#,
+        }],
+        guards: &[core("testpath::two_temp_paths_never_collide")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
     Defect {
         name: "lark-opener",
         symptom: "every streaming tool call died: `byte 'ÿ' fails parse`; and \
@@ -620,6 +657,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
+        // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
+        // its own: it is three lines of test scaffolding shared by three
+        // round-trip tests, and a file for it would be more ceremony than code.
+        (_, "scratch-path-collision") => "lib.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

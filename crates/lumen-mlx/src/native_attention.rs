@@ -295,9 +295,11 @@ mod imp {
             let hi = row_start + (valid_max_abs_excl - cache_first_held_pos);
             data[lo..hi].fill(0.0);
         }
-        let arr = Array::from_slice(&data, &[query_len as i32, total_keys as i32])
-            .as_dtype(mlx_rs::Dtype::Bfloat16)
-            .context("build_causal_mask: legacy cast mask to bf16 failed")?;
+        // One construction, not two. This was written twice with the first
+        // binding shadowed, so every call built and dropped a whole
+        // `[query_len, kv_actual]` bf16 array before building the one it
+        // returned — 33 MB of pure waste at a 4K context, on the builder whose
+        // own callers already complain about the size of this allocation.
         let arr = Array::from_slice(&data, &[query_len as i32, total_keys as i32])
             .as_dtype(mlx_rs::Dtype::Bfloat16)
             .context("build_causal_mask: legacy cast mask to bf16 failed")?;

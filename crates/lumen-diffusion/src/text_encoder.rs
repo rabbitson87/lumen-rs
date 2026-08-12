@@ -582,7 +582,9 @@ mod parity_tests {
     }
 
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND the /tmp/mistral_*.bin dump set (tokens, \
+                firstreal, h10, embed_ref); no committed script produces them — \
+                see crates/lumen-mlx/tests/golden/README.md"]
     fn mistral_encoder_matches_reference() {
         const T: usize = 512;
         let ids = read_i32_bin("/tmp/mistral_tokens.bin");

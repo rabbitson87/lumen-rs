@@ -203,7 +203,9 @@ mod parity_tests {
     /// Standalone VAE packed-decode parity: feed mflux's FINAL packed latents,
     /// compare decoded image to mflux's image.
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND /tmp/klein_{packed_cf,unpatch_f32,image}.bin \
+                reference dumps; no committed script produces them — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn vae_decode_packed_matches_reference() {
         use crate::vae::VaeDecoder;
         let (lat_h, lat_w, _img_seq, _txt) = read_dims();
@@ -267,7 +269,15 @@ mod parity_tests {
     /// Full e2e glue parity: run the Rust denoise loop on mflux's init latents,
     /// compare per-step latents (cosine) + final image (PSNR / max-abs).
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    // /tmp/klein_sigmas.bin is the same dump the `flux-scheduler-invariants`
+    // defect was recorded against: a dev-session artifact that had ceased to
+    // exist, so the test failed everywhere but the machine that made it. That
+    // one was fixed by reading the schedule from the code; this test still
+    // needs the whole set, and nothing committed regenerates them.
+    #[ignore = "needs a Metal device AND the full /tmp/klein_*.bin dump set \
+                (sigmas, prompt_embeds, init_latents, img_ids, text_ids, per_step, \
+                image); no committed script produces them — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn klein_e2e_matches_reference() {
         let (lat_h, lat_w, img_seq, txt_seq) = read_dims();
         let steps = 4usize;

@@ -301,13 +301,13 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         let qjl = QJLProjector::new(64, 128, 42);
-        let path = "/tmp/tq_qjl_test.bin";
+        let scratch = crate::testpath::TempPath::new("qjl");
+        let path = scratch.as_str();
         qjl.save(path).unwrap();
         let loaded = QJLProjector::load(path).unwrap();
         assert_eq!(qjl.dim, loaded.dim);
         assert_eq!(qjl.m, loaded.m);
         assert_eq!(qjl.proj_matrix, loaded.proj_matrix);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]

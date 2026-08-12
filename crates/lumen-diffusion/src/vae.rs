@@ -661,7 +661,9 @@ mod parity_tests {
     }
 
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND /tmp/vae_latent.bin plus the \
+                /tmp/dbg_after_*.bin stage dumps; no committed script produces \
+                them — see crates/lumen-mlx/tests/golden/README.md"]
     fn vae_decoder_debug_stages() {
         let latent_cf = read_f32_bin("/tmp/vae_latent.bin");
         let latent = Array::from_slice(&latent_cf, &[1, 32, 16, 16]);
@@ -701,7 +703,9 @@ mod parity_tests {
     /// Golden parity: numpy reference decode (channels-first) vs native mlx-rs
     /// decode (channels-last). Run `/tmp/vae_ref.py` first to produce the bins.
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND /tmp/vae_{latent,out}.bin reference \
+                dumps; no committed script produces them — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn vae_decoder_matches_reference() {
         // latent [1,32,16,16] channels-first.
         let latent_cf = read_f32_bin("/tmp/vae_latent.bin");
