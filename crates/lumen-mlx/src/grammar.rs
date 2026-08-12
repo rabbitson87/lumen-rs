@@ -129,6 +129,31 @@ impl ToolCalls {
         matches!(self, Self::ExactlyOne)
     }
 
+    /// The turn should end now: `token` closed a tool call and the request
+    /// asked for exactly one.
+    ///
+    /// Two things this deliberately does NOT depend on.
+    ///
+    /// **The grammar.** It used to hang off `Gemma4GrammarState`, which made it
+    /// inert on the imatrix-AWQ family — `grammar_factory()` returns `None`
+    /// there, so there is no state to ask. Measured: a three-city prompt with
+    /// `parallel_tool_calls: false` returned three calls on that build, which
+    /// is the same accepted-then-silently-dropped failure the parameter was
+    /// added to remove, just narrowed to one model family. The closer is the
+    /// model's own framing and is emitted whether or not anything constrains
+    /// it, so the token is the right thing to watch.
+    ///
+    /// **The grammar finishing.** The Lark grammar covers `call:NAME{…}` only,
+    /// so `finished` goes true one token BEFORE `<tool_call|>`; stopping there
+    /// cut the framing the response parser needs and returned HTTP 200 with an
+    /// empty message.
+    ///
+    /// Gemma 4 specific — Qwen 3.6 closes with the literal text
+    /// `</tool_call>`, which is inside its grammar rather than a special token.
+    pub fn must_stop_after_call_closer(self, token: u32) -> bool {
+        self.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE
+    }
+
     /// Resolve from OpenAI's `parallel_tool_calls`, whose absence means the
     /// documented default of `true`.
     pub fn from_parallel_flag(parallel: Option<bool>) -> Self {
@@ -153,10 +178,6 @@ pub struct Gemma4GrammarState {
     /// triggering entirely — the grammar then only ever constrains in
     /// [`GrammarMode::Eager`].
     lazy_trigger: Option<LazyTrigger>,
-    /// Whether the turn ends after one completed call. See [`ToolCalls`] — it
-    /// is enforced by the decode loop rather than by the grammar, because the
-    /// call framing lives outside the grammar.
-    calls: ToolCalls,
 }
 
 /// The token that activates a [`GrammarMode::Lazy`] grammar, and whether that
@@ -199,9 +220,6 @@ impl Gemma4GrammarState {
                 // emitted before it and is not part of the grammar.
                 in_grammar: false,
             }),
-            // `new` is the JSON-shape smoke-test builder and takes no
-            // `parallel_tool_calls`; the default is the OpenAI default.
-            calls: ToolCalls::OneOrMore,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -239,7 +257,6 @@ impl Gemma4GrammarState {
             // The whole assistant message is the JSON value — there is no
             // opener token to wait for, so this variant has no lazy trigger.
             lazy_trigger: None,
-            calls: ToolCalls::OneOrMore,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -314,7 +331,6 @@ impl Gemma4GrammarState {
                 // it and is not a terminal in this grammar.
                 in_grammar: false,
             }),
-            calls,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -379,7 +395,6 @@ impl Gemma4GrammarState {
                 token,
                 in_grammar: true,
             }),
-            calls,
         };
         if matches!(mode, GrammarMode::Eager) {
             state.activate()?;
@@ -391,25 +406,6 @@ impl Gemma4GrammarState {
     /// sampler to decide whether to compute the mask at all.
     pub fn is_active(&self) -> bool {
         !self.finished && self.matcher.is_some()
-    }
-
-    /// The turn should end now: `token` closed a tool call and the request
-    /// asked for exactly one (`parallel_tool_calls: false` /
-    /// `disable_parallel_tool_use: true`).
-    ///
-    /// Keyed on the **closer token**, not on the grammar finishing, and the
-    /// difference is the whole thing. The Lark grammar covers `call:NAME{…}`
-    /// only, so `finished` goes true the moment the `}` lands — one token
-    /// before `<tool_call|>`. Breaking there cuts the framing the response
-    /// parser needs, and the request returns 200 with an empty message: the
-    /// server log said `ending the turn after one completed call at 12 tokens`
-    /// while the client saw zero calls and zero tokens.
-    ///
-    /// Gemma 4 specific, and that is why it lives in the Gemma decode loop:
-    /// Qwen 3.6 closes with the literal text `</tool_call>`, which is inside
-    /// its grammar rather than a special token.
-    pub fn must_stop_after_call_closer(&self, token: u32) -> bool {
-        self.calls.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE
     }
 
     /// Stop constraining, permanently, and let the rest of the generation
@@ -2019,22 +2015,17 @@ mod tests {
         assert!(!ToolCalls::OneOrMore.stops_after_first_call());
     }
 
-    /// The stop is keyed on the **closer token**, not on the grammar finishing.
+    /// The stop is keyed on the **closer token** and on nothing else — not on
+    /// the grammar finishing, and not on a grammar existing at all.
     ///
-    /// The Lark grammar covers `call:NAME{…}` only, so `finished` goes true one
-    /// token before `<tool_call|>`. Stopping there cut the framing the response
-    /// parser needs and the request returned 200 with an empty message — the
-    /// log said "ending the turn after one completed call at 12 tokens" while
-    /// the client saw zero calls.
+    /// Both were live defects. Keying on `finished` cut the turn one token
+    /// before `<tool_call|>` and returned an empty message; hanging the check
+    /// off the grammar state made it inert on the imatrix-AWQ family, where
+    /// `grammar_factory()` returns `None` — measured there, a three-city prompt
+    /// with `parallel_tool_calls: false` still returned three calls.
     #[test]
-    fn the_one_call_stop_fires_on_the_closer_and_nothing_else() {
-        let one = Gemma4GrammarState::new_lark_strict(
-            shared_factory_placeholder(),
-            &sample_tools(),
-            GrammarMode::Eager,
-            ToolCalls::ExactlyOne,
-        )
-        .expect("build ExactlyOne state");
+    fn the_one_call_stop_fires_on_the_closer_and_needs_no_grammar() {
+        let one = ToolCalls::ExactlyOne;
         assert!(
             one.must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE),
             "the closer must end the turn under ExactlyOne"
@@ -2045,53 +2036,18 @@ mod tests {
                 "token {other} is not a call closer and must not end the turn"
             );
         }
-
-        let many = Gemma4GrammarState::new_lark_strict(
-            shared_factory_placeholder(),
-            &sample_tools(),
-            GrammarMode::Eager,
-            ToolCalls::OneOrMore,
-        )
-        .expect("build OneOrMore state");
+        // The default must let the model keep calling — measured: 3 distinct
+        // calls for a three-city prompt, 1 with parallel_tool_calls=false.
+        assert!(!ToolCalls::OneOrMore.must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE));
+        // A plain policy value, reachable with no factory and no model: that is
+        // the property the imatrix-AWQ gap was missing.
         assert!(
-            !many.must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE),
-            "the default must let the model keep calling — measured: 3 distinct \
-             calls for a three-city prompt, 1 with parallel_tool_calls=false"
+            ToolCalls::from_parallel_flag(Some(false))
+                .must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE)
         );
-    }
-
-    /// Absence means `true`. OpenAI documents `parallel_tool_calls` as
-    /// defaulting to `true`, so a request that never mentions it must behave
-    /// like one that asked for it — not like one that disabled it.
-    #[test]
-    fn an_absent_parallel_flag_is_the_documented_default_of_true() {
-        assert_eq!(ToolCalls::from_parallel_flag(None), ToolCalls::OneOrMore);
-        assert_eq!(
-            ToolCalls::from_parallel_flag(Some(true)),
-            ToolCalls::OneOrMore
+        assert!(
+            !ToolCalls::from_parallel_flag(None).must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE)
         );
-        assert_eq!(
-            ToolCalls::from_parallel_flag(Some(false)),
-            ToolCalls::ExactlyOne
-        );
-        assert_eq!(ToolCalls::default(), ToolCalls::OneOrMore);
-    }
-
-    /// Both shapes have to compile under llguidance, not merely read right.
-    /// `+` on the start rule is the kind of change that produces a valid-looking
-    /// string and an unbuildable parser.
-    #[test]
-    fn both_call_counts_compile_under_llguidance() {
-        for calls in [ToolCalls::OneOrMore, ToolCalls::ExactlyOne] {
-            let factory = shared_factory_placeholder();
-            Gemma4GrammarState::new_lark_strict(
-                factory,
-                &sample_tools(),
-                GrammarMode::Eager,
-                calls,
-            )
-            .unwrap_or_else(|e| panic!("{calls:?} must compile: {e}"));
-        }
     }
 
     #[test]

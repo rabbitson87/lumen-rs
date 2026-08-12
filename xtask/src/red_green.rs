@@ -170,18 +170,20 @@ static DEFECTS: &[Defect] = &[
         name: "parallel-tool-calls-not-enforced",
         symptom: "`parallel_tool_calls: false` was accepted and then not applied \
                   — a three-city prompt returned three tool calls either way. \
-                  The first attempt at enforcing it keyed off the grammar \
-                  finishing, which lands one token BEFORE the `<tool_call|>` \
-                  closer, so the turn was cut mid-frame and the client got \
-                  HTTP 200 with zero calls and zero tokens",
+                  Two wrong fixes before the right one: keying off the grammar \
+                  FINISHING lands one token before the `<tool_call|>` closer, so \
+                  the turn was cut mid-frame and the client got HTTP 200 with an \
+                  empty message; hanging the check off the grammar STATE left it \
+                  inert on the imatrix-AWQ family, where `grammar_factory()` \
+                  returns None and three calls came back regardless",
         revert: &[Mutation {
             path: MLX,
-            find: r#"        self.calls.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE"#,
+            find: r#"        self.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE"#,
             replace: r#"        let _ = token;
-        self.finished && self.calls.stops_after_first_call()"#,
+        false // defect: the cap never fires"#,
         }],
         guards: &[core_mlx_lib(
-            "grammar::tests::the_one_call_stop_fires_on_the_closer_and_nothing_else",
+            "grammar::tests::the_one_call_stop_fires_on_the_closer_and_needs_no_grammar",
         )],
         occurrences: 1,
         needs_checkpoint: false,

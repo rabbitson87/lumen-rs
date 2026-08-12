@@ -3607,9 +3607,14 @@ pub(crate) mod imp {
                             // `parallel_tool_calls: false` — the grammar has
                             // just reported a completed call and the client
                             // asked for exactly one.
-                            let stop_one_call = grammar
-                                .as_ref()
-                                .is_some_and(|g| g.must_stop_after_call_closer(next_tok));
+                            // Read from the request policy, NOT from the
+                            // grammar: `grammar_factory()` returns None on the
+                            // imatrix-AWQ family, and asking a state that does
+                            // not exist made the cap inert exactly there.
+                            let stop_one_call = crate::grammar::ToolCalls::from_parallel_flag(
+                                ov.parallel_tool_calls,
+                            )
+                            .must_stop_after_call_closer(next_tok);
                             let stopping = stop_eos
                                 || stop_runaway.is_some()
                                 || stop_hard_break
