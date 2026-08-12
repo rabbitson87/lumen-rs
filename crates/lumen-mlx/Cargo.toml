@@ -191,6 +191,17 @@ name = "config_faults"
 # precisely so this sweep runs in the default build.
 
 [[test]]
+name = "qwen35_config_validate"
+
+[[test]]
+name = "gemma4_config_validate"
+
+# Own binary: it sets process-global env vars that `load()` reads, so sharing a
+# binary with the other config tests would race them.
+[[test]]
+name = "gemma4_config_env"
+
+[[test]]
 name = "gemma4_config_faults"
 # No feature: the Gemma 4 config parser was hoisted to ungated `gemma4_config`
 # for the same reason its Qwen counterpart was.
