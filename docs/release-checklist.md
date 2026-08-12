@@ -120,9 +120,18 @@ produces plausible wrong numbers instead of a crash.
 - [ ] Fork SHAs pinned and reachable: `mlx-rs` / `mlx-sys` `rev =` in
       `crates/lumen-mlx/Cargo.toml` resolve from a clean clone, and the
       workspace `[patch]` overrides are **commented out**.
-- [ ] `cargo build -p lumen-server --features mlx-native-metal --release` from a
-      clean `target/` for the crate — a warm cache can hide a missing
-      `required-features`.
+- [ ] `cargo build -p lumen-server --release` from a clean `target/` for the
+      crate — a warm cache can hide a missing `required-features`.
+
+      No `--features` flag, and that is the correction rather than the
+      shorthand. This item used to read `--features mlx-native-metal`, which
+      **fails outright**: `lumen-server` has no such feature, and cargo says so
+      — `packages with the missing feature: lumen-mlx, lumen-diffusion`. The
+      server's own feature is `mlx-native`, and `default = ["mlx-native"]`
+      already selects it, so naming anything here is redundant at best.
+
+      An item nobody has run is indistinguishable from one that passes, which is
+      the whole reason this file exists; this one had never been run.
 
 ## 5. Behaviour, by hand
 
