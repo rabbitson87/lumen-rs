@@ -11,9 +11,9 @@
 //! comparison.
 //!
 //! Run:
-//!   MLX_LOCAL_SOURCE_DIR=/Users/sonheesung/Documents/GitHub/mlx \
-//!   MODEL_ID=/Users/sonheesung/models/hsng95--gemma-4-26b-a4b-mlx-imatrix3plus-awq \
-//!   DRAFTER_DIR=/Users/sonheesung/models/gemma-4-26B-A4B-it-assistant-bf16 \
+//!   MLX_LOCAL_SOURCE_DIR=/path/to/mlx \
+//!   MODEL_ID=/path/to/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq \
+//!   DRAFTER_DIR=/path/to/models/gemma-4-26B-A4B-it-assistant-bf16 \
 //!   cargo run --release -p lumen-mlx \
 //!       --example gemma4_backend_mtp_chat_smoke --features mlx-native
 
@@ -65,11 +65,10 @@ fn run_once(
 
 #[cfg(feature = "mlx-native")]
 fn main() -> Result<()> {
-    let model_id = std::env::var("MODEL_ID").unwrap_or_else(|_| {
-        "/Users/sonheesung/models/hsng95--gemma-4-26b-a4b-mlx-imatrix3plus-awq".into()
-    });
+    let model_id = std::env::var("MODEL_ID")
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq".into());
     let drafter_dir = std::env::var("DRAFTER_DIR")
-        .unwrap_or_else(|_| "/Users/sonheesung/models/gemma-4-26B-A4B-it-assistant-bf16".into());
+        .unwrap_or_else(|_| "/path/to/models/gemma-4-26B-A4B-it-assistant-bf16".into());
     let max_new_tokens: usize = std::env::var("MAX_NEW_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -25759,7 +25759,7 @@
     "p_at_1": 0.96,
     "p_at_3": 0.88
   },
-  "model_id_used": "/Users/sonheesung/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-0.6B-8bit/snapshots/b8d7100604f51da6d14eab4dd1805f596fa1ce3f/",
+  "model_id_used": "mlx-community/Qwen3-Embedding-0.6B-8bit",
   "model_repo": "mlx-community/Qwen3-Embedding-0.6B-8bit",
   "normalization": "l2",
   "pooling": "last-token"

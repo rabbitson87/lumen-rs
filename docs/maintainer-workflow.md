@@ -39,34 +39,41 @@ change scope.
 
 ## 2. Pre-commit / pre-push validation gates
 
-Before staging anything, run these — in order, fail fast:
+One command:
 
 ```bash
-# 1. The suite, with the features and serialization that make it
-#    representative. See xtask/src/test_all.rs for why a plain
-#    `cargo test --workspace` is not.
-cargo xtask test
-# Expected: 0 failed. Note what is *ignored* — that count is how many
-# tests did not run, and it is meant to be looked at, not scrolled past.
-
-# 2. Every regression guard still catches its defect.
-cargo xtask red-green
-# Expected: all PASS. A VACUOUS or ALREADY-RED verdict fails the run.
-
-# 3. The GPU-free build compiles and its tests run in seconds. This is the
-#    configuration that silently rotted before (`qwen3_5_mtp` lost its
-#    feature gate and nothing noticed for months).
-cargo test -p lumen-mlx
-cargo test -p lumen-server --no-default-features --lib
-
-# 4. Personal-path leak scan
-git grep "/Users/sonheesung"
-# Expected: empty output
+cargo xtask gate
 ```
 
-Anything that prints `error[E...]` blocks the commit. Compile warnings
-are acceptable (the workspace has known warnings; the perf A/B path is
-the source of most).
+It runs, cheapest-failing-first: a feature-combination check (both the
+`default = []` and the `mlx-native` build, `--all-targets`), `fmt`, `clippy`,
+the representative test suite, `red-green`, `flags --check`, and the
+personal-path/email hygiene greps. Each step prints why it exists when it
+fails, so a failure does not send you looking for the rationale.
+
+`--quick` skips the two slow steps (the suite and red-green) for a fast
+sanity pass mid-work; it is not a substitute before pushing.
+
+Two deliberate omissions, both explained in `xtask/src/gate.rs`:
+
+- **clippy is report-only.** At `-D warnings` this workspace fails with **330**
+  pre-existing warnings — it has never been clippy-clean. A gate that fails on
+  day one is a gate people learn to skip. The number is the debt; make the step
+  blocking once it reaches zero.
+- **Soak-scale work is not here.** Fuzzing, the full `Optimization`-flag
+  equivalence matrix, coverage, Metal validation and Miri all take minutes to
+  hours. They belong to a release: see `docs/release-checklist.md`.
+
+Why a plain `cargo test --workspace` is not enough, in one line each: the
+interesting harnesses are feature-gated (green by omission without them), and
+parallel libtest threads share one Metal command buffer (intermittent SIGABRT).
+`xtask/src/test_all.rs` documents both.
+
+Anything that prints `error[E...]` blocks the commit.
+
+**Regression policy:** no bugfix lands without a `DEFECTS` entry in
+`xtask/src/red_green.rs` proving red→green. The rule, and what an entry needs,
+is at the end of `docs/release-checklist.md`.
 
 ---
 

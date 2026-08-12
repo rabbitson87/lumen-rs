@@ -187,17 +187,56 @@ fn run_check(flags: &[Flag]) -> ExitCode {
 
 /// `env: "…"` occurrences inside `flag!` invocations, straight from source.
 fn grep_declared_envs() -> Result<Vec<String>, String> {
+    // `-n` and the filename, because a declaration inside a `#[cfg(test)] mod`
+    // is not production surface: the dump binary is built without `cfg(test)`,
+    // so those flags legitimately never reach the registry. Counting them made
+    // `--check` fail on lumen-flags' own two test flags — the same mistake the
+    // coverage tool made with assertions in inline test modules, which is worth
+    // noting as a pattern: test-only code keeps getting counted as API.
     let out = Command::new("git")
         .current_dir(repo_root())
-        .args(["grep", "-h", "env: \"", "--", "crates/*/src/*.rs"])
+        .args(["grep", "-n", "env: \"", "--", "crates/*/src/*.rs"])
         .output()
         .map_err(|e| e.to_string())?;
+    let cfg_test = Command::new("git")
+        .current_dir(repo_root())
+        .args(["grep", "-n", "#\\[cfg(test)\\]", "--", "crates/*/src/*.rs"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    // file -> first `#[cfg(test)]` line, if any.
+    let mut test_mod_at: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for line in String::from_utf8_lossy(&cfg_test.stdout).lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(file), Some(no)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(no) = no.parse::<usize>() else {
+            continue;
+        };
+        test_mod_at
+            .entry(file.to_string())
+            .and_modify(|e| *e = (*e).min(no))
+            .or_insert(no);
+    }
+
     let mut envs = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(rest) = line.trim().strip_prefix("env: \"") {
-            if let Some(env) = rest.split('"').next() {
-                envs.push(env.to_string());
-            }
+        let mut parts = line.splitn(3, ':');
+        let (Some(file), Some(no), Some(text)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(no) = no.parse::<usize>() else {
+            continue;
+        };
+        if test_mod_at.get(file).is_some_and(|cut| no >= *cut) {
+            continue;
+        }
+        if let Some(rest) = text.trim().strip_prefix("env: \"")
+            && let Some(env) = rest.split('"').next()
+        {
+            envs.push(env.to_string());
         }
     }
     envs.sort();

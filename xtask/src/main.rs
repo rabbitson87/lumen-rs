@@ -15,10 +15,11 @@
 mod coverage;
 mod flags;
 mod fuzz;
+mod gate;
 mod red_green;
 mod test_all;
 
-const USAGE: &str = "usage: cargo xtask <test [CARGO ARGS…] | red-green [--list] [NAME…] | fuzz <TARGET…|--all|--list> [--minutes N] | flags [--list|--docs|--check|--one-at-a-time] | coverage [--mcdc] [--html]>";
+const USAGE: &str = "usage: cargo xtask <test [--validate] [CARGO ARGS…] | red-green [--list] [NAME…] | fuzz <TARGET…|--all|--list> [--minutes N] | flags [--list|--docs|--check|--one-at-a-time] | coverage [--mcdc] [--html] | gate [--quick]>";
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
@@ -28,6 +29,7 @@ fn main() -> std::process::ExitCode {
         Some("fuzz") => fuzz::main(args.collect()),
         Some("flags") => flags::main(args.collect()),
         Some("coverage") => coverage::main(args.collect()),
+        Some("gate") => gate::main(args.collect()),
         Some(other) => {
             eprintln!("unknown task {other:?}\n\n{USAGE}");
             std::process::ExitCode::from(2)
