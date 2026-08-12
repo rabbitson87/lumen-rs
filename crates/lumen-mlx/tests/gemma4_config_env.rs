@@ -45,6 +45,15 @@ fn dense() -> Value {
     })
 }
 
+fn tc(v: &Value, key: &str, val: Value) -> Value {
+    let mut v = v.clone();
+    v["text_config"]
+        .as_object_mut()
+        .unwrap()
+        .insert(key.into(), val);
+    v
+}
+
 fn load(v: &Value) -> NativeGemma4Config {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.json");
@@ -143,4 +152,64 @@ fn the_load_time_env_overrides_apply_clamp_and_ignore_correctly() {
         .expect("an env-overridden config must still be valid");
     assert_eq!(cfg.text_config.sliding_window, 128);
     assert_eq!(cfg.text_config.max_position_embeddings, 1024);
+}
+
+/// `LUMEN_GEMMA4_TOP_K` overrides the MoE routing width at load time — the
+/// third of this config's load-time env knobs and the one that changes *model
+/// behaviour* rather than a memory bound. A router that suddenly picks a
+/// different number of experts produces different text with nothing in the
+/// config to explain it.
+#[test]
+fn the_top_k_override_applies_and_ignores_junk() {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded within this test binary.
+            unsafe { std::env::remove_var("LUMEN_GEMMA4_TOP_K") };
+        }
+    }
+    let _g = Guard;
+    // SAFETY: as above.
+    let set = |v: &str| unsafe { std::env::set_var("LUMEN_GEMMA4_TOP_K", v) };
+    let clear = || unsafe { std::env::remove_var("LUMEN_GEMMA4_TOP_K") };
+
+    let moe = {
+        let v = dense();
+        let v = tc(&v, "enable_moe_block", json!(true));
+        let v = tc(&v, "num_experts", json!(128));
+        let v = tc(&v, "top_k_experts", json!(8));
+        tc(&v, "moe_intermediate_size", json!(1024))
+    };
+
+    clear();
+    assert_eq!(
+        load(&moe).text_config.top_k_experts,
+        8,
+        "unset means the config's own value"
+    );
+
+    for want in ["1", "4", "16"] {
+        set(want);
+        assert_eq!(
+            load(&moe).text_config.top_k_experts,
+            want.parse::<usize>().unwrap(),
+            "LUMEN_GEMMA4_TOP_K={want} must be applied"
+        );
+    }
+
+    for junk in ["0", "", "eight", "-1", "4.5"] {
+        set(junk);
+        assert_eq!(
+            load(&moe).text_config.top_k_experts,
+            8,
+            "LUMEN_GEMMA4_TOP_K={junk:?} must be ignored, not zero the router"
+        );
+    }
+
+    // An overridden config must still validate — the override runs inside
+    // `load()`, before any caller can check it.
+    set("4");
+    load(&moe)
+        .validate_gemma4_family()
+        .expect("an overridden top_k must still be a valid config");
 }

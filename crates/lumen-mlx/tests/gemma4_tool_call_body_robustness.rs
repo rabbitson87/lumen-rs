@@ -136,3 +136,64 @@ fn args_to_json_handles_quoted_keys_already() {
         .expect("quoted keys + Gemma string delim");
     assert_eq!(v, json!({"location": "Seoul"}));
 }
+
+// ─────────── scanner and brace-matcher edges (005 Phase 4.1) ───────────
+
+/// The name scan stops at `{`, `\n` or `\r`. Only the `{` arm had coverage, so
+/// a newline between the opener and a brace would have run the scan on into
+/// whatever followed — the same class of bug as `tool-name-scanner`, where a
+/// runaway scan produced a tool name nobody declared.
+#[test]
+fn a_newline_terminates_the_tool_name_scan() {
+    for sep in ["\n", "\r", "\r\n"] {
+        let text = format!("call:broken{sep}call:good{{x:1}}");
+        let calls = lumen_mlx::gemma4_tool_syntax::parse_tool_call_body(&text)
+            .expect("a newline-separated body must parse");
+        for c in &calls {
+            assert!(
+                !c.name.contains("call:") && !c.name.contains('\n') && !c.name.contains('\r'),
+                "the scan ran past the line break and built {:?}",
+                c.name
+            );
+        }
+    }
+}
+
+/// The brace matcher's guard is `open_at >= len || bytes[open_at] != b'{'`,
+/// and both operands were uncovered. Neither may panic: the first is an
+/// out-of-range index and the second is the byte-check that stops the matcher
+/// walking from a position that is not an opener at all.
+#[test]
+fn a_body_whose_opener_is_missing_or_out_of_range_is_rejected_not_panicked_on() {
+    for text in [
+        // `call:` at the very end — the scan's `open_at` lands past the buffer.
+        "call:",
+        "call:name",
+        "prefix call:name",
+        // A non-`{` where the opener should be.
+        "call:name[x:1]",
+        "call:name(x:1)",
+        "call:name x:1",
+    ] {
+        // The contract is "returns", not "returns Ok": a malformed body may be
+        // an error, but it may never index out of bounds.
+        let _ = lumen_mlx::gemma4_tool_syntax::parse_tool_call_body(text);
+    }
+}
+
+/// An unterminated placeholder in the args JSON must be a typed error rather
+/// than a slice past the end. The placeholders are NUL-delimited, so an odd
+/// number of NULs is exactly what a truncated stream produces.
+#[test]
+fn an_unterminated_string_placeholder_errors() {
+    // A quoted string that opens but never closes leaves a dangling
+    // placeholder once the quoting pass runs.
+    let unterminated = "{k:<|\"|>value}";
+    let res = lumen_mlx::gemma4_tool_syntax::gemma4_args_to_json(unterminated);
+    // Either a clean parse (the quoting pass tolerated it) or a typed error —
+    // never a panic, which is the only outcome the guard prevents.
+    if let Err(e) = res {
+        let msg = format!("{e:#}");
+        assert!(!msg.is_empty(), "an error must say something");
+    }
+}

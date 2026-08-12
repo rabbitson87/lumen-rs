@@ -272,3 +272,53 @@ fn allowed_length_is_the_free_repeat_budget() {
         "a generous allowance must tolerate the same cycle"
     );
 }
+
+/// Two different cycle lengths ending in the same continuation: the `>` in the
+/// max-tracking must be able to *not* fire, or a shorter later match would
+/// overwrite a longer earlier one and under-penalise the real cycle.
+#[test]
+fn a_shorter_later_match_does_not_overwrite_a_longer_one() {
+    let cfg = enabled();
+    // Token 5 continues both a long run and a short one.
+    let recent = [5u32, 5, 5, 5, 5, 5, 5, 5, 1, 5, 5];
+    let mut logits = vec![0.0_f32; 8];
+    apply_dry_penalty(&mut logits, &recent, &cfg);
+    assert!(logits.iter().all(|v| v.is_finite()));
+
+    // A single long run must be penalised at least as hard as a truncated one,
+    // which is the property the max-tracking exists to preserve.
+    let long: Vec<u32> = std::iter::repeat_n(5u32, 12).collect();
+    let mut long_logits = vec![0.0_f32; 8];
+    apply_dry_penalty(&mut long_logits, &long, &cfg);
+
+    let short = [5u32, 5, 5, 5];
+    let mut short_logits = vec![0.0_f32; 8];
+    apply_dry_penalty(&mut short_logits, &short, &cfg);
+
+    assert!(
+        long_logits[5] <= short_logits[5],
+        "a longer run must not be penalised less: {} vs {}",
+        long_logits[5],
+        short_logits[5]
+    );
+}
+
+/// The inner extension loop stops when the two positions stop agreeing. Mixed
+/// content — a partial match that diverges — is what exercises the `!=` exit
+/// rather than the run-off-the-end one.
+#[test]
+fn a_partial_match_that_diverges_is_measured_at_its_real_length() {
+    let cfg = enabled();
+    // "1 2 3 4" then "1 2 3 9": the match extends three tokens and then breaks.
+    let recent = [1u32, 2, 3, 4, 1, 2, 3, 9, 1, 2, 3];
+    let mut logits = vec![0.0_f32; 12];
+    apply_dry_penalty(&mut logits, &recent, &cfg);
+    assert!(logits.iter().all(|v| v.is_finite()));
+    // Both continuations seen after "1 2 3" are candidates; at least one is
+    // penalised, and no token outside the observed continuations is.
+    assert!(
+        logits[4] < 0.0 || logits[9] < 0.0,
+        "a diverging repeat must still penalise its continuations: {logits:?}"
+    );
+    assert_eq!(logits[7], 0.0, "an unrelated token is untouched");
+}

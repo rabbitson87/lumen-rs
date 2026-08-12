@@ -600,3 +600,37 @@ fn the_distribution_top_p_survives_a_distribution_with_no_mass() {
         "no cutoff reached means nothing is masked: {dist:?}"
     );
 }
+
+/// `sample_from_logits` has its own copy of the penalty guards, and its
+/// disabled sides were untouched — the ordinary request (a window exists, no
+/// penalties configured) must cost nothing and change nothing.
+#[test]
+fn the_one_shot_sampler_skips_disabled_penalties() {
+    let cfg = SamplingConfig {
+        temperature: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repeat_penalty_last_n: 16,
+        ..Default::default()
+    };
+    let recent = [0u32, 0, 0, 0];
+
+    // Same seed, with and without history: identical draws prove the window
+    // was walked but nothing was applied.
+    for seed in 0..64u64 {
+        let mut a = vec![1.0_f32, 2.0, 3.0];
+        let mut ra = Xorshift64::new(seed);
+        let with = sample_from_logits(&mut a, &recent, &cfg, &mut ra);
+
+        let mut b = vec![1.0_f32, 2.0, 3.0];
+        let mut rb = Xorshift64::new(seed);
+        let without = sample_from_logits(&mut b, &[], &cfg, &mut rb);
+
+        assert_eq!(
+            with, without,
+            "seed {seed}: a window with no penalties must not change the draw"
+        );
+        assert_eq!(a, b, "and must leave the logits identical");
+    }
+}

@@ -500,3 +500,26 @@ fn eos_token_id_accepts_both_a_scalar_and_a_list() {
     );
     assert!(load(&dense()).eos_token_ids.is_empty());
 }
+
+/// `text_config.model_type` is checked separately from the top-level one, and
+/// only the top-level check had coverage. A checkpoint whose nested block names
+/// a different family would otherwise load and be built with Gemma 4's
+/// assumptions.
+#[test]
+fn the_nested_text_config_model_type_is_checked_too() {
+    for mt in ["gemma3_text", "qwen3_5_text", "gemma4", ""] {
+        let err = load(&tc(&dense(), "model_type", json!(mt)))
+            .validate_gemma4_family()
+            .expect_err("a non-gemma4_text nested model_type must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("text_config.model_type"),
+            "the error must say WHICH model_type, or it reads as the top-level \
+             one and sends the reader to the wrong line: {msg}"
+        );
+    }
+    // The correct value still passes, so the check is not just "always reject".
+    load(&tc(&dense(), "model_type", json!("gemma4_text")))
+        .validate_gemma4_family()
+        .expect("gemma4_text is the expected value");
+}

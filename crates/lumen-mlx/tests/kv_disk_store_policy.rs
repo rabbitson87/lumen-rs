@@ -355,3 +355,64 @@ fn an_unreadable_index_is_an_error_rather_than_a_silent_empty_cache() {
         "the error must name the index so the cause is findable: {msg}"
     );
 }
+
+/// Key sanitization keeps `-` and `_` verbatim — they are the two
+/// non-alphanumeric characters the real key format uses (`auto-<hex>`), so a
+/// sanitizer that replaced them would collapse distinct keys onto one filename
+/// and make two conversations share a KV snapshot.
+#[test]
+fn sanitization_preserves_the_characters_real_keys_use() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store = DiskKvStore::open(root.path(), FP, 0, 0).expect("open");
+
+    // Two keys that differ ONLY in a preserved character must not collide.
+    for (a, b) in [("auto-abc", "auto_abc"), ("k-1", "k-2"), ("x_y", "x-y")] {
+        store
+            .put(a, &manifest_for(FP, 1), &records(4))
+            .expect("put a");
+        store
+            .put(b, &manifest_for(FP, 2), &records(4))
+            .expect("put b");
+        let (ma, _) = store.get(a).expect("get a").expect("a present");
+        let (mb, _) = store.get(b).expect("get b").expect("b present");
+        assert_ne!(
+            ma.position, mb.position,
+            "{a:?} and {b:?} collapsed onto one file — two conversations would \
+             share a KV snapshot"
+        );
+    }
+}
+
+/// Removing a key that was never stored is a no-op, not an error. The eviction
+/// and miss paths both call it speculatively, so an error here would turn a
+/// cache miss into a failed request.
+#[test]
+fn removing_an_absent_key_is_a_no_op() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store = DiskKvStore::open(root.path(), FP, 0, 0).expect("open");
+    store
+        .remove("never-stored")
+        .expect("removing an absent key must succeed");
+    assert!(store.is_empty());
+
+    store
+        .put("k", &manifest_for(FP, 1), &records(4))
+        .expect("put");
+    store
+        .remove("other")
+        .expect("still a no-op with entries present");
+    assert_eq!(
+        store.len(),
+        1,
+        "an unrelated remove must not touch the store"
+    );
+    assert!(store.get("k").expect("get").is_some());
+
+    // And clear() on an empty store is equally quiet. The tempdir must be
+    // BOUND: `tempfile::tempdir().path()` drops the guard at the end of the
+    // statement and deletes the directory out from under the store.
+    let fresh_root = tempfile::tempdir().expect("tempdir");
+    let mut fresh = DiskKvStore::open(fresh_root.path(), FP, 0, 0).expect("open");
+    fresh.clear().expect("clear on an empty store");
+    assert!(fresh.is_empty());
+}
