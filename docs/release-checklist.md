@@ -40,8 +40,28 @@ Run in order; the cheap and the automatic first.
       there is no substitute: an out-of-bounds read on a shared heap returns
       plausible numbers rather than crashing. Slow by roughly an order of
       magnitude; that is why it is here and not in the gate.
-- [ ] `cargo +nightly miri test -p lumen-core --lib` — clean. `lumen-core` is
-      the FFI-free crate, so it is the only one Miri can reason about.
+- [ ] Miri over `lumen-core`, the FFI-free crate and so the only one Miri can
+      reason about. The command is not the obvious one, and both differences
+      were found by running it rather than by reading about it:
+
+      ```
+      MIRIFLAGS="-Zmiri-disable-isolation" \
+        cargo +nightly miri test -p lumen-core --lib -- --skip mtp_procrustes
+      ```
+
+      * `-Zmiri-disable-isolation` — three round-trip tests write a scratch file,
+        and Miri blocks filesystem access by default. Without the flag the run
+        stops at the first `File::create` and reports a failure that has nothing
+        to do with memory.
+      * `--skip mtp_procrustes` — those tests call `faer`'s SVD, which uses the
+        AArch64 NEON intrinsic `llvm.aarch64.neon.fmaxnmv.f64.v2f64`. Miri does
+        not emulate it and reports **`unsupported operation`**, which is a Miri
+        limitation and not a finding. Skipping is the honest response; treating
+        the abort as a failure would be as wrong as treating it as a pass.
+
+      So Miri covers `lumen-core` **minus the faer-backed linear algebra**. That
+      exclusion is the same kind as the `.metal` shaders in Phase 4.1: named,
+      with the reason, rather than quietly absent.
 - [ ] Performance within the bands in `docs/maintainer-workflow.md` §8, on an
       **idle** machine. A loaded machine has produced false regressions three
       times (`bf16-out-dispatch`, `dense-shapes-on-qmv-fast`, and the

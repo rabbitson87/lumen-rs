@@ -150,10 +150,10 @@ static DEFECTS: &[Defect] = &[
         revert: &[Mutation {
             path: CORE,
             find: r#"            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
-                "lumen-core-{stem}-{}-{n}.bin",
-                std::process::id()
-            )))"#,
+            Self(
+                std::env::temp_dir()
+                    .join(format!("lumen-core-{stem}-{}-{n}.bin", std::process::id())),
+            )"#,
             replace: r#"            let _ = NEXT.fetch_add(1, Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!("lumen-core-{stem}.bin")))"#,
         }],
