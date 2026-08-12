@@ -286,6 +286,40 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "qwen-nested-eos-token-id",
+        symptom: "a checkpoint declaring `eos_token_id` only inside \
+                  `text_config` (Qwen3.5-9B-MTPLX-Speed) got an EMPTY stop \
+                  set — no error, just generation running past the turn \
+                  boundary and emitting the next turn's `\\nuser\\n` header \
+                  into the reply, and 4 identical tool calls where one was \
+                  asked for",
+        revert: &[Mutation {
+            path: MLX,
+            // Renaming rather than deleting: removing the field breaks
+            // COMPILATION of the guard that reads it, and the harness reports
+            // that as "guard matched no test" — which is not the same as RED.
+            // A mutation has to change behaviour while keeping the tree
+            // buildable, or it proves nothing about the guard.
+            find: r#"        rename = "eos_token_id",
+        deserialize_with = "deserialize_token_ids"
+    )]
+    pub eos_token_ids: Vec<u32>,
+    pub model_type: String,"#,
+            replace: r#"        rename = "eos_token_id_never_present",
+        deserialize_with = "deserialize_token_ids"
+    )]
+    pub eos_token_ids: Vec<u32>,
+    pub model_type: String,"#,
+        }],
+        guards: &[mlx_ungated_test(
+            "qwen35_config_validate",
+            "eos_token_id_is_read_from_either_level",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "gemma4-config-null-moe-fields",
         symptom: "the JGOS-31B shape was still live in Gemma 4: a dense \
                   checkpoint spelling `\"num_experts\": null` hard-failed with \
@@ -575,7 +609,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // fuzzed without `mlx-native`.
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
-        (_, "config-null-moe-fields") => "qwen35_config.rs",
+        (_, "config-null-moe-fields") | (_, "qwen-nested-eos-token-id") => "qwen35_config.rs",
         (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",

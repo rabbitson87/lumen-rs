@@ -531,3 +531,45 @@ fn eos_token_id_accepts_both_a_scalar_and_a_list() {
     // Absent → empty, not a parse failure.
     assert!(load(&dense()).eos_token_ids.is_empty());
 }
+
+/// EOS is spelled at the **top level** by some checkpoints and inside
+/// `text_config` by others, and reading only one of them does not error — it
+/// yields an EMPTY stop set, and generation runs past the turn boundary into
+/// the next turn's header. `Qwen3.5-9B-MTPLX-Speed` is a shipping checkpoint
+/// that declares it only in the nested block.
+///
+/// Found by the by-hand end-to-end request in `docs/release-checklist.md` §5,
+/// which is exactly the failure automation cannot see: the answer is correct,
+/// and then it keeps going.
+#[test]
+fn eos_token_id_is_read_from_either_level() {
+    // Top level only — the common spelling.
+    let cfg = load(&top(&dense(), "eos_token_id", json!([151645])));
+    assert_eq!(cfg.eos_token_ids, vec![151645]);
+    assert!(cfg.text_config.eos_token_ids.is_empty());
+
+    // Nested only — the shape that produced an empty stop set.
+    let cfg = load(&tc(&dense(), "eos_token_id", json!(248044)));
+    assert_eq!(
+        cfg.text_config.eos_token_ids,
+        vec![248044],
+        "a checkpoint declaring EOS only in text_config must still be readable, \
+         or nothing terminates the turn"
+    );
+
+    // Both, with the top level richer — the Gemma-style layout where the top
+    // level carries extra stop tokens the nested block omits.
+    let v = tc(
+        &top(&dense(), "eos_token_id", json!([1, 106, 50])),
+        "eos_token_id",
+        json!(1),
+    );
+    let cfg = load(&v);
+    assert_eq!(cfg.eos_token_ids, vec![1, 106, 50]);
+    assert_eq!(cfg.text_config.eos_token_ids, vec![1]);
+
+    // Absent from both is empty rather than a parse failure — an unquantized
+    // or minimal config must still load.
+    let cfg = load(&dense());
+    assert!(cfg.eos_token_ids.is_empty() && cfg.text_config.eos_token_ids.is_empty());
+}

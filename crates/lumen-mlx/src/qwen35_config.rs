@@ -53,6 +53,17 @@ pub struct NativeModelConfig {
 /// `text_config` block — all fields the forward path needs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NativeTextConfig {
+    /// Some checkpoints declare EOS **only here** and leave the top level
+    /// absent — `Qwen3.5-9B-MTPLX-Speed` is one. Reading only the top level
+    /// then yields an empty stop set, and generation runs past the turn
+    /// boundary into `\nuser\n…` with nothing to end it. Gemma 4 already had
+    /// this fallback; Qwen did not.
+    #[serde(
+        default,
+        rename = "eos_token_id",
+        deserialize_with = "deserialize_token_ids"
+    )]
+    pub eos_token_ids: Vec<u32>,
     pub model_type: String,
     pub hidden_size: usize,
     pub head_dim: usize,

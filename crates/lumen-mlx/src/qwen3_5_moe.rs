@@ -1430,8 +1430,25 @@ mod imp {
             &self.weights
         }
 
+        /// Prefer the top-level list, fall back to `text_config`.
+        ///
+        /// Both spellings ship. A checkpoint that declares EOS only in
+        /// `text_config` (e.g. `Qwen3.5-9B-MTPLX-Speed`) otherwise gets an
+        /// EMPTY stop set — and an empty stop set does not error, it lets
+        /// generation run past the turn boundary and emit the next turn's
+        /// header into the reply. Found by the by-hand end-to-end check, which
+        /// is exactly the failure automation cannot see: the answer is correct,
+        /// and then it keeps going.
+        ///
+        /// Same shape and same preference order as the Gemma 4 path, which had
+        /// already met this and grown the fallback.
         pub fn eos_tokens(&self) -> &[u32] {
-            &self.config.eos_token_ids
+            let top = &self.config.eos_token_ids;
+            if !top.is_empty() {
+                top
+            } else {
+                &self.config.text_config.eos_token_ids
+            }
         }
 
         pub fn vocab_size(&self) -> usize {
