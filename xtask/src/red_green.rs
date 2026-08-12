@@ -167,19 +167,21 @@ const fn core(filter: &'static str) -> Guard {
 
 static DEFECTS: &[Defect] = &[
     Defect {
-        name: "tool-calls-grammar-spans-one-call",
-        symptom: "`tool_choice=\"required\"` returned FOUR identical tool calls \
-                  where `\"auto\"` returned one — the same call repeated, so a \
-                  client executing them ran the same tool four times",
+        name: "parallel-tool-calls-not-enforced",
+        symptom: "`parallel_tool_calls: false` was accepted and then not applied \
+                  — a three-city prompt returned three tool calls either way. \
+                  The first attempt at enforcing it keyed off the grammar \
+                  finishing, which lands one token BEFORE the `<tool_call|>` \
+                  closer, so the turn was cut mid-frame and the client got \
+                  HTTP 200 with zero calls and zero tokens",
         revert: &[Mutation {
             path: MLX,
-            find: r#"    grammar.push_str(&format!("start: tool_call{}\n", calls.start_suffix()));
-    grammar.push_str(&format!("tool_call: \"call:\" ({tool_call_lhs})\n"));"#,
-            replace: r#"    grammar.push_str("start: tool_call\n");
-    grammar.push_str(&format!("tool_call: \"call:\" ({tool_call_lhs})\n"));"#,
+            find: r#"        self.calls.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE"#,
+            replace: r#"        let _ = token;
+        self.finished && self.calls.stops_after_first_call()"#,
         }],
         guards: &[core_mlx_lib(
-            "grammar::tests::the_default_grammar_spans_the_whole_call_list",
+            "grammar::tests::the_one_call_stop_fires_on_the_closer_and_nothing_else",
         )],
         occurrences: 1,
         needs_checkpoint: false,
@@ -726,7 +728,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.
         (_, "scratch-path-collision") => "lib.rs",
-        (_, "tool-calls-grammar-spans-one-call") => "grammar.rs",
+        (_, "parallel-tool-calls-not-enforced") => "grammar.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };

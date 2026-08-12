@@ -3604,7 +3604,16 @@ pub(crate) mod imp {
                             let stop_eos = eos.contains(&next_tok);
                             let stop_runaway = runaway.check(&all_tokens);
                             let stop_hard_break = thinking_budget.should_hard_break();
-                            let stopping = stop_eos || stop_runaway.is_some() || stop_hard_break;
+                            // `parallel_tool_calls: false` — the grammar has
+                            // just reported a completed call and the client
+                            // asked for exactly one.
+                            let stop_one_call = grammar
+                                .as_ref()
+                                .is_some_and(|g| g.must_stop_after_call_closer(next_tok));
+                            let stopping = stop_eos
+                                || stop_runaway.is_some()
+                                || stop_hard_break
+                                || stop_one_call;
                             let at_budget = all_tokens.len() >= max_new_tokens;
 
                             if overlap_enabled && !stopping && !at_budget {
@@ -3658,6 +3667,14 @@ pub(crate) mod imp {
                             if stop_hard_break {
                                 eprintln!(
                                     "[thinking-budget] hard break at {} tokens — force-close did not help",
+                                    all_tokens.len()
+                                );
+                                break;
+                            }
+                            if stop_one_call {
+                                eprintln!(
+                                    "[tool-calls] parallel_tool_calls=false — ending the turn after \
+                                     one completed call at {} tokens",
                                     all_tokens.len()
                                 );
                                 break;
