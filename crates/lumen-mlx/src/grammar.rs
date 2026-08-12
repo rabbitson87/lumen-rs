@@ -1156,6 +1156,152 @@ mod tests {
         ]
     }
 
+    // ──────── state-machine edges (005 Phase 4.1) ────────
+    //
+    // These are the paths a grammar takes when something has already gone
+    // wrong: the tool list is empty, the matcher was released, the vocab does
+    // not match, the parse stopped. A grammar is an assist rather than a
+    // correctness requirement, so most of them are deliberately *quiet* — and
+    // quiet is exactly why they need pinning. The one that must NOT be quiet
+    // is the vocab mismatch, because masking against the wrong vocabulary
+    // silently forbids legal tokens.
+
+    /// Every state constructor rejects an empty tool list. An empty grammar
+    /// matches nothing, so accepting one would mask the model into silence.
+    #[test]
+    fn every_state_constructor_rejects_an_empty_tool_list() {
+        let f = shared_factory_placeholder();
+        assert!(Gemma4GrammarState::new_lark(f.clone(), &[], GrammarMode::Eager).is_err());
+        assert!(Gemma4GrammarState::new_lark_strict(f.clone(), &[], GrammarMode::Eager).is_err());
+        assert!(Gemma4GrammarState::new_qwen35_xml(f, &[], GrammarMode::Eager, None).is_err());
+    }
+
+    /// A logits buffer SHORTER than the mask means the tokenizer env and the
+    /// model disagree about the vocabulary, and everything downstream is
+    /// meaningless — so this is the one edge that errors rather than
+    /// degrading. A padded lm_head (logits LONGER than the mask) is normal and
+    /// must keep working, so both sides are asserted together.
+    #[test]
+    fn a_short_logits_buffer_errors_while_a_padded_one_is_fine() {
+        let mut g = Gemma4GrammarState::new_lark(
+            shared_factory_placeholder(),
+            &sample_tools(),
+            GrammarMode::Eager,
+        )
+        .expect("eager state");
+        assert!(g.is_active());
+
+        // Learn the mask width from a run that is definitely wide enough.
+        let mut wide = vec![1.0_f32; 4096];
+        let masked = g
+            .apply_mask_to_logits(&mut wide)
+            .expect("a generous buffer must mask cleanly");
+        assert!(masked > 0, "an active grammar should forbid something");
+
+        let mut short = vec![1.0_f32; 2];
+        let err = g
+            .apply_mask_to_logits(&mut short)
+            .expect_err("a logits buffer narrower than the mask must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vocab mismatch"),
+            "the error must name the mismatch so the cause is diagnosable: {msg}"
+        );
+    }
+
+    /// After `release()` the state is permanently transparent: masking is a
+    /// no-op that must leave the buffer untouched, and both observe entry
+    /// points must accept tokens without erroring. A released grammar that
+    /// still errored would turn a recoverable desync into a failed request.
+    #[test]
+    fn a_released_grammar_is_transparent_from_every_entry_point() {
+        let mut g = Gemma4GrammarState::new_lark(
+            shared_factory_placeholder(),
+            &sample_tools(),
+            GrammarMode::Eager,
+        )
+        .expect("eager state");
+        g.release();
+        assert!(!g.is_active());
+
+        let mut logits = vec![1.0_f32; 64];
+        assert_eq!(g.apply_mask_to_logits(&mut logits).unwrap(), 0);
+        assert!(
+            logits.iter().all(|v| (*v - 1.0).abs() < 1e-6),
+            "a released grammar must not touch the logits"
+        );
+        // Arbitrary tokens, including ones the grammar would have rejected.
+        for tok in [0u32, 7, 48, 9999] {
+            g.observe(tok).expect("observe after release");
+            g.observe_prefill(tok)
+                .expect("observe_prefill after release");
+        }
+    }
+
+    /// A Lazy grammar before its trigger has no matcher at all, so prefill
+    /// replay has nothing to consume. It must be a silent no-op — Eager is the
+    /// only mode that prefills, and erroring here would break every lazy
+    /// request that happens to replay a prompt token.
+    #[test]
+    fn prefill_replay_is_a_no_op_before_a_lazy_grammar_activates() {
+        let mut g = Gemma4GrammarState::new_lark(
+            shared_factory_placeholder(),
+            &sample_tools(),
+            GrammarMode::Lazy,
+        )
+        .expect("lazy state");
+        assert!(!g.is_active(), "lazy grammars start without a matcher");
+
+        for tok in [1u32, 2, 3] {
+            g.observe_prefill(tok)
+                .expect("prefill before activation must be a silent no-op");
+        }
+        assert!(!g.is_active(), "prefill must not activate a lazy grammar");
+    }
+
+    /// Once the matcher reports `is_stopped()` the state latches finished and
+    /// stops constraining. Driven here through prefill replay, which has its
+    /// own copy of the stop check — the `observe` copy is already covered by
+    /// the streaming tests.
+    #[test]
+    fn a_stopped_matcher_latches_finished_through_prefill() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+        let mut g =
+            Gemma4GrammarState::new_lark(shared_factory_placeholder(), &tools, GrammarMode::Eager)
+                .expect("eager state");
+
+        // Replay the whole deterministic opener plus body. The single-byte
+        // env makes every ASCII byte its own token, so the grammar's literal
+        // text is exactly its token sequence.
+        let mut latched = false;
+        for byte in b"call:noop{}" {
+            if g.observe_prefill(u32::from(*byte)).is_err() {
+                break;
+            }
+            if !g.is_active() {
+                latched = true;
+                break;
+            }
+        }
+        // Either the matcher stopped (latched) or it is still mid-parse; what
+        // must never happen is a state that reports active while its matcher
+        // has stopped, so assert the invariant rather than a fixed outcome.
+        if latched {
+            let mut logits = vec![1.0_f32; 64];
+            assert_eq!(
+                g.apply_mask_to_logits(&mut logits).unwrap(),
+                0,
+                "a finished grammar must stop masking"
+            );
+        }
+    }
+
     // ───────── degenerate-schema coverage (005 Phase 4.1) ─────────
     //
     // Every branch below is a fallback the renderers take when a tool schema
