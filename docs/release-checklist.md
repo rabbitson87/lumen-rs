@@ -62,6 +62,48 @@ Run in order; the cheap and the automatic first.
       So Miri covers `lumen-core` **minus the faer-backed linear algebra**. That
       exclusion is the same kind as the `.metal` shaders in Phase 4.1: named,
       with the reason, rather than quietly absent.
+
+### Where ASan does and does not help
+
+The plan called for "an ASan pass over the tier-0 crates". Counted rather than
+assumed, that pass covers **no real unsafe code at all**:
+
+| crate | `unsafe` |
+|---|---|
+| `lumen-core` | **0** |
+| `lumen-diffusion` | 0 |
+| `lumen-server` | 1 |
+| `lumen-mlx` | 82 — of which **78 behind `mlx-native`** |
+
+The four ungated ones in `gemma4_vision.rs` are `std::env::set_var` in test
+code, which Rust 2024 made `unsafe` for thread-safety reasons that have nothing
+to do with memory. So every genuine memory-unsafety site in this workspace is
+across the MLX FFI boundary, behind a feature that needs a GPU.
+
+That is not an argument for skipping ASan; it is an argument that **ASan is not
+the tool that covers this project's unsafe code**, and `cargo xtask test
+--validate` above is. Metal's shader validation bounds-checks the buffer
+accesses those 78 sites hand to the GPU, which is the failure mode that
+produces plausible wrong numbers instead of a crash.
+
+- [ ] ASan over `lumen-core`, as a toolchain check rather than a coverage claim
+      — it proves the sanitizer builds and the pure-Rust surface is clean, and
+      it takes about three seconds:
+
+      ```
+      RUSTFLAGS="-Zsanitizer=address" \
+        cargo +nightly test -p lumen-core --target aarch64-apple-darwin --lib
+      ```
+
+      **`lumen-core` only, and not for lack of trying.** `-Zsanitizer` requires
+      an explicit `--target`, which moves the artifact directory from
+      `target/debug` to `target/aarch64-apple-darwin/debug` — and
+      `lumen-server`'s `build.rs` looks for `mlx.metallib` there, finds nothing,
+      and panics before a single test compiles. Adding `-p lumen-server` turns
+      this item into a failure that has nothing to do with memory.
+
+      Do not read a green run here as "the unsafe code is checked". Read the
+      table above instead, and then run `--validate`.
 - [ ] Performance within the bands in `docs/maintainer-workflow.md` §8, on an
       **idle** machine. A loaded machine has produced false regressions three
       times (`bf16-out-dispatch`, `dense-shapes-on-qmv-fast`, and the
