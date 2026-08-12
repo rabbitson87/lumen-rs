@@ -191,6 +191,9 @@ name = "config_faults"
 # precisely so this sweep runs in the default build.
 
 [[test]]
+name = "kv_disk_store_policy"
+
+[[test]]
 name = "qwen35_config_validate"
 
 [[test]]

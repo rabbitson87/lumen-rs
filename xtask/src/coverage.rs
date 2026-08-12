@@ -286,9 +286,28 @@ fn parse_branch_line(line: &str) -> Option<(String, (u64, u64))> {
     let (loc, tail) = rest.split_once(')')?;
     let arms = tail.split_once('[')?.1;
     let (t, f) = arms.split_once(", False: ")?;
-    let t: u64 = t.trim_start_matches("True: ").trim().parse().ok()?;
-    let f: u64 = f.trim_end_matches(']').trim().parse().ok()?;
+    let t = parse_count(t.trim_start_matches("True: ").trim())?;
+    let f = parse_count(f.trim_end_matches(']').trim())?;
     Some((loc.to_string(), (t, f)))
+}
+
+/// Parse an execution count, which llvm-cov **abbreviates once it gets large**:
+/// `1.43k`, `2.1M`, `3G`.
+///
+/// This is not cosmetic. A plain `u64::from_str` fails on `1.43k`, and a parser
+/// that drops the record then loses exactly the evidence that a branch IS
+/// covered — a hot branch reads as one-sided. Found in `kv_disk.rs`, where
+/// `Branch (388:8)` records `[True: 5, False: 1.43k]` and was being reported as
+/// a gap; 43 records across the scope carry an abbreviated count.
+fn parse_count(s: &str) -> Option<u64> {
+    let (num, scale) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1_000f64),
+        'M' => (&s[..s.len() - 1], 1_000_000f64),
+        'G' => (&s[..s.len() - 1], 1_000_000_000f64),
+        _ => (s, 1f64),
+    };
+    let v: f64 = num.parse().ok()?;
+    Some((v * scale) as u64)
 }
 
 enum McdcSupport {
@@ -369,6 +388,17 @@ mod tests {
                 .expect("zero arms still parse"),
             ("145:27".to_string(), (0, 0))
         );
+        // Abbreviated counts must not be dropped: dropping the record loses
+        // the proof that a hot branch is covered.
+        assert_eq!(
+            parse_branch_line("  |  Branch (388:8): [True: 5, False: 1.43k]"),
+            Some(("388:8".to_string(), (5, 1430)))
+        );
+        assert_eq!(parse_count("2.1M"), Some(2_100_000));
+        assert_eq!(parse_count("3G"), Some(3_000_000_000));
+        assert_eq!(parse_count("0"), Some(0));
+        assert_eq!(parse_count("nope"), None);
+
         // Source lines, not branch records.
         assert!(parse_branch_line("  132|      2|    if xs.is_empty() {").is_none());
         assert!(parse_branch_line("").is_none());
