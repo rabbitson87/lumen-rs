@@ -673,6 +673,9 @@ impl DiskKvStore {
         }
         while self.total_bytes() > self.max_bytes && self.index.entries.len() > 1 {
             // Find LRU victim (oldest last_access_unix).
+            // Unreachable: the loop guard requires `entries.len() > 1`, so a
+            // minimum exists. `break` rather than `unwrap` keeps a future
+            // change to that guard from aborting an eviction pass.
             let Some(victim) = self
                 .index
                 .entries

@@ -245,6 +245,12 @@ fn one_sided_report() -> std::io::Result<BTreeMap<String, (usize, usize)>> {
                 e.0 += arms.0;
                 e.1 += arms.1;
             }
+            // `defensive.rs`'s `__probe_unguarded` is one-sided ON PURPOSE — it
+            // is the control half of the experiment proving `always!()` removes
+            // a branch, so counting it as a gap would ask us to "fix" the
+            // evidence. Its guarded twin emits no branch at all, which is the
+            // result being demonstrated.
+            let probe_exempt = usize::from(scoped.ends_with("defensive.rs"));
             let (mut one_sided, mut unreached) = (0usize, 0usize);
             for (t, f) in merged.values() {
                 match (*t == 0, *f == 0) {
@@ -254,7 +260,7 @@ fn one_sided_report() -> std::io::Result<BTreeMap<String, (usize, usize)>> {
                 }
             }
             let e = out.entry((*scoped).to_string()).or_insert((0, 0));
-            e.0 += one_sided;
+            e.0 += one_sided.saturating_sub(probe_exempt);
             e.1 += unreached;
         }
     }

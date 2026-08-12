@@ -96,8 +96,13 @@ macro_rules! always {
         #[cfg(all(not(coverage), debug_assertions))]
         {
             let c = $cond;
+            // `{}` and not the concat directly: a condition containing a
+            // brace — `bytes[i] != b'{'`, any struct literal — would otherwise
+            // be parsed as a format specifier and fail to compile at the call
+            // site. Found the first time this was used in a parser.
             debug_assert!(
                 c,
+                "{}",
                 concat!(
                     "always!(",
                     stringify!($cond),
@@ -138,8 +143,13 @@ macro_rules! never {
         #[cfg(all(not(coverage), debug_assertions))]
         {
             let c = $cond;
+            // `{}` and not the concat directly: a condition containing a
+            // brace — `bytes[i] != b'{'`, any struct literal — would otherwise
+            // be parsed as a format specifier and fail to compile at the call
+            // site. Found the first time this was used in a parser.
             debug_assert!(
                 !c,
+                "{}",
                 concat!(
                     "never!(",
                     stringify!($cond),

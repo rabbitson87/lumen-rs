@@ -468,7 +468,10 @@ impl NativeGemma4TextConfig {
         // for 26B-A4B's pattern=6).
         let n_full = self.layer_types.iter().filter(|t| t.is_full()).count();
         let expected_full = self.num_hidden_layers / self.sliding_window_pattern;
-        if n_full == 0 || n_full > self.num_hidden_layers {
+        // `n_full > num_hidden_layers` is unreachable — it counts entries of
+        // a list whose length was just checked equal to `num_hidden_layers` —
+        // but it keeps the message honest if that check ever moves.
+        if n_full == 0 || lumen_core::never!(n_full > self.num_hidden_layers) {
             return Err(anyhow!(
                 "layer_types has {n_full} full_attention entries, expected ~{expected_full} given pattern={}",
                 self.sliding_window_pattern,

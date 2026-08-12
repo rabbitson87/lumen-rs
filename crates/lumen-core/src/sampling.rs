@@ -222,7 +222,10 @@ pub fn softmax_inplace(logits: &mut [f32]) {
         *v = (*v - max).exp();
         sum += *v;
     }
-    if sum <= 0.0 {
+    // Unreachable: `max` is finite (guarded above), so `exp(max - max) == 1`
+    // is always one of the terms. Kept because the alternative is dividing by
+    // a sum nothing proves non-zero.
+    if crate::never!(sum <= 0.0) {
         let u = 1.0 / logits.len() as f32;
         for v in logits.iter_mut() {
             *v = u;

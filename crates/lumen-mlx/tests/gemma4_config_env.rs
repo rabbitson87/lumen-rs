@@ -206,6 +206,12 @@ fn the_top_k_override_applies_and_ignores_junk() {
         );
     }
 
+    // An override equal to the config's own value is a no-op rather than a
+    // logged change — the `n != top_k_experts` guard's other side, and the
+    // shape an operator gets when they pin the value the model already uses.
+    set("8");
+    assert_eq!(load(&moe).text_config.top_k_experts, 8);
+
     // An overridden config must still validate — the override runs inside
     // `load()`, before any caller can check it.
     set("4");

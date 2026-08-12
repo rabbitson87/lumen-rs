@@ -755,7 +755,10 @@ fn qwen35_body_for_object_schema(schema: &Value) -> Result<String> {
     for k in &opt_keys {
         segments.push(format!("({})?", rendered[*k]));
     }
-    if segments.is_empty() {
+    // Unreachable: `rendered` is non-empty here (an empty `properties` map
+    // returned earlier), and every key lands in exactly one of req/opt. Kept as
+    // a terminating fallback rather than an `unwrap`.
+    if lumen_core::never!(segments.is_empty()) {
         return Ok("(param_block)*".to_string());
     }
     Ok(segments.join(" "))
@@ -980,7 +983,7 @@ fn lark_body_for_object_schema(
             segments.push(format!("(\",\" {})?", rendered[*f]));
         }
     }
-    if segments.is_empty() {
+    if lumen_core::never!(segments.is_empty()) {
         // Defensive: properties non-empty but nothing rendered (shouldn't
         // happen). Permissive fallback keeps the matcher terminating.
         return Ok("<[^125]>*".to_string());

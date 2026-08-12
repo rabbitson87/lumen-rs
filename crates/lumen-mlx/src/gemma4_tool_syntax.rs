@@ -224,7 +224,11 @@ fn find_substr(haystack: &str, needle: &str, from: usize) -> Option<usize> {
 
 fn match_balanced_braces(text: &str, open_at: usize) -> Option<usize> {
     let bytes = text.as_bytes();
-    if open_at >= bytes.len() || bytes[open_at] != b'{' {
+    // Both operands are unreachable from `parse_tool_call_body`, which only
+    // calls this with an `open_at` its scanner already found pointing at `{`.
+    // They are the contract for any other caller, and the bounds check is what
+    // makes the index below safe to read.
+    if lumen_core::never!(open_at >= bytes.len()) || lumen_core::never!(bytes[open_at] != b'{') {
         return None;
     }
     const STR_DELIM_BYTES: &[u8] = b"<|\"|>";

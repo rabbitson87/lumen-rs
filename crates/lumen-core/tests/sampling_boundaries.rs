@@ -634,3 +634,29 @@ fn the_one_shot_sampler_skips_disabled_penalties() {
         assert_eq!(a, b, "and must leave the logits identical");
     }
 }
+
+/// The one-shot sampler's `presence != 0 || frequency != 0` guard has a second
+/// operand that only evaluates when presence is zero. Frequency-only is a real
+/// OpenAI configuration and must reach the penalty through this path too.
+#[test]
+fn the_one_shot_sampler_applies_a_frequency_only_penalty() {
+    let cfg = SamplingConfig {
+        temperature: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 4.0,
+        repeat_penalty_last_n: 16,
+        ..Default::default()
+    };
+    let recent = [1u32; 6];
+
+    let mut counts = [0usize; 3];
+    for seed in 0..300u64 {
+        let mut r = Xorshift64::new(seed);
+        let mut logits = vec![1.0_f32, 1.0, 1.0];
+        counts[sample_from_logits(&mut logits, &recent, &cfg, &mut r) as usize] += 1;
+    }
+    assert!(
+        counts[1] < counts[0] && counts[1] < counts[2],
+        "frequency-only must reach the penalty through the one-shot path: {counts:?}"
+    );
+}
