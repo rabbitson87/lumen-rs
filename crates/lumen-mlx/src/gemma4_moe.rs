@@ -11,8 +11,8 @@
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
-    use serde::Deserialize;
-    use std::collections::{BTreeMap, HashMap};
+
+    use std::collections::HashMap;
     use std::path::Path;
     use std::time::Instant;
 
@@ -440,7 +440,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -515,7 +515,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -715,7 +715,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -817,7 +817,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -920,7 +920,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -1356,7 +1356,7 @@ pub(crate) mod imp {
                 "language_model.model.norm.weight",
             ];
             for k in top_level {
-                if self.tensors.get(k).is_none() {
+                if !self.tensors.contains_key(k) {
                     return Err(anyhow!("missing top-level weight `{k}`"));
                 }
             }
@@ -1397,7 +1397,7 @@ pub(crate) mod imp {
                     ]);
                 }
                 for k in &required_keys {
-                    if self.tensors.get(k).is_none() {
+                    if !self.tensors.contains_key(k) {
                         return Err(anyhow!(
                             "missing weight `{k}` (layer {layer_idx}, kind={:?})",
                             layer_kind
@@ -1411,7 +1411,7 @@ pub(crate) mod imp {
                 // stale tensor.
                 if cfg.use_k_eq_v_for(*layer_kind) {
                     let vp = format!("{base}.self_attn.v_proj.weight");
-                    if self.tensors.get(&vp).is_some() {
+                    if self.tensors.contains_key(&vp) {
                         return Err(anyhow!(
                             "config declares attention_k_eq_v=true for full attention but `{vp}` is present — checkpoint inconsistent with config"
                         ));
@@ -1801,8 +1801,7 @@ pub(crate) mod imp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(head_dim * 4)
-            .min(2048)
-            .max(1)
+            .clamp(1, 2048)
     }
 
     /// Full-model cache — one slot per decoder layer, allocated based on the
@@ -2445,9 +2444,9 @@ pub(crate) mod imp {
 
     thread_local! {
         static MASK_CACHE_SLIDING: std::cell::RefCell<Option<MaskCacheEntry>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
         static MASK_CACHE_FULL: std::cell::RefCell<Option<MaskCacheEntry>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
 
     pub fn make_attention_mask_for_layer_chunked(
@@ -2734,7 +2733,7 @@ pub(crate) mod imp {
     fn require_clone(weights: &NativeGemma4Weights, name: &str) -> Result<Array> {
         weights
             .require(name)
-            .map(|arr| arr.clone())
+            .cloned()
             .with_context(|| format!("require_clone: missing `{name}`"))
     }
 
@@ -3355,14 +3354,10 @@ pub(crate) mod imp {
                     if lw.kind != NativeGemma4LayerType::SlidingAttention {
                         continue;
                     }
-                    if bake_v {
-                        if let Some(ref vp) = lw.attn.v_proj {
-                            let vp_rot = bake_r_into_v_proj(vp, &r_arr, h_kv, head_dim)
-                                .with_context(|| {
-                                    format!("load: bake R into v_proj (layer {idx})")
-                                })?;
-                            lw.attn.v_proj = Some(vp_rot);
-                        }
+                    if bake_v && let Some(ref vp) = lw.attn.v_proj {
+                        let vp_rot = bake_r_into_v_proj(vp, &r_arr, h_kv, head_dim)
+                            .with_context(|| format!("load: bake R into v_proj (layer {idx})"))?;
+                        lw.attn.v_proj = Some(vp_rot);
                     }
                     if bake_o {
                         let op_rot = bake_r_into_o_proj(&lw.attn.o_proj, &r_arr, h_q, head_dim)
@@ -3504,7 +3499,7 @@ pub(crate) mod imp {
             // Sanity check: drafter's backbone_hidden_size must match trunk's
             // hidden_size; otherwise pre_projection / post_projection won't
             // align with our hidden state shapes.
-            let trunk_hidden = self.config.text_config.hidden_size as usize;
+            let trunk_hidden = self.config.text_config.hidden_size;
             let drafter_backbone = drafter.config.backbone_hidden_size;
             if drafter_backbone != trunk_hidden {
                 return Err(anyhow!(
@@ -4866,7 +4861,12 @@ pub(crate) mod imp {
                     let fused_attn_enabled = std::env::var("LUMEN_GEMMA4_TQ_FUSED_ATTN")
                         .map(|s| s == "1")
                         .unwrap_or(false);
-                    if fused_attn_enabled && !use_ref && vc_inline.is_some() && vs_inline.is_some()
+                    // Bind through `zip` rather than testing `is_some()` and
+                    // then `expect()`ing: the two-step form lets the condition
+                    // and the unwrap drift apart, and a copy-paste that checks
+                    // `vc` twice while unwrapping `vs` still compiles.
+                    let vcs_inline = vc_inline.as_ref().zip(vs_inline.as_ref());
+                    if let (true, true, Some((vc, vs))) = (fused_attn_enabled, !use_ref, vcs_inline)
                     {
                         // Q in head_dim space already (q_rot is Q after RoPE +
                         // R rotation, same input the qk_inline kernel takes).
@@ -4876,8 +4876,6 @@ pub(crate) mod imp {
                         // numerically stable without extra scaling — verified
                         // empirically: existing `qk_inline` path also uses
                         // scale=1.0 implicit via score = Q@K_dq^T).
-                        let vc = vc_inline.as_ref().expect("fused_attn: vc_inline");
-                        let vs = vs_inline.as_ref().expect("fused_attn: vs_inline");
                         // Outer block bumps sdpa_start timing after the match
                         // expression — do not double-bump here.
                         crate::turboquant::turboquant_fused_attn(
@@ -5304,14 +5302,14 @@ pub(crate) mod imp {
         /// requires 10 arrays — biases must be present). Gemma 4's affine
         /// quantization always emits biases, so case (b) is a defensive guard.
         fn dense_mlp_forward(x: &Array, w: &ResolvedGemma4DenseMlpWeights) -> Result<Array> {
-            if gemma4_dense_mlp_fuse_enabled() {
-                if let Ok(out) = gemma4_dense_mlp_fused(x, w) {
-                    return Ok(out);
-                }
-                // Fall through to legacy path if compile dispatch fails
-                // (e.g. biases missing). The fused helper logs via `.context`,
-                // and the legacy path is bit-identical fallback.
+            if gemma4_dense_mlp_fuse_enabled()
+                && let Ok(out) = gemma4_dense_mlp_fused(x, w)
+            {
+                return Ok(out);
             }
+            // Fall through to legacy path if compile dispatch fails
+            // (e.g. biases missing). The fused helper logs via `.context`,
+            // and the legacy path is bit-identical fallback.
             let gate = Self::qmatmul(&w.gate_proj, x)?;
             let up = Self::qmatmul(&w.up_proj, x)?;
             let activated = Self::geglu_apply(&gate, &up)?;
@@ -6043,7 +6041,7 @@ pub(crate) mod imp {
         /// hard-coded to `biases=None`, which is fine for MXFP4 but misses
         /// Gemma 4's affine `embed_tokens.biases`. We replicate the take_axis
         /// + dequantize_with_mode pattern with the optional biases plumbed
-        /// through.
+        ///   through.
         fn embed_lookup_affine(&self, token_ids: &Array) -> Result<Array> {
             let embed = match &self.embed_tokens {
                 EmbedTokensWeights::Bf16(w) => {
@@ -6150,15 +6148,14 @@ pub(crate) mod imp {
             // prefill softcap input shape. Env-gated A/B
             // (`LUMEN_GEMMA4_FUSE_SOFTCAP=0`) falls back to the unfused
             // path; default ON.
-            if gemma4_softcap_fuse_enabled() {
-                if let Ok(out) =
+            if gemma4_softcap_fuse_enabled()
+                && let Ok(out) =
                     gemma4_softcap_fused(logits, &self.const_softcap_inv, &self.const_softcap)
-                {
-                    return Ok(out);
-                }
-                // Trace dispatch failed for some reason — fall through to
-                // unfused legacy path (bit-identical numerically).
+            {
+                return Ok(out);
             }
+            // Trace dispatch failed for some reason — fall through to
+            // unfused legacy path (bit-identical numerically).
             let scaled = mlx_rs::ops::multiply(logits, &self.const_softcap_inv)
                 .context("softcap: logits × (1/cap) failed")?;
             let tanh = mlx_rs::ops::tanh(&scaled).context("softcap: tanh failed")?;
@@ -6538,10 +6535,9 @@ pub(crate) mod imp {
             if self
                 .mtp_capture_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(mut slot) = self.mtp_capture_slot.lock()
             {
-                if let Ok(mut slot) = self.mtp_capture_slot.lock() {
-                    *slot = Some(h.clone());
-                }
+                *slot = Some(h.clone());
             }
 
             // Optional: reduce h to last position before lm_head when the
@@ -6551,7 +6547,7 @@ pub(crate) mod imp {
             // L=1 path is a no-op so the guard simply avoids the extra
             // take_axis dispatch at decode.
             let h_for_lm_head = if slice_last_token && l > 1 {
-                let last_pos = (l - 1) as i32;
+                let last_pos = l - 1;
                 let last_idx = Array::from_slice(&[last_pos], &[1]);
                 mlx_rs::ops::indexing::take_axis(&h, &last_idx, 1)
                     .context("forward: slice h to last position for lm_head")?
@@ -6566,10 +6562,9 @@ pub(crate) mod imp {
             if self
                 .correction_capture_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(mut slot) = self.correction_capture_slot.lock()
             {
-                if let Ok(mut slot) = self.correction_capture_slot.lock() {
-                    *slot = Some(h_for_lm_head.clone());
-                }
+                *slot = Some(h_for_lm_head.clone());
             }
 
             // (5+6) Tied lm_head + softcap.
@@ -6683,7 +6678,7 @@ pub(crate) mod imp {
         /// prompt_ids.len()` AND `prompt_ids[..cache.offset()]` matches the
         /// tokens already in the cache. Use [`NativeGemma4PromptCache::clone`]
         /// + [`NativeGemma4PromptCache::truncate_to`] to manage prefix-cache
-        /// fork/extend semantics from the outside (see `Gemma4Backend`).
+        ///   fork/extend semantics from the outside (see `Gemma4Backend`).
         pub fn generate_with_cache(
             &self,
             prompt_ids: &[u32],
@@ -6764,13 +6759,13 @@ pub(crate) mod imp {
             // logits semantics for forward_probe / debug callers.
             let prefill_start = Instant::now();
             let logits = if images.is_empty() {
-                self.forward_last_token(prompt_ids, &mut cache)
+                self.forward_last_token(prompt_ids, cache)
                     .context("generate: prefill forward_last_token")?
             } else {
                 // Image prefill still slices to the last token; the only
                 // difference is that the placeholder rows carry vision
                 // features instead of `<|image|>` embeddings.
-                self.forward_with_images(prompt_ids, images, &mut cache, true)
+                self.forward_with_images(prompt_ids, images, cache, true)
                     .context("generate: prefill forward_with_images")?
             };
             // Lazy argmax — schedule async eval so the GPU starts work while
@@ -6869,7 +6864,7 @@ pub(crate) mod imp {
                         .as_dtype(mlx_rs::Dtype::Int32)
                         .context("generate(sampled): build input array")?;
                     let step_logits = self
-                        .forward_array_last_token(&input, &mut cache)
+                        .forward_array_last_token(&input, cache)
                         .context("generate(sampled): decode forward")?;
                     let sampled = sample_next_token_with_eos_guard(
                         &step_logits,
@@ -6966,7 +6961,7 @@ pub(crate) mod imp {
                 budget_mtp.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_mtp {
                     let out = self
-                        .mtp_step(&mut cache, current_u32, n_draft)
+                        .mtp_step(cache, current_u32, n_draft)
                         .context("generate(MTP): mtp_step")?;
                     decode_steps_mtp += 1;
                     // The last element of `committed` is the next-call input
@@ -7065,7 +7060,7 @@ pub(crate) mod imp {
                 budget_lk.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_lk {
                     let out = self
-                        .lookup_step(&mut cache, current_u32, &history, n_lookup, n_draft)
+                        .lookup_step(cache, current_u32, &history, n_lookup, n_draft)
                         .context("generate(LOOKUP): lookup_step")?;
                     decode_steps_lk += 1;
                     let next_input = *out.committed.last().unwrap();
@@ -7226,7 +7221,7 @@ pub(crate) mod imp {
                     None
                 };
                 let next_logits = self
-                    .forward_array_last_token(&current, &mut cache)
+                    .forward_array_last_token(&current, cache)
                     .context("generate: decode forward_array_last_token")?;
                 let next_lazy = self
                     .argmax_last_token_lazy(&next_logits)
@@ -8597,10 +8592,7 @@ pub(crate) mod imp {
             assert_eq!(stats.prompt_tokens, prompt_len, "prompt length stored");
             assert_eq!(stats.generated_tokens.len(), 4, "all 4 decode steps ran");
             for t in &stats.generated_tokens {
-                assert!(
-                    (*t as u32) < vocab,
-                    "generated token {t} out of vocab {vocab}"
-                );
+                assert!(*t < vocab, "generated token {t} out of vocab {vocab}");
             }
 
             // Cache invariants: build a fresh cache and replay the prefill
@@ -8714,7 +8706,7 @@ pub(crate) mod imp {
 
             // Decode-step sanity: feed a 1-token follow-up to layer 0 and
             // make sure RotatingKvCache grows correctly.
-            let n_decode = (b * 1 * hidden) as usize;
+            let n_decode = (b * hidden) as usize;
             let data1: Vec<f32> = (0..n_decode)
                 .map(|i| 0.001 * ((i % 13) as f32 - 6.0))
                 .collect();

@@ -56,7 +56,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
-            let state = AppState::load(&app.handle())?;
+            let state = AppState::load(app.handle())?;
             app.manage(state);
             Ok(())
         })

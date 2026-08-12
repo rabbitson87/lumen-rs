@@ -28,7 +28,7 @@ pub mod imp {
     use mlx_rs::Array;
     use mlx_rs::Dtype;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    use serde::Deserialize;
+
     use std::sync::OnceLock;
 
     // ───────────────────────────── config ─────────────────────────────
@@ -594,7 +594,7 @@ pub mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_56_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_sq = mlx_rs::ops::multiply(x, x)?;
         let x_cubed = mlx_rs::ops::multiply(&x_sq, x)?;
         let inner = mlx_rs::ops::add(x, &mlx_rs::ops::multiply(&x_cubed, &c3)?)?;

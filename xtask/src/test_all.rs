@@ -94,7 +94,7 @@ fn report_effective_cases() {
     if rows.is_empty() {
         return;
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     rows.dedup_by(|a, b| a.1 == b.1);
     eprintln!("\neffective cases executed (parameterized sweeps only): {total}");
     for (n, what) in rows.iter().take(6) {

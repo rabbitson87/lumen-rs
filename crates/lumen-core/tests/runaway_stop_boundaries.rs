@@ -28,10 +28,7 @@ fn a_short_history_never_trips() {
     assert_eq!(d.check(&[7]), None);
 
     // A repeating 4-gram, but not enough repeats to reach n * max_repeats.
-    let few_cycles: Vec<u32> = std::iter::repeat([1u32, 2, 3, 4])
-        .take(7)
-        .flatten()
-        .collect();
+    let few_cycles: Vec<u32> = std::iter::repeat_n([1u32, 2, 3, 4], 7).flatten().collect();
     assert_eq!(
         d.check(&few_cycles),
         None,
@@ -78,10 +75,7 @@ fn a_genuine_runaway_still_trips() {
     let long_run: Vec<u32> = std::iter::repeat_n(7u32, 64).collect();
     assert_eq!(d.check(&long_run), Some("single-token repeat"));
 
-    let cycles: Vec<u32> = std::iter::repeat([1u32, 2, 3, 4])
-        .take(12)
-        .flatten()
-        .collect();
+    let cycles: Vec<u32> = std::iter::repeat_n([1u32, 2, 3, 4], 12).flatten().collect();
     assert!(
         d.check(&cycles).is_some(),
         "12 repeats of a 4-gram is a cycle"

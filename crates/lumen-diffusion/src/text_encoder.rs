@@ -206,10 +206,10 @@ mod imp {
 
             let mut key_shard = HashMap::new();
             for (k, v) in weight_map {
-                if let Some(f) = v.as_str() {
-                    if let Some(&si) = file_index.get(f) {
-                        key_shard.insert(k.clone(), si);
-                    }
+                if let Some(f) = v.as_str()
+                    && let Some(&si) = file_index.get(f)
+                {
+                    key_shard.insert(k.clone(), si);
                 }
             }
             Ok(Self { shards, key_shard })

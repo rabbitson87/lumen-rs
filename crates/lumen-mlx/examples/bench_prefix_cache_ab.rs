@@ -50,6 +50,7 @@ fn build_msgs(user: &str) -> Vec<(String, String)> {
 struct RunResult {
     label: String,
     user: String,
+    #[allow(dead_code)] // unread field: kept so the fixture matches the JSON it is parsed from.
     text: String,
     ttft_ms: f64,
     total_ms: f64,
@@ -133,8 +134,8 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "\n{:<5} {:<12} {:>10} {:>10} {:>5} | {}",
-        "i", "label", "ttft(ms)", "total(ms)", "n", "user"
+        "\n{:<5} {:<12} {:>10} {:>10} {:>5} | user",
+        "i", "label", "ttft(ms)", "total(ms)", "n"
     );
     println!("{}", "-".repeat(90));
     for (i, r) in results.iter().enumerate() {

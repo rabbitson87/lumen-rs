@@ -210,13 +210,13 @@ pub fn format_qwen3_chat_with_tools(
             None
         };
         s.push_str(&render_tools_system_block(tools, leading_system));
-    } else if let Some((role, content)) = messages.first() {
-        if role.eq_ignore_ascii_case("system") {
-            s.push_str("<|im_start|>system\n");
-            s.push_str(content);
-            s.push_str("<|im_end|>\n");
-            idx = 1;
-        }
+    } else if let Some((role, content)) = messages.first()
+        && role.eq_ignore_ascii_case("system")
+    {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(content);
+        s.push_str("<|im_end|>\n");
+        idx = 1;
     }
 
     while idx < messages.len() {
@@ -479,6 +479,9 @@ impl Qwen35ResponseParser {
         }
     }
 
+    #[allow(dead_code)]
+    // no caller. NOTE: this never ran, so the `defense-in-depth` it claims does
+    // not exist — the engine's downgrade-to-Auto is the only check in the path.
     /// Total accumulated visible bytes so far (live view — for
     /// `completion_tokens_with_tools` post-decode accounting).
     pub fn visible_so_far(&self) -> &str {
@@ -821,14 +824,15 @@ fn parse_param_value(raw: &str) -> JsonValue {
     let looks_json = matches!(first, b'{' | b'[' | b'"' | b't' | b'f' | b'n')
         || first.is_ascii_digit()
         || first == b'-';
-    if looks_json {
-        if let Ok(v) = serde_json::from_str::<JsonValue>(trimmed) {
-            return v;
-        }
+    if looks_json && let Ok(v) = serde_json::from_str::<JsonValue>(trimmed) {
+        return v;
     }
     JsonValue::String(raw.to_string())
 }
 
+#[allow(dead_code)]
+// no caller. NOTE: this never ran, so the `defense-in-depth` it claims does
+// not exist — the engine's downgrade-to-Auto is the only check in the path.
 /// Reject obviously-malformed tool_choice prefill for `Tool(name)` where
 /// the requested name doesn't appear in the tool defs. Engine layer
 /// already downgrades to Auto in that case, but defense-in-depth.
@@ -836,10 +840,10 @@ pub fn validate_tool_choice_against_defs<'a>(
     choice: &ResolvedToolChoice<'a>,
     tools: &[ToolDef<'_>],
 ) -> Result<()> {
-    if let ResolvedToolChoice::Tool(name) = choice {
-        if !tools.iter().any(|t| t.name == *name) {
-            return Err(anyhow!("tool_choice references unknown function: {name}"));
-        }
+    if let ResolvedToolChoice::Tool(name) = choice
+        && !tools.iter().any(|t| t.name == *name)
+    {
+        return Err(anyhow!("tool_choice references unknown function: {name}"));
     }
     Ok(())
 }

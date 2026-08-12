@@ -23,6 +23,12 @@ mod imp {
         inner: mlx_sys::mlx_fast_metal_kernel_config,
     }
 
+    impl Default for MetalKernelConfig {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MetalKernelConfig {
         pub fn new() -> Self {
             Self {

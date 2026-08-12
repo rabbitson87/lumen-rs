@@ -195,7 +195,7 @@ mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?; // sqrt(2/PI)
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?; // sqrt(2/PI)
 
         let x_squared = gate.multiply(gate)?;
         let x_cubed = x_squared.multiply(gate)?;

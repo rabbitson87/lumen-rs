@@ -138,9 +138,9 @@ pub struct QuantConfig {
     ///   * `Off`  — never quantize; KV stays in bf16 (fastest, most memory).
     ///   * `On`   — always quantize at `bits`; saves memory on every request.
     ///   * `Auto` — quantize only when a request's `prompt_tokens` reaches
-    ///              `kv_auto_threshold_tokens`. Default — gives short chats
-    ///              full bf16 speed and only pays the per-step quant
-    ///              dispatch cost when the memory matters.
+    ///     `kv_auto_threshold_tokens`. Default — gives short chats
+    ///     full bf16 speed and only pays the per-step quant
+    ///     dispatch cost when the memory matters.
     ///
     /// Emits `LUMEN_GEMMA4_QUANT_KV_MODE`.
     #[serde(default = "default_kv_mode")]
@@ -618,8 +618,10 @@ max_batch = 6
     /// value the user set under the new name.
     #[test]
     fn v9_migration_does_not_overwrite_an_existing_mlx_batch_max() {
-        let mut cfg = PersistentConfig::default();
-        cfg.schema_version = 8;
+        let mut cfg = PersistentConfig {
+            schema_version: 8,
+            ..PersistentConfig::default()
+        };
         cfg.advanced.mlx_batch_max = Some(2);
         cfg.advanced.paged_attention = Some(LegacyPagedConfig { max_batch: Some(6) });
         migrate_in_place(&mut cfg);
@@ -630,8 +632,10 @@ max_batch = 6
     /// unreachable because the constant was never bumped past it.
     #[test]
     fn current_schema_version_reaches_the_last_migration_step() {
-        let mut cfg = PersistentConfig::default();
-        cfg.schema_version = 0;
+        let mut cfg = PersistentConfig {
+            schema_version: 0,
+            ..PersistentConfig::default()
+        };
         migrate_in_place(&mut cfg);
         assert_eq!(
             cfg.schema_version, CURRENT_SCHEMA_VERSION,

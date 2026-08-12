@@ -250,7 +250,7 @@ fn main() -> Result<()> {
     if !mean.is_finite() {
         return Err(anyhow!("mean cycle latency is not finite"));
     }
-    if accept_rate < 0.0 || accept_rate > 1.0 {
+    if !(0.0..=1.0).contains(&accept_rate) {
         return Err(anyhow!("accept_rate {accept_rate} out of [0,1]"));
     }
     if emit_mean < 1.0 || emit_mean > (k + 1) as f64 {

@@ -157,7 +157,7 @@ mod tests {
         // identical tokens is fine.
         let d = detector(64, 128, 4, 8);
         let mut tokens = vec![1u32, 2, 3];
-        tokens.extend(std::iter::repeat(99u32).take(10));
+        tokens.extend(std::iter::repeat_n(99u32, 10));
         tokens.extend(vec![4u32, 5, 6]);
         assert_eq!(d.check(&tokens), None);
     }

@@ -189,17 +189,13 @@ pub(crate) mod imp {
             // parens like `Playwright (Stealth)__browser_navigate`).
             // Trailing whitespace between NAME and `{` is trimmed.
             let prefix = self.tool_text_prefix.as_str();
-            let Some(start) = prefix.find("call:") else {
-                return None;
-            };
+            let start = prefix.find("call:")?;
             let name_start = start + "call:".len();
             let after = &prefix[name_start..];
             // Scan until '{' or newline (which acts as a hard boundary
             // so a stray `call:` token on its own line can't swallow
             // following text).
-            let Some(stop_offset) = after.find(|c: char| c == '{' || c == '\n' || c == '\r') else {
-                return None;
-            };
+            let stop_offset = after.find(['{', '\n', '\r'])?;
             if after.as_bytes().get(stop_offset) != Some(&b'{') {
                 return None;
             }

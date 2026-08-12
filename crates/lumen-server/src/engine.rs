@@ -1235,7 +1235,7 @@ impl InferenceEngine {
             let mut earliest: Option<usize> = None;
             for s in &ov.stop {
                 if let Some(i) = parsed.visible.find(s.as_str()) {
-                    if earliest.map_or(true, |e| i < e) {
+                    if earliest.is_none_or(|e| i < e) {
                         earliest = Some(i);
                         matched_stop = Some(s.clone());
                     }
@@ -3696,8 +3696,7 @@ mod anthropic_turn_image_alignment {
     fn an_image_on_an_assistant_turn_is_refused() {
         let messages = vec![msg("assistant")];
         let err = anthropic_turn_images(&messages, false, &[img(9)], &[0], &[false])
-            .err()
-            .expect("an assistant turn has nowhere to put an image");
+            .expect_err("an assistant turn has nowhere to put an image");
         assert!(err.to_string().contains("user message"), "{err}");
     }
 }

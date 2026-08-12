@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn first_real_index_handles_the_degenerate_ends() {
         assert_eq!(
-            first_real_index(&vec![PAD_ID; 8]),
+            first_real_index(&[PAD_ID; 8]),
             8,
             "all padding → one past the end, never a panic"
         );

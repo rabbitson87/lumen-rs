@@ -118,6 +118,12 @@ pub fn read_env(env: &str, default: bool) -> bool {
 pub struct ProcessOverride(pub AtomicU8);
 
 #[doc(hidden)]
+impl Default for ProcessOverride {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessOverride {
     pub const fn new() -> Self {
         Self(AtomicU8::new(2))
@@ -195,20 +201,28 @@ macro_rules! flag {
                 f()
             }
 
+            // The three below are generated for every flag, and no single flag
+            // uses all of them — `set`/`clear` matter to an in-process A/B
+            // harness, `describe` to whoever walks the registry. The macro
+            // cannot know which, so the allow lives here rather than being
+            // pasted at each call site that happens not to need one.
             /// Process-wide override for A/B harnesses that flip a flag
             /// between in-process conditions — the thing a bare `OnceLock`
             /// cannot do. Overridden per-thread by [`with`].
+            #[allow(dead_code)]
             pub fn set(value: bool) {
                 PROCESS.set(Some(value));
             }
 
             /// Drop the process override; `get()` falls back to the env-seeded
             /// value.
+            #[allow(dead_code)]
             pub fn clear() {
                 PROCESS.set(None);
             }
 
             /// This flag's registry entry.
+            #[allow(dead_code)]
             pub fn describe() -> &'static $crate::FlagDesc {
                 &DESC
             }

@@ -79,19 +79,17 @@ fn main() -> anyhow::Result<()> {
     let loss_fn = move |args: &[Array]| -> Vec<Array> {
         let a = &args[0];
         let b = &args[1];
-        let base = hmat_c
-            .matmul(&w_c.transpose_axes(&[1, 0]).unwrap())
-            .unwrap();
+        let base = hmat_c.matmul(w_c.transpose_axes(&[1, 0]).unwrap()).unwrap();
         let delta = hmat_c
-            .matmul(&a.transpose_axes(&[1, 0]).unwrap())
+            .matmul(a.transpose_axes(&[1, 0]).unwrap())
             .unwrap()
-            .matmul(&b.transpose_axes(&[1, 0]).unwrap())
+            .matmul(b.transpose_axes(&[1, 0]).unwrap())
             .unwrap();
         let logits = base.add(&delta).unwrap();
         // CE = mean( logsumexp(logits) - logits[target] )
         let lse = logits.logsumexp_axis(1, false).unwrap(); // [n]
         let tgt_logit = logits
-            .take_along_axis(&tgt_c.reshape(&[n as i32, 1]).unwrap(), 1)
+            .take_along_axis(tgt_c.reshape(&[n as i32, 1]).unwrap(), 1)
             .unwrap()
             .reshape(&[n as i32])
             .unwrap();

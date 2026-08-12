@@ -263,53 +263,52 @@ impl NativeGemma4Config {
             .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))?;
         // `LUMEN_SLIDING_WINDOW` (desktop CONTEXT card → server) overrides the
         // model's built-in sliding window size. 0 means "no override".
-        if let Ok(s) = std::env::var("LUMEN_SLIDING_WINDOW") {
-            if let Ok(n) = s.parse::<usize>() {
-                if n > 0 {
-                    eprintln!(
-                        "[gemma4] sliding_window override via LUMEN_SLIDING_WINDOW: {} → {n}",
-                        cfg.text_config.sliding_window
-                    );
-                    cfg.text_config.sliding_window = n;
-                }
-            }
+        if let Ok(s) = std::env::var("LUMEN_SLIDING_WINDOW")
+            && let Ok(n) = s.parse::<usize>()
+            && n > 0
+        {
+            eprintln!(
+                "[gemma4] sliding_window override via LUMEN_SLIDING_WINDOW: {} → {n}",
+                cfg.text_config.sliding_window
+            );
+            cfg.text_config.sliding_window = n;
         }
         // `LUMEN_MAX_CTX` caps the maximum position embeddings the model
         // advertises — useful to keep KV cache pool sizing predictable
         // when the model config claims e.g. 128K but the host RAM can't
         // hold it.
-        if let Ok(s) = std::env::var("LUMEN_MAX_CTX") {
-            if let Ok(n) = s.parse::<usize>() {
-                if n > 0 && n < cfg.text_config.max_position_embeddings {
-                    eprintln!(
-                        "[gemma4] max_position_embeddings capped via LUMEN_MAX_CTX: {} → {n}",
-                        cfg.text_config.max_position_embeddings
-                    );
-                    cfg.text_config.max_position_embeddings = n;
-                }
-            }
+        if let Ok(s) = std::env::var("LUMEN_MAX_CTX")
+            && let Ok(n) = s.parse::<usize>()
+            && n > 0
+            && n < cfg.text_config.max_position_embeddings
+        {
+            eprintln!(
+                "[gemma4] max_position_embeddings capped via LUMEN_MAX_CTX: {} → {n}",
+                cfg.text_config.max_position_embeddings
+            );
+            cfg.text_config.max_position_embeddings = n;
         }
         // `LUMEN_GEMMA4_TOP_K` overrides the MoE router's top-k expert
         // count at load time. Quality knob — model was trained at k=8;
         // lowering to k=4 ~halves expert FFN compute per token but may
         // degrade output. Use for A/B measurement; ship only after
         // multi-axis quality eval (HAERAE / KMMLU / GSM8K).
-        if let Ok(s) = std::env::var("LUMEN_GEMMA4_TOP_K") {
-            if let Ok(n) = s.parse::<usize>() {
-                if n > 0 && n <= cfg.text_config.num_experts {
-                    if n != cfg.text_config.top_k_experts {
-                        eprintln!(
-                            "[gemma4] top_k_experts overridden via LUMEN_GEMMA4_TOP_K: {} → {n}",
-                            cfg.text_config.top_k_experts
-                        );
-                        cfg.text_config.top_k_experts = n;
-                    }
-                } else {
+        if let Ok(s) = std::env::var("LUMEN_GEMMA4_TOP_K")
+            && let Ok(n) = s.parse::<usize>()
+        {
+            if n > 0 && n <= cfg.text_config.num_experts {
+                if n != cfg.text_config.top_k_experts {
                     eprintln!(
-                        "[gemma4] LUMEN_GEMMA4_TOP_K={n} ignored (must be 1..={}, got {n})",
-                        cfg.text_config.num_experts
+                        "[gemma4] top_k_experts overridden via LUMEN_GEMMA4_TOP_K: {} → {n}",
+                        cfg.text_config.top_k_experts
                     );
+                    cfg.text_config.top_k_experts = n;
                 }
+            } else {
+                eprintln!(
+                    "[gemma4] LUMEN_GEMMA4_TOP_K={n} ignored (must be 1..={}, got {n})",
+                    cfg.text_config.num_experts
+                );
             }
         }
         Ok(cfg)
@@ -572,7 +571,7 @@ impl NativeGemma4VisionConfig {
         {
             return Err(anyhow!("vision_config has zero-valued core dims"));
         }
-        if self.head_dim % 4 != 0 {
+        if !self.head_dim.is_multiple_of(4) {
             // 2-D RoPE splits head_dim into 2 halves and each half into
             // sin/cos pairs, so head_dim must be a multiple of 4.
             return Err(anyhow!(

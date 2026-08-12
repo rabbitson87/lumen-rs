@@ -718,7 +718,7 @@ mod parity_tests {
     }
 
     // ───────────────────── split attention (shared-prefix KV dedup) ─────────────────────
-    use super::imp::{attn_lse, sdpa_split};
+    use super::imp::sdpa_split;
     use mlx_rs::ops::concatenate_axis;
 
     /// Deterministic pseudo-random fill in [-1, 1) — avoids Math.random so the

@@ -25,7 +25,7 @@ pub mod imp {
     use mlx_rs::Array;
     use mlx_rs::Dtype;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    use serde::Deserialize;
+
     use std::sync::OnceLock;
 
     use crate::native_quant::quantized_matmul_with_mode;
@@ -556,9 +556,9 @@ pub mod imp {
                 let hi = lo + per;
                 let xs = x.index((Ellipsis, lo..hi));
                 // [N, per] → [1, N, 1, per] so it broadcasts across heads.
-                let c = mlx_rs::ops::reshape(&cos.index((Ellipsis, lo..hi)), &[1, n, 1, per])
+                let c = mlx_rs::ops::reshape(cos.index((Ellipsis, lo..hi)), &[1, n, 1, per])
                     .context("rope: reshape cos slice")?;
-                let s = mlx_rs::ops::reshape(&sin.index((Ellipsis, lo..hi)), &[1, n, 1, per])
+                let s = mlx_rs::ops::reshape(sin.index((Ellipsis, lo..hi)), &[1, n, 1, per])
                     .context("rope: reshape sin slice")?;
                 let rotated = rotate_half(&xs, per)?;
                 let a = mlx_rs::ops::multiply(&xs, &c).context("rope: x·cos")?;
@@ -677,7 +677,7 @@ pub mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_sq = mlx_rs::ops::multiply(gate, gate)?;
         let x_cubed = mlx_rs::ops::multiply(&x_sq, gate)?;
         let inner = mlx_rs::ops::add(gate, &mlx_rs::ops::multiply(&x_cubed, &c3)?)?;

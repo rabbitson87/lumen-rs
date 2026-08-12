@@ -9,10 +9,10 @@
 //!
 //! The Python reference for this capture path is `dflash_runtime.py::patch_model`
 //! + `_LayerHook.__call__` + `get_target_hidden(model)` — wraps each layer in
-//! `target_layer_ids` so the layer's `__call__` return is recorded, then
-//! concatenates the recorded list along axis -1 producing
-//! `[1, T, len(target_layer_ids) * hidden]`. Native impl mirrors that layer
-//! output (post-MLP residual of `h + mlp(post_attention_layernorm(h))`).
+//!   `target_layer_ids` so the layer's `__call__` return is recorded, then
+//!   concatenates the recorded list along axis -1 producing
+//!   `[1, T, len(target_layer_ids) * hidden]`. Native impl mirrors that layer
+//!   output (post-MLP residual of `h + mlp(post_attention_layernorm(h))`).
 //!
 //! Bit-identical comparison against the Python path is left to D5a.5; this
 //! smoke covers the structural shape + dtype contract only.

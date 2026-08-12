@@ -109,7 +109,7 @@ fn vision_tower_matches_reference_soft_tokens() {
         .as_u64()
         .unwrap_or(280) as usize;
 
-    let golden = Array::load_safetensors(&fixture("gemma4_vision_golden.safetensors"))
+    let golden = Array::load_safetensors(fixture("gemma4_vision_golden.safetensors"))
         .expect("load golden fixture");
     let grid = to_vec_f32(&golden["grid_hw"]);
     let (rows, cols) = (grid[0] as usize, grid[1] as usize);

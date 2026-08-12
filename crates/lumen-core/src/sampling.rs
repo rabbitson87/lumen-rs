@@ -449,7 +449,14 @@ pub fn sampling_distribution(logits: &mut [f32], recent: &[u32], cfg: &SamplingC
 /// input so it never deadlocks.
 pub fn sample_distribution(probs: &[f32], rng: &mut Xorshift64) -> u32 {
     let mass: f32 = probs.iter().sum();
-    if !(mass > 0.0) {
+    // `!(mass > 0.0)` and NOT `mass <= 0.0`: the two differ on NaN, where
+    // the first is true and the second false. NaN mass is exactly the
+    // degenerate input this guard exists for — a NaN logit anywhere in the
+    // vector poisons the sum — so clippy's suggestion here would reintroduce
+    // the fallthrough it is meant to prevent.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let degenerate = !(mass > 0.0);
+    if degenerate {
         return probs
             .iter()
             .enumerate()
@@ -516,7 +523,14 @@ pub fn sample_residual(p: &[f32], q: &[f32], rng: &mut Xorshift64) -> u32 {
             mass += r;
         }
     }
-    if !(mass > 0.0) {
+    // `!(mass > 0.0)` and NOT `mass <= 0.0`: the two differ on NaN, where
+    // the first is true and the second false. NaN mass is exactly the
+    // degenerate input this guard exists for — a NaN logit anywhere in the
+    // vector poisons the sum — so clippy's suggestion here would reintroduce
+    // the fallthrough it is meant to prevent.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let degenerate = !(mass > 0.0);
+    if degenerate {
         return p
             .iter()
             .enumerate()

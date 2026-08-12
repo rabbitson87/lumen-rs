@@ -19,7 +19,7 @@ use mlx_rs::Array;
 fn rel_mae(a: &Array, b: &Array) -> f32 {
     let af = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
     let bf = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
-    let num = mlx_rs::ops::abs(&mlx_rs::ops::subtract(&af, &bf).unwrap())
+    let num = mlx_rs::ops::abs(mlx_rs::ops::subtract(&af, &bf).unwrap())
         .unwrap()
         .sum(None)
         .unwrap();

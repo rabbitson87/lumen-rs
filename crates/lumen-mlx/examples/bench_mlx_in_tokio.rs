@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     // Move the backend ownership into a spawn_blocking so the whole bench
     // runs on a dedicated blocking-pool thread, isolated from tokio's async
     // workers and from any QoS / scheduling interference they might cause.
-    tokio::task::spawn_blocking(|| run_sync()).await??;
+    tokio::task::spawn_blocking(run_sync).await??;
     Ok(())
 }
 

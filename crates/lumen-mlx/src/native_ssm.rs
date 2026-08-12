@@ -1388,7 +1388,7 @@ mod capture_kernel_tests {
             .collect()
     }
     fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        let d = mlx_rs::ops::abs(&mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
         let m = d.max(None).unwrap();
         m.eval().unwrap();
         m.as_slice::<f32>()[0]

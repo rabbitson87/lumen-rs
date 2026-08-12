@@ -438,8 +438,9 @@ fn main() -> Result<()> {
     }
 
     // Decode mut borrow has ended; show generated text to confirm the
-    // context stayed coherent (in-distribution).
-    drop(qwen);
+    // context stayed coherent (in-distribution). No `drop(qwen)` — it is a
+    // borrow, so dropping it freed nothing; NLL ends the borrow at its last
+    // use, which is what the call was really relying on.
     let base_text = backend.decode(&base_tokens).unwrap_or_default();
     let mtp_text = backend.decode(&mtp_tokens).unwrap_or_default();
     println!();

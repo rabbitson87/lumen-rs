@@ -338,7 +338,7 @@ fn expected_safetensors_size(path: &Path) -> Option<u64> {
     // Sanity bounds: real safetensors headers are KB-MB range. Reject
     // anything < 2 (invalid JSON) or > 100 MB (likely truncated /
     // corrupted file producing a bogus length).
-    if header_len < 2 || header_len > 100 * 1024 * 1024 {
+    if !(2..=100 * 1024 * 1024).contains(&header_len) {
         return None;
     }
     let mut header_buf = vec![0u8; header_len as usize];

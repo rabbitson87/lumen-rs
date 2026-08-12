@@ -68,16 +68,26 @@ const STEPS: &[Step] = &[
     },
     Step {
         name: "clippy",
-        // REPORT-ONLY, deliberately. At `-D warnings` this workspace fails with
-        // **330** pre-existing warnings (69 collapsible-if, 27 doc-indent, 18
-        // very-complex-type, 13 dead-code, …) — it has never been clippy-clean.
-        // Making the gate fail on day one would mean the gate gets skipped,
-        // which is the same failure as a pre-push check that takes an hour.
-        // Flip `optional` to false once the count reaches zero; the number is
-        // the debt, and `cargo clippy --workspace --all-targets` prints it.
-        rationale: "lints that catch real bugs, not just style — report-only \
-                    until the 330-warning backlog is cleared, then make it \
-                    blocking",
+        // BLOCKING as of the backlog reaching zero. It was report-only while
+        // 349 warnings stood, because a gate that fails on day one is a gate
+        // people skip.
+        //
+        // Two things the cleanup found that report-only had been hiding:
+        //
+        // * a **deny-by-default error** (`approx_constant` on a `3.14` in a test
+        //   fixture) had been failing `cargo clippy` outright for as long as the
+        //   step was optional. Not a warning among 349 — an error, invisible
+        //   because nothing read the exit code.
+        // * two `drop(x)` calls on borrows, which free nothing and were written
+        //   believing they did.
+        //
+        // Four lints are allowed workspace-wide in the root `Cargo.toml`, each
+        // with its reason next to it. Everything else is expected to be zero:
+        // one lint left warning forever re-teaches the skimming this step was
+        // reinstated to stop.
+        rationale: "lints that catch real bugs, not just style — blocking now \
+                    that the backlog is zero; report-only was hiding a \
+                    deny-by-default error, not just warnings",
         program: "cargo",
         args: &[
             "clippy",
@@ -87,7 +97,7 @@ const STEPS: &[Step] = &[
             "-D",
             "warnings",
         ],
-        optional: true,
+        optional: false,
     },
     Step {
         name: "test (representative)",
@@ -281,7 +291,7 @@ mod tests {
         // The exemption list must cover this file: it necessarily contains
         // every pattern it forbids.
         assert!(
-            RULE_DEFINITIONS.iter().any(|d| *d == "xtask/src/gate.rs"),
+            RULE_DEFINITIONS.contains(&"xtask/src/gate.rs"),
             "the gate source defines the patterns, so it must be exempt or the \
              gate can never pass"
         );

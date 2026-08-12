@@ -74,6 +74,11 @@ pub(crate) mod imp {
         Ok(f32_view.as_slice::<f32>().to_vec())
     }
 
+    #[allow(dead_code)]
+    // no caller: the decode loop pulls logits and samples inline. Kept as the
+    // one-shot form, but it is NOT exercised, so treat it as untested if you
+    // wire it up — two sampling paths that never run together is how
+    // `causal-mask-builders-agree` happened.
     /// One-shot helper: take the [1, L, V] logits array, sample the
     /// next token id using the supplied recent-token window and
     /// `lumen_core` sampling config. Hides the GPU→CPU pull so callers
@@ -90,6 +95,11 @@ pub(crate) mod imp {
         Ok(sample_from_logits(&mut buf, recent_tokens, cfg, rng))
     }
 
+    #[allow(dead_code)]
+    // no caller: the decode loop pulls logits and samples inline. Kept as the
+    // one-shot form, but it is NOT exercised, so treat it as untested if you
+    // wire it up — two sampling paths that never run together is how
+    // `causal-mask-builders-agree` happened.
     /// Grammar-constrained variant. When `grammar` is `Some` and the
     /// matcher is in its active (constraining) state, this masks logits
     /// to the set of tokens allowed by the grammar before sampling, then

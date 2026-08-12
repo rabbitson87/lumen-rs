@@ -44,8 +44,10 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2.0);
-    lumen_mlx::metal_memory::set_memory_limit((mem_gb * 1024.0 * 1024.0 * 1024.0) as usize);
-    lumen_mlx::metal_memory::set_cache_limit((cache_gb * 1024.0 * 1024.0 * 1024.0) as usize);
+    // Both return the PREVIOUS limit, which nothing here needs.
+    let _ = lumen_mlx::metal_memory::set_memory_limit((mem_gb * 1024.0 * 1024.0 * 1024.0) as usize);
+    let _ =
+        lumen_mlx::metal_memory::set_cache_limit((cache_gb * 1024.0 * 1024.0 * 1024.0) as usize);
     eprintln!("[vision] mlx limits: memory {mem_gb} GB, cache {cache_gb} GB");
 
     eprintln!("[vision] loading {model_id}");

@@ -351,11 +351,11 @@ pub(crate) mod imp {
     ///      `ArgumentsDelta` chunk at `<tool_call|>` close.)
     ///   3. Boundary tokens (`<|tool_call>` open / `<tool_call|>`
     ///      close). Suppressed — no event fires.
-    /// Per-token stderr trace. Enabled when `LUMEN_GEMMA4_TOKEN_TRACE` is
-    /// set to a non-empty / non-`0` / non-`false` value. Prints one line
-    /// per sampled token with id + decoded text (special tokens visible)
+    ///      Per-token stderr trace. Enabled when `LUMEN_GEMMA4_TOKEN_TRACE` is
+    ///      set to a non-empty / non-`0` / non-`false` value. Prints one line
+    ///      per sampled token with id + decoded text (special tokens visible)
     /// + parser state transition. Use for debugging reasoning runaway,
-    /// tool-call structure, or channel close failures.
+    ///   tool-call structure, or channel close failures.
     ///
     /// Cheap when off (single env lookup per call, cached on first hit
     /// via a `OnceLock`). Bounded cost when on (one decode per token,
@@ -424,12 +424,12 @@ pub(crate) mod imp {
         // fire the early ToolCallStart event.
         if matches!(state_after, ParseState::ToolCall) {
             let body_chunk = chat.decode(&[token], /* skip_special */ false)?;
-            if !body_chunk.is_empty() {
-                if let Some(name) = parser.observe_tool_text_fragment(&body_chunk) {
-                    on_event(BackendStreamEvent::ToolCallStart {
-                        name: name.as_str(),
-                    })?;
-                }
+            if !body_chunk.is_empty()
+                && let Some(name) = parser.observe_tool_text_fragment(&body_chunk)
+            {
+                on_event(BackendStreamEvent::ToolCallStart {
+                    name: name.as_str(),
+                })?;
             }
         }
         Ok(())
@@ -3947,7 +3947,7 @@ pub(crate) mod imp {
                                 Some((name, cnt))
                             })
                             .collect();
-                        entries.sort_by(|a, b| b.1.cmp(&a.1));
+                        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
                         let max_show = 25.min(entries.len());
                         eprintln!("[gemma4-primhist-dyn] top-{max_show} per-step:");
                         for (name, cnt) in entries.iter().take(max_show) {

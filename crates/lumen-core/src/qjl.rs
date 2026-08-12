@@ -34,7 +34,7 @@ const MAGIC: &[u8; 4] = b"TQJL";
 /// Number of u64 words needed to pack `m` bits.
 #[inline]
 pub fn packed_len(m: usize) -> usize {
-    (m + 63) / 64
+    m.div_ceil(64)
 }
 
 impl QJLProjector {

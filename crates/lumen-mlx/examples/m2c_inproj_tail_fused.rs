@@ -1,8 +1,8 @@
 //! M2c: the WIREABLE input-side fused kernel — conv1d(window-4) + silu + split
 //! + per-head q/k RMSNorm, ALL in one Metal dispatch, producing q_scaled,
-//! k_scaled, v_post directly. Replaces ~5 launches/layer (conv1d, silu, split,
-//! rms_norm×2) with 1. Validated bit-close against the current op-by-op path.
-//! This is the unit M4 wires into `layer_linear_attn_forward`.
+//!   k_scaled, v_post directly. Replaces ~5 launches/layer (conv1d, silu, split,
+//!   rms_norm×2) with 1. Validated bit-close against the current op-by-op path.
+//!   This is the unit M4 wires into `layer_linear_attn_forward`.
 //!
 //! Layout (27B decode b=1,s=1): conv_dim = 2*key_dim + value_dim,
 //! key_dim = nk*dn (q and k each), value_dim = nv*dv.
@@ -129,8 +129,8 @@ fn main() -> Result<()> {
         .as_dtype(Dtype::Float32)?;
     let scale_q = (dn as f32).powf(-0.5) * (dn as f32).powf(-0.5);
     let scale_k = (dn as f32).powf(-0.5);
-    let wq = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(&Array::from_f32(scale_q))?;
-    let wk = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(&Array::from_f32(scale_k))?;
+    let wq = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(Array::from_f32(scale_q))?;
+    let wk = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(Array::from_f32(scale_k))?;
     wq.eval()?;
     wk.eval()?;
 
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
             None => xk.multiply(&wk_)?,
         });
     }
-    let conv_out = mlx_rs::nn::silu(&acc.unwrap())?;
+    let conv_out = mlx_rs::nn::silu(acc.unwrap())?;
     let parts = mlx_rs::ops::split_sections(&conv_out, &[key_dim, 2 * key_dim], -1)?;
     let q_post = parts[0].reshape(&[nk, dn])?;
     let k_post = parts[1].reshape(&[nk, dn])?;

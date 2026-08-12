@@ -255,17 +255,17 @@ mod imp {
             // the run resuming it, leaving an f32 prefix under a bf16 suffix (or
             // the reverse). Concatenating those would either promote silently or
             // fail somewhere far from the cause.
-            if let Some(k) = self.keys.as_ref() {
-                if k.dtype() != keys.dtype() {
-                    return Err(anyhow!(
-                        "NativeKvCache: cache holds {:?} keys but received {:?}. A KV cache built \
+            if let Some(k) = self.keys.as_ref()
+                && k.dtype() != keys.dtype()
+            {
+                return Err(anyhow!(
+                    "NativeKvCache: cache holds {:?} keys but received {:?}. A KV cache built \
                          under a different LUMEN_MLX_KV_BF16 setting cannot be extended — discard \
                          the persisted cache (LUMEN_KV_DISK directory / prefix cache) or restore \
                          the previous setting.",
-                        k.dtype(),
-                        keys.dtype(),
-                    ));
-                }
+                    k.dtype(),
+                    keys.dtype(),
+                ));
             }
 
             let prev = self.offset;
@@ -301,7 +301,7 @@ mod imp {
             let need_grow = self
                 .keys
                 .as_ref()
-                .map_or(true, |k| new_total > k.shape()[2] as usize);
+                .is_none_or(|k| new_total > k.shape()[2] as usize);
 
             if need_grow {
                 let b = keys.shape()[0];
@@ -323,7 +323,7 @@ mod imp {
                     None => new_k,
                     Some(old) => {
                         // mlx_lm: trim partial last block before concat
-                        let trimmed = if prev % KV_CACHE_STEP != 0 {
+                        let trimmed = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             slice_axis2(&old, 0, prev as i32)?
                         } else {
                             old
@@ -335,7 +335,7 @@ mod imp {
                 self.values = Some(match self.values.take() {
                     None => new_v,
                     Some(old) => {
-                        let trimmed = if prev % KV_CACHE_STEP != 0 {
+                        let trimmed = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             slice_axis2(&old, 0, prev as i32)?
                         } else {
                             old
@@ -622,7 +622,7 @@ mod imp {
             let need_grow = self
                 .keys
                 .as_ref()
-                .map_or(true, |(kp, _, _)| new_total > kp.shape()[2] as usize);
+                .is_none_or(|(kp, _, _)| new_total > kp.shape()[2] as usize);
 
             if need_grow {
                 let b = keys.shape()[0];
@@ -660,7 +660,7 @@ mod imp {
                 self.keys = Some(match self.keys.take() {
                     None => (new_kp, new_ks, new_kb),
                     Some((kp, ks, kb)) => {
-                        let (kp_t, ks_t, kb_t) = if prev % KV_CACHE_STEP != 0 {
+                        let (kp_t, ks_t, kb_t) = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             (
                                 slice_axis2(&kp, 0, prev as i32)?,
                                 slice_axis2(&ks, 0, prev as i32)?,
@@ -681,7 +681,7 @@ mod imp {
                 self.values = Some(match self.values.take() {
                     None => (new_vp, new_vs, new_vb),
                     Some((vp, vs, vb)) => {
-                        let (vp_t, vs_t, vb_t) = if prev % KV_CACHE_STEP != 0 {
+                        let (vp_t, vs_t, vb_t) = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             (
                                 slice_axis2(&vp, 0, prev as i32)?,
                                 slice_axis2(&vs, 0, prev as i32)?,
@@ -1617,8 +1617,8 @@ mod imp {
     /// Memory at 1024-token ring (bits=4 unpacked uint8):
     ///   - codes  : [B, n_kv, 1024, D] uint8 = 1024 × D bytes per (K|V) per layer
     ///   - sigma  : [B, n_kv, 1024, 1] f32   = 4096 bytes per (K|V) per layer
-    /// vs bf16 baseline of 1024 × D × 2 bytes. 2× compression at uint8;
-    /// adding 4-bit packing would push to ~3.5×.
+    ///     vs bf16 baseline of 1024 × D × 2 bytes. 2× compression at uint8;
+    ///     adding 4-bit packing would push to ~3.5×.
     ///
     /// QJL Stage-2 (1-bit residual correction) is deferred — Stage 1 alone
     /// recovers ≥0.99 cosine similarity per the paper.

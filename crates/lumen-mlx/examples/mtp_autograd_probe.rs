@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     let uw = mkq(ff, h)?;
     let dw = mkq(h, ff)?;
     let lm = mkq(v, h)?;
-    let qmm = |x: &Array, q: &(Array, Array, Array)| -> anyhow::Result<Array> {
+    let _qmm = |x: &Array, q: &(Array, Array, Array)| -> anyhow::Result<Array> {
         quantized_matmul(x, &q.0, &q.1, Some(&q.2), Some(true), Some(gs), Some(bits))
             .map_err(Into::into)
     };
@@ -105,9 +105,9 @@ fn main() -> anyhow::Result<()> {
             // eh_proj base + LoRA delta = (concat·Aᵀ)·Bᵀ
             let base = g(&concat, &eh); // [n,1,h]
             let delta = concat
-                .matmul(&a.transpose_axes(&[1, 0]).unwrap())
+                .matmul(a.transpose_axes(&[1, 0]).unwrap())
                 .unwrap() // [n,1,r]
-                .matmul(&b.transpose_axes(&[1, 0]).unwrap())
+                .matmul(b.transpose_axes(&[1, 0]).unwrap())
                 .unwrap(); // [n,1,h]
             let cur = base.add(&delta).unwrap();
             // attention sub-block
@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
             let q4 = g(&cur_n, &qw).reshape(&[n, 1, heads, hd]).unwrap();
             let qn4 = rms_norm(&q4, &qn, eps).unwrap();
             let qt = rope(
-                &qn4.transpose_axes(&[0, 2, 1, 3]).unwrap(),
+                qn4.transpose_axes(&[0, 2, 1, 3]).unwrap(),
                 hd,
                 false,
                 Some(1.0e6f32),
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             let k4 = g(&cur_n, &kw).reshape(&[n, 1, kv, hd]).unwrap();
             let kn4 = rms_norm(&k4, &kn, eps).unwrap();
             let kt = rope(
-                &kn4.transpose_axes(&[0, 2, 1, 3]).unwrap(),
+                kn4.transpose_axes(&[0, 2, 1, 3]).unwrap(),
                 hd,
                 false,
                 Some(1.0e6f32),
@@ -153,9 +153,7 @@ fn main() -> anyhow::Result<()> {
             let cur_n2 = rms_norm(&cur, &w_post, eps).unwrap();
             let gate = g(&cur_n2, &gw);
             let up = g(&cur_n2, &uw);
-            let silu = gate
-                .multiply(&mlx_rs::ops::sigmoid(&gate).unwrap())
-                .unwrap();
+            let silu = gate.multiply(mlx_rs::ops::sigmoid(&gate).unwrap()).unwrap();
             let act = silu.multiply(&up).unwrap();
             let down = g(&act, &dw);
             let cur = down.add(&cur).unwrap();
@@ -165,7 +163,7 @@ fn main() -> anyhow::Result<()> {
             // CE
             let lse = logits.logsumexp_axis(1, false).unwrap();
             let tl = logits
-                .take_along_axis(&targets.reshape(&[n, 1]).unwrap(), 1)
+                .take_along_axis(targets.reshape(&[n, 1]).unwrap(), 1)
                 .unwrap()
                 .reshape(&[n])
                 .unwrap();

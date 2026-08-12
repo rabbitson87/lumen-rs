@@ -38,29 +38,29 @@ fn every_knob_can_veto_greedy_on_its_own() {
     let base = SamplingConfig::default();
     assert!(base.is_greedy(), "the default config is the greedy path");
 
-    let mut c = base.clone();
+    let mut c = base;
     c.temperature = 0.7;
     assert!(!c.is_greedy(), "temperature must veto");
 
-    let mut c = base.clone();
+    let mut c = base;
     c.repeat_penalty = 1.1;
     assert!(!c.is_greedy(), "repeat_penalty must veto");
 
-    let mut c = base.clone();
+    let mut c = base;
     c.presence_penalty = 0.5;
     assert!(!c.is_greedy(), "presence_penalty must veto");
 
-    let mut c = base.clone();
+    let mut c = base;
     c.frequency_penalty = 0.5;
     assert!(!c.is_greedy(), "frequency_penalty must veto");
 
-    let mut c = base.clone();
+    let mut c = base;
     c.dry.multiplier = 0.8;
     assert!(!c.is_greedy(), "DRY must veto");
 
     // min_p is excluded deliberately: it can never move the argmax, so it must
     // NOT veto. Pinning this stops someone "fixing" the omission.
-    let mut c = base.clone();
+    let mut c = base;
     c.min_p = 0.1;
     assert!(
         c.is_greedy(),
@@ -69,14 +69,14 @@ fn every_knob_can_veto_greedy_on_its_own() {
 
     // Boundary: temperature is `<= 0.0`, so exactly 0.0 is still greedy and the
     // smallest positive value is not.
-    let mut c = base.clone();
+    let mut c = base;
     c.temperature = 0.0;
     assert!(c.is_greedy());
     c.temperature = f32::MIN_POSITIVE;
     assert!(!c.is_greedy());
 
     // repeat_penalty uses an epsilon, not equality.
-    let mut c = base.clone();
+    let mut c = base;
     c.repeat_penalty = 1.0 + 1e-9;
     assert!(
         c.is_greedy(),
@@ -297,7 +297,7 @@ fn the_penalty_window_length_is_clamped_and_zero_disables_it() {
     // Window longer than the history: clamped, not an out-of-range slice.
     let cfg_long = SamplingConfig {
         repeat_penalty_last_n: 1000,
-        ..cfg_off.clone()
+        ..cfg_off
     };
     let mut logits = vec![1.0_f32, 1.0];
     let dist = sampling_distribution(&mut logits, &[0], &cfg_long);

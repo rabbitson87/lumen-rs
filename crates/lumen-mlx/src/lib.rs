@@ -12,7 +12,7 @@
 //!   or the legacy `LUMEN_MLX_SUBPROCESS=1` falls back to spawning `python
 //!   mlx_runner.py` and pipes newline-delimited JSON. Kept as a debugging aid
 //!   + as the supported path for environments where embedding Python
-//!   (libpython linkage) is impractical.
+//!     (libpython linkage) is impractical.
 //!
 //! - **Native Rust mlx-rs (`native`)**: `LUMEN_MLX_BACKEND=native` selects
 //!   `runner_native::NativeMlxRunner`, a pure-Rust port over `mlx-rs`. No
@@ -1217,11 +1217,11 @@ fn format_system_prefix(message: &(String, String)) -> String {
 ///    using the shared `native_*` primitives
 /// 2. Add a variant to this enum + `MlxBackendKind`
 /// 3. Wire arch detection in `MlxBackend::load`
-/// Phase 3: the minimal per-seq driver surface the batched MLX scheduler
-/// (`lumen-server::engine::run_batched_mlx`) needs, so one scheduler works for
-/// any MLX family (Qwen 3.6 + Gemma 4). Both backends implement it by forwarding
-/// to their inherent methods — the trait only exists so the scheduler can hold
-/// one `&mut dyn` regardless of family.
+///    Phase 3: the minimal per-seq driver surface the batched MLX scheduler
+///    (`lumen-server::engine::run_batched_mlx`) needs, so one scheduler works for
+///    any MLX family (Qwen 3.6 + Gemma 4). Both backends implement it by forwarding
+///    to their inherent methods — the trait only exists so the scheduler can hold
+///    one `&mut dyn` regardless of family.
 pub trait MlxBatchedSeqDriver {
     fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>>;
     fn eos_tokens(&self) -> &[u32];
@@ -2764,7 +2764,7 @@ impl MlxQwen35Backend {
     ///   - forward_ns: `self.model(arr, cache=cache)` (lazy graph build)
     ///   - sync_ns:    `mx.argmax(...).item()` (forces GPU sync)
     ///   - tail_ns:    `_apply_kv_quant` + state update
-    /// Returns empty Vec for non-PyO3 backends or when env was not set.
+    ///     Returns empty Vec for non-PyO3 backends or when env was not set.
     pub fn take_pyo3_decode_stage_timings(&mut self) -> Result<Vec<(u64, u64, u64, u64)>> {
         self.runner.take_pyo3_decode_stage_timings()
     }
@@ -3808,13 +3808,13 @@ impl MlxQwen35Backend {
             // For a named choice, the grammar must include the named tool; if the
             // engine didn't already downgrade an unknown name to Auto, skip rather
             // than build a grammar that can never match.
-            if let ResolvedToolChoice::Tool(name) = tool_choice {
-                if !tools.iter().any(|t| t.name == *name) {
-                    eprintln!(
-                        "[qwen35-backend] tool grammar skipped: tool_choice names unknown tool {name:?}"
-                    );
-                    return None;
-                }
+            if let ResolvedToolChoice::Tool(name) = tool_choice
+                && !tools.iter().any(|t| t.name == *name)
+            {
+                eprintln!(
+                    "[qwen35-backend] tool grammar skipped: tool_choice names unknown tool {name:?}"
+                );
+                return None;
             }
             let factory = self.grammar_factory()?;
             // Convert the borrowed ToolDefs into the OpenAI-style `tools` JSON the
@@ -4008,25 +4008,25 @@ impl MlxQwen35Backend {
         // object).
         #[cfg(feature = "mlx-native")]
         let _ = first_masked;
-        if let Some(g) = grammar.as_mut() {
-            if g.is_active() {
-                if let Err(e) = g.observe(last) {
-                    eprintln!(
-                        "[qwen35-backend] response_format grammar first-token observe \
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+            && let Err(e) = g.observe(last)
+        {
+            eprintln!(
+                "[qwen35-backend] response_format grammar first-token observe \
                          desynced (dropping grammar, sampling free): {e:#}"
-                    );
-                    grammar = None;
-                }
-            }
+            );
+            grammar = None;
         }
 
         let mut generated: Vec<u32> = vec![last];
         let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                emitted_idx = generated.len();
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            emitted_idx = generated.len();
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -4076,13 +4076,13 @@ impl MlxQwen35Backend {
             pos = new_pos;
             generated.push(next);
             let tail_start = emitted_idx;
-            if tail_start < generated.len() {
-                if let Ok(text) = self.decode(&generated[tail_start..]) {
-                    if !text.is_empty() && !text.contains('\u{FFFD}') {
-                        on_token(&text);
-                        emitted_idx = generated.len();
-                    }
-                }
+            if tail_start < generated.len()
+                && let Ok(text) = self.decode(&generated[tail_start..])
+                && !text.is_empty()
+                && !text.contains('\u{FFFD}')
+            {
+                on_token(&text);
+                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -4329,17 +4329,18 @@ impl MlxQwen35Backend {
         // hasn't opted out. Falls back to baseline decode_step otherwise so
         // unmtp-loaded deployments behave identically.
         #[cfg(feature = "mlx-native")]
-        if !has_images && self.qwen35_mtp_enabled() {
-            if let Some(k) = effective_qwen35_mtp_k() {
-                return self.chat_streaming_qwen35_mtp(
-                    messages,
-                    max_new_tokens,
-                    thinking,
-                    seq_id,
-                    k,
-                    on_token,
-                );
-            }
+        if !has_images
+            && self.qwen35_mtp_enabled()
+            && let Some(k) = effective_qwen35_mtp_k()
+        {
+            return self.chat_streaming_qwen35_mtp(
+                messages,
+                max_new_tokens,
+                thinking,
+                seq_id,
+                k,
+                on_token,
+            );
         }
 
         // OPT-IN draft-model speculative decode. Engaged only when (1) a draft
@@ -4371,17 +4372,17 @@ impl MlxQwen35Backend {
             );
         }
 
-        if self.prefix_store.enabled() {
-            if let Some(key) = auto_prefix_key(messages) {
-                return self.chat_streaming_prefix_cache(
-                    messages,
-                    max_new_tokens,
-                    thinking,
-                    seq_id,
-                    &key,
-                    on_token,
-                );
-            }
+        if self.prefix_store.enabled()
+            && let Some(key) = auto_prefix_key(messages)
+        {
+            return self.chat_streaming_prefix_cache(
+                messages,
+                max_new_tokens,
+                thinking,
+                seq_id,
+                &key,
+                on_token,
+            );
         }
 
         // Images change both halves: the prompt gains a placeholder run per
@@ -4442,23 +4443,24 @@ impl MlxQwen35Backend {
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
         let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                if stream_timing {
-                    let now = std::time::Instant::now();
-                    if t_first_emit.is_none() {
-                        t_first_emit = Some(now);
-                    }
-                    if n_emits == stream_skip {
-                        t_skip_emit = Some(now);
-                    }
-                    t_last_emit = Some(now);
-                    n_emits += 1;
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            if stream_timing {
+                let now = std::time::Instant::now();
+                if t_first_emit.is_none() {
+                    t_first_emit = Some(now);
                 }
-                on_token(&text);
-                prev_text = text;
-                emitted_idx = generated.len();
+                if n_emits == stream_skip {
+                    t_skip_emit = Some(now);
+                }
+                t_last_emit = Some(now);
+                n_emits += 1;
             }
+            on_token(&text);
+            prev_text = text;
+            emitted_idx = generated.len();
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -4474,27 +4476,11 @@ impl MlxQwen35Backend {
             generated.push(next);
             if incr_detok {
                 let tail_start = emitted_idx;
-                if tail_start < generated.len() {
-                    if let Ok(text) = self.decode(&generated[tail_start..]) {
-                        if !text.is_empty() && !text.contains('\u{FFFD}') {
-                            if stream_timing {
-                                let now = std::time::Instant::now();
-                                if t_first_emit.is_none() {
-                                    t_first_emit = Some(now);
-                                }
-                                if n_emits == stream_skip {
-                                    t_skip_emit = Some(now);
-                                }
-                                t_last_emit = Some(now);
-                                n_emits += 1;
-                            }
-                            on_token(&text);
-                            emitted_idx = generated.len();
-                        }
-                    }
-                }
-            } else if let Ok(text) = self.decode(&generated) {
-                if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
+                if tail_start < generated.len()
+                    && let Ok(text) = self.decode(&generated[tail_start..])
+                    && !text.is_empty()
+                    && !text.contains('\u{FFFD}')
+                {
                     if stream_timing {
                         let now = std::time::Instant::now();
                         if t_first_emit.is_none() {
@@ -4506,9 +4492,26 @@ impl MlxQwen35Backend {
                         t_last_emit = Some(now);
                         n_emits += 1;
                     }
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                    on_token(&text);
+                    emitted_idx = generated.len();
                 }
+            } else if let Ok(text) = self.decode(&generated)
+                && text.len() > prev_text.len()
+                && !text.contains('\u{FFFD}')
+            {
+                if stream_timing {
+                    let now = std::time::Instant::now();
+                    if t_first_emit.is_none() {
+                        t_first_emit = Some(now);
+                    }
+                    if n_emits == stream_skip {
+                        t_skip_emit = Some(now);
+                    }
+                    t_last_emit = Some(now);
+                    n_emits += 1;
+                }
+                on_token(&text[prev_text.len()..]);
+                prev_text = text;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -4524,22 +4527,20 @@ impl MlxQwen35Backend {
             "[mlx] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
             n_gen as f64 / (decode_ms / 1000.0)
         );
-        if stream_timing {
-            if let (Some(tf), Some(tl)) = (t_first_emit, t_last_emit) {
-                let emit_span_ms = (tl - tf).as_secs_f64() * 1000.0;
-                let steady_span_ms = t_skip_emit
-                    .map(|ts| (tl - ts).as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                let steady_n = n_emits.saturating_sub(stream_skip + 1);
-                let steady_rate = if steady_span_ms > 0.0 {
-                    steady_n as f64 / (steady_span_ms / 1000.0)
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[stream-timing] seq {seq_id} emit: n_emits={n_emits} first->last={emit_span_ms:.1}ms skip{stream_skip}->last={steady_span_ms:.1}ms steady_rate_emit={steady_rate:.2}tok/s"
-                );
-            }
+        if stream_timing && let (Some(tf), Some(tl)) = (t_first_emit, t_last_emit) {
+            let emit_span_ms = (tl - tf).as_secs_f64() * 1000.0;
+            let steady_span_ms = t_skip_emit
+                .map(|ts| (tl - ts).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let steady_n = n_emits.saturating_sub(stream_skip + 1);
+            let steady_rate = if steady_span_ms > 0.0 {
+                steady_n as f64 / (steady_span_ms / 1000.0)
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[stream-timing] seq {seq_id} emit: n_emits={n_emits} first->last={emit_span_ms:.1}ms skip{stream_skip}->last={steady_span_ms:.1}ms steady_rate_emit={steady_rate:.2}tok/s"
+            );
         }
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
@@ -4968,24 +4969,24 @@ impl MlxQwen35Backend {
         // rejects) drops the grammar → free sampling, never a corrupt masked
         // decode. Unlike the first *generated* token above, these are tokens the
         // prompt already committed to, so there is nothing left to constrain.
-        if let Some(g) = grammar.as_mut() {
-            if g.is_active() {
-                let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
-                if !desync {
-                    for tok in &prefill_tokens {
-                        if let Err(e) = g.observe_prefill(*tok) {
-                            eprintln!(
-                                "[qwen35-backend] grammar prefill replay desynced \
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+        {
+            let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
+            if !desync {
+                for tok in &prefill_tokens {
+                    if let Err(e) = g.observe_prefill(*tok) {
+                        eprintln!(
+                            "[qwen35-backend] grammar prefill replay desynced \
                                  (dropping grammar, sampling free): {e:#}"
-                            );
-                            desync = true;
-                            break;
-                        }
+                        );
+                        desync = true;
+                        break;
                     }
                 }
-                if desync {
-                    grammar = None;
-                }
+            }
+            if desync {
+                grammar = None;
             }
         }
 
@@ -5020,16 +5021,15 @@ impl MlxQwen35Backend {
                 }
             }
         }
-        if let Some(g) = grammar.as_mut() {
-            if g.is_active() {
-                if let Err(e) = g.observe(last) {
-                    eprintln!(
-                        "[qwen35-backend] grammar first-token observe desynced \
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+            && let Err(e) = g.observe(last)
+        {
+            eprintln!(
+                "[qwen35-backend] grammar first-token observe desynced \
                          (dropping grammar, sampling free): {e:#}"
-                    );
-                    grammar = None;
-                }
-            }
+            );
+            grammar = None;
         }
 
         // The grammar (WS-C #2) enforces required params structurally and
@@ -5091,45 +5091,45 @@ impl MlxQwen35Backend {
             // model writes the value instead of closing an empty call
             // (`<function=read></function>` → "path is required"). The value
             // is still model-generated — only the opener is forced.
-            if force_active {
-                if let Some(key) = parser.next_required_param_to_force(&force_required) {
-                    let inj = format!("<parameter={key}>\n");
-                    let inj_tokens = self.encode_raw(&inj)?;
-                    if !inj_tokens.is_empty() {
-                        // Forward the still-unforwarded `last` plus the opener
-                        // in one extend; `last` is consumed (already pushed +
-                        // fed in the prior step).
-                        let mut combined = Vec::with_capacity(1 + inj_tokens.len());
-                        combined.push(last);
-                        combined.extend_from_slice(&inj_tokens);
-                        let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
-                        generated.extend_from_slice(&inj_tokens);
-                        emitted_idx = generated.len();
-                        for ev in parser.feed(&inj) {
+            if force_active && let Some(key) = parser.next_required_param_to_force(&force_required)
+            {
+                let inj = format!("<parameter={key}>\n");
+                let inj_tokens = self.encode_raw(&inj)?;
+                if !inj_tokens.is_empty() {
+                    // Forward the still-unforwarded `last` plus the opener
+                    // in one extend; `last` is consumed (already pushed +
+                    // fed in the prior step).
+                    let mut combined = Vec::with_capacity(1 + inj_tokens.len());
+                    combined.push(last);
+                    combined.extend_from_slice(&inj_tokens);
+                    let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
+                    generated.extend_from_slice(&inj_tokens);
+                    emitted_idx = generated.len();
+                    for ev in parser.feed(&inj) {
+                        forward_parse_event(ev, &mut on_event)?;
+                    }
+                    if debug_qwen_tools {
+                        eprintln!("[qwen35-tools] forced required param {key:?}");
+                    }
+                    // `next2` is produced-but-unforwarded — it becomes the
+                    // new `last`; push + feed it to restore the loop's
+                    // top-of-iteration invariant, then re-evaluate.
+                    last = next2;
+                    pos = pos2;
+                    generated.push(last);
+                    if let Ok(text) = self.decode(&generated[emitted_idx..])
+                        && !text.is_empty()
+                        && !text.contains('\u{FFFD}')
+                    {
+                        for ev in parser.feed(&text) {
                             forward_parse_event(ev, &mut on_event)?;
                         }
-                        if debug_qwen_tools {
-                            eprintln!("[qwen35-tools] forced required param {key:?}");
-                        }
-                        // `next2` is produced-but-unforwarded — it becomes the
-                        // new `last`; push + feed it to restore the loop's
-                        // top-of-iteration invariant, then re-evaluate.
-                        last = next2;
-                        pos = pos2;
-                        generated.push(last);
-                        if let Ok(text) = self.decode(&generated[emitted_idx..]) {
-                            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                                for ev in parser.feed(&text) {
-                                    forward_parse_event(ev, &mut on_event)?;
-                                }
-                                emitted_idx = generated.len();
-                            }
-                        }
-                        if self.eos_tokens.contains(&last) {
-                            break;
-                        }
-                        continue;
+                        emitted_idx = generated.len();
                     }
+                    if self.eos_tokens.contains(&last) {
+                        break;
+                    }
+                    continue;
                 }
             }
             // Grammar-masked decode when active: same forward (KV + SSM state
@@ -5180,18 +5180,18 @@ impl MlxQwen35Backend {
             pos = new_pos;
             generated.push(next);
             let tail_start = emitted_idx;
-            if tail_start < generated.len() {
-                if let Ok(text) = self.decode(&generated[tail_start..]) {
-                    if !text.is_empty() && !text.contains('\u{FFFD}') {
-                        if debug_qwen_tools {
-                            eprintln!("[qwen35-tools] step={step} text={text:?}");
-                        }
-                        for ev in parser.feed(&text) {
-                            forward_parse_event(ev, &mut on_event)?;
-                        }
-                        emitted_idx = generated.len();
-                    }
+            if tail_start < generated.len()
+                && let Ok(text) = self.decode(&generated[tail_start..])
+                && !text.is_empty()
+                && !text.contains('\u{FFFD}')
+            {
+                if debug_qwen_tools {
+                    eprintln!("[qwen35-tools] step={step} text={text:?}");
                 }
+                for ev in parser.feed(&text) {
+                    forward_parse_event(ev, &mut on_event)?;
+                }
+                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -5407,11 +5407,12 @@ impl MlxQwen35Backend {
         // ── Decode loop (parallel to chat_streaming) ──
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
@@ -5426,11 +5427,12 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            if let Ok(text) = self.decode(&generated) {
-                if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
-                }
+            if let Ok(text) = self.decode(&generated)
+                && text.len() > prev_text.len()
+                && !text.contains('\u{FFFD}')
+            {
+                on_token(&text[prev_text.len()..]);
+                prev_text = text;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -5457,13 +5459,12 @@ impl MlxQwen35Backend {
     /// delivery. No-op when `persist` is `None` or the disk tier is off;
     /// non-fatal on error (the request already succeeded).
     fn persist_boundary_snapshot(&mut self, persist: Option<(u64, Vec<u32>)>, key: &str) {
-        if let Some((snap_id, prefix)) = persist {
-            if let Err(e) = self
+        if let Some((snap_id, prefix)) = persist
+            && let Err(e) = self
                 .runner
                 .persist_snapshot_disk(snap_id, key, &prefix, None)
-            {
-                eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
-            }
+        {
+            eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
         }
         // L2 spill: under memory pressure, drop cold in-memory snapshots (now
         // durably on disk) to free RAM; they rehydrate on next access. Off
@@ -5659,11 +5660,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -5688,11 +5690,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -5734,11 +5737,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d1);
                 history.push(d1);
                 stats.committed_via_spec += 2;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&d0) || self.eos_tokens.contains(&d1) {
                     break;
@@ -5752,11 +5756,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, row1);
                 history.push(row1);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&row1) {
                     break;
@@ -5779,11 +5784,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d0);
                 history.push(d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&d0) {
                     break;
@@ -5800,11 +5806,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, after_d0);
                 history.push(after_d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&after_d0) {
                     break;
@@ -5865,11 +5872,12 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -5915,11 +5923,12 @@ impl MlxQwen35Backend {
                     break;
                 }
                 generated.push(*tok);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(tok) {
                     stop = true;
@@ -6034,11 +6043,12 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
 
         if !self.eos_tokens.contains(&last) {
@@ -6047,11 +6057,12 @@ impl MlxQwen35Backend {
                 last = next;
                 pos = new_pos;
                 generated.push(next);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&next) {
                     break;
@@ -6775,6 +6786,8 @@ mod tests {
         assert!(auto_prefix_key(&empty_sys).is_none());
     }
 
+    #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to
+    // `bench_qwen35_mtp_realprompt`, which parses its own.
     fn parse_prompt_tokens_env() -> Option<Vec<u32>> {
         let raw = std::env::var("PROMPT_TOKENS").ok()?;
         let tokens: Vec<u32> = raw

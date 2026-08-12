@@ -356,7 +356,7 @@ fn main() -> Result<()> {
                 seq_total += 1;
                 if x == y {
                     seq_match += 1;
-                } else if first_divergence.map_or(true, |d| k < d) {
+                } else if first_divergence.is_none_or(|d| k < d) {
                     first_divergence = Some(k);
                 }
             }

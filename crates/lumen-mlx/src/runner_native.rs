@@ -439,7 +439,7 @@ mod imp {
                     "native mlx-rs loader requires non-zero attention heads, KV heads, and layers"
                 ));
             }
-            if self.hidden_size % self.num_attention_heads != 0 {
+            if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
                 return Err(anyhow!(
                     "native mlx-rs loader expected hidden_size to be divisible by num_attention_heads, got {} % {}",
                     self.hidden_size,
@@ -1739,10 +1739,10 @@ mod imp {
                     };
                     // Every seq shares prompt[..p] by construction of the LCP.
                     for id in seq_ids {
-                        if let Some(s) = self.seqs.get_mut(id) {
-                            if s.cache.shared_prefix_len() == 0 {
-                                s.cache.keep_suffix_from(p)?;
-                            }
+                        if let Some(s) = self.seqs.get_mut(id)
+                            && s.cache.shared_prefix_len() == 0
+                        {
+                            s.cache.keep_suffix_from(p)?;
                         }
                     }
                     eprintln!(
@@ -1762,16 +1762,15 @@ mod imp {
                         .map(|s| s.prompt[..p].to_vec());
                     if let Some(refpx) = reference {
                         for id in seq_ids {
-                            if let Some(s) = self.seqs.get_mut(id) {
-                                if s.cache.shared_prefix_len() == 0
-                                    && s.prompt.len() >= p
-                                    && s.prompt[..p] == refpx[..]
-                                {
-                                    s.cache.keep_suffix_from(p)?;
-                                    eprintln!(
-                                        "[mlx shared-prefix] attached late seq {id} at prefix_len={p}"
-                                    );
-                                }
+                            if let Some(s) = self.seqs.get_mut(id)
+                                && s.cache.shared_prefix_len() == 0
+                                && s.prompt.len() >= p
+                                && s.prompt[..p] == refpx[..]
+                            {
+                                s.cache.keep_suffix_from(p)?;
+                                eprintln!(
+                                    "[mlx shared-prefix] attached late seq {id} at prefix_len={p}"
+                                );
                             }
                         }
                     }

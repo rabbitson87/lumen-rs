@@ -299,18 +299,17 @@ impl NativeModelConfig {
             ));
         }
         self.text_config.validate()?;
-        if let Some(quant) = &self.quantization_config {
-            if (quant.mode != "mxfp4" && quant.mode != "nvfp4")
+        if let Some(quant) = &self.quantization_config
+            && ((quant.mode != "mxfp4" && quant.mode != "nvfp4")
                 || quant.bits != 4
-                || quant.group_size == 0
-            {
-                return Err(anyhow!(
-                    "quantization_config must default to (mxfp4|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
-                    quant.mode,
-                    quant.bits,
-                    quant.group_size
-                ));
-            }
+                || quant.group_size == 0)
+        {
+            return Err(anyhow!(
+                "quantization_config must default to (mxfp4|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
+                quant.mode,
+                quant.bits,
+                quant.group_size
+            ));
         }
         Ok(())
     }
@@ -406,7 +405,7 @@ impl NativeTextConfig {
         // RoPE rotary span — partial_rotary_factor == 0.25 → rope_dim = 64 for
         // head_dim=256. Must be even (RoPE rotates pairs).
         let rope_dim = self.rope_dim();
-        if rope_dim == 0 || rope_dim % 2 != 0 {
+        if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
             return Err(anyhow!(
                 "rope_dim {} (= head_dim {} × partial_rotary_factor {}) must be a positive even number",
                 rope_dim,
@@ -501,7 +500,7 @@ impl NativeQwen36VisionConfig {
         {
             return Err(anyhow!("vision_config has zero-valued core dims"));
         }
-        if self.hidden_size % self.num_heads != 0 {
+        if !self.hidden_size.is_multiple_of(self.num_heads) {
             return Err(anyhow!(
                 "vision hidden_size ({}) is not divisible by num_heads ({})",
                 self.hidden_size,
@@ -510,7 +509,7 @@ impl NativeQwen36VisionConfig {
         }
         // The rotary table is built over `head_dim / 2` and split in half
         // again for the (h, w) pair, so head_dim must be a multiple of 4.
-        if self.head_dim() % 4 != 0 {
+        if !self.head_dim().is_multiple_of(4) {
             return Err(anyhow!(
                 "vision head_dim ({}) must be a multiple of 4 for 2-D RoPE",
                 self.head_dim()

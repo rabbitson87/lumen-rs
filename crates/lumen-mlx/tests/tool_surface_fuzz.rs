@@ -141,10 +141,10 @@ fn args_to_json_survives_generated_bodies() {
         // all, which fails for a reason that has nothing to do with the code
         // under test.
         let mut candidates = vec![g.output.text.clone()];
-        if let (Some(a), Some(b)) = (g.output.text.find('{'), g.output.text.rfind('}')) {
-            if a < b {
-                candidates.push(g.output.text[a..=b].to_string());
-            }
+        if let (Some(a), Some(b)) = (g.output.text.find('{'), g.output.text.rfind('}'))
+            && a < b
+        {
+            candidates.push(g.output.text[a..=b].to_string());
         }
         for c in candidates {
             if let Ok(v) = gemma4_args_to_json(&c) {

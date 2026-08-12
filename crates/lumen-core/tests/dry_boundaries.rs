@@ -159,7 +159,7 @@ fn a_very_long_repetition_stays_finite() {
         penalty_last_n: 4096,
     };
     // 400 repeats of a 2-gram — far past where 1.75^n overflows f32.
-    let recent: Vec<u32> = std::iter::repeat([7u32, 8]).take(400).flatten().collect();
+    let recent: Vec<u32> = std::iter::repeat_n([7u32, 8], 400).flatten().collect();
     let mut logits = vec![0.0_f32; 16];
     apply_dry_penalty(&mut logits, &recent, &cfg);
 
@@ -190,7 +190,7 @@ fn a_base_of_exactly_one_does_not_divide_by_zero() {
         "base 1.0 is enabled, so this path is live"
     );
 
-    let recent: Vec<u32> = std::iter::repeat([7u32, 8]).take(200).flatten().collect();
+    let recent: Vec<u32> = std::iter::repeat_n([7u32, 8], 200).flatten().collect();
     let mut logits = vec![0.0_f32; 16];
     apply_dry_penalty(&mut logits, &recent, &cfg);
     assert!(

@@ -9,7 +9,7 @@
 //! the 35B-A3B HF original (`Qwen/Qwen3.6-35B-A3B`) when cached. Trunk
 //! integration lands in Phase 2 S3 — this smoke only proves the loader
 //! + block dispatch are correct; argmax content is meaningless without
-//! the real trunk lm_head.
+//!   the real trunk lm_head.
 //!
 //! Required env:
 //!   LUMEN_QWEN35_HF_ORIGINAL = snapshot directory holding the HF-original

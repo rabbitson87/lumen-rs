@@ -19,8 +19,8 @@
 //!   in_proj_z / in_proj_b / in_proj_a 4-way MXFP4 matmuls + reshape
 //!   + Conv1d depthwise (kernel=4) over the persistent conv_state cache slot
 //!   + SiLU + per-head q/k RMSNorm with `inv_scale^{1,2}` rescaling +
-//!   `gated_delta_step_kernel` Metal SSM update + RMSNormGated output gate +
-//!   out_proj MXFP4 matmul. Mirrors `qwen3_next.Qwen3NextGatedDeltaNet.__call__`.
+//!     `gated_delta_step_kernel` Metal SSM update + RMSNormGated output gate +
+//!     out_proj MXFP4 matmul. Mirrors `qwen3_next.Qwen3NextGatedDeltaNet.__call__`.
 //! * **Phase 3d.4** — `layer_moe_forward()` wiring of `Qwen3NextSparseMoeBlock`
 //!   (8-bit affine `gate` → softmax(precise) → top-k argpartition → mxfp4
 //!   `switch_mlp` swiglu via `gather_qmm_with_mode` (mirroring `SwitchGLU`'s
@@ -47,8 +47,8 @@
 mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
-    use serde::Deserialize;
-    use std::collections::{BTreeMap, HashMap};
+
+    use std::collections::HashMap;
     use std::ffi::CStr;
     use std::path::Path;
     use std::time::Instant;
@@ -675,12 +675,7 @@ mod imp {
     /// attention at 4-bit preserves accept while 2-bit MLP cuts the bulk of bytes
     /// → fast baseline + high accept → MTP toward ~21. bits∈{2,3,4} (4 = keep).
     fn requant_target_bits_for(base: &str) -> Option<i32> {
-        let parse = |s: String| {
-            s.trim()
-                .parse::<i32>()
-                .ok()
-                .filter(|b| matches!(b, 2 | 3 | 4))
-        };
+        let parse = |s: String| s.trim().parse::<i32>().ok().filter(|b| matches!(b, 2..=4));
         let key = if base.contains(".mlp") {
             "LUMEN_NATIVE_REQUANT_MLP_BITS"
         } else {
@@ -942,7 +937,7 @@ mod imp {
     ///   * `scale_k`       — Array::from_f32(inv_scale), 30 callsites/step
     ///   * `keep_indices_decode` — Array::from_slice for s=1 decode regime,
     ///     30 callsites/step (prefill keeps dynamic path since `s` varies)
-    /// Total: ~120 allocs/step → 0 (cached refs).
+    ///     Total: ~120 allocs/step → 0 (cached refs).
     ///
     /// **WASH at 35B server long-prompt n=5 A/B (2026-05-03)**: A_off
     /// 169.71 vs B_reuse_on 168.61 tok/s = Δ -0.6% σ -1.35 (within noise).
@@ -1012,12 +1007,12 @@ mod imp {
         }
     }
 
-    /// Returns true when wrapper-alloc reduction lever is on.
-    /// **Default ON 2026-05-11** — required by linear_attn_scale_fuse (default ON);
-    /// pairs with that lever to produce the -0.315ms WIN at t=-3.33σ.
-    /// Cached LinearAttnConstants (ones_w + scale_q/k + keep_indices + scaled_w_q/k).
-    /// Bit-identical to per-call construction (same dtype/shape/value).
-    /// Opt out with `LUMEN_NATIVE_ALLOC_REUSE=0`.
+    // Returns true when wrapper-alloc reduction lever is on.
+    // **Default ON 2026-05-11** — required by linear_attn_scale_fuse (default ON);
+    // pairs with that lever to produce the -0.315ms WIN at t=-3.33σ.
+    // Cached LinearAttnConstants (ones_w + scale_q/k + keep_indices + scaled_w_q/k).
+    // Bit-identical to per-call construction (same dtype/shape/value).
+    // Opt out with `LUMEN_NATIVE_ALLOC_REUSE=0`.
     lumen_flags::flag! {
         /// Reuse per-layer scratch allocations across decode steps instead of
         /// reallocating. Default ON (LANDED 2026-05-11). Prerequisite for
@@ -1034,16 +1029,16 @@ mod imp {
         alloc_reuse::get()
     }
 
-    /// Linear-attn scale fuse: absorb `scale_q/k` into rms_norm weight.
-    /// **Default ON 2026-05-11** — thermal-clean A/B (n=10, STEPS=100) confirmed
-    /// Δ=-0.315ms, Welch t=-3.33σ WIN. Closes 51% of remaining decode gap;
-    /// Native (14.075ms) vs PyO3 (13.913ms) = 1.16% slower (was 2.4%).
-    /// Only active when `alloc_reuse_enabled()` is also true (the fused-weight
-    /// constants live in `LinearAttnConstants`). Opt out with
-    /// `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE=0`.
-    /// Identified via op-by-op forward divergence audit 2026-05-11 — 42 ops/step
-    /// removed (highest single divergence). Bit-identical by linearity of rms_norm
-    /// weight scaling.
+    // Linear-attn scale fuse: absorb `scale_q/k` into rms_norm weight.
+    // **Default ON 2026-05-11** — thermal-clean A/B (n=10, STEPS=100) confirmed
+    // Δ=-0.315ms, Welch t=-3.33σ WIN. Closes 51% of remaining decode gap;
+    // Native (14.075ms) vs PyO3 (13.913ms) = 1.16% slower (was 2.4%).
+    // Only active when `alloc_reuse_enabled()` is also true (the fused-weight
+    // constants live in `LinearAttnConstants`). Opt out with
+    // `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE=0`.
+    // Identified via op-by-op forward divergence audit 2026-05-11 — 42 ops/step
+    // removed (highest single divergence). Bit-identical by linearity of rms_norm
+    // weight scaling.
     lumen_flags::flag! {
         /// Absorb `scale_q/k` into the rms_norm weight (bit-identical by
         /// linearity of rms_norm weight scaling). Default ON 2026-05-11:
@@ -1060,11 +1055,11 @@ mod imp {
         linear_attn_scale_fuse::get()
     }
 
-    /// Divergence #4: conv-state advance via `slice` (mlx_slice view/copy)
-    /// instead of `take_axis` (gather kernel). Mirrors Python
-    /// `mx.contiguous(conv_input[:, -n_keep:, :])`. Bit-identical for s==1
-    /// decode regime — same indices `[s, s+1, ..., total_len-1]` but cheaper
-    /// Metal kernel. Opt out with `LUMEN_NATIVE_CONV_SLICE=0`.
+    // Divergence #4: conv-state advance via `slice` (mlx_slice view/copy)
+    // instead of `take_axis` (gather kernel). Mirrors Python
+    // `mx.contiguous(conv_input[:, -n_keep:, :])`. Bit-identical for s==1
+    // decode regime — same indices `[s, s+1, ..., total_len-1]` but cheaper
+    // Metal kernel. Opt out with `LUMEN_NATIVE_CONV_SLICE=0`.
     lumen_flags::flag! {
         /// Conv-state advance via `slice` (view/copy) instead of `take_axis`
         /// (gather kernel). Bit-identical for the s==1 decode regime — same
@@ -1108,12 +1103,12 @@ mod imp {
             .unwrap_or(false)
     }
 
-    /// M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
-    /// split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
-    /// ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
-    /// non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
-    /// default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
-    /// the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
+    // M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
+    // split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
+    // ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
+    // non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
+    // default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
+    // the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
     lumen_flags::flag! {
         /// Fused input-side linear-attn kernel (conv+silu+q/k-norm). Built to
         /// completion, output bit-identical, measured 0 speedup — MLX async
@@ -2157,7 +2152,7 @@ mod imp {
                 let new_conv_state = {
                     use mlx_rs::ops::indexing::TryIndexOp;
                     conv_input
-                        .try_index((.., (s as i32)..(total_len as i32), ..))
+                        .try_index((.., s..total_len, ..))
                         .context("probe: slice conv_state failed")?
                 };
                 cache.set(0, new_conv_state)?;
@@ -2208,7 +2203,7 @@ mod imp {
             let new_conv_state = if conv_slice_enabled() && s == 1 {
                 use mlx_rs::ops::indexing::TryIndexOp;
                 conv_input
-                    .try_index((.., (s as i32)..(total_len as i32), ..))
+                    .try_index((.., s..total_len, ..))
                     .context("layer_linear_attn_forward: slice(conv_state, decode) failed")?
             } else if alloc_reuse_enabled() && s == 1 {
                 mlx_rs::ops::indexing::take_axis(
@@ -2942,14 +2937,14 @@ mod imp {
             positions: RopePlan<'_>,
             soft: VisionSoft<'_>,
         ) -> Result<(Array, Vec<Array>)> {
-            if let RopePlan::Explicit(pos) = positions {
-                if pos.len() != input_ids.len() {
-                    return Err(anyhow!(
-                        "forward: {} rope positions for {} tokens",
-                        pos.len(),
-                        input_ids.len()
-                    ));
-                }
+            if let RopePlan::Explicit(pos) = positions
+                && pos.len() != input_ids.len()
+            {
+                return Err(anyhow!(
+                    "forward: {} rope positions for {} tokens",
+                    pos.len(),
+                    input_ids.len()
+                ));
             }
             if input_ids.is_empty() {
                 return Err(anyhow!("forward: input_ids is empty"));
@@ -3107,10 +3102,10 @@ mod imp {
             // block's `h_pre` input. Cheap refcount clone — captured even when
             // the slot already holds a stale value (overwritten). The slot is
             // drained by `take_captured_h()` after the trunk forward returns.
-            if self.mtp_capture_enabled.load(Ordering::Relaxed) {
-                if let Ok(mut slot) = self.mtp_capture_slot.lock() {
-                    *slot = Some(hidden_states.clone());
-                }
+            if self.mtp_capture_enabled.load(Ordering::Relaxed)
+                && let Ok(mut slot) = self.mtp_capture_slot.lock()
+            {
+                *slot = Some(hidden_states.clone());
             }
 
             // Final RMSNorm + lm_head projection. `tie_word_embeddings = false`
@@ -3477,10 +3472,8 @@ mod imp {
         }
         fn set_ssm_capture_enabled(&self, on: bool) {
             self.ssm_capture_enabled.store(on, Ordering::Relaxed);
-            if on {
-                if let Ok(mut s) = self.ssm_capture_slot.lock() {
-                    s.clear();
-                }
+            if on && let Ok(mut s) = self.ssm_capture_slot.lock() {
+                s.clear();
             }
         }
         fn push_ssm_capture(&self, layer_idx: usize, state_per_pos: Array, conv_input: Array) {
@@ -3760,7 +3753,7 @@ mod imp {
             let tgt_all = Array::from_slice(&t_all, &[n as i32]);
 
             // Probe vocab from a 1-row lm_head application.
-            let row0 = x_all.take_axis(&Array::from_slice(&[0i32], &[1]), 0)?;
+            let row0 = x_all.take_axis(Array::from_slice(&[0i32], &[1]), 0)?;
             let probe = self.lm_head_apply(&row0)?;
             let vocab = probe.shape()[probe.ndim() - 1];
 
@@ -3893,8 +3886,8 @@ mod imp {
                     move |args: &[Array]| -> Vec<Array> {
                         let a = &args[0];
                         let b = &args[1];
-                        let ha = xb.matmul(&a.transpose_axes(&[1, 0]).unwrap()).unwrap();
-                        let delta = ha.matmul(&b.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        let ha = xb.matmul(a.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        let delta = ha.matmul(b.transpose_axes(&[1, 0]).unwrap()).unwrap();
                         // HIDDEN mode: map the hidden-space delta through the
                         // frozen dense lm_head into logit space; else delta IS
                         // the logit correction.
@@ -3911,7 +3904,7 @@ mod imp {
                         let logits = base.add(&delta_logits).unwrap();
                         let lse = logits.logsumexp_axis(1, false).unwrap();
                         let tl = logits
-                            .take_along_axis(&tb.reshape(&[bsz, 1]).unwrap(), 1)
+                            .take_along_axis(tb.reshape(&[bsz, 1]).unwrap(), 1)
                             .unwrap()
                             .reshape(&[bsz])
                             .unwrap();
@@ -4175,7 +4168,7 @@ mod imp {
                 } else {
                     let lse = logits.logsumexp_axis(1, false).unwrap();
                     let tl = logits
-                        .take_along_axis(&t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
+                        .take_along_axis(t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
                         .unwrap()
                         .reshape(&[m_tr as i32])
                         .unwrap();
@@ -4550,15 +4543,15 @@ mod imp {
                         self.hidden_to_host_f32(&new_h)?
                     };
                     if proc_active {
-                        if let Ok(slot) = self.mtp_procrustes.lock() {
-                            if let Some(c) = slot.as_ref() {
-                                c.apply(&mut hv, k + 1);
-                            }
-                        }
-                    } else if let Ok(slot) = self.mtp_corrector.lock() {
-                        if let Some(c) = slot.as_ref() {
+                        if let Ok(slot) = self.mtp_procrustes.lock()
+                            && let Some(c) = slot.as_ref()
+                        {
                             c.apply(&mut hv, k + 1);
                         }
+                    } else if let Ok(slot) = self.mtp_corrector.lock()
+                        && let Some(c) = slot.as_ref()
+                    {
+                        c.apply(&mut hv, k + 1);
                     }
                     Array::from_slice(&hv, &[1, 1, hidden_dim])
                 } else {
@@ -4611,25 +4604,23 @@ mod imp {
                     let ys: Vec<Option<Vec<f32>>> = (0..n_pairs)
                         .map(|k| self.logits_row_to_cpu_f32(&vh, k as i32).ok())
                         .collect();
-                    if calib_active {
-                        if let Ok(mut slot) = self.mtp_calib.lock() {
-                            if let Some(stats) = slot.as_mut() {
-                                for k in 0..n_pairs {
-                                    if let Some(y) = &ys[k] {
-                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
-                                    }
-                                }
+                    if calib_active
+                        && let Ok(mut slot) = self.mtp_calib.lock()
+                        && let Some(stats) = slot.as_mut()
+                    {
+                        for k in 0..n_pairs {
+                            if let Some(y) = &ys[k] {
+                                stats.observe(k + 1, &draft_hiddens_host[k], y);
                             }
                         }
                     }
-                    if proc_calib_active {
-                        if let Ok(mut slot) = self.mtp_proc_calib.lock() {
-                            if let Some(stats) = slot.as_mut() {
-                                for k in 0..n_pairs {
-                                    if let Some(y) = &ys[k] {
-                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
-                                    }
-                                }
+                    if proc_calib_active
+                        && let Ok(mut slot) = self.mtp_proc_calib.lock()
+                        && let Some(stats) = slot.as_mut()
+                    {
+                        for k in 0..n_pairs {
+                            if let Some(y) = &ys[k] {
+                                stats.observe(k + 1, &draft_hiddens_host[k], y);
                             }
                         }
                     }
@@ -4703,14 +4694,13 @@ mod imp {
                 // C4 calib: pair each draft's lm_head input (norm_out =
                 // draft_hiddens_host[k]) with the trunk's correct token
                 // (preds[k]). Trains the lm_head LoRA to re-aim the draft logits.
-                if c4_calib_active {
-                    if let Ok(mut slot) = self.mtp_c4_calib.lock() {
-                        if let Some((xs, tgts)) = slot.as_mut() {
-                            for k in 0..n_draft.min(draft_hiddens_host.len()) {
-                                xs.push(draft_hiddens_host[k].clone());
-                                tgts.push(preds[k]);
-                            }
-                        }
+                if c4_calib_active
+                    && let Ok(mut slot) = self.mtp_c4_calib.lock()
+                    && let Some((xs, tgts)) = slot.as_mut()
+                {
+                    for k in 0..n_draft.min(draft_hiddens_host.len()) {
+                        xs.push(draft_hiddens_host[k].clone());
+                        tgts.push(preds[k]);
                     }
                 }
                 if hi_calib_active {
@@ -4721,13 +4711,13 @@ mod imp {
                         let row = self.logits_row_to_cpu_f32(&verify_logits, 0)?;
                         topk_softmax(&row, 64)
                     };
-                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock()) {
-                        if let Some((es, hs, tgts, soft)) = slot.as_mut() {
-                            es.push(e.clone());
-                            hs.push(h.clone());
-                            tgts.push(preds[0]);
-                            soft.push(soft0);
-                        }
+                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock())
+                        && let Some((es, hs, tgts, soft)) = slot.as_mut()
+                    {
+                        es.push(e.clone());
+                        hs.push(h.clone());
+                        tgts.push(preds[0]);
+                        soft.push(soft0);
                     }
                 }
                 let mut acc = 0usize;
@@ -4856,8 +4846,14 @@ mod imp {
             let st = std::env::var("LUMEN_MTP_STAGE_TIMING")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            let (mut t_draft, mut t_snap, mut t_verify, mut t_accept, mut t_carry, mut t_roll) =
-                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            // `t_roll` is the odd one out: every other bucket accumulates with
+            // `+=` and needs the zero, while the rollback stage assigns its
+            // total once. Declared without an initializer so the compiler keeps
+            // proving that — an unread zero here would mean a stage stopped
+            // reporting.
+            let (mut t_draft, mut t_snap, mut t_verify, mut t_accept, mut t_carry) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let t_roll: f64;
             let mut roll_replay = false;
 
             // Resolve the drafter seed: (lead_token, h_draft, emit_lead).

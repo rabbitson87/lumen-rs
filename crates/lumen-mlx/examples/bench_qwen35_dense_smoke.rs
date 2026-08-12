@@ -40,7 +40,9 @@ fn main() -> Result<()> {
         pos = p;
     }
     qwen.remove_seq(seq)?;
-    drop(qwen);
+    // `drop(qwen)` used to be here. `qwen` is a borrow, so dropping it freed
+    // nothing; NLL already ends the borrow at its last use, which is what the
+    // line was actually achieving.
 
     let text = backend.decode(&out).unwrap_or_default();
     println!("--- continuation ---\n{text}");

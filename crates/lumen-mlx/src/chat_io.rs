@@ -131,18 +131,13 @@ pub enum BackendStreamEvent<'a> {
 /// entirely, `Required` and `Tool(name)` prefill `<|tool_call>` (and
 /// optionally `call:NAME{`) at the end of the generation prompt so
 /// the model MUST start generating a tool call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ResolvedToolChoice<'a> {
+    #[default]
     Auto,
     None,
     Required,
     Tool(&'a str),
-}
-
-impl Default for ResolvedToolChoice<'_> {
-    fn default() -> Self {
-        ResolvedToolChoice::Auto
-    }
 }
 
 /// Heuristic: does this user-role message look like a client-injected
@@ -273,7 +268,7 @@ where
     S2: AsRef<str>,
 {
     // Strongest signal: explicit `task_complete` tool.
-    if tool_names.iter().any(|n| *n == "task_complete") {
+    if tool_names.contains(&"task_complete") {
         return InferredMode::Agent;
     }
 

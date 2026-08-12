@@ -234,20 +234,14 @@ impl FailingReader {
 impl std::io::Read for FailingReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.budget {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "fault injection: input/output error",
-            ));
+            return Err(std::io::Error::other("fault injection: input/output error"));
         }
         let end = (self.pos + buf.len()).min(self.budget).min(self.data.len());
         let n = end.saturating_sub(self.pos);
         buf[..n].copy_from_slice(&self.data[self.pos..end]);
         self.pos += n;
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "fault injection: input/output error",
-            ));
+            return Err(std::io::Error::other("fault injection: input/output error"));
         }
         Ok(n)
     }

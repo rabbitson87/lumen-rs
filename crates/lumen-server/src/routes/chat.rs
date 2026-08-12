@@ -579,8 +579,11 @@ async fn handle_streaming(
                 // reasoning + EOS (no visible content) — a known
                 // failure mode on quantized variants whose CoT path is
                 // degraded (channel-token amplification on imatrix-AWQ).
+                //
+                // No `reasoning_open = false` here, unlike the sibling block
+                // above: this one runs at end-of-stream, so the flag is never
+                // read again and the compiler says so.
                 if reasoning_open {
-                    reasoning_open = false;
                     let close_chunk = ChatCompletionChunk {
                         id: id.clone(),
                         object: "chat.completion.chunk".into(),

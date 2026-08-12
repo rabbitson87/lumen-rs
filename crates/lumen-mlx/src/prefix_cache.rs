@@ -532,6 +532,9 @@ impl PrefixCacheStore {
         best.map(|(i, _)| i)
     }
 
+    #[allow(dead_code)]
+    // no caller: the shared-prefix work computes its LCP in the runner, which
+    // owns the token buffers this would have to be handed.
     /// Length of the longest common token prefix between `a` and `b`.
     fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()

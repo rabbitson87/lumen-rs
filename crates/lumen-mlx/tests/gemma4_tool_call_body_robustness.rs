@@ -93,10 +93,13 @@ fn numeric_boolean_array_argument_types() {
     // Gemma 4 emits numbers / booleans / arrays as raw JSON inside
     // the args block (only strings get the `<|"|>` wrapper). The
     // converter must preserve types end-to-end.
-    let calls = parse_tool_call_body("call:fn{n:42,f:3.14,b:true,arr:[1,2,3]}").expect("parses");
+    // 4.25 rather than 3.14: the value is arbitrary test data, but clippy reads
+    // 3.14 as an approximation of PI and `approx_constant` is deny-by-default,
+    // so it made this file fail to lint. Exactly representable in binary too.
+    let calls = parse_tool_call_body("call:fn{n:42,f:4.25,b:true,arr:[1,2,3]}").expect("parses");
     assert_eq!(
         calls[0].arguments,
-        json!({"n": 42, "f": 3.14, "b": true, "arr": [1, 2, 3]})
+        json!({"n": 42, "f": 4.25, "b": true, "arr": [1, 2, 3]})
     );
 }
 

@@ -43,6 +43,32 @@ license = "MIT"
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
 
+# Two clippy lints are allowed workspace-wide, on purpose and with a reason.
+# Everything else is expected to be zero so `cargo xtask gate` can fail on a
+# new warning; a lint left warning forever teaches people to skim the output,
+# which is how the 330-warning backlog happened in the first place.
+[workspace.lints.clippy]
+# 27 sites. A kernel entry point takes what the kernel takes: queries, keys,
+# values, scale, mask, cache, offsets, window, flags. Bundling them into a
+# params struct does not reduce the arity, it hides it behind a constructor
+# and adds a copy on a path where the copy is measurable. The threshold is a
+# heuristic for business logic and this is not business logic.
+too_many_arguments = "allow"
+# 18 sites, almost all `HashMap<String, Vec<(usize, Array)>>`-shaped weight
+# tables built once at load time. A type alias would name the shape without
+# explaining it, and the shape is the documentation: what the loader returns
+# is exactly what the checkpoint contains.
+type_complexity = "allow"
+# 12 sites, every one a matrix kernel where the loop index is the algorithm:
+# `for i in 0..dim { let row = &m[i*dim..(i+1)*dim]; y[i] = row·x }` uses `i`
+# to slice the operand AND to place the result. The iterator rewrite has to
+# thread both, and reads worse than the arithmetic it replaces.
+needless_range_loop = "allow"
+# 2 sites, both runner enums that exist once per process for its lifetime.
+# Boxing the big variant to even them up would add an indirection on the
+# decode path to save bytes that are never allocated more than once.
+large_enum_variant = "allow"
+
 [workspace.dependencies]
 # TurboQuant workspace crates
 lumen-core = { path = "crates/lumen-core" }

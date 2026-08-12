@@ -37,10 +37,10 @@ fn default_python_path() -> String {
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.join(".venv").join("bin").join("python"));
-    if let Some(p) = venv_python {
-        if p.exists() {
-            return p.to_string_lossy().into_owned();
-        }
+    if let Some(p) = venv_python
+        && p.exists()
+    {
+        return p.to_string_lossy().into_owned();
     }
     "python3".to_string()
 }
