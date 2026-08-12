@@ -1254,7 +1254,7 @@ pub(crate) mod imp {
         pub num_key_value_heads: usize,
         /// Per-layer KV-head count for full attention layers when k_eq_v.
         /// 26B-A4B sets this to 2; absent in smaller variants.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub num_global_key_value_heads: Option<usize>,
         /// Head dim for sliding attention layers (and the default fallback).
         pub head_dim: usize,
@@ -1283,28 +1283,28 @@ pub(crate) mod imp {
         pub attention_bias: bool,
         #[serde(default)]
         pub attention_dropout: f32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub attention_k_eq_v: bool,
 
         // MoE
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub enable_moe_block: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub num_experts: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub top_k_experts: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub moe_intermediate_size: usize,
 
         // Dense MLP (always present in 26B; sized via intermediate_size).
         pub intermediate_size: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub use_double_wide_mlp: bool,
 
         // Per-layer input embedding (2B/4B Gemma 4; 0 for 26B-A4B).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub hidden_size_per_layer_input: usize,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
         pub num_kv_shared_layers: usize,
 
         // Activation + logit softcap

@@ -36,6 +36,8 @@ use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
 pub mod chat_io;
+/// Serde helpers shared by the per-family `config.json` parsers.
+pub mod config_serde;
 mod gemma4_backend;
 mod gemma4_chat;
 mod gemma4_critical_correction;

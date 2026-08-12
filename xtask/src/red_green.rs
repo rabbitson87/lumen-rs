@@ -283,6 +283,28 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "gemma4-config-null-moe-fields",
+        symptom: "the JGOS-31B shape was still live in Gemma 4: a dense \
+                  checkpoint spelling `\"num_experts\": null` hard-failed with \
+                  `invalid type: null, expected usize at line N column M` — the \
+                  fix was remembered as a Gemma 4 fix but had only ever landed \
+                  in the Qwen parser",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        #[serde(default, deserialize_with = "crate::config_serde::null_as_default")]
+        pub num_experts: usize,"#,
+            replace: r#"        #[serde(default)]
+        pub num_experts: usize,"#,
+        }],
+        guards: &[mlx_native_test(
+            "gemma4_config_faults",
+            "explicit_null_moe_fields_on_a_dense_config",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "prefill-budget-rounds-to-zero",
         symptom: "a positive-but-tiny `*_PREFILL_SCORES_GB` (under 1e-9, i.e. \
                   less than one byte) passed the `> 0.0` check and then cast to \
@@ -552,6 +574,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
         (_, "config-null-moe-fields") | (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
+        (_, "gemma4-config-null-moe-fields") => "gemma4_moe.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",

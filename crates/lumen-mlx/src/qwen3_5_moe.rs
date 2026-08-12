@@ -210,24 +210,10 @@ mod imp {
         pub vision_end_token_id: Option<u32>,
     }
 
-    /// `#[serde(default)]` covers a **missing** key; it does not cover an
-    /// explicit `null`. Upstream exporters routinely spell an inapplicable
-    /// field as `null` rather than omitting it — a dense checkpoint carrying
-    /// `"num_experts": null` is the JGOS-31B shape — and a plain
-    /// `#[serde(default)] usize` hard-fails on it with `invalid type: null,
-    /// expected usize at line N column M`, an error that names neither the
-    /// field nor the file's architecture.
-    ///
-    /// Applied to every field that is legitimately absent on *some*
-    /// architecture (the MoE group on a dense config, the dense group on a
-    /// MoE one), so null and missing mean the same thing: the default.
-    fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-        T: serde::Deserialize<'de> + Default,
-    {
-        Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
-    }
+    /// Null-tolerant field decoding, shared with the Gemma 4 parser. See
+    /// [`crate::config_serde::null_as_default`] for why plain
+    /// `#[serde(default)]` is not enough.
+    use crate::config_serde::null_as_default;
 
     /// `text_config` block — all fields the forward path needs.
     #[derive(Debug, Clone, Deserialize)]
