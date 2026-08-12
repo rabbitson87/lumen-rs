@@ -222,12 +222,25 @@ fn one_sided_report() -> std::io::Result<BTreeMap<String, (usize, usize)>> {
                 continue;
             };
             let text = std::fs::read_to_string(&p)?;
+            // Branches inside an inline `#[cfg(test)] mod tests` are not
+            // production code, and one of them can never be covered by
+            // construction: `assert!(cond)` compiles to a branch whose false
+            // arm is the panic, so a *passing* test leaves it one-sided
+            // forever. Counting those makes the target unreachable for a
+            // reason that has nothing to do with the code under test —
+            // measured: 3 of grammar.rs's 21.
+            let test_mod_at = first_cfg_test_line(&text);
             // location -> (true count, false count), summed across binaries.
             let mut merged: BTreeMap<String, (u64, u64)> = BTreeMap::new();
             for line in text.lines() {
                 let Some((loc, arms)) = parse_branch_line(line) else {
                     continue;
                 };
+                if let Some(cut) = test_mod_at
+                    && branch_line_no(&loc).is_some_and(|n| n >= cut)
+                {
+                    continue;
+                }
                 let e = merged.entry(loc).or_insert((0, 0));
                 e.0 += arms.0;
                 e.1 += arms.1;
@@ -246,6 +259,25 @@ fn one_sided_report() -> std::io::Result<BTreeMap<String, (usize, usize)>> {
         }
     }
     Ok(out)
+}
+
+/// Line number of the first `#[cfg(test)]` in a `--text` report, or `None`
+/// when the file has no inline test module.
+///
+/// Source lines in the report are rendered as `  1110|       |#[cfg(test)]`, so
+/// the number is the first `|`-delimited field.
+fn first_cfg_test_line(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        if !l.contains("#[cfg(test)]") {
+            return None;
+        }
+        l.split('|').next()?.trim().parse::<u64>().ok()
+    })
+}
+
+/// `"219:12"` → `219`.
+fn branch_line_no(loc: &str) -> Option<u64> {
+    loc.split(':').next()?.parse().ok()
 }
 
 /// `  |  Branch (81:16): [True: 7, False: 1]` → `("81:16", (7, 1))`.
@@ -357,6 +389,19 @@ mod tests {
             "merged, this branch is covered — classifying records individually \
              would have reported it as a gap"
         );
+    }
+
+    #[test]
+    fn inline_test_modules_are_located_and_excluded() {
+        let report = "\
+    1|       |fn prod() {}
+ 1110|       |#[cfg(test)]
+ 1111|       |mod tests {
+";
+        assert_eq!(first_cfg_test_line(report), Some(1110));
+        assert_eq!(first_cfg_test_line("  1|  |fn prod() {}\n"), None);
+        assert_eq!(branch_line_no("219:12"), Some(219));
+        assert_eq!(branch_line_no("nonsense"), None);
     }
 
     /// Every exclusion carries a reason. An entry with an empty reason is a

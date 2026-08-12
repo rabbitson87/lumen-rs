@@ -1156,6 +1156,218 @@ mod tests {
         ]
     }
 
+    // ───────── degenerate-schema coverage (005 Phase 4.1) ─────────
+    //
+    // Every branch below is a fallback the renderers take when a tool schema
+    // is outside the supported subset. They matter because none of them
+    // *fails*: each one silently widens the grammar, and a grammar that is too
+    // wide constrains nothing while still looking like it is working. Seven of
+    // the recorded defects came off this surface, so the fallbacks deserve the
+    // same pinning the happy path already has.
+
+    /// An empty `tools` array must be an error from every builder, not an
+    /// empty grammar. An empty grammar matches nothing, so the model would be
+    /// masked into silence with no explanation.
+    #[test]
+    fn every_builder_rejects_an_empty_tool_list() {
+        let err = qwen35_lark_grammar_string(&[]).expect_err("qwen35 builder");
+        assert!(format!("{err:#}").contains("empty tools"), "{err:#}");
+        for strict in [false, true] {
+            let err = lark_grammar_string(&[], strict).expect_err("gemma builder");
+            assert!(format!("{err:#}").contains("empty tools"), "{err:#}");
+        }
+    }
+
+    /// A tool whose parameters carry no `properties` key at all. The body
+    /// collapses to "anything but `}`" — permissive by design, but it must be
+    /// that exact fallback and not an error or an empty rule.
+    #[test]
+    fn a_schema_without_properties_falls_back_to_permissive() {
+        let mut extra = Vec::new();
+        for schema in [
+            json!({}),
+            json!({"type": "object"}),
+            json!({"properties": []}),
+        ] {
+            let body = lark_body_for_object_schema(&schema, &mut extra, false)
+                .expect("the fallback must not error");
+            assert_eq!(
+                body, "<[^125]>*",
+                "schema {schema} should render the permissive body"
+            );
+        }
+    }
+
+    /// `properties: {}` is different from a missing `properties`: the tool
+    /// declares it takes nothing, so the body must be the empty literal rather
+    /// than the permissive wildcard.
+    #[test]
+    fn an_empty_properties_map_renders_an_empty_body() {
+        let mut extra = Vec::new();
+        let body =
+            lark_body_for_object_schema(&json!({"properties": {}}), &mut extra, false).unwrap();
+        assert_eq!(body, "\"\"");
+    }
+
+    /// The required/optional split is the **strict** path only; `strict:false`
+    /// renders a permissive any-order repeat instead. Both arms are asserted
+    /// because conflating them is exactly how a strict grammar silently stops
+    /// being strict.
+    #[test]
+    fn the_required_optional_split_is_strict_only() {
+        let mut extra = Vec::new();
+        let two_optional = json!({
+            "properties": { "a": {"type": "string"}, "b": {"type": "string"} }
+        });
+
+        // Non-strict: an any-order comma-separated repeat, no per-field gating.
+        let permissive = lark_body_for_object_schema(&two_optional, &mut extra, false).unwrap();
+        assert!(
+            permissive.contains(")*"),
+            "the permissive body should be a repeat: {permissive}"
+        );
+
+        // Strict, all-optional: first optional standalone, the rest comma-gated
+        // so skipping the first cannot leave a leading comma.
+        let strict = lark_body_for_object_schema(&two_optional, &mut extra, true).unwrap();
+        assert!(
+            !strict.trim_start().starts_with("(\",\""),
+            "the first optional must not be comma-prefixed: {strict}"
+        );
+        assert!(
+            strict.contains("(\",\""),
+            "later optionals must be: {strict}"
+        );
+        assert!(
+            !strict.contains(")*"),
+            "strict must not fall back to a repeat: {strict}"
+        );
+
+        // Strict with one optional: same arm, loop body never runs.
+        let lone = lark_body_for_object_schema(
+            &json!({ "properties": { "only": {"type": "string"} } }),
+            &mut extra,
+            true,
+        )
+        .unwrap();
+        assert!(
+            !lone.contains("(\",\""),
+            "a lone optional needs no comma: {lone}"
+        );
+
+        // Strict with a required field takes the other arm: required first and
+        // ungated, optionals after and comma-gated.
+        let mixed = lark_body_for_object_schema(
+            &json!({
+                "properties": { "req": {"type": "string"}, "opt": {"type": "string"} },
+                "required": ["req"]
+            }),
+            &mut extra,
+            true,
+        )
+        .unwrap();
+        assert!(
+            mixed.starts_with("(\"req:\""),
+            "the required field must lead, ungated: {mixed}"
+        );
+        assert!(
+            mixed.contains("(\",\" (\"opt:\""),
+            "the optional must follow comma-gated: {mixed}"
+        );
+    }
+
+    /// `const` short-circuits ahead of `type`, so a schema carrying both must
+    /// render the literal — otherwise a fixed-value parameter would accept the
+    /// whole type.
+    #[test]
+    fn a_const_wins_over_the_declared_type() {
+        let mut extra = Vec::new();
+        let rule = lark_value_for_schema(
+            &json!({ "const": "yes", "type": "string" }),
+            &mut extra,
+            false,
+        )
+        .unwrap();
+        assert!(rule.contains("yes"), "const literal expected, got {rule}");
+        assert!(
+            !rule.contains("[^"),
+            "the string wildcard must not appear alongside a const: {rule}"
+        );
+    }
+
+    /// `type` as an array is the nullable-field shape (`["string","null"]`).
+    /// Each variant renders and the union is taken.
+    #[test]
+    fn a_type_array_unions_its_variants() {
+        let mut extra = Vec::new();
+        let rule = lark_value_for_schema(&json!({ "type": ["string", "null"] }), &mut extra, false)
+            .unwrap();
+        assert!(
+            rule.starts_with('(') && rule.contains(" | "),
+            "union expected: {rule}"
+        );
+    }
+
+    /// Non-string entries inside a `type` array are skipped rather than
+    /// erroring — and when *every* entry is skipped the union is empty, so the
+    /// renderer must fall through to the single-type path instead of emitting
+    /// `()`, which matches nothing.
+    #[test]
+    fn a_type_array_of_junk_falls_through_instead_of_emitting_an_empty_union() {
+        let mut extra = Vec::new();
+
+        // Mixed: the string survives, the rest are ignored.
+        let rule = lark_value_for_schema(
+            &json!({ "type": [42, "string", null, {"nested": true}] }),
+            &mut extra,
+            false,
+        )
+        .unwrap();
+        assert!(!rule.contains("()"), "empty alternative in {rule}");
+
+        // All junk: no alternatives at all.
+        let rule =
+            lark_value_for_schema(&json!({ "type": [42, null] }), &mut extra, false).unwrap();
+        assert!(
+            !rule.is_empty() && !rule.contains("()"),
+            "an all-junk type array must still render something matchable, got {rule:?}"
+        );
+    }
+
+    /// The Qwen XML renderer has its own required/optional split, and its
+    /// empty case is a repeat rather than an empty string — an empty rule
+    /// there would make a no-parameter tool unmatchable.
+    #[test]
+    fn the_qwen_param_renderer_has_a_repeat_fallback_when_nothing_renders() {
+        let s = qwen35_lark_grammar_string(&[json!({
+            "type": "function",
+            "function": { "name": "noop", "parameters": { "type": "object" } }
+        })])
+        .expect("a no-parameter tool must still build");
+        assert!(s.contains("noop"), "the tool name must survive: {s}");
+    }
+
+    /// `with_bounded_whitespace` walks a schema object; a non-object schema
+    /// (JSON Schema allows `true`/`false` as whole schemas) must pass straight
+    /// through rather than panic or be rewritten into an object.
+    #[test]
+    fn a_non_object_schema_passes_through_whitespace_bounding() {
+        for v in [
+            json!(true),
+            json!(false),
+            json!(null),
+            json!(7),
+            json!("s"),
+            json!([]),
+        ] {
+            assert_eq!(
+                with_bounded_whitespace(v.clone()),
+                v,
+                "a non-object schema must be returned unchanged"
+            );
+        }
+    }
+
     #[test]
     fn grammar_builds_for_two_tools() {
         let g = build_tool_grammar(&sample_tools()).expect("build grammar");
