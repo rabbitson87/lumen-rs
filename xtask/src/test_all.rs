@@ -50,8 +50,61 @@ const VALIDATION_ENV: &[(&str, &str)] = &[
     ("MTL_DEBUG_LAYER_ERROR_MODE", "assert"),
 ];
 
+/// Where `lumen_testkit::cases` accumulates. Truncated before the run so the
+/// count reflects this run and not every run since the last `cargo clean`.
+fn cases_file() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|r| r.join("target").join("effective-cases.jsonl"))
+        .unwrap_or_else(|| std::path::PathBuf::from("target/effective-cases.jsonl"))
+}
+
+/// Sum of the `n` fields written during the run, with the largest contributors.
+///
+/// This is the metric that replaces SQLite's 590:1 test-LOC ratio. libtest
+/// reports a sweep over 3,400 budgets as `1 passed`, which is exactly as
+/// informative as counting test files; the number below is what was actually
+/// executed. Only the parameterized sweeps report, so it is a floor rather than
+/// a total — a floor that can only be raised by writing generators, which is
+/// the mechanism worth copying.
+fn report_effective_cases() {
+    let Ok(text) = std::fs::read_to_string(cases_file()) else {
+        return;
+    };
+    let mut total = 0usize;
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    for line in text.lines() {
+        let Some(n) = line
+            .split("\"n\":")
+            .nth(1)
+            .and_then(|r| r.split(&[',', '}'][..]).next())
+            .and_then(|n| n.trim().parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let what = line
+            .split("\"what\":\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("?")
+            .to_string();
+        total += n;
+        rows.push((n, what));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.dedup_by(|a, b| a.1 == b.1);
+    eprintln!("\neffective cases executed (parameterized sweeps only): {total}");
+    for (n, what) in rows.iter().take(6) {
+        eprintln!("  {n:>7}  {what}");
+    }
+}
+
 pub fn main(args: Vec<String>) -> ExitCode {
     let validate = args.iter().any(|a| a == "--validate");
+    let _ = std::fs::remove_file(cases_file());
     let args: Vec<String> = args.into_iter().filter(|a| a != "--validate").collect();
 
     let mut cmd = Command::new("cargo");
@@ -97,8 +150,14 @@ pub fn main(args: Vec<String>) -> ExitCode {
     );
 
     match cmd.status() {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::FAILURE,
+        Ok(s) if s.success() => {
+            report_effective_cases();
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            report_effective_cases();
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("could not spawn cargo: {e}");
             ExitCode::FAILURE

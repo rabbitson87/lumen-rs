@@ -208,3 +208,68 @@ mod tests {
         );
     }
 }
+
+// ───────────────────────── effective-case counting ─────────────────────────
+
+/// Record that a test executed `n` distinct cases.
+///
+/// SQLite's 92 MSLOC of test code is not hand-written; it is ~50k cases
+/// expanded into ~2.4M parameterized instances. Chasing the 590:1 *ratio* would
+/// be chasing the wrong number — 142K src LOC × 590 is 84 million lines, and
+/// every hand-written one is bit-rot surface. The transferable part is the
+/// mechanism, so the metric is **effective cases executed per run**.
+///
+/// libtest reports a sweep over 3,400 budgets as `1 passed`, which is exactly
+/// as informative as counting test files. This makes the real number visible.
+///
+/// Appends to `target/effective-cases.jsonl` rather than printing, because
+/// libtest captures stdout and stderr and each test binary is a separate
+/// process — a counter that only works within one binary would under-report by
+/// construction. `cargo xtask test` truncates the file before the run and sums
+/// it after.
+pub fn cases(n: usize, what: &str) {
+    use std::io::Write;
+    let Some(path) = cases_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    // One line per call; `what` is escaped only enough to keep the line
+    // parseable, since it is written by test code we control.
+    let what = what.replace(['"', '\n'], "");
+    let _ = writeln!(f, "{{\"n\":{n},\"what\":\"{what}\"}}");
+}
+
+/// `$CARGO_TARGET_DIR/effective-cases.jsonl`, or `target/` relative to the
+/// workspace. `None` when neither can be determined, in which case counting is
+/// silently skipped — a metric must never fail a test.
+fn cases_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return Some(std::path::Path::new(&dir).join("effective-cases.jsonl"));
+    }
+    // `CARGO_MANIFEST_DIR` for lumen-testkit is `crates/lumen-testkit`.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let root = std::path::Path::new(&manifest).parent()?.parent()?;
+    Some(root.join("target").join("effective-cases.jsonl"))
+}
+
+#[cfg(test)]
+mod cases_tests {
+    use super::*;
+
+    /// Counting must never be the reason a test fails, so an unwritable path is
+    /// a silent no-op rather than a panic.
+    #[test]
+    fn counting_is_best_effort() {
+        // SAFETY: single-threaded test; the value is read on the next call.
+        unsafe { std::env::set_var("CARGO_TARGET_DIR", "/proc/nonexistent-on-macos") };
+        cases(7, "unwritable path");
+        unsafe { std::env::remove_var("CARGO_TARGET_DIR") };
+    }
+}

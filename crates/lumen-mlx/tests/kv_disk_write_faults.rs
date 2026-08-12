@@ -79,6 +79,7 @@ fn every_partial_write_errors_and_is_unreadable() {
     let full = encoded_len();
     assert!(full > 100, "fixture too small to sweep: {full} bytes");
 
+    lumen_testkit::cases(full, "kv-disk partial-write sweep");
     for budget in 0..full {
         let mut w = FailingWriter::new(budget);
         let res = write_lkv(&mut w, &m, &r);

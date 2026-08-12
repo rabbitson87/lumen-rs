@@ -73,6 +73,7 @@ fn every_truncation_errors_and_leaves_the_loader_usable() {
         offsets.len()
     );
 
+    lumen_testkit::cases(offsets.len(), "safetensors truncation sweep");
     for off in offsets {
         let bad = corrupt(&good, Corruption::TruncateAt(off));
         let (_d, res) = load_shard(&bad);

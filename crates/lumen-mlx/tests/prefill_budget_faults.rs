@@ -108,6 +108,7 @@ fn budget_sweep_holds_every_invariant() {
             }
         }
     }
+    lumen_testkit::cases(total, "prefill budget sweep");
     assert!(total > 2_000, "sweep should be dense, got {total} cases");
     assert!(
         floored_cases > 0,

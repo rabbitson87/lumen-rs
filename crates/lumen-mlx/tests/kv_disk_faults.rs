@@ -97,6 +97,7 @@ fn every_truncation_errors_without_panicking() {
         offsets.len()
     );
 
+    lumen_testkit::cases(offsets.len(), "kv-disk truncation sweep");
     for off in offsets {
         let bad = corrupt(&bytes, Corruption::TruncateAt(off));
         let res = read_lkv(&mut bad.as_slice());
@@ -122,6 +123,7 @@ fn every_truncation_errors_without_panicking() {
 fn every_single_byte_flip_is_err_or_benign_never_panic() {
     let (m, r) = sample();
     let bytes = encode(&m, &r);
+    lumen_testkit::cases(bytes.len(), "kv-disk single-byte-flip sweep");
     let mut errs = 0usize;
     for at in 0..bytes.len() {
         let bad = corrupt(&bytes, Corruption::FlipByte(at));
