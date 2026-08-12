@@ -25,6 +25,23 @@
 //!    unobtainable here and the plan's target is blocked on the toolchain, not
 //!    on effort. Saying so is the point.
 
+//! ## Why the headline percentage is not the number to chase
+//!
+//! llvm-cov merges one coverage record **per test binary**. A binary that links
+//! a crate but never calls a given function still contributes a record for it,
+//! with both branch arms at zero. Those `[True: 0, False: 0]` entries are
+//! counted as missed, so the merged percentage falls when you add an unrelated
+//! test binary — measured here: `dry.rs` carries **17** never-ran duplicates
+//! against **9** genuine one-sided branches, and its percentage dropped when
+//! `sampling_boundaries.rs` was added despite `dry.rs` gaining tests nowhere.
+//!
+//! A metric that moves the wrong way when you add tests cannot gate anything.
+//! So this command reports **one-sided branches** — the ones that actually ran
+//! and only ever went one way — which is both the honest count and the
+//! actionable one. The percentage is still printed, clearly labelled as the
+//! polluted figure it is.
+
+use std::collections::BTreeMap;
 use std::process::{Command, ExitCode};
 
 /// Packages that can be measured without a GPU or downloaded weights, with the
@@ -118,7 +135,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
         if html {
             cmd.args(["--html", "--output-dir", &format!("target/coverage/{pkg}")]);
         } else {
-            cmd.arg("--summary-only");
+            // `--text` alongside the summary so the one-sided report below has
+            // per-branch data to read; the summary alone carries only totals.
+            cmd.args(["--text", "--output-dir", "target/coverage-text"]);
         }
         match cmd.status() {
             Ok(s) if s.success() => {}
@@ -134,6 +153,27 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
     }
 
+    println!("\n=== one-sided branches in the named scope ===");
+    println!("  (records merged by source location first — the text report");
+    println!("   prints one per test binary and does NOT merge them.");
+    println!("   one-sided = ran, only ever went one way: the actionable gap.");
+    println!("   unreached = no test binary reached it at all.)\n");
+    match one_sided_report() {
+        Ok(rows) if rows.is_empty() => {
+            println!("  no text report found — run without --html to generate one");
+        }
+        Ok(rows) => {
+            println!("  {:<40} {:>10}  {:>10}", "file", "one-sided", "unreached");
+            let mut total = 0usize;
+            for (file, (one_sided, unreached)) in &rows {
+                println!("  {file:<40} {one_sided:>10}  {unreached:>10}");
+                total += one_sided;
+            }
+            println!("\n  TOTAL one-sided branches in scope: {total}");
+        }
+        Err(e) => println!("  could not parse the text report: {e}"),
+    }
+
     println!("\n=== named scope ({} files) ===", IN_SCOPE.len());
     for f in IN_SCOPE {
         println!("  {f}");
@@ -147,6 +187,76 @@ pub fn main(args: Vec<String>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Per in-scope file: `(one-sided branches, branches never reached at all)`.
+///
+/// **Merges by source location first**, which is the whole correctness of this
+/// function. The `--text` report prints one record *per test binary* without
+/// merging them — `sampling.rs` has 49 distinct branch locations spread over 95
+/// records — so classifying records individually double-counts and reports a
+/// covered branch as a gap. Measured: `Branch (81:16)` appears as
+/// `[True: 7, False: 1]` from one binary and `[True: 1, False: 0]` from
+/// another; only the sum, `[True: 8, False: 1]`, is the truth. (llvm-cov's own
+/// summary merges correctly; only the text rendering does not.)
+///
+/// After merging: both arms zero means no test binary ever reached the branch;
+/// exactly one arm zero means it ran and only ever went one way — the
+/// actionable gap.
+fn one_sided_report() -> std::io::Result<BTreeMap<String, (usize, usize)>> {
+    let mut out: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let root = std::path::Path::new("target/coverage-text");
+    if !root.exists() {
+        return Ok(out);
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let p = entry?.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p.to_string_lossy().to_string();
+            let Some(scoped) = IN_SCOPE.iter().find(|s| name.contains(*s)) else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&p)?;
+            // location -> (true count, false count), summed across binaries.
+            let mut merged: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+            for line in text.lines() {
+                let Some((loc, arms)) = parse_branch_line(line) else {
+                    continue;
+                };
+                let e = merged.entry(loc).or_insert((0, 0));
+                e.0 += arms.0;
+                e.1 += arms.1;
+            }
+            let (mut one_sided, mut unreached) = (0usize, 0usize);
+            for (t, f) in merged.values() {
+                match (*t == 0, *f == 0) {
+                    (true, true) => unreached += 1,
+                    (true, false) | (false, true) => one_sided += 1,
+                    (false, false) => {}
+                }
+            }
+            let e = out.entry((*scoped).to_string()).or_insert((0, 0));
+            e.0 += one_sided;
+            e.1 += unreached;
+        }
+    }
+    Ok(out)
+}
+
+/// `  |  Branch (81:16): [True: 7, False: 1]` → `("81:16", (7, 1))`.
+fn parse_branch_line(line: &str) -> Option<(String, (u64, u64))> {
+    let rest = line.split("Branch (").nth(1)?;
+    let (loc, tail) = rest.split_once(')')?;
+    let arms = tail.split_once('[')?.1;
+    let (t, f) = arms.split_once(", False: ")?;
+    let t: u64 = t.trim_start_matches("True: ").trim().parse().ok()?;
+    let f: u64 = f.trim_end_matches(']').trim().parse().ok()?;
+    Some((loc.to_string(), (t, f)))
 }
 
 enum McdcSupport {
@@ -213,6 +323,40 @@ mod tests {
             let p = root.join("crates").join(f);
             assert!(p.exists(), "in-scope file does not exist: {}", p.display());
         }
+    }
+
+    #[test]
+    fn branch_lines_parse_and_merge_by_location() {
+        let (loc, arms) = parse_branch_line("  |  Branch (81:16): [True: 7, False: 1]")
+            .expect("a normal branch line must parse");
+        assert_eq!(loc, "81:16");
+        assert_eq!(arms, (7, 1));
+
+        assert_eq!(
+            parse_branch_line("  |  Branch (145:27): [True: 0, False: 0]")
+                .expect("zero arms still parse"),
+            ("145:27".to_string(), (0, 0))
+        );
+        // Source lines, not branch records.
+        assert!(parse_branch_line("  132|      2|    if xs.is_empty() {").is_none());
+        assert!(parse_branch_line("").is_none());
+    }
+
+    /// The bug this parser was rewritten for: the text report prints one record
+    /// per test binary, so a branch covered by binary B looks one-sided in
+    /// binary A's record. Only the merged sum is the truth.
+    #[test]
+    fn a_branch_covered_by_a_second_binary_is_not_a_gap() {
+        let a = parse_branch_line("  |  Branch (81:16): [True: 7, False: 1]").unwrap();
+        let b = parse_branch_line("  |  Branch (81:16): [True: 1, False: 0]").unwrap();
+        assert_eq!(a.0, b.0, "same location");
+        let merged = (a.1.0 + b.1.0, a.1.1 + b.1.1);
+        assert_eq!(merged, (8, 1));
+        assert!(
+            merged.0 > 0 && merged.1 > 0,
+            "merged, this branch is covered — classifying records individually \
+             would have reported it as a gap"
+        );
     }
 
     /// Every exclusion carries a reason. An entry with an empty reason is a
