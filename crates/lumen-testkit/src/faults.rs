@@ -151,6 +151,121 @@ pub fn truncation_offsets(len: usize, stride: usize, boundaries: &[usize]) -> Ve
     offs
 }
 
+// ───────────────────────── failing I/O ─────────────────────────
+
+/// A sink that accepts `budget` bytes and then fails — the disk-full /
+/// quota-exceeded / device-disappeared case, injected without a filesystem.
+///
+/// This is SQLite's VFS I/O-error injection reduced to what a serializer can
+/// actually observe. Sweeping `budget` from 0 upward fails the write at every
+/// point in the format, which matters because the interesting failures are not
+/// "the write failed" (any sink can report that) but **what the partial output
+/// looks like to a reader**: a truncated snapshot that parses is silent
+/// corruption, and the only way to know it does not parse is to feed a reader
+/// every prefix a failing writer can leave behind.
+pub struct FailingWriter {
+    written: Vec<u8>,
+    budget: usize,
+}
+
+impl FailingWriter {
+    /// Accept `budget` bytes, then fail every subsequent write.
+    pub fn new(budget: usize) -> Self {
+        Self {
+            written: Vec::new(),
+            budget,
+        }
+    }
+
+    /// The bytes that made it through before the failure — the partial file a
+    /// real interrupted write would leave on disk.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.written
+    }
+
+    pub fn len(&self) -> usize {
+        self.written.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.written.is_empty()
+    }
+}
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let room = self.budget.saturating_sub(self.written.len());
+        if room == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "fault injection: no space left on device",
+            ));
+        }
+        let take = buf.len().min(room);
+        self.written.extend_from_slice(&buf[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A source that yields `budget` bytes and then returns an I/O **error** —
+/// distinct from EOF, which is what a truncation sweep produces. A reader that
+/// only handles short reads will treat this as a hang or an unwrap; a correct
+/// one propagates it.
+pub struct FailingReader {
+    data: Vec<u8>,
+    pos: usize,
+    budget: usize,
+}
+
+impl FailingReader {
+    pub fn new(data: impl Into<Vec<u8>>, budget: usize) -> Self {
+        Self {
+            data: data.into(),
+            pos: 0,
+            budget,
+        }
+    }
+}
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.budget {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "fault injection: input/output error",
+            ));
+        }
+        let end = (self.pos + buf.len()).min(self.budget).min(self.data.len());
+        let n = end.saturating_sub(self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..end]);
+        self.pos += n;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "fault injection: input/output error",
+            ));
+        }
+        Ok(n)
+    }
+}
+
+/// Make `path` un-writable by `fs::write` by occupying it with a **directory**.
+///
+/// A real failure produced by real filesystem semantics, with no mock in the
+/// call path: `fs::write` on a directory fails with `IsADirectory`. Pointing
+/// this at a store's temp path is how the atomic write-then-rename sequence
+/// gets tested from the outside, exercising the same error branch a full disk
+/// would take. Returns the blocked path so the caller can unblock it.
+pub fn block_path_with_directory(path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    let p = path.as_ref().to_path_buf();
+    std::fs::create_dir_all(&p).expect("fault injection: create blocking directory");
+    p
+}
+
 // ───────────────────────── config mutation ─────────────────────────
 
 /// Structured mutations of a `config.json`-shaped value. The alphabet comes

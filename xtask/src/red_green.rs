@@ -283,6 +283,29 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "prefill-budget-rounds-to-zero",
+        symptom: "a positive-but-tiny `*_PREFILL_SCORES_GB` (under 1e-9, i.e. \
+                  less than one byte) passed the `> 0.0` check and then cast to \
+                  0 — the OOM guard was silently switched off, pinning every \
+                  prompt to the 256-token floor while still logging a clamp as \
+                  if it were working",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        .map(|g| (g * 1e9) as u64)
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_SCORES_BUDGET_BYTES)"#,
+            replace: r#"        .map(|g| (g * 1e9) as u64)
+        .unwrap_or(DEFAULT_SCORES_BUDGET_BYTES)"#,
+        }],
+        guards: &[mlx_ungated_test(
+            "prefill_budget_faults",
+            "hostile_budget_env_values_never_hang_or_disable_the_guard",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "kv-disk-alloc-bomb",
         symptom: "a corrupt KV-disk record's u64 payload length was allocated \
                   unvalidated — a 280 TB request that ABORTS the process \
@@ -528,6 +551,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-name-scanner") | (_, "args-unicode-keys") => "gemma4_tool_syntax.rs",
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
         (_, "config-null-moe-fields") | (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
+        (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",

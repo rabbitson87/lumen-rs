@@ -2962,26 +2962,25 @@ pub(crate) mod imp {
                 // clamp also keeps the per-command-buffer intermediate graph
                 // bounded, so it is applied uniformly. Override the budget with
                 // `LUMEN_GEMMA4_PREFILL_SCORES_GB`.
-                let scores_budget_bytes: u64 = std::env::var("LUMEN_GEMMA4_PREFILL_SCORES_GB")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .filter(|&g| g > 0.0)
-                    .map(|g| (g * 1e9) as u64)
-                    .unwrap_or(8_000_000_000);
-                // f32 worst case for the scores accumulator (bf16 only halves it,
-                // so 4 keeps the bound conservative regardless of dtype).
-                const SCORES_BYTES_PER_ELEM: u64 = 4;
-                let heads = self.model.config().text_config.num_attention_heads.max(1) as u64;
-                let kv_upper = (prompt.len() as u64).max(1);
-                let max_safe_chunk = (scores_budget_bytes
-                    / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
-                    .max(256) as usize;
-                let chunk_size = requested_chunk.min(max_safe_chunk);
-                if chunk_size < requested_chunk {
+                // The arithmetic lives in `prefill_budget` so it can be swept at
+                // tier 0; the two backends had it duplicated. Behaviour here is
+                // unchanged by the hoist.
+                let scores_budget_bytes =
+                    crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB");
+                let decision = crate::prefill_budget::clamp_chunk(
+                    requested_chunk,
+                    scores_budget_bytes,
+                    self.model.config().text_config.num_attention_heads,
+                    prompt.len(),
+                );
+                let chunk_size = decision.chunk;
+                if decision.clamped() {
                     eprintln!(
                         "[prefill] chunk clamped {requested_chunk} → {chunk_size} \
-                         (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                         (heads={} kv_upper={} budget={:.1}GB) — \
                          keeps single-chunk scores under the Metal buffer cap",
+                        decision.heads.max(1),
+                        decision.kv_upper.max(1),
                         scores_budget_bytes as f64 / 1e9
                     );
                 }

@@ -1106,28 +1106,30 @@ mod imp {
         // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
         // chunk override.
         let chunk = {
-            let scores_budget_bytes: u64 = std::env::var("LUMEN_QWEN35_PREFILL_SCORES_GB")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|&g| g > 0.0)
-                .map(|g| (g * 1e9) as u64)
-                .unwrap_or(8_000_000_000);
-            // f32 worst case for the scores accumulator (bf16 only halves it).
-            const SCORES_BYTES_PER_ELEM: u64 = 4;
-            let heads = model.config().text_config.num_attention_heads.max(1) as u64;
-            let kv_upper = (n as u64).max(1);
-            let max_safe_chunk = (scores_budget_bytes / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
-                .max(256) as usize;
-            let clamped = requested_chunk.min(max_safe_chunk);
-            if clamped < requested_chunk {
+            // The arithmetic lives in `prefill_budget` so it can be swept at
+            // tier 0 (it is this crate's `malloc`-fail-at-N analogue: MLX
+            // allocation cannot fail into an `Err`, so the guard is to not
+            // allocate). Behaviour here is unchanged by the hoist.
+            let budget =
+                crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB");
+            let d = crate::prefill_budget::clamp_chunk(
+                requested_chunk,
+                budget,
+                model.config().text_config.num_attention_heads,
+                n,
+            );
+            if d.clamped() {
                 eprintln!(
-                    "[prefill] qwen chunk clamped {requested_chunk} → {clamped} \
-                     (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                    "[prefill] qwen chunk clamped {requested_chunk} → {} \
+                     (heads={} kv_upper={} budget={:.1}GB) — \
                      keeps single-chunk full-attn scores under the Metal buffer cap",
-                    scores_budget_bytes as f64 / 1e9
+                    d.chunk,
+                    d.heads.max(1),
+                    d.kv_upper.max(1),
+                    budget as f64 / 1e9
                 );
             }
-            clamped
+            d.chunk
         };
         if n <= chunk {
             return match vision {
