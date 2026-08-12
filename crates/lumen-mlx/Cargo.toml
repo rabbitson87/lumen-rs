@@ -191,6 +191,9 @@ name = "config_faults"
 # precisely so this sweep runs in the default build.
 
 [[test]]
+name = "vision_config_validate"
+
+[[test]]
 name = "chat_io_meta_wrapper"
 
 # Own binary: sets LUMEN_STRIP_CLIENT_META_WRAPPERS, which the strip functions
