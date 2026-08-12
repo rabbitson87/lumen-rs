@@ -191,6 +191,15 @@ name = "config_faults"
 # precisely so this sweep runs in the default build.
 
 [[test]]
+name = "chat_io_meta_wrapper"
+
+# Own binary: sets LUMEN_STRIP_CLIENT_META_WRAPPERS, which the strip functions
+# read from the process environment — sharing a binary would silently turn the
+# sibling tests' strip assertions into no-ops.
+[[test]]
+name = "chat_io_meta_wrapper_env"
+
+[[test]]
 name = "kv_disk_store_policy"
 
 [[test]]
