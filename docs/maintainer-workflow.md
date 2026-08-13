@@ -318,6 +318,26 @@ prefill returns:
 | | 1024 | **+9 to +17%** | 1,750–1,816 MB |
 | | 512 | **+54 to +118%** | 1,348–1,414 MB |
 
+**Re-measured on a later tree**, same harness, same model, 20,000 tokens,
+`--chunks 2048,1024 --gen 8`:
+
+| prompt | chunk | prefill | memory after prefill |
+|---|---|---|---|
+| 20,000 tok | 2048 | 50.4 s | **1,959 MB** (was 2,556–2,621) |
+| | 1024 | 49.7 s | **1,153 MB** (was 1,750–1,816) |
+
+Memory is ~25–35% lower while the prefill time lands inside the original band,
+so this is not a different workload being measured — something reduced the
+per-chunk activation footprint between the two runs. The `+9 to +17%` time
+penalty at 1024 did not reproduce here either (49.7 s vs 50.4 s, inside noise
+for a two-point sample).
+
+Both rows are kept. The point of a recorded number is to be re-measured, and a
+release-checklist item that reads "does not regress" against a number nobody has
+re-taken is checking against a memory rather than against the code. Output was
+byte-identical across both chunk sizes, so the chunk-invariance argument still
+holds.
+
 At 8K the time deltas over five runs average ~0 against a ±11% run-to-run noise
 floor, so there is nothing to detect. At 20K the cost is unmistakable and
 reproduces with the sweep order reversed (512 first: 113 s, 2048 second: 52 s),
