@@ -238,16 +238,26 @@ since contention can make a number worse but not better:
 
 | Workload | Recorded | Measured | |
 |---|---|---|---|
-| Embedding, 25 texts warm | ~55 ms, 2.20 ms/item | **57 ms, 2.30 ms/item** | within 5% |
+| Embedding, 25 texts warm | ~55 ms, 2.20 ms/item | **57 ms, 2.30 ms/item** | +4% |
 | Embedding quality | P@1 ≥ 0.95, MRR ≥ 0.97, cosine ≥ 0.99 | **0.96 / 0.98 / 0.9988** | pass |
 | Gemma 4 26B-A4B decode | ~18.8 ms/step | **13.5 and 13.9 ms/step** | ~27% *faster* |
+| Qwen3.6-35B-A3B-mxfp4 N=1 | 13.9 ms p50, 71.6 tok/s | **14.20 ms p50, 69.6 tok/s** | +2.2% |
+| …same, PROMPT_LEN=2048 | 14.85 ms p50, 67.3 tok/s | **14.62 ms p50, 68.2 tok/s** | 1.5% *faster* |
 
-The Gemma row being well outside the band on the good side is the same drift the
-20K prefill memory showed in §9 — these tables record a tree, and the tree moved.
+**The drift is not uniform, and that is the useful part.** Both mxfp4 rows
+reproduce within ~2% of numbers recorded on an earlier tree, which says the
+harness and the method are sound and that a ±2% band is what "unchanged" looks
+like here. Against that, the Gemma 4 row sitting 27% *faster* is not measurement
+slop — it is either a real improvement that landed unrecorded, or the original
+figure was taken differently (a different prompt length, or before a lever
+landed). Worth chasing the next time someone touches that path; a number that
+good and that unexplained is as much a smell as a slow one.
 
-`Qwen3.6-35B-A3B-mxfp4` is **not measurable on this machine**: the local 35B is
-`affine` 4-bit gs64, and substituting it would compare a different
-bytes-per-token against a number that only means anything for mxfp4.
+`Qwen3.6-35B-A3B-mxfp4` needs the actual mxfp4 checkpoint —
+`mlx-community/Qwen3.6-35B-A3B-mxfp4`, 18 GB, `mode: mxfp4 / bits 4 /
+group_size 32`. An `affine` 4-bit build is not a substitute: different
+bytes-per-token, so it would be compared against a number that only means
+anything for mxfp4.
 
 ⚠️ **`bench_gemma4_native_e2e` does not run the `STEPS` you ask for.** On a
 synthetic prompt the model degenerates and the runaway guard aborts — at step 32
