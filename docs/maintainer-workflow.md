@@ -256,6 +256,35 @@ figure was taken differently (a different prompt length, or before a lever
 landed). Worth chasing the next time someone touches that path; a number that
 good and that unexplained is as much a smell as a slow one.
 
+### Chasing the Gemma 4 delta: what is established, and what is not
+
+The A/B partner column exists to explain that row, so it was the obvious next
+step. Two things came out of it; only one is a measurement.
+
+**Established, from code and config rather than a stopwatch.** The custom
+flash-attn kernel can apply to at most **5 of 30 layers**. `layer_types` on
+gemma-4-26b-a4b is 25 `sliding_attention` to 5 `full_attention`, and
+`use_custom_flash` requires `!use_sdpa_windowed` (plus `S == 1`, `head_dim ==
+256`, all-bf16, no explicit mask — see `gemma4_moe.rs`). Whatever the kernel is
+worth, it is worth it on a sixth of the attention work, and attention is itself
+a small share of a decode step that is dominated by weight reads. That alone
+predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
+**448 ms vs 449 ms over 31 steps — nothing.**
+
+**Not established: whether the kernel helps or hurts at long context.** At
+`PROMPT_LEN=8192` two sweeps disagreed. Blocked ON→OFF twice said OFF was 20–27%
+faster; the reversed OFF→ON sweep produced a **93.5 s** run where every other
+run took 1.5–3.5 s, and then a round favouring ON. Load average went 3 → 5.45
+across the experiment on a machine with other users. A 60× outlier means the
+instrument, not the kernel.
+
+So: **do not read the recorded `~19.9 ms` A/B partner as verified, and do not
+read it as refuted.** It does not reproduce at short context, and long context
+is unmeasured. Settle it on a quiet machine with an interleaved ABAB sweep, not
+blocked orders — and read the `[runaway] … aborted` line first, because unequal
+step counts make two runs incomparable (that trap is above, and it caught me
+here before the thermal one did).
+
 `Qwen3.6-35B-A3B-mxfp4` needs the actual mxfp4 checkpoint —
 `mlx-community/Qwen3.6-35B-A3B-mxfp4`, 18 GB, `mode: mxfp4 / bits 4 /
 group_size 32`. An `affine` 4-bit build is not a substitute: different
