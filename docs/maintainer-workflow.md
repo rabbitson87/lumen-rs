@@ -239,6 +239,10 @@ why MLX became the only path.
 **Re-measured**, load average ~3 (not idle) — which only strengthens a *pass*,
 since contention can make a number worse but not better:
 
+Conditions for every row below: `mlx-community--gemma-4-26b-a4b-it-4bit` /
+`mlx-community--Qwen3.6-35B-A3B-mxfp4` / `qwen3-embedding-0.6b-8bit`, M3 Max,
+2026-08-13, `PROMPT_LEN=8` unless stated.
+
 | Workload | Recorded | Measured | |
 |---|---|---|---|
 | Embedding, 25 texts warm | ~55 ms, 2.20 ms/item | **57 ms, 2.30 ms/item** | +4% |
@@ -284,7 +288,43 @@ predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
 here, which is what the 5-of-30-layers bound predicts.
 
 So the custom kernel is **not** the explanation for the Gemma row's 27% drift.
-Something else got faster between the recording and now; that is still open.
+
+### Where the drift came from: eliminated, and what is left
+
+The Gemma row was written on **2026-05-19** (`41d3cb4`) and never revised. The
+mxfp4 rows next to it *were* revised, later the same day (`bc41ef9`, when
+mlx-native became the default runner), which is why one pair reproduces at ±2%
+and the other does not. The drift is bookkeeping first and code second.
+
+The comparison is fair: the recorded row states no `PROMPT_LEN`, the bench
+default is 8, and 8 is what the re-measurement used. The mxfp4 rows in the same
+table *do* state theirs, which is evidence the Gemma row simply took the
+default.
+
+**Eliminated, each by measurement or by reading rather than by assumption:**
+
+* *Custom flash-attn* — −0.3% min-vs-min over 10 in-process pairs. Not it.
+* *A default flip on the Gemma path* — 47 env gates then, 60 now: 13 new, all
+  default-off, and **zero changed defaults**.
+* *`LUMEN_MLX_KV_BF16` being flipped by the flags-registry refactor* — it was
+  not. The pre-refactor code already read `.unwrap_or(true)`; the migration was
+  faithful. (It is on the Gemma path despite being declared in the Qwen module —
+  14 uses in `gemma4_moe.rs` — and its measured decode effect is +1.6…4.1%,
+  which is not 28% either.)
+
+**Left, in cost order:** the mlx-rs fork moved once in the window
+(`4db2402d` → `f8cfdd88`, 2026-05-29, two commits both labelled CI fixes) and
+has not moved since; and ~30 lumen commits touched shared decode code
+(`native_cache.rs` 11, `native_quant.rs` 8, `native_attention.rs` 5). Attributing
+further needs a rebuild at the old fork rev or a bisect, and each bisect step is
+a full MLX rebuild.
+
+**The reusable lesson is the metadata, not the culprit.** That row could not be
+attributed because it records a number and nothing else: no prompt length, no
+model build, no date. The bench's own default `MODEL_ID` is the scrubbed
+placeholder `/path/to/models/gemma-4-26b-a4b-mlx-4bit`, so even the checkpoint
+that produced 18.8 is unrecoverable — and six different Gemma 4 26B-A4B builds
+exist on this machine now. Rows added below carry their conditions.
 
 Getting there took four attempts, and the first three failed in instructive
 ways. Blocked ON→OFF said OFF was 20–27% faster. The reversed order produced a
