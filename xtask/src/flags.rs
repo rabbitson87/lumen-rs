@@ -225,9 +225,20 @@ fn check_documented_envs_exist() -> Result<Vec<(String, usize, String)>, String>
     // next rename.
     const PREFIXES: &[&str] = &["LUMEN_", "KESTREL_"];
 
+    // `*.md` AND the app's env schema + locale strings. Scanning only markdown
+    // missed a dead variable that mattered more than any of the doc ones:
+    // `LUMEN_BATCHED_PREFILL_CHUNK` was a **number slider in the app's Advanced
+    // settings**, min 128 / max 8192 / default 512, whose reader went with the
+    // Candle backend in `7eacd3a`. A doc that lies costs a reader a minute; a
+    // UI control that lies is a switch the user watches do nothing.
     let docs = Command::new("git")
         .current_dir(repo_root())
-        .args(["ls-files", "*.md"])
+        .args([
+            "ls-files",
+            "*.md",
+            "crates/lumen-app/frontend/src/lib/env-schema.ts",
+            "crates/lumen-app/frontend/src/messages/*.ts",
+        ])
         .output()
         .map_err(|e| e.to_string())?;
 
@@ -284,7 +295,16 @@ fn source_mentions(var: &str) -> Result<bool, String> {
             "--fixed-strings",
             var,
             "--",
-            "crates/",
+            // Backend crates + xtask only. NOT `crates/` wholesale: that would
+            // include the frontend files this check now scans, so a variable
+            // named only in `env-schema.ts` would find itself and pass — a
+            // check that reports clean because it is looking in a mirror.
+            "crates/lumen-core",
+            "crates/lumen-mlx",
+            "crates/lumen-server",
+            "crates/lumen-diffusion",
+            "crates/lumen-app/src",
+            "crates/turboquant-cache",
             "xtask/",
         ])
         .output()
