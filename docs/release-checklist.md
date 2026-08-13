@@ -63,6 +63,13 @@ Run in order; the cheap and the automatic first.
       exclusion is the same kind as the `.metal` shaders in Phase 4.1: named,
       with the reason, rather than quietly absent.
 
+      **Start it the night before.** Measured: 75 passed, 0 failed, 3 filtered —
+      in **41,892 s (11 h 38 m)**. Miri interprets rather than executes, and
+      `lloyd_max::compute` runs 1,000 EM iterations over the full codebook, so
+      the cost is in the numerics rather than in anything pathological. Treat
+      this as an overnight job; a release plan that plans for minutes here will
+      quietly drop the item instead.
+
 ### Where ASan does and does not help
 
 The plan called for "an ASan pass over the tier-0 crates". Counted rather than
