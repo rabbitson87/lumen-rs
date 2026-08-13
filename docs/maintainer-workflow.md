@@ -271,19 +271,48 @@ a small share of a decode step that is dominated by weight reads. That alone
 predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
 **448 ms vs 449 ms over 31 steps — nothing.**
 
-**Not established: whether the kernel helps or hurts at long context.** At
-`PROMPT_LEN=8192` two sweeps disagreed. Blocked ON→OFF twice said OFF was 20–27%
-faster; the reversed OFF→ON sweep produced a **93.5 s** run where every other
-run took 1.5–3.5 s, and then a round favouring ON. Load average went 3 → 5.45
-across the experiment on a machine with other users. A 60× outlier means the
-instrument, not the kernel.
+**Settled, once the measurement stopped being process-per-run.** At
+`PROMPT_LEN=8192`, 10 interleaved in-process pairs:
 
-So: **do not read the recorded `~19.9 ms` A/B partner as verified, and do not
-read it as refuted.** It does not reproduce at short context, and long context
-is unmeasured. Settle it on a quiet machine with an interleaved ABAB sweep, not
-blocked orders — and read the `[runaway] … aborted` line first, because unequal
-step counts make two runs incomparable (that trap is above, and it caught me
-here before the thermal one did).
+| | median | min |
+|---|---|---|
+| custom flash-attn ON | 22.54 ms/step | 21.43 |
+| OFF (mlx default sdpa) | 23.00 ms/step | 21.50 |
+
+**min-vs-min −0.3%**, median −2.0%, against a 7.0% noise floor. The recorded
+5.5% gap (18.8 vs 19.9) does not reproduce: the two paths are indistinguishable
+here, which is what the 5-of-30-layers bound predicts.
+
+So the custom kernel is **not** the explanation for the Gemma row's 27% drift.
+Something else got faster between the recording and now; that is still open.
+
+Getting there took four attempts, and the first three failed in instructive
+ways. Blocked ON→OFF said OFF was 20–27% faster. The reversed order produced a
+**93.5 s** run against a 1.5–3.5 s norm. Interleaved ABAB across processes, on a
+quiet machine, gave 1 win ON / 2 OFF / 1 tie with a 2.7× spread *inside* each
+side. Every one of those paid a fresh 26 B model load, cold page cache and
+Metal pipeline compilation per sample — variance charged to the measurement and
+far larger than the effect.
+
+`examples/bench_env_flag_ab.rs` is the tool that worked: one model load, flag
+flipped between `generate` calls, `decode_ms` only. Use it for any flag read via
+`env::var` at its point of use — and **not** for a `OnceLock`-cached
+`lumen_flags` flag, which latches on first read and would give a beautifully
+tight "no difference" while measuring one side twice.
+
+Two things it taught about measuring on this machine:
+
+* **`min` is the estimator, not `mean` or `max`.** Contention only ever makes a
+  sample slower, so the fastest run of each side is the least interfered with.
+  The noise floor is `median/min` — the spread of the clean cluster.
+* **Stalls happen even when idle.** 4 of 20 samples exceeded 3× the median, one
+  at 40×. An outlier-sensitive spread metric (`max/min`) reported 4179% and made
+  every verdict INCONCLUSIVE by construction; a tool that cannot conclude is not
+  measuring anything.
+
+And read the `[runaway] … aborted` line first: unequal step counts make two runs
+incomparable, which is the trap documented above and the one that broke this
+experiment before thermals got a chance to.
 
 `Qwen3.6-35B-A3B-mxfp4` needs the actual mxfp4 checkpoint —
 `mlx-community/Qwen3.6-35B-A3B-mxfp4`, 18 GB, `mode: mxfp4 / bits 4 /
