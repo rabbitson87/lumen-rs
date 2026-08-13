@@ -177,6 +177,60 @@ fn run_check(flags: &[Flag]) -> ExitCode {
         failed = true;
     }
 
+    match audit_env_vars(flags) {
+        Ok((all, unmanaged)) => {
+            println!(
+                "env vars: {} read in source / {} registered / {} unmanaged (baseline {UNMANAGED_BASELINE})",
+                all.len(),
+                flags.len(),
+                unmanaged.len()
+            );
+            if unmanaged.len() > UNMANAGED_BASELINE {
+                eprintln!(
+                    "unmanaged flag count rose to {} (baseline {UNMANAGED_BASELINE}). A new \
+                     hand-rolled env::var is invisible to docs, to `--one-at-a-time`, and — if \
+                     it gates an optimization — to the equivalence matrix. Register it, or \
+                     raise the baseline deliberately.",
+                    unmanaged.len()
+                );
+                for v in unmanaged.iter().skip(UNMANAGED_BASELINE) {
+                    eprintln!("    {v}");
+                }
+                failed = true;
+            }
+        }
+        Err(e) => {
+            eprintln!("env audit failed: {e}");
+            failed = true;
+        }
+    }
+
+    match audit_env_vars(flags) {
+        Ok((all, _)) => {
+            let registered: std::collections::HashSet<&str> =
+                flags.iter().map(|f| f.env.as_str()).collect();
+            // A registry flag read ALSO via raw `env::var` is worse than an
+            // unregistered one. The raw site ignores `with()` / `set()`, so a
+            // harness that flips the flag registry-side flips it everywhere
+            // except there — and the two sites can drift apart on parsing, which
+            // is exactly what happened: `LUMEN_NATIVE_TIMING` kept the old
+            // `1|true|TRUE|yes` rule at its raw site after the registry moved to
+            // "any non-`0`", so `=on` meant true one place and false the other.
+            for v in all.iter().filter(|v| registered.contains(v.as_str())) {
+                eprintln!(
+                    "{v} is a registry flag AND is read directly with env::var. The raw \
+                     read bypasses with()/set() and can drift on parsing — call the \
+                     flag's accessor instead."
+                );
+                failed = true;
+            }
+        }
+        Err(e) => {
+            eprintln!("env audit failed: {e}");
+            failed = true;
+        }
+    }
+
     match grep_declared_envs() {
         Ok(declared) => {
             let registered: std::collections::HashSet<&str> =
@@ -310,6 +364,65 @@ fn source_mentions(var: &str) -> Result<bool, String> {
         .output()
         .map_err(|e| e.to_string())?;
     Ok(!out.stdout.is_empty())
+}
+
+/// The unmanaged-flag ratchet.
+///
+/// Hand-rolled `env::var` reads are:
+/// undocumented in the generated `docs/env-flags.md`, invisible to
+/// `--one-at-a-time`, and — for any that gate an optimization — never
+/// both-path tested. `causal-mask-builders-agree` and
+/// `rotating-cache-both-paths` in `red_green.rs` are both that defect: an
+/// alternate path no test could reach.
+///
+/// Migrating 190 at once is not the answer; most are one-shot diagnostics that
+/// would only add noise to the registry. So this is a **ratchet**, the same
+/// shape as the one-sided branch count in `cargo xtask coverage`: the number is
+/// allowed to fall and not to rise. Lower it when you migrate one.
+///
+/// Raising it is a decision, not a fix. If a new flag gates an optimization,
+/// it belongs in the registry so the equivalence matrix covers it.
+/// 202 distinct `LUMEN_*` names are read via `env::var` in library source and
+/// 12 live in the registry, but the two sets are **nearly disjoint** rather
+/// than nested: a registry flag is read through the `flag!`-generated `get()`,
+/// so it does not appear as a literal `env::var("LUMEN_X")`. 201 of the 202 raw
+/// reads are unregistered. (I first wrote 190 here by subtracting one from the
+/// other, which is the arithmetic of a subset and these are not.)
+const UNMANAGED_BASELINE: usize = 201;
+
+/// Every `LUMEN_*` read via `env::var` in library source, and whether the
+/// registry knows about it.
+fn audit_env_vars(flags: &[Flag]) -> Result<(Vec<String>, Vec<String>), String> {
+    let out = Command::new("git")
+        .current_dir(repo_root())
+        .args([
+            "grep",
+            "-oh",
+            "-E",
+            r#"env::var(_os)?\("LUMEN_[A-Z0-9_]*"\)"#,
+            "--",
+            "crates/lumen-core/src",
+            "crates/lumen-mlx/src",
+            "crates/lumen-server/src",
+            "crates/lumen-diffusion/src",
+            "crates/lumen-app/src",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let registered: std::collections::HashSet<&str> =
+        flags.iter().map(|f| f.env.as_str()).collect();
+    let mut all: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split('"').nth(1).map(str::to_string))
+        .collect();
+    all.sort();
+    all.dedup();
+    let unmanaged: Vec<String> = all
+        .iter()
+        .filter(|v| !registered.contains(v.as_str()))
+        .cloned()
+        .collect();
+    Ok((all, unmanaged))
 }
 
 /// `env: "…"` occurrences inside `flag!` invocations, straight from source.

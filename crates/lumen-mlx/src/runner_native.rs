@@ -1202,9 +1202,14 @@ mod imp {
 
     impl NativeMlxRunner {
         pub(crate) fn new() -> Result<Self> {
-            let timing_enabled = std::env::var("LUMEN_NATIVE_TIMING")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
+            // Through the registry, not `env::var`. This site used to read the
+            // variable directly, which meant two things at once: it ignored the
+            // flag's `with()` / `set()` overrides — so a harness enabling
+            // timing registry-side got it everywhere except here — and it kept
+            // the OLD parse rule (`1|true|TRUE|yes`) after the registry moved
+            // to "any non-`0`". `LUMEN_NATIVE_TIMING=on` was true for the flag
+            // and false for this line.
+            let timing_enabled = crate::native_runtime::fine_timing_active();
             // Lightweight stage timing (forward+eval / tail) without the
             // layer-kind fine probes that force intermediate evals. Used for
             // apples-to-apples Native vs PyO3 stage comparison.
