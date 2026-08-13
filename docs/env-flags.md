@@ -9,6 +9,14 @@ unset → default, `"0"` → off, any other value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
+| `LUMEN_GEMMA4_FUSE_DENSE_MLP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_dense_mlp` |
+| `LUMEN_GEMMA4_FUSE_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_experts` |
+| `LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE` | off | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_layer_epilogue` |
+| `LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS` | off | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_norm_routing_experts` |
+| `LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP` | off | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_pre_post_norm_dense_mlp` |
+| `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
+| `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
+| `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -23,6 +31,60 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 
 ## Details
+
+### `LUMEN_GEMMA4_FUSE_DENSE_MLP`
+
+*Optimization, default on.*
+
+Fuse the dense-MLP chain. Output-identical.
+
+### `LUMEN_GEMMA4_FUSE_EXPERTS`
+
+*Optimization, default on.*
+
+Fuse the expert gather + GLU. Output-identical.
+
+### `LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE`
+
+*Optimization, default off.*
+
+Fuse the per-layer epilogue. Default OFF — opt-in; land path is enable,
+ measure, promote if positive.
+
+### `LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS`
+
+*Optimization, default off.*
+
+Fold the pre/post norms into the fused routing+experts path. Default OFF —
+ opt-in; land path is enable, measure, promote if positive.
+
+### `LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP`
+
+*Optimization, default off.*
+
+Fold the pre/post RMSNorm into the dense-MLP fusion. Default OFF — opt-in;
+ land path is enable, measure, promote if positive.
+
+### `LUMEN_GEMMA4_FUSE_ROUTER`
+
+*Optimization, default on.*
+
+Fuse the MoE router into one dispatch. Output-identical.
+
+### `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS`
+
+*Optimization, default on.*
+
+Fuse routing into the expert dispatch, replacing the two-slot
+ routing_tail + experts path. LANDED 2026-05-17, bit-identical with the
+ baseline (greedy tokens match exactly); 3-pair cool-state A/B at 8K
+ showed +2.2% throughput (53.35 +/- 0.5 -> 54.5 +/- 0.7 tok/s).
+
+### `LUMEN_GEMMA4_FUSE_SOFTCAP`
+
+*Optimization, default on.*
+
+Fuse the attention logit softcap. Output-identical.
 
 ### `LUMEN_MLX_KV_BF16`
 

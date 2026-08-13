@@ -388,7 +388,9 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// so it does not appear as a literal `env::var("LUMEN_X")`. 201 of the 202 raw
 /// reads are unregistered. (I first wrote 190 here by subtracting one from the
 /// other, which is the arithmetic of a subset and these are not.)
-const UNMANAGED_BASELINE: usize = 201;
+///
+/// 201 -> 193 when the eight Gemma 4 fusion flags moved into the registry.
+const UNMANAGED_BASELINE: usize = 193;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

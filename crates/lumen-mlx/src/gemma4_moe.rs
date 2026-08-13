@@ -375,10 +375,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the MoE router into one dispatch. Output-identical.
+        pub(crate) fuse_router {
+            env: "LUMEN_GEMMA4_FUSE_ROUTER",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_router_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_ROUTER")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_router::get()
     }
 
     // ───────────────────────── Dense MLP compile (Phase 1.5 P9) ────────
@@ -460,10 +467,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the dense-MLP chain. Output-identical.
+        pub(crate) fuse_dense_mlp {
+            env: "LUMEN_GEMMA4_FUSE_DENSE_MLP",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_dense_mlp_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_DENSE_MLP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_dense_mlp::get()
     }
 
     // Tier 2C (2026-05-16) — pre+post-norm absorbed dense MLP compile slot.
@@ -536,10 +550,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fold the pre/post RMSNorm into the dense-MLP fusion. Default OFF — opt-in;
+        /// land path is enable, measure, promote if positive.
+        pub(crate) fuse_pre_post_norm_dense_mlp {
+            env: "LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_pre_post_norm_dense_mlp_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_pre_post_norm_dense_mlp::get()
     }
 
     fn gemma4_pre_post_norm_dense_mlp_fused(
@@ -735,10 +757,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the expert gather + GLU. Output-identical.
+        pub(crate) fuse_experts {
+            env: "LUMEN_GEMMA4_FUSE_EXPERTS",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_experts_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_EXPERTS")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_experts::get()
     }
 
     // ─────────── Combined routing+experts compile (lever exploration 2026-05-17) ─────
@@ -844,14 +873,20 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse routing into the expert dispatch, replacing the two-slot
+        /// routing_tail + experts path. LANDED 2026-05-17, bit-identical with the
+        /// baseline (greedy tokens match exactly); 3-pair cool-state A/B at 8K
+        /// showed +2.2% throughput (53.35 +/- 0.5 -> 54.5 +/- 0.7 tok/s).
+        pub(crate) fuse_routing_experts {
+            env: "LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_routing_experts_fuse_enabled() -> bool {
-        // LANDED 2026-05-17 — bit-identical with baseline (greedy tokens
-        // match exactly). 3-pair cool-state A/B at 8K shows +2.2% throughput
-        // (53.35 ± 0.5 → 54.5 ± 0.7 tok/s). Default ON; set the env to
-        // "0" to revert to the two-slot routing_tail + experts path.
-        std::env::var("LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_routing_experts::get()
     }
 
     // ─ Pre+post-norm absorbed into routing+experts (lever exploration 2026-05-17) ─
@@ -950,11 +985,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fold the pre/post norms into the fused routing+experts path. Default OFF —
+        /// opt-in; land path is enable, measure, promote if positive.
+        pub(crate) fuse_norm_routing_experts {
+            env: "LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_pre_post_norm_routing_experts_fuse_enabled() -> bool {
-        // Default OFF — opt-in. Land path: enable, measure, promote if positive.
-        std::env::var("LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_norm_routing_experts::get()
     }
 
     fn gemma4_pre_post_norm_routing_experts_fused(
@@ -1076,10 +1118,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the attention logit softcap. Output-identical.
+        pub(crate) fuse_softcap {
+            env: "LUMEN_GEMMA4_FUSE_SOFTCAP",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_softcap_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_SOFTCAP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_softcap::get()
     }
 
     fn gemma4_softcap_fused(logits: &Array, softcap_inv: &Array, softcap: &Array) -> Result<Array> {
@@ -1130,10 +1179,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the per-layer epilogue. Default OFF — opt-in; land path is enable,
+        /// measure, promote if positive.
+        pub(crate) fuse_layer_epilogue {
+            env: "LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_layer_epilogue_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_layer_epilogue::get()
     }
 
     fn gemma4_layer_epilogue_fused(
