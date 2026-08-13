@@ -56,10 +56,13 @@ sanity pass mid-work; it is not a substitute before pushing.
 
 Two deliberate omissions, both explained in `xtask/src/gate.rs`:
 
-- **clippy is report-only.** At `-D warnings` this workspace fails with **330**
-  pre-existing warnings — it has never been clippy-clean. A gate that fails on
-  day one is a gate people learn to skip. The number is the debt; make the step
-  blocking once it reaches zero.
+- **clippy is blocking**, as of the backlog reaching zero. It was report-only
+  while 349 warnings stood, on the reasoning that a gate failing on day one is
+  a gate people learn to skip. Report-only turned out to be hiding more than
+  warnings: a deny-by-default `approx_constant` **error** had been failing
+  `cargo clippy` outright for as long as nothing read its exit code. Four lints
+  are allowed workspace-wide in the root `Cargo.toml`, each with its reason
+  written next to it; everything else is expected to stay at zero.
 - **Soak-scale work is not here.** Fuzzing, the full `Optimization`-flag
   equivalence matrix, coverage, Metal validation and Miri all take minutes to
   hours. They belong to a release: see `docs/release-checklist.md`.
@@ -224,7 +227,7 @@ before pushing.
 |---|---|---|
 | Embedding, 25 texts warm | ~55 ms total, 2.20 ms/item | unbatched (`LUMEN_EMBEDDING_BATCH_ROWS=1`): 220 ms, 8.80 ms/item |
 | Embedding quality eval (25-item KR/EN) | P@1 ≥ 0.95, MRR ≥ 0.97 | vs the committed Candle reference: per-item cosine ≥ 0.99 |
-| Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
+| Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
 | Qwen3.6-35B-A3B-mxfp4 N=1 decode | 13.9 ms/step p50, **71.6 tok/s** | — |
 | Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode | 14.85 ms/step p50, **67.3 tok/s** | — |
 

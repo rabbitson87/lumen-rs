@@ -137,14 +137,39 @@ fn dump_registry() -> Result<Vec<Flag>, String> {
     Ok(flags)
 }
 
-/// Two staleness checks, both of which exist because of an observed failure
+/// Three staleness checks, each of which exists because of an observed failure
 /// mode rather than caution:
 ///  1. docs/env-flags.md must match a fresh render (the 370-vs-27 audit gap).
 ///  2. every `env: "LUMEN_…"` string in source must appear in the linked
 ///     registry — the dump depends on the linker pulling the declaring rlib,
 ///     which an anchor forces today but no contract guarantees.
+///  3. every env var **named in any committed doc** must exist in the source.
+///     The project was renamed and `KESTREL_*` became `LUMEN_*`, but README.md
+///     and getting-started.md kept telling readers to set the old names — three
+///     variables, in the two most-read files, that had done nothing for as long
+///     as the rename was old. Checks 1 and 2 could not see it: both start from
+///     the `flag!` registry, and these are hand-rolled `env::var` reads. A doc
+///     is the only place a dead variable can hide in plain sight, because
+///     setting it fails silently by construction.
 fn run_check(flags: &[Flag]) -> ExitCode {
     let mut failed = false;
+
+    match check_documented_envs_exist() {
+        Ok(dead) if dead.is_empty() => {}
+        Ok(dead) => {
+            for (file, line, var) in &dead {
+                eprintln!(
+                    "{file}:{line} documents {var}, which appears nowhere in the source — \
+                     a reader who sets it gets silence"
+                );
+            }
+            failed = true;
+        }
+        Err(e) => {
+            eprintln!("documented-env scan failed: {e}");
+            failed = true;
+        }
+    }
 
     let committed = std::fs::read_to_string(repo_root().join(DOCS_PATH)).unwrap_or_default();
     if committed != render_docs(flags) {
@@ -183,6 +208,88 @@ fn run_check(flags: &[Flag]) -> ExitCode {
         println!("flags check clean");
         ExitCode::SUCCESS
     }
+}
+
+/// Env vars named in committed docs that do not exist anywhere in the source.
+///
+/// Returns `(file, line, var)`. The match is deliberately broad — any
+/// `SCREAMING_SNAKE` token with a known project prefix — because the failure
+/// this catches is a *renamed* prefix, and a scanner that only knew the current
+/// prefix would have been blind to exactly the case that motivated it.
+fn check_documented_envs_exist() -> Result<Vec<(String, usize, String)>, String> {
+    // The file that defines the rule has to be allowed to name a dead variable,
+    // same reasoning as `RULE_DEFINITIONS` in gate.rs.
+    const RULE_DEFINITIONS: &[&str] = &["xtask/src/flags.rs", "docs/env-flags.md"];
+    // Prefixes this project has shipped under. `KESTREL_` is dead and stays in
+    // the list on purpose: dropping it is how the check would stop catching the
+    // next rename.
+    const PREFIXES: &[&str] = &["LUMEN_", "KESTREL_"];
+
+    let docs = Command::new("git")
+        .current_dir(repo_root())
+        .args(["ls-files", "*.md"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let mut dead = Vec::new();
+    for file in String::from_utf8_lossy(&docs.stdout).lines() {
+        if RULE_DEFINITIONS.iter().any(|d| file.ends_with(d)) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(repo_root().join(file)) else {
+            continue;
+        };
+        for (i, line) in text.lines().enumerate() {
+            for var in env_tokens(line, PREFIXES) {
+                if !source_mentions(&var)? {
+                    dead.push((file.to_string(), i + 1, var));
+                }
+            }
+        }
+    }
+    Ok(dead)
+}
+
+/// `SCREAMING_SNAKE` tokens on `line` carrying one of `prefixes`.
+fn env_tokens(line: &str, prefixes: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_uppercase() {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_uppercase() || bytes[i].is_ascii_digit() || bytes[i] == '_')
+            {
+                i += 1;
+            }
+            let tok: String = bytes[start..i].iter().collect();
+            if prefixes.iter().any(|p| tok.starts_with(p)) && tok.len() > 8 && !out.contains(&tok) {
+                out.push(tok);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Does `var` appear anywhere under `crates/` or `xtask/`?
+fn source_mentions(var: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .current_dir(repo_root())
+        .args([
+            "grep",
+            "-l",
+            "--fixed-strings",
+            var,
+            "--",
+            "crates/",
+            "xtask/",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(!out.stdout.is_empty())
 }
 
 /// `env: "…"` occurrences inside `flag!` invocations, straight from source.
@@ -346,4 +453,63 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("xtask sits one level below the repo root")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The token scanner has to find a variable wherever a doc happens to spell
+    /// it — bare, in backticks, in a table cell, with a value attached.
+    #[test]
+    fn env_tokens_finds_variables_in_the_shapes_docs_actually_use() {
+        let cases = [
+            (
+                "| `LUMEN_GEMMA4_PREFILL_SYNC=0` | on | skip |",
+                "LUMEN_GEMMA4_PREFILL_SYNC",
+            ),
+            (
+                "set KESTREL_GEMMA4_CUSTOM_FLASH_ATTN before running",
+                "KESTREL_GEMMA4_CUSTOM_FLASH_ATTN",
+            ),
+            ("unset `LUMEN_AFFINE8_NAIVE`.", "LUMEN_AFFINE8_NAIVE"),
+        ];
+        for (line, want) in cases {
+            let got = env_tokens(line, &["LUMEN_", "KESTREL_"]);
+            assert!(got.iter().any(|t| t == want), "{line:?} -> {got:?}");
+        }
+    }
+
+    /// It must not fire on ordinary prose. A scanner that flags `MODEL_ID` or a
+    /// shouted word costs more attention than it saves, and a check people
+    /// learn to ignore is the failure mode this whole command exists to avoid.
+    #[test]
+    fn env_tokens_ignores_everything_that_is_not_a_project_variable() {
+        for line in [
+            "Set MODEL_ID to a local directory.",
+            "This is IMPORTANT and MUST be read.",
+            "HTTP GET /v1/models returns JSON.",
+            "See LUMEN_ for the prefix convention.", // bare prefix names nothing
+        ] {
+            assert!(
+                env_tokens(line, &["LUMEN_", "KESTREL_"]).is_empty(),
+                "false positive on {line:?}"
+            );
+        }
+    }
+
+    /// `KESTREL_` is dead, and stays in the prefix list on purpose. Dropping a
+    /// retired prefix is exactly how the check would go quiet on the next
+    /// rename — the case that motivated it in the first place.
+    #[test]
+    fn the_retired_prefix_is_still_scanned() {
+        assert!(
+            !env_tokens(
+                "`KESTREL_GEMMA4_PER_STEP_LATENCY=1`",
+                &["LUMEN_", "KESTREL_"]
+            )
+            .is_empty(),
+            "a retired prefix must still be recognised, or renames stop being caught"
+        );
+    }
 }

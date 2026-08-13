@@ -458,8 +458,8 @@ unchanged to six decimal places — the speedup does not move the output.
 | `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native`. |
 | `LUMEN_EMBEDDING_BATCH_ROWS` | Rows per padded embedding forward pass (default 32; `1` disables batching). |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |
-| `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
-| `KESTREL_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
+| `LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
+| `LUMEN_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
 
 ### Vision (Gemma 4 image input)
 
@@ -623,8 +623,11 @@ is unset, or you built without `--features mlx-native`.
 **Slow embedding latency (~35 ms instead of ~19 ms)** — the `qmv_fast`
 kernel needs `in_features % 512 == 0 AND out_features % 8 == 0`. The
 Qwen3-Embedding-0.6B shapes (1024 / 3072 in; 512 / 1024 / 3072 / vocab out)
-satisfy both, so this should not trigger. If you see naive-kernel speed,
-unset `LUMEN_AFFINE8_NAIVE`.
+satisfy both, so this should not trigger.
+
+(This entry used to end by telling you to unset an env var that does not
+exist. Unsetting it changed nothing — the least useful kind of advice,
+because it appears to work every time.)
 
 **`thread panicked at 'metal command buffer not enqueued'`** — known
 intermittent issue when interleaving Candle and mlx kernels on the same

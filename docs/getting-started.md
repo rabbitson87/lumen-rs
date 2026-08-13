@@ -278,15 +278,22 @@ LUMEN_VISION=1 MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
 | Env | Default | Effect |
 |---|---|---|
 | `LUMEN_EMBEDDING_BATCH_ROWS=1` | off | Force naive 8-bit GEMM (embedding path) |
-| `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | on | Disable custom flash-attn primitive |
-| `KESTREL_GEMMA4_PREFILL_SYNC=0` | on | Skip explicit eval-sync after prefill |
-| `LUMEN_DISABLE_FLASH_ATTN=1` | off | Disable Qwen3.6 flash-attn |
-| `LUMEN_DISABLE_RESIDUAL_FUSION=1` | off | Disable Qwen3.6 residual+RMSNorm fusion |
-| `LUMEN_DISABLE_INPUT_RMSNORM_FUSION=1` | off | Disable Qwen3.6 input-norm fusion |
-| `LUMEN_DISABLE_DENSE_MLP_RESIDUAL_FUSION=1` | off | Disable Qwen3.6 dense-MLP residual fusion |
-| `LUMEN_DISABLE_MOE_GATE_UP_SILU_MUL_FUSION=1` | off | Disable Qwen3.6 MoE gate/up/silu/mul fusion |
-| `LUMEN_DISABLE_MOE_WSUM_FUSION=1` | off | Disable Qwen3.6 MoE weighted-sum fusion |
+| `LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0` | on | Disable custom flash-attn primitive |
+| `LUMEN_GEMMA4_PREFILL_SYNC=0` | on | Skip explicit eval-sync after prefill |
 | `LUMEN_MLX_BACKEND=native\|pyo3\|subprocess` | **native** | Picks the mlx runner. `native` is the Apple-silicon-optimized mlx-rs path |
+
+**The Qwen 3.6 fusion opt-outs that used to be listed here are gone**, and were
+gone from the code long before they were removed from this table: seven
+`LUMEN_DISABLE_*_FUSION` variables that went with the Candle backend in
+`7eacd3a`. Anyone who followed this table set them and got silence.
+
+Their MLX-era replacements are registered flags, so they are in
+**[`env-flags.md`](env-flags.md)** — which is generated from the source and
+verified by `cargo xtask flags --check`, rather than maintained by hand like
+this table. Prefer that file; it cannot drift.
+
+`cargo xtask flags --check` now also fails when *any* committed doc names an
+env var the source does not define, which is what surfaced these.
 
 ## 8. Troubleshooting
 
