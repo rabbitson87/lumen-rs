@@ -233,6 +233,29 @@ for the record: Candle N=1 was 22.0 ms / 45.5 tok/s, and at PROMPT_LEN=2048 it
 was 486 ms / 2.0 tok/s — its SDPA did not scale to long KV, which is most of
 why MLX became the only path.
 
+**Re-measured**, load average ~3 (not idle) — which only strengthens a *pass*,
+since contention can make a number worse but not better:
+
+| Workload | Recorded | Measured | |
+|---|---|---|---|
+| Embedding, 25 texts warm | ~55 ms, 2.20 ms/item | **57 ms, 2.30 ms/item** | within 5% |
+| Embedding quality | P@1 ≥ 0.95, MRR ≥ 0.97, cosine ≥ 0.99 | **0.96 / 0.98 / 0.9988** | pass |
+| Gemma 4 26B-A4B decode | ~18.8 ms/step | **13.5 and 13.9 ms/step** | ~27% *faster* |
+
+The Gemma row being well outside the band on the good side is the same drift the
+20K prefill memory showed in §9 — these tables record a tree, and the tree moved.
+
+`Qwen3.6-35B-A3B-mxfp4` is **not measurable on this machine**: the local 35B is
+`affine` 4-bit gs64, and substituting it would compare a different
+bytes-per-token against a number that only means anything for mxfp4.
+
+⚠️ **`bench_gemma4_native_e2e` does not run the `STEPS` you ask for.** On a
+synthetic prompt the model degenerates and the runaway guard aborts — at step 32
+of a requested 64, at both `PROMPT_LEN=8` and `512`. The per-step figure is still
+sound (it is an average), but a request for 64 steps silently yields 32, so a
+run is less thermally loaded than it looks. Check the `[runaway] … aborted` line
+before comparing two runs of different lengths.
+
 **Always report `p50` for thermal-sensitive measurements** — `mean` is
 noisy after a few hot runs. The benches print both.
 
