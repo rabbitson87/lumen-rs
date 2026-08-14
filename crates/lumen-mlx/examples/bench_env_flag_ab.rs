@@ -154,6 +154,13 @@ fn main() -> anyhow::Result<()> {
     // INCONCLUSIVE by construction. A tool that cannot conclude is not
     // measuring anything.
     //
+    // Those stalls were NOT a property of the machine, though this comment
+    // used to imply they were. They were memory pressure: a 16 GB model
+    // resident on a 36 GB box with a release build running underneath it.
+    // Keeping the metric robust is still right — outliers do occur — but if
+    // you see 40x samples here, check what else you started before blaming
+    // the hardware. One model bench, or one build. Not both.
+    //
     // So: `min` is the primary estimator, because contention only ever makes a
     // sample **slower** — the fastest run of each side is the one least
     // interfered with. The noise floor is `median/min`, which describes the

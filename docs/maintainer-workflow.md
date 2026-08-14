@@ -345,10 +345,22 @@ Two things it taught about measuring on this machine:
 * **`min` is the estimator, not `mean` or `max`.** Contention only ever makes a
   sample slower, so the fastest run of each side is the least interfered with.
   The noise floor is `median/min` — the spread of the clean cluster.
-* **Stalls happen even when idle.** 4 of 20 samples exceeded 3× the median, one
-  at 40×. An outlier-sensitive spread metric (`max/min`) reported 4179% and made
-  every verdict INCONCLUSIVE by construction; a tool that cannot conclude is not
-  measuring anything.
+* **A robust spread metric, because outliers happen.** 4 of 20 samples exceeded
+  3× the median, one at 40×. An outlier-sensitive metric (`max/min`) reported
+  4179% and made every verdict INCONCLUSIVE by construction; a tool that cannot
+  conclude is not measuring anything.
+
+  ⚠️ **Those stalls were self-inflicted, and this file said otherwise.** It
+  originally read "stalls happen even when idle" — presented as a property of
+  the machine. They were memory pressure: 36 GB of RAM, a 16 GB model resident,
+  and a release-build `cargo xtask gate` started underneath it. The box
+  eventually froze and rebooted. Read the same way, the gate slowing from 555s
+  to 775s to 841s across the session was the same signal, and it was missed too.
+
+  **So: never run a model bench and a build/gate at the same time.** One at a
+  time, and wait. Run alone on a settled machine the gate finishes in ~810s and
+  never takes the load above 6.4. If a measurement here shows 40× outliers,
+  suspect your own concurrency before the hardware.
 
 And read the `[runaway] … aborted` line first: unequal step counts make two runs
 incomparable, which is the trap documented above and the one that broke this
