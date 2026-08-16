@@ -124,14 +124,26 @@ mod imp {
             .0
     }
 
+    lumen_flags::flag! {
+        /// Share one `OnceLock` stream + sentinel across FFI quant ops instead
+        /// of constructing `StreamGuard::gpu()` + `OwnedEmptyArray` per call.
+        /// Default OFF — Lever 2 infrastructure, measured an **A/B wash**
+        /// (2026-05-03). Kept because the per-call construction is the thing it
+        /// would replace, not because it won.
+        ///
+        /// Stream plumbing only; the arithmetic is untouched, hence
+        /// `Optimization`.
+        pub(crate) cached_stream {
+            env: "LUMEN_NATIVE_CACHED_STREAM",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     /// Returns true (default) when each FFI quant op constructs its own
-    /// `StreamGuard::gpu()` + `OwnedEmptyArray` sentinels. Set
-    /// `LUMEN_NATIVE_CACHED_STREAM=1` to opt in to the OnceLock singleton
-    /// path (Lever 2 infrastructure, A/B WASH 2026-05-03).
+    /// `StreamGuard::gpu()` + `OwnedEmptyArray` sentinels.
     fn use_per_call_stream() -> bool {
-        std::env::var("LUMEN_NATIVE_CACHED_STREAM")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        !cached_stream::get()
     }
 
     /// RAII guard for the temporary "no biases" sentinel handle. When the

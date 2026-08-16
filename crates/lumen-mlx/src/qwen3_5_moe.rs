@@ -121,6 +121,24 @@ mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Fuse `gate_proj` + `up_proj` into one QMV when their quant params
+        /// match. Default OFF and **tested negative**: an A/B on 27B / M3 Max
+        /// showed no win (separate 85.7 ms vs fused 89.2 ms/tok). Real decode
+        /// pipelines the matmuls and is bandwidth-bound, so fusing same-byte
+        /// matmuls saves nothing and the extra split op costs a little. The
+        /// isolation bench overstated dispatch overhead because it `eval()`s
+        /// every call, which defeats pipelining.
+        ///
+        /// Kept as a future-hardware lever. Row-concat is bit-identical, which
+        /// is why this is an `Optimization` rather than a `Behavior` flag.
+        pub(crate) fuse_gate_up_flag {
+            env: "LUMEN_NATIVE_FUSE_GATE_UP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     pub(crate) fn kv_store_bf16() -> bool {
         kv_bf16::get()
     }
@@ -791,9 +809,7 @@ mod imp {
         // isolation bench (bench_affine4_qmv_decode) overstated dispatch overhead
         // because it eval()s every call (defeats pipelining). Kept env-gated
         // (`LUMEN_NATIVE_FUSE_GATE_UP=1`) as a tested-negative / future-HW lever.
-        let fuse = std::env::var("LUMEN_NATIVE_FUSE_GATE_UP")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        let fuse = fuse_gate_up_flag::get()
             && gate.group_size == up.group_size
             && gate.bits == up.bits
             && gate.mode == up.mode;

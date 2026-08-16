@@ -20,9 +20,11 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
+| `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
+| `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
 | `LUMEN_NATIVE_FUSE_LINATTN_IN` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
 | `LUMEN_NATIVE_FUSE_SIGMOID_MUL` | off | Optimization | `lumen_mlx::native_kernels::imp::sigmoid_mul_fuse` |
 | `LUMEN_NATIVE_FUSE_SWIGLU` | on | Optimization | `lumen_mlx::native_moe::imp::swiglu_fuse` |
@@ -135,6 +137,19 @@ Reuse per-layer scratch allocations across decode steps instead of
  `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` (the fused-weight constants
  live in the reused `LinearAttnConstants`).
 
+### `LUMEN_NATIVE_CACHED_STREAM`
+
+*Optimization, default off.*
+
+Share one `OnceLock` stream + sentinel across FFI quant ops instead
+ of constructing `StreamGuard::gpu()` + `OwnedEmptyArray` per call.
+ Default OFF — Lever 2 infrastructure, measured an **A/B wash**
+ (2026-05-03). Kept because the per-call construction is the thing it
+ would replace, not because it won.
+
+ Stream plumbing only; the arithmetic is untouched, hence
+ `Optimization`.
+
 ### `LUMEN_NATIVE_COMPILE`
 
 *Optimization, default on.*
@@ -159,6 +174,21 @@ Compile-wrap the MoE routing graph. Default OFF (A/B WASH). (Parse
 Conv-state advance via `slice` (view/copy) instead of `take_axis`
  (gather kernel). Bit-identical for the s==1 decode regime — same
  indices, cheaper Metal kernel. Default OFF (A/B WASH).
+
+### `LUMEN_NATIVE_FUSE_GATE_UP`
+
+*Optimization, default off.*
+
+Fuse `gate_proj` + `up_proj` into one QMV when their quant params
+ match. Default OFF and **tested negative**: an A/B on 27B / M3 Max
+ showed no win (separate 85.7 ms vs fused 89.2 ms/tok). Real decode
+ pipelines the matmuls and is bandwidth-bound, so fusing same-byte
+ matmuls saves nothing and the extra split op costs a little. The
+ isolation bench overstated dispatch overhead because it `eval()`s
+ every call, which defeats pipelining.
+
+ Kept as a future-hardware lever. Row-concat is bit-identical, which
+ is why this is an `Optimization` rather than a `Behavior` flag.
 
 ### `LUMEN_NATIVE_FUSE_LINATTN_IN`
 
