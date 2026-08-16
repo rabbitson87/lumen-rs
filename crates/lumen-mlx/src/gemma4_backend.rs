@@ -51,6 +51,33 @@ pub(crate) mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Disable overlap scheduling on the sampled decode path, restoring the
+        /// original fully-synchronous order. Default OFF, i.e. overlap is on.
+        ///
+        /// Output-identical by construction: everything that affects the token
+        /// stream — sampling, `all_tokens.push`, thinking-budget force-close and
+        /// channel-block, the EOS check, the runaway check, the hard break —
+        /// stays synchronous and in the original order. Only the parser advance,
+        /// detokenisation and SSE send of the *previous* token are deferred, and
+        /// the parser is consumed solely by `emit_token_event` / `finalize`.
+        pub(crate) no_overlap {
+            env: "LUMEN_MLX_NO_OVERLAP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    /// Overlap scheduling on, i.e. `LUMEN_MLX_NO_OVERLAP` is not asserted.
+    ///
+    /// Split out of the decode loop so the polarity is reachable from a test.
+    /// The defect it guards was keyed on the variable being *set* rather than
+    /// on its value, and the call site sits inside a decode loop no unit test
+    /// can enter.
+    pub(crate) fn overlap_scheduling_enabled() -> bool {
+        !no_overlap::get()
+    }
+
     /// Background worker that drops MLX's reusable Metal-buffer pool after each
     /// chat completion. MLX keeps freed buffers in a reuse cache that grows with
     /// every request's KV-sized allocations; without a periodic clear, process
@@ -3459,7 +3486,11 @@ pub(crate) mod imp {
                         // decode path) ────────────────────────────────────
                         //
                         // Default ON; `LUMEN_MLX_NO_OVERLAP=1` restores the
-                        // exact original synchronous path.
+                        // exact original synchronous path. Read through the
+                        // registry, so `=0` means "do not disable" — this used
+                        // to be `env::var(..).is_err()`, i.e. keyed on the
+                        // variable being SET at all, so `=0` disabled overlap
+                        // and contradicted the line above.
                         //
                         // Per step we (a) sample token N (blocks on this
                         // step's logits via `last_logits_to_cpu_f32`'s eval),
@@ -3482,7 +3513,7 @@ pub(crate) mod imp {
                         // Only the parser advance + detok + SSE send is
                         // deferred (the parser is consumed solely by
                         // `emit_token_event` and `finalize`).
-                        let overlap_enabled = std::env::var("LUMEN_MLX_NO_OVERLAP").is_err();
+                        let overlap_enabled = overlap_scheduling_enabled();
                         // size-1 FIFO: the previous step's (token, state_before)
                         // whose parser.push + emit was deferred.
                         let mut pending: Option<(u32, ParseState)> = None;
@@ -4087,6 +4118,24 @@ pub(crate) mod imp {
 
         fn dir_present() -> bool {
             Path::new(LMSTUDIO_DIR).exists()
+        }
+
+        /// `LUMEN_MLX_NO_OVERLAP=0` must NOT disable overlap.
+        ///
+        /// The read used to be `env::var(..).is_err()` — keyed on the variable
+        /// being set at all — so `=0`, `=false` and even `=` turned overlap off,
+        /// which is the opposite of what every one of those spellings means and
+        /// the opposite of what the comment beside it promised.
+        #[test]
+        fn zero_does_not_disable_overlap() {
+            // SAFETY: single-threaded test; the value is read through the flag
+            // registry, which applies the uniform `!= "0"` rule.
+            unsafe { std::env::set_var("LUMEN_MLX_NO_OVERLAP", "0") };
+            assert!(
+                overlap_scheduling_enabled(),
+                "setting the variable to 0 must leave overlap ON"
+            );
+            unsafe { std::env::remove_var("LUMEN_MLX_NO_OVERLAP") };
         }
 
         #[test]

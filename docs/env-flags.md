@@ -18,6 +18,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
+| `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
@@ -110,6 +111,20 @@ Store the full-attention KV cache in bf16 rather than f32.
  below the 1.5th percentile of the top1−top2 logit gap. `=0`
  restores f32. Harnesses: `examples/kv_bf16_ab.rs`,
  `examples/kv_bf16_quality.rs`.
+
+### `LUMEN_MLX_NO_OVERLAP`
+
+*Optimization, default off.*
+
+Disable overlap scheduling on the sampled decode path, restoring the
+ original fully-synchronous order. Default OFF, i.e. overlap is on.
+
+ Output-identical by construction: everything that affects the token
+ stream — sampling, `all_tokens.push`, thinking-budget force-close and
+ channel-block, the EOS check, the runaway check, the hard break —
+ stays synchronous and in the original order. Only the parser advance,
+ detokenisation and SSE send of the *previous* token are deferred, and
+ the parser is consumed solely by `emit_token_event` / `finalize`.
 
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 

@@ -167,6 +167,26 @@ const fn core(filter: &'static str) -> Guard {
 
 static DEFECTS: &[Defect] = &[
     Defect {
+        name: "no-overlap-keyed-on-presence",
+        symptom: "`LUMEN_MLX_NO_OVERLAP=0` — which reads as \"do not disable \
+                  overlap\" — disabled it. The read was \
+                  `env::var(..).is_err()`, keyed on the variable being SET at \
+                  all, so every value including `0` and the empty string turned \
+                  off overlap scheduling and slowed streaming. The comment two \
+                  lines above it said `=1` restores the synchronous path",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        !no_overlap::get()"#,
+            replace: r#"        std::env::var("LUMEN_MLX_NO_OVERLAP").is_err()"#,
+        }],
+        guards: &[mlx(
+            "gemma4_backend::imp::tests::zero_does_not_disable_overlap",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "parallel-tool-calls-not-enforced",
         symptom: "`parallel_tool_calls: false` was accepted and then not applied \
                   — a three-city prompt returned three tool calls either way. \
@@ -731,6 +751,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // round-trip tests, and a file for it would be more ceremony than code.
         (_, "scratch-path-collision") => "lib.rs",
         (_, "parallel-tool-calls-not-enforced") => "grammar.rs",
+        (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
