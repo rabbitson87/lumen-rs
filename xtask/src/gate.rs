@@ -100,6 +100,18 @@ const STEPS: &[Step] = &[
         optional: false,
     },
     Step {
+        name: "frontend check",
+        rationale: "the gate was Rust-only, so `svelte-check` had been reporting two \
+                    errors for as long as nobody ran it — one of them a dead \
+                    comparison against a `LifecycleState` variant that does not \
+                    exist, which made a restart-after-crash spin its full 30s \
+                    timeout. Node is not a new dependency: `tauri.conf.json` \
+                    already runs `npm run build` before every app build",
+        program: "npm",
+        args: &["--prefix", "crates/lumen-app/frontend", "run", "check"],
+        optional: false,
+    },
+    Step {
         name: "test (representative)",
         rationale: "`cargo test --workspace` alone is green by omission — the \
                     interesting harnesses are feature-gated, and parallel threads \

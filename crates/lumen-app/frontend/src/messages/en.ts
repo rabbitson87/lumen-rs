@@ -94,6 +94,27 @@ export const en: Record<string, string> = {
   "metrics.requestsPerMin": "req/min",
 
   // ── CONTEXT card ────────────────────────────────────────────────
+  "spec.title": "SPECULATIVE DECODING",
+  "spec.titleHint": "(draft tokens, then verify)",
+  "spec.kind": "Strategy",
+  "spec.off": "Off",
+  "spec.lookup": "Lookup",
+  "spec.mtp": "MTP",
+  "spec.hint.kind":
+    "Off is the safe default. Lookup drafts from n-grams already in the prompt (no extra weights, helps on repetitive text). MTP uses the model's own multi-token-prediction head and needs a checkpoint that ships one. Output is unchanged either way \u2014 rejected drafts are discarded. Sets",
+  "spec.draftK": "Draft tokens per step",
+  "spec.hint.draftK":
+    "How many tokens to draft before verifying. Higher drafts more per step but wastes more work when the draft is rejected; 1\u20132 is usually best, and past ~3 acceptance falls faster than the saving grows. Sets",
+  "batch.title": "BATCHING",
+  "batch.titleHint": "(serve several requests per step)",
+  "batch.enable": "Continuous batching",
+  "batch.off": "Off",
+  "batch.on": "On",
+  "batch.hint.enable":
+    "Decode several sequences in one forward pass. Raises total throughput and lowers per-sequence speed. Only greedy requests are admitted \u2014 anything with temperature or top-p falls back to single-sequence decode. Sets",
+  "batch.max": "Max sequences per step",
+  "batch.hint.max":
+    "Upper bound on sequences decoded together. Each concurrent sequence holds its own KV cache, so this is a memory knob as much as a throughput one. Sets",
   "diskkv.title": "DISK KV CACHE",
   "diskkv.titleHint": "(persist prefix KV across restarts)",
   "diskkv.enable": "Enable",
