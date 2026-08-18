@@ -961,7 +961,13 @@ fn lark_grammar_string(tools: &[Value], strict: bool, calls: ToolCalls) -> Resul
 /// general — `Playwright (Stealth)__browser_navigate`, `날씨_조회`, `도시`. They
 /// are safe *as literals* once escaped; what is not safe is using them as Lark
 /// rule names, which is why rule names are indexed instead.
-fn lark_literal(s: &str) -> String {
+///
+/// `pub` only so the `grammar_literals` fuzz target can assert the escape
+/// invariant directly instead of inferring it from a whole emitted grammar.
+/// `grammar-literal-escaping` shipped precisely because nothing tested this
+/// function alone.
+#[doc(hidden)]
+pub fn lark_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -981,7 +987,11 @@ fn lark_literal(s: &str) -> String {
 /// True when the string is a safe `[a-zA-Z_][a-zA-Z0-9_]*` identifier —
 /// used to refuse tool / property names that would need escaping when
 /// emitted as Lark literals.
-fn is_safe_ident(s: &str) -> bool {
+///
+/// `pub` for the same reason as [`lark_literal`]: the two are a pair, and the
+/// property worth fuzzing is the relationship between them.
+#[doc(hidden)]
+pub fn is_safe_ident(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
         return false;

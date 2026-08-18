@@ -49,8 +49,16 @@ const TARGETS: &[(&str, &str)] = &[
         "ToolSet → build_qwen35_tool_grammar_lark; hostile schema alphabet, no panics",
     ),
     (
+        "grammar_literals",
+        "raw bytes → lark_literal/is_safe_ident; a name must not escape its own quotes",
+    ),
+    (
         "grammar_x_output",
         "ToolSet + ModelOutput mutated together; the dbsqlfuzz cross-invariant",
+    ),
+    (
+        "chat_render",
+        "ToolSet → render_tools_system_block; every declared tool reaches the model",
     ),
     (
         "request_parse",
@@ -121,6 +129,17 @@ pub fn main(args: Vec<String>) -> ExitCode {
 
     for name in &names {
         println!("\n=== fuzz {name} ({minutes} min) ===");
+
+        // libFuzzer refuses to start when the working corpus directory is
+        // absent, and it is gitignored — so it is missing on every fresh clone
+        // and for every newly added target. Creating it here keeps that from
+        // reading as "the new target is broken".
+        if let Err(e) = std::fs::create_dir_all(root.join("fuzz/corpus").join(name)) {
+            eprintln!("cannot create fuzz/corpus/{name}: {e}");
+            failed.push((*name).to_string());
+            continue;
+        }
+
         let before = artifact_files(&root, name);
 
         // `cargo fuzz run` exits nonzero on a crash — that is the tool working,

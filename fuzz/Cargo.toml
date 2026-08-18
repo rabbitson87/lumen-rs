@@ -62,3 +62,17 @@ path = "fuzz_targets/request_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "grammar_literals"
+path = "fuzz_targets/grammar_literals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chat_render"
+path = "fuzz_targets/chat_render.rs"
+test = false
+doc = false
+bench = false

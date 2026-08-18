@@ -15,6 +15,7 @@
 
 pub mod faults;
 pub mod generators;
+pub mod invariants;
 
 /// Re-exported so replay tests drive `Unstructured` at the exact version the
 /// generators were compiled against — a skew there changes what bytes decode

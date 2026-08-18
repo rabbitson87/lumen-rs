@@ -330,9 +330,16 @@ static DEFECTS: &[Defect] = &[
             replace: r#"            '\\' => out.push('\\'),
             '"' => out.push('"'),"#,
         }],
-        guards: &[mlx(
-            "grammar::tests::lark_grammar_escapes_a_quote_in_a_tool_name",
-        )],
+        guards: &[
+            mlx("grammar::tests::lark_grammar_escapes_a_quote_in_a_tool_name"),
+            // The second guard is what makes the `grammar_literals` fuzz target
+            // worth having. The unit test above pins one hand-written name; this
+            // one asserts the escaping *contract* over every committed seed, and
+            // it is the same assertion the soak runs — so a revert here proves
+            // the fuzzer would have caught the original defect rather than
+            // leaving that as a claim.
+            mlx_ungated_test("fuzz_corpus_replay", "replay_grammar_literals"),
+        ],
         occurrences: 1,
         needs_checkpoint: false,
         extra: &[],

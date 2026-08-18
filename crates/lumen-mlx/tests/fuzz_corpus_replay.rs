@@ -21,10 +21,13 @@
 
 use std::path::PathBuf;
 
+use lumen_mlx::chat_io::ToolDef;
 use lumen_mlx::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
-use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
+use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark, is_safe_ident, lark_literal};
+use lumen_mlx::render_tools_system_block;
 use lumen_testkit::arbitrary;
 use lumen_testkit::generators::{GrammarAndOutput, ToolSet};
+use lumen_testkit::invariants::{assert_lark_literal_contract, assert_tools_block_contract};
 
 /// Committed inputs for `target`: seeds always, artifacts when any exist.
 /// Panics on a missing/empty seed directory — an empty replay set silently
@@ -130,6 +133,60 @@ fn replay_grammar_x_output() {
             );
         }
     }
+}
+
+/// Unlike the four replays above, this one and `replay_chat_render` share their
+/// assertion with the fuzz target rather than restating it, so the drift this
+/// file's header warns about cannot happen here.
+#[test]
+fn replay_grammar_literals() {
+    for (path, bytes) in committed_inputs("grammar_literals") {
+        let Ok(s) = std::str::from_utf8(&bytes) else {
+            panic!("{}: seed is not UTF-8", path.display());
+        };
+        assert_lark_literal_contract(s, &lark_literal(s), is_safe_ident(s));
+    }
+}
+
+#[test]
+fn replay_chat_render() {
+    let mut non_vacuous = 0usize;
+    for (path, bytes) in committed_inputs("chat_render") {
+        let mut u = arbitrary::Unstructured::new(&bytes);
+        let Ok((tools, extra)) =
+            <(ToolSet, Option<String>) as arbitrary::Arbitrary>::arbitrary(&mut u)
+        else {
+            continue;
+        };
+        let defs: Vec<ToolDef<'_>> = tools
+            .tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                Some(ToolDef {
+                    name: f.get("name")?.as_str()?,
+                    description: f.get("description").and_then(serde_json::Value::as_str),
+                    parameters: f.get("parameters"),
+                    response: None,
+                })
+            })
+            .collect();
+        if !defs.is_empty() {
+            non_vacuous += 1;
+        }
+        let declared: Vec<&str> = defs.iter().map(|d| d.name).collect();
+        let rendered = render_tools_system_block(&defs, extra.as_deref());
+        assert_tools_block_contract(&declared, &rendered, extra.as_deref());
+        let _ = path;
+    }
+    // The seeds are opaque `Arbitrary` blobs, so "every seed decoded to zero
+    // tools" would replay perfectly while covering nothing — the same
+    // green-by-omission shape `committed_inputs` guards against for empty
+    // directories.
+    assert!(
+        non_vacuous > 0,
+        "every chat_render seed decoded to an empty tool set; the corpus covers nothing"
+    );
 }
 
 /// The known-defect reproducers are also asserted *positively* — not just "no

@@ -160,6 +160,11 @@ mod qwen3_5_moe;
 #[cfg(feature = "mlx-native")]
 mod qwen3_5_mtp;
 mod qwen3_5_tools;
+// The Qwen tool-calling system-prompt renderer, reachable from the
+// `chat_render` fuzz target. The module itself stays private; this exposes one
+// pure `&[ToolDef] -> String` function and nothing else.
+#[doc(hidden)]
+pub use qwen3_5_tools::render_tools_system_block;
 // Phase 2 Step B microbench — synthetic-weight latency probe at
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
