@@ -33,6 +33,12 @@
 //!     keys and names, in more than one script.
 //!   * `grammar-literal-escaping` — a literal escaping its own quotes. Hence
 //!     names carrying `"`, `\` and newlines.
+//!   * `grammar-control-chars` — a raw `\x1b` in a name making llguidance
+//!     reject the whole grammar. Hence names and keys carrying ESC, NUL and
+//!     DEL. This one is here as a correction rather than a credit: the
+//!     alphabet had `"`, `\` and `\n` but no *other* control character, so
+//!     millions of executions could not have found it. See the note on
+//!     `HOSTILE_NAMES`.
 //!   * `json-whitespace` / `json-separator-space` — significant whitespace
 //!     around separators. Hence the whitespace mutations.
 //!   * `lark-opener` — a truncated or doubled opener token.
@@ -47,6 +53,19 @@ use serde_json::{Value, json};
 /// Tool names that are legal for a client to send and awkward for us to
 /// handle. The empty string and the 1 KB name are boundary cases; the rest are
 /// shapes that have produced real defects.
+///
+/// **A generator finds only what its alphabet contains.** This list held a
+/// quote, a backslash and a newline but no other control character, and
+/// `grammar_build` ran millions of executions over it without ever finding
+/// `grammar-control-chars` — a raw `\x1b` in a name makes llguidance reject
+/// the entire grammar. The hole in the alphabet was the exact shape of the
+/// bug. When a defect turns up by another route, the first question is whether
+/// this list could have produced it.
+///
+/// Adding an entry renumbers `u.choose`, so the opaque `Arbitrary` seed blobs
+/// under `fuzz/seeds/` decode to different tool sets afterwards. That is
+/// acceptable for the generic `seed_a`/`seed_b` blobs; if a committed seed is
+/// ever a crash reproducer, pin it as raw text instead.
 const HOSTILE_NAMES: &[&str] = &[
     "get_weather",
     "날씨_조회",
@@ -68,6 +87,12 @@ const HOSTILE_NAMES: &[&str] = &[
     "trailing_space ",
     " leading_space",
     "very.dotted.name",
+    // ASCII controls — the class `grammar-control-chars` lived in. ESC and NUL
+    // are the two extremes (mid-range and the zero byte); DEL is the other side
+    // of the printable band, which a `< 0x20` test would miss.
+    "with\u{1b}escape",
+    "with\u{0}nul",
+    "with\u{7f}del",
 ];
 
 /// Argument keys, same idea. `<|\"|>` is Gemma 4's own string delimiter, so a
@@ -84,6 +109,7 @@ const HOSTILE_KEYS: &[&str] = &[
     "unit",
     "<|\"|>",
     "0",
+    "key\u{1b}escape",
 ];
 
 /// JSON Schema fragments a real client might send, including the shapes that

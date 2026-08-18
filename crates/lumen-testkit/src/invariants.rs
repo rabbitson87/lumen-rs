@@ -36,6 +36,16 @@ pub fn assert_lark_literal_contract(input: &str, lit: &str, safe_ident: bool) {
         "literal escaped its own quoting: {lit:?} from {input:?}"
     );
 
+    // llguidance's Lark lexer rejects a raw ASCII control character inside a
+    // literal, and a rejected grammar is a *dropped* grammar — the model is
+    // then free to invent a tool nobody declared. That is `grammar-control-chars`,
+    // which this assertion was added in response to and which the escape table
+    // now covers.
+    assert!(
+        !interior.chars().any(|c| c.is_ascii_control()),
+        "raw ASCII control character survived escaping: {lit:?} from {input:?}"
+    );
+
     // Checked *in addition to* the quoting scan, not instead of it: a
     // `lark_literal` that had stopped escaping quotes altogether (`"` → `"""`)
     // still round-trips back to `"`, so a round trip alone would pass the
@@ -73,6 +83,16 @@ fn unescape(interior: &str) -> Option<String> {
             'n' => out.push('\n'),
             'r' => out.push('\r'),
             't' => out.push('\t'),
+            // `\uNNNN`, the spelling llguidance's Lark accepts for the ASCII
+            // controls that have no shorthand. Exactly four hex digits.
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() != 4 {
+                    return None;
+                }
+                let cp = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(cp)?);
+            }
             _ => return None,
         }
     }
@@ -199,6 +219,27 @@ mod tests {
     #[should_panic(expected = "round trip lost information")]
     fn literal_contract_rejects_a_dropped_character() {
         assert_lark_literal_contract("abc", "\"ab\"", false);
+    }
+
+    #[test]
+    fn literal_contract_accepts_the_unicode_escape() {
+        assert_lark_literal_contract("a\u{1b}b", "\"a\\u001bb\"", false);
+        assert_lark_literal_contract("\u{0}", "\"\\u0000\"", false);
+    }
+
+    /// The shape the `grammar-control-chars` defect emitted: a raw ESC passed
+    /// straight through, which round-trips perfectly and still makes
+    /// llguidance's lexer reject the grammar.
+    #[test]
+    #[should_panic(expected = "raw ASCII control character survived")]
+    fn literal_contract_rejects_a_raw_control_char() {
+        assert_lark_literal_contract("a\u{1b}b", "\"a\u{1b}b\"", false);
+    }
+
+    #[test]
+    #[should_panic(expected = "not un-escapable")]
+    fn literal_contract_rejects_a_truncated_unicode_escape() {
+        assert_lark_literal_contract("\u{1b}", "\"\\u01\"", false);
     }
 
     #[test]

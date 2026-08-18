@@ -977,6 +977,15 @@ pub fn lark_literal(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Every other ASCII control, plus DEL. These used to be emitted
+            // raw, and llguidance's Lark lexer rejects them — see the
+            // `grammar-control-chars` defect. Only 0x00-0x1F and 0x7F: the C1
+            // range and everything above it lexes fine, and escaping it would
+            // make Korean and emoji tool names unreadable in a dumped grammar
+            // for no gain.
+            '\x00'..='\x1f' | '\x7f' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             _ => out.push(c),
         }
     }
@@ -2218,6 +2227,83 @@ mod tests {
         let factory = shared_factory_placeholder();
         Gemma4GrammarState::new_lark(factory, &tools, GrammarMode::Eager, ToolCalls::OneOrMore)
             .expect("must compile under llguidance");
+    }
+
+    /// Found by the `grammar_literals` fuzz target's *documented gap* rather
+    /// than by the target itself: it noted that ASCII controls were passed
+    /// through raw and declined to guess whether llguidance minded. It does —
+    /// every one of these is `lexer error` without the escape, which drops the
+    /// grammar and leaves the model free to invent a tool nobody declared.
+    ///
+    /// Both grammar shapes are checked. The Qwen XML builder emits the name
+    /// into `"<function=NAME>\n"`, the Gemma one into a bare literal, and a fix
+    /// to only one of them would leave the other broken.
+    #[test]
+    fn lark_grammar_escapes_control_chars_in_a_tool_name() {
+        for (label, name) in [
+            ("NUL", "a\u{0}b"),
+            ("BEL", "a\u{7}b"),
+            ("VT", "a\u{b}b"),
+            ("FF", "a\u{c}b"),
+            ("ESC", "a\u{1b}b"),
+            ("US", "a\u{1f}b"),
+            ("DEL", "a\u{7f}b"),
+        ] {
+            let tools = vec![json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type":"object","properties":{} } }
+            })];
+
+            let s = lark_grammar_string(&tools, false, ToolCalls::OneOrMore)
+                .unwrap_or_else(|e| panic!("{label}: must build: {e}"));
+            assert!(
+                !s.chars().any(|c| c.is_ascii_control() && c != '\n'),
+                "{label}: a raw control character reached the grammar text"
+            );
+
+            Gemma4GrammarState::new_lark(
+                shared_factory_placeholder(),
+                &tools,
+                GrammarMode::Eager,
+                ToolCalls::OneOrMore,
+            )
+            .unwrap_or_else(|e| panic!("{label}: must compile under llguidance: {e}"));
+
+            Gemma4GrammarState::new_qwen35_xml(
+                shared_factory_placeholder(),
+                &tools,
+                GrammarMode::Eager,
+                None,
+                ToolCalls::OneOrMore,
+            )
+            .unwrap_or_else(|e| panic!("{label}: XML shape must compile under llguidance: {e}"));
+        }
+    }
+
+    /// The escape stops at DEL on purpose. C1 (U+0080-U+009F) and everything
+    /// above it lexes fine, and escaping it would render a Korean or emoji tool
+    /// name unreadable in a dumped grammar for no gain — so this pins the upper
+    /// bound rather than leaving it to be "tidied" later.
+    #[test]
+    fn lark_grammar_leaves_non_ascii_names_readable() {
+        let name = "날씨_조회";
+        let tools = vec![json!({
+            "type": "function",
+            "function": { "name": name, "parameters": { "type":"object","properties":{} } }
+        })];
+        let s = lark_grammar_string(&tools, false, ToolCalls::OneOrMore).expect("must build");
+        assert!(
+            s.contains(name),
+            "non-ASCII name must appear verbatim:\n{s}"
+        );
+        Gemma4GrammarState::new_qwen35_xml(
+            shared_factory_placeholder(),
+            &tools,
+            GrammarMode::Eager,
+            None,
+            ToolCalls::OneOrMore,
+        )
+        .expect("must compile under llguidance");
     }
 
     #[test]

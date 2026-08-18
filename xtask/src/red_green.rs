@@ -321,6 +321,34 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "grammar-control-chars",
+        symptom: "a tool whose name held an ASCII control character (`\\x00`, \
+                  `\\x0b`, `\\x1b`, DEL …) made llguidance reject the whole \
+                  grammar with `lexer error` — so the grammar was dropped and \
+                  the model was left unconstrained, free to emit a tool nobody \
+                  declared. Same end state as `grammar-rule-names`, reached \
+                  through the escape table instead of the rule names",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            '\x00'..='\x1f' | '\x7f' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+"#,
+            replace: "            // xtask red-green: control-char escaping removed\n",
+        }],
+        // Both guards, because they fail for different reasons and a fix that
+        // satisfied only one would still ship broken: the unit test builds a
+        // real llguidance matcher (the production symptom), the replay asserts
+        // the escape contract over the committed seeds (what the fuzzer sees).
+        guards: &[
+            mlx("grammar::tests::lark_grammar_escapes_control_chars_in_a_tool_name"),
+            mlx_ungated_test("fuzz_corpus_replay", "replay_grammar_literals"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "grammar-literal-escaping",
         symptom: "a quote inside a tool name closed the Lark literal",
         revert: &[Mutation {
@@ -736,7 +764,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "json-whitespace")
         | (_, "json-separator-space")
         | (_, "grammar-rule-names")
-        | (_, "grammar-literal-escaping") => "grammar.rs",
+        | (_, "grammar-literal-escaping")
+        | (_, "grammar-control-chars") => "grammar.rs",
         // Both defects live in the tool-call body grammar, which moved out of
         // `gemma4_response`'s feature-gated `mod imp` so it can be tested and
         // fuzzed without `mlx-native`.
