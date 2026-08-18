@@ -73,6 +73,38 @@ export const MODEL_GEOMETRY: Record<string, ModelGeometry> = {
     headDim: 256,
     maxContext: 262_144,
   },
+  // ── Qwen 27B dense (3.6 and 3.8) ──────────────────────────────────────
+  // Same geometry for both: `text_config` is byte-identical between the two
+  // generations (64 layers, full_attention_interval=4 → 16 full-attn layers,
+  // 24 heads / 4 KV heads, head_dim 256). Only `weightsBytes` differs, because
+  // the 3.8 build is quantized differently. Both keys existed as a gap before —
+  // the calculator fell through to "No memory profile for model" for every 27B.
+  "qwen3.8-27b": {
+    family: "qwen35",
+    label: "Qwen3.8-27B Dense (MTPLX 4/8-bit)",
+    // Sum of the shipped repo: 19.5 GB trunk + 0.92 GB vision tower + 0.85 GB
+    // MTP head = 21.3 GB on disk, plus the ~2.4 GiB runtime gap the 35B entry
+    // documents. UNLIKE the other two entries this is NOT yet anchored to an
+    // observed startup `active=` — treat it as an upper-ish estimate and
+    // re-anchor from the operator's own log.
+    weightsBytes: 23_900_000_000, // ~22.3 GiB resident (estimated, not observed)
+    fullAttnLayers: 16, // 64 layers, full_attention_interval=4
+    nKvHeads: 4,
+    nHeads: 24,
+    headDim: 256,
+    maxContext: 262_144,
+  },
+  "qwen3.6-27b": {
+    family: "qwen35",
+    label: "Qwen3.6-27B Dense (MTPLX 4-bit)",
+    // Flat affine 4-bit group-64: ~16 GB on disk + the runtime gap.
+    weightsBytes: 18_400_000_000, // ~17.1 GiB resident (estimated, not observed)
+    fullAttnLayers: 16,
+    nKvHeads: 4,
+    nHeads: 24,
+    headDim: 256,
+    maxContext: 262_144,
+  },
   "gemma-4-26b": {
     family: "gemma4",
     label: "Gemma 4 26B-A4B (4-bit)",

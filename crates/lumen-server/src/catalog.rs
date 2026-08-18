@@ -132,6 +132,29 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         min_ram_gb: 24,
         notes: "Dense 27B, 4-bit affine, with a built-in MTP self-speculative head. Stronger English / math / code than the 35B MoE; ~17.5 tok/s decode on M3 Max with MTP (≈19 at 3-bit). ~16 GB, needs ~24 GB RAM. Enable speculative decode: native runner + `LUMEN_QWEN35_MTP=1` + `LUMEN_SPEC=mtp` (point `LUMEN_QWEN35_HF_ORIGINAL` at the model dir, which holds the `mtp/` head).",
     },
+    RecommendedModel {
+        // Qwen3.8's trunk is the SAME architecture as the 3.6-27B above — its
+        // `text_config` is byte-identical (64 layers, hidden 5120,
+        // full_attention_interval 4, same linear-attn dims, same vision tower),
+        // and the MLX build carries the same tensor names. It is a newer, more
+        // capable generation on that backbone, not a new model to port.
+        //
+        // Heavier on disk than the 3.6 row despite the same shape: this build is
+        // 4-bit group-32 with per-tensor 8-bit group-64 on lm_head, embed_tokens,
+        // every linear_attn.out_proj and the last layers' MLP — so 21 GB, not 16,
+        // and it wants ~32 GB of RAM rather than 24.
+        //
+        // MTP measured on this checkpoint (M3 Max, K=2, greedy, 320 tokens):
+        // accept 0.494, output bit-exact against the non-MTP baseline (320/320),
+        // roughly 2x the baseline decode rate. Needs no env vars — the head
+        // auto-enables from the repo's own `mtp.safetensors`.
+        id: "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        family: ModelFamily::Qwen35Dense,
+        label: "Qwen 3.8 — 27B Dense (MTPLX)",
+        approx_size_gb: 21,
+        min_ram_gb: 32,
+        notes: "**Newest Qwen dense.** Same 27B hybrid backbone as the 3.6 entry (Gated DeltaNet linear-attn + 1-in-4 full attention, 262k context, vision tower) with a stronger 3.8-generation checkpoint — Qwen reports large agentic/coding gains over 3.6-27B. Ships a built-in MTP self-speculative head that auto-enables with **no env vars**: measured accept 0.494 at K=2 and ~2× baseline decode on M3 Max, with output bit-exact against the non-MTP path (320/320 tokens). Mixed precision (4-bit group-32 + 8-bit group-64 on lm_head / embeddings / attention out-projections / late MLP), so it is larger than the 3.6 build: ~21 GB, wants ~32 GB RAM. Prefer the 3.6-27B row on a 24 GB machine.",
+    },
     // Gemma 4 lineup — the NVFP4 base + two derived hybrids that share its fast
     // NVFP4 expert core. Built + measured 2026-06-02 (see the hsng95
     // `…-nvfp4-{smin,qmax}-mlx` model cards). NVFP4's finer per-group scales
@@ -247,11 +270,7 @@ pub fn family_of(model_id: &str) -> Option<ModelFamily> {
     if is_qwen3_5_dense(&lower) {
         return Some(ModelFamily::Qwen35Dense);
     }
-    if lower.contains("qwen3.6")
-        || lower.contains("qwen3_5")
-        || lower.contains("qwen3-next")
-        || lower.contains("a3b-mxfp4")
-    {
+    if is_qwen35_family(&lower) || lower.contains("qwen3-next") || lower.contains("a3b-mxfp4") {
         return Some(ModelFamily::Qwen35Moe);
     }
     if is_gemma4(&lower) {
@@ -272,9 +291,27 @@ fn is_gemma4(lower_id: &str) -> bool {
         || lower_id.contains("gemma4_")
 }
 
+/// Repo-id spellings that mean "this is the `qwen3_5` architecture family".
+///
+/// One list, because it has already been copied enough times to go wrong: the
+/// MTP loader used to select its head shape from this same set of substrings and
+/// silently mis-shaped any release outside it. Version markers accumulate here
+/// (3.5, 3.6, 3.8 …) since Qwen keeps the `model_type: "qwen3_5"` backbone
+/// across generations.
+///
+/// This is a *display* heuristic — it decides what the app's MODELS card offers.
+/// Load-time behaviour reads the checkpoint's own config.json, never this.
+/// NOTE the absent spelling: `"qwen3.5"` with a dot is deliberately NOT here.
+/// The dot-spelled 3.5 repos in the wild are dense 9B builds whose ids carry no
+/// size marker, so `is_qwen3_5_dense` would reject them and `family_of` would
+/// label them MoE — a wrong answer where the current one is `None` ("not a
+/// catalog model"). Add it only together with a size rule that gets 9B right.
+fn is_qwen35_family(lower_id: &str) -> bool {
+    lower_id.contains("qwen3_5") || lower_id.contains("qwen3.6") || lower_id.contains("qwen3.8")
+}
+
 fn is_qwen3_5_dense(lower_id: &str) -> bool {
-    let qwen35_family = lower_id.contains("qwen3.6") || lower_id.contains("qwen3_5");
-    if !qwen35_family {
+    if !is_qwen35_family(lower_id) {
         return false;
     }
     if lower_id.contains("-dense") || lower_id.contains("_dense") {
@@ -292,5 +329,86 @@ pub fn catalog() -> Catalog {
         recommended: RECOMMENDED.to_vec(),
         embeddings: EMBEDDINGS.to_vec(),
         image_models: IMAGE_MODELS.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Catalog, ModelFamily, catalog, family_of};
+
+    #[test]
+    fn the_qwen38_row_is_serveable_and_downloadable() {
+        let Catalog { recommended, .. } = catalog();
+        let row = recommended
+            .iter()
+            .find(|r| r.id == "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed")
+            .expect(
+                "Qwen3.8-27B must be in the recommended list — the app's MODELS card and its \
+                     hf-cache scan are both filtered by these ids, so an absent row means the \
+                     model cannot be downloaded or selected",
+            );
+        assert!(matches!(row.family, ModelFamily::Qwen35Dense));
+        // Sized from the shipped repo (19.5 GB trunk + 0.92 GB vision + the
+        // head), not copied from the 3.6 row — this build is mixed 4/8-bit and
+        // genuinely larger.
+        assert_eq!(row.approx_size_gb, 21);
+        assert_eq!(row.min_ram_gb, 32);
+    }
+
+    #[test]
+    fn the_36_row_survives_the_38_row() {
+        // The 3.8 entry was added ALONGSIDE 3.6, not in place of it: the hf-cache
+        // scan only surfaces ids present in this list, so dropping 3.6 would make
+        // an already-downloaded 3.6 vanish from the app.
+        let ids: Vec<&str> = catalog().recommended.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&"Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"));
+        assert!(ids.contains(&"Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"));
+    }
+
+    #[test]
+    fn a_38_id_resolves_to_the_dense_family() {
+        // RED before the `is_qwen35_family` hoist: `family_of` tested only for
+        // "qwen3.6" / "qwen3_5", so every 3.8 id returned None.
+        assert_eq!(
+            family_of("Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"),
+            Some(ModelFamily::Qwen35Dense)
+        );
+        assert_eq!(
+            family_of("mlx-community/Qwen3.8-27B-4bit"),
+            Some(ModelFamily::Qwen35Dense)
+        );
+    }
+
+    #[test]
+    fn the_previously_known_families_are_unchanged() {
+        assert_eq!(
+            family_of("Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"),
+            Some(ModelFamily::Qwen35Dense)
+        );
+        assert_eq!(
+            family_of("mlx-community/Qwen3.6-35B-A3B-mxfp4"),
+            Some(ModelFamily::Qwen35Moe)
+        );
+        assert_eq!(
+            family_of("mlx-community/gemma-4-26b-a4b-it-nvfp4"),
+            Some(ModelFamily::Gemma4)
+        );
+        assert_eq!(
+            family_of("Qwen/Qwen2.5-7B-Instruct"),
+            Some(ModelFamily::Qwen25)
+        );
+        assert_eq!(family_of("meta-llama/Llama-3-8B"), None);
+    }
+
+    #[test]
+    fn a_dot_spelled_35_id_stays_unknown_rather_than_being_called_moe() {
+        // The dot-spelled 3.5 repos are dense 9B builds carrying no size marker,
+        // so admitting them to `is_qwen35_family` without a size rule would label
+        // them MoE. `None` ("not a catalog model") is the honest answer until the
+        // dense heuristic can tell 9B apart.
+        assert_eq!(
+            family_of("Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed"),
+            None
+        );
     }
 }
