@@ -2934,9 +2934,10 @@ impl MlxQwen35Backend {
     /// Env-driven MTP auto-enable hook called at the end of `load()`.
     /// Triggered by `LUMEN_QWEN35_MTP=1`. Resolves the HF-original snapshot
     /// directory holding the bf16 `mtp.*` tensors from
-    /// `LUMEN_QWEN35_HF_ORIGINAL` (required when MTP is enabled), detects the
-    /// trunk variant (27B Dense vs 35B-A3B MoE) from the model_id substring,
-    /// loads the block via `load_block_from_hf` (AFFINE4 group_size=64), and
+    /// `LUMEN_QWEN35_HF_ORIGINAL` (required when MTP is enabled), derives the
+    /// head shape (Dense vs MoE, dims) from the trunk's own `config.json` via
+    /// [`crate::qwen3_5_mtp::mtp_shape_from_text_config`], loads the block via
+    /// `load_block_from_hf` (AFFINE4 group_size=64), and
     /// installs it through `enable_qwen35_mtp`. Returns `Err` only when the
     /// user-facing config is broken (env present but path missing / invalid
     /// dims / dtype) — propagated by the caller as a non-fatal warning so
@@ -3005,55 +3006,33 @@ impl MlxQwen35Backend {
                 }
             },
         };
-        // Dim detection from model_id — same substring rules as the server's
-        // `is_qwen3_5_dense`. 27B = Dense; everything else under the Qwen3.6
-        // family with mtp.* = MoE (35B-A3B currently).
-        let lower = self.model_id.to_lowercase();
-        let is_27b_dense = (lower.contains("qwen3.6") || lower.contains("qwen3_5"))
-            && !lower.contains("a3b")
-            && !lower.contains("moe")
-            && (lower.contains("27b") || lower.contains("-27-") || lower.contains("-dense"));
-        let (dims, mlp_cfg, label) = if is_27b_dense {
-            (
-                crate::qwen3_5_mtp::Qwen35MtpDims {
-                    hidden_size: 5120,
-                    num_attention_heads: 24,
-                    num_key_value_heads: 4,
-                    head_dim: 256,
-                    rope_theta: 10_000_000.0,
-                    rope_dim: 64,
-                    rms_norm_eps: 1e-6,
-                    attn_output_gate: true,
-                },
-                crate::qwen3_5_mtp::MtpMlpConfig::Dense {
-                    intermediate_size: 17_408,
-                },
-                "Qwen3.6-27B (Dense)",
-            )
-        } else {
-            // Default to the 35B-A3B MoE shape — matches the published
-            // checkpoint and the bench_qwen35_mtp_loader_smoke.rs 35b branch.
-            (
-                crate::qwen3_5_mtp::Qwen35MtpDims {
-                    hidden_size: 2048,
-                    num_attention_heads: 16,
-                    num_key_value_heads: 2,
-                    head_dim: 256,
-                    rope_theta: 10_000_000.0,
-                    rope_dim: 64,
-                    rms_norm_eps: 1e-6,
-                    attn_output_gate: true,
-                },
-                crate::qwen3_5_mtp::MtpMlpConfig::Moe(crate::qwen3_5_mtp::MtpMoeConfig {
-                    num_experts: 256,
-                    num_experts_per_tok: 8,
-                    moe_intermediate_size: 512,
-                    shared_expert_intermediate_size: 512,
-                    norm_topk_prob: true,
-                }),
-                "Qwen3.6-35B-A3B (MoE)",
-            )
+        // Head shape comes from the TRUNK's own config.json, not from the model
+        // id. The previous rule tested the id for `"qwen3.6" | "qwen3_5"` (the
+        // server's `is_qwen3_5_dense` spelling) and fell through to the 35B-A3B
+        // MoE shape for anything else — so a Qwen3.8 repo, whose trunk is the
+        // same 27B dense architecture, silently asked for hidden=2048 + MoE and
+        // failed at load. Every value those two branches hardcoded is already
+        // parsed here.
+        let trunk_dir = crate::runner_native::resolve_model_dir(&self.model_id)
+            .with_context(|| format!("resolve trunk dir for MTP dims ({})", self.model_id))?;
+        let trunk_cfg =
+            crate::qwen35_config::NativeModelConfig::load(&trunk_dir.join("config.json"))
+                .with_context(|| {
+                    format!(
+                        "read trunk config.json for MTP dims ({})",
+                        trunk_dir.display()
+                    )
+                })?;
+        let (dims, mlp_cfg) =
+            crate::qwen3_5_mtp::mtp_shape_from_text_config(&trunk_cfg.text_config)?;
+        let label = match mlp_cfg {
+            crate::qwen3_5_mtp::MtpMlpConfig::Dense { .. } => "Dense",
+            crate::qwen3_5_mtp::MtpMlpConfig::Moe(_) => "MoE",
         };
+        let label = format!(
+            "{label} hidden={} heads={}/{} head_dim={}",
+            dims.hidden_size, dims.num_attention_heads, dims.num_key_value_heads, dims.head_dim
+        );
         let quant = crate::qwen3_5_mtp::MtpLoadQuant::Affine4 { group_size: 64 };
         let t0 = std::time::Instant::now();
         let block = crate::qwen3_5_mtp::load_block_from_hf(&hf_path, dims, mlp_cfg, quant)

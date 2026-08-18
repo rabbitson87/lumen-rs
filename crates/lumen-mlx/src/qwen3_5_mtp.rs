@@ -180,6 +180,60 @@ pub enum MtpMlpConfig {
     Moe(MtpMoeConfig),
 }
 
+/// Derive the MTP head's shape from the **trunk's** `text_config`.
+///
+/// The head reuses the trunk's attention dims and MLP topology, so every value
+/// here is already in the parsed config — there is nothing to infer from the
+/// model id. Callers previously selected between two hardcoded structs by
+/// testing the id for `"qwen3.6" | "qwen3_5"`, which silently picked the wrong
+/// shape for any id outside that spelling (a Qwen3.8 repo fell into the 35B-A3B
+/// MoE branch). Deriving instead means a new family member needs no code.
+///
+/// `attn_output_gate` stays `true`: the whole qwen3_5 family ships the doubled
+/// Q projection (`q_proj` out = `num_heads · head_dim · 2`), and the trunk's own
+/// full-attn layer assumes the same. `load_block_from_hf` validates the loaded
+/// `q_proj` against the shape this implies, so a checkpoint that ever breaks the
+/// assumption fails loudly at load rather than computing something plausible.
+pub fn mtp_shape_from_text_config(
+    tc: &crate::qwen35_config::NativeTextConfig,
+) -> Result<(Qwen35MtpDims, MtpMlpConfig)> {
+    use crate::qwen35_config::MlpKind;
+
+    let dims = Qwen35MtpDims {
+        hidden_size: tc.hidden_size,
+        num_attention_heads: tc.num_attention_heads,
+        num_key_value_heads: tc.num_key_value_heads,
+        head_dim: tc.head_dim,
+        rope_theta: tc.rope_theta,
+        rope_dim: tc.rope_dim(),
+        rms_norm_eps: tc.rms_norm_eps,
+        attn_output_gate: true,
+    };
+
+    let mlp = match tc.mlp_kind() {
+        MlpKind::Dense => {
+            if tc.intermediate_size == 0 {
+                return Err(anyhow!(
+                    "mtp_shape_from_text_config: dense trunk has intermediate_size=0 \
+                     (expected e.g. 17408 for the 27B)"
+                ));
+            }
+            MtpMlpConfig::Dense {
+                intermediate_size: tc.intermediate_size,
+            }
+        }
+        MlpKind::Moe => MtpMlpConfig::Moe(MtpMoeConfig {
+            num_experts: tc.num_experts as i32,
+            num_experts_per_tok: tc.num_experts_per_tok as i32,
+            moe_intermediate_size: tc.moe_intermediate_size,
+            shared_expert_intermediate_size: tc.shared_expert_intermediate_size,
+            norm_topk_prob: tc.norm_topk_prob,
+        }),
+    };
+
+    Ok((dims, mlp))
+}
+
 /// Full resolved MTP block — input, attention, MLP, output norm/head.
 /// Constructed once at server startup by the loader from the HF-original
 /// `mtp.*` shards (see future `qwen3_5_mtp_loader.rs`).
@@ -1805,4 +1859,186 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
     }
 
     Ok(report)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shape derivation regressions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Guards for [`mtp_shape_from_text_config`].
+///
+/// The derivation replaced two hardcoded `Qwen35MtpDims` structs that were
+/// selected by testing the model id for `"qwen3.6" | "qwen3_5"`. These tests pin
+/// the derived values to exactly what those branches produced, so the refactor
+/// is provably inert for the two shipped checkpoints before a third depends on
+/// it — and then show the case the substring rule got wrong.
+#[cfg(test)]
+mod shape_derivation_tests {
+    use super::{MtpMlpConfig, mtp_shape_from_text_config};
+    use crate::qwen35_config::NativeModelConfig;
+
+    /// Mirrors `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed/config.json`
+    /// (and `mlx-community/Qwen3.6-27B-4bit`) — the dense 27B trunk. Layer
+    /// count trimmed to 4; nothing in the MTP shape reads it.
+    const DENSE_27B: &str = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120, "head_dim": 256,
+            "num_attention_heads": 24, "num_key_value_heads": 4,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "intermediate_size": 17408
+        },
+        "quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"}
+    }"#;
+
+    /// Mirrors `mlx-community/Qwen3.6-35B-A3B-mxfp4/config.json` — the MoE trunk.
+    const MOE_35B: &str = r#"{
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 2048, "head_dim": 256,
+            "num_attention_heads": 16, "num_key_value_heads": 2,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "num_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512
+        },
+        "quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    }"#;
+
+    /// Copied from the shipped `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed/
+    /// config.json` (layer list trimmed to 4). Kept as its own fixture rather
+    /// than aliased to `DENSE_27B` so it keeps testing the real file's shape if
+    /// a future 3.8 respin drifts.
+    ///
+    /// Two things about it are deliberate. It carries rope inside
+    /// `rope_parameters` with the key spelled `"type"` — the MTPLX builds write
+    /// that where the official repo writes `"rope_type"` — and it carries no
+    /// flat `rope_theta`. Both are inert: `NativeRopeParameters` reads only the
+    /// mrope fields, and `rope_theta` falls back to the 10e6 default that the
+    /// nested block also specifies. The assertion below pins that they stay
+    /// inert.
+    const DENSE_27B_V38: &str = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120, "head_dim": 256,
+            "num_attention_heads": 24, "num_key_value_heads": 4,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "intermediate_size": 17408,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "type": "default"
+            }
+        },
+        "quantization_config": {"group_size": 32, "bits": 4, "mode": "affine"}
+    }"#;
+
+    fn shape(raw: &str) -> (super::Qwen35MtpDims, MtpMlpConfig) {
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("fixture parses");
+        mtp_shape_from_text_config(&cfg.text_config).expect("shape derives")
+    }
+
+    #[test]
+    fn dense_27b_derives_the_previously_hardcoded_shape() {
+        let (d, mlp) = shape(DENSE_27B);
+        // Exactly the struct the `is_27b_dense` branch built.
+        assert_eq!(d.hidden_size, 5120);
+        assert_eq!(d.num_attention_heads, 24);
+        assert_eq!(d.num_key_value_heads, 4);
+        assert_eq!(d.head_dim, 256);
+        assert_eq!(d.rope_theta, 10_000_000.0);
+        assert_eq!(d.rope_dim, 64);
+        assert_eq!(d.rms_norm_eps, 1e-6);
+        assert!(d.attn_output_gate);
+        match mlp {
+            MtpMlpConfig::Dense { intermediate_size } => assert_eq!(intermediate_size, 17_408),
+            MtpMlpConfig::Moe(_) => panic!("dense trunk must not derive a MoE head"),
+        }
+    }
+
+    #[test]
+    fn moe_35b_derives_the_previously_hardcoded_shape() {
+        let (d, mlp) = shape(MOE_35B);
+        // Exactly the struct the `else` (35B-A3B) branch built.
+        assert_eq!(d.hidden_size, 2048);
+        assert_eq!(d.num_attention_heads, 16);
+        assert_eq!(d.num_key_value_heads, 2);
+        assert_eq!(d.head_dim, 256);
+        assert_eq!(d.rope_theta, 10_000_000.0);
+        assert_eq!(d.rope_dim, 64);
+        assert_eq!(d.rms_norm_eps, 1e-6);
+        assert!(d.attn_output_gate);
+        match mlp {
+            MtpMlpConfig::Moe(m) => {
+                assert_eq!(m.num_experts, 256);
+                assert_eq!(m.num_experts_per_tok, 8);
+                assert_eq!(m.moe_intermediate_size, 512);
+                assert_eq!(m.shared_expert_intermediate_size, 512);
+                assert!(m.norm_topk_prob);
+            }
+            MtpMlpConfig::Dense { .. } => panic!("MoE trunk must not derive a dense head"),
+        }
+    }
+
+    // ── The defect the derivation fixes ──────────────────────────────────
+    // RED: `try_enable_qwen35_mtp_from_env` picked the head shape by testing
+    // the model id for `"qwen3.6" | "qwen3_5"`. `Qwen3.8-27B-MTPLX-…` matches
+    // neither, so it fell through to the 35B-A3B branch and asked for
+    // hidden=2048 + a 256-expert MoE MLP against a 5120-wide dense head.
+    #[test]
+    fn a_trunk_whose_id_carries_no_known_version_string_still_derives_its_own_shape() {
+        let (v38, mlp) = shape(DENSE_27B_V38);
+        assert_eq!(
+            v38.hidden_size, 5120,
+            "shape must follow the config, not the model id"
+        );
+        assert!(
+            matches!(mlp, MtpMlpConfig::Dense { .. }),
+            "a dense trunk must not fall through to the MoE default"
+        );
+
+        // The claim this port rests on: 3.8's trunk is the same architecture as
+        // 3.6's, so the derived head shape is identical field for field. If a
+        // respin ever changes that, this fails here rather than as a shape
+        // mismatch deep inside `load_block_from_hf`.
+        let (v36, _) = shape(DENSE_27B);
+        assert_eq!(v38.hidden_size, v36.hidden_size);
+        assert_eq!(v38.num_attention_heads, v36.num_attention_heads);
+        assert_eq!(v38.num_key_value_heads, v36.num_key_value_heads);
+        assert_eq!(v38.head_dim, v36.head_dim);
+        assert_eq!(v38.rms_norm_eps, v36.rms_norm_eps);
+        assert_eq!(v38.attn_output_gate, v36.attn_output_gate);
+        // Pins that MTPLX's `"type"`-spelled rope block and its missing flat
+        // `rope_theta` stay inert — both resolve to the same rope as 3.6's.
+        assert_eq!(
+            v38.rope_theta, v36.rope_theta,
+            "rope_theta must still be 10e6"
+        );
+        assert_eq!(v38.rope_dim, v36.rope_dim, "rope_dim must still be 64");
+    }
+
+    #[test]
+    fn a_dense_trunk_missing_intermediate_size_is_an_error_not_a_zero_wide_mlp() {
+        let raw = DENSE_27B.replace(r#""intermediate_size": 17408"#, r#""intermediate_size": 0"#);
+        let cfg: NativeModelConfig = serde_json::from_str(&raw).expect("fixture parses");
+        let err = mtp_shape_from_text_config(&cfg.text_config)
+            .expect_err("a zero-wide dense MLP must not be silently accepted");
+        assert!(
+            err.to_string().contains("intermediate_size"),
+            "error should name the missing field, got: {err}"
+        );
+    }
 }
