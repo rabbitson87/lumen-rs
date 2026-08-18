@@ -67,6 +67,18 @@ const STEPS: &[Step] = &[
         optional: false,
     },
     Step {
+        // `--all` above means "all workspace members", and the fuzz crate is
+        // not one — same blind spot that let two of its targets stop compiling.
+        // Stable, unlike the compile check below, because rustfmt does not need
+        // to resolve `libfuzzer-sys`.
+        name: "fmt: fuzz targets",
+        rationale: "`cargo fmt --all` covers workspace members, and the fuzz crate is \
+                    excluded from the workspace",
+        program: "cargo",
+        args: &["fmt", "--manifest-path", "fuzz/Cargo.toml", "--check"],
+        optional: false,
+    },
+    Step {
         name: "clippy",
         // BLOCKING as of the backlog reaching zero. It was report-only while
         // 349 warnings stood, because a gate that fails on day one is a gate
@@ -109,6 +121,35 @@ const STEPS: &[Step] = &[
                     already runs `npm run build` before every app build",
         program: "npm",
         args: &["--prefix", "crates/lumen-app/frontend", "run", "check"],
+        optional: false,
+    },
+    Step {
+        name: "check: fuzz targets",
+        // Found by running this for the first time: `grammar_build` and
+        // `grammar_x_output` had not compiled since `build_qwen35_tool_grammar_lark`
+        // grew its `ToolCalls` argument. Two things hid it. The fuzz crate is
+        // excluded from the workspace (its binaries need nightly plus sanitizer
+        // flags), so every `--workspace` step above skips it; and `cargo fuzz
+        // run <name>` passes `--bin <name>`, so soaking one target never builds
+        // the other four. `cargo xtask fuzz --all` would have caught it, and
+        // nothing runs that outside a release.
+        //
+        // Blocking, but skipped with a printed reason when nightly is absent —
+        // see `nightly_available`. Reporting it as an ordinary optional FAILURE
+        // would make "you have no nightly toolchain" look exactly like "the
+        // targets are broken again", which is the signal this step exists to
+        // give.
+        rationale: "the fuzz crate is outside the workspace, so no --workspace step \
+                    compiles it and soaking one target does not build the rest; two \
+                    targets had been uncompilable for three commits",
+        program: "cargo",
+        args: &[
+            "+nightly",
+            "check",
+            "--manifest-path",
+            "fuzz/Cargo.toml",
+            "--all-targets",
+        ],
         optional: false,
     },
     Step {
@@ -194,6 +235,16 @@ pub fn main(args: Vec<String>) -> ExitCode {
             println!("── {} … SKIPPED (--quick)", step.name);
             continue;
         }
+        // Derived from the args rather than a struct field: a step whose first
+        // argument is `+nightly` needs nightly, and there is no way for the two
+        // to disagree.
+        if step.args.first() == Some(&"+nightly") && !nightly_available() {
+            println!(
+                "── {} … SKIPPED (no nightly toolchain — `rustup toolchain install nightly`)",
+                step.name
+            );
+            continue;
+        }
         print!("── {} … ", step.name);
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -255,6 +306,22 @@ pub fn main(args: Vec<String>) -> ExitCode {
         println!("gate FAILED in {total:.1}s: {}", failures.join(", "));
         ExitCode::FAILURE
     }
+}
+
+/// Whether a nightly toolchain is installed.
+///
+/// The one gate step that needs it (`check: fuzz targets`) is blocking when it
+/// can run and skipped-with-a-reason when it cannot, rather than optional. An
+/// optional step reports its failure and continues, which would print the same
+/// FAILED line for "the fuzz targets no longer compile" and for "this machine
+/// has no nightly" — and the first of those is the reason the step exists.
+fn nightly_available() -> bool {
+    Command::new("cargo")
+        .args(["+nightly", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Run the hygiene greps over tracked files only — `git grep` rather than a

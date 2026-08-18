@@ -15,7 +15,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lumen_mlx::grammar::build_qwen35_tool_grammar_lark;
+use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::generators::ToolSet;
 
 fuzz_target!(|tools: ToolSet| {
@@ -24,5 +24,5 @@ fuzz_target!(|tools: ToolSet| {
     }
     // Err is a legitimate answer to a hostile schema; only a panic (caught by
     // the harness as a crash) or a malformed Ok is a defect.
-    let _ = build_qwen35_tool_grammar_lark(&tools.tools);
+    let _ = build_qwen35_tool_grammar_lark(&tools.tools, ToolCalls::OneOrMore);
 });

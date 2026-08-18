@@ -176,6 +176,17 @@ Why it is worth the friction: a regression test written *after* a fix is worth
 nothing until you show it fails without the fix, and that is the easy step to
 skip precisely when the fix already works.
 
+**The one exception, named rather than left implicit:** a fix whose guard is the
+*compiler* gets a gate step instead of a `DEFECTS` entry. This has come up once.
+Two fuzz targets stopped compiling when `build_qwen35_tool_grammar_lark` grew a
+`ToolCalls` argument and stayed broken for three commits, because the fuzz crate
+is excluded from the workspace and `cargo fuzz run <name>` builds only the named
+binary. Requirement 3 above cannot be met — a compile error in an
+out-of-workspace crate is not something a libtest guard can go RED on — so the
+guard is `check: fuzz targets` in `cargo xtask gate`, which is deterministic and
+stronger than a test. Do not read this as a general escape hatch: it applies
+when the failure is a build failure, not a behaviour change.
+
 Two things that make the rule cheap to follow:
 
 - Anchors are indentation-sensitive. Moving code between modules changes its

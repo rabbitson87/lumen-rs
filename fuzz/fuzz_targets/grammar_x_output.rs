@@ -16,7 +16,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use lumen_mlx::gemma4_tool_syntax::parse_tool_call_body;
-use lumen_mlx::grammar::build_qwen35_tool_grammar_lark;
+use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::generators::{GrammarAndOutput, Mutation};
 
 fn stream_safe(name: &str) -> bool {
@@ -29,7 +29,7 @@ fn stream_safe(name: &str) -> bool {
 fuzz_target!(|g: GrammarAndOutput| {
     // Grammar side: must survive whatever schema the output was paired with.
     if !g.tools.tools.is_empty() {
-        let _ = build_qwen35_tool_grammar_lark(&g.tools.tools);
+        let _ = build_qwen35_tool_grammar_lark(&g.tools.tools, ToolCalls::OneOrMore);
     }
 
     // Parser side.
