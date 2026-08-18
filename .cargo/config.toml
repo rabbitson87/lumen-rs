@@ -6,3 +6,8 @@
 # Override locally by setting `PYO3_PYTHON` in your shell before running cargo.
 [env]
 PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
+
+# `cargo xtask …` runs the workspace task runner. Kept out of `default-members`
+# so it never slows down a plain `cargo build` at the root.
+[alias]
+xtask = "run --quiet --package xtask --"

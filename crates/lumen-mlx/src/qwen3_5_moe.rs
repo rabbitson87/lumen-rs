@@ -19,8 +19,8 @@
 //!   in_proj_z / in_proj_b / in_proj_a 4-way MXFP4 matmuls + reshape
 //!   + Conv1d depthwise (kernel=4) over the persistent conv_state cache slot
 //!   + SiLU + per-head q/k RMSNorm with `inv_scale^{1,2}` rescaling +
-//!   `gated_delta_step_kernel` Metal SSM update + RMSNormGated output gate +
-//!   out_proj MXFP4 matmul. Mirrors `qwen3_next.Qwen3NextGatedDeltaNet.__call__`.
+//!     `gated_delta_step_kernel` Metal SSM update + RMSNormGated output gate +
+//!     out_proj MXFP4 matmul. Mirrors `qwen3_next.Qwen3NextGatedDeltaNet.__call__`.
 //! * **Phase 3d.4** — `layer_moe_forward()` wiring of `Qwen3NextSparseMoeBlock`
 //!   (8-bit affine `gate` → softmax(precise) → top-k argpartition → mxfp4
 //!   `switch_mlp` swiglu via `gather_qmm_with_mode` (mirroring `SwitchGLU`'s
@@ -47,8 +47,8 @@
 mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
-    use serde::Deserialize;
-    use std::collections::{BTreeMap, HashMap};
+
+    use std::collections::HashMap;
     use std::ffi::CStr;
     use std::path::Path;
     use std::time::Instant;
@@ -91,6 +91,63 @@ mod imp {
 
     pub(crate) fn sigmoid_mul_fuse_enabled_pub() -> bool {
         sigmoid_mul_fuse_enabled()
+    }
+
+    lumen_flags::flag! {
+        /// Store the full-attention KV cache in bf16 rather than f32.
+        ///
+        /// Task 007 measured the cache at ~67 KB per allocated slot on
+        /// Qwen3.5-9B, which matches the f32 arithmetic exactly (8 full-attn
+        /// layers × 4 KV heads × 256 head_dim × 2 for K+V × 4 bytes =
+        /// 64.0 KB). Halving it is the largest memory lever left after that
+        /// task ruled out PagedAttention — worth ~1.5 GB at eight concurrent
+        /// long-context sequences, against paging's 35 MB — and decode gets
+        /// +1.6–4.1% faster because attention reads half the bytes.
+        ///
+        /// **`Behavior`, not `Optimization`: this is a numerics change.** The
+        /// cast lands after k_norm and RoPE, so attention runs in bf16
+        /// end-to-end and greedy output may differ from f32 — the equivalence
+        /// matrix must never flip it expecting identical output. Default ON
+        /// since the quality pass: 6,300 teacher-forced positions across two
+        /// models, 99.73–99.83% top-1 agreement against an f32-vs-f32 control
+        /// of exactly 100.000%, flat across context depth, every disagreement
+        /// below the 1.5th percentile of the top1−top2 logit gap. `=0`
+        /// restores f32. Harnesses: `examples/kv_bf16_ab.rs`,
+        /// `examples/kv_bf16_quality.rs`.
+        pub(crate) kv_bf16 {
+            env: "LUMEN_MLX_KV_BF16",
+            default: true,
+            kind: Behavior,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Fuse `gate_proj` + `up_proj` into one QMV when their quant params
+        /// match. Default OFF and **tested negative**: an A/B on 27B / M3 Max
+        /// showed no win (separate 85.7 ms vs fused 89.2 ms/tok). Real decode
+        /// pipelines the matmuls and is bandwidth-bound, so fusing same-byte
+        /// matmuls saves nothing and the extra split op costs a little. The
+        /// isolation bench overstated dispatch overhead because it `eval()`s
+        /// every call, which defeats pipelining.
+        ///
+        /// Kept as a future-hardware lever. Row-concat is bit-identical, which
+        /// is why this is an `Optimization` rather than a `Behavior` flag.
+        pub(crate) fuse_gate_up_flag {
+            env: "LUMEN_NATIVE_FUSE_GATE_UP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    pub(crate) fn kv_store_bf16() -> bool {
+        kv_bf16::get()
+    }
+
+    /// Pin [`kv_store_bf16`] process-wide for an A/B harness, bypassing the
+    /// env read. Thin wrapper over the flag module's `set` so the examples
+    /// that predate `lumen_flags` keep their entry point.
+    pub fn set_kv_store_bf16(on: bool) {
+        kv_bf16::set(on);
     }
 
     /// Top-`k` softmax over a full logits row → `(ids, probs)` where `probs` are
@@ -139,348 +196,124 @@ mod imp {
         set
     }
 
-    // ───────────────────────── config.json parsing ─────────────────────────
+    // config.json parsing lives in the ungated `qwen35_config` module so a
+    // tier-0 sweep can reach it without the GPU stack; re-exported here so
+    // every call site keeps its `imp::` path.
+    pub use crate::qwen35_config::*;
 
-    /// Top-level config.json wrapper for `qwen3_5_moe`.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeModelConfig {
-        pub model_type: String,
-        #[serde(
-            default,
-            rename = "eos_token_id",
-            deserialize_with = "deserialize_token_ids"
-        )]
-        pub eos_token_ids: Vec<u32>,
-        pub text_config: NativeTextConfig,
-        #[serde(default)]
-        pub quantization_config: Option<NativeQuantizationConfig>,
-    }
-
-    /// `text_config` block — all fields the forward path needs.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeTextConfig {
-        pub model_type: String,
-        pub hidden_size: usize,
-        pub head_dim: usize,
-        pub num_attention_heads: usize,
-        pub num_key_value_heads: usize,
-        pub num_hidden_layers: usize,
-        pub vocab_size: usize,
-        pub rms_norm_eps: f32,
-        #[serde(default = "default_full_attn_interval")]
-        pub full_attention_interval: usize,
-        pub layer_types: Vec<NativeLayerType>,
-
-        // RoPE
-        #[serde(default = "default_rope_theta")]
-        pub rope_theta: f32,
-        #[serde(default = "default_partial_rotary_factor")]
-        pub partial_rotary_factor: f32,
-        #[serde(default = "default_max_pos_emb")]
-        pub max_position_embeddings: usize,
-
-        // Linear (delta-net) attention dims
-        #[serde(default)]
-        pub linear_num_value_heads: usize,
-        #[serde(default)]
-        pub linear_num_key_heads: usize,
-        #[serde(default)]
-        pub linear_key_head_dim: usize,
-        #[serde(default)]
-        pub linear_value_head_dim: usize,
-        #[serde(default)]
-        pub linear_conv_kernel_dim: usize,
-
-        // MoE
-        #[serde(default)]
-        pub num_experts: usize,
-        #[serde(default)]
-        pub num_experts_per_tok: usize,
-        #[serde(default)]
-        pub moe_intermediate_size: usize,
-        #[serde(default)]
-        pub shared_expert_intermediate_size: usize,
-        #[serde(default = "default_norm_topk_prob")]
-        pub norm_topk_prob: bool,
-
-        // Dense SwiGLU intermediate dim (Qwen3.6-27B: 17408). Absent from MoE configs
-        // (35B-A3B uses moe_intermediate_size + shared_expert_intermediate_size instead).
-        #[serde(default)]
-        pub intermediate_size: usize,
-
-        // Tied embedding → lm_head reuses embed_tokens. Defaults to false for
-        // Qwen3.5-MoE (35B); checked at load time.
-        #[serde(default)]
-        pub tie_word_embeddings: bool,
-        // Other unknown fields (`attn_output_gate`, …) are silently dropped by serde
-        // — no allow-list needed.
-    }
-
-    /// MLP variant within the qwen3_5 family. Dense (27B) carries `intermediate_size`
-    /// and zero `num_experts`; MoE (35B-A3B) carries the per-expert sizes and `num_experts > 0`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MlpKind {
-        Moe,
-        Dense,
-    }
-
-    fn default_full_attn_interval() -> usize {
-        4
-    }
-    fn default_rope_theta() -> f32 {
-        10_000_000.0
-    }
-    fn default_partial_rotary_factor() -> f32 {
-        0.25
-    }
-    fn default_max_pos_emb() -> usize {
-        262_144
-    }
-    fn default_norm_topk_prob() -> bool {
-        true
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum NativeLayerType {
-        LinearAttention,
-        FullAttention,
-    }
-
-    impl NativeLayerType {
-        pub fn is_linear(self) -> bool {
-            matches!(self, NativeLayerType::LinearAttention)
-        }
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeQuantizationConfig {
-        pub group_size: usize,
-        pub bits: usize,
-        pub mode: String,
-        // Per-tensor overrides (e.g. mlp.gate, shared_expert_gate at 8-bit).
-        #[serde(flatten)]
-        pub overrides: BTreeMap<String, NativeQuantizationOverride>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeQuantizationOverride {
-        pub group_size: usize,
-        pub bits: usize,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    enum TokenIdValue {
-        One(u32),
-        Many(Vec<u32>),
-    }
-
-    fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = Option::<TokenIdValue>::deserialize(deserializer)?;
-        Ok(match value {
-            Some(TokenIdValue::One(id)) => vec![id],
-            Some(TokenIdValue::Many(ids)) => ids,
-            None => Vec::new(),
-        })
-    }
-
-    impl NativeModelConfig {
-        pub fn load(path: &Path) -> Result<Self> {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|err| anyhow!("config.json read failed at {}: {err}", path.display()))?;
-            serde_json::from_str(&raw)
-                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))
-        }
-
-        /// Validate that this config belongs to the Qwen3.5 family (either MoE or Dense)
-        /// and returns which MLP variant it carries. Production load path uses this for
-        /// dispatch; existing strict callers can still call [`Self::validate_qwen3_5_moe`].
-        pub fn validate_qwen3_5_family(&self) -> Result<MlpKind> {
-            if self.model_type != "qwen3_5_moe" && self.model_type != "qwen3_5" {
-                return Err(anyhow!(
-                    "expected model_type='qwen3_5_moe' or 'qwen3_5', got '{}'",
-                    self.model_type
-                ));
-            }
-            let kind = self.text_config.validate_family()?;
-            if let Some(quant) = &self.quantization_config {
-                // 35B-A3B-mxfp4 ships `mxfp4`; 27B Dense MLX-4bit ships `affine`.
-                // Both at 4-bit, both with non-zero group_size — the per-tensor dispatch
-                // (mxfp4 kernel vs affine kernel) is selected later from `mode`.
-                let mode_ok =
-                    quant.mode == "mxfp4" || quant.mode == "affine" || quant.mode == "nvfp4";
-                // mxfp4/nvfp4 are 4-bit E2M1; affine ships 4/6/8-bit (9B Speed =
-                // affine 6-bit, 27B Speed = affine 4-bit). Require 4-bit for the
-                // E2M1 formats, allow {4,6,8} for affine.
-                let bits_ok = if quant.mode == "affine" {
-                    matches!(quant.bits, 4 | 6 | 8)
-                } else {
-                    quant.bits == 4
-                };
-                if !mode_ok || !bits_ok || quant.group_size == 0 {
-                    return Err(anyhow!(
-                        "quantization_config must be (mxfp4|nvfp4)/4-bit or affine/{{4,6,8}}-bit with non-zero group, got mode='{}' bits={} group={}",
-                        quant.mode,
-                        quant.bits,
-                        quant.group_size
-                    ));
-                }
-            }
-            Ok(kind)
-        }
-
-        /// Strict MoE-only contract. Wraps [`Self::validate_qwen3_5_family`] and asserts
-        /// the result is MoE — preserves the original error surface that downstream
-        /// MoE-only call sites and existing tests depend on.
-        pub fn validate_qwen3_5_moe(&self) -> Result<()> {
-            if self.model_type != "qwen3_5_moe" {
-                return Err(anyhow!(
-                    "expected model_type='qwen3_5_moe', got '{}'",
-                    self.model_type
-                ));
-            }
-            self.text_config.validate()?;
-            if let Some(quant) = &self.quantization_config {
-                if (quant.mode != "mxfp4" && quant.mode != "nvfp4")
-                    || quant.bits != 4
-                    || quant.group_size == 0
-                {
-                    return Err(anyhow!(
-                        "quantization_config must default to (mxfp4|nvfp4)/4-bit/non-zero group, got mode='{}' bits={} group={}",
-                        quant.mode,
-                        quant.bits,
-                        quant.group_size
-                    ));
-                }
-            }
-            Ok(())
-        }
-    }
-
-    impl NativeTextConfig {
-        /// Strict MoE text-config contract (legacy behavior).
-        pub fn validate(&self) -> Result<()> {
-            if self.model_type != "qwen3_5_moe_text" {
-                return Err(anyhow!(
-                    "expected text_config.model_type='qwen3_5_moe_text', got '{}'",
-                    self.model_type
-                ));
-            }
-            self.validate_core_dims()?;
-            if self.num_experts > 0 {
-                if self.num_experts_per_tok == 0 || self.num_experts_per_tok > self.num_experts {
-                    return Err(anyhow!(
-                        "num_experts_per_tok {} invalid against num_experts {}",
-                        self.num_experts_per_tok,
-                        self.num_experts
-                    ));
-                }
-                if self.moe_intermediate_size == 0 {
-                    return Err(anyhow!("moe_intermediate_size must be non-zero with MoE"));
-                }
-            }
-            Ok(())
-        }
-
-        /// Family validator: accepts both MoE (`qwen3_5_moe_text`) and Dense
-        /// (`qwen3_5_text`) text configs and returns which MLP variant the
-        /// per-layer dispatch should use.
-        pub fn validate_family(&self) -> Result<MlpKind> {
-            if self.model_type != "qwen3_5_moe_text" && self.model_type != "qwen3_5_text" {
-                return Err(anyhow!(
-                    "expected text_config.model_type='qwen3_5_moe_text' or 'qwen3_5_text', got '{}'",
-                    self.model_type
-                ));
-            }
-            self.validate_core_dims()?;
-            let kind = self.mlp_kind();
-            match kind {
-                MlpKind::Moe => {
-                    if self.num_experts_per_tok == 0 || self.num_experts_per_tok > self.num_experts
-                    {
-                        return Err(anyhow!(
-                            "num_experts_per_tok {} invalid against num_experts {}",
-                            self.num_experts_per_tok,
-                            self.num_experts
-                        ));
-                    }
-                    if self.moe_intermediate_size == 0 {
-                        return Err(anyhow!("moe_intermediate_size must be non-zero with MoE"));
-                    }
-                }
-                MlpKind::Dense => {
-                    if self.intermediate_size == 0 {
-                        return Err(anyhow!(
-                            "intermediate_size must be non-zero for dense qwen3_5 (e.g. 17408 for 27B)"
-                        ));
-                    }
-                }
-            }
-            Ok(kind)
-        }
-
-        /// Infer MLP variant from which family of size fields is populated.
-        pub fn mlp_kind(&self) -> MlpKind {
-            if self.num_experts > 0 {
-                MlpKind::Moe
-            } else {
-                MlpKind::Dense
-            }
-        }
-
-        fn validate_core_dims(&self) -> Result<()> {
-            if self.hidden_size == 0
-                || self.head_dim == 0
-                || self.vocab_size == 0
-                || self.num_attention_heads == 0
-                || self.num_key_value_heads == 0
-                || self.num_hidden_layers == 0
-            {
-                return Err(anyhow!("text_config has zero-sized core dims"));
-            }
-            if self.layer_types.len() != self.num_hidden_layers {
-                return Err(anyhow!(
-                    "layer_types length {} != num_hidden_layers {}",
-                    self.layer_types.len(),
-                    self.num_hidden_layers
-                ));
-            }
-            // RoPE rotary span — partial_rotary_factor == 0.25 → rope_dim = 64 for
-            // head_dim=256. Must be even (RoPE rotates pairs).
-            let rope_dim = self.rope_dim();
-            if rope_dim == 0 || rope_dim % 2 != 0 {
-                return Err(anyhow!(
-                    "rope_dim {} (= head_dim {} × partial_rotary_factor {}) must be a positive even number",
-                    rope_dim,
-                    self.head_dim,
-                    self.partial_rotary_factor
-                ));
-            }
-            Ok(())
-        }
-
-        pub fn rope_dim(&self) -> usize {
-            ((self.head_dim as f32) * self.partial_rotary_factor) as usize
-        }
-
-        pub fn is_linear_per_layer(&self) -> Vec<bool> {
-            self.layer_types.iter().map(|t| t.is_linear()).collect()
-        }
-
-        /// Convenience: index of the first full-attention layer (used by
-        /// `Qwen3_5TextModel.fa_idx` for mask creation).
-        pub fn first_full_attn_layer(&self) -> Option<usize> {
-            self.layer_types
-                .iter()
-                .position(|t| matches!(t, NativeLayerType::FullAttention))
-        }
-    }
+    /// Encoded images for one forward pass: where this window starts in the
+    /// full prompt, the prompt-global placeholder runs, and each image's
+    /// `[run_len, hidden]` block.
+    ///
+    /// Passed as a unit because the three are only meaningful together — the
+    /// runs are addressed against the whole prompt, so a window offset is
+    /// required to interpret them.
+    pub(crate) type VisionSoft<'a> = Option<(usize, &'a [(usize, usize)], &'a [Array])>;
 
     // ───────────────────────── safetensors weights ─────────────────────────
+
+    /// Reject a `.safetensors` file whose data section is shorter than its own
+    /// header says it should be.
+    ///
+    /// This is a **silent-corruption** guard, and the silence is the problem.
+    /// A file truncated inside its data section — the shape every interrupted
+    /// download, full disk and killed `hf download` leaves behind — loads
+    /// through `Array::load_safetensors` **without error** and yields wrong
+    /// values: measured on a 4x4 f32 tensor missing its last 16 bytes, the
+    /// load succeeded and the final element read 3.0 where the file had
+    /// written 15.0. Nothing downstream can notice; the model simply serves
+    /// plausible, wrong output forever.
+    ///
+    /// Header truncation, a bad length prefix and a garbled header are all
+    /// already clean errors from upstream, so this checks only what upstream
+    /// does not: that the bytes the header promises are actually present.
+    /// Costs one `metadata()` plus a header parse per shard, once per load.
+    fn validate_safetensors_complete(path: &Path) -> Result<()> {
+        use std::io::Read;
+
+        let mut f = std::fs::File::open(path)
+            .with_context(|| format!("open({}) failed", path.display()))?;
+        let file_len = f
+            .metadata()
+            .with_context(|| format!("metadata({}) failed", path.display()))?
+            .len();
+
+        let mut len_buf = [0u8; 8];
+        if f.read_exact(&mut len_buf).is_err() {
+            // Too short to even hold a header length; upstream reports this
+            // clearly, so let it.
+            return Ok(());
+        }
+        let header_len = u64::from_le_bytes(len_buf);
+        let Some(data_start) = 8u64.checked_add(header_len) else {
+            return Ok(()); // absurd length — upstream rejects it
+        };
+        if data_start > file_len {
+            return Ok(()); // header itself truncated — upstream rejects it
+        }
+
+        let mut header_bytes = vec![0u8; header_len as usize];
+        if f.read_exact(&mut header_bytes).is_err() {
+            return Ok(());
+        }
+
+        // A header region that is present but does not parse as exactly one
+        // JSON object is itself the corruption signal, and this is NOT
+        // deferrable to upstream.
+        //
+        // Flipping one byte of the length prefix (120 -> 135 on the test
+        // fixture) makes the declared region a valid JSON object followed by
+        // 15 bytes of the data section. nlohmann — upstream's parser — stops
+        // at the closing brace and ignores the trailing bytes, so the load
+        // succeeds, but it then computes the data section as starting at
+        // `8 + 135` instead of `8 + 120`: every tensor is read 15 bytes off
+        // and every value is wrong, silently. serde_json rejects trailing
+        // content, which is what makes this check able to see it at all.
+        let parsed = serde_json::from_slice::<serde_json::Value>(&header_bytes);
+        let Ok(header) = parsed else {
+            return Err(anyhow!(
+                "{}: the {header_len}-byte header region is not a single JSON object. The \
+                 declared header length is wrong, which shifts the data section and makes \
+                 every tensor read from the wrong offset. Re-download the shard.",
+                path.display(),
+            ));
+        };
+        let Some(entries) = header.as_object() else {
+            return Err(anyhow!(
+                "{}: safetensors header is not a JSON object",
+                path.display()
+            ));
+        };
+
+        // Largest `data_offsets[1]` across all tensors is the data section's
+        // required extent. `__metadata__` carries no offsets and is skipped.
+        let mut required_end = 0u64;
+        for (name, spec) in entries {
+            if name == "__metadata__" {
+                continue;
+            }
+            if let Some(end) = spec
+                .get("data_offsets")
+                .and_then(|o| o.get(1))
+                .and_then(serde_json::Value::as_u64)
+            {
+                required_end = required_end.max(end);
+            }
+        }
+
+        let required_len = data_start.saturating_add(required_end);
+        if file_len < required_len {
+            return Err(anyhow!(
+                "{} is truncated: header declares {required_len} bytes ({data_start} header + \
+                 {required_end} data) but the file is {file_len} — {} bytes short. A partial \
+                 download loads without error and silently yields wrong weights, so it is \
+                 rejected here. Re-download the shard.",
+                path.display(),
+                required_len - file_len,
+            ));
+        }
+        Ok(())
+    }
 
     /// Multi-shard safetensors weight bag, keyed by tensor name.
     /// Mirrors mlx_lm's `weights = mx.load(path)` dict but covers all shards
@@ -504,6 +337,7 @@ mod imp {
             }
             let mut tensors: HashMap<String, Array> = HashMap::new();
             for shard in shard_paths {
+                validate_safetensors_complete(&shard)?;
                 let map = Array::load_safetensors(&shard).map_err(|err| {
                     anyhow!("load_safetensors({}) failed: {err}", shard.display())
                 })?;
@@ -562,6 +396,12 @@ mod imp {
 
         pub fn get(&self, name: &str) -> Option<&Array> {
             self.tensors.get(name)
+        }
+
+        /// Raw tensor bag. Read this **before** [`Self::sanitize`] if you need
+        /// the `vision_tower.*` / `model.visual.*` entries it drops.
+        pub fn tensors(&self) -> &HashMap<String, Array> {
+            &self.tensors
         }
 
         pub fn require(&self, name: &str) -> Result<&Array> {
@@ -853,12 +693,7 @@ mod imp {
     /// attention at 4-bit preserves accept while 2-bit MLP cuts the bulk of bytes
     /// → fast baseline + high accept → MTP toward ~21. bits∈{2,3,4} (4 = keep).
     fn requant_target_bits_for(base: &str) -> Option<i32> {
-        let parse = |s: String| {
-            s.trim()
-                .parse::<i32>()
-                .ok()
-                .filter(|b| matches!(b, 2 | 3 | 4))
-        };
+        let parse = |s: String| s.trim().parse::<i32>().ok().filter(|b| matches!(b, 2..=4));
         let key = if base.contains(".mlp") {
             "LUMEN_NATIVE_REQUANT_MLP_BITS"
         } else {
@@ -974,9 +809,7 @@ mod imp {
         // isolation bench (bench_affine4_qmv_decode) overstated dispatch overhead
         // because it eval()s every call (defeats pipelining). Kept env-gated
         // (`LUMEN_NATIVE_FUSE_GATE_UP=1`) as a tested-negative / future-HW lever.
-        let fuse = std::env::var("LUMEN_NATIVE_FUSE_GATE_UP")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        let fuse = fuse_gate_up_flag::get()
             && gate.group_size == up.group_size
             && gate.bits == up.bits
             && gate.mode == up.mode;
@@ -1120,7 +953,7 @@ mod imp {
     ///   * `scale_k`       — Array::from_f32(inv_scale), 30 callsites/step
     ///   * `keep_indices_decode` — Array::from_slice for s=1 decode regime,
     ///     30 callsites/step (prefill keeps dynamic path since `s` varies)
-    /// Total: ~120 allocs/step → 0 (cached refs).
+    ///     Total: ~120 allocs/step → 0 (cached refs).
     ///
     /// **WASH at 35B server long-prompt n=5 A/B (2026-05-03)**: A_off
     /// 169.71 vs B_reuse_on 168.61 tok/s = Δ -0.6% σ -1.35 (within noise).
@@ -1190,43 +1023,72 @@ mod imp {
         }
     }
 
-    /// Returns true when wrapper-alloc reduction lever is on.
-    /// **Default ON 2026-05-11** — required by linear_attn_scale_fuse (default ON);
-    /// pairs with that lever to produce the -0.315ms WIN at t=-3.33σ.
-    /// Cached LinearAttnConstants (ones_w + scale_q/k + keep_indices + scaled_w_q/k).
-    /// Bit-identical to per-call construction (same dtype/shape/value).
-    /// Opt out with `LUMEN_NATIVE_ALLOC_REUSE=0`.
+    // Returns true when wrapper-alloc reduction lever is on.
+    // **Default ON 2026-05-11** — required by linear_attn_scale_fuse (default ON);
+    // pairs with that lever to produce the -0.315ms WIN at t=-3.33σ.
+    // Cached LinearAttnConstants (ones_w + scale_q/k + keep_indices + scaled_w_q/k).
+    // Bit-identical to per-call construction (same dtype/shape/value).
+    // Opt out with `LUMEN_NATIVE_ALLOC_REUSE=0`.
+    lumen_flags::flag! {
+        /// Reuse per-layer scratch allocations across decode steps instead of
+        /// reallocating. Default ON (LANDED 2026-05-11). Prerequisite for
+        /// `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` (the fused-weight constants
+        /// live in the reused `LinearAttnConstants`).
+        pub(crate) alloc_reuse {
+            env: "LUMEN_NATIVE_ALLOC_REUSE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn alloc_reuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_ALLOC_REUSE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        alloc_reuse::get()
     }
 
-    /// Linear-attn scale fuse: absorb `scale_q/k` into rms_norm weight.
-    /// **Default ON 2026-05-11** — thermal-clean A/B (n=10, STEPS=100) confirmed
-    /// Δ=-0.315ms, Welch t=-3.33σ WIN. Closes 51% of remaining decode gap;
-    /// Native (14.075ms) vs PyO3 (13.913ms) = 1.16% slower (was 2.4%).
-    /// Only active when `alloc_reuse_enabled()` is also true (the fused-weight
-    /// constants live in `LinearAttnConstants`). Opt out with
-    /// `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE=0`.
-    /// Identified via op-by-op forward divergence audit 2026-05-11 — 42 ops/step
-    /// removed (highest single divergence). Bit-identical by linearity of rms_norm
-    /// weight scaling.
+    // Linear-attn scale fuse: absorb `scale_q/k` into rms_norm weight.
+    // **Default ON 2026-05-11** — thermal-clean A/B (n=10, STEPS=100) confirmed
+    // Δ=-0.315ms, Welch t=-3.33σ WIN. Closes 51% of remaining decode gap;
+    // Native (14.075ms) vs PyO3 (13.913ms) = 1.16% slower (was 2.4%).
+    // Only active when `alloc_reuse_enabled()` is also true (the fused-weight
+    // constants live in `LinearAttnConstants`). Opt out with
+    // `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE=0`.
+    // Identified via op-by-op forward divergence audit 2026-05-11 — 42 ops/step
+    // removed (highest single divergence). Bit-identical by linearity of rms_norm
+    // weight scaling.
+    lumen_flags::flag! {
+        /// Absorb `scale_q/k` into the rms_norm weight (bit-identical by
+        /// linearity of rms_norm weight scaling). Default ON 2026-05-11:
+        /// thermal-clean A/B (n=10, STEPS=100) Δ=−0.315 ms, Welch t=−3.33σ.
+        /// Only active when `LUMEN_NATIVE_ALLOC_REUSE` is also on.
+        pub(crate) linear_attn_scale_fuse {
+            env: "LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn linear_attn_scale_fuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        linear_attn_scale_fuse::get()
     }
 
-    /// Divergence #4: conv-state advance via `slice` (mlx_slice view/copy)
-    /// instead of `take_axis` (gather kernel). Mirrors Python
-    /// `mx.contiguous(conv_input[:, -n_keep:, :])`. Bit-identical for s==1
-    /// decode regime — same indices `[s, s+1, ..., total_len-1]` but cheaper
-    /// Metal kernel. Opt out with `LUMEN_NATIVE_CONV_SLICE=0`.
+    // Divergence #4: conv-state advance via `slice` (mlx_slice view/copy)
+    // instead of `take_axis` (gather kernel). Mirrors Python
+    // `mx.contiguous(conv_input[:, -n_keep:, :])`. Bit-identical for s==1
+    // decode regime — same indices `[s, s+1, ..., total_len-1]` but cheaper
+    // Metal kernel. Opt out with `LUMEN_NATIVE_CONV_SLICE=0`.
+    lumen_flags::flag! {
+        /// Conv-state advance via `slice` (view/copy) instead of `take_axis`
+        /// (gather kernel). Bit-identical for the s==1 decode regime — same
+        /// indices, cheaper Metal kernel. Default OFF (A/B WASH).
+        pub(crate) conv_slice {
+            env: "LUMEN_NATIVE_CONV_SLICE",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn conv_slice_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_CONV_SLICE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
+        conv_slice::get()
     }
 
     /// PROBE (timing only, NOT correct — `LUMEN_PROBE_SKIP_LINCOMPUTE=1`):
@@ -1257,16 +1119,27 @@ mod imp {
             .unwrap_or(false)
     }
 
-    /// M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
-    /// split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
-    /// ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
-    /// non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
-    /// default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
-    /// the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
+    // M4: fuse the decode (s=1) linear-attn input-side chain (conv1d + silu +
+    // split + q/k RMSNorm) into ONE Metal kernel (`inproj_tail_fused`), cutting
+    // ~5 launches/layer → 1 (the launch-latency lever; gate-0 measured the
+    // non-matmul chain at ~10ms/step). `LUMEN_NATIVE_FUSE_LINATTN_IN=1`,
+    // default OFF. Only valid on the scale-fused alloc-reuse path (it consumes
+    // the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
+    lumen_flags::flag! {
+        /// Fused input-side linear-attn kernel (conv+silu+q/k-norm). Built to
+        /// completion, output bit-identical, measured 0 speedup — MLX async
+        /// already overlaps the small launches. Kept as a reusable artifact;
+        /// default OFF. (Parse note: previously only `=1` enabled this; the
+        /// registry's uniform rule now accepts any non-`"0"` value.)
+        pub(crate) fuse_linattn_in {
+            env: "LUMEN_NATIVE_FUSE_LINATTN_IN",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn fuse_linattn_in_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_FUSE_LINATTN_IN")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_linattn_in::get()
     }
 
     /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.
@@ -1377,6 +1250,20 @@ mod imp {
                 Vec<(Vec<u32>, Vec<f32>)>,
             )>,
         >,
+        /// Image encoder. `Some` only when `LUMEN_VISION=1` **and** the
+        /// checkpoint still carries `vision_tower.*` weights. `None` leaves the
+        /// text path byte-for-byte unchanged, memory footprint included.
+        vision: Option<crate::qwen36_vision::NativeQwen36VisionTower>,
+    }
+
+    /// Opt-in gate for loading the ~0.9 GB image tower.
+    fn vision_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     /// Post-projection / post-RoPE intermediates shared by the plain and
@@ -1431,6 +1318,38 @@ mod imp {
             let mlp_kind = config.validate_qwen3_5_family()?;
 
             let mut weights = NativeWeights::load_dir(model_dir)?;
+
+            // Build the image tower from the raw bag — `sanitize()` drops every
+            // `vision_tower.*` / `model.visual.*` entry on the next line.
+            let vision = if vision_enabled() {
+                match config.vision_config.clone() {
+                    Some(vcfg) if weights.get("vision_tower.pos_embed.weight").is_some() => Some(
+                        crate::qwen36_vision::NativeQwen36VisionTower::load(
+                            weights.tensors(),
+                            vcfg,
+                        )
+                        .context("load Qwen 3.6 vision tower")?,
+                    ),
+                    Some(_) => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but {} ships no vision_tower.* weights \
+                             (text-only conversion) — image input stays disabled",
+                            model_dir.display()
+                        );
+                        None
+                    }
+                    None => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but config.json has no vision_config \
+                             — image input stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             weights.sanitize()?;
 
             let is_linear_per_layer = config.text_config.is_linear_per_layer();
@@ -1485,6 +1404,7 @@ mod imp {
                 is_linear_per_layer,
                 layer_weights,
                 linear_attn_constants,
+                vision,
                 mtp: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
@@ -1521,8 +1441,25 @@ mod imp {
             &self.weights
         }
 
+        /// Prefer the top-level list, fall back to `text_config`.
+        ///
+        /// Both spellings ship. A checkpoint that declares EOS only in
+        /// `text_config` (e.g. `Qwen3.5-9B-MTPLX-Speed`) otherwise gets an
+        /// EMPTY stop set — and an empty stop set does not error, it lets
+        /// generation run past the turn boundary and emit the next turn's
+        /// header into the reply. Found by the by-hand end-to-end check, which
+        /// is exactly the failure automation cannot see: the answer is correct,
+        /// and then it keeps going.
+        ///
+        /// Same shape and same preference order as the Gemma 4 path, which had
+        /// already met this and grown the fallback.
         pub fn eos_tokens(&self) -> &[u32] {
-            &self.config.eos_token_ids
+            let top = &self.config.eos_token_ids;
+            if !top.is_empty() {
+                top
+            } else {
+                &self.config.text_config.eos_token_ids
+            }
         }
 
         pub fn vocab_size(&self) -> usize {
@@ -1641,6 +1578,21 @@ mod imp {
                 .with_context(|| format!("{what}: cast to f32 failed"))
         }
 
+        /// Cast to the KV-cache storage dtype. A no-op clone (refcount bump)
+        /// when bf16 storage is off, so the default path keeps its exact
+        /// previous graph.
+        ///
+        /// Queries go through here too: `NativeKvCache` stores whatever dtype
+        /// it is handed, so once K/V are bf16 the queries must match or
+        /// `scaled_dot_product_attention` sees mixed dtypes.
+        fn to_kv_dtype(arr: &Array, what: &str) -> Result<Array> {
+            if !kv_store_bf16() {
+                return Ok(arr.clone());
+            }
+            arr.as_dtype(mlx_rs::Dtype::Bfloat16)
+                .with_context(|| format!("{what}: cast to bf16 failed"))
+        }
+
         /// Full-attn layer body. Mirrors
         /// `qwen3_next.Qwen3NextAttention.__call__` for the production
         /// MXFP4-quantized weights:
@@ -1665,12 +1617,21 @@ mod imp {
             layer_idx: usize,
             causal: bool,
             cache: &mut NativeKvCache,
+            positions: RopePlan<'_>,
         ) -> Result<Array> {
-            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
-            // (5) Append to KV cache and fetch full history.
-            let (k_full, v_full) = cache.update_and_fetch(&p.k_rope, &p.v_t)?;
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
+            // (5) Append to KV cache and fetch full history. Under bf16 storage
+            // the cast happens here, after k_norm and RoPE, so the cache holds
+            // exactly what attention will read.
+            let k_store = Self::to_kv_dtype(&p.k_rope, "layer_full_attn_forward: k")?;
+            let v_store = Self::to_kv_dtype(&p.v_t, "layer_full_attn_forward: v")?;
+            let (k_full, v_full) = cache.update_and_fetch(&k_store, &v_store)?;
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
-            let attn_out = sdpa(&p.q_rope, &k_full, &v_full, p.scale, causal)?;
+            let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward: q")?;
+            let attn_out = sdpa(&q, &k_full, &v_full, p.scale, causal)?;
+            // Back to f32 before the gate: `full_attn_finish` multiplies by an
+            // f32 gate through a fused kernel that expects matching dtypes.
+            let attn_out = Self::to_f32(attn_out, "layer_full_attn_forward: attn_out")?;
             self.full_attn_finish(
                 &attn_out,
                 &p.gate,
@@ -1696,12 +1657,13 @@ mod imp {
             layer_idx: usize,
             causal: bool,
             cache: &mut NativeRotatingKvCacheTurboQuant,
+            positions: RopePlan<'_>,
         ) -> Result<Array> {
             use crate::turboquant::{
                 TURBOQUANT_SEED, lloyd_max_centroids, lloyd_max_dequantize_scaled,
                 lloyd_max_quantize_stage1, rotate_last_axis, rotation_matrix_f32,
             };
-            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32)?;
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
 
             let centroids = lloyd_max_centroids(cache.bits())
                 .context("layer_full_attn_forward_tq: Lloyd-Max centroids")?;
@@ -1753,13 +1715,20 @@ mod imp {
             x: &Array,
             layer_idx: usize,
             offset: i32,
+            positions: RopePlan<'_>,
         ) -> Result<FullAttnQkv> {
             // Projections + per-head norm (batched, weight-bound) then RoPE.
             // Single-seq callers get a thin wrapper over the Stage-1 split, so
             // this path is bit-identical to the pre-split implementation.
             let p = self.full_attn_proj_no_rope(x, layer_idx)?;
-            let (q_rope, k_rope) =
-                self.apply_full_attn_rope(&p.queries_t, &p.k_t, p.rope_dim, p.base_theta, offset)?;
+            let (q_rope, k_rope) = self.apply_full_attn_rope(
+                &p.queries_t,
+                &p.k_t,
+                p.rope_dim,
+                p.base_theta,
+                offset,
+                positions,
+            )?;
             Ok(FullAttnQkv {
                 q_rope,
                 k_rope,
@@ -1777,6 +1746,7 @@ mod imp {
         /// (the cache token position). Honors `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS`.
         /// Factored out of `full_attn_qkv_rope` so the batched decode path can
         /// apply RoPE per seq at each seq's own offset.
+        #[allow(clippy::too_many_arguments)]
         fn apply_full_attn_rope(
             &self,
             queries_t: &Array,
@@ -1784,7 +1754,41 @@ mod imp {
             rope_dim: i32,
             base_theta: f32,
             offset: i32,
+            positions: RopePlan<'_>,
         ) -> Result<(Array, Array)> {
+            // Explicit positions mean MRoPE: an image block's tokens share a
+            // `t` and spread over an `h`/`w` grid, which no scalar offset can
+            // express. Text-only prompts pass `None` and keep the fused kernel
+            // — MRoPE would degenerate to the same rotation anyway, just
+            // slower.
+            // Match on the plan first: this runs per full-attn layer on every
+            // decode step, and the text path should not even look at the config.
+            let offset = match positions {
+                RopePlan::Sequential => offset,
+                RopePlan::Shifted(delta) => offset + delta,
+                RopePlan::Explicit(pos) => {
+                    if let Some((sections, interleaved)) = self.text_config().mrope() {
+                        let q = crate::native_rope::mrope(
+                            queries_t,
+                            rope_dim,
+                            pos,
+                            sections,
+                            interleaved,
+                            base_theta,
+                        )?;
+                        let k = crate::native_rope::mrope(
+                            k_t,
+                            rope_dim,
+                            pos,
+                            sections,
+                            interleaved,
+                            base_theta,
+                        )?;
+                        return Ok((q, k));
+                    }
+                    offset
+                }
+            };
             let use_precomputed_freqs = std::env::var("LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -1980,22 +1984,40 @@ mod imp {
                 // PER SEQ, so a batch may mix attached seqs (sharing the prefix)
                 // with fresh full-history seqs — each takes the right path.
                 let attached = shared_layer.is_some() && kv.base_offset() > 0;
-                let (q_rope, k_rope) =
-                    self.apply_full_attn_rope(&q_i, &k_i, p.rope_dim, p.base_theta, offset_i)?;
+                // Batched decode is one token per seq, so positions are always
+                // the scalar `offset_i` — even under MRoPE, where the three
+                // axes have realigned by the time decode starts.
+                let (q_rope, k_rope) = self.apply_full_attn_rope(
+                    &q_i,
+                    &k_i,
+                    p.rope_dim,
+                    p.base_theta,
+                    offset_i,
+                    RopePlan::Sequential,
+                )?;
                 // RoPE used the absolute `offset_i`, so suffix K is positioned
                 // consistently with the shared prefix. `update_and_fetch` returns
                 // the seq's own buffer view: the suffix only when attached (then
                 // `sdpa_split` merges the single shared prefix segment via
                 // log-sum-exp), or the full history when unattached (plain SDPA,
                 // byte-identical to the pre-dedup path).
-                let (k_view, v_view) = kv.update_and_fetch(&k_rope, &v_i)?;
+                let k_store = Self::to_kv_dtype(&k_rope, "layer_full_attn_forward_batch: k")?;
+                let v_store = Self::to_kv_dtype(&v_i, "layer_full_attn_forward_batch: v")?;
+                let (k_view, v_view) = kv.update_and_fetch(&k_store, &v_store)?;
+                let q_store = Self::to_kv_dtype(&q_rope, "layer_full_attn_forward_batch: q")?;
                 let attn_i = match (attached, shared_layer) {
+                    // The shared prefix was written through this same cast, so
+                    // prefix and suffix agree on dtype and `sdpa_split`'s
+                    // log-sum-exp merge sees one dtype throughout.
                     (true, Some((pk, pv))) => {
-                        sdpa_split(&q_rope, pk, pv, &k_view, &v_view, p.scale)?
+                        sdpa_split(&q_store, pk, pv, &k_view, &v_view, p.scale)?
                     }
-                    _ => sdpa(&q_rope, &k_view, &v_view, p.scale, /* causal */ false)?,
+                    _ => sdpa(&q_store, &k_view, &v_view, p.scale, /* causal */ false)?,
                 };
-                attn_parts.push(attn_i);
+                attn_parts.push(Self::to_f32(
+                    attn_i,
+                    "layer_full_attn_forward_batch: attn_out",
+                )?);
             }
             let refs: Vec<&Array> = attn_parts.iter().collect();
             let attn_stacked = mlx_rs::ops::concatenate_axis(&refs, 0)
@@ -2146,7 +2168,7 @@ mod imp {
                 let new_conv_state = {
                     use mlx_rs::ops::indexing::TryIndexOp;
                     conv_input
-                        .try_index((.., (s as i32)..(total_len as i32), ..))
+                        .try_index((.., s..total_len, ..))
                         .context("probe: slice conv_state failed")?
                 };
                 cache.set(0, new_conv_state)?;
@@ -2197,7 +2219,7 @@ mod imp {
             let new_conv_state = if conv_slice_enabled() && s == 1 {
                 use mlx_rs::ops::indexing::TryIndexOp;
                 conv_input
-                    .try_index((.., (s as i32)..(total_len as i32), ..))
+                    .try_index((.., s..total_len, ..))
                     .context("layer_linear_attn_forward: slice(conv_state, decode) failed")?
             } else if alloc_reuse_enabled() && s == 1 {
                 mlx_rs::ops::indexing::take_axis(
@@ -2623,8 +2645,14 @@ mod imp {
         /// `lm_head` (untied) or the embedding `as_linear` (tied) projects
         /// the hidden states into vocab logits with shape `[B, L, vocab]`.
         pub fn forward(&self, input_ids: &[u32], cache: &mut NativePromptCache) -> Result<Array> {
-            let (logits, _) =
-                self.forward_impl(input_ids, cache, /* last_only */ false, &[])?;
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                /* last_only */ false,
+                &[],
+                RopePlan::Sequential,
+                None,
+            )?;
             Ok(logits)
         }
 
@@ -2643,7 +2671,58 @@ mod imp {
             cache: &mut NativePromptCache,
             last_only: bool,
         ) -> Result<Array> {
-            let (logits, _) = self.forward_impl(input_ids, cache, last_only, &[])?;
+            let (logits, _) =
+                self.forward_impl(input_ids, cache, last_only, &[], RopePlan::Sequential, None)?;
+            Ok(logits)
+        }
+
+        /// [`Self::forward_with_opts`] with the running MRoPE position shifted
+        /// by `mrope_delta`.
+        ///
+        /// After an image block, `cache.offset()` counts tokens but the MRoPE
+        /// position counter has advanced more slowly — an image occupies `h·w`
+        /// slots and advances by `max(h, w)`. `mrope_delta` is that difference,
+        /// so decode keeps using the fused kernel and merely starts from the
+        /// right number. `0` is byte-identical to [`Self::forward_with_opts`].
+        pub fn forward_decode_shifted(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            mrope_delta: i32,
+        ) -> Result<Array> {
+            let plan = if mrope_delta == 0 {
+                RopePlan::Sequential
+            } else {
+                RopePlan::Shifted(mrope_delta)
+            };
+            let (logits, _) = self.forward_impl(input_ids, cache, last_only, &[], plan, None)?;
+            Ok(logits)
+        }
+
+        /// [`Self::forward_with_opts`] with explicit MRoPE positions.
+        ///
+        /// `positions[i]` is the `(t, h, w)` triple for `input_ids[i]`. Used by
+        /// the image path, where a vision block's tokens share a `t` and spread
+        /// over an `h`/`w` grid. Passing text-only positions (all three axes
+        /// equal, contiguous from the cache offset) is equivalent to
+        /// [`Self::forward_with_opts`] but takes the slower unfused rope, so
+        /// callers with no image should keep using that.
+        pub fn forward_with_positions(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            positions: &[[i32; 3]],
+        ) -> Result<Array> {
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                &[],
+                RopePlan::Explicit(positions),
+                None,
+            )?;
             Ok(logits)
         }
 
@@ -2670,7 +2749,195 @@ mod imp {
             last_only: bool,
             capture_layer_ids: &[usize],
         ) -> Result<(Array, Vec<Array>)> {
-            self.forward_impl(input_ids, cache, last_only, capture_layer_ids)
+            self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                capture_layer_ids,
+                RopePlan::Sequential,
+                None,
+            )
+        }
+
+        /// Is the image tower loaded and usable?
+        pub fn vision_available(&self) -> bool {
+            self.vision.is_some()
+        }
+
+        /// Token id whose embedding rows vision features replace.
+        pub fn image_token_id(&self) -> Option<u32> {
+            self.config.image_token_id
+        }
+
+        /// `spatial_merge_size`, for converting a patch grid to the merged
+        /// token grid the MRoPE positions are laid out over.
+        pub fn vision_merge_size(&self) -> Option<usize> {
+            self.vision.as_ref().map(|v| v.config().spatial_merge_size)
+        }
+
+        /// The loaded tower's config, for header-only prompt sizing.
+        pub fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+            self.vision.as_ref().map(|v| v.config().clone())
+        }
+
+        /// Decode + resize one image onto the patch grid, without running the
+        /// tower.
+        ///
+        /// Callers hold the result: `num_tokens` sizes the prompt's placeholder
+        /// run and `grid` drives the MRoPE positions, then the same
+        /// [`PreparedImage`] goes into [`Self::encode_prepared_image`].
+        /// Re-deriving it at encode time would decode and resize twice.
+        ///
+        /// [`PreparedImage`]: crate::qwen36_vision::PreparedImage
+        pub fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            crate::qwen36_vision::prepare_image(encoded, vision.config())
+                .map_err(|e| anyhow!("image preprocessing failed: {e}"))
+        }
+
+        /// Run the tower on an already-prepared image, returning
+        /// `[num_tokens, out_hidden_size]` language-model embeddings.
+        pub fn encode_prepared_image(
+            &self,
+            prepared: &crate::qwen36_vision::PreparedImage,
+        ) -> Result<Array> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let cfg = vision.config();
+            let per_patch =
+                cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size * cfg.in_channels;
+            let n = (prepared.grid.0 * prepared.grid.1) as i32;
+            let px = Array::from_slice(&prepared.patches, &[n, per_patch as i32]);
+            let soft = vision
+                .forward(&px, prepared.grid)
+                .context("vision tower forward")?;
+            // Materialize now so the tower's intermediates are freed before the
+            // text prefill allocates its own working set.
+            soft.eval().context("vision: eval soft tokens")?;
+            Ok(soft)
+        }
+
+        /// Locate each image's placeholder run and encode the matching image,
+        /// checking the two agree on length.
+        ///
+        /// Encoding happens once, before the chunked prefill starts, because
+        /// the runs are prompt-global and any chunk may need any of them.
+        pub fn encode_images_for_prompt(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::qwen36_vision::PreparedImage],
+        ) -> Result<(Vec<(usize, usize)>, Vec<Array>)> {
+            let image_token = self
+                .config
+                .image_token_id
+                .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+            let runs = crate::vision_splice::image_token_runs(prompt_ids, image_token);
+            if runs.len() != images.len() {
+                return Err(anyhow!(
+                    "prompt has {} image-token run(s) but {} image(s) were supplied",
+                    runs.len(),
+                    images.len()
+                ));
+            }
+            let mut soft = Vec::with_capacity(images.len());
+            for (idx, (prepared, run)) in images.iter().zip(runs.iter()).enumerate() {
+                if prepared.num_tokens != run.1 {
+                    return Err(anyhow!(
+                        "image {idx} encodes to {} tokens but the prompt reserved {} \
+                         image_pad placeholders",
+                        prepared.num_tokens,
+                        run.1
+                    ));
+                }
+                soft.push(
+                    self.encode_prepared_image(prepared)
+                        .with_context(|| format!("encoding image {idx}"))?,
+                );
+            }
+            Ok((runs, soft))
+        }
+
+        /// [`Self::forward_with_opts`] for one chunk of an image-bearing prompt.
+        ///
+        /// `positions` covers this chunk's tokens; `span_start` / `runs` /
+        /// `soft` stay prompt-global across the whole chunk loop.
+        #[allow(clippy::too_many_arguments)]
+        pub fn forward_chunk_with_images(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            positions: &[[i32; 3]],
+            span_start: usize,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let (logits, _) = self.forward_impl(
+                input_ids,
+                cache,
+                last_only,
+                &[],
+                RopePlan::Explicit(positions),
+                Some((span_start, runs, soft)),
+            )?;
+            Ok(logits)
+        }
+
+        /// Replace the embedding rows covered by each image's placeholder run
+        /// with that image's features, for the window
+        /// `[span_start, span_start + l)`.
+        fn splice_soft_tokens(
+            &self,
+            h: &Array,
+            span_start: i32,
+            l: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let hidden = self.text_config().hidden_size as i32;
+            let dt = h.dtype();
+            let slices = crate::vision_splice::clip_runs_to_window(span_start, l, runs)?;
+            if slices.is_empty() {
+                return Ok(h.clone());
+            }
+
+            let take_span = |x: &Array, start: i32, end: i32| -> Result<Array> {
+                let idx: Vec<i32> = (start..end).collect();
+                let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+                mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("splice: take_axis(axis=1)")
+            };
+
+            let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
+            let mut cursor = 0i32;
+            for s in &slices {
+                if s.local_start > cursor {
+                    segments.push(
+                        take_span(h, cursor, s.local_start)
+                            .context("splice: text span before image")?,
+                    );
+                }
+                let block = soft
+                    .get(s.image)
+                    .ok_or_else(|| anyhow!("splice: no features for image {}", s.image))?;
+                let run_len = runs[s.image].1 as i32;
+                let block = mlx_rs::ops::reshape(block, &[1, run_len, hidden])
+                    .context("splice: reshape image features")?;
+                let block = take_span(&block, s.row_start, s.row_end)
+                    .context("splice: clip image features to window")?;
+                segments.push(block.as_dtype(dt).context("splice: cast image features")?);
+                cursor = s.local_end;
+            }
+            if cursor < l {
+                segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
+            }
+            let refs: Vec<&Array> = segments.iter().collect();
+            let out =
+                mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
+            debug_assert_eq!(out.shape(), [1, l, hidden]);
+            Ok(out)
         }
 
         /// Inner forward implementation, parameterized by both `last_only`
@@ -2683,7 +2950,18 @@ mod imp {
             cache: &mut NativePromptCache,
             last_only: bool,
             capture_layer_ids: &[usize],
+            positions: RopePlan<'_>,
+            soft: VisionSoft<'_>,
         ) -> Result<(Array, Vec<Array>)> {
+            if let RopePlan::Explicit(pos) = positions
+                && pos.len() != input_ids.len()
+            {
+                return Err(anyhow!(
+                    "forward: {} rope positions for {} tokens",
+                    pos.len(),
+                    input_ids.len()
+                ));
+            }
             if input_ids.is_empty() {
                 return Err(anyhow!("forward: input_ids is empty"));
             }
@@ -2720,6 +2998,17 @@ mod imp {
             let hidden_dim = cfg.hidden_size as i32;
             let hidden_states = mlx_rs::ops::reshape(&embed_f32, &[1, l, hidden_dim])
                 .context("forward: reshape embeddings to [1, L, hidden] failed")?;
+
+            // Vision splice. Unlike Gemma 4 there is no embedding scale to
+            // order against — the image features simply replace the
+            // placeholder rows' embeddings.
+            let hidden_states = match soft {
+                None => hidden_states,
+                Some((span_start, runs, blocks)) => self
+                    .splice_soft_tokens(&hidden_states, span_start as i32, l, runs, blocks)
+                    .context("forward: splice vision soft tokens")?,
+            };
+
             if let Some(t0) = t_embed {
                 hidden_states
                     .eval()
@@ -2762,10 +3051,10 @@ mod imp {
                     self.layer_linear_attn_forward(&normed, layer_idx, lin)?
                 } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
                     let tq = layer_cache.as_full_turboquant_mut()?;
-                    self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq)?
+                    self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq, positions)?
                 } else {
                     let kv = layer_cache.as_full_mut()?;
-                    self.layer_full_attn_forward(&normed, layer_idx, causal, kv)?
+                    self.layer_full_attn_forward(&normed, layer_idx, causal, kv, positions)?
                 };
                 if let Some(t0) = t_attn {
                     attn.eval().context("forward: timing eval(attn) failed")?;
@@ -2829,10 +3118,10 @@ mod imp {
             // block's `h_pre` input. Cheap refcount clone — captured even when
             // the slot already holds a stale value (overwritten). The slot is
             // drained by `take_captured_h()` after the trunk forward returns.
-            if self.mtp_capture_enabled.load(Ordering::Relaxed) {
-                if let Ok(mut slot) = self.mtp_capture_slot.lock() {
-                    *slot = Some(hidden_states.clone());
-                }
+            if self.mtp_capture_enabled.load(Ordering::Relaxed)
+                && let Ok(mut slot) = self.mtp_capture_slot.lock()
+            {
+                *slot = Some(hidden_states.clone());
             }
 
             // Final RMSNorm + lm_head projection. `tie_word_embeddings = false`
@@ -3053,9 +3342,13 @@ mod imp {
                                 "forward_decode_batch: slice seq for TQ full-attn failed",
                             )?;
                             let tq = c.layer_mut(layer_idx).unwrap().as_full_turboquant_mut()?;
-                            parts.push(
-                                self.layer_full_attn_forward_tq(&normed_i, layer_idx, false, tq)?,
-                            );
+                            parts.push(self.layer_full_attn_forward_tq(
+                                &normed_i,
+                                layer_idx,
+                                false,
+                                tq,
+                                RopePlan::Sequential,
+                            )?);
                         }
                         let refs: Vec<&Array> = parts.iter().collect();
                         mlx_rs::ops::concatenate_axis(&refs, 0)
@@ -3195,10 +3488,8 @@ mod imp {
         }
         fn set_ssm_capture_enabled(&self, on: bool) {
             self.ssm_capture_enabled.store(on, Ordering::Relaxed);
-            if on {
-                if let Ok(mut s) = self.ssm_capture_slot.lock() {
-                    s.clear();
-                }
+            if on && let Ok(mut s) = self.ssm_capture_slot.lock() {
+                s.clear();
             }
         }
         fn push_ssm_capture(&self, layer_idx: usize, state_per_pos: Array, conv_input: Array) {
@@ -3478,7 +3769,7 @@ mod imp {
             let tgt_all = Array::from_slice(&t_all, &[n as i32]);
 
             // Probe vocab from a 1-row lm_head application.
-            let row0 = x_all.take_axis(&Array::from_slice(&[0i32], &[1]), 0)?;
+            let row0 = x_all.take_axis(Array::from_slice(&[0i32], &[1]), 0)?;
             let probe = self.lm_head_apply(&row0)?;
             let vocab = probe.shape()[probe.ndim() - 1];
 
@@ -3611,8 +3902,8 @@ mod imp {
                     move |args: &[Array]| -> Vec<Array> {
                         let a = &args[0];
                         let b = &args[1];
-                        let ha = xb.matmul(&a.transpose_axes(&[1, 0]).unwrap()).unwrap();
-                        let delta = ha.matmul(&b.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        let ha = xb.matmul(a.transpose_axes(&[1, 0]).unwrap()).unwrap();
+                        let delta = ha.matmul(b.transpose_axes(&[1, 0]).unwrap()).unwrap();
                         // HIDDEN mode: map the hidden-space delta through the
                         // frozen dense lm_head into logit space; else delta IS
                         // the logit correction.
@@ -3629,7 +3920,7 @@ mod imp {
                         let logits = base.add(&delta_logits).unwrap();
                         let lse = logits.logsumexp_axis(1, false).unwrap();
                         let tl = logits
-                            .take_along_axis(&tb.reshape(&[bsz, 1]).unwrap(), 1)
+                            .take_along_axis(tb.reshape(&[bsz, 1]).unwrap(), 1)
                             .unwrap()
                             .reshape(&[bsz])
                             .unwrap();
@@ -3893,7 +4184,7 @@ mod imp {
                 } else {
                     let lse = logits.logsumexp_axis(1, false).unwrap();
                     let tl = logits
-                        .take_along_axis(&t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
+                        .take_along_axis(t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
                         .unwrap()
                         .reshape(&[m_tr as i32])
                         .unwrap();
@@ -4268,15 +4559,15 @@ mod imp {
                         self.hidden_to_host_f32(&new_h)?
                     };
                     if proc_active {
-                        if let Ok(slot) = self.mtp_procrustes.lock() {
-                            if let Some(c) = slot.as_ref() {
-                                c.apply(&mut hv, k + 1);
-                            }
-                        }
-                    } else if let Ok(slot) = self.mtp_corrector.lock() {
-                        if let Some(c) = slot.as_ref() {
+                        if let Ok(slot) = self.mtp_procrustes.lock()
+                            && let Some(c) = slot.as_ref()
+                        {
                             c.apply(&mut hv, k + 1);
                         }
+                    } else if let Ok(slot) = self.mtp_corrector.lock()
+                        && let Some(c) = slot.as_ref()
+                    {
+                        c.apply(&mut hv, k + 1);
                     }
                     Array::from_slice(&hv, &[1, 1, hidden_dim])
                 } else {
@@ -4329,25 +4620,23 @@ mod imp {
                     let ys: Vec<Option<Vec<f32>>> = (0..n_pairs)
                         .map(|k| self.logits_row_to_cpu_f32(&vh, k as i32).ok())
                         .collect();
-                    if calib_active {
-                        if let Ok(mut slot) = self.mtp_calib.lock() {
-                            if let Some(stats) = slot.as_mut() {
-                                for k in 0..n_pairs {
-                                    if let Some(y) = &ys[k] {
-                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
-                                    }
-                                }
+                    if calib_active
+                        && let Ok(mut slot) = self.mtp_calib.lock()
+                        && let Some(stats) = slot.as_mut()
+                    {
+                        for k in 0..n_pairs {
+                            if let Some(y) = &ys[k] {
+                                stats.observe(k + 1, &draft_hiddens_host[k], y);
                             }
                         }
                     }
-                    if proc_calib_active {
-                        if let Ok(mut slot) = self.mtp_proc_calib.lock() {
-                            if let Some(stats) = slot.as_mut() {
-                                for k in 0..n_pairs {
-                                    if let Some(y) = &ys[k] {
-                                        stats.observe(k + 1, &draft_hiddens_host[k], y);
-                                    }
-                                }
+                    if proc_calib_active
+                        && let Ok(mut slot) = self.mtp_proc_calib.lock()
+                        && let Some(stats) = slot.as_mut()
+                    {
+                        for k in 0..n_pairs {
+                            if let Some(y) = &ys[k] {
+                                stats.observe(k + 1, &draft_hiddens_host[k], y);
                             }
                         }
                     }
@@ -4421,14 +4710,13 @@ mod imp {
                 // C4 calib: pair each draft's lm_head input (norm_out =
                 // draft_hiddens_host[k]) with the trunk's correct token
                 // (preds[k]). Trains the lm_head LoRA to re-aim the draft logits.
-                if c4_calib_active {
-                    if let Ok(mut slot) = self.mtp_c4_calib.lock() {
-                        if let Some((xs, tgts)) = slot.as_mut() {
-                            for k in 0..n_draft.min(draft_hiddens_host.len()) {
-                                xs.push(draft_hiddens_host[k].clone());
-                                tgts.push(preds[k]);
-                            }
-                        }
+                if c4_calib_active
+                    && let Ok(mut slot) = self.mtp_c4_calib.lock()
+                    && let Some((xs, tgts)) = slot.as_mut()
+                {
+                    for k in 0..n_draft.min(draft_hiddens_host.len()) {
+                        xs.push(draft_hiddens_host[k].clone());
+                        tgts.push(preds[k]);
                     }
                 }
                 if hi_calib_active {
@@ -4439,13 +4727,13 @@ mod imp {
                         let row = self.logits_row_to_cpu_f32(&verify_logits, 0)?;
                         topk_softmax(&row, 64)
                     };
-                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock()) {
-                        if let Some((es, hs, tgts, soft)) = slot.as_mut() {
-                            es.push(e.clone());
-                            hs.push(h.clone());
-                            tgts.push(preds[0]);
-                            soft.push(soft0);
-                        }
+                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock())
+                        && let Some((es, hs, tgts, soft)) = slot.as_mut()
+                    {
+                        es.push(e.clone());
+                        hs.push(h.clone());
+                        tgts.push(preds[0]);
+                        soft.push(soft0);
                     }
                 }
                 let mut acc = 0usize;
@@ -4574,8 +4862,14 @@ mod imp {
             let st = std::env::var("LUMEN_MTP_STAGE_TIMING")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            let (mut t_draft, mut t_snap, mut t_verify, mut t_accept, mut t_carry, mut t_roll) =
-                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            // `t_roll` is the odd one out: every other bucket accumulates with
+            // `+=` and needs the zero, while the rollback stage assigns its
+            // total once. Declared without an initializer so the compiler keeps
+            // proving that — an unread zero here would mean a stage stopped
+            // reporting.
+            let (mut t_draft, mut t_snap, mut t_verify, mut t_accept, mut t_carry) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let t_roll: f64;
             let mut roll_replay = false;
 
             // Resolve the drafter seed: (lead_token, h_draft, emit_lead).
@@ -4891,15 +5185,30 @@ mod imp {
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by runner_native.rs Phase 3d wiring.
-pub(crate) use imp::{
-    NativeLayerType, NativeModelConfig, NativeQuantizationConfig, NativeQuantizationOverride,
-    NativeQwen3_5MoeModel, NativeTextConfig, NativeWeights,
-};
+pub(crate) use imp::{NativeQuantizationConfig, NativeQuantizationOverride, NativeQwen3_5MoeModel};
+
+/// Config parsing is pure serde over `config.json` — no MLX, no GPU — and it
+/// is the first code a downloaded checkpoint touches, so the Phase 3 fault
+/// sweep (`tests/config_faults.rs`) drives it directly.
+///
+/// Still behind `mlx-native` only because it lives inside this file's gated
+/// `mod imp`. Hoisting it out — the way `gemma4_tool_syntax` was hoisted for
+/// exactly this reason — would let it be fuzzed and coverage-measured in the
+/// default build; that is a follow-up, noted in 005's checklist rather than
+/// bundled into the sweep.
+#[cfg(feature = "mlx-native")]
+pub use imp::{NativeLayerType, NativeModelConfig, NativeTextConfig, NativeWeights};
 
 // MTP types are part of the public surface (Phase 2 S3) — re-exported from
 // the crate root via `lumen_mlx::MtpStepOutput`.
 #[cfg(feature = "mlx-native")]
 pub use imp::MtpStepOutput;
+
+/// bf16 KV storage toggle. Public so an A/B harness can flip it between runs in
+/// one process rather than relying on a per-process env read — see
+/// `examples/kv_bf16_ab.rs`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_kv_store_bf16;
 
 // ───────────────────────── unit tests ─────────────────────────
 //
@@ -4907,13 +5216,308 @@ pub use imp::MtpStepOutput;
 // sanitize key rewriting on a fake weight map). MLX FFI tests are gated by
 // `feature = "mlx-native"` and `#[ignore]`'d per Issue #5.
 
+/// MRoPE gate: introducing an unfused rope path is only safe if it is a no-op
+/// for every text-only prompt, which is all of them until image input lands.
+/// The cheap half of that (config parsing, section validation) runs everywhere;
+/// the expensive half (identical logits from a real checkpoint) is `#[ignore]`d
+/// behind `LUMEN_QWEN35_MODEL_DIR`.
+#[cfg(all(test, feature = "mlx-native"))]
+mod mrope_tests {
+    use super::imp::{NativeModelConfig, NativeQwen3_5MoeModel};
+
+    /// The shipped Qwen3.6 configs put rope settings in a nested block; the
+    /// sections have to line up with the rotary span or MRoPE is refused.
+    #[test]
+    fn parses_qwen36_rope_parameters() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "rope_type": "default"
+                }
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.rope_dim(), 64);
+        assert_eq!(cfg.text_config.mrope(), Some(([11, 11, 10], true)));
+    }
+
+    /// The whole qwen3_5 family declares MRoPE, including the 35B-A3B config
+    /// checked in here — they are all `…ForConditionalGeneration` checkpoints.
+    /// That is exactly why the identity gate below matters: MRoPE is not an
+    /// opt-in for exotic models, it is on for every Qwen3.6 prompt we serve.
+    #[test]
+    fn shipped_qwen35_config_declares_mrope() {
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), Some(([11, 11, 10], true)));
+    }
+
+    /// A config with no `rope_parameters` (older/plain text checkpoints) keeps
+    /// the fused kernel unconditionally.
+    #[test]
+    fn absent_rope_parameters_means_no_mrope() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), None);
+    }
+
+    /// A section list that does not tile the rotary span is ignored rather than
+    /// fatal: it only matters for image input, and a text-only deploy should
+    /// not fail to load over it.
+    #[test]
+    fn mismatched_sections_disable_mrope_instead_of_failing() {
+        let raw = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16, "head_dim": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1,
+                "num_hidden_layers": 1, "vocab_size": 128,
+                "rms_norm_eps": 1e-6, "layer_types": ["full_attention"],
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": { "mrope_section": [11, 11], "mrope_interleaved": true }
+            }
+        }"#;
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("parse");
+        assert_eq!(cfg.text_config.mrope(), None);
+    }
+
+    /// THE gate for Phase A: feeding identity positions (`t == h == w ==
+    /// offset + i`) through the unfused MRoPE path must produce the same tokens
+    /// as the fused scalar-offset path. If this drifts, every text prompt on a
+    /// Qwen3.6 checkpoint drifts with it.
+    ///
+    /// ```sh
+    /// LUMEN_QWEN35_MODEL_DIR=~/models/Qwen3.6-27B-MTPLX-Speed \
+    ///   cargo test -p lumen-mlx --features mlx-native \
+    ///   mrope_tests::identity_positions -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "needs a real Qwen3.6 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn identity_positions_match_the_fused_rope_path() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let model = NativeQwen3_5MoeModel::load(&dir).expect("load model");
+        assert!(
+            model.text_config().mrope().is_some(),
+            "checkpoint declares no mrope_section — this gate would be vacuous"
+        );
+
+        // Real token ids, not a synthetic ramp: routing (MoE) and the linear
+        // layers behave differently on out-of-distribution input.
+        let prompt: Vec<u32> = vec![
+            9707, 11, 4340, 653, 498, 1936, 264, 4285, 1815, 304, 22775, 30,
+        ];
+
+        let mut cache_a = model.make_cache();
+        let fused = model
+            .forward_with_opts(&prompt, &mut cache_a, /* last_only */ true)
+            .expect("fused forward");
+
+        let positions: Vec<[i32; 3]> = (0..prompt.len() as i32).map(|i| [i, i, i]).collect();
+        let mut cache_b = model.make_cache();
+        let manual = model
+            .forward_with_positions(&prompt, &mut cache_b, true, &positions)
+            .expect("mrope forward");
+
+        let to_vec = |a: &mlx_rs::Array| {
+            a.as_dtype(mlx_rs::Dtype::Float32)
+                .expect("cast")
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let (a, b) = (to_vec(&fused), to_vec(&manual));
+        assert_eq!(a.len(), b.len());
+
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(
+            argmax(&a),
+            argmax(&b),
+            "identity-position MRoPE picked a different next token than fused rope"
+        );
+
+        // Logits agreeing closely is the stronger statement; the argmax above
+        // is the one that actually decides output.
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        println!("logit max|Δ| = {max_abs:.4e} (peak |logit| = {scale:.3})");
+        assert!(
+            max_abs < 0.02 * scale,
+            "logits diverge by {max_abs} (peak {scale}) — the unfused path is not equivalent"
+        );
+    }
+}
+
+/// End-to-end gate for the Qwen 3.6 image path.
+///
+/// A vision tower fails silently — a wrong rotary split, norm convention or
+/// token order yields confident nonsense, not an error — and with no PyTorch on
+/// this machine there is no golden tensor to compare against. So the gate is
+/// behavioural: encode a probe image whose content is known, run the real
+/// checkpoint, and require the model to describe it. Structural bugs do not
+/// survive that; a scrambled tower produces text about something else entirely.
+///
+/// ```sh
+/// LUMEN_VISION=1 LUMEN_QWEN35_MODEL_DIR=~/models/Qwen3.6-27B-MTPLX-Speed \
+///   cargo test -p lumen-mlx --features mlx-native --release \
+///   qwen36_vision_e2e -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(all(test, feature = "mlx-native"))]
+mod qwen36_vision_e2e {
+    use super::imp::NativeQwen3_5MoeModel;
+    use crate::qwen36_vision;
+
+    /// The same probe the Gemma 4 parity fixture uses: bright rectangles
+    /// scattered on black. Distinctive enough that a generic answer cannot pass
+    /// for a correct one.
+    const PROBE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gemma4_vision_probe.png"
+    );
+
+    #[test]
+    #[ignore = "needs LUMEN_VISION=1 and a Qwen3.6 checkpoint with vision weights"]
+    fn describes_a_known_image() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let model = NativeQwen3_5MoeModel::load(&dir).expect("load model");
+        assert!(
+            model.vision_available(),
+            "vision tower not loaded — set LUMEN_VISION=1 and use a checkpoint \
+             that still ships vision_tower.* weights"
+        );
+        let tok =
+            tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+
+        let bytes = std::fs::read(PROBE).expect("read probe image");
+        let prepared = model.prepare_image(&bytes).expect("prepare image");
+        let merge = model.vision_merge_size().expect("merge size");
+        println!(
+            "probe → {}×{} patches, {} merged tokens",
+            prepared.grid.0, prepared.grid.1, prepared.num_tokens
+        );
+
+        // One placeholder per image in the rendered text; expanded to one per
+        // merged token at the id level.
+        let text = format!(
+            "<|im_start|>user\n{}Describe this image in one sentence.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            qwen36_vision::IMAGE_BLOCK
+        );
+        let ids: Vec<u32> = tok
+            .encode(text.as_str(), true)
+            .expect("tokenize")
+            .get_ids()
+            .to_vec();
+        let image_token = model.image_token_id().expect("image_token_id");
+        assert!(
+            ids.contains(&image_token),
+            "the tokenizer did not resolve <|image_pad|> to {image_token}"
+        );
+        let prompt =
+            qwen36_vision::expand_image_placeholders(&ids, image_token, &[prepared.num_tokens])
+                .expect("expand placeholders");
+        println!("prompt = {} tokens", prompt.len());
+
+        // Prefill with the image spliced in, then greedy-decode.
+        let (runs, soft) = model
+            .encode_images_for_prompt(&prompt, std::slice::from_ref(&prepared))
+            .expect("encode image");
+        let positions =
+            qwen36_vision::mrope_positions(&prompt, image_token, &[prepared.merged_grid(merge)])
+                .expect("positions");
+        let delta = qwen36_vision::next_position(&positions) - prompt.len() as i32;
+        println!("mrope delta = {delta} (positions run shorter than tokens)");
+
+        let mut cache = model.make_cache();
+        let logits = model
+            .forward_chunk_with_images(&prompt, &mut cache, true, &positions, 0, &runs, &soft)
+            .expect("prefill");
+        let mut next = model.argmax_last_token(&logits).expect("argmax");
+
+        let eos: Vec<u32> = model.eos_tokens().to_vec();
+        let mut generated = Vec::new();
+        for _ in 0..48 {
+            if eos.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            let logits = model
+                .forward_decode_shifted(&[next], &mut cache, true, delta)
+                .expect("decode");
+            next = model.argmax_last_token(&logits).expect("argmax");
+        }
+        let reply = tok.decode(&generated, true).expect("decode text");
+        println!("--- reply ---\n{reply}\n-------------");
+
+        assert!(!reply.trim().is_empty(), "model produced nothing");
+        // The probe is unmistakable: coloured rectangles on a black field. A
+        // structurally broken tower describes something else, or asks for the
+        // image it never received.
+        let lower = reply.to_lowercase();
+        let hits = [
+            "black",
+            "dark",
+            "color",
+            "colour",
+            "rectangle",
+            "square",
+            "shape",
+            "block",
+        ]
+        .iter()
+        .filter(|w| lower.contains(*w))
+        .count();
+        assert!(
+            hits >= 2,
+            "reply does not describe the probe image (matched {hits} cue words): {reply:?}"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "mlx-native"))]
 mod config_tests {
     use super::imp::{MlpKind, NativeLayerType, NativeModelConfig};
 
     #[test]
     fn parses_checked_in_qwen3_5_moe_config() {
-        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
         let config: NativeModelConfig =
             serde_json::from_str(raw).expect("checked-in config.json must parse");
         config.validate_qwen3_5_moe().expect("contract must hold");
@@ -4976,7 +5580,7 @@ mod config_tests {
 
     #[test]
     fn family_validator_accepts_existing_moe_fixture_as_moe() {
-        let raw = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+        let raw = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
         let config: NativeModelConfig = serde_json::from_str(raw).unwrap();
         let kind = config
             .validate_qwen3_5_family()

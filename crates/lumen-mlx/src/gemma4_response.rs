@@ -19,16 +19,22 @@
 #[cfg(feature = "mlx-native")]
 #[allow(dead_code)] // surfaced via gemma4_response::imp::* once the server lands
 pub(crate) mod imp {
-    use anyhow::{Context, Result, anyhow};
-    use serde_json::Value as JsonValue;
+    use anyhow::{Context, Result};
 
     use crate::gemma4_chat::imp::{Gemma4ChatTemplate, TOK_CHANNEL_CLOSE, TOK_CHANNEL_OPEN};
 
     // Re-export the non-feature-gated data types from `chat_io` so existing
     // call sites (`gemma4_response::imp::ParsedResponse` etc.) keep
-    // resolving. The parser itself stays feature-gated since it depends on
-    // the tokenizer-backed `Gemma4ChatTemplate`.
+    // resolving. The *streaming* parser below stays feature-gated since it
+    // depends on the tokenizer-backed `Gemma4ChatTemplate`.
     pub use crate::chat_io::{ParsedResponse, ParsedToolCall};
+
+    // The tool-call body grammar, by contrast, is `&str` in and JSON out and
+    // needs no tokenizer, so it lives in an ungated module the plain
+    // `default = []` build can test, fuzz and measure. Re-exported here (and
+    // onward through `crate::gemma4`) so every existing call site keeps the
+    // path it already uses.
+    pub use crate::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
 
     // Tool-call delimiters from `tokenizer.json` added_tokens:
     //   <|tool_call> = 48,  <tool_call|> = 49
@@ -183,17 +189,13 @@ pub(crate) mod imp {
             // parens like `Playwright (Stealth)__browser_navigate`).
             // Trailing whitespace between NAME and `{` is trimmed.
             let prefix = self.tool_text_prefix.as_str();
-            let Some(start) = prefix.find("call:") else {
-                return None;
-            };
+            let start = prefix.find("call:")?;
             let name_start = start + "call:".len();
             let after = &prefix[name_start..];
             // Scan until '{' or newline (which acts as a hard boundary
             // so a stray `call:` token on its own line can't swallow
             // following text).
-            let Some(stop_offset) = after.find(|c: char| c == '{' || c == '\n' || c == '\r') else {
-                return None;
-            };
+            let stop_offset = after.find(['{', '\n', '\r'])?;
             if after.as_bytes().get(stop_offset) != Some(&b'{') {
                 return None;
             }
@@ -224,209 +226,13 @@ pub(crate) mod imp {
         }
     }
 
-    /// Parse `call:NAME{...}` (potentially multiple such blocks) out of a
-    /// decoded `<|tool_call>…<tool_call|>` body.
-    ///
-    /// Mirrors `mlx_lm.tool_parsers.gemma4.parse_tool_call` minus the
-    /// recursive `(?R)` regex — we do balanced-brace matching by hand
-    /// because the standard `regex` crate doesn't support recursion.
-    pub fn parse_tool_call_body(text: &str) -> Result<Vec<ParsedToolCall>> {
-        let mut out = Vec::new();
-        let bytes = text.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            // Find next "call:"
-            let Some(call_pos) = find_substr(text, "call:", i) else {
-                break;
-            };
-            // Read NAME permissively — any character up to the first
-            // '{' (newline is a hard boundary). Accepts non-OpenAI-spec
-            // function names (spaces, parens, dots, …) so clients like
-            // Ayla can pass MCP-prefixed names through without
-            // sanitizing — e.g. `Playwright (Stealth)__browser_navigate`.
-            let name_start = call_pos + "call:".len();
-            let mut brace_start = name_start;
-            while brace_start < bytes.len() {
-                let b = bytes[brace_start];
-                if b == b'{' || b == b'\n' || b == b'\r' {
-                    break;
-                }
-                brace_start += 1;
-            }
-            if brace_start >= bytes.len() || bytes[brace_start] != b'{' {
-                i = name_start;
-                continue;
-            }
-            // Trim trailing whitespace from NAME.
-            let mut name_end = brace_start;
-            while name_end > name_start && bytes[name_end - 1].is_ascii_whitespace() {
-                name_end -= 1;
-            }
-            if name_end == name_start {
-                i = brace_start + 1;
-                continue;
-            }
-            let name = &text[name_start..name_end];
-
-            // Balanced-brace span starting at brace_start.
-            let brace_end = match_balanced_braces(text, brace_start)
-                .ok_or_else(|| anyhow!("tool-call: unbalanced braces near {brace_start}"))?;
-            let args_raw = &text[brace_start..=brace_end];
-            let arguments = gemma4_args_to_json(args_raw)
-                .with_context(|| format!("tool-call '{name}': arg→json"))?;
-            out.push(ParsedToolCall {
-                name: name.to_string(),
-                arguments,
-            });
-            i = brace_end + 1;
-        }
-        if out.is_empty() {
-            return Err(anyhow!("tool-call: no call:NAME{{…}} found in body"));
-        }
-        Ok(out)
-    }
-
-    /// Convert Gemma 4 tool-call argument syntax (`{key:<|"|>val<|"|>,...}`)
-    /// into a strict JSON value.
-    ///
-    /// Algorithm mirrors `mlx_lm.tool_parsers.gemma4._gemma4_args_to_json`:
-    ///   1. Replace every `<|"|>...<|"|>` literal with a placeholder.
-    ///   2. Quote bare keys (`,key:` → `,"key":` and `{key:` → `{"key":`).
-    ///   3. Substitute placeholders back as JSON-escaped string literals.
-    ///   4. Parse as JSON.
-    pub fn gemma4_args_to_json(text: &str) -> Result<JsonValue> {
-        const STR_DELIM: &str = "<|\"|>";
-
-        // extract strings, replace with placeholders.
-        let mut strings: Vec<String> = Vec::new();
-        let mut buf = String::with_capacity(text.len());
-        let mut rest = text;
-        loop {
-            let Some(open) = rest.find(STR_DELIM) else {
-                buf.push_str(rest);
-                break;
-            };
-            buf.push_str(&rest[..open]);
-            let after_open = &rest[open + STR_DELIM.len()..];
-            let Some(close) = after_open.find(STR_DELIM) else {
-                return Err(anyhow!("unterminated <|\"|> string literal"));
-            };
-            let s = &after_open[..close];
-            strings.push(s.to_string());
-            buf.push_str(&format!("\x00{}\x00", strings.len() - 1));
-            rest = &after_open[close + STR_DELIM.len()..];
-        }
-
-        // quote bare keys. A bare key follows '{' or ',' (after
-        // optional whitespace), consists of [\w-]+, and is terminated by ':'.
-        let mut quoted = String::with_capacity(buf.len() + 16);
-        let bytes = buf.as_bytes();
-        let mut idx = 0usize;
-        while idx < bytes.len() {
-            let c = bytes[idx];
-            quoted.push(c as char);
-            if c == b'{' || c == b',' {
-                // Skip whitespace.
-                let mut j = idx + 1;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    quoted.push(bytes[j] as char);
-                    j += 1;
-                }
-                // Identifier?
-                let id_start = j;
-                while j < bytes.len() {
-                    let b = bytes[j];
-                    if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if j > id_start && j < bytes.len() && bytes[j] == b':' {
-                    let ident = &buf[id_start..j];
-                    quoted.push('"');
-                    quoted.push_str(ident);
-                    quoted.push('"');
-                    idx = j;
-                    continue;
-                }
-            }
-            idx += 1;
-        }
-
-        // substitute placeholders with JSON-escaped strings.
-        let mut final_str = String::with_capacity(quoted.len() + 32);
-        let bytes = quoted.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == 0 {
-                // \x00 N \x00 placeholder
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != 0 {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    return Err(anyhow!("placeholder NUL mismatch"));
-                }
-                let n: usize = std::str::from_utf8(&bytes[i + 1..j])
-                    .context("placeholder utf8")?
-                    .parse()
-                    .context("placeholder index")?;
-                let s = strings.get(n).ok_or_else(|| anyhow!("placeholder oob"))?;
-                final_str.push_str(&serde_json::to_string(s).context("escape string")?);
-                i = j + 1;
-            } else {
-                final_str.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-
-        serde_json::from_str(&final_str)
-            .with_context(|| format!("tool-call args JSON parse: {final_str:?}"))
-    }
-
-    fn find_substr(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-        haystack[from..].find(needle).map(|p| p + from)
-    }
-
-    fn match_balanced_braces(text: &str, open_at: usize) -> Option<usize> {
-        let bytes = text.as_bytes();
-        if open_at >= bytes.len() || bytes[open_at] != b'{' {
-            return None;
-        }
-        const STR_DELIM_BYTES: &[u8] = b"<|\"|>";
-        let mut depth: i32 = 0;
-        let mut i = open_at;
-        while i < bytes.len() {
-            // Skip <|"|>…<|"|> string literals (braces inside are not
-            // structural).
-            if bytes[i..].starts_with(STR_DELIM_BYTES) {
-                let after = i + STR_DELIM_BYTES.len();
-                let rest = &bytes[after..];
-                if let Some(pos) = rest
-                    .windows(STR_DELIM_BYTES.len())
-                    .position(|w| w == STR_DELIM_BYTES)
-                {
-                    i = after + pos + STR_DELIM_BYTES.len();
-                    continue;
-                } else {
-                    return None;
-                }
-            }
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        None
-    }
+    // `parse_tool_call_body`, `gemma4_args_to_json` and their two helpers now
+    // live in `crate::gemma4_tool_syntax` and are re-exported at the top of
+    // this module, so the uses above are unchanged. They took `&str` and
+    // returned JSON — no tokenizer anywhere — but sitting inside this
+    // `#[cfg(feature = "mlx-native")]` module put them out of reach of the
+    // fast GPU-free build, which is where the tests that would have caught
+    // `tool-name-scanner` and `args-unicode-keys` should have been running.
 
     // ───────────────────────── tests ─────────────────────────
 
@@ -434,106 +240,8 @@ pub(crate) mod imp {
     mod tests {
         use super::*;
 
-        #[test]
-        fn arg_parser_simple_string_value() {
-            let v = gemma4_args_to_json(r#"{name:<|"|>Tokyo<|"|>}"#).expect("parse");
-            assert_eq!(v["name"], "Tokyo");
-        }
-
-        #[test]
-        fn arg_parser_multiple_fields_mixed_types() {
-            let v = gemma4_args_to_json(r#"{city:<|"|>Paris<|"|>,unit:<|"|>celsius<|"|>,days:7}"#)
-                .expect("parse");
-            assert_eq!(v["city"], "Paris");
-            assert_eq!(v["unit"], "celsius");
-            assert_eq!(v["days"], 7);
-        }
-
-        #[test]
-        fn arg_parser_nested_object() {
-            let v = gemma4_args_to_json(r#"{location:{lat:35.6,lng:139.7,name:<|"|>Tokyo<|"|>}}"#)
-                .expect("parse");
-            assert_eq!(v["location"]["lat"], 35.6);
-            assert_eq!(v["location"]["lng"], 139.7);
-            assert_eq!(v["location"]["name"], "Tokyo");
-        }
-
-        #[test]
-        fn arg_parser_array_of_strings() {
-            let v = gemma4_args_to_json(r#"{tags:[<|"|>red<|"|>,<|"|>blue<|"|>]}"#).expect("parse");
-            assert!(v["tags"].is_array());
-            assert_eq!(v["tags"][0], "red");
-            assert_eq!(v["tags"][1], "blue");
-        }
-
-        #[test]
-        fn arg_parser_string_with_braces_and_commas() {
-            // Internal characters that look like JSON structure must NOT
-            // be misread (they live inside a <|"|>...<|"|> literal).
-            let v = gemma4_args_to_json(r#"{q:<|"|>hello, {world}<|"|>}"#).expect("parse");
-            assert_eq!(v["q"], "hello, {world}");
-        }
-
-        #[test]
-        fn arg_parser_unterminated_string_errors() {
-            let err = gemma4_args_to_json(r#"{q:<|"|>broken}"#).unwrap_err();
-            assert!(format!("{err}").contains("unterminated"), "got: {err}");
-        }
-
-        #[test]
-        fn body_parser_single_call() {
-            let body = r#"call:get_weather{city:<|"|>Seoul<|"|>}"#;
-            let calls = parse_tool_call_body(body).expect("parse");
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "get_weather");
-            assert_eq!(calls[0].arguments["city"], "Seoul");
-        }
-
-        #[test]
-        fn body_parser_multiple_calls() {
-            let body = r#"call:a{x:1}call:b{y:<|"|>z<|"|>}"#;
-            let calls = parse_tool_call_body(body).expect("parse");
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0].name, "a");
-            assert_eq!(calls[0].arguments["x"], 1);
-            assert_eq!(calls[1].name, "b");
-            assert_eq!(calls[1].arguments["y"], "z");
-        }
-
-        #[test]
-        fn body_parser_rejects_empty_body() {
-            let err = parse_tool_call_body("(no calls here)").unwrap_err();
-            assert!(format!("{err}").contains("no call:"));
-        }
-
-        #[test]
-        fn body_parser_accepts_spaces_and_parens_in_name() {
-            // Ayla MCP server prefix has spaces+parens — must round-trip
-            // without 500 error. Mirrors `getAllTools()` output shape.
-            let body =
-                r#"call:Playwright (Stealth)__browser_navigate{url:<|"|>https://example.com<|"|>}"#;
-            let calls = parse_tool_call_body(body).expect("parse permissive name");
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "Playwright (Stealth)__browser_navigate");
-            assert_eq!(calls[0].arguments["url"], "https://example.com");
-        }
-
-        #[test]
-        fn body_parser_trims_trailing_whitespace_from_name() {
-            // Whitespace between NAME and `{` must be tolerated AND
-            // stripped from the emitted name.
-            let body = r#"call:my tool   {x:1}"#;
-            let calls = parse_tool_call_body(body).expect("parse trimmed name");
-            assert_eq!(calls[0].name, "my tool");
-        }
-
-        #[test]
-        fn body_parser_handles_dots_in_name() {
-            // Some MCP / non-OpenAI clients use dots (e.g. namespace.method).
-            let body = r#"call:fs.read_file{path:<|"|>/tmp/x<|"|>}"#;
-            let calls = parse_tool_call_body(body).expect("parse dotted name");
-            assert_eq!(calls[0].name, "fs.read_file");
-        }
+        // The tool-call syntax tests moved with their parsers to
+        // `crate::gemma4_tool_syntax`, where they run without `mlx-native`.
 
         #[test]
         fn state_machine_transitions_reasoning() {

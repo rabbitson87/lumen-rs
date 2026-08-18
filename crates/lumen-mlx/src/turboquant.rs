@@ -145,6 +145,7 @@
 //! At ~50 μs each, ~20 ms decode overhead on top of compute.
 //!
 //! ── Next levers (decreasing ROI) ──
+//! ```text
 //!
 //!   (1) **Fuse encode** — LANDED, NEUTRAL-positive. `lumen_tq_encode_fused`
 //!       Metal kernel collapses (cast → square → sum → divide → sqrt →
@@ -156,7 +157,7 @@
 //!       Predicted: ~12.5 ms decode savings (8 dispatches × ~50 µs × 25
 //!       layers × 2 K+V).
 //!       Actual (8K, bits=6, STEPS=64, 2 trials):
-//!           fused    39.2 ± 0.1 tok/s  (25.50 ms/step)
+//!           fused     39.2 ± 0.1 tok/s  (25.50 ms/step)
 //!           non-fused 38.4 ± 0.1 tok/s  (26.05 ms/step)
 //!           Δ = +2.1% decode (~0.55 ms saved); prefill +1.2%
 //!
@@ -192,6 +193,7 @@
 //!       register tiles would (a) avoid materializing the dequant
 //!       buffers and (b) recover the (L−W)/L block skip win for the
 //!       quant cache path. **Now top ROI item.**
+//! ```
 //!
 //! Updated combined impact estimate after (1) LANDED: NEUTRAL gain from
 //! kernel fusion alone (Tier-2C). To reach parity with the OFF path, (5)
@@ -328,6 +330,10 @@ pub fn lloyd_max_boundaries_inner(bits: u32) -> Result<Array> {
     Ok(arr)
 }
 
+#[allow(dead_code)]
+// no caller: superseded by the `_fused` / `_packed` variant below. Kept as
+// the unfused reference for the Lloyd-Max kernel work the module docs
+// describe — deleting it would delete the thing that work is written against.
 /// Encode `x` (f32) into Lloyd-Max codes via nearest-centroid argmin.
 /// Returns codes as uint8 (assumes n_levels ≤ 256 → bits ≤ 8).
 ///
@@ -378,7 +384,7 @@ pub fn per_vector_sigma(x_f32: &Array) -> Result<Array> {
     let sum_sq = mlx_rs::ops::sum_axis(&x_sq, last_axis, /* keepdims */ true)
         .context("turboquant: sigma sum")?;
     let mean_sq =
-        mlx_rs::ops::divide(&sum_sq, &Array::from_f32(d)).context("turboquant: sigma divide")?;
+        mlx_rs::ops::divide(&sum_sq, Array::from_f32(d)).context("turboquant: sigma divide")?;
     mlx_rs::ops::sqrt(&mean_sq).context("turboquant: sigma sqrt")
 }
 
@@ -516,6 +522,10 @@ fn qjl_correction_scale_array_f32(m: usize) -> Result<Array> {
     Ok(arr)
 }
 
+#[allow(dead_code)]
+// no caller: superseded by the `_fused` / `_packed` variant below. Kept as
+// the unfused reference for the Lloyd-Max kernel work the module docs
+// describe — deleting it would delete the thing that work is written against.
 /// QJL Stage-2 encode. Given rotated K and its Stage-1 dequantization,
 /// produces:
 ///   - `signs` bf16 `[..., m]` with values in {-1, +1}, the sign of each
@@ -572,10 +582,14 @@ pub fn qjl_encode_stage2(
     Ok((signs_bf16, r_norm))
 }
 
+#[allow(dead_code)]
+// no caller: superseded by the `_fused` / `_packed` variant below. Kept as
+// the unfused reference for the Lloyd-Max kernel work the module docs
+// describe — deleting it would delete the thing that work is written against.
 /// Number of u32 words required to pack `m` sign bits.
 #[inline]
 pub fn qjl_packed_words(m: usize) -> usize {
-    (m + 31) / 32
+    m.div_ceil(32)
 }
 
 /// QJL Stage-2 encode (packed). Same math as `qjl_encode_stage2` but
@@ -739,8 +753,8 @@ pub fn rotate_and_lloyd_max_quantize_stage1_fused(
 ///   - `q`        : bf16  `[B, H, T, D]`        (T = 1 for decode)
 ///   - `k_codes`  : uint8 `[B, H_kv, N, D]`
 ///   - `k_sigma`  : f32   `[B, H_kv, N, 1]` (cache layout) — the trailing-1
-///                   axis is squeezed before the kernel call. May also be
-///                   passed as `[B, H_kv, N]`.
+///     axis is squeezed before the kernel call. May also be
+///     passed as `[B, H_kv, N]`.
 ///   - `centroids`: f32   `[n_levels]`
 ///
 /// Returns `scores` bf16 `[B, H, T, N]`. First-iteration constraints
@@ -766,6 +780,10 @@ pub fn turboquant_qk_inline(
         .map_err(|e| anyhow!("turboquant: lumen_tq_qk_inline kernel: {e}"))
 }
 
+#[allow(dead_code)]
+// no caller: superseded by the `_fused` / `_packed` variant below. Kept as
+// the unfused reference for the Lloyd-Max kernel work the module docs
+// describe — deleting it would delete the thing that work is written against.
 /// Stage-1 fused encode with **packed 4-bit output**. Emits codes as uint32
 /// with 8 codes per word — halves K/V cache storage and the downstream
 /// inline-kernel DRAM read bandwidth. 4-bit only (`centroids` length must
@@ -790,6 +808,10 @@ pub fn lloyd_max_quantize_stage1_packed4(
         .map_err(|e| anyhow!("turboquant: lumen_tq_encode_fused_packed4 kernel: {e}"))
 }
 
+#[allow(dead_code)]
+// no caller: superseded by the `_fused` / `_packed` variant below. Kept as
+// the unfused reference for the Lloyd-Max kernel work the module docs
+// describe — deleting it would delete the thing that work is written against.
 /// Q @ K_codes_packed inline matmul (4-bit packed). Symmetric to
 /// `turboquant_qk_inline` but consumes packed uint32 codes (8 codes per
 /// word). Used by the bit-packed cache path in the SlidingTurboquant
@@ -829,8 +851,8 @@ pub fn turboquant_qk_inline_packed4(
 ///   - `s`        : bf16  `[B, H, T, N]`        (softmax-normalized scores)
 ///   - `v_codes`  : uint8 `[B, H_kv, N, D]`
 ///   - `v_sigma`  : f32   `[B, H_kv, N, 1]` (cache layout) — the trailing-1
-///                   axis is squeezed before the kernel call. May also be
-///                   passed as `[B, H_kv, N]`.
+///     axis is squeezed before the kernel call. May also be
+///     passed as `[B, H_kv, N]`.
 ///   - `centroids`: f32   `[n_levels]`
 ///
 /// Returns `attn_out` bf16 `[B, H, T, D]`. First-iteration constraints
@@ -1140,7 +1162,7 @@ mod qjl_correctness_tests {
             (bf16_elems * 2.0) / (packed_elems * 4.0)
         );
         assert!(
-            ratio >= 31.0 && ratio <= 33.0,
+            (31.0..=33.0).contains(&ratio),
             "expected packed elements 32× fewer than bf16 (m=128 → n_words=4); got {}×",
             ratio
         );
@@ -1530,7 +1552,7 @@ mod qjl_correctness_tests {
         // axis must be expanded to match Q's H. Easiest reference: replicate
         // K along the head dim via reshape + broadcast, then matmul with Q.
         let k_dq = lloyd_max_dequantize_scaled(&k_codes, &k_sigma, &centroids).unwrap();
-        let group = (h / h_kv) as i32;
+        let group = h / h_kv;
         // [B, H_kv, N, D] → [B, H_kv, 1, N, D] → broadcast to [B, H_kv, group, N, D]
         //                → [B, H, N, D]
         let k_dq_5d = mlx_rs::ops::reshape(&k_dq, &[b, h_kv, 1, n, d]).unwrap();
@@ -1915,7 +1937,7 @@ mod qjl_correctness_tests {
     /// the ratio; not a unit-test assertion (`#[ignore]` by default — opt in
     /// via `cargo test --release -- --ignored bench_packed4_vs_unpacked_qk`).
     #[test]
-    #[ignore]
+    #[ignore = "microbenchmark, not an assertion; needs Metal — run with --ignored"]
     fn bench_packed4_vs_unpacked_qk() {
         use mlx_rs::random;
         use std::time::Instant;
@@ -2036,7 +2058,7 @@ mod qjl_correctness_tests {
                 let diff = mlx_rs::ops::subtract(&ya_f32, &yb_f32).unwrap();
                 let abs = mlx_rs::ops::abs(&diff).unwrap();
                 let max_err = mlx_rs::ops::max(&abs, false).unwrap().item::<f32>();
-                let ya_max = mlx_rs::ops::max(&mlx_rs::ops::abs(&ya_f32).unwrap(), false)
+                let ya_max = mlx_rs::ops::max(mlx_rs::ops::abs(&ya_f32).unwrap(), false)
                     .unwrap()
                     .item::<f32>();
                 let rel = if ya_max > 0.0 {

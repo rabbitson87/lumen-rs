@@ -1,0 +1,78 @@
+# libFuzzer soak targets — the other half of the two-driver split.
+#
+# `crates/lumen-mlx/tests/tool_surface_fuzz.rs` walks the same generators
+# deterministically on every `cargo test`; these targets hand the identical
+# entry points to a coverage-guided mutator for open-ended soaks. Run via
+# `cargo xtask fuzz <target>` (which shells out to `cargo +nightly fuzz run`),
+# never directly in the tier-0 path.
+#
+# Excluded from the workspace (root Cargo.toml `exclude`): fuzz binaries need
+# nightly plus sanitizer flags, and a workspace membership would drag
+# libfuzzer-sys into every `cargo test` build graph.
+[package]
+name = "lumen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.4", features = ["derive"] }
+serde_json = "1"
+lumen-testkit = { path = "../crates/lumen-testkit" }
+# Default features only — `gemma4_tool_syntax` and `grammar` are deliberately
+# ungated, which is what makes them fuzzable without a GPU in the loop.
+lumen-mlx = { path = "../crates/lumen-mlx" }
+lumen-server = { path = "../crates/lumen-server", default-features = false }
+
+[[bin]]
+name = "tool_body_parse"
+path = "fuzz_targets/tool_body_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "args_to_json"
+path = "fuzz_targets/args_to_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grammar_build"
+path = "fuzz_targets/grammar_build.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grammar_x_output"
+path = "fuzz_targets/grammar_x_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_parse"
+path = "fuzz_targets/request_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grammar_literals"
+path = "fuzz_targets/grammar_literals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chat_render"
+path = "fuzz_targets/chat_render.rs"
+test = false
+doc = false
+bench = false

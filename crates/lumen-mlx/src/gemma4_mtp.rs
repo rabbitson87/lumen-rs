@@ -212,7 +212,7 @@ pub mod imp {
 
     /// Load every drafter weight from a directory containing `config.json`
     /// + `model.safetensors`. Validates that all expected keys are present
-    /// and dimensions match the config.
+    ///   and dimensions match the config.
     pub fn load_drafter(drafter_dir: &Path) -> Result<ResolvedGemma4MtpDrafter> {
         let config_path = drafter_dir.join("config.json");
         let config = NativeGemma4MtpConfig::load(&config_path)
@@ -612,7 +612,7 @@ pub mod imp {
             let c3 = Array::from_f32(0.044715)
                 .as_dtype(dt)
                 .context("draft_layer: const c3")?;
-            let coeff = Array::from_f32(0.7978845608028654_f32)
+            let coeff = Array::from_f32(0.797_884_6_f32)
                 .as_dtype(dt)
                 .context("draft_layer: const coeff")?;
             let x_sq = mlx_rs::ops::multiply(&gate, &gate).context("draft_layer: gelu x_sq")?;

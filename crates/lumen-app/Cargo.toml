@@ -9,6 +9,9 @@ description = "Lumen desktop control plane — Tauri 2.x dashboard for the lumen
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
 
+[lints]
+workspace = true
+
 [dependencies]
 tauri = { version = "2.11.2", features = [] }
 tauri-plugin-dialog = "2.7.1"

@@ -81,7 +81,8 @@ fn main() -> Result<()> {
     let fixed_prompt: &[u32] = match prompt_kind.as_str() {
         "korean" => KOREAN_PROMPT,
         "sports" => SPORTS_PROMPT,
-        "code" | _ => CODE_PROMPT,
+        // `code` is the default as well as a name for it.
+        _ => CODE_PROMPT,
     };
 
     let model_id = std::env::var("MODEL_ID")

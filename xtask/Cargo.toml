@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies on purpose. This runs the test suite, so it must build even
+# when the workspace it is checking does not.
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"

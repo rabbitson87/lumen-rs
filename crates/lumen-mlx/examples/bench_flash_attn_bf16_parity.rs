@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect()
         };
-        let q_data = mk(n_heads * 1 * d, 0.0);
+        let q_data = mk(n_heads * d, 0.0);
         let k_data = mk(n_kv * skv * d, 1.0);
         let v_data = mk(n_kv * skv * d, 2.0);
 
@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect()
         };
-        let q_data = mk(n_heads * 1 * d, 0.0);
+        let q_data = mk(n_heads * d, 0.0);
         let k_data = mk(n_kv * skv * d, 1.0);
         let v_data = mk(n_kv * skv * d, 2.0);
 

@@ -1,13 +1,16 @@
-/// Bit-packing utilities for N-bit quantization codes.
-///
-/// Packs codes of `bits` width into u64 words.
-/// For 3-bit: 21 codes per u64 (21 × 3 = 63 bits, 1 bit unused).
+//! Bit-packing utilities for N-bit quantization codes.
+//!
+//! Packs codes of `bits` width into u64 words.
+//! For 3-bit: 21 codes per u64 (21 × 3 = 63 bits, 1 bit unused).
+//!
+//! Written with `///` and a blank line, so it documented `packed_words`
+//! instead of the module and the module had no docs at all.
 
 /// Number of u64 words needed to pack `n` codes of `bits` width.
 #[inline]
 pub fn packed_words(n: usize, bits: u32) -> usize {
     let codes_per_word = 64 / bits as usize;
-    (n + codes_per_word - 1) / codes_per_word
+    n.div_ceil(codes_per_word)
 }
 
 /// Pack a slice of u8 codes (each using `bits` bits) into u64 words.

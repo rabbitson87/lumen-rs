@@ -268,7 +268,9 @@ mod smoke_tests {
     /// Gate = runs without error, all weights load, output is finite and
     /// non-degenerate, and a PNG is written.
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device; 32B forward is slow"]
+    #[ignore = "needs a Metal device AND /tmp/mistral_embed_ref.bin; 32B forward \
+                is slow; no committed script produces the dump — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn dev_pipeline_minimal_e2e() {
         const TXT_SEQ: i32 = 512;
         const JOINT_DIM: i32 = 15360;

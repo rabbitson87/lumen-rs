@@ -432,6 +432,9 @@ impl Pyo3Runner {
             Ok(ProbeRows {
                 row_argmaxes,
                 row_max_abs,
+                // The Python probe returns argmax + max|logit| only. Left empty
+                // rather than faked; consumers check the length.
+                row_top2_gap: Vec::new(),
                 position,
             })
         })

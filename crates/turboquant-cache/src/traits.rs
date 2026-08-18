@@ -1,7 +1,11 @@
 /// KV cache abstraction for TurboQuant-compressed attention.
 ///
-/// `SimpleCache` (contiguous memory, no paging).
-/// `PagedCache` (vLLM-style paged attention).
+/// Implemented by `SimpleCache` (contiguous memory, no paging). A vLLM-style
+/// `PagedCache` was the intended second implementor; task 007 measured what
+/// paging would reclaim on this workload (under 1% of process memory) and the
+/// paged crate was deleted instead — see `docs/maintainer-workflow.md` §9.
+/// The trait stays an abstraction because the seam is cheap, not because a
+/// second implementation is pending.
 pub trait KVCache: Send + Sync {
     /// Store KV vectors for a given layer during prefill/decode.
     ///

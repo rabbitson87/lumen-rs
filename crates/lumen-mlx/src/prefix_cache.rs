@@ -532,6 +532,9 @@ impl PrefixCacheStore {
         best.map(|(i, _)| i)
     }
 
+    #[allow(dead_code)]
+    // no caller: the shared-prefix work computes its LCP in the runner, which
+    // owns the token buffers this would have to be handed.
     /// Length of the longest common token prefix between `a` and `b`.
     fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
@@ -904,6 +907,253 @@ mod tests {
             self.log.push(format!("release({snapshot_id})"));
             Ok(())
         }
+    }
+
+    // ───────────────── interrupt integrity (005 Phase 3.1) ─────────────────
+    //
+    // SQLite's crash testing asserts "committed or completely rolled back" of
+    // durable state. lumen has almost none, but it has the same property to
+    // uphold about *resources*: when a request dies partway — cancelled,
+    // disconnected, or failed inside the runner — every KV snapshot it touched
+    // must end up either owned by a live cache entry or released. A snapshot
+    // that is neither is a leaked multi-GB buffer, which is not a hypothetical
+    // failure class here: an unreclaimed pool once drove decode from 35 to
+    // 2.5 tok/s, recoverable only by restarting the process.
+    //
+    // Measuring live MLX memory needs a loaded model (tier 2). The *ownership*
+    // half does not: the store already takes its runner as a trait, so a runner
+    // that fails on its Nth call turns the whole cancellation sweep into a
+    // tier-0 test, run at every interruption point rather than the two or three
+    // anyone would write by hand.
+
+    /// A runner that behaves normally until its `fail_at`-th call, then fails
+    /// every call. Tracks snapshot ownership so a leak is detectable.
+    struct InterruptingRunner {
+        next_snap: u64,
+        calls: usize,
+        fail_at: usize,
+        created: Vec<u64>,
+        released: std::collections::HashSet<u64>,
+    }
+
+    impl InterruptingRunner {
+        fn never_fails() -> Self {
+            Self {
+                next_snap: 0,
+                calls: 0,
+                fail_at: usize::MAX,
+                created: Vec::new(),
+                released: std::collections::HashSet::new(),
+            }
+        }
+
+        fn failing_at(fail_at: usize) -> Self {
+            Self {
+                fail_at,
+                ..Self::never_fails()
+            }
+        }
+
+        /// Count this call and decide whether it is the one that dies.
+        fn tick(&mut self) -> Result<()> {
+            self.calls += 1;
+            if self.calls >= self.fail_at {
+                anyhow::bail!("interrupted at call {}", self.calls);
+            }
+            Ok(())
+        }
+
+        /// Snapshots handed out and not released — the resources still owned by
+        /// someone.
+        fn live(&self) -> Vec<u64> {
+            self.created
+                .iter()
+                .copied()
+                .filter(|id| !self.released.contains(id))
+                .collect()
+        }
+    }
+
+    impl SnapshotRunner for InterruptingRunner {
+        fn prefill(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.tick()?;
+            Ok((PREFILL_TOK, tokens.len()))
+        }
+        fn extend(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.tick()?;
+            Ok((EXTEND_TOK, tokens.len()))
+        }
+        fn snapshot_state_deep(&mut self, _seq: u64) -> Result<(u64, usize)> {
+            self.tick()?;
+            let id = self.next_snap;
+            self.next_snap += 1;
+            self.created.push(id);
+            Ok((id, 0))
+        }
+        fn fork_from_snapshot(&mut self, _snapshot_id: u64, _dst: u64) -> Result<usize> {
+            self.tick()?;
+            Ok(0)
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            // Releases are deliberately NOT interruptible: cleanup that can fail
+            // would make every invariant below untestable, and the real
+            // implementation's release is an in-process table removal.
+            self.released.insert(snapshot_id);
+            Ok(())
+        }
+    }
+
+    /// The three ownership invariants, asserted together after any interruption.
+    fn assert_snapshot_ownership_is_intact(
+        store: &PrefixCacheStore,
+        runner: &InterruptingRunner,
+        ctx: &str,
+    ) {
+        let referenced: std::collections::HashSet<u64> = store
+            .entries
+            .values()
+            .flatten()
+            .map(|e| e.master_snapshot_id)
+            .collect();
+
+        for id in runner.live() {
+            assert!(
+                referenced.contains(&id),
+                "{ctx}: snapshot {id} is neither released nor owned by a cache entry — \
+                 a leaked KV buffer that only a restart reclaims"
+            );
+        }
+        for e in store.entries.values().flatten() {
+            assert!(
+                !runner.released.contains(&e.master_snapshot_id),
+                "{ctx}: entry points at snapshot {} which was already released — the \
+                 next fork from this entry is a use-after-free",
+                e.master_snapshot_id
+            );
+            assert_eq!(
+                e.in_use, 0,
+                "{ctx}: entry left in_use={} after the request died — the guard \
+                 exempts it from eviction permanently, so this entry's KV can never \
+                 be reclaimed",
+                e.in_use
+            );
+        }
+    }
+
+    /// Drive `scenario` with a runner that dies at call 1, then 2, then 3, …
+    /// until the whole scenario completes without being interrupted. Every
+    /// interruption point must leave ownership intact and the store usable.
+    fn sweep_interruptions(
+        label: &str,
+        scenario: fn(&mut PrefixCacheStore, &mut InterruptingRunner),
+    ) {
+        // Establish how many runner calls an uninterrupted run makes.
+        let mut probe_store = PrefixCacheStore::with_policy(true, None, None);
+        let mut probe = InterruptingRunner::never_fails();
+        scenario(&mut probe_store, &mut probe);
+        let total = probe.calls;
+        assert!(total > 0, "{label}: scenario makes no runner calls");
+
+        for fail_at in 1..=total {
+            let mut store = PrefixCacheStore::with_policy(true, None, None);
+            let mut runner = InterruptingRunner::failing_at(fail_at);
+            // The scenario's own `unwrap`s are not used here: interruption is
+            // expected, so the closure must tolerate errors (see the scenarios).
+            scenario(&mut store, &mut runner);
+
+            let ctx = format!("{label}: interrupted at runner call {fail_at}/{total}");
+            assert_snapshot_ownership_is_intact(&store, &runner, &ctx);
+
+            // Post-failure integrity: a fresh request on a healthy runner must
+            // still work, which is the "next request succeeds normally" half of
+            // the invariant.
+            let mut healthy = InterruptingRunner::never_fails();
+            let out = store.prefill_optionally_cached(
+                &mut healthy,
+                999,
+                &[7, 7, 7],
+                Some("recovery"),
+                None,
+            );
+            assert!(
+                out.is_ok(),
+                "{ctx}: the store was unusable afterwards: {:?}",
+                out.err()
+            );
+        }
+    }
+
+    #[test]
+    fn cold_miss_survives_interruption_at_every_point() {
+        sweep_interruptions("cold miss", |store, runner| {
+            let _ = store.prefill_optionally_cached(runner, 1, &[1, 2, 3], Some("k"), None);
+        });
+    }
+
+    #[test]
+    fn extending_hit_survives_interruption_at_every_point() {
+        sweep_interruptions("extending hit", |store, runner| {
+            let _ = store.prefill_optionally_cached(runner, 1, &[1, 2, 3], Some("k"), None);
+            let _ = store.prefill_optionally_cached(runner, 2, &[1, 2, 3, 4, 5], Some("k"), None);
+        });
+    }
+
+    #[test]
+    fn exact_retry_survives_interruption_at_every_point() {
+        sweep_interruptions("exact retry", |store, runner| {
+            let _ = store.prefill_optionally_cached(runner, 1, &[1, 2, 3], Some("k"), None);
+            let _ = store.prefill_optionally_cached(runner, 2, &[1, 2, 3, 4], Some("k"), None);
+            // Same prompt again — the exact-retry fork path.
+            let _ = store.prefill_optionally_cached(runner, 3, &[1, 2, 3, 4], Some("k"), None);
+        });
+    }
+
+    #[test]
+    fn divergent_branches_survive_interruption_at_every_point() {
+        sweep_interruptions("divergent branches", |store, runner| {
+            let _ = store.prefill_optionally_cached(runner, 1, &[1, 2, 3], Some("k"), None);
+            // Shares the head, then diverges — pushes a second branch.
+            let _ = store.prefill_optionally_cached(runner, 2, &[1, 2, 9, 9], Some("k"), None);
+            let _ = store.prefill_optionally_cached(runner, 3, &[1, 2, 3, 4], Some("k"), None);
+        });
+    }
+
+    /// A cancelled request must not leave the entry it was forking from pinned.
+    /// `in_use` is bumped across fork+extend precisely so a concurrent eviction
+    /// cannot release the snapshot mid-flight; if an interruption skips the
+    /// matching decrement, that entry becomes permanently unevictable and its
+    /// KV is pinned for the life of the process.
+    #[test]
+    fn an_interrupted_fork_does_not_pin_its_source_entry_forever() {
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut warm = InterruptingRunner::never_fails();
+        store
+            .prefill_optionally_cached(&mut warm, 1, &[1, 2, 3], Some("k"), None)
+            .expect("warm-up");
+        assert_eq!(store.len(), 1);
+
+        // Fail on the very first call of the second request: the fork itself.
+        let mut runner = InterruptingRunner::failing_at(1);
+        let res =
+            store.prefill_optionally_cached(&mut runner, 2, &[1, 2, 3, 4, 5], Some("k"), None);
+        assert!(res.is_err(), "the interrupted request reported success");
+
+        let pinned: Vec<u32> = store
+            .entries
+            .values()
+            .flatten()
+            .map(|e| e.in_use)
+            .filter(|&n| n > 0)
+            .collect();
+        assert!(
+            pinned.is_empty(),
+            "entries left pinned after an interrupted fork: {pinned:?} — eviction will \
+             skip them forever"
+        );
+
+        // And eviction can in fact reclaim it now.
+        let mut cleanup = InterruptingRunner::never_fails();
+        assert_eq!(store.clear(&mut cleanup), 1);
     }
 
     #[test]

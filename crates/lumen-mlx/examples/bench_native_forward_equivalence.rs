@@ -18,15 +18,15 @@
 //!      deterministic test sequence `block_input` of length `N_max + 2` so
 //!      every N value uses the same input prefix.
 //!   2. For each N in the sweep:
-//!        a. Allocate two seq ids A and B, prefill both with PROMPT (identical
-//!           starting cache state).
-//!        b. Path A: single `forward_probe(seq_A, block_input[..N])` — S=N.
-//!        c. Path B: for i in 0..N: `forward_probe(seq_B, &[block_input[i]])`
-//!           — N × S=1.
-//!        d. Compare per-position argmax (A vs B) and per-position max-abs
-//!           logit (proxy for logit-magnitude divergence; full element-wise
-//!           diff would require exposing logits, but argmax + max-abs is the
-//!           strongest signal the existing API surfaces).
+//!      a. Allocate two seq ids A and B, prefill both with PROMPT (identical
+//!      starting cache state).
+//!      b. Path A: single `forward_probe(seq_A, block_input[..N])` — S=N.
+//!      c. Path B: for i in 0..N: `forward_probe(seq_B, &[block_input[i]])`
+//!      — N × S=1.
+//!      d. Compare per-position argmax (A vs B) and per-position max-abs
+//!      logit (proxy for logit-magnitude divergence; full element-wise
+//!      diff would require exposing logits, but argmax + max-abs is the
+//!      strongest signal the existing API surfaces).
 //!
 //! BAR.1 (max-abs proxy): per-position |max_abs_A[i] - max_abs_B[i]| < 0.5
 //!     for all i in [0, N) AND all swept N. (Threshold rationale: if the two
@@ -70,6 +70,7 @@ struct PerN {
     n: usize,
     argmax_match_all: bool,
     max_abs_diff_max: f32,
+    #[allow(dead_code)] // unread field: kept so the fixture matches the JSON it is parsed from.
     positions: Vec<PerPos>,
 }
 

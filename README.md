@@ -13,6 +13,11 @@ a personal research project. Apple Silicon only. Currently validated:
   Flagship-KR), custom AWQ + imatrix MLX builds validated across 11 measurement
   axes. The upstream `mlx-community/gemma-4-26b-a4b-mlx-4bit` and `-3bit`
   variants also work.
+- **Image input** on `/v1/chat/completions` via Gemma 4's native-resolution
+  vision tower — opt in with `LUMEN_VISION=1`. The MLX port is checked
+  tensor-for-tensor against the upstream reference (cosine similarity
+  1.00000000) by `gemma4_vision_parity`. Requires a checkpoint that kept its
+  `vision_tower.*` weights.
 
 Ships in two forms:
 
@@ -24,15 +29,10 @@ Ships in two forms:
    binary you launch with env vars. Recommended for headless deployments
    and library/research use.
 
-Other model paths exist in the codebase and should be treated as exploratory
-(may not work without local tweaks):
-
-- **Qwen3.5 35B-A3B / Qwen3.6 27B MoE** — full Candle backend including a
-  256-expert MoE assembly + native MLX runner. Opt-in via
-  `--features qwen3_5_moe` (off by default). Mostly working; see source
-  comments and the `LUMEN_QWEN35_SHARDS` env var.
-- **GGUF Gemma** via candle's gguf loader (CPU/Metal).
-- **Candle Qwen** legacy path.
+The Candle backend was removed: MLX is the only inference path. That also
+retired the GGUF loader, which had no MLX equivalent — and which had already
+been unreachable in a default build, since backend selection short-circuited to
+MLX before the GGUF check.
 
 ---
 
@@ -145,45 +145,31 @@ schema-migration policy), see
 
 ## Install
 
-### 1. Clone the repo plus the patched candle fork
-
-The workspace currently depends on a sibling `candle/` directory with a
-one-line patch on `candle-transformers` (see [DEPENDENCIES.md](DEPENDENCIES.md)
-for the exact change).
+### 1. Clone
 
 ```bash
 cd ~/your-projects/
 git clone <THIS_REPO_URL> lumen-rs
-
-# Sibling candle checkout — required because Cargo.toml uses path = "../candle".
-git clone https://github.com/huggingface/candle.git
-# Apply the clear_kv_cache patch — see DEPENDENCIES.md for the diff.
 ```
 
-Your tree should look like:
-
-```
-your-projects/
-  ├── candle/         (the patched fork)
-  └── lumen-rs/       (this repo)
-```
+No sibling checkouts are needed. The MLX forks are pinned by git URL + SHA in
+`Cargo.toml`; see [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ### 2. Build
 
 ```bash
 cd lumen-rs
-cargo build --release                          # default features: Metal + TurboQuant GPU
-cargo build --release --features mlx-native    # add the native Gemma 4 MLX backend
+cargo build --release      # mlx-native is on by default
 ```
 
-The first build downloads dependencies and compiles ~250 crates. Allow
-~5–10 minutes on a clean M-series machine.
+The first build compiles MLX from source (CMake + the Metal shader compiler).
+Allow ~10 minutes on a clean M-series machine.
 
-### 3. Smoke test the embedding stack (no checkpoint setup required)
+### 3. Smoke test (no checkpoint setup required)
 
 ```bash
-cargo test -p lumen-metal --release --test affine8_parity
-# expected: 7 passed; 0 failed
+cargo test -p lumen-mlx
+# ~200 tests, a couple of seconds, no GPU or model weights needed
 ```
 
 ---
@@ -336,6 +322,75 @@ curl -s localhost:8080/v1/chat/completions \
   }' | jq .
 ```
 
+#### Image input (Gemma 4 and Qwen 3.6 vision towers)
+
+With `LUMEN_VISION=1` and a checkpoint that still carries its
+`vision_tower.*` weights, the endpoint accepts OpenAI-style
+`image_url` content parts. Both native MLX families have a tower:
+Gemma 4's native-resolution ViT and Qwen 3.6's Qwen3-VL ViT.
+
+```bash
+B64=$(base64 -i photo.png)
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d "{
+    \"model\": \"gemma-4-26b-a4b\",
+    \"max_tokens\": 128,
+    \"messages\": [{\"role\": \"user\", \"content\": [
+      {\"type\": \"text\", \"text\": \"Describe this image.\"},
+      {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$B64\"}}
+    ]}]
+  }" | jq -r '.choices[0].message.content'
+```
+
+Notes:
+
+- **Only `data:` URLs.** Remote URLs are rejected rather than fetched —
+  the server does not issue outbound requests on a caller's behalf.
+- `POST /v1/messages` takes the same images in Anthropic's shape —
+  `{"type": "image", "source": {"type": "base64", "media_type": …, "data": …}}`.
+  A `url` source is refused for the same SSRF reason, and an unrecognized
+  block type fails the request rather than being silently ignored.
+- PNG, JPEG and WebP decode; the image is resized preserving aspect
+  ratio onto the patch grid, so no particular input size is required.
+- Images are placed at the **start** of their turn, before that
+  message's text. A message that interleaves text/image/text renders
+  with both text runs after the image.
+- `"stream": true` works on both families. Images are encoded once before
+  prefill and spliced into whichever prefill chunk covers them; decode is
+  pure text.
+- Image requests bypass the prefix cache — it is keyed on text alone, and
+  a vision prompt's placeholder rows only mean anything together with the
+  image they were spliced from. On Qwen 3.6 they also bypass MTP and
+  speculative decode, for the same reason.
+- `response_format` works alongside images on both families — describing a
+  picture as structured JSON is a first-class path. When a request carries both
+  a schema and tools, the schema wins, matching the text path.
+- Set `"additionalProperties": false` on a `json_schema`. Without it the schema
+  permits any extra key, and a model handed that freedom invents keys until
+  `max_tokens`. lumen leaves this to the caller because the schema means what it
+  says, but it is the first thing to check when a structured reply looks wrong.
+- Tools work alongside images on both families and both APIs, including a
+  tool-calling history (an assistant `tool_calls` turn or a `role:"tool"` /
+  `tool_result` message): the structured renderers carry images on their
+  `User` turns. On `/v1/messages` one message expands into several turns —
+  N `tool_result` blocks become N tool turns before the user turn — and the
+  images are indexed per *turn* so they stay put.
+- An image may only be attached to a **user** message. Attaching one to an
+  assistant turn is refused, because the renderers place the placeholder run
+  at the head of a user turn and an assistant turn carrying tool calls may
+  render no text at all.
+- Requires the mlx-native backend. Other backends return an error rather
+  than answering without the image.
+
+Qwen 3.6 sizes each image to a **token** budget rather than a pixel one,
+since tokens are what the prompt and KV cache pay for:
+
+| Var | Purpose |
+|---|---|
+| `LUMEN_VISION_MAX_IMAGE_TOKENS` | Cap on merged tokens per image (default `1024`). One token covers `merge² × patch²` = 32×32 pixels. |
+| `LUMEN_VISION_MIN_IMAGE_TOKENS` | Floor, so a thumbnail still gets enough patches to read (default `16`). |
+
 ### `POST /v1/completions`
 
 OpenAI-compatible legacy completions endpoint. Same backend as
@@ -349,59 +404,40 @@ Returns the loaded model identifiers.
 
 ## Run the bundled examples
 
-### Embedding smoke test
+### Embedding parity + quality
 
 ```bash
 EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
-  cargo run --release -p lumen-model --example embedding_smoke
-```
-
-Loads the model, embeds three Korean+English phrases, prints timings, RSS,
-norm validation, and cosine similarities.
-
-```
-[smoke] model loaded — dim=1024 max_seq_len=32768
-[smoke] RSS: 6 MB → 890 MB (+884 MB at load)
-[smoke] embed b=3 over 5 iters: median=19.35ms min=18.72ms max=22.35ms
-[smoke] OK: semantic ordering preserved
-```
-
-### Embedding quality eval
-
-```bash
-EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
-  cargo run --release -p lumen-model --example embedding_quality
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 ```
 
 Embeds a 25-item KR/EN multi-domain corpus (KBO baseball, NBA basketball,
-programming languages, Korean cities, Korean food). Reports retrieval
-metrics:
+programming languages, Korean cities, Korean food) and checks it against the
+reference vectors committed in `crates/lumen-mlx/tests/golden/` — the output of
+the Candle implementation this replaced, captured before it was deleted.
 
 ```
-[quality] embed b=25 in 251ms (10.05ms/item)
-[quality] P@1 = 0.960   P@3 = 0.880   MRR = 0.980
-[quality] per-category MRR:
-  baseball_kbo       (5 items)  MRR = 0.900
-  basketball_nba     (5 items)  MRR = 1.000
-  city_korea         (5 items)  MRR = 1.000
-  food_korean        (5 items)  MRR = 1.000
-  programming        (5 items)  MRR = 1.000
+[parity] embedded 25 texts: cold 107 ms, warm 55 ms (2.20 ms/item warm)
+[parity] worst per-item cosine vs candle = 0.998829
+[parity] largest deviation from unit norm = 1.110e-16
+[parity] MLX    P@1 =0.9600  P@3 =0.8800  MRR =0.9800
+[parity] PASS — the MLX port reproduces the candle model
 ```
 
-### Compare the qmv_fast vs naive 8-bit kernel
+### Batched vs unbatched embedding
 
 ```bash
-# qmv_fast (default — cooperative simdgroup):
-cargo run --release -p lumen-model --example embedding_smoke
+# default: length-bucketed batches of up to 32 rows
+EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 
-# Naive 1-thread/output (slow path; useful for A/B testing):
-LUMEN_AFFINE8_NAIVE=1 \
-  cargo run --release -p lumen-model --example embedding_smoke
+# one sequence at a time (A/B lever)
+LUMEN_EMBEDDING_BATCH_ROWS=1 EMBEDDING_MODEL_ID=~/models/qwen3-embedding-0.6b-8bit \
+  cargo run --release --features mlx-native -p lumen-mlx --example embedding_parity
 ```
 
-On an M3 Max you should see ~19 ms/batch with qmv_fast vs ~35 ms with
-naive, with identical cosine ordering — proof that the kernel-level
-optimization preserves model quality.
+On an M3 Max: 2.20 ms/item batched vs 8.80 ms unbatched, with per-item cosine
+unchanged to six decimal places — the speedup does not move the output.
 
 ---
 
@@ -419,13 +455,26 @@ optimization preserves model quality.
 | Var | Purpose |
 |---|---|
 | `PORT`, `HOST` | HTTP listen address (defaults `127.0.0.1:8080`). |
-| `LUMEN_MODE` | `mlx` \| `candle` \| `auto`. Selects the backend mode. Defaults to `mlx` when built with `mlx-native` (default); `candle` otherwise. |
-| `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native` under the `mlx-native` feature (+57% tok/s vs Candle, 33× at PROMPT_LEN=2048 on Qwen3.6-35B-A3B-mxfp4). |
-| `LUMEN_AFFINE8_NAIVE=1` | Force the naive 8-bit GEMM kernel path (A/B testing). |
+| `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native`. |
+| `LUMEN_EMBEDDING_BATCH_ROWS` | Rows per padded embedding forward pass (default 32; `1` disables batching). |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |
-| `BATCHED_ENGINE=1` | Continuous-batching scheduler for the GGUF and Qwen3.6 backends. |
-| `KESTREL_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
-| `KESTREL_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
+| `LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
+| `LUMEN_GEMMA4_PER_STEP_LATENCY=1` | Dump per-step latency table at the end of generation. |
+
+### Vision (Gemma 4 image input)
+
+| Var | Purpose |
+|---|---|
+| `LUMEN_VISION=1` | Load the Gemma 4 image tower (~1.1 GB on top of the text weights) and accept `image_url` content parts. Off by default, so text-only deploys keep their exact memory footprint. |
+| `LUMEN_VISION_MAX_SOFT_TOKENS` | Per-image soft-token budget: `70` \| `140` \| `280` \| `560` \| `1120` (default: the checkpoint's `vision_soft_tokens_per_image`, 280 on 26B-A4B). Lower values shrink the patch grid, which cuts attention cost quadratically and activation memory linearly — `140` is a good starting point on 36 GB machines. |
+| `LUMEN_VISION_EVAL_EVERY` | Drain the lazy graph every N encoder layers (default `4`; `0` disables). Without it, all 27 layers' activations stay live until the first eval and peak memory climbs by several GB. |
+| `LUMEN_VISION_F32` | Run the tower in float32 instead of the checkpoint's bf16. Used by the parity test; not for production. |
+
+The tower needs a checkpoint that still ships `vision_tower.*` weights.
+Some requantizations drop them — `mlx-community/gemma-4-26b-a4b-it-4bit`
+keeps all 358 tensors, while
+`hsng95/gemma-4-26b-a4b-mlx-imatrix3plus-awq` has none. When they are
+missing the server logs a warning at load and image input stays off.
 
 A full list of advanced flags lives in source-level docstrings under
 [crates/lumen-mlx/src/env_state.rs](crates/lumen-mlx/src/env_state.rs).
@@ -440,25 +489,47 @@ Three layered components separated by traits so the codec stays portable:
    Lloyd-Max scalar quantization + random orthogonal rotation + 1-bit
    QJL residual. Implements the [TurboQuant ICLR'26
    paper](https://arxiv.org/abs/2504.19874).
-2. **KV-cache strategies + model code** (`turboquant-cache`,
-   `lumen-model`, `lumen-mlx`). Candle-based models for embedding and
-   GGUF/Gemma paths; native MLX-rs assembly for Gemma 4 26B-A4B and the
-   shared Qwen3 native runner.
+2. **KV-cache strategies + model code** (`turboquant-cache`, `lumen-mlx`).
+   Native MLX-rs assembly for Gemma 4 26B-A4B, the shared Qwen3 native
+   runner, and the Qwen3 embedding encoder.
 3. **Serving** (`lumen-server`). atomic_http-based OpenAI-compatible
-   HTTP server. Optional continuous-batching scheduler.
+   HTTP server, with an MLX continuous-batching scheduler for greedy
+   streaming requests.
 
-Two pieces of custom kernel work that the public release covers:
+Custom kernel work the public release covers:
 
-- **`affine8_qmv_fast_bf16`** in `crates/lumen-metal/src/shaders/affine8.metal`
-  — cooperative simdgroup 8-bit MLX-format GEMM. NSG=2 × RPS=4
-  (8 outputs per threadgroup, 32-lane K-dimension split). Bit-parity
-  with a CPU reference; ~45 % latency reduction over the naive
-  1-thread/output kernel at Qwen3-Embedding shapes.
 - **`kestrel_flash_attn_bf16`** mlx Primitive. Bit-near-identical
   (max|Δ|=1.95e-3) to `mlx::fast::sdpa`. Registered as a first-class
   mlx Primitive — keeps the kernel in mlx's own command-buffer
   batching, avoiding the bridge-dispatch cost (~30 ms/step when the
   pattern is violated).
+
+### Gemma 4 vision tower
+
+`crates/lumen-mlx/src/gemma4_vision.rs`. Gemma 4's image encoder is **not**
+the SigLIP tower Gemma 3 used — it is a native-resolution ViT
+(`model_type: "gemma4_vision"`):
+
+- linear patch embedding over 16×16 RGB patches (no conv), plus a
+  factorized 2-D absolute position table (`[2, 10240, 1152]`, x + y),
+- 27 Gemma-shaped blocks (RMSNorm pre/post around both attention and
+  MLP, QK-norm, GeGLU) with **2-D RoPE** and **bidirectional** attention,
+- 3×3 average pooling → ×√hidden → standardize, then a quantized
+  1152 → 2816 projection into the language model's embedding space.
+
+Two conventions differ from the text tower and are easy to get wrong: the
+vision RMSNorm is a plain `normed * weight` (**not** the text
+`normed * (1 + weight)`), and the attention scale is `1.0` (the q_norm
+absorbs the `1/√head_dim`).
+
+Soft tokens are spliced over the `<|image|>` placeholder rows **after**
+the text embeddings are scaled by `√hidden_size`, matching upstream's
+`masked_scatter` ordering — the image features themselves are unscaled.
+
+A single image is processed unpadded: upstream pads only to batch
+differently-sized images, and the padded and unpadded paths were verified
+to produce identical soft tokens, which lets this port skip the attention
+mask entirely.
 
 ---
 
@@ -466,26 +537,21 @@ Two pieces of custom kernel work that the public release covers:
 
 | Crate | Feature | Effect |
 |---|---|---|
-| `lumen-model` | `metal` *(default)* | Metal backend on `candle-*`. |
-| `lumen-model` | `turboquant` *(default)* | Candle TurboQuant attention. |
-| `lumen-model` | `turboquant-gpu` *(default)* | GPU dispatch for affine quantization kernels. |
-| `lumen-model` | `paged-kv` *(default)* | PagedAttention KV-cache scaffolding. |
-| `lumen-model` | `qwen3_5_moe` | Qwen3.5 30B-A3B / Qwen3.6 27B MoE backend (Candle path). Off by default; opt-in for chat completions on these checkpoints. |
-| `lumen-mlx` | `mlx-native` | Pure-Rust Gemma 4 26B-A4B path via mlx-rs. **Required for `/v1/chat/completions`.** |
+| `lumen-mlx` | `mlx-native` | The MLX runner — Gemma 4, Qwen 2.5/3.5/3.6, and the embedding encoder. On by default via `lumen-server`. |
+| `lumen-mlx` | `mlx-native-metal` | `mlx-native` + `mlx-rs/metal`. |
 | `lumen-mlx` | `mlx-pyo3` | PyO3 / mlx-lm subprocess fallback (development only). |
-| `lumen-server` | `qwen3_5_moe` | Forwards the lumen-model qwen3_5_moe feature. |
+| `lumen-diffusion` | `mlx-native` | FLUX.2-dev text-to-image backend. |
+| `lumen-server` | `mlx-native` *(default)* | Pulls both of the above. |
+
+`lumen-mlx` builds with `default = []` too, and its ~200 GPU-free tests run in
+a couple of seconds — that configuration is part of the pre-commit gate
+because it is the one that silently rotted before.
 
 Typical command lines:
 
 ```bash
-# Minimum: embedding-only server.
-cargo build --release
-
-# Embedding + Gemma 4 chat (recommended dev / prod build).
-cargo build --release --features mlx-native
-
-# Add the Qwen3.5 / Qwen3.6 MoE backend.
-cargo build --release --features mlx-native --features lumen-server/qwen3_5_moe
+# The server. mlx-native is on by default.
+cargo build --release -p lumen-server
 ```
 
 ---
@@ -516,13 +582,11 @@ kernel. Candle's per-expert loop pays close to full-model bandwidth, which
 shows up as a 1.6× slowdown at short prompts and a 33× cliff at
 PROMPT_LEN=2048 once attention KV joins the read budget.
 
-The server defaults to `LUMEN_MODE=mlx` + `LUMEN_MLX_BACKEND=native`
-whenever the `mlx-native` feature is compiled in. Pass
-`LUMEN_MODE=candle` to opt into the multi-tenant CB path (Candle still
-wins on aggregate throughput at N≥4 because mlx-rs single-tenant
-microbatching does not fan out).
+The server defaults to `LUMEN_MLX_BACKEND=native`. The Candle backend that
+these numbers were measured against has since been removed; they are kept
+because they are why.
 
-### Kernel fusion impact (Qwen3.6-35B-A3B-mxfp4, N=1, Candle backend only)
+### Kernel fusion impact (Qwen3.6-35B-A3B-mxfp4, N=1 — historical, Candle backend)
 
 | Config | p50 step latency | aggregate tps | vs fused |
 |---|---|---|---|
@@ -559,8 +623,11 @@ is unset, or you built without `--features mlx-native`.
 **Slow embedding latency (~35 ms instead of ~19 ms)** — the `qmv_fast`
 kernel needs `in_features % 512 == 0 AND out_features % 8 == 0`. The
 Qwen3-Embedding-0.6B shapes (1024 / 3072 in; 512 / 1024 / 3072 / vocab out)
-satisfy both, so this should not trigger. If you see naive-kernel speed,
-unset `LUMEN_AFFINE8_NAIVE`.
+satisfy both, so this should not trigger.
+
+(This entry used to end by telling you to unset an env var that does not
+exist. Unsetting it changed nothing — the least useful kind of advice,
+because it appears to work every time.)
 
 **`thread panicked at 'metal command buffer not enqueued'`** — known
 intermittent issue when interleaving Candle and mlx kernels on the same
@@ -581,16 +648,15 @@ respectively. See the "Configure models" section for the full tier table.
 ```
 crates/
   lumen-core/         pure-Rust TurboQuant codec (Lloyd-Max + QJL, hardware-agnostic)
-  lumen-metal/        Metal compute kernels: affine 3/4/8-bit quant GEMM,
-                      MXFP4, flash-attn, rms_norm, silu_mul, sampling
-  lumen-mlx/          MLX-native Gemma 4 26B-A4B MoE backend + custom mlx
-                      primitives (kestrel_flash_attn_bf16) + bridge crates
-  lumen-model/        candle-based model assemblies (Gemma, Gemma-GGUF,
-                      Qwen, Qwen3-Embedding) + KV-cache strategies
+  lumen-mlx/          MLX-native model assemblies — Gemma 4 26B-A4B MoE,
+                      Qwen 2.5/3.5/3.6, the Qwen3 embedding encoder, vision
+                      towers, and custom mlx primitives (kestrel_flash_attn_bf16)
+  lumen-diffusion/    FLUX.2-dev text-to-image backend
   lumen-server/       atomic_http-based OpenAI-compatible HTTP server
-                      (/v1/embeddings, /v1/chat/completions, /v1/completions)
-  turboquant-cache/   KVCache trait + SimpleCache / PagedCache scaffolding
-  paged-attention/    PagedAttention scaffolding (WIP)
+                      (/v1/embeddings, /v1/chat/completions, /v1/completions,
+                      /v1/messages, /v1/images/generations)
+  lumen-testkit/      test-only helpers (numeric comparison, deterministic data)
+  turboquant-cache/   KVCache trait + SimpleCache
 
 deploy/               example .env + launchd plist for macOS service install
 examples/             end-to-end demo binaries

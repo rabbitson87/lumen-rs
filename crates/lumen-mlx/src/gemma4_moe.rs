@@ -11,8 +11,8 @@
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
-    use serde::Deserialize;
-    use std::collections::{BTreeMap, HashMap};
+
+    use std::collections::HashMap;
     use std::path::Path;
     use std::time::Instant;
 
@@ -27,11 +27,14 @@ pub(crate) mod imp {
         NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
     };
     use crate::native_norm::rms_norm;
+    // Shared with the Qwen 3.6 tower — see `vision_splice` for why the window
+    // arithmetic lives outside both.
     use crate::native_quant::{
         MODE_AFFINE, MODE_MXFP4, MODE_MXFP8, MODE_NVFP4, dequantize_with_mode,
         gather_qmm_with_mode, quantize_with_mode, quantized_matmul_with_mode,
     };
     use crate::native_rope::{rope, rope_with_freqs};
+    use crate::vision_splice::{clip_runs_to_window, image_token_runs};
     use mlx_rs::error::Exception;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
     use std::cell::Cell;
@@ -372,10 +375,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the MoE router into one dispatch. Output-identical.
+        pub(crate) fuse_router {
+            env: "LUMEN_GEMMA4_FUSE_ROUTER",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_router_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_ROUTER")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_router::get()
     }
 
     // ───────────────────────── Dense MLP compile (Phase 1.5 P9) ────────
@@ -437,7 +447,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -457,10 +467,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the dense-MLP chain. Output-identical.
+        pub(crate) fuse_dense_mlp {
+            env: "LUMEN_GEMMA4_FUSE_DENSE_MLP",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_dense_mlp_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_DENSE_MLP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_dense_mlp::get()
     }
 
     // Tier 2C (2026-05-16) — pre+post-norm absorbed dense MLP compile slot.
@@ -512,7 +529,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -533,10 +550,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fold the pre/post RMSNorm into the dense-MLP fusion. Default OFF — opt-in;
+        /// land path is enable, measure, promote if positive.
+        pub(crate) fuse_pre_post_norm_dense_mlp {
+            env: "LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_pre_post_norm_dense_mlp_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_PRE_POST_NORM_DENSE_MLP")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_pre_post_norm_dense_mlp::get()
     }
 
     fn gemma4_pre_post_norm_dense_mlp_fused(
@@ -712,7 +737,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -732,10 +757,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the expert gather + GLU. Output-identical.
+        pub(crate) fuse_experts {
+            env: "LUMEN_GEMMA4_FUSE_EXPERTS",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_experts_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_EXPERTS")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_experts::get()
     }
 
     // ─────────── Combined routing+experts compile (lever exploration 2026-05-17) ─────
@@ -814,7 +846,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -841,14 +873,20 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse routing into the expert dispatch, replacing the two-slot
+        /// routing_tail + experts path. LANDED 2026-05-17, bit-identical with the
+        /// baseline (greedy tokens match exactly); 3-pair cool-state A/B at 8K
+        /// showed +2.2% throughput (53.35 +/- 0.5 -> 54.5 +/- 0.7 tok/s).
+        pub(crate) fuse_routing_experts {
+            env: "LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_routing_experts_fuse_enabled() -> bool {
-        // LANDED 2026-05-17 — bit-identical with baseline (greedy tokens
-        // match exactly). 3-pair cool-state A/B at 8K shows +2.2% throughput
-        // (53.35 ± 0.5 → 54.5 ± 0.7 tok/s). Default ON; set the env to
-        // "0" to revert to the two-slot routing_tail + experts path.
-        std::env::var("LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_routing_experts::get()
     }
 
     // ─ Pre+post-norm absorbed into routing+experts (lever exploration 2026-05-17) ─
@@ -917,7 +955,7 @@ pub(crate) mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
         let x_squared = gate.multiply(&gate)?;
         let x_cubed = x_squared.multiply(&gate)?;
         let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
@@ -947,11 +985,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fold the pre/post norms into the fused routing+experts path. Default OFF —
+        /// opt-in; land path is enable, measure, promote if positive.
+        pub(crate) fuse_norm_routing_experts {
+            env: "LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_pre_post_norm_routing_experts_fuse_enabled() -> bool {
-        // Default OFF — opt-in. Land path: enable, measure, promote if positive.
-        std::env::var("LUMEN_GEMMA4_FUSE_NORM_ROUTING_EXPERTS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_norm_routing_experts::get()
     }
 
     fn gemma4_pre_post_norm_routing_experts_fused(
@@ -1073,10 +1118,17 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the attention logit softcap. Output-identical.
+        pub(crate) fuse_softcap {
+            env: "LUMEN_GEMMA4_FUSE_SOFTCAP",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_softcap_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_SOFTCAP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        fuse_softcap::get()
     }
 
     fn gemma4_softcap_fused(logits: &Array, softcap_inv: &Array, softcap: &Array) -> Result<Array> {
@@ -1127,10 +1179,18 @@ pub(crate) mod imp {
         std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>,
     > = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse the per-layer epilogue. Default OFF — opt-in; land path is enable,
+        /// measure, promote if positive.
+        pub(crate) fuse_layer_epilogue {
+            env: "LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn gemma4_layer_epilogue_fuse_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        fuse_layer_epilogue::get()
     }
 
     fn gemma4_layer_epilogue_fused(
@@ -1192,493 +1252,10 @@ pub(crate) mod imp {
         out.pop().context("gemma4_experts_fused: missing output")
     }
 
-    // ───────────────────────── config.json parsing ─────────────────────────
-
-    /// Top-level config.json wrapper for `gemma4` (text-only deploy ignores
-    /// `vision_config`, `audio_config`, vision/image token ids).
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4Config {
-        pub model_type: String,
-        #[serde(default)]
-        pub architectures: Vec<String>,
-        #[serde(
-            default,
-            rename = "eos_token_id",
-            deserialize_with = "deserialize_token_ids"
-        )]
-        pub eos_token_ids: Vec<u32>,
-        pub text_config: NativeGemma4TextConfig,
-        /// `quantization` and `quantization_config` are duplicates in
-        /// lmstudio's MLX shards; we accept either, with `quantization`
-        /// taking precedence when both are present.
-        #[serde(default)]
-        pub quantization: Option<NativeGemma4QuantizationConfig>,
-        #[serde(default)]
-        pub quantization_config: Option<NativeGemma4QuantizationConfig>,
-        #[serde(default)]
-        pub tie_word_embeddings: Option<bool>,
-    }
-
-    /// `text_config` block — every field the forward path needs.
-    ///
-    /// Fields absent in 26B-A4B (per-layer input embeddings: 2B/4B-only) are
-    /// kept with serde defaults so the same struct handles other Gemma 4
-    /// variants once we get there.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4TextConfig {
-        pub model_type: String,
-        pub hidden_size: usize,
-        pub num_hidden_layers: usize,
-        pub num_attention_heads: usize,
-        pub num_key_value_heads: usize,
-        /// Per-layer KV-head count for full attention layers when k_eq_v.
-        /// 26B-A4B sets this to 2; absent in smaller variants.
-        #[serde(default)]
-        pub num_global_key_value_heads: Option<usize>,
-        /// Head dim for sliding attention layers (and the default fallback).
-        pub head_dim: usize,
-        /// Head dim for full attention layers (26B/31B). 0 means "use head_dim".
-        #[serde(default)]
-        pub global_head_dim: usize,
-        pub vocab_size: usize,
-        #[serde(default = "default_vocab_size_per_layer_input")]
-        pub vocab_size_per_layer_input: usize,
-        pub rms_norm_eps: f32,
-        pub layer_types: Vec<NativeGemma4LayerType>,
-        pub sliding_window: usize,
-        #[serde(default = "default_sliding_window_pattern")]
-        pub sliding_window_pattern: usize,
-        pub max_position_embeddings: usize,
-
-        // RoPE
-        pub rope_parameters: NativeGemma4RopeParameters,
-        #[serde(default = "default_rope_traditional")]
-        pub rope_traditional: bool,
-        #[serde(default = "default_partial_rotary_factor")]
-        pub partial_rotary_factor: f32,
-
-        // Attention behavior
-        #[serde(default)]
-        pub attention_bias: bool,
-        #[serde(default)]
-        pub attention_dropout: f32,
-        #[serde(default)]
-        pub attention_k_eq_v: bool,
-
-        // MoE
-        #[serde(default)]
-        pub enable_moe_block: bool,
-        #[serde(default)]
-        pub num_experts: usize,
-        #[serde(default)]
-        pub top_k_experts: usize,
-        #[serde(default)]
-        pub moe_intermediate_size: usize,
-
-        // Dense MLP (always present in 26B; sized via intermediate_size).
-        pub intermediate_size: usize,
-        #[serde(default)]
-        pub use_double_wide_mlp: bool,
-
-        // Per-layer input embedding (2B/4B Gemma 4; 0 for 26B-A4B).
-        #[serde(default)]
-        pub hidden_size_per_layer_input: usize,
-        #[serde(default)]
-        pub num_kv_shared_layers: usize,
-
-        // Activation + logit softcap
-        #[serde(default = "default_hidden_activation")]
-        pub hidden_activation: String,
-        pub final_logit_softcapping: f32,
-
-        // Tied embedding → lm_head reuses embed_tokens.
-        #[serde(default)]
-        pub tie_word_embeddings: bool,
-
-        // Tokens
-        #[serde(default)]
-        pub pad_token_id: u32,
-        #[serde(default = "default_bos_token_id")]
-        pub bos_token_id: u32,
-        #[serde(
-            default,
-            rename = "eos_token_id",
-            deserialize_with = "deserialize_token_ids"
-        )]
-        pub eos_token_ids: Vec<u32>,
-    }
-
-    /// RoPE parameter block, keyed per attention layer kind. mlx-lm's
-    /// `gemma4_text.py` looks up `rope_parameters["sliding_attention"|"full_attention"]`.
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4RopeParameters {
-        pub full_attention: NativeGemma4RopePerKind,
-        pub sliding_attention: NativeGemma4RopePerKind,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4RopePerKind {
-        pub rope_theta: f32,
-        #[serde(default = "default_partial_rotary_factor")]
-        pub partial_rotary_factor: f32,
-        #[serde(default = "default_rope_type")]
-        pub rope_type: String,
-    }
-
-    /// Layer kind discriminant. mlx-lm config.json string values match
-    /// `snake_case` form.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum NativeGemma4LayerType {
-        SlidingAttention,
-        FullAttention,
-    }
-
-    impl NativeGemma4LayerType {
-        pub fn is_sliding(self) -> bool {
-            matches!(self, NativeGemma4LayerType::SlidingAttention)
-        }
-
-        pub fn is_full(self) -> bool {
-            matches!(self, NativeGemma4LayerType::FullAttention)
-        }
-    }
-
-    /// Quantization block — uniform `(group_size, bits, mode)` default plus
-    /// per-tensor 8-bit overrides for `mlp.{gate,up,down}_proj` and
-    /// `router.proj` (and any future override entries).
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4QuantizationConfig {
-        pub group_size: usize,
-        pub bits: usize,
-        pub mode: String,
-        #[serde(flatten)]
-        pub overrides: BTreeMap<String, NativeGemma4QuantizationOverride>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct NativeGemma4QuantizationOverride {
-        pub group_size: usize,
-        pub bits: usize,
-        /// Optional per-tensor mode override. When absent the override
-        /// inherits MODE_AFFINE (Qwen3.6 reference convention: overrides
-        /// encode AFFINE exceptions inside an otherwise non-AFFINE model,
-        /// e.g. 8-bit AFFINE gate layers inside an MXFP4 model). When
-        /// present, must be one of `"affine" | "mxfp4"`.
-        #[serde(default)]
-        pub mode: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    enum TokenIdValue {
-        One(u32),
-        Many(Vec<u32>),
-    }
-
-    fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = Option::<TokenIdValue>::deserialize(deserializer)?;
-        Ok(match value {
-            Some(TokenIdValue::One(id)) => vec![id],
-            Some(TokenIdValue::Many(ids)) => ids,
-            None => Vec::new(),
-        })
-    }
-
-    fn default_sliding_window_pattern() -> usize {
-        6
-    }
-
-    fn default_partial_rotary_factor() -> f32 {
-        1.0
-    }
-
-    fn default_rope_traditional() -> bool {
-        false
-    }
-
-    fn default_rope_type() -> String {
-        "default".to_string()
-    }
-
-    fn default_hidden_activation() -> String {
-        "gelu_pytorch_tanh".to_string()
-    }
-
-    fn default_bos_token_id() -> u32 {
-        2
-    }
-
-    fn default_vocab_size_per_layer_input() -> usize {
-        0
-    }
-
-    impl NativeGemma4Config {
-        pub fn load(path: &Path) -> Result<Self> {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|err| anyhow!("config.json read failed at {}: {err}", path.display()))?;
-            let mut cfg: Self = serde_json::from_str(&raw)
-                .map_err(|err| anyhow!("config.json parse failed at {}: {err}", path.display()))?;
-            // `LUMEN_SLIDING_WINDOW` (desktop CONTEXT card → server) overrides the
-            // model's built-in sliding window size. 0 means "no override".
-            if let Ok(s) = std::env::var("LUMEN_SLIDING_WINDOW") {
-                if let Ok(n) = s.parse::<usize>() {
-                    if n > 0 {
-                        eprintln!(
-                            "[gemma4] sliding_window override via LUMEN_SLIDING_WINDOW: {} → {n}",
-                            cfg.text_config.sliding_window
-                        );
-                        cfg.text_config.sliding_window = n;
-                    }
-                }
-            }
-            // `LUMEN_MAX_CTX` caps the maximum position embeddings the model
-            // advertises — useful to keep KV cache pool sizing predictable
-            // when the model config claims e.g. 128K but the host RAM can't
-            // hold it.
-            if let Ok(s) = std::env::var("LUMEN_MAX_CTX") {
-                if let Ok(n) = s.parse::<usize>() {
-                    if n > 0 && n < cfg.text_config.max_position_embeddings {
-                        eprintln!(
-                            "[gemma4] max_position_embeddings capped via LUMEN_MAX_CTX: {} → {n}",
-                            cfg.text_config.max_position_embeddings
-                        );
-                        cfg.text_config.max_position_embeddings = n;
-                    }
-                }
-            }
-            // `LUMEN_GEMMA4_TOP_K` overrides the MoE router's top-k expert
-            // count at load time. Quality knob — model was trained at k=8;
-            // lowering to k=4 ~halves expert FFN compute per token but may
-            // degrade output. Use for A/B measurement; ship only after
-            // multi-axis quality eval (HAERAE / KMMLU / GSM8K).
-            if let Ok(s) = std::env::var("LUMEN_GEMMA4_TOP_K") {
-                if let Ok(n) = s.parse::<usize>() {
-                    if n > 0 && n <= cfg.text_config.num_experts {
-                        if n != cfg.text_config.top_k_experts {
-                            eprintln!(
-                                "[gemma4] top_k_experts overridden via LUMEN_GEMMA4_TOP_K: {} → {n}",
-                                cfg.text_config.top_k_experts
-                            );
-                            cfg.text_config.top_k_experts = n;
-                        }
-                    } else {
-                        eprintln!(
-                            "[gemma4] LUMEN_GEMMA4_TOP_K={n} ignored (must be 1..={}, got {n})",
-                            cfg.text_config.num_experts
-                        );
-                    }
-                }
-            }
-            Ok(cfg)
-        }
-
-        /// Returns whichever of `quantization` / `quantization_config` is
-        /// present (preferring the former, which is what lmstudio's MLX
-        /// shards reference at runtime).
-        pub fn effective_quantization(&self) -> Option<&NativeGemma4QuantizationConfig> {
-            self.quantization
-                .as_ref()
-                .or(self.quantization_config.as_ref())
-        }
-
-        /// Validate that this config belongs to the Gemma 4 family with a
-        /// reachable text-only forward path.
-        pub fn validate_gemma4_family(&self) -> Result<()> {
-            if self.model_type != "gemma4" {
-                return Err(anyhow!(
-                    "expected model_type='gemma4', got '{}'",
-                    self.model_type
-                ));
-            }
-            if !self.architectures.is_empty()
-                && !self
-                    .architectures
-                    .iter()
-                    .any(|a| a == "Gemma4ForConditionalGeneration")
-            {
-                return Err(anyhow!(
-                    "expected architectures to include 'Gemma4ForConditionalGeneration', got {:?}",
-                    self.architectures
-                ));
-            }
-            self.text_config.validate()?;
-            if let Some(quant) = self.effective_quantization() {
-                if !matches!(quant.mode.as_str(), "affine" | "mxfp4" | "mxfp8" | "nvfp4")
-                    || quant.group_size == 0
-                {
-                    return Err(anyhow!(
-                        "quantization default must be mode∈{{affine, mxfp4, mxfp8, nvfp4}} with non-zero group, got mode='{}' bits={} group={}",
-                        quant.mode,
-                        quant.bits,
-                        quant.group_size
-                    ));
-                }
-                if !matches!(quant.bits, 2 | 3 | 4 | 5 | 6 | 8) {
-                    return Err(anyhow!(
-                        "quantization default bits must be in {{2,3,4,5,6,8}} (mlx-supported), got {}",
-                        quant.bits
-                    ));
-                }
-                // (Sanity probe removed: it asserted the specific lmstudio
-                // mixed 4/8 packaging, which doesn't hold for in-house
-                // conversions via `mlx_lm.convert` — those may keep MLPs at
-                // the default bit-width or pick different mixed recipes.
-                // Per-key dispatch via `quant_params_for` handles whatever
-                // overrides the config actually contains.)
-                // Override `group_size` is only required to match the default
-                // when the override's mode matches the default mode — when
-                // modes differ (e.g. MXFP4 g=32 default with AFFINE g=64 embed
-                // override), per-tensor dispatch through `quant_params_for`
-                // routes each tensor to a kernel that consumes its own
-                // `(group_size, bits, mode)` triple, so cross-mode group_size
-                // mismatches are safe. This mirrors Qwen3.5's loader which has
-                // no mixed-group-size check at all and ships in production
-                // (Qwen3.6 MXFP4 g=32 default + AFFINE g=64 gate overrides).
-                let top_mode = quant.mode.as_str();
-                for (k, ov) in &quant.overrides {
-                    let ov_mode = ov.mode.as_deref().unwrap_or("affine");
-                    let modes_match = ov_mode == top_mode;
-                    if modes_match && ov.group_size != quant.group_size {
-                        return Err(anyhow!(
-                            "override '{k}' has group_size={} but default is {} (same mode={top_mode}) — mixed group_size within one mode not supported",
-                            ov.group_size,
-                            quant.group_size
-                        ));
-                    }
-                    if !matches!(ov.bits, 2 | 3 | 4 | 5 | 6 | 8) {
-                        return Err(anyhow!(
-                            "override '{k}' bits must be in {{2,3,4,5,6,8}} (mlx-supported), got {}",
-                            ov.bits
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-
-    impl NativeGemma4TextConfig {
-        pub fn validate(&self) -> Result<()> {
-            if self.model_type != "gemma4_text" {
-                return Err(anyhow!(
-                    "expected text_config.model_type='gemma4_text', got '{}'",
-                    self.model_type
-                ));
-            }
-            if self.hidden_size == 0
-                || self.num_hidden_layers == 0
-                || self.num_attention_heads == 0
-                || self.num_key_value_heads == 0
-                || self.head_dim == 0
-                || self.vocab_size == 0
-                || self.intermediate_size == 0
-            {
-                return Err(anyhow!(
-                    "text_config has zero-valued core dims: hidden={} layers={} q_heads={} kv_heads={} head_dim={} vocab={} mlp_inter={}",
-                    self.hidden_size,
-                    self.num_hidden_layers,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self.head_dim,
-                    self.vocab_size,
-                    self.intermediate_size,
-                ));
-            }
-            if self.layer_types.len() != self.num_hidden_layers {
-                return Err(anyhow!(
-                    "layer_types length {} != num_hidden_layers {}",
-                    self.layer_types.len(),
-                    self.num_hidden_layers
-                ));
-            }
-            if self.sliding_window == 0 {
-                return Err(anyhow!("sliding_window must be > 0"));
-            }
-            if self.final_logit_softcapping <= 0.0 {
-                return Err(anyhow!(
-                    "final_logit_softcapping must be > 0, got {}",
-                    self.final_logit_softcapping
-                ));
-            }
-            // 26B-A4B has enable_moe_block=true + num_experts=128 + top_k=8.
-            // For now we keep this validator strict so unsupported variants
-            // surface early.
-            if self.enable_moe_block {
-                if self.num_experts == 0 {
-                    return Err(anyhow!("enable_moe_block=true but num_experts=0"));
-                }
-                if self.top_k_experts == 0 || self.top_k_experts > self.num_experts {
-                    return Err(anyhow!(
-                        "top_k_experts {} invalid against num_experts {}",
-                        self.top_k_experts,
-                        self.num_experts
-                    ));
-                }
-                if self.moe_intermediate_size == 0 {
-                    return Err(anyhow!(
-                        "moe_intermediate_size must be > 0 when enable_moe_block=true"
-                    ));
-                }
-            }
-            // sliding/full split sanity: every num_hidden_layers/sliding_window_pattern
-            // positions should be a full attention layer (5 sliding + 1 full
-            // for 26B-A4B's pattern=6).
-            let n_full = self.layer_types.iter().filter(|t| t.is_full()).count();
-            let expected_full = self.num_hidden_layers / self.sliding_window_pattern;
-            if n_full == 0 || n_full > self.num_hidden_layers {
-                return Err(anyhow!(
-                    "layer_types has {n_full} full_attention entries, expected ~{expected_full} given pattern={}",
-                    self.sliding_window_pattern,
-                ));
-            }
-            Ok(())
-        }
-
-        /// Resolved head dim for a given layer kind. Sliding layers use
-        /// `head_dim`; full layers use `global_head_dim` when set.
-        pub fn head_dim_for(&self, kind: NativeGemma4LayerType) -> usize {
-            match kind {
-                NativeGemma4LayerType::FullAttention if self.global_head_dim != 0 => {
-                    self.global_head_dim
-                }
-                _ => self.head_dim,
-            }
-        }
-
-        /// Resolved KV-head count for a given layer kind. When
-        /// `attention_k_eq_v` is set and the layer is full attention,
-        /// `num_global_key_value_heads` (if present) overrides
-        /// `num_key_value_heads`.
-        pub fn n_kv_heads_for(&self, kind: NativeGemma4LayerType) -> usize {
-            match kind {
-                NativeGemma4LayerType::FullAttention
-                    if self.attention_k_eq_v && self.num_global_key_value_heads.is_some() =>
-                {
-                    self.num_global_key_value_heads.unwrap()
-                }
-                _ => self.num_key_value_heads,
-            }
-        }
-
-        /// Returns true iff this layer should drop the `v_proj` tensor and
-        /// reuse `k_proj` as `values` (full attention layers only when
-        /// `attention_k_eq_v` is set).
-        pub fn use_k_eq_v_for(&self, kind: NativeGemma4LayerType) -> bool {
-            self.attention_k_eq_v && kind.is_full()
-        }
-
-        /// Resolved RoPE block for a given layer kind.
-        pub fn rope_for(&self, kind: NativeGemma4LayerType) -> &NativeGemma4RopePerKind {
-            match kind {
-                NativeGemma4LayerType::FullAttention => &self.rope_parameters.full_attention,
-                NativeGemma4LayerType::SlidingAttention => &self.rope_parameters.sliding_attention,
-            }
-        }
-    }
+    // config.json parsing lives in the ungated `gemma4_config` module so a
+    // tier-0 sweep can reach it without the GPU stack; re-exported here so
+    // every call site keeps its `imp::` path.
+    pub use crate::gemma4_config::*;
 
     // ───────────────────────── safetensors weights ─────────────────────────
 
@@ -1792,6 +1369,12 @@ pub(crate) mod imp {
             self.tensors.get(name)
         }
 
+        /// Raw tensor bag. Read this **before** [`Self::sanitize`] if you need
+        /// the `vision_tower.*` / `embed_vision.*` entries it strips.
+        pub fn tensors(&self) -> &HashMap<String, Array> {
+            &self.tensors
+        }
+
         pub fn require(&self, name: &str) -> Result<&Array> {
             self.tensors
                 .get(name)
@@ -1830,7 +1413,7 @@ pub(crate) mod imp {
                 "language_model.model.norm.weight",
             ];
             for k in top_level {
-                if self.tensors.get(k).is_none() {
+                if !self.tensors.contains_key(k) {
                     return Err(anyhow!("missing top-level weight `{k}`"));
                 }
             }
@@ -1871,7 +1454,7 @@ pub(crate) mod imp {
                     ]);
                 }
                 for k in &required_keys {
-                    if self.tensors.get(k).is_none() {
+                    if !self.tensors.contains_key(k) {
                         return Err(anyhow!(
                             "missing weight `{k}` (layer {layer_idx}, kind={:?})",
                             layer_kind
@@ -1885,7 +1468,7 @@ pub(crate) mod imp {
                 // stale tensor.
                 if cfg.use_k_eq_v_for(*layer_kind) {
                     let vp = format!("{base}.self_attn.v_proj.weight");
-                    if self.tensors.get(&vp).is_some() {
+                    if self.tensors.contains_key(&vp) {
                         return Err(anyhow!(
                             "config declares attention_k_eq_v=true for full attention but `{vp}` is present — checkpoint inconsistent with config"
                         ));
@@ -2275,8 +1858,7 @@ pub(crate) mod imp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(head_dim * 4)
-            .min(2048)
-            .max(1)
+            .clamp(1, 2048)
     }
 
     /// Full-model cache — one slot per decoder layer, allocated based on the
@@ -2919,9 +2501,9 @@ pub(crate) mod imp {
 
     thread_local! {
         static MASK_CACHE_SLIDING: std::cell::RefCell<Option<MaskCacheEntry>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
         static MASK_CACHE_FULL: std::cell::RefCell<Option<MaskCacheEntry>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
 
     pub fn make_attention_mask_for_layer_chunked(
@@ -3197,10 +2779,18 @@ pub(crate) mod imp {
         pub layer_scalar: Array,
     }
 
+    /// `x[:, start..end, :]` for a `[B, L, H]` array. Expressed as a gather
+    /// because mlx-rs exposes no axis-slice op; the cost is prefill-only.
+    fn take_span(x: &Array, start: i32, end: i32) -> Result<Array> {
+        let idx: Vec<i32> = (start..end).collect();
+        let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+        mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("take_span: take_axis(axis=1)")
+    }
+
     fn require_clone(weights: &NativeGemma4Weights, name: &str) -> Result<Array> {
         weights
             .require(name)
-            .map(|arr| arr.clone())
+            .cloned()
             .with_context(|| format!("require_clone: missing `{name}`"))
     }
 
@@ -3678,6 +3268,21 @@ pub(crate) mod imp {
         /// directory has a `logit_corrections.bin` sidecar.
         correction_capture_slot: std::sync::Mutex<Option<Array>>,
         correction_capture_enabled: std::sync::atomic::AtomicBool,
+        /// Image encoder. `Some` only when `LUMEN_VISION=1` **and** the
+        /// checkpoint still carries `vision_tower.*` weights (some AWQ/imatrix
+        /// requantizations drop them). `None` leaves the text path byte-for-byte
+        /// unchanged, including its memory footprint.
+        vision: Option<crate::gemma4_vision::NativeGemma4VisionTower>,
+    }
+
+    /// Opt-in gate for loading the ~1.1 GB image tower.
+    fn vision_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     impl NativeGemma4Model {
@@ -3689,6 +3294,62 @@ pub(crate) mod imp {
             cfg.validate_gemma4_family()?;
 
             let mut weights = NativeGemma4Weights::load_dir(model_dir)?;
+
+            // Build the image tower from the raw bag — `sanitize()` strips
+            // `vision_tower.*` / `embed_vision.*` right after this.
+            //
+            // The gate checks the projection, not just the tower: a checkpoint
+            // could plausibly keep one and drop the other, and the projection
+            // is the piece with no fallback.
+            let vision_present = weights.get("vision_tower.std_scale").is_some()
+                && weights
+                    .get("embed_vision.embedding_projection.weight")
+                    .is_some();
+            let vision = if vision_enabled() {
+                match cfg.vision_config.clone() {
+                    Some(vcfg) if vision_present => {
+                        // Resolve the projection's quantization through the same
+                        // path every other quantized tensor uses, so a per-tensor
+                        // override or a non-affine checkpoint (nvfp4 ships one)
+                        // is honoured instead of silently mis-dequantized.
+                        let (group_size, bits, mode) =
+                            quant_params_for(&cfg, "embed_vision.embedding_projection").context(
+                                "resolve quantization for embed_vision.embedding_projection",
+                            )?;
+                        Some(
+                            crate::gemma4_vision::NativeGemma4VisionTower::load(
+                                weights.tensors(),
+                                vcfg,
+                                crate::gemma4_vision::VisionProjectionQuant {
+                                    group_size,
+                                    bits,
+                                    mode,
+                                },
+                            )
+                            .context("load Gemma 4 vision tower")?,
+                        )
+                    }
+                    Some(_) => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but {} ships no vision_tower.* / \
+                             embed_vision.* weights (requantized text-only) — image input \
+                             stays disabled",
+                            model_dir.display()
+                        );
+                        None
+                    }
+                    None => {
+                        eprintln!(
+                            "[vision] LUMEN_VISION=1 but config.json has no vision_config \
+                             — image input stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             weights.sanitize()?;
             weights.validate_keys_against_config(&cfg.text_config)?;
 
@@ -3750,14 +3411,10 @@ pub(crate) mod imp {
                     if lw.kind != NativeGemma4LayerType::SlidingAttention {
                         continue;
                     }
-                    if bake_v {
-                        if let Some(ref vp) = lw.attn.v_proj {
-                            let vp_rot = bake_r_into_v_proj(vp, &r_arr, h_kv, head_dim)
-                                .with_context(|| {
-                                    format!("load: bake R into v_proj (layer {idx})")
-                                })?;
-                            lw.attn.v_proj = Some(vp_rot);
-                        }
+                    if bake_v && let Some(ref vp) = lw.attn.v_proj {
+                        let vp_rot = bake_r_into_v_proj(vp, &r_arr, h_kv, head_dim)
+                            .with_context(|| format!("load: bake R into v_proj (layer {idx})"))?;
+                        lw.attn.v_proj = Some(vp_rot);
                     }
                     if bake_o {
                         let op_rot = bake_r_into_o_proj(&lw.attn.o_proj, &r_arr, h_q, head_dim)
@@ -3878,6 +3535,7 @@ pub(crate) mod imp {
                 correction_capture_slot: std::sync::Mutex::new(None),
                 correction_capture_enabled: std::sync::atomic::AtomicBool::new(false),
                 mtp_active: std::sync::atomic::AtomicBool::new(false),
+                vision,
             })
         }
 
@@ -3898,7 +3556,7 @@ pub(crate) mod imp {
             // Sanity check: drafter's backbone_hidden_size must match trunk's
             // hidden_size; otherwise pre_projection / post_projection won't
             // align with our hidden state shapes.
-            let trunk_hidden = self.config.text_config.hidden_size as usize;
+            let trunk_hidden = self.config.text_config.hidden_size;
             let drafter_backbone = drafter.config.backbone_hidden_size;
             if drafter_backbone != trunk_hidden {
                 return Err(anyhow!(
@@ -5260,7 +4918,12 @@ pub(crate) mod imp {
                     let fused_attn_enabled = std::env::var("LUMEN_GEMMA4_TQ_FUSED_ATTN")
                         .map(|s| s == "1")
                         .unwrap_or(false);
-                    if fused_attn_enabled && !use_ref && vc_inline.is_some() && vs_inline.is_some()
+                    // Bind through `zip` rather than testing `is_some()` and
+                    // then `expect()`ing: the two-step form lets the condition
+                    // and the unwrap drift apart, and a copy-paste that checks
+                    // `vc` twice while unwrapping `vs` still compiles.
+                    let vcs_inline = vc_inline.as_ref().zip(vs_inline.as_ref());
+                    if let (true, true, Some((vc, vs))) = (fused_attn_enabled, !use_ref, vcs_inline)
                     {
                         // Q in head_dim space already (q_rot is Q after RoPE +
                         // R rotation, same input the qk_inline kernel takes).
@@ -5270,8 +4933,6 @@ pub(crate) mod imp {
                         // numerically stable without extra scaling — verified
                         // empirically: existing `qk_inline` path also uses
                         // scale=1.0 implicit via score = Q@K_dq^T).
-                        let vc = vc_inline.as_ref().expect("fused_attn: vc_inline");
-                        let vs = vs_inline.as_ref().expect("fused_attn: vs_inline");
                         // Outer block bumps sdpa_start timing after the match
                         // expression — do not double-bump here.
                         crate::turboquant::turboquant_fused_attn(
@@ -5698,14 +5359,14 @@ pub(crate) mod imp {
         /// requires 10 arrays — biases must be present). Gemma 4's affine
         /// quantization always emits biases, so case (b) is a defensive guard.
         fn dense_mlp_forward(x: &Array, w: &ResolvedGemma4DenseMlpWeights) -> Result<Array> {
-            if gemma4_dense_mlp_fuse_enabled() {
-                if let Ok(out) = gemma4_dense_mlp_fused(x, w) {
-                    return Ok(out);
-                }
-                // Fall through to legacy path if compile dispatch fails
-                // (e.g. biases missing). The fused helper logs via `.context`,
-                // and the legacy path is bit-identical fallback.
+            if gemma4_dense_mlp_fuse_enabled()
+                && let Ok(out) = gemma4_dense_mlp_fused(x, w)
+            {
+                return Ok(out);
             }
+            // Fall through to legacy path if compile dispatch fails
+            // (e.g. biases missing). The fused helper logs via `.context`,
+            // and the legacy path is bit-identical fallback.
             let gate = Self::qmatmul(&w.gate_proj, x)?;
             let up = Self::qmatmul(&w.up_proj, x)?;
             let activated = Self::geglu_apply(&gate, &up)?;
@@ -6437,7 +6098,7 @@ pub(crate) mod imp {
         /// hard-coded to `biases=None`, which is fine for MXFP4 but misses
         /// Gemma 4's affine `embed_tokens.biases`. We replicate the take_axis
         /// + dequantize_with_mode pattern with the optional biases plumbed
-        /// through.
+        ///   through.
         fn embed_lookup_affine(&self, token_ids: &Array) -> Result<Array> {
             let embed = match &self.embed_tokens {
                 EmbedTokensWeights::Bf16(w) => {
@@ -6472,6 +6133,65 @@ pub(crate) mod imp {
             .context("embed_lookup: dequantize_with_mode failed")
         }
 
+        /// Replace the embedding rows covered by each image's placeholder run
+        /// with that image's soft tokens, returning the rebuilt
+        /// `[1, l, hidden]` stream.
+        ///
+        /// `runs` are **prompt-global** `(start, len)` spans and `soft[i]` is
+        /// the `[len_i, hidden]` encoding of `runs[i]`; `h` covers the prompt
+        /// window `[span_start, span_start + l)`. Single-pass prefill passes
+        /// `span_start = 0` with the whole prompt. Chunked prefill hands over
+        /// one window at a time, so a run may fall entirely outside the window
+        /// or straddle either edge — only the overlapping rows are spliced
+        /// here and the remainder arrives with the neighbouring chunk.
+        fn splice_soft_tokens_for_span(
+            &self,
+            h: &Array,
+            span_start: i32,
+            l: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            let hidden = self.config.text_config.hidden_size as i32;
+            let dt = h.dtype();
+            let slices = clip_runs_to_window(span_start, l, runs)?;
+            // No image touches this window — hand back the embeddings untouched
+            // rather than round-tripping them through a gather + concat.
+            if slices.is_empty() {
+                return Ok(h.clone());
+            }
+
+            let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
+            let mut cursor: i32 = 0;
+            for s in &slices {
+                if s.local_start > cursor {
+                    segments.push(
+                        take_span(h, cursor, s.local_start)
+                            .context("splice: text span before image")?,
+                    );
+                }
+                let soft_i = soft
+                    .get(s.image)
+                    .ok_or_else(|| anyhow!("splice: no soft tokens for image {}", s.image))?;
+                let run_len = runs[s.image].1 as i32;
+                let soft_3d = mlx_rs::ops::reshape(soft_i, &[1, run_len, hidden])
+                    .context("splice: reshape soft tokens")?;
+                let soft_3d = take_span(&soft_3d, s.row_start, s.row_end)
+                    .context("splice: clip soft tokens to window")?;
+                segments.push(soft_3d.as_dtype(dt).context("splice: cast soft tokens")?);
+                cursor = s.local_end;
+            }
+            if cursor < l {
+                segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
+            }
+
+            let refs: Vec<&Array> = segments.iter().collect();
+            let out =
+                mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
+            debug_assert_eq!(out.shape(), [1, l, hidden]);
+            Ok(out)
+        }
+
         /// Apply Gemma 4's `final_logit_softcapping`:
         ///   `out = tanh(out / softcap) * softcap`
         /// with `softcap = 30.0` per 26B-A4B's config.
@@ -6485,15 +6205,14 @@ pub(crate) mod imp {
             // prefill softcap input shape. Env-gated A/B
             // (`LUMEN_GEMMA4_FUSE_SOFTCAP=0`) falls back to the unfused
             // path; default ON.
-            if gemma4_softcap_fuse_enabled() {
-                if let Ok(out) =
+            if gemma4_softcap_fuse_enabled()
+                && let Ok(out) =
                     gemma4_softcap_fused(logits, &self.const_softcap_inv, &self.const_softcap)
-                {
-                    return Ok(out);
-                }
-                // Trace dispatch failed for some reason — fall through to
-                // unfused legacy path (bit-identical numerically).
+            {
+                return Ok(out);
             }
+            // Trace dispatch failed for some reason — fall through to
+            // unfused legacy path (bit-identical numerically).
             let scaled = mlx_rs::ops::multiply(logits, &self.const_softcap_inv)
                 .context("softcap: logits × (1/cap) failed")?;
             let tanh = mlx_rs::ops::tanh(&scaled).context("softcap: tanh failed")?;
@@ -6524,6 +6243,191 @@ pub(crate) mod imp {
             let l = input_ids.len() as i32;
             let ids = Array::from_slice(input_ids, &[1, l]);
             self.forward_array(&ids, cache)
+        }
+
+        /// Is the image tower loaded and usable?
+        pub fn vision_available(&self) -> bool {
+            self.vision.is_some()
+        }
+
+        /// Token id whose embedding rows vision soft tokens replace.
+        pub fn image_token_id(&self) -> Option<u32> {
+            self.config.image_token_id
+        }
+
+        /// Prompt tokens this image will occupy: its soft-token run plus the
+        /// `<|image>` / `<image|>` sentinels and the newline the renderer emits
+        /// after the block.
+        ///
+        /// Header-only — no pixel decode — so the server can size a prompt for
+        /// the context guard and usage accounting before deciding whether to
+        /// run anything at all.
+        pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let vcfg = vision.config();
+            let budget = crate::gemma4_vision::imp::soft_token_budget_override()
+                .or(self.config.vision_soft_tokens_per_image)
+                .unwrap_or(280);
+            let soft = crate::gemma4_vision::soft_token_count(
+                encoded,
+                vcfg.patch_size,
+                budget,
+                vcfg.pooling_kernel_size,
+            )
+            .map_err(|e| anyhow!("image sizing failed: {e}"))?;
+            // + `<|image>`, `<image|>`, and the trailing newline.
+            Ok(soft + 3)
+        }
+
+        /// Decode + resize one image onto the patch grid, without running the
+        /// tower.
+        ///
+        /// Callers hold the result: `num_soft_tokens` sizes the prompt's
+        /// placeholder run, and the same [`PreparedImage`] then goes straight
+        /// into [`Self::encode_prepared_image`]. Re-deriving it from the bytes
+        /// at encode time would decode and bicubic-resize every image twice.
+        ///
+        /// [`PreparedImage`]: crate::gemma4_vision::PreparedImage
+        pub fn prepare_image(&self, encoded: &[u8]) -> Result<crate::gemma4_vision::PreparedImage> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+            let vcfg = vision.config();
+            let budget = crate::gemma4_vision::imp::soft_token_budget_override()
+                .or(self.config.vision_soft_tokens_per_image)
+                .unwrap_or(280);
+            crate::gemma4_vision::prepare_image(
+                encoded,
+                vcfg.patch_size,
+                budget,
+                vcfg.pooling_kernel_size,
+            )
+            .map_err(|e| anyhow!("image preprocessing failed: {e}"))
+        }
+
+        /// Run the tower on an already-prepared image, returning
+        /// `[num_soft_tokens, hidden]` language-model embeddings.
+        pub fn encode_prepared_image(
+            &self,
+            prepared: &crate::gemma4_vision::PreparedImage,
+        ) -> Result<Array> {
+            let vision = self.vision.as_ref().ok_or_else(|| {
+                anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
+            })?;
+
+            let n = (prepared.grid.0 * prepared.grid.1) as i32;
+            let width = (3 * vision.config().patch_size * vision.config().patch_size) as i32;
+            let px = Array::from_slice(&prepared.pixel_values, &[n, width]);
+            let soft = vision
+                .forward(&px, prepared.grid)
+                .context("vision tower forward")?;
+            // Materialize now so the tower's intermediates are freed before the
+            // 30-layer text prefill allocates its own working set.
+            soft.eval().context("vision: eval soft tokens")?;
+            Ok(soft)
+        }
+
+        /// Forward with image inputs spliced in.
+        ///
+        /// `input_ids` must already contain one run of `image_token_id` per
+        /// image, of exactly `prepared[i].num_soft_tokens` length (the caller
+        /// builds this while rendering the chat template). Each run's embedding
+        /// rows are replaced wholesale by that image's soft tokens.
+        ///
+        /// Ordering matters: upstream scales the *text* embeddings by
+        /// `sqrt(hidden_size)` and then `masked_scatter`s the **unscaled** image
+        /// features over them, so the splice happens after the scale, not
+        /// before.
+        pub fn forward_with_images(
+            &self,
+            input_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
+            cache: &mut NativeGemma4PromptCache,
+            slice_last_token: bool,
+        ) -> Result<Array> {
+            if images.is_empty() {
+                let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+                return self.forward_array_impl(&ids, cache, slice_last_token);
+            }
+            let (runs, soft_tokens) = self.encode_images_for_prompt(input_ids, images)?;
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            self.forward_array_impl_with_soft(&ids, cache, slice_last_token, 0, &runs, &soft_tokens)
+        }
+
+        /// Locate each image's placeholder run in `prompt_ids` and encode the
+        /// matching image, checking the two agree on length.
+        ///
+        /// Split out from [`Self::forward_with_images`] because chunked prefill
+        /// has to encode every image **once**, before the chunk loop starts,
+        /// and then splice slices of the result into whichever chunks the runs
+        /// land in. Returns prompt-global runs paired with `[len_i, hidden]`
+        /// soft tokens, ready for [`Self::forward_last_token_with_soft`].
+        pub fn encode_images_for_prompt(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
+        ) -> Result<(Vec<(usize, usize)>, Vec<Array>)> {
+            let image_token = self
+                .config
+                .image_token_id
+                .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+
+            let runs = image_token_runs(prompt_ids, image_token);
+            if runs.len() != images.len() {
+                return Err(anyhow!(
+                    "prompt has {} image-token run(s) but {} image(s) were supplied",
+                    runs.len(),
+                    images.len()
+                ));
+            }
+
+            let mut soft_tokens = Vec::with_capacity(images.len());
+            for (idx, (prepared, run)) in images.iter().zip(runs.iter()).enumerate() {
+                if prepared.num_soft_tokens != run.1 {
+                    return Err(anyhow!(
+                        "image {idx} encodes to {} soft tokens but the prompt reserved {} \
+                         image_token placeholders",
+                        prepared.num_soft_tokens,
+                        run.1
+                    ));
+                }
+                soft_tokens.push(
+                    self.encode_prepared_image(prepared)
+                        .with_context(|| format!("encoding image {idx}"))?,
+                );
+            }
+            Ok((runs, soft_tokens))
+        }
+
+        /// [`Self::forward_last_token`] for one chunk of an image-bearing
+        /// prompt.
+        ///
+        /// `span_start` is the chunk's offset in the full prompt; `runs` /
+        /// `soft` come from [`Self::encode_images_for_prompt`] and stay
+        /// prompt-global across the whole chunk loop. Chunks that contain no
+        /// placeholder rows fall through to the plain text path.
+        pub fn forward_last_token_with_soft(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativeGemma4PromptCache,
+            span_start: usize,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
+            if input_ids.is_empty() {
+                return Err(anyhow!("forward_last_token_with_soft: empty input_ids"));
+            }
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            self.forward_array_impl_with_soft(
+                &ids,
+                cache,
+                /* slice_last_token */ true,
+                span_start as i32,
+                runs,
+                soft,
+            )
         }
 
         /// Prefill-optimized variant of `forward()` — returns only the LAST
@@ -6593,6 +6497,24 @@ pub(crate) mod imp {
             cache: &mut NativeGemma4PromptCache,
             slice_last_token: bool,
         ) -> Result<Array> {
+            self.forward_array_impl_with_soft(input_ids, cache, slice_last_token, 0, &[], &[])
+        }
+
+        /// [`Self::forward_array_impl`] with optional vision splicing.
+        ///
+        /// `runs` are prompt-global `(start, len)` spans of `image_token_id`,
+        /// ascending and non-overlapping; `soft[i]` is `[len_i, hidden]`.
+        /// `span_start` is where `input_ids` begins in that prompt — `0` for a
+        /// single-pass prefill, the running offset for a chunked one.
+        fn forward_array_impl_with_soft(
+            &self,
+            input_ids: &Array,
+            cache: &mut NativeGemma4PromptCache,
+            slice_last_token: bool,
+            span_start: i32,
+            runs: &[(usize, usize)],
+            soft: &[Array],
+        ) -> Result<Array> {
             let cfg = &self.config.text_config;
             assert_eq!(
                 cfg.hidden_size_per_layer_input, 0,
@@ -6618,6 +6540,17 @@ pub(crate) mod imp {
             // (2) h *= sqrt(hidden_size) — Phase 1.5 P8: cached const_embed_scale.
             let h = mlx_rs::ops::multiply(&h, &self.const_embed_scale)
                 .context("forward: × sqrt(hidden_size)")?;
+
+            // (2b) Vision splice. Upstream applies the embed scale to the text
+            // embeddings and then `masked_scatter`s the image features over
+            // them, so the soft tokens must land *after* the multiply and stay
+            // unscaled. Rebuilding h by concatenating the untouched spans is
+            // cheaper than a scatter and keeps everything on the lazy graph.
+            let h = if runs.is_empty() {
+                h
+            } else {
+                self.splice_soft_tokens_for_span(&h, span_start, l, runs, soft)?
+            };
             dump_hidden(&h, "embed")?;
 
             // (3) Decoder layers.
@@ -6659,10 +6592,9 @@ pub(crate) mod imp {
             if self
                 .mtp_capture_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(mut slot) = self.mtp_capture_slot.lock()
             {
-                if let Ok(mut slot) = self.mtp_capture_slot.lock() {
-                    *slot = Some(h.clone());
-                }
+                *slot = Some(h.clone());
             }
 
             // Optional: reduce h to last position before lm_head when the
@@ -6672,7 +6604,7 @@ pub(crate) mod imp {
             // L=1 path is a no-op so the guard simply avoids the extra
             // take_axis dispatch at decode.
             let h_for_lm_head = if slice_last_token && l > 1 {
-                let last_pos = (l - 1) as i32;
+                let last_pos = l - 1;
                 let last_idx = Array::from_slice(&[last_pos], &[1]);
                 mlx_rs::ops::indexing::take_axis(&h, &last_idx, 1)
                     .context("forward: slice h to last position for lm_head")?
@@ -6687,10 +6619,9 @@ pub(crate) mod imp {
             if self
                 .correction_capture_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(mut slot) = self.correction_capture_slot.lock()
             {
-                if let Ok(mut slot) = self.correction_capture_slot.lock() {
-                    *slot = Some(h_for_lm_head.clone());
-                }
+                *slot = Some(h_for_lm_head.clone());
             }
 
             // (5+6) Tied lm_head + softcap.
@@ -6804,10 +6735,26 @@ pub(crate) mod imp {
         /// prompt_ids.len()` AND `prompt_ids[..cache.offset()]` matches the
         /// tokens already in the cache. Use [`NativeGemma4PromptCache::clone`]
         /// + [`NativeGemma4PromptCache::truncate_to`] to manage prefix-cache
-        /// fork/extend semantics from the outside (see `Gemma4Backend`).
+        ///   fork/extend semantics from the outside (see `Gemma4Backend`).
         pub fn generate_with_cache(
             &self,
             prompt_ids: &[u32],
+            cfg: &GenerateConfig,
+            cache_in: Option<&mut NativeGemma4PromptCache>,
+        ) -> Result<GenerateStats> {
+            self.generate_with_cache_and_images(prompt_ids, &[], cfg, cache_in)
+        }
+
+        /// [`Self::generate_with_cache`] with image inputs.
+        ///
+        /// `prompt_ids` must carry one run of `image_token_id` per image, sized
+        /// to that image's `num_soft_tokens`. Only the prefill differs — decode
+        /// steps are pure text and take the unchanged path, so MTP /
+        /// lookup-spec / sampling all behave identically.
+        pub fn generate_with_cache_and_images(
+            &self,
+            prompt_ids: &[u32],
+            images: &[crate::gemma4_vision::PreparedImage],
             cfg: &GenerateConfig,
             cache_in: Option<&mut NativeGemma4PromptCache>,
         ) -> Result<GenerateStats> {
@@ -6868,9 +6815,16 @@ pub(crate) mod imp {
             // `argmax_last_token_lazy` anyway. forward() retains full-
             // logits semantics for forward_probe / debug callers.
             let prefill_start = Instant::now();
-            let logits = self
-                .forward_last_token(prompt_ids, &mut cache)
-                .context("generate: prefill forward_last_token")?;
+            let logits = if images.is_empty() {
+                self.forward_last_token(prompt_ids, cache)
+                    .context("generate: prefill forward_last_token")?
+            } else {
+                // Image prefill still slices to the last token; the only
+                // difference is that the placeholder rows carry vision
+                // features instead of `<|image|>` embeddings.
+                self.forward_with_images(prompt_ids, images, cache, true)
+                    .context("generate: prefill forward_with_images")?
+            };
             // Lazy argmax — schedule async eval so the GPU starts work while
             // we queue up the first decode step's graph.
             let mut current = self
@@ -6967,7 +6921,7 @@ pub(crate) mod imp {
                         .as_dtype(mlx_rs::Dtype::Int32)
                         .context("generate(sampled): build input array")?;
                     let step_logits = self
-                        .forward_array_last_token(&input, &mut cache)
+                        .forward_array_last_token(&input, cache)
                         .context("generate(sampled): decode forward")?;
                     let sampled = sample_next_token_with_eos_guard(
                         &step_logits,
@@ -7064,7 +7018,7 @@ pub(crate) mod imp {
                 budget_mtp.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_mtp {
                     let out = self
-                        .mtp_step(&mut cache, current_u32, n_draft)
+                        .mtp_step(cache, current_u32, n_draft)
                         .context("generate(MTP): mtp_step")?;
                     decode_steps_mtp += 1;
                     // The last element of `committed` is the next-call input
@@ -7163,7 +7117,7 @@ pub(crate) mod imp {
                 budget_lk.observe(current_u32);
                 while generated.len() < cfg.max_new_tokens && !hit_eos_lk {
                     let out = self
-                        .lookup_step(&mut cache, current_u32, &history, n_lookup, n_draft)
+                        .lookup_step(cache, current_u32, &history, n_lookup, n_draft)
                         .context("generate(LOOKUP): lookup_step")?;
                     decode_steps_lk += 1;
                     let next_input = *out.committed.last().unwrap();
@@ -7324,7 +7278,7 @@ pub(crate) mod imp {
                     None
                 };
                 let next_logits = self
-                    .forward_array_last_token(&current, &mut cache)
+                    .forward_array_last_token(&current, cache)
                     .context("generate: decode forward_array_last_token")?;
                 let next_lazy = self
                     .argmax_last_token_lazy(&next_logits)
@@ -7979,13 +7933,26 @@ pub(crate) mod imp {
                     .expect("non-empty mask");
             assert_eq!(m.shape(), &[4, 4]);
             m.eval().expect("eval");
-            // Inspect last row: query at position 3 with window 2 attends to keys 2..=3 only.
-            let v = m.as_slice::<f32>();
-            let last_row = &v[3 * 4..4 * 4];
-            assert!(!last_row[0].is_finite(), "key 0 masked");
-            assert!(!last_row[1].is_finite(), "key 1 masked");
-            assert!(last_row[2].is_finite(), "key 2 attended");
-            assert!(last_row[3].is_finite(), "key 3 attended");
+            // Read the mask as "may attend", not as f32. The default builder
+            // returns a bool array and the `LUMEN_LEGACY_MASK_BUILDER` path a
+            // bf16 `0.0`/`-inf` one; this test asserted `as_slice::<f32>()`,
+            // which panicked on both, and being `#[ignore]`d it never said so.
+            let attendable: Vec<bool> = match m.dtype() {
+                mlx_rs::Dtype::Bool => m.as_slice::<bool>().to_vec(),
+                _ => m
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .expect("cast mask to f32")
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|v| v.is_finite())
+                    .collect(),
+            };
+            // Query at position 3 with window 2 attends to keys 2..=3 only.
+            assert_eq!(
+                &attendable[3 * 4..4 * 4],
+                &[false, false, true, true],
+                "sliding window must clamp the last row to keys 2..=3"
+            );
         }
 
         #[test]
@@ -8682,10 +8649,7 @@ pub(crate) mod imp {
             assert_eq!(stats.prompt_tokens, prompt_len, "prompt length stored");
             assert_eq!(stats.generated_tokens.len(), 4, "all 4 decode steps ran");
             for t in &stats.generated_tokens {
-                assert!(
-                    (*t as u32) < vocab,
-                    "generated token {t} out of vocab {vocab}"
-                );
+                assert!(*t < vocab, "generated token {t} out of vocab {vocab}");
             }
 
             // Cache invariants: build a fresh cache and replay the prefill
@@ -8799,7 +8763,7 @@ pub(crate) mod imp {
 
             // Decode-step sanity: feed a 1-token follow-up to layer 0 and
             // make sure RotatingKvCache grows correctly.
-            let n_decode = (b * 1 * hidden) as usize;
+            let n_decode = (b * hidden) as usize;
             let data1: Vec<f32> = (0..n_decode)
                 .map(|i| 0.001 * ((i % 13) as f32 - 6.0))
                 .collect();

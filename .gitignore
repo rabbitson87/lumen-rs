@@ -1,5 +1,12 @@
 # ── Rust ──
 /target/
+# Fuzzing state. COMMITTED: fuzz/seeds/ (hand-written inputs + every promoted
+# crasher — the permanent tier-0 replay set) and fuzz/artifacts/ (raw crash
+# inputs as the soak found them). LOCAL: fuzz/corpus/ is libFuzzer's working
+# state — thousands of coverage-minimized blobs meaningful only to its own
+# coverage map, regrown from the seeds on any machine.
+/fuzz/target/
+/fuzz/corpus/
 
 # ── OS ──
 .DS_Store
@@ -20,10 +27,12 @@ __pycache__/
 models/
 assets/*.bin
 
-# ── Test fixtures (regenerate via scripts/fetch_fixtures.py) ──
-crates/lumen-model/tests/fixtures/*.safetensors
+# ── Test fixtures ──
 crates/lumen-mlx/tests/fixtures/*.safetensors
-crates/lumen-metal/tests/fixtures/
+# Exception: the vision-tower golden is 2.9 MB, not GB-scale, and is the only
+# thing standing between `gemma4_vision_parity` and a Python dependency at test
+# time. Committing it keeps that test pure Rust and runnable from a clean clone.
+!crates/lumen-mlx/tests/fixtures/gemma4_vision_golden.safetensors
 
 # ── Personal AI workflow tooling (kept local; not part of the public project) ──
 .ai/
@@ -48,7 +57,17 @@ worker-hang-investigation.html
 
 # ── Personal benchmarking + dev scripts (kept local; not part of the
 #    public project). ──
-scripts/
+# `scripts/*` and not `scripts/`: git does not descend into an excluded
+# DIRECTORY, so a `!scripts/golden/` re-include below would never be consulted.
+scripts/*
+# ...except the ORACLES. A golden nobody can regenerate rots the moment the
+# model or the reference implementation moves — `flux-scheduler-invariants` was
+# exactly that, a test comparing against a /tmp dump that had ceased to exist.
+# So the scripts that PRODUCE or COMPARE-AGAINST a reference are committed
+# alongside the goldens they make. The other ~47 files here are one-shot A/B and
+# profiling artifacts and stay local. See crates/lumen-mlx/tests/golden/README.md.
+!scripts/golden/
+!scripts/golden/*.py
 
 # ── Moltis 협조 데이터 (외부 프로젝트 reference data + raw 입력 로그).
 #    Personal eval / pruning ground truth 용도. Public repo 업로드 금지. ──

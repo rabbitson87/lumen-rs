@@ -1,0 +1,1 @@
+call:get_weather{city:<|"|>서울<|"|>,unit:celsius}

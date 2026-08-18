@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         .ok()
         .map(|s| {
             s.split(',')
-                .filter_map(|p| MtpLoraPos::parse(p))
+                .filter_map(MtpLoraPos::parse)
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())

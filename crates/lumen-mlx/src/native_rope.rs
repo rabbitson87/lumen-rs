@@ -67,6 +67,134 @@ mod imp {
         .context("mlx-rs fast::rope (with freqs) FFI call failed")
     }
 
+    /// Apply MRoPE with explicit per-token 3-axis positions.
+    ///
+    /// `mlx::fast::rope` only takes a scalar `offset`, i.e. it assumes token
+    /// `i` sits at position `offset + i` on a single axis. That holds for text
+    /// — and for MRoPE text is the degenerate case where `t == h == w` — but an
+    /// image block gives its tokens a constant `t` and a grid of `h`/`w`, which
+    /// no scalar offset can express. This is the unfused path for those
+    /// prompts: build cos/sin from the positions directly, then apply the same
+    /// GPT-NeoX split rotation the fused kernel does.
+    ///
+    /// Prefill only. Decode stays on `fast::rope` because positions realign
+    /// (`t == h == w`) once the image block is behind us — only the starting
+    /// value shifts.
+    ///
+    /// * `x` — `[B, H, L, head_dim]`; the first `dimensions` features rotate,
+    ///   the rest pass through (partial rotary).
+    /// * `positions` — `[(t, h, w); L]`, one triple per token in `x`.
+    /// * `sections` — `mrope_section`, summing to `dimensions / 2`.
+    pub fn mrope(
+        x: &Array,
+        dimensions: i32,
+        positions: &[[i32; 3]],
+        sections: [usize; 3],
+        interleaved: bool,
+        base: f32,
+    ) -> Result<Array> {
+        let shape = x.shape().to_vec();
+        if shape.len() != 4 {
+            return Err(anyhow::anyhow!(
+                "mrope: expected x of rank 4 [B, H, L, D], got {shape:?}"
+            ));
+        }
+        let (l, head_dim) = (shape[2], shape[3]);
+        if positions.len() != l as usize {
+            return Err(anyhow::anyhow!(
+                "mrope: {} positions for {l} tokens",
+                positions.len()
+            ));
+        }
+        if dimensions <= 0 || dimensions % 2 != 0 || dimensions > head_dim {
+            return Err(anyhow::anyhow!(
+                "mrope: dimensions ({dimensions}) must be a positive even number ≤ head_dim ({head_dim})"
+            ));
+        }
+        let half = (dimensions / 2) as usize;
+        if sections.iter().sum::<usize>() != half {
+            return Err(anyhow::anyhow!(
+                "mrope: sections {sections:?} sum to {} but dimensions/2 is {half}",
+                sections.iter().sum::<usize>()
+            ));
+        }
+
+        // `inv[i] = 1 / base^(2i/dimensions)`, matching what MLX derives
+        // internally (it stores the forward form and takes its reciprocal).
+        let mut angles: Vec<f32> = Vec::with_capacity(l as usize * half);
+        let mut inv: Vec<f32> = Vec::with_capacity(half);
+        for i in 0..half {
+            inv.push(1.0 / base.powf((2 * i) as f32 / dimensions as f32));
+        }
+        // Each frequency channel is driven by one spatial axis; for text-only
+        // input all three axes carry the same value, so this collapses to
+        // ordinary 1-D RoPE.
+        let axes: Vec<usize> = (0..half)
+            .map(|c| mrope_axis_of_channel(c, sections, interleaved))
+            .collect();
+        for pos in positions {
+            for c in 0..half {
+                angles.push(pos[axes[c]] as f32 * inv[c]);
+            }
+        }
+        let angles = Array::from_slice(&angles, &[1, 1, l, half as i32]);
+        let cos = mlx_rs::ops::cos(&angles).context("mrope: cos")?;
+        let sin = mlx_rs::ops::sin(&angles).context("mrope: sin")?;
+        let cos = cos.as_dtype(x.dtype()).context("mrope: cast cos")?;
+        let sin = sin.as_dtype(x.dtype()).context("mrope: cast sin")?;
+
+        // GPT-NeoX split form over the rotated span: the two halves of
+        // `x[..., ..dimensions]` rotate into each other, and anything past
+        // `dimensions` is copied through untouched.
+        use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+        let h = dimensions / 2;
+        let x1 = x.index((Ellipsis, 0..h));
+        let x2 = x.index((Ellipsis, h..dimensions));
+        let out1 = mlx_rs::ops::subtract(
+            &mlx_rs::ops::multiply(&x1, &cos).context("mrope: x1·cos")?,
+            &mlx_rs::ops::multiply(&x2, &sin).context("mrope: x2·sin")?,
+        )
+        .context("mrope: x1·cos - x2·sin")?;
+        let out2 = mlx_rs::ops::add(
+            &mlx_rs::ops::multiply(&x2, &cos).context("mrope: x2·cos")?,
+            &mlx_rs::ops::multiply(&x1, &sin).context("mrope: x1·sin")?,
+        )
+        .context("mrope: x2·cos + x1·sin")?;
+
+        if dimensions == head_dim {
+            mlx_rs::ops::concatenate_axis(&[&out1, &out2], -1).context("mrope: concat halves")
+        } else {
+            let tail = x.index((Ellipsis, dimensions..head_dim));
+            mlx_rs::ops::concatenate_axis(&[&out1, &out2, &tail], -1)
+                .context("mrope: concat halves + pass-through tail")
+        }
+    }
+
+    /// Which spatial axis (0 = t, 1 = h, 2 = w) drives frequency channel `c`.
+    ///
+    /// Two layouts exist. The original Qwen2-VL one assigns contiguous chunks
+    /// (`[0..s0)` → t, then h, then w). Qwen3.6 sets `mrope_interleaved`, which
+    /// spreads the axes across the spectrum instead: channel `c` goes to h when
+    /// `c % 3 == 1`, to w when `c % 3 == 2`, and to t otherwise — each only
+    /// while that axis still has section budget left. Interleaving matters
+    /// because it gives every axis both high and low frequencies rather than
+    /// confining w to the flattest end.
+    pub fn mrope_axis_of_channel(c: usize, sections: [usize; 3], interleaved: bool) -> usize {
+        if interleaved {
+            match c % 3 {
+                1 if c < sections[1] * 3 => 1,
+                2 if c < sections[2] * 3 => 2,
+                _ => 0,
+            }
+        } else if c < sections[0] {
+            0
+        } else if c < sections[0] + sections[1] {
+            1
+        } else {
+            2
+        }
+    }
+
     /// Precompute the RoPE per-pair frequency table MLX expects as the
     /// `freqs` argument to `mlx::fast::rope`. MLX applies `reciprocal()`
     /// internally to obtain its `inv_freqs`, so the user-supplied array
@@ -96,7 +224,130 @@ mod imp {
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3b model assembly in runner_native.rs.
-pub(crate) use imp::{precompute_rope_freqs, rope, rope_with_freqs};
+pub(crate) use imp::{mrope, mrope_axis_of_channel, precompute_rope_freqs, rope, rope_with_freqs};
+
+/// Channel→axis assignment, which is pure arithmetic and the part most likely
+/// to be silently wrong (a mis-assigned channel still produces plausible
+/// activations).
+#[cfg(test)]
+mod mrope_layout_tests {
+    #[cfg(feature = "mlx-native")]
+    use super::imp::mrope_axis_of_channel;
+
+    /// Qwen3.6's shipped layout: `mrope_section [11, 11, 10]` over the 32
+    /// frequency channels of a 64-wide rotary span.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn interleaved_layout_covers_every_channel_with_the_configured_budget() {
+        let sections = [11usize, 11, 10];
+        let axes: Vec<usize> = (0..32)
+            .map(|c| mrope_axis_of_channel(c, sections, true))
+            .collect();
+        // Each axis gets exactly the count its section asked for.
+        for (axis, want) in sections.iter().enumerate() {
+            let got = axes.iter().filter(|&&a| a == axis).count();
+            assert_eq!(
+                got, *want,
+                "axis {axis} claimed {got} channels, want {want}"
+            );
+        }
+        // …and they alternate t, h, w rather than sitting in blocks — that is
+        // the whole point of the interleaved variant.
+        assert_eq!(&axes[..6], &[0, 1, 2, 0, 1, 2]);
+    }
+
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn chunked_layout_assigns_contiguous_blocks() {
+        let sections = [11usize, 11, 10];
+        let axes: Vec<usize> = (0..32)
+            .map(|c| mrope_axis_of_channel(c, sections, false))
+            .collect();
+        assert!(axes[..11].iter().all(|&a| a == 0));
+        assert!(axes[11..22].iter().all(|&a| a == 1));
+        assert!(axes[22..].iter().all(|&a| a == 2));
+    }
+
+    /// When an axis runs out of budget its interleave slots fall back to `t`,
+    /// so every channel still gets driven by something.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn exhausted_sections_fall_back_to_the_time_axis() {
+        let sections = [14usize, 1, 1];
+        let axes: Vec<usize> = (0..16)
+            .map(|c| mrope_axis_of_channel(c, sections, true))
+            .collect();
+        assert_eq!(axes.iter().filter(|&&a| a == 1).count(), 1);
+        assert_eq!(axes.iter().filter(|&&a| a == 2).count(), 1);
+        assert_eq!(axes.iter().filter(|&&a| a == 0).count(), 14);
+    }
+}
+
+/// The unfused MRoPE path has to agree with `mlx::fast::rope` whenever the
+/// three axes carry the same position — that is the entire safety argument for
+/// introducing it, since every text-only prompt takes that branch.
+#[cfg(all(test, feature = "mlx-native"))]
+mod mrope_identity_tests {
+    use super::imp::{mrope, rope};
+    use mlx_rs::Array;
+
+    #[test]
+    #[ignore = "MLX FFI needs a real Metal device; run outside the sandbox"]
+    fn matches_fused_rope_when_all_axes_agree() {
+        const B: i32 = 1;
+        const H: i32 = 4;
+        const L: i32 = 12;
+        const HEAD_DIM: i32 = 256;
+        const ROPE_DIM: i32 = 64; // partial_rotary_factor 0.25
+        const BASE: f32 = 10_000_000.0;
+        const OFFSET: i32 = 5;
+
+        let n = (B * H * L * HEAD_DIM) as usize;
+        // Deterministic, varied, and not symmetric — a wrong half-split or a
+        // swapped sign would survive a constant input.
+        let vals: Vec<f32> = (0..n).map(|i| ((i % 97) as f32 - 48.0) / 32.0).collect();
+        let x = Array::from_slice(&vals, &[B, H, L, HEAD_DIM]);
+
+        let fused = rope(&x, ROPE_DIM, false, BASE, 1.0, OFFSET).expect("fused rope");
+
+        // Text-only MRoPE: t == h == w == offset + i.
+        let positions: Vec<[i32; 3]> = (0..L)
+            .map(|i| [OFFSET + i, OFFSET + i, OFFSET + i])
+            .collect();
+        let manual = mrope(&x, ROPE_DIM, &positions, [11, 11, 10], true, BASE).expect("mrope");
+
+        let a = fused
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .expect("cast")
+            .as_slice::<f32>()
+            .to_vec();
+        let b = manual
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .expect("cast")
+            .as_slice::<f32>()
+            .to_vec();
+        assert_eq!(a.len(), b.len());
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // Not bit-identical: the fused kernel and this path build the angles
+        // with different op orders. Agreement to ~1e-5 is what matters — the
+        // token-level gate lives in tests/qwen36_mrope_identity.rs.
+        assert!(max_abs < 1e-4, "max|Δ| vs fused rope = {max_abs}");
+
+        // Sanity: the pass-through tail past `dimensions` is untouched.
+        for head in 0..(B * H) as usize {
+            for t in 0..L as usize {
+                let base = (head * L as usize + t) * HEAD_DIM as usize;
+                for d in ROPE_DIM as usize..HEAD_DIM as usize {
+                    assert_eq!(b[base + d], vals[base + d], "tail feature {d} was modified");
+                }
+            }
+        }
+    }
+}
 
 // RoPE bit-identical vs MLX reference.
 //

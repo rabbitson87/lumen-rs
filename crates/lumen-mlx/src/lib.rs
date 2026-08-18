@@ -12,7 +12,7 @@
 //!   or the legacy `LUMEN_MLX_SUBPROCESS=1` falls back to spawning `python
 //!   mlx_runner.py` and pipes newline-delimited JSON. Kept as a debugging aid
 //!   + as the supported path for environments where embedding Python
-//!   (libpython linkage) is impractical.
+//!     (libpython linkage) is impractical.
 //!
 //! - **Native Rust mlx-rs (`native`)**: `LUMEN_MLX_BACKEND=native` selects
 //!   `runner_native::NativeMlxRunner`, a pure-Rust port over `mlx-rs`. No
@@ -36,17 +36,35 @@ use hf_hub::api::sync::ApiBuilder;
 use tokenizers::Tokenizer;
 
 pub mod chat_io;
+/// Serde helpers shared by the per-family `config.json` parsers.
+pub mod config_serde;
 mod gemma4_backend;
 mod gemma4_chat;
+/// Gemma 4 `config.json` parsing. Ungated on purpose — see the module docs.
+pub mod gemma4_config;
 mod gemma4_critical_correction;
 mod gemma4_moe;
 mod gemma4_mtp;
 mod gemma4_response;
 mod gemma4_sampling;
 mod gemma4_thinking;
+/// Gemma 4's tool-call body grammar. Ungated on purpose — see the module docs.
+pub mod gemma4_tool_syntax;
 mod gemma4_tools;
+pub mod gemma4_vision;
 pub mod grammar;
 mod jinja_chat;
+/// Pre-flight prefill allocation budget. Ungated on purpose — see the module
+/// docs: it is the OOM guard's arithmetic, and it is only testable at tier 0
+/// because it is separated from the backend that consumes it.
+pub mod prefill_budget;
+/// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
+pub mod qwen35_config;
+pub mod qwen36_vision;
+/// Resource-bounded image decoding shared by both image towers.
+mod vision_image;
+/// Placeholder-run bookkeeping shared by both image towers.
+mod vision_splice;
 // On-disk KV-cache persistence primitives (P0). Pure format/store layer
 // compiles under default features; Array<->record conversion is gated behind
 // `mlx-native`. Phase 1 wires this into the prefix-cache disk tier.
@@ -81,7 +99,8 @@ pub mod gemma4 {
     };
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
-        NativeGemma4Model, NativeGemma4PromptCache, set_forward_step, take_gemma4_breakdown,
+        NativeGemma4Model, NativeGemma4PromptCache, quant_params_for, set_forward_step,
+        take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
@@ -103,11 +122,18 @@ pub mod gemma4 {
         };
     }
 }
+/// Qwen3-Embedding on mlx-rs — the `/v1/embeddings` backend.
+pub mod embedding;
 pub mod env_state;
 mod golden;
 pub mod metal_kernel;
 pub mod native_attention;
 mod native_cache;
+/// Block granularity the per-sequence full-attention KV cache grows in
+/// (`mlx_lm.cache.KVCache(step=256)` semantics). Exposed for harnesses that
+/// reason about allocation rounding — see `examples/kv_concurrency_ab.rs`.
+#[cfg(feature = "mlx-native")]
+pub use native_cache::KV_CACHE_STEP;
 mod native_compile_cache;
 mod native_conv1d;
 mod native_embedding;
@@ -125,14 +151,45 @@ mod native_snapshot;
 pub mod native_ssm;
 mod prefix_cache;
 mod qwen3_5_moe;
+// Unlike its `qwen3_5_moe` sibling — which keeps a `#[cfg]`'d `mod imp` inside
+// an ungated file — every item here takes or returns `mlx_rs::Array`, so the
+// whole module is gated at the declaration (same shape as
+// `native_metal_bridge` above). Without this the crate does not build under
+// its own `default = []`, which is the configuration the pure modules
+// (`grammar`, `chat_io`, `gemma4_tool_syntax`) exist to be testable in.
+#[cfg(feature = "mlx-native")]
 mod qwen3_5_mtp;
 mod qwen3_5_tools;
+// The Qwen tool-calling system-prompt renderer, reachable from the
+// `chat_render` fuzz target. The module itself stays private; this exposes one
+// pure `&[ToolDef] -> String` function and nothing else.
+#[doc(hidden)]
+pub use qwen3_5_tools::render_tools_system_block;
 // Phase 2 Step B microbench — synthetic-weight latency probe at
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
 // math before investing in the HF-native loader + runner wiring.
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
+#[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_kv_store_bf16;
+
+/// Qwen 3.5/3.6 `config.json` parsing. Public so the Phase 3 fault sweep can
+/// drive the loader that every downloaded checkpoint hits first.
+#[cfg(feature = "mlx-native")]
+pub mod qwen3_5_moe_config {
+    pub use crate::qwen3_5_moe::{
+        NativeLayerType, NativeModelConfig, NativeTextConfig, NativeWeights,
+    };
+}
+
+/// Link anchor for `examples/dump_flags.rs`. The flag registry is collected by
+/// linkme at link time, but an rlib's objects are only linked when referenced —
+/// a binary that touches nothing in this crate sees an empty registry. Calling
+/// this (a no-op) forces the linkage.
+#[cfg(feature = "mlx-native")]
+pub fn flags_link_anchor() {}
+#[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
     Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
@@ -167,6 +224,17 @@ pub struct SamplingOverrides {
     /// Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Matched
     /// incrementally in the streaming loop, not in `build_sampling_config`.
     pub stop: Vec<String>,
+    /// OpenAI `parallel_tool_calls` (default `true` when absent), or the
+    /// inverse of Anthropic's `disable_parallel_tool_use`. `Some(false)` caps
+    /// the turn at exactly one tool call.
+    ///
+    /// Not a sampling knob, and it rides here for the reason `stop` does: this
+    /// is the per-request channel that already reaches every streaming
+    /// entrypoint, and the alternative was a sixth parameter on five public
+    /// signatures. Read by `select_grammar_state`, which turns it into a
+    /// [`grammar::ToolCalls`] — see that type for why the count is separate
+    /// from `tool_choice` in the first place.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
@@ -175,12 +243,40 @@ pub struct SamplingOverrides {
 pub struct ProbeRows {
     pub row_argmaxes: Vec<u32>,
     pub row_max_abs: Vec<f32>,
+    /// Per-row `top1 - top2` logit gap — how decisively the argmax won.
+    ///
+    /// Needed to interpret an argmax disagreement between two numeric
+    /// configurations: a flip where the gap was ~0 is a tie broken differently,
+    /// which is what any perturbation is expected to do and says nothing about
+    /// quality; a flip at a large gap is a genuinely changed prediction. Used
+    /// by `examples/kv_bf16_quality.rs` to tell those apart.
+    ///
+    /// Empty when the runner does not compute it (the PyO3 path); check the
+    /// length before indexing.
+    pub row_top2_gap: Vec<f32>,
     pub position: usize,
 }
 
 trait Runner {
     fn name(&self) -> &'static str;
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
+    /// [`Runner::prefill`] with encoded images spliced over their placeholder
+    /// runs.
+    ///
+    /// Only the native runner implements this. The others reject rather than
+    /// prefilling a prompt whose image placeholders would never be filled —
+    /// which would answer confidently about an image the model never saw.
+    #[cfg(feature = "mlx-native")]
+    fn prefill_with_images(
+        &mut self,
+        _seq_id: u64,
+        _tokens: &[u32],
+        _images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        Err(anyhow!(
+            "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
+        ))
+    }
     fn decode_step(
         &mut self,
         seq_id: u64,
@@ -345,6 +441,19 @@ impl Runner for NativeMlxRunner {
         NativeMlxRunner::prefill(self, seq_id, tokens)
     }
 
+    // Gated to match the trait declaration — `Runner::prefill_with_images`
+    // only exists under `mlx-native`, so an ungated impl is not overriding
+    // anything. The `MlxRunnerEnum` impl below already carries this gate.
+    #[cfg(feature = "mlx-native")]
+    fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        NativeMlxRunner::prefill_with_images(self, seq_id, tokens, images)
+    }
+
     fn decode_step(
         &mut self,
         seq_id: u64,
@@ -478,6 +587,47 @@ impl RunnerImpl {
 
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         self.as_runner_mut().prefill(seq_id, tokens)
+    }
+
+    #[cfg(feature = "mlx-native")]
+    fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        self.as_runner_mut()
+            .prefill_with_images(seq_id, tokens, images)
+    }
+
+    /// Decode + resize one image onto the tower's patch grid. Native only —
+    /// the other runners have no tower to size against.
+    #[cfg(feature = "mlx-native")]
+    fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
+        match self {
+            Self::Native(r) => r.prepare_image(encoded),
+            _ => Err(anyhow!(
+                "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
+            )),
+        }
+    }
+
+    /// Token id whose embedding rows the vision features replace.
+    #[cfg(feature = "mlx-native")]
+    fn image_token_id(&self) -> Option<u32> {
+        match self {
+            Self::Native(r) => r.image_token_id(),
+            _ => None,
+        }
+    }
+
+    /// The loaded tower's config, for header-only prompt sizing.
+    #[cfg(feature = "mlx-native")]
+    fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+        match self {
+            Self::Native(r) => r.vision_config(),
+            _ => None,
+        }
     }
 
     fn decode_step(
@@ -914,6 +1064,49 @@ fn effective_qwen35_mtp_k() -> Option<usize> {
     }
 }
 
+/// Should prefill stop one token short so the first *generated* token can be
+/// masked?
+///
+/// Prefill argmaxes its final position with no grammar mask, so with an active
+/// grammar the first generated token is the one token the matcher never
+/// constrains. Holding the last prompt token back and feeding it through the
+/// masked decode step fixes that — but only when a grammar is actually active,
+/// so the unconstrained path stays byte-identical, and only when the held-back
+/// token is not an image placeholder, which would tear a placeholder run out of
+/// the span the images are spliced over.
+#[cfg(feature = "mlx-native")]
+fn hold_back_last_prompt_token(
+    grammar_active: bool,
+    prompt_ids: &[u32],
+    image_token: Option<u32>,
+) -> bool {
+    grammar_active && prompt_ids.len() > 1 && image_token != prompt_ids.last().copied()
+}
+
+/// Would a Gemma 4 request get a grammar if it went through the streaming
+/// decode?
+///
+/// The non-streaming path runs a batched `generate()` that applies no mask, so
+/// this is what decides whether a request must be re-routed through streaming
+/// to get the constraint it asked for. It mirrors the conditions
+/// `Gemma4Backend::select_grammar_state` uses — response_format unconditionally,
+/// tools only when the Lark grammar is enabled and `tool_choice` is not
+/// `"none"` — because a mismatch either loses the grammar again or pays a cold
+/// prefill for nothing.
+#[cfg(feature = "mlx-native")]
+fn gemma4_grammar_would_constrain(
+    response_schema: Option<&serde_json::Value>,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+) -> bool {
+    if response_schema.is_some() {
+        return true;
+    }
+    !tools.is_empty()
+        && !matches!(tool_choice, crate::chat_io::ResolvedToolChoice::None)
+        && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
+}
+
 fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     let (role, content) = messages.first()?;
     if role != "system" || content.is_empty() {
@@ -1040,11 +1233,11 @@ fn format_system_prefix(message: &(String, String)) -> String {
 ///    using the shared `native_*` primitives
 /// 2. Add a variant to this enum + `MlxBackendKind`
 /// 3. Wire arch detection in `MlxBackend::load`
-/// Phase 3: the minimal per-seq driver surface the batched MLX scheduler
-/// (`lumen-server::engine::run_batched_mlx`) needs, so one scheduler works for
-/// any MLX family (Qwen 3.6 + Gemma 4). Both backends implement it by forwarding
-/// to their inherent methods — the trait only exists so the scheduler can hold
-/// one `&mut dyn` regardless of family.
+///    Phase 3: the minimal per-seq driver surface the batched MLX scheduler
+///    (`lumen-server::engine::run_batched_mlx`) needs, so one scheduler works for
+///    any MLX family (Qwen 3.6 + Gemma 4). Both backends implement it by forwarding
+///    to their inherent methods — the trait only exists so the scheduler can hold
+///    one `&mut dyn` regardless of family.
 pub trait MlxBatchedSeqDriver {
     fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>>;
     fn eos_tokens(&self) -> &[u32];
@@ -1302,6 +1495,32 @@ impl MlxBackend {
         }
     }
 
+    /// Prompt tokens the attached images will add on top of the rendered text.
+    ///
+    /// `build_chat_input` only sees `(role, content)` strings, so an image
+    /// request's real prompt is hundreds of tokens longer than what it reports
+    /// — enough to matter for the context guard and for `usage.prompt_tokens`.
+    /// Reads image headers only; never decodes pixels. Backends without image
+    /// support contribute nothing.
+    pub fn image_prompt_tokens(&self, images: &[Vec<Vec<u8>>]) -> usize {
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => images
+                .iter()
+                .flatten()
+                .map(|bytes| m.image_prompt_tokens(bytes).unwrap_or(0))
+                .sum(),
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen35Family(m) => images
+                .iter()
+                .flatten()
+                .map(|bytes| m.image_prompt_tokens(bytes).unwrap_or(0))
+                .sum(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
     pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
         match self {
             Self::Qwen35Family(m) => m.drop_prefix_cache(key),
@@ -1359,6 +1578,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_response_format(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1374,11 +1594,13 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_with_tools(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     );
                 }
                 let _ = tool_choice;
@@ -1396,15 +1618,19 @@ impl MlxBackend {
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
-                // response_format wiring (WS-F #1): the batched `generate()`
-                // path below applies no grammar. When a JSON schema is
-                // present, route through the streaming decode — which DOES
-                // apply the response-format grammar — with a no-op sink and
-                // collect its ParsedResponse. Rare path; it forgoes the
-                // prefix cache, trading a cold prefill for a correct
-                // (schema-constrained) non-streaming answer instead of
-                // silently emitting free text.
-                if let Some(schema) = response_schema {
+                // The batched `generate()` path below applies no grammar at
+                // all, so any request that would have one runs through the
+                // streaming decode with a no-op sink and returns its
+                // ParsedResponse. It forgoes the prefix cache — a cold prefill
+                // in exchange for the constraint the caller asked for, rather
+                // than silently unconstrained output.
+                //
+                // This covers `response_format` and tool calls alike. Leaving
+                // tools out is what let a non-streaming `tool_choice=required`
+                // return `迎get_weather`: no matcher was ever built, so the
+                // name was whatever the model felt like, and only the response
+                // parser's fuzzy repair stood between that and the client.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming(
                         messages,
                         max_new_tokens,
@@ -1414,7 +1640,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
@@ -1456,11 +1682,349 @@ impl MlxBackend {
         }
     }
 
+    /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
+    ///
+    /// Falls through to [`Self::chat`] when nothing is attached, so callers can
+    /// route every request here. Image requests skip the prefix cache: the
+    /// cached prefix is keyed on text alone, and a vision prompt's placeholder
+    /// rows are only meaningful together with the image they were spliced from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_with_images(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            );
+        }
+        match self {
+            // The variant itself is `#[cfg]`'d on `mlx-native`, so the arm has
+            // to be too — as does everything it reaches
+            // (`gemma4_grammar_would_constrain`).
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                // Same trick as the text path: only the streaming decode
+                // applies a grammar, so a non-streaming request that wants one
+                // runs it with a no-op sink.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                    return m.chat_streaming_with_images(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        response_schema,
+                        |_| Ok(()),
+                    );
+                }
+                m.chat_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                // The Qwen3.6 image path is greedy-only: the family's sampled
+                // branches key on text.
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                // response_format wins over tools, matching the text path.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    return m.chat_response_format(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
+                if !tools.is_empty() {
+                    return m.chat_with_tools(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    );
+                }
+                let _ = tool_choice;
+                // Non-streaming: drive the same loop and discard the deltas.
+                let visible = m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    |_| {},
+                )?;
+                Ok(crate::chat_io::ParsedResponse {
+                    visible,
+                    ..Default::default()
+                })
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
+            )),
+        }
+    }
+
+    /// [`Self::chat_streaming`] with inline images.
+    ///
+    /// Same contract as [`Self::chat_with_images`]: falls through to the text
+    /// path when nothing is attached, and rejects rather than silently
+    /// answering without the image on a backend that cannot see it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_with_images<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_streaming(
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            );
+        }
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                let mut on_event = on_event;
+                // response_format wins over tools, matching the text path.
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let mut sink = |chunk: &str| {
+                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut sink,
+                    );
+                }
+                if !tools.is_empty() {
+                    return m.chat_streaming_with_tools(
+                        messages,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        tools,
+                        tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        on_event,
+                    );
+                }
+                let _ = tool_choice;
+                let mut sink = |chunk: &str| {
+                    let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                };
+                let visible = m.chat_streaming_with_images(
+                    messages,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    &mut sink,
+                )?;
+                Ok(crate::chat_io::ParsedResponse {
+                    visible,
+                    ..Default::default()
+                })
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input requires a vision-capable MLX backend (LUMEN_VISION=1)"
+            )),
+        }
+    }
+
     /// Structured-history variant of `chat`. Used by the turn-2+ path
     /// where the request carries assistant.tool_calls / role:tool entries
     /// that the legacy `(role, content)` shape can't represent. Falls
     /// through to plain-text rendering for Qwen 3.5 (Phase 2 will wire its
     /// own structured renderer).
+    /// [`Self::chat_from_history`] with images attached to `User` turns.
+    ///
+    /// Falls through to the text path when nothing is attached. Image requests
+    /// bypass the prefix cache (keyed on text alone) and reject
+    /// `response_format`, which routes through a grammar path that has no
+    /// image wiring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_from_history_with_images(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+            );
+        }
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                // Only the streaming decode applies a grammar; run it with a
+                // no-op sink for the non-streaming call.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                    return m.chat_streaming_from_history_with_images(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        temperature,
+                        top_p,
+                        ov,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        response_schema,
+                        |_| Ok(()),
+                    );
+                }
+                m.chat_from_history_with_images(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    return m.chat_response_format_from_history(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                    );
+                }
+                m.chat_with_tools_from_history(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    tools,
+                    tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input with a tool-calling history requires a vision-capable MLX \
+                 backend (LUMEN_VISION=1)"
+            )),
+        }
+    }
+
     pub fn chat_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1485,6 +2049,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_response_format_from_history(
                         turns,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1502,11 +2067,13 @@ impl MlxBackend {
                 let seq_id = m.alloc_seq_id();
                 m.chat_with_tools_from_history(
                     turns,
+                    &[],
                     max_new_tokens,
                     thinking,
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -1517,13 +2084,11 @@ impl MlxBackend {
                 // turn content. Falls through to the no-prefix-cache path
                 // when neither yields a key (e.g. user-first chat with no
                 // system turn).
-                // response_format wiring (WS-F #1): mirror the flat `chat`
-                // path — when a JSON schema is present, route through the
-                // grammar-aware streaming decode with a no-op sink so the
-                // non-streaming structured-history answer is actually
-                // schema-constrained (the cache/`generate` path applies no
-                // grammar). Rare path; forgoes the prefix cache.
-                if let Some(schema) = response_schema {
+                // Mirror the flat `chat` path — a request that would get a
+                // grammar routes through the grammar-aware streaming decode
+                // with a no-op sink, because the cache/`generate` path applies
+                // none. Forgoes the prefix cache for those requests.
+                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
                     return m.chat_streaming_from_history(
                         turns,
                         max_new_tokens,
@@ -1533,7 +2098,7 @@ impl MlxBackend {
                         thinking,
                         tools,
                         tool_choice,
-                        Some(schema),
+                        response_schema,
                         |_| Ok(()),
                     );
                 }
@@ -1606,6 +2171,7 @@ impl MlxBackend {
                     };
                     return m.chat_streaming_response_format(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1622,11 +2188,13 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     return m.chat_streaming_with_tools(
                         messages,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
                         tools,
                         tool_choice,
+                        crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
                     );
                 }
@@ -1708,6 +2276,98 @@ impl MlxBackend {
     /// loops can stream natural-language continuations. Qwen 3.5
     /// family currently flattens to plain text (loses tool metadata);
     /// future Hermes-style structured streaming lands in Phase 2.
+    /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_from_history_with_images<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+        thinking: bool,
+        session_id: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return self.chat_streaming_from_history(
+                turns,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            );
+        }
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = session_id;
+                m.chat_streaming_from_history_with_images(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                )
+            }
+            Self::Qwen35Family(m) => {
+                let _ = (temperature, top_p, ov, session_id);
+                let seq_id = m.alloc_seq_id();
+                let mut on_event = on_event;
+                if let Some(schema) = response_schema {
+                    let _ = (tools, tool_choice);
+                    let mut sink = |chunk: &str| {
+                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    };
+                    return m.chat_streaming_response_format_from_history(
+                        turns,
+                        images,
+                        max_new_tokens,
+                        thinking,
+                        seq_id,
+                        schema,
+                        &mut sink,
+                    );
+                }
+                m.chat_streaming_with_tools_from_history(
+                    turns,
+                    images,
+                    max_new_tokens,
+                    thinking,
+                    seq_id,
+                    tools,
+                    tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    on_event,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow::anyhow!(
+                "image input with a tool-calling history requires a vision-capable MLX \
+                 backend (LUMEN_VISION=1)"
+            )),
+        }
+    }
+
     pub fn chat_streaming_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1741,6 +2401,7 @@ impl MlxBackend {
                     };
                     return m.chat_streaming_response_format_from_history(
                         turns,
+                        &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
@@ -1754,11 +2415,13 @@ impl MlxBackend {
                 let seq_id = m.alloc_seq_id();
                 m.chat_streaming_with_tools_from_history(
                     turns,
+                    &[],
                     max_new_tokens,
                     thinking,
                     seq_id,
                     tools,
                     tool_choice,
+                    crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
                 )
             }
@@ -1921,6 +2584,20 @@ struct DraftRunner {
     eos_tokens: Vec<u32>,
 }
 
+/// Messages rewritten to carry their images, plus everything prefill needs to
+/// pair each placeholder run with the right image. See
+/// [`MlxQwen35Backend::attach_image_blocks`].
+#[cfg(feature = "mlx-native")]
+struct AttachedImages {
+    /// `(role, content)` with an `<|image_pad|>` block prepended to the body of
+    /// every message that had an image attached.
+    messages: Vec<(String, String)>,
+    /// Decoded and resized images, in prompt order.
+    prepared: Vec<crate::qwen36_vision::PreparedImage>,
+    /// `counts[k]` is how many placeholder rows `prepared[k]` occupies.
+    counts: Vec<usize>,
+}
+
 impl MlxQwen35Backend {
     /// Load the model. Default path is PyO3 in-process. `LUMEN_MLX_BACKEND`
     /// selects the runner (`pyo3`, `subprocess`, or `native`); legacy
@@ -2037,6 +2714,33 @@ impl MlxQwen35Backend {
         self.runner.prefill(seq_id, tokens)
     }
 
+    /// Prompt tokens one attached image adds — its merged-token run plus the
+    /// vision sentinels. Header-only; no pixel decode.
+    #[cfg(feature = "mlx-native")]
+    pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+        let cfg = self
+            .runner
+            .vision_config()
+            .ok_or_else(|| anyhow!("vision tower not loaded"))?;
+        crate::qwen36_vision::image_prompt_tokens(encoded, &cfg)
+            .map_err(|e| anyhow!("image sizing failed: {e}"))
+    }
+
+    /// [`Self::prefill`] with encoded images spliced over their placeholder
+    /// runs. An empty slice is byte-identical to [`Self::prefill`].
+    #[cfg(feature = "mlx-native")]
+    pub fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        if images.is_empty() {
+            return self.runner.prefill(seq_id, tokens);
+        }
+        self.runner.prefill_with_images(seq_id, tokens, images)
+    }
+
     pub fn decode_step(
         &mut self,
         seq_id: u64,
@@ -2084,7 +2788,7 @@ impl MlxQwen35Backend {
     ///   - forward_ns: `self.model(arr, cache=cache)` (lazy graph build)
     ///   - sync_ns:    `mx.argmax(...).item()` (forces GPU sync)
     ///   - tail_ns:    `_apply_kv_quant` + state update
-    /// Returns empty Vec for non-PyO3 backends or when env was not set.
+    ///     Returns empty Vec for non-PyO3 backends or when env was not set.
     pub fn take_pyo3_decode_stage_timings(&mut self) -> Result<Vec<(u64, u64, u64, u64)>> {
         self.runner.take_pyo3_decode_stage_timings()
     }
@@ -2743,6 +3447,84 @@ impl MlxQwen35Backend {
             .map_err(|e| anyhow!("tokenizer decode: {e}"))
     }
 
+    /// [`Self::build_chat_input`] with inline images.
+    ///
+    /// Returns the prompt ids alongside the prepared images in prompt order —
+    /// the pairing `prefill_with_images` relies on.
+    ///
+    /// The rendered text carries one `<|image_pad|>` per image; the expansion
+    /// to one placeholder per merged token happens after tokenization, so the
+    /// counts stay exact regardless of how the tokenizer would have handled a
+    /// long repeated literal.
+    ///
+    /// Images are placed at the **start** of their turn, before that message's
+    /// text: the flattened `(role, content)` shape has already lost where each
+    /// content part sat, and image-then-question is what essentially every
+    /// vision client sends.
+    #[cfg(feature = "mlx-native")]
+    pub fn build_chat_input_with_images(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        let attached = self.attach_image_blocks(messages, images)?;
+        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking))?;
+        let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
+        Ok((ids, attached.prepared))
+    }
+
+    /// Decode every attached image and splice an `<|image_pad|>` block into the
+    /// head of its message, returning the rewritten messages together with the
+    /// prepared images and their token counts **in prompt order**.
+    ///
+    /// Prompt order is the contract: `prefill_with_images` pairs the k-th
+    /// placeholder run with the k-th prepared image, and
+    /// [`expand_image_placeholders`](Self::expand_image_placeholders) sizes the
+    /// k-th run from `counts[k]`. Iterating messages in order and prepending to
+    /// each body is what keeps all three in step.
+    #[cfg(feature = "mlx-native")]
+    fn attach_image_blocks(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+    ) -> Result<AttachedImages> {
+        let mut out = AttachedImages {
+            messages: Vec::with_capacity(messages.len()),
+            prepared: Vec::new(),
+            counts: Vec::new(),
+        };
+        for (i, (role, content)) in messages.iter().enumerate() {
+            let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let mut body = String::new();
+            for bytes in attached {
+                let p = self.runner.prepare_image(bytes)?;
+                out.counts.push(p.num_tokens);
+                out.prepared.push(p);
+                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
+            }
+            body.push_str(content);
+            out.messages.push((role.clone(), body));
+        }
+        Ok(out)
+    }
+
+    /// Blow each single `<|image_pad|>` token up to the run of placeholder rows
+    /// its image will occupy.
+    ///
+    /// Done on token ids rather than on the rendered text so the counts stay
+    /// exact no matter how the tokenizer would have merged a long repeated
+    /// literal.
+    #[cfg(feature = "mlx-native")]
+    fn expand_image_placeholders(&self, ids: &[u32], counts: &[usize]) -> Result<Vec<u32>> {
+        let image_token = self
+            .runner
+            .image_token_id()
+            .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+        crate::qwen36_vision::expand_image_placeholders(ids, image_token, counts)
+            .map_err(|e| anyhow!("expand image placeholders: {e}"))
+    }
+
     pub fn build_chat_input(
         &self,
         messages: &[(String, String)],
@@ -2787,6 +3569,40 @@ impl MlxQwen35Backend {
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
+    }
+
+    /// [`build_chat_input_with_tools_split`](Self::build_chat_input_with_tools_split)
+    /// with inline images.
+    ///
+    /// The two features compose because they touch different parts of the
+    /// prompt: images add placeholder runs inside the message bodies, the tool
+    /// template wraps everything and appends its `tool_choice` prefill at the
+    /// very end. Ordering matters in one place — the prefill split is taken
+    /// *before* the placeholders expand. Expansion only ever grows runs that
+    /// sit ahead of the prefill, so the prefill's token ids are the same either
+    /// way, but taking the split afterwards would compare a grown `ids` against
+    /// an ungrown `prompt_ids` and report a spurious BPE desync.
+    #[cfg(feature = "mlx-native")]
+    fn build_chat_input_with_tools_and_images_split(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Vec<u32>,
+        Vec<crate::qwen36_vision::PreparedImage>,
+    )> {
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        let attached = self.attach_image_blocks(messages, images)?;
+        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
+        Ok((ids, prefill, prefill_tokens, attached.prepared))
     }
 
     /// Encode `prompt_only + prefill` and isolate the prefill's trailing token
@@ -2857,6 +3673,79 @@ impl MlxQwen35Backend {
         Ok((ids, prefill, prefill_tokens))
     }
 
+    /// [`build_chat_input_with_tools_from_history_split`](Self::build_chat_input_with_tools_from_history_split)
+    /// with inline images, `images[i]` belonging to `turns[i]`.
+    ///
+    /// Only `User` turns can carry an image. That is a real restriction rather
+    /// than a simplification: this renderer does not emit every turn's text
+    /// verbatim — a leading `System` turn is folded into the `<tools>` block and
+    /// an `Assistant` turn with tool calls may render no text at all — so a
+    /// placeholder attached elsewhere could vanish or move, and the k-th
+    /// placeholder run would then be spliced with the wrong image. Refusing is
+    /// the only honest option; silently dropping the image is the failure mode
+    /// this whole feature exists to avoid.
+    #[cfg(feature = "mlx-native")]
+    fn build_chat_input_with_tools_and_images_from_history_split(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Vec<u32>,
+        Vec<crate::qwen36_vision::PreparedImage>,
+    )> {
+        use crate::chat_io::ChatTurn;
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+        };
+
+        // Rewrite the User turns that carry images. The rewritten bodies are
+        // owned here so the borrowed `ChatTurn`s built below can point at them.
+        let mut bodies: Vec<Option<String>> = Vec::with_capacity(turns.len());
+        let mut prepared = Vec::new();
+        let mut counts = Vec::new();
+        for (i, turn) in turns.iter().enumerate() {
+            let attached = images.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            if attached.is_empty() {
+                bodies.push(None);
+                continue;
+            }
+            let ChatTurn::User(text) = turn else {
+                return Err(anyhow!(
+                    "images can only be attached to a user message on the Qwen 3.6 \
+                     tool-calling path"
+                ));
+            };
+            let mut body = String::new();
+            for bytes in attached {
+                let p = self.runner.prepare_image(bytes)?;
+                counts.push(p.num_tokens);
+                prepared.push(p);
+                body.push_str(crate::qwen36_vision::IMAGE_BLOCK);
+            }
+            body.push_str(text);
+            bodies.push(Some(body));
+        }
+        let rewritten: Vec<ChatTurn<'_>> = turns
+            .iter()
+            .zip(bodies.iter())
+            .map(|(turn, body)| match body {
+                Some(b) => ChatTurn::User(b.as_str()),
+                None => turn.clone(),
+            })
+            .collect();
+
+        let prompt_only = format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
+        let ids = self.expand_image_placeholders(&ids, &counts)?;
+        Ok((ids, prefill, prefill_tokens, prepared))
+    }
+
     pub fn alloc_seq_id(&self) -> u64 {
         self.next_seq_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -2911,6 +3800,7 @@ impl MlxQwen35Backend {
         &self,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Option<crate::grammar::Gemma4GrammarState> {
         use crate::chat_io::ResolvedToolChoice;
         use crate::grammar::{Gemma4GrammarState, GrammarMode};
@@ -2920,7 +3810,7 @@ impl MlxQwen35Backend {
         // build a grammar that would be inert.
         #[cfg(not(feature = "mlx-native"))]
         {
-            let _ = (tools, tool_choice);
+            let _ = (tools, tool_choice, calls);
             return None;
         }
         #[cfg(feature = "mlx-native")]
@@ -2943,13 +3833,13 @@ impl MlxQwen35Backend {
             // For a named choice, the grammar must include the named tool; if the
             // engine didn't already downgrade an unknown name to Auto, skip rather
             // than build a grammar that can never match.
-            if let ResolvedToolChoice::Tool(name) = tool_choice {
-                if !tools.iter().any(|t| t.name == *name) {
-                    eprintln!(
-                        "[qwen35-backend] tool grammar skipped: tool_choice names unknown tool {name:?}"
-                    );
-                    return None;
-                }
+            if let ResolvedToolChoice::Tool(name) = tool_choice
+                && !tools.iter().any(|t| t.name == *name)
+            {
+                eprintln!(
+                    "[qwen35-backend] tool grammar skipped: tool_choice names unknown tool {name:?}"
+                );
+                return None;
             }
             let factory = self.grammar_factory()?;
             // Convert the borrowed ToolDefs into the OpenAI-style `tools` JSON the
@@ -2965,10 +3855,10 @@ impl MlxQwen35Backend {
                     serde_json::json!({ "type": "function", "function": func })
                 })
                 .collect();
-            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None) {
+            match Gemma4GrammarState::new_qwen35_xml(factory, &tools_json, mode, None, calls) {
                 Ok(state) => {
                     eprintln!(
-                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?})",
+                        "[qwen35-backend] tool grammar active for {} tool(s) (mode={mode:?}, calls={calls:?})",
                         tools.len()
                     );
                     Some(state)
@@ -3044,9 +3934,14 @@ impl MlxQwen35Backend {
     /// desync, this degrades to a plain greedy decode — the server-side
     /// first-JSON-value trim still yields a parseable object in the common case.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn chat_response_format_impl<F>(
         &mut self,
         prompt_ids: Vec<u32>,
+        // Images to splice over the prompt's placeholder runs, in prompt order.
+        // Empty for a text-only request, which then prefills byte-identically
+        // to the pre-vision path.
+        prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
         grammar: Option<crate::grammar::Gemma4GrammarState>,
         max_new_tokens: usize,
         seq_id: u64,
@@ -3079,10 +3974,23 @@ impl MlxQwen35Backend {
         let (mut last, mut pos);
         #[cfg(feature = "mlx-native")]
         let mut first_masked = false;
+        // Vision prompts prefill through the image-splicing path; the held-back
+        // token is the tail of the assistant header, never a placeholder, so the
+        // runs stay wholly inside the prefilled span either way.
+        #[cfg(feature = "mlx-native")]
+        macro_rules! prefill_span {
+            ($ids:expr) => {
+                if prepared_images.is_empty() {
+                    self.prefill(seq_id, $ids)
+                } else {
+                    self.prefill_with_images(seq_id, $ids, &prepared_images)
+                }
+            };
+        }
         #[cfg(feature = "mlx-native")]
         if grammar_active_at_start && prompt_ids.len() >= 2 {
             let split = prompt_ids.len() - 1;
-            let (_pf, _pos0) = self.prefill(seq_id, &prompt_ids[..split])?;
+            let (_pf, _pos0) = prefill_span!(&prompt_ids[..split])?;
             let final_tok = prompt_ids[split];
             let stepped = {
                 let g = grammar.as_mut().expect("grammar active implies Some");
@@ -3095,12 +4003,17 @@ impl MlxQwen35Backend {
             pos = p;
             first_masked = true;
         } else {
-            let (l, p) = self.prefill(seq_id, &prompt_ids)?;
+            let (l, p) = prefill_span!(&prompt_ids)?;
             last = l;
             pos = p;
         }
         #[cfg(not(feature = "mlx-native"))]
         {
+            if !prepared_images.is_empty() {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
             let (l, p) = self.prefill(seq_id, &prompt_ids)?;
             last = l;
             pos = p;
@@ -3120,25 +4033,25 @@ impl MlxQwen35Backend {
         // object).
         #[cfg(feature = "mlx-native")]
         let _ = first_masked;
-        if let Some(g) = grammar.as_mut() {
-            if g.is_active() {
-                if let Err(e) = g.observe(last) {
-                    eprintln!(
-                        "[qwen35-backend] response_format grammar first-token observe \
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+            && let Err(e) = g.observe(last)
+        {
+            eprintln!(
+                "[qwen35-backend] response_format grammar first-token observe \
                          desynced (dropping grammar, sampling free): {e:#}"
-                    );
-                    grammar = None;
-                }
-            }
+            );
+            grammar = None;
         }
 
         let mut generated: Vec<u32> = vec![last];
         let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                emitted_idx = generated.len();
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            emitted_idx = generated.len();
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -3188,13 +4101,13 @@ impl MlxQwen35Backend {
             pos = new_pos;
             generated.push(next);
             let tail_start = emitted_idx;
-            if tail_start < generated.len() {
-                if let Ok(text) = self.decode(&generated[tail_start..]) {
-                    if !text.is_empty() && !text.contains('\u{FFFD}') {
-                        on_token(&text);
-                        emitted_idx = generated.len();
-                    }
-                }
+            if tail_start < generated.len()
+                && let Ok(text) = self.decode(&generated[tail_start..])
+                && !text.is_empty()
+                && !text.contains('\u{FFFD}')
+            {
+                on_token(&text);
+                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -3224,22 +4137,100 @@ impl MlxQwen35Backend {
     pub fn chat_response_format(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input(messages, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            |_| {},
+        )
+    }
+
+    /// Prompt for a flat-message `response_format` request, with or without
+    /// images. Split out so the streaming and non-streaming entry points cannot
+    /// drift on how the placeholder runs are built.
+    fn build_response_format_input(
+        &self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        if !images.iter().any(|v| !v.is_empty()) {
+            return Ok((self.build_chat_input(messages, thinking)?, Vec::new()));
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            self.build_chat_input_with_images(messages, images, thinking)
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            Err(anyhow!(
+                "image input requires a build with the `mlx-native` feature"
+            ))
+        }
+    }
+
+    /// Structured-history counterpart of
+    /// [`build_response_format_input`](Self::build_response_format_input).
+    ///
+    /// Goes through the tool-aware renderer with no tools — it is the only one
+    /// that can represent assistant `tool_calls` / `role:tool` turns — so the
+    /// same `User`-turn-only image rule applies.
+    fn build_response_format_input_from_history(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
+        use crate::chat_io::ResolvedToolChoice;
+        if !images.iter().any(|v| !v.is_empty()) {
+            let (ids, _prefill, _prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    &[],
+                    &ResolvedToolChoice::None,
+                )?;
+            return Ok((ids, Vec::new()));
+        }
+        #[cfg(feature = "mlx-native")]
+        {
+            let (ids, _prefill, _prefill_tokens, prepared) = self
+                .build_chat_input_with_tools_and_images_from_history_split(
+                    turns,
+                    images,
+                    thinking,
+                    &[],
+                    &ResolvedToolChoice::None,
+                )?;
+            Ok((ids, prepared))
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            Err(anyhow!(
+                "image input requires a build with the `mlx-native` feature"
+            ))
+        }
     }
 
     /// `response_format` streaming chat (flat messages). Same as
     /// [`chat_response_format`] but forwards each visible JSON fragment to
     /// `on_token`.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_response_format<F>(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -3249,9 +4240,17 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input(messages, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            on_token,
+        )
     }
 
     /// `response_format` non-streaming chat (structured history). Routes the
@@ -3261,27 +4260,31 @@ impl MlxQwen35Backend {
     pub fn chat_response_format_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        use crate::chat_io::ResolvedToolChoice;
-        let (prompt_ids, _prefill, _prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(
-                turns,
-                thinking,
-                &[],
-                &ResolvedToolChoice::None,
-            )?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input_from_history(turns, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, |_| {})
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            |_| {},
+        )
     }
 
     /// `response_format` streaming chat (structured history).
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_response_format_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
@@ -3291,16 +4294,17 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
-        use crate::chat_io::ResolvedToolChoice;
-        let (prompt_ids, _prefill, _prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(
-                turns,
-                thinking,
-                &[],
-                &ResolvedToolChoice::None,
-            )?;
+        let (prompt_ids, prepared) =
+            self.build_response_format_input_from_history(turns, images, thinking)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(prompt_ids, grammar, max_new_tokens, seq_id, on_token)
+        self.chat_response_format_impl(
+            prompt_ids,
+            prepared,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            on_token,
+        )
     }
 
     /// Streaming chat. Calls `on_token` with each new decoded text fragment.
@@ -3314,28 +4318,54 @@ impl MlxQwen35Backend {
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
+        on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.chat_streaming_with_images(messages, &[], max_new_tokens, thinking, seq_id, on_token)
+    }
+
+    /// [`Self::chat_streaming`] with inline images.
+    ///
+    /// `images[i]` holds the encoded byte streams attached to `messages[i]`.
+    /// An empty slice is byte-identical to [`Self::chat_streaming`].
+    ///
+    /// Image requests skip MTP, draft/n-gram speculation and the prefix cache:
+    /// all four are keyed on text alone, and a vision prompt's placeholder rows
+    /// only mean anything together with the image spliced over them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_streaming_with_images<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
         mut on_token: F,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
+        let has_images = images.iter().any(|v| !v.is_empty());
         // Phase 2 S4 — MTP routing. `LUMEN_SPEC=mtp` activates the
         // qwen3_5_mtp speculative path when (1) the native runner installed
         // a drafter (via LUMEN_QWEN35_MTP=1 at load), and (2) the request
         // hasn't opted out. Falls back to baseline decode_step otherwise so
         // unmtp-loaded deployments behave identically.
         #[cfg(feature = "mlx-native")]
-        if self.qwen35_mtp_enabled() {
-            if let Some(k) = effective_qwen35_mtp_k() {
-                return self.chat_streaming_qwen35_mtp(
-                    messages,
-                    max_new_tokens,
-                    thinking,
-                    seq_id,
-                    k,
-                    on_token,
-                );
-            }
+        if !has_images
+            && self.qwen35_mtp_enabled()
+            && let Some(k) = effective_qwen35_mtp_k()
+        {
+            return self.chat_streaming_qwen35_mtp(
+                messages,
+                max_new_tokens,
+                thinking,
+                seq_id,
+                k,
+                on_token,
+            );
         }
 
         // OPT-IN draft-model speculative decode. Engaged only when (1) a draft
@@ -3346,7 +4376,7 @@ impl MlxQwen35Backend {
         // OFF: when no draft is loaded, this is a no-op and the existing path
         // below runs byte-identically.
         #[cfg(feature = "mlx-native")]
-        if self.draft_enabled() {
+        if !has_images && self.draft_enabled() {
             return self.chat_streaming_spec_draft(
                 messages,
                 max_new_tokens,
@@ -3356,7 +4386,7 @@ impl MlxQwen35Backend {
             );
         }
 
-        if let Some(cfg) = spec_decode::read_spec_config() {
+        if !has_images && let Some(cfg) = spec_decode::read_spec_config() {
             return self.chat_streaming_spec_ngram(
                 messages,
                 max_new_tokens,
@@ -3367,24 +4397,43 @@ impl MlxQwen35Backend {
             );
         }
 
-        if self.prefix_store.enabled() {
-            if let Some(key) = auto_prefix_key(messages) {
-                return self.chat_streaming_prefix_cache(
-                    messages,
-                    max_new_tokens,
-                    thinking,
-                    seq_id,
-                    &key,
-                    on_token,
-                );
-            }
+        if self.prefix_store.enabled()
+            && let Some(key) = auto_prefix_key(messages)
+        {
+            return self.chat_streaming_prefix_cache(
+                messages,
+                max_new_tokens,
+                thinking,
+                seq_id,
+                &key,
+                on_token,
+            );
         }
 
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        // Images change both halves: the prompt gains a placeholder run per
+        // image, and prefill has to splice the encoded features over it.
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prepared) = if has_images {
+            self.build_chat_input_with_images(messages, images, thinking)?
+        } else {
+            (self.build_chat_input(messages, thinking)?, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let prompt_ids = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            self.build_chat_input(messages, thinking)?
+        };
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
         let t_prefill = std::time::Instant::now();
+        #[cfg(feature = "mlx-native")]
+        let (mut last, mut pos) = self.prefill_with_images(seq_id, &prompt_ids, &prepared)?;
+        #[cfg(not(feature = "mlx-native"))]
         let (mut last, mut pos) = self.prefill(seq_id, &prompt_ids)?;
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
@@ -3419,23 +4468,24 @@ impl MlxQwen35Backend {
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
         let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                if stream_timing {
-                    let now = std::time::Instant::now();
-                    if t_first_emit.is_none() {
-                        t_first_emit = Some(now);
-                    }
-                    if n_emits == stream_skip {
-                        t_skip_emit = Some(now);
-                    }
-                    t_last_emit = Some(now);
-                    n_emits += 1;
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            if stream_timing {
+                let now = std::time::Instant::now();
+                if t_first_emit.is_none() {
+                    t_first_emit = Some(now);
                 }
-                on_token(&text);
-                prev_text = text;
-                emitted_idx = generated.len();
+                if n_emits == stream_skip {
+                    t_skip_emit = Some(now);
+                }
+                t_last_emit = Some(now);
+                n_emits += 1;
             }
+            on_token(&text);
+            prev_text = text;
+            emitted_idx = generated.len();
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -3451,27 +4501,11 @@ impl MlxQwen35Backend {
             generated.push(next);
             if incr_detok {
                 let tail_start = emitted_idx;
-                if tail_start < generated.len() {
-                    if let Ok(text) = self.decode(&generated[tail_start..]) {
-                        if !text.is_empty() && !text.contains('\u{FFFD}') {
-                            if stream_timing {
-                                let now = std::time::Instant::now();
-                                if t_first_emit.is_none() {
-                                    t_first_emit = Some(now);
-                                }
-                                if n_emits == stream_skip {
-                                    t_skip_emit = Some(now);
-                                }
-                                t_last_emit = Some(now);
-                                n_emits += 1;
-                            }
-                            on_token(&text);
-                            emitted_idx = generated.len();
-                        }
-                    }
-                }
-            } else if let Ok(text) = self.decode(&generated) {
-                if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
+                if tail_start < generated.len()
+                    && let Ok(text) = self.decode(&generated[tail_start..])
+                    && !text.is_empty()
+                    && !text.contains('\u{FFFD}')
+                {
                     if stream_timing {
                         let now = std::time::Instant::now();
                         if t_first_emit.is_none() {
@@ -3483,9 +4517,26 @@ impl MlxQwen35Backend {
                         t_last_emit = Some(now);
                         n_emits += 1;
                     }
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                    on_token(&text);
+                    emitted_idx = generated.len();
                 }
+            } else if let Ok(text) = self.decode(&generated)
+                && text.len() > prev_text.len()
+                && !text.contains('\u{FFFD}')
+            {
+                if stream_timing {
+                    let now = std::time::Instant::now();
+                    if t_first_emit.is_none() {
+                        t_first_emit = Some(now);
+                    }
+                    if n_emits == stream_skip {
+                        t_skip_emit = Some(now);
+                    }
+                    t_last_emit = Some(now);
+                    n_emits += 1;
+                }
+                on_token(&text[prev_text.len()..]);
+                prev_text = text;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -3501,22 +4552,20 @@ impl MlxQwen35Backend {
             "[mlx] seq {seq_id} done: {n_gen} tokens in {decode_ms:.0}ms ({:.1} tok/s)",
             n_gen as f64 / (decode_ms / 1000.0)
         );
-        if stream_timing {
-            if let (Some(tf), Some(tl)) = (t_first_emit, t_last_emit) {
-                let emit_span_ms = (tl - tf).as_secs_f64() * 1000.0;
-                let steady_span_ms = t_skip_emit
-                    .map(|ts| (tl - ts).as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                let steady_n = n_emits.saturating_sub(stream_skip + 1);
-                let steady_rate = if steady_span_ms > 0.0 {
-                    steady_n as f64 / (steady_span_ms / 1000.0)
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[stream-timing] seq {seq_id} emit: n_emits={n_emits} first->last={emit_span_ms:.1}ms skip{stream_skip}->last={steady_span_ms:.1}ms steady_rate_emit={steady_rate:.2}tok/s"
-                );
-            }
+        if stream_timing && let (Some(tf), Some(tl)) = (t_first_emit, t_last_emit) {
+            let emit_span_ms = (tl - tf).as_secs_f64() * 1000.0;
+            let steady_span_ms = t_skip_emit
+                .map(|ts| (tl - ts).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let steady_n = n_emits.saturating_sub(stream_skip + 1);
+            let steady_rate = if steady_span_ms > 0.0 {
+                steady_n as f64 / (steady_span_ms / 1000.0)
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[stream-timing] seq {seq_id} emit: n_emits={n_emits} first->last={emit_span_ms:.1}ms skip{stream_skip}->last={steady_span_ms:.1}ms steady_rate_emit={steady_rate:.2}tok/s"
+            );
         }
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
@@ -3532,34 +4581,23 @@ impl MlxQwen35Backend {
     pub fn chat_with_tools(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill, prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key(messages);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len(messages, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_flat(
+            messages,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
+            calls,
             |_ev| Ok(()),
         )
     }
@@ -3568,41 +4606,31 @@ impl MlxQwen35Backend {
     /// `BackendStreamEvent::Text` for visible-text deltas and
     /// `BackendStreamEvent::ToolCallStart { name }` the moment the
     /// parser sees `<function=NAME>`.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_with_tools<F>(
         &mut self,
         messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill, prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key(messages);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len(messages, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_flat(
+            messages,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
+            calls,
             on_event,
         )
     }
@@ -3611,60 +4639,118 @@ impl MlxQwen35Backend {
     pub fn chat_with_tools_from_history(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
     ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prefill, prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key_from_turns(turns);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len_from_turns(turns, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
+        self.chat_with_tools_history(
+            turns,
+            images,
             max_new_tokens,
+            thinking,
             seq_id,
-            prefix_key.as_deref(),
-            incremental_boundary,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
+            tools,
+            tool_choice,
+            calls,
             |_ev| Ok(()),
         )
     }
 
     /// Structured-history streaming variant.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_streaming_with_tools_from_history<F>(
         &mut self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
         on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
-        let (prompt_ids, prefill, prefill_tokens) = self
-            .build_chat_input_with_tools_from_history_split(turns, thinking, tools, tool_choice)?;
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice);
-        let prefix_key = auto_prefix_key_from_turns(turns);
-        let incremental_boundary = self
-            .detect_system_tools_prefix_len_from_turns(turns, tools)
-            .ok()
-            .filter(|&b| b > 0 && b < prompt_ids.len());
+        self.chat_with_tools_history(
+            turns,
+            images,
+            max_new_tokens,
+            thinking,
+            seq_id,
+            tools,
+            tool_choice,
+            calls,
+            on_event,
+        )
+    }
+
+    /// Prompt-building half of the flat-message tool path, shared by the
+    /// streaming and non-streaming entry points (they differ only in the sink).
+    ///
+    /// Images turn off both prefix-cache reuse and the incremental boundary:
+    /// each is keyed on text alone, so a hit would hand this request KV rows
+    /// built from another request's pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_tools_flat<F>(
+        &mut self,
+        messages: &[(String, String)],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let has_images = images.iter().any(|v| !v.is_empty());
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
+            self.build_chat_input_with_tools_and_images_split(
+                messages,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+            )?
+        } else {
+            let (ids, prefill, prefill_tokens) =
+                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            let (ids, prefill, prefill_tokens) =
+                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
+        let prefix_key = if has_images {
+            None
+        } else {
+            auto_prefix_key(messages)
+        };
+        let incremental_boundary = if has_images {
+            None
+        } else {
+            self.detect_system_tools_prefix_len(messages, tools)
+                .ok()
+                .filter(|&b| b > 0 && b < prompt_ids.len())
+        };
         self.chat_with_tools_impl(
             prompt_ids,
             prefill,
@@ -3679,6 +4765,92 @@ impl MlxQwen35Backend {
             } else {
                 Default::default()
             },
+            prepared,
+            on_event,
+        )
+    }
+
+    /// Structured-history counterpart of [`chat_with_tools_flat`](Self::chat_with_tools_flat).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_tools_history<F>(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        images: &[Vec<Vec<u8>>],
+        max_new_tokens: usize,
+        thinking: bool,
+        seq_id: u64,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
+        on_event: F,
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+    {
+        let has_images = images.iter().any(|v| !v.is_empty());
+        #[cfg(feature = "mlx-native")]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
+            self.build_chat_input_with_tools_and_images_from_history_split(
+                turns,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+            )?
+        } else {
+            let (ids, prefill, prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (prompt_ids, prefill, prefill_tokens, prepared) = {
+            if has_images {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            let (ids, prefill, prefill_tokens) = self
+                .build_chat_input_with_tools_from_history_split(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                )?;
+            (ids, prefill, prefill_tokens, Vec::new())
+        };
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
+        let prefix_key = if has_images {
+            None
+        } else {
+            auto_prefix_key_from_turns(turns)
+        };
+        let incremental_boundary = if has_images {
+            None
+        } else {
+            self.detect_system_tools_prefix_len_from_turns(turns, tools)
+                .ok()
+                .filter(|&b| b > 0 && b < prompt_ids.len())
+        };
+        self.chat_with_tools_impl(
+            prompt_ids,
+            prefill,
+            prefill_tokens,
+            grammar,
+            max_new_tokens,
+            seq_id,
+            prefix_key.as_deref(),
+            incremental_boundary,
+            if force_required_params_enabled() {
+                force_required_params_map(tools)
+            } else {
+                Default::default()
+            },
+            prepared,
             on_event,
         )
     }
@@ -3723,6 +4895,10 @@ impl MlxQwen35Backend {
         // loop injects a `<parameter=KEY>\n` opener before the model can close
         // a `<function=NAME>` block with a required param still missing.
         force_required: std::collections::HashMap<String, Vec<String>>,
+        // Images to splice over the prompt's placeholder runs, in prompt order.
+        // Empty for a text-only request, which then prefills byte-identically
+        // to the pre-vision path.
+        prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -3746,18 +4922,76 @@ impl MlxQwen35Backend {
 
         let debug_qwen_tools = std::env::var("LUMEN_QWEN35_TOOL_DEBUG").is_ok();
         let t_prefill = std::time::Instant::now();
-        let (mut last, mut pos) = self.prefix_store.prefill_optionally_cached(
-            &mut self.runner,
-            seq_id,
+        // A vision prompt cannot reuse a cached prefix: the cache is keyed on
+        // text alone, and the placeholder rows only mean anything once this
+        // request's images have been spliced over them. The callers already
+        // pass `None` for the key; this asserts the invariant at the one place
+        // that would silently corrupt the prompt if it were violated.
+        //
+        // ── First-token masking ──
+        // Prefill argmaxes its final position with no grammar mask, so with an
+        // active grammar the very first generated token was the one token the
+        // matcher never got to constrain. Checking it afterwards is too late:
+        // the model's unmasked pick disagreeing with the grammar is precisely
+        // when the grammar is doing its job, yet the old code responded by
+        // throwing the grammar away. `tool_choice=required` therefore never
+        // enforced anything — asked for `get_weather`, the model would open
+        // `<function=` and continue `weather`, the matcher would reject it, and
+        // the request would finish on free sampling. Holding the last prompt
+        // token back and feeding it through `decode_step_masked` puts that
+        // first choice under the mask like every later one.
+        //
+        // Only the last token moves, and it is always the tail of the assistant
+        // header or the `tool_choice` prefill — never an image placeholder — so
+        // the image runs stay wholly inside the prefilled span. The `is_none`
+        // guard makes that explicit rather than relying on it.
+        let mut grammar = grammar;
+        #[cfg(feature = "mlx-native")]
+        let hold_back_last = hold_back_last_prompt_token(
+            grammar.as_ref().is_some_and(|g| g.is_active()),
             &prompt_ids,
-            prefix_cache_key,
-            incremental_boundary,
-        )?;
+            self.runner.image_token_id(),
+        );
+        #[cfg(not(feature = "mlx-native"))]
+        let hold_back_last = false;
+        let prefill_ids = if hold_back_last {
+            &prompt_ids[..prompt_ids.len() - 1]
+        } else {
+            &prompt_ids[..]
+        };
+
+        #[cfg(feature = "mlx-native")]
+        let (mut last, mut pos) = if prepared_images.is_empty() {
+            self.prefix_store.prefill_optionally_cached(
+                &mut self.runner,
+                seq_id,
+                prefill_ids,
+                prefix_cache_key,
+                incremental_boundary,
+            )?
+        } else {
+            self.prefill_with_images(seq_id, prefill_ids, &prepared_images)?
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (mut last, mut pos) = {
+            if !prepared_images.is_empty() {
+                return Err(anyhow!(
+                    "image input requires a build with the `mlx-native` feature"
+                ));
+            }
+            self.prefix_store.prefill_optionally_cached(
+                &mut self.runner,
+                seq_id,
+                prefill_ids,
+                prefix_cache_key,
+                incremental_boundary,
+            )?
+        };
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
-            prompt_ids.len(),
-            prompt_ids.len() as f64 / (prefill_ms / 1000.0)
+            prefill_ids.len(),
+            prefill_ids.len() as f64 / (prefill_ms / 1000.0)
         );
 
         // ── WS-C #2: grammar prefill replay ──
@@ -3766,40 +5000,71 @@ impl MlxQwen35Backend {
         // went into the model's context but were never *sampled*, so the
         // matcher hasn't seen them. Replay the exact prefill tokens through
         // `observe_prefill` so the matcher's parse position matches the model.
-        // The first prefill-produced token `last` was argmaxed WITHOUT a mask
-        // (it continues the forced opener), so `observe` it too to stay
-        // aligned. Any desync (empty split despite a prefill, or a token the
-        // grammar rejects) drops the grammar → free sampling, never a corrupt
-        // masked decode.
-        let mut grammar = grammar;
-        if let Some(g) = grammar.as_mut() {
-            if g.is_active() {
-                let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
-                if !desync {
-                    for tok in &prefill_tokens {
-                        if let Err(e) = g.observe_prefill(*tok) {
-                            eprintln!(
-                                "[qwen35-backend] grammar prefill replay desynced \
-                                 (dropping grammar, sampling free): {e:#}"
-                            );
-                            desync = true;
-                            break;
-                        }
-                    }
-                }
-                if !desync {
-                    if let Err(e) = g.observe(last) {
+        // A desync here (empty split despite a prefill, or a token the grammar
+        // rejects) drops the grammar → free sampling, never a corrupt masked
+        // decode. Unlike the first *generated* token above, these are tokens the
+        // prompt already committed to, so there is nothing left to constrain.
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+        {
+            let mut desync = !prefill_str.is_empty() && prefill_tokens.is_empty();
+            if !desync {
+                for tok in &prefill_tokens {
+                    if let Err(e) = g.observe_prefill(*tok) {
                         eprintln!(
-                            "[qwen35-backend] grammar first-token observe desynced \
-                             (dropping grammar, sampling free): {e:#}"
+                            "[qwen35-backend] grammar prefill replay desynced \
+                                 (dropping grammar, sampling free): {e:#}"
                         );
                         desync = true;
+                        break;
                     }
                 }
-                if desync {
+            }
+            if desync {
+                grammar = None;
+            }
+        }
+
+        // Now that the matcher is aligned, produce the first generated token
+        // under the mask by feeding it the prompt token we held back.
+        #[cfg(feature = "mlx-native")]
+        if hold_back_last {
+            let held = *prompt_ids.last().expect("hold_back_last implies non-empty");
+            let stepped = {
+                let g = grammar
+                    .as_mut()
+                    .expect("hold_back_last implies an active grammar");
+                let mut mask =
+                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
+                self.runner.decode_step_masked(seq_id, held, &mut mask)
+            };
+            match stepped {
+                Ok((next, new_pos)) => {
+                    last = next;
+                    pos = new_pos;
+                }
+                Err(e) => {
+                    // The mask itself failed (vocab mismatch, matcher error).
+                    // Take the step unmasked so the request still answers.
+                    eprintln!(
+                        "[qwen35-backend] masked first step failed (dropping grammar): {e:#}"
+                    );
                     grammar = None;
+                    let (next, new_pos) = self.decode_step(seq_id, held, pos)?;
+                    last = next;
+                    pos = new_pos;
                 }
             }
+        }
+        if let Some(g) = grammar.as_mut()
+            && g.is_active()
+            && let Err(e) = g.observe(last)
+        {
+            eprintln!(
+                "[qwen35-backend] grammar first-token observe desynced \
+                         (dropping grammar, sampling free): {e:#}"
+            );
+            grammar = None;
         }
 
         // The grammar (WS-C #2) enforces required params structurally and
@@ -3861,45 +5126,45 @@ impl MlxQwen35Backend {
             // model writes the value instead of closing an empty call
             // (`<function=read></function>` → "path is required"). The value
             // is still model-generated — only the opener is forced.
-            if force_active {
-                if let Some(key) = parser.next_required_param_to_force(&force_required) {
-                    let inj = format!("<parameter={key}>\n");
-                    let inj_tokens = self.encode_raw(&inj)?;
-                    if !inj_tokens.is_empty() {
-                        // Forward the still-unforwarded `last` plus the opener
-                        // in one extend; `last` is consumed (already pushed +
-                        // fed in the prior step).
-                        let mut combined = Vec::with_capacity(1 + inj_tokens.len());
-                        combined.push(last);
-                        combined.extend_from_slice(&inj_tokens);
-                        let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
-                        generated.extend_from_slice(&inj_tokens);
-                        emitted_idx = generated.len();
-                        for ev in parser.feed(&inj) {
+            if force_active && let Some(key) = parser.next_required_param_to_force(&force_required)
+            {
+                let inj = format!("<parameter={key}>\n");
+                let inj_tokens = self.encode_raw(&inj)?;
+                if !inj_tokens.is_empty() {
+                    // Forward the still-unforwarded `last` plus the opener
+                    // in one extend; `last` is consumed (already pushed +
+                    // fed in the prior step).
+                    let mut combined = Vec::with_capacity(1 + inj_tokens.len());
+                    combined.push(last);
+                    combined.extend_from_slice(&inj_tokens);
+                    let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
+                    generated.extend_from_slice(&inj_tokens);
+                    emitted_idx = generated.len();
+                    for ev in parser.feed(&inj) {
+                        forward_parse_event(ev, &mut on_event)?;
+                    }
+                    if debug_qwen_tools {
+                        eprintln!("[qwen35-tools] forced required param {key:?}");
+                    }
+                    // `next2` is produced-but-unforwarded — it becomes the
+                    // new `last`; push + feed it to restore the loop's
+                    // top-of-iteration invariant, then re-evaluate.
+                    last = next2;
+                    pos = pos2;
+                    generated.push(last);
+                    if let Ok(text) = self.decode(&generated[emitted_idx..])
+                        && !text.is_empty()
+                        && !text.contains('\u{FFFD}')
+                    {
+                        for ev in parser.feed(&text) {
                             forward_parse_event(ev, &mut on_event)?;
                         }
-                        if debug_qwen_tools {
-                            eprintln!("[qwen35-tools] forced required param {key:?}");
-                        }
-                        // `next2` is produced-but-unforwarded — it becomes the
-                        // new `last`; push + feed it to restore the loop's
-                        // top-of-iteration invariant, then re-evaluate.
-                        last = next2;
-                        pos = pos2;
-                        generated.push(last);
-                        if let Ok(text) = self.decode(&generated[emitted_idx..]) {
-                            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                                for ev in parser.feed(&text) {
-                                    forward_parse_event(ev, &mut on_event)?;
-                                }
-                                emitted_idx = generated.len();
-                            }
-                        }
-                        if self.eos_tokens.contains(&last) {
-                            break;
-                        }
-                        continue;
+                        emitted_idx = generated.len();
                     }
+                    if self.eos_tokens.contains(&last) {
+                        break;
+                    }
+                    continue;
                 }
             }
             // Grammar-masked decode when active: same forward (KV + SSM state
@@ -3950,18 +5215,18 @@ impl MlxQwen35Backend {
             pos = new_pos;
             generated.push(next);
             let tail_start = emitted_idx;
-            if tail_start < generated.len() {
-                if let Ok(text) = self.decode(&generated[tail_start..]) {
-                    if !text.is_empty() && !text.contains('\u{FFFD}') {
-                        if debug_qwen_tools {
-                            eprintln!("[qwen35-tools] step={step} text={text:?}");
-                        }
-                        for ev in parser.feed(&text) {
-                            forward_parse_event(ev, &mut on_event)?;
-                        }
-                        emitted_idx = generated.len();
-                    }
+            if tail_start < generated.len()
+                && let Ok(text) = self.decode(&generated[tail_start..])
+                && !text.is_empty()
+                && !text.contains('\u{FFFD}')
+            {
+                if debug_qwen_tools {
+                    eprintln!("[qwen35-tools] step={step} text={text:?}");
                 }
+                for ev in parser.feed(&text) {
+                    forward_parse_event(ev, &mut on_event)?;
+                }
+                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -4177,11 +5442,12 @@ impl MlxQwen35Backend {
         // ── Decode loop (parallel to chat_streaming) ──
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
@@ -4196,11 +5462,12 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            if let Ok(text) = self.decode(&generated) {
-                if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
-                }
+            if let Ok(text) = self.decode(&generated)
+                && text.len() > prev_text.len()
+                && !text.contains('\u{FFFD}')
+            {
+                on_token(&text[prev_text.len()..]);
+                prev_text = text;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -4227,17 +5494,19 @@ impl MlxQwen35Backend {
     /// delivery. No-op when `persist` is `None` or the disk tier is off;
     /// non-fatal on error (the request already succeeded).
     fn persist_boundary_snapshot(&mut self, persist: Option<(u64, Vec<u32>)>, key: &str) {
-        if let Some((snap_id, prefix)) = persist {
-            if let Err(e) = self
+        if let Some((snap_id, prefix)) = persist
+            && let Err(e) = self
                 .runner
                 .persist_snapshot_disk(snap_id, key, &prefix, None)
-            {
-                eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
-            }
+        {
+            eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
         }
         // L2 spill: under memory pressure, drop cold in-memory snapshots (now
         // durably on disk) to free RAM; they rehydrate on next access. Off
-        // unless `LUMEN_KV_SPILL_MEM_GB` is set.
+        // unless `LUMEN_KV_SPILL_MEM_GB` is set. Gated because the pressure
+        // probe reads MLX active memory, which has no meaning — and no
+        // symbol — without `mlx-native`.
+        #[cfg(feature = "mlx-native")]
         if crate::kv_disk::under_memory_pressure() {
             let keep = crate::kv_disk::spill_keep_floor();
             let before = self.prefix_store.len();
@@ -4426,11 +5695,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -4455,11 +5725,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -4501,11 +5772,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d1);
                 history.push(d1);
                 stats.committed_via_spec += 2;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&d0) || self.eos_tokens.contains(&d1) {
                     break;
@@ -4519,11 +5791,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, row1);
                 history.push(row1);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&row1) {
                     break;
@@ -4546,11 +5819,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d0);
                 history.push(d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&d0) {
                     break;
@@ -4567,11 +5841,12 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, after_d0);
                 history.push(after_d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&after_d0) {
                     break;
@@ -4632,11 +5907,12 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -4682,11 +5958,12 @@ impl MlxQwen35Backend {
                     break;
                 }
                 generated.push(*tok);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(tok) {
                     stop = true;
@@ -4801,11 +6078,12 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated) {
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                on_token(&text);
-                prev_text = text;
-            }
+        if let Ok(text) = self.decode(&generated)
+            && !text.is_empty()
+            && !text.contains('\u{FFFD}')
+        {
+            on_token(&text);
+            prev_text = text;
         }
 
         if !self.eos_tokens.contains(&last) {
@@ -4814,11 +6092,12 @@ impl MlxQwen35Backend {
                 last = next;
                 pos = new_pos;
                 generated.push(next);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Ok(text) = self.decode(&generated)
+                    && text.len() > prev_text.len()
+                    && !text.contains('\u{FFFD}')
+                {
+                    on_token(&text[prev_text.len()..]);
+                    prev_text = text;
                 }
                 if self.eos_tokens.contains(&next) {
                     break;
@@ -5055,6 +6334,112 @@ pub(crate) struct LoadInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // Smoke test
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression guards for the grammar-routing defects.
+///
+/// Each test names the behaviour it restores and the symptom that behaviour
+/// had before. `tools/red_green.py` re-derives the red state mechanically by
+/// reverting the fix and asserting these fail — a claim that "this was broken"
+/// is only worth as much as a way to reproduce it.
+#[cfg(all(test, feature = "mlx-native"))]
+mod grammar_routing_regressions {
+    use super::{gemma4_grammar_would_constrain, hold_back_last_prompt_token};
+    use crate::chat_io::{ResolvedToolChoice, ToolDef};
+
+    fn one_tool() -> Vec<ToolDef<'static>> {
+        vec![ToolDef {
+            name: "get_weather",
+            description: None,
+            parameters: None,
+            response: None,
+        }]
+    }
+
+    // ── Gemma 4 non-streaming ran with no grammar at all ──────────────────
+    // RED: a non-streaming `tool_choice=required` returned `迎get_weather`.
+    // Only `response_format` was re-routed to the streaming decode, so tool
+    // requests kept the batched `generate()` path, which applies no mask.
+
+    #[test]
+    fn tools_alone_must_route_through_the_grammar_aware_decode() {
+        assert!(
+            gemma4_grammar_would_constrain(None, &one_tool(), &ResolvedToolChoice::Auto),
+            "a tool request gets a grammar, so it cannot use the unmasked batched path"
+        );
+        assert!(gemma4_grammar_would_constrain(
+            None,
+            &one_tool(),
+            &ResolvedToolChoice::Required
+        ));
+    }
+
+    #[test]
+    fn requests_that_get_no_grammar_keep_the_fast_path() {
+        // The re-route costs a cold prefill, so it must not fire for requests
+        // that would not be constrained anyway.
+        assert!(
+            !gemma4_grammar_would_constrain(None, &[], &ResolvedToolChoice::Auto),
+            "no tools, no schema"
+        );
+        assert!(
+            !gemma4_grammar_would_constrain(None, &one_tool(), &ResolvedToolChoice::None),
+            "tool_choice=none builds no grammar"
+        );
+    }
+
+    #[test]
+    fn a_schema_routes_even_without_tools() {
+        let schema = serde_json::json!({ "type": "object" });
+        assert!(gemma4_grammar_would_constrain(
+            Some(&schema),
+            &[],
+            &ResolvedToolChoice::Auto
+        ));
+    }
+
+    // ── Qwen 3.6: the first generated token escaped the mask ──────────────
+    // RED: `tool_choice=required` never enforced anything. Prefill argmaxed
+    // its last position unmasked, and the caller responded to the resulting
+    // mismatch by dropping the grammar.
+
+    #[test]
+    fn an_active_grammar_holds_the_last_prompt_token_back() {
+        assert!(
+            hold_back_last_prompt_token(true, &[1, 2, 3], None),
+            "the first generated token must be produced under the mask"
+        );
+    }
+
+    #[test]
+    fn no_grammar_means_the_prefill_is_untouched() {
+        assert!(
+            !hold_back_last_prompt_token(false, &[1, 2, 3], None),
+            "the unconstrained path must stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_image_placeholder_is_never_held_back() {
+        // Splitting a placeholder off the prompt tail would tear a run out of
+        // the span the images are spliced over.
+        assert!(
+            !hold_back_last_prompt_token(true, &[1, 2, 77], Some(77)),
+            "the tail is an image placeholder"
+        );
+        assert!(
+            hold_back_last_prompt_token(true, &[77, 2, 3], Some(77)),
+            "a placeholder elsewhere in the prompt is fine"
+        );
+    }
+
+    #[test]
+    fn a_single_token_prompt_is_left_alone() {
+        assert!(
+            !hold_back_last_prompt_token(true, &[1], None),
+            "there is nothing to prefill if the only token is held back"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -5436,6 +6821,8 @@ mod tests {
         assert!(auto_prefix_key(&empty_sys).is_none());
     }
 
+    #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to
+    // `bench_qwen35_mtp_realprompt`, which parses its own.
     fn parse_prompt_tokens_env() -> Option<Vec<u32>> {
         let raw = std::env::var("PROMPT_TOKENS").ok()?;
         let tokens: Vec<u32> = raw
@@ -5483,9 +6870,13 @@ mod tests {
         fn forward_probe(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
             let row_argmaxes: Vec<u32> = tokens.iter().map(|t| t + 1).collect();
             let row_max_abs = vec![1.0_f32; tokens.len()];
+            // A wide, uniform gap: this fake never produces a near-tie, so a
+            // consumer that treats small gaps specially takes its ordinary path.
+            let row_top2_gap = vec![1.0_f32; tokens.len()];
             Ok(ProbeRows {
                 row_argmaxes,
                 row_max_abs,
+                row_top2_gap,
                 position: tokens.len(),
             })
         }

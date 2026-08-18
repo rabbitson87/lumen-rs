@@ -131,18 +131,13 @@ pub enum BackendStreamEvent<'a> {
 /// entirely, `Required` and `Tool(name)` prefill `<|tool_call>` (and
 /// optionally `call:NAME{`) at the end of the generation prompt so
 /// the model MUST start generating a tool call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ResolvedToolChoice<'a> {
+    #[default]
     Auto,
     None,
     Required,
     Tool(&'a str),
-}
-
-impl Default for ResolvedToolChoice<'_> {
-    fn default() -> Self {
-        ResolvedToolChoice::Auto
-    }
 }
 
 /// Heuristic: does this user-role message look like a client-injected
@@ -186,27 +181,43 @@ pub fn is_client_meta_wrapper(content: &str) -> bool {
 /// `tool_choice="required"` (OpenAI) or `tool_choice={type:"any"}`
 /// (Anthropic) parameters, both first-class.
 pub fn strip_client_meta_wrappers(turns: &mut Vec<ChatTurn<'_>>) {
+    let _ = strip_client_meta_wrappers_indexed(turns);
+}
+
+/// [`strip_client_meta_wrappers`] that also reports, for each surviving turn,
+/// its index in the input.
+///
+/// The turn counterpart of [`strip_client_meta_wrappers_flat_indexed`], and it
+/// exists for the same reason: a caller carrying a per-turn side table — image
+/// attachments — has to filter it with the *same* predicate, or entry `i` ends
+/// up describing a different turn than it did before the strip.
+pub fn strip_client_meta_wrappers_indexed(turns: &mut Vec<ChatTurn<'_>>) -> Vec<usize> {
     if std::env::var("LUMEN_STRIP_CLIENT_META_WRAPPERS")
         .map(|s| s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false)
     {
-        return;
+        return (0..turns.len()).collect();
     }
     let before = turns.len();
-    turns.retain(|t| match t {
-        ChatTurn::User(s) => {
-            if is_client_meta_wrapper(s) {
+    let mut kept: Vec<usize> = Vec::with_capacity(before);
+    let mut idx = 0usize;
+    turns.retain(|t| {
+        let i = idx;
+        idx += 1;
+        match t {
+            ChatTurn::User(s) if is_client_meta_wrapper(s) => {
                 let preview: String = s.trim().chars().take(80).collect();
                 eprintln!(
                     "[chat-io] stripped client meta-wrapper user turn (len={}): {preview:?}...",
                     s.len()
                 );
                 false
-            } else {
+            }
+            _ => {
+                kept.push(i);
                 true
             }
         }
-        _ => true,
     });
     if turns.len() < before {
         eprintln!(
@@ -215,6 +226,7 @@ pub fn strip_client_meta_wrappers(turns: &mut Vec<ChatTurn<'_>>) {
             before - turns.len()
         );
     }
+    kept
 }
 
 /// Heuristic classification of the chat request into "agent" vs "chat"
@@ -256,7 +268,7 @@ where
     S2: AsRef<str>,
 {
     // Strongest signal: explicit `task_complete` tool.
-    if tool_names.iter().any(|n| *n == "task_complete") {
+    if tool_names.contains(&"task_complete") {
         return InferredMode::Agent;
     }
 
@@ -296,14 +308,30 @@ where
 /// semantics and env override (`LUMEN_STRIP_CLIENT_META_WRAPPERS=0`)
 /// as the structured variant.
 pub fn strip_client_meta_wrappers_flat(messages: &mut Vec<(String, String)>) {
+    let _ = strip_client_meta_wrappers_flat_indexed(messages);
+}
+
+/// [`strip_client_meta_wrappers_flat`] that also reports, for each surviving
+/// message, its index in the input.
+///
+/// Callers that carry a per-message side table — image attachments, in
+/// particular — must filter it with the *same* predicate, or entry `i` ends up
+/// describing a different turn than it did before the strip. Returning the
+/// surviving indices keeps that predicate in one place instead of inviting a
+/// second, drifting copy at the call site.
+pub fn strip_client_meta_wrappers_flat_indexed(messages: &mut Vec<(String, String)>) -> Vec<usize> {
     if std::env::var("LUMEN_STRIP_CLIENT_META_WRAPPERS")
         .map(|s| s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false)
     {
-        return;
+        return (0..messages.len()).collect();
     }
     let before = messages.len();
+    let mut kept: Vec<usize> = Vec::with_capacity(before);
+    let mut idx = 0usize;
     messages.retain(|(role, content)| {
+        let i = idx;
+        idx += 1;
         let is_user = matches!(role.as_str(), "user" | "User" | "USER");
         if is_user && is_client_meta_wrapper(content) {
             let preview: String = content.trim().chars().take(80).collect();
@@ -313,6 +341,7 @@ pub fn strip_client_meta_wrappers_flat(messages: &mut Vec<(String, String)>) {
             );
             false
         } else {
+            kept.push(i);
             true
         }
     });
@@ -323,6 +352,7 @@ pub fn strip_client_meta_wrappers_flat(messages: &mut Vec<(String, String)>) {
             before - messages.len()
         );
     }
+    kept
 }
 
 #[cfg(test)]
@@ -373,5 +403,40 @@ mod meta_wrapper_tests {
         assert_eq!(turns.len(), 4);
         // Real user turn preserved
         assert!(matches!(turns[1], ChatTurn::User(s) if s == "What's the weather?"));
+    }
+
+    const WRAPPER: &str = "If you have fully completed the task, call the task_complete \
+                           tool now. Otherwise return your final answer.";
+
+    fn flat(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    }
+
+    /// The surviving indices are what lets a caller filter a parallel
+    /// side-table (image attachments) in lockstep with the messages.
+    #[test]
+    fn indexed_strip_reports_surviving_positions() {
+        let mut msgs = flat(&[
+            ("system", "be helpful"),
+            ("user", WRAPPER),
+            ("user", "what is in this image?"),
+        ]);
+        let kept = strip_client_meta_wrappers_flat_indexed(&mut msgs);
+        assert_eq!(kept, vec![0, 2]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].1, "what is in this image?");
+    }
+
+    #[test]
+    fn indexed_strip_is_identity_when_nothing_matches() {
+        let mut msgs = flat(&[("system", "be helpful"), ("user", "hello")]);
+        assert_eq!(
+            strip_client_meta_wrappers_flat_indexed(&mut msgs),
+            vec![0, 1]
+        );
+        assert_eq!(msgs.len(), 2);
     }
 }

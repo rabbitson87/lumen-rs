@@ -4,10 +4,20 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+# Vision input decoding for the Gemma 4 image tower (PNG/JPEG/WebP in,
+# bicubic resize onto the patch grid). No encoder side is needed here.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+] }
 tokenizers = "0.23.1"
 hf-hub = "0.5.0"
 # Phase 2 — grammar-constrained tool calling. JSON Schema → token mask
@@ -41,6 +51,10 @@ minijinja-contrib = { version = "2.13", features = ["pycompat"] }
 # Gaussianization. Pulled into lumen-mlx for the K-rotation lever in the
 # sliding quantized cache (LUMEN_GEMMA4_QUANT_KV_SLIDING_ROTATE=1).
 lumen-core = { path = "../lumen-core" }
+# Env-flag macro + link-time registry (005 Phase 2). Every boolean LUMEN_* gate
+# migrates to `lumen_flags::flag!` so `cargo xtask flags` can enumerate, doc
+# and equivalence-test them.
+lumen-flags = { path = "../lumen-flags" }
 # Native MLX runner scaffold. This stays opt-in (off by default; gate
 # via `--features mlx-native`) because the dependency tree includes a
 # patched mlx-rs / mlx-sys fork with our Kestrel custom primitives
@@ -86,6 +100,127 @@ mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
-# A/B benchmark only: compares the custom Nvfp4 Metal kernel against the mlx FFI
-# quantized_matmul(NVFP4) path. Not a production dependency of lumen-mlx.
-lumen-metal = { path = "../lumen-metal" }
+# Structure-aware generators for the tool-calling text surface. Shared with the
+# libFuzzer targets so the deterministic driver and the soak driver walk the
+# same inputs.
+lumen-testkit = { path = "../lumen-testkit" }
+
+# ── Examples that cannot build under `default = []` ───────────────────────────
+#
+# Most examples here handle the featureless build themselves, with a
+# `#[cfg(feature = "mlx-native")] fn main()` and a stub for the other side.
+# These twelve name `mlx_rs` types (or `lumen_mlx` re-exports that are gated on
+# it) at module scope, where a `cfg` on `main` cannot help. Per
+# `docs/maintainer-workflow.md` §6 they declare the feature instead, so a plain
+# `cargo test -p lumen-mlx` skips them rather than failing to compile.
+#
+# Without these entries the crate's own default configuration does not build,
+# which is how `qwen3_5_mtp` silently lost its feature gate: nothing ever ran
+# the build that would have caught it.
+[[example]]
+name = "bench_affine4_qmv_decode"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_mtp_headinternal_poc"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_mtp_ref_compare"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_ab"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_decode_smoke"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_loader_smoke"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_realprompt"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "bench_qwen35_mtp_step_b"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m1_affine4_qmv_custom"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2a_conv_silu_fused"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2b_qk_rmsnorm_fused"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "m2c_inproj_tail_fused"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "kv_concurrency_ab"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "prefill_chunk_equivalence"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "kv_bf16_ab"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "kv_bf16_quality"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "dump_flags"
+required-features = ["mlx-native"]
+
+[[test]]
+name = "config_faults"
+# No feature: the Qwen config parser was hoisted to ungated `qwen35_config`
+# precisely so this sweep runs in the default build.
+
+[[test]]
+name = "vision_config_validate"
+
+[[test]]
+name = "chat_io_meta_wrapper"
+
+# Own binary: sets LUMEN_STRIP_CLIENT_META_WRAPPERS, which the strip functions
+# read from the process environment — sharing a binary would silently turn the
+# sibling tests' strip assertions into no-ops.
+[[test]]
+name = "chat_io_meta_wrapper_env"
+
+[[test]]
+name = "kv_disk_store_policy"
+
+[[test]]
+name = "qwen35_config_validate"
+
+[[test]]
+name = "gemma4_config_validate"
+
+# Own binary: it sets process-global env vars that `load()` reads, so sharing a
+# binary with the other config tests would race them.
+[[test]]
+name = "gemma4_config_env"
+
+[[test]]
+name = "gemma4_config_faults"
+# No feature: the Gemma 4 config parser was hoisted to ungated `gemma4_config`
+# for the same reason its Qwen counterpart was.
+
+[[test]]
+name = "weights_faults"
+required-features = ["mlx-native"]

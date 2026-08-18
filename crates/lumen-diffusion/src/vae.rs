@@ -137,7 +137,7 @@ mod imp {
             let bytes = &self.blob[self.data_start + m.start..self.data_start + m.end];
             let data: Vec<f32> = match m.dtype.as_str() {
                 "BF16" => {
-                    if bytes.len() % 2 != 0 {
+                    if !bytes.len().is_multiple_of(2) {
                         bail!("BF16 tensor {name} has odd byte length");
                     }
                     bytes
@@ -661,7 +661,9 @@ mod parity_tests {
     }
 
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND /tmp/vae_latent.bin plus the \
+                /tmp/dbg_after_*.bin stage dumps; no committed script produces \
+                them — see crates/lumen-mlx/tests/golden/README.md"]
     fn vae_decoder_debug_stages() {
         let latent_cf = read_f32_bin("/tmp/vae_latent.bin");
         let latent = Array::from_slice(&latent_cf, &[1, 32, 16, 16]);
@@ -701,13 +703,15 @@ mod parity_tests {
     /// Golden parity: numpy reference decode (channels-first) vs native mlx-rs
     /// decode (channels-last). Run `/tmp/vae_ref.py` first to produce the bins.
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND /tmp/vae_{latent,out}.bin reference \
+                dumps; no committed script produces them — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn vae_decoder_matches_reference() {
         // latent [1,32,16,16] channels-first.
         let latent_cf = read_f32_bin("/tmp/vae_latent.bin");
-        assert_eq!(latent_cf.len(), 1 * 32 * 16 * 16, "latent size");
+        assert_eq!(latent_cf.len(), 32 * 16 * 16, "latent size");
         let expected = read_f32_bin("/tmp/vae_out.bin"); // [1,3,128,128] channels-first
-        assert_eq!(expected.len(), 1 * 3 * 128 * 128, "expected size");
+        assert_eq!(expected.len(), 3 * 128 * 128, "expected size");
 
         // Build channels-first array then transpose to channels-last [1,16,16,32].
         let latent = Array::from_slice(&latent_cf, &[1, 32, 16, 16]);

@@ -138,6 +138,11 @@ mod imp {
         /// common prompt prefix across the active batch. Empty for seqs created
         /// via snapshot fork (those don't participate in dedup).
         prompt: Vec<u32>,
+        /// MRoPE position minus token count for this seq's prompt — nonzero
+        /// only when an image shortened the position run. Decode adds it to
+        /// `cache.offset()` so the fused rope keeps counting from the right
+        /// place. `0` on every text-only seq, which is the byte-identical path.
+        mrope_delta: i32,
     }
 
     /// process-wide background worker that runs
@@ -434,7 +439,7 @@ mod imp {
                     "native mlx-rs loader requires non-zero attention heads, KV heads, and layers"
                 ));
             }
-            if self.hidden_size % self.num_attention_heads != 0 {
+            if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
                 return Err(anyhow!(
                     "native mlx-rs loader expected hidden_size to be divisible by num_attention_heads, got {} % {}",
                     self.hidden_size,
@@ -1070,12 +1075,19 @@ mod imp {
         seen.then_some(best_idx as u32)
     }
 
+    /// `vision` carries an image-bearing prompt's extras, all addressed
+    /// against the **whole** prompt: per-token MRoPE positions, the placeholder
+    /// runs, and each image's encoded block. Each chunk gets the slice of
+    /// positions it covers and splices whichever image rows fall inside it.
+    /// `None` is the text path, unchanged.
+    #[allow(clippy::type_complexity)]
     fn forward_chunked(
         model: &NativeQwen3_5MoeModel,
         tokens: &[u32],
         cache: &mut NativePromptCache,
         last_only: bool,
         label: &str,
+        vision: Option<(&[[i32; 3]], &[(usize, usize)], &[Array])>,
     ) -> Result<Array> {
         let requested_chunk = qwen35_prefill_chunk();
         let n = tokens.len();
@@ -1094,33 +1106,38 @@ mod imp {
         // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
         // chunk override.
         let chunk = {
-            let scores_budget_bytes: u64 = std::env::var("LUMEN_QWEN35_PREFILL_SCORES_GB")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|&g| g > 0.0)
-                .map(|g| (g * 1e9) as u64)
-                .unwrap_or(8_000_000_000);
-            // f32 worst case for the scores accumulator (bf16 only halves it).
-            const SCORES_BYTES_PER_ELEM: u64 = 4;
-            let heads = model.config().text_config.num_attention_heads.max(1) as u64;
-            let kv_upper = (n as u64).max(1);
-            let max_safe_chunk = (scores_budget_bytes / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
-                .max(256) as usize;
-            let clamped = requested_chunk.min(max_safe_chunk);
-            if clamped < requested_chunk {
+            // The arithmetic lives in `prefill_budget` so it can be swept at
+            // tier 0 (it is this crate's `malloc`-fail-at-N analogue: MLX
+            // allocation cannot fail into an `Err`, so the guard is to not
+            // allocate). Behaviour here is unchanged by the hoist.
+            let budget =
+                crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB");
+            let d = crate::prefill_budget::clamp_chunk(
+                requested_chunk,
+                budget,
+                model.config().text_config.num_attention_heads,
+                n,
+            );
+            if d.clamped() {
                 eprintln!(
-                    "[prefill] qwen chunk clamped {requested_chunk} → {clamped} \
-                     (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                    "[prefill] qwen chunk clamped {requested_chunk} → {} \
+                     (heads={} kv_upper={} budget={:.1}GB) — \
                      keeps single-chunk full-attn scores under the Metal buffer cap",
-                    scores_budget_bytes as f64 / 1e9
+                    d.chunk,
+                    d.heads.max(1),
+                    d.kv_upper.max(1),
+                    budget as f64 / 1e9
                 );
             }
-            clamped
+            d.chunk
         };
         if n <= chunk {
-            return model
-                .forward_with_opts(tokens, cache, last_only)
-                .with_context(|| format!("{label}: forward ({n} tokens)"));
+            return match vision {
+                Some((positions, runs, soft)) => model
+                    .forward_chunk_with_images(tokens, cache, last_only, positions, 0, runs, soft),
+                None => model.forward_with_opts(tokens, cache, last_only),
+            }
+            .with_context(|| format!("{label}: forward ({n} tokens)"));
         }
         let n_chunks = n.div_ceil(chunk);
         let report = std::env::var("LUMEN_QWEN35_PREFILL_CHUNK_LOG")
@@ -1137,16 +1154,26 @@ mod imp {
             // discarded. The final chunk honours the caller's `last_only`.
             let lo = if is_last { last_only } else { true };
             let t0 = report.then(std::time::Instant::now);
-            let out = model
-                .forward_with_opts(&tokens[start..end], cache, lo)
-                .with_context(|| {
-                    format!(
-                        "{label}: chunk {}/{} ({} tokens)",
-                        idx + 1,
-                        n_chunks,
-                        end - start
-                    )
-                })?;
+            let out = match vision {
+                Some((positions, runs, soft)) => model.forward_chunk_with_images(
+                    &tokens[start..end],
+                    cache,
+                    lo,
+                    &positions[start..end],
+                    start,
+                    runs,
+                    soft,
+                ),
+                None => model.forward_with_opts(&tokens[start..end], cache, lo),
+            }
+            .with_context(|| {
+                format!(
+                    "{label}: chunk {}/{} ({} tokens)",
+                    idx + 1,
+                    n_chunks,
+                    end - start
+                )
+            })?;
             // CRITICAL: force evaluation so the chunk's transient graph is freed
             // before the next chunk (see fn doc). Bit-identical to single-pass.
             out.eval()
@@ -1175,9 +1202,14 @@ mod imp {
 
     impl NativeMlxRunner {
         pub(crate) fn new() -> Result<Self> {
-            let timing_enabled = std::env::var("LUMEN_NATIVE_TIMING")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
+            // Through the registry, not `env::var`. This site used to read the
+            // variable directly, which meant two things at once: it ignored the
+            // flag's `with()` / `set()` overrides — so a harness enabling
+            // timing registry-side got it everywhere except here — and it kept
+            // the OLD parse rule (`1|true|TRUE|yes`) after the registry moved
+            // to "any non-`0`". `LUMEN_NATIVE_TIMING=on` was true for the flag
+            // and false for this line.
+            let timing_enabled = crate::native_runtime::fine_timing_active();
             // Lightweight stage timing (forward+eval / tail) without the
             // layer-kind fine probes that force intermediate evals. Used for
             // apples-to-apples Native vs PyO3 stage comparison.
@@ -1305,6 +1337,42 @@ mod imp {
         }
 
         pub(crate) fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.prefill_with_images(seq_id, tokens, &[])
+        }
+
+        /// Decode + resize one image onto the tower's patch grid.
+        pub(crate) fn prepare_image(
+            &self,
+            encoded: &[u8],
+        ) -> Result<crate::qwen36_vision::PreparedImage> {
+            self.require_model()?.prepare_image(encoded)
+        }
+
+        /// Token id whose embedding rows the vision features replace.
+        pub(crate) fn image_token_id(&self) -> Option<u32> {
+            self.model.as_ref().and_then(|m| m.image_token_id())
+        }
+
+        /// The loaded tower's config, for header-only prompt sizing.
+        pub(crate) fn vision_config(
+            &self,
+        ) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+            self.model.as_ref().and_then(|m| m.vision_config())
+        }
+
+        /// [`Self::prefill`] with encoded images spliced over their
+        /// placeholder runs.
+        ///
+        /// `images` are already decoded and resized; this encodes each once
+        /// before the chunk loop, derives the prompt's MRoPE positions, and
+        /// records the position/token-count delta so decode can keep using the
+        /// fused rope. An empty slice is byte-identical to [`Self::prefill`].
+        pub(crate) fn prefill_with_images(
+            &mut self,
+            seq_id: u64,
+            tokens: &[u32],
+            images: &[crate::qwen36_vision::PreparedImage],
+        ) -> Result<(u32, usize)> {
             if tokens.is_empty() {
                 return Err(anyhow!("native mlx-rs runner: prefill given empty tokens"));
             }
@@ -1322,10 +1390,44 @@ mod imp {
             // bench. Default: optimization ON.
             let last_only = std::env::var("LUMEN_NATIVE_LM_HEAD_FULL").is_err();
             let t_start = timing_on.then(Instant::now);
-            let logits = forward_chunked(model, tokens, &mut cache, last_only, "native-prefill")
-                .with_context(|| {
-                    format!("native mlx-rs runner: prefill forward (seq_id={seq_id})")
-                })?;
+
+            // Encode every image up front: the placeholder runs are
+            // prompt-global, so any chunk may need any of them.
+            let vision = if images.is_empty() {
+                None
+            } else {
+                let image_token = model
+                    .image_token_id()
+                    .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+                let merge = model
+                    .vision_merge_size()
+                    .ok_or_else(|| anyhow!("vision tower not loaded"))?;
+                let grids: Vec<(usize, usize)> =
+                    images.iter().map(|p| p.merged_grid(merge)).collect();
+                let positions = crate::qwen36_vision::mrope_positions(tokens, image_token, &grids)
+                    .map_err(|e| anyhow!("native mlx-rs runner: mrope positions: {e}"))?;
+                let (runs, soft) = model.encode_images_for_prompt(tokens, images)?;
+                Some((positions, runs, soft))
+            };
+            // Positions run shorter than tokens once an image is present; the
+            // difference is what decode has to add to `cache.offset()`.
+            let mrope_delta = vision
+                .as_ref()
+                .map(|(pos, _, _)| crate::qwen36_vision::next_position(pos) - tokens.len() as i32)
+                .unwrap_or(0);
+            let vision_ref = vision
+                .as_ref()
+                .map(|(p, r, s)| (p.as_slice(), r.as_slice(), s.as_slice()));
+
+            let logits = forward_chunked(
+                model,
+                tokens,
+                &mut cache,
+                last_only,
+                "native-prefill",
+                vision_ref,
+            )
+            .with_context(|| format!("native mlx-rs runner: prefill forward (seq_id={seq_id})"))?;
             if timing_on {
                 logits
                     .eval()
@@ -1373,6 +1475,7 @@ mod imp {
                     mtp_kv: NativeKvCache::new(),
                     mtp_carried: None,
                     prompt: tokens.to_vec(),
+                    mrope_delta,
                 },
             );
             Ok((next_tok, position))
@@ -1450,6 +1553,7 @@ mod imp {
                     mtp_kv: NativeKvCache::new(),
                     mtp_carried: None,
                     prompt: tokens.to_vec(),
+                    mrope_delta: 0,
                 },
             );
             Ok((next_tok, position, captured))
@@ -1505,7 +1609,12 @@ mod imp {
             let next_tok = if self.timing_log.is_some() {
                 let t0 = Instant::now();
                 let logits = model
-                    .forward_with_opts(&[last_token], &mut state.cache, /* last_only */ true)
+                    .forward_decode_shifted(
+                        &[last_token],
+                        &mut state.cache,
+                        /* last_only */ true,
+                        state.mrope_delta,
+                    )
                     .with_context(|| {
                         format!("native mlx-rs runner: decode forward (seq_id={seq_id})")
                     })?;
@@ -1528,7 +1637,12 @@ mod imp {
                 next_tok
             } else {
                 let logits = model
-                    .forward_with_opts(&[last_token], &mut state.cache, /* last_only */ true)
+                    .forward_decode_shifted(
+                        &[last_token],
+                        &mut state.cache,
+                        /* last_only */ true,
+                        state.mrope_delta,
+                    )
                     .with_context(|| {
                         format!("native mlx-rs runner: decode forward (seq_id={seq_id})")
                     })?;
@@ -1630,10 +1744,10 @@ mod imp {
                     };
                     // Every seq shares prompt[..p] by construction of the LCP.
                     for id in seq_ids {
-                        if let Some(s) = self.seqs.get_mut(id) {
-                            if s.cache.shared_prefix_len() == 0 {
-                                s.cache.keep_suffix_from(p)?;
-                            }
+                        if let Some(s) = self.seqs.get_mut(id)
+                            && s.cache.shared_prefix_len() == 0
+                        {
+                            s.cache.keep_suffix_from(p)?;
                         }
                     }
                     eprintln!(
@@ -1653,16 +1767,15 @@ mod imp {
                         .map(|s| s.prompt[..p].to_vec());
                     if let Some(refpx) = reference {
                         for id in seq_ids {
-                            if let Some(s) = self.seqs.get_mut(id) {
-                                if s.cache.shared_prefix_len() == 0
-                                    && s.prompt.len() >= p
-                                    && s.prompt[..p] == refpx[..]
-                                {
-                                    s.cache.keep_suffix_from(p)?;
-                                    eprintln!(
-                                        "[mlx shared-prefix] attached late seq {id} at prefix_len={p}"
-                                    );
-                                }
+                            if let Some(s) = self.seqs.get_mut(id)
+                                && s.cache.shared_prefix_len() == 0
+                                && s.prompt.len() >= p
+                                && s.prompt[..p] == refpx[..]
+                            {
+                                s.cache.keep_suffix_from(p)?;
+                                eprintln!(
+                                    "[mlx shared-prefix] attached late seq {id} at prefix_len={p}"
+                                );
                             }
                         }
                     }
@@ -1874,10 +1987,11 @@ mod imp {
             let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
                 anyhow!("native mlx-rs runner: extend on unknown seq_id {seq_id}")
             })?;
-            let logits = forward_chunked(model, tokens, &mut state.cache, true, "native-extend")
-                .with_context(|| {
-                    format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
-                })?;
+            let logits =
+                forward_chunked(model, tokens, &mut state.cache, true, "native-extend", None)
+                    .with_context(|| {
+                        format!("native mlx-rs runner: extend forward (seq_id={seq_id})")
+                    })?;
             let next_tok = model.argmax_last_token(&logits)?;
             state.position += tokens.len();
             Ok((next_tok, state.position))
@@ -2108,6 +2222,17 @@ mod imp {
                 mlx_rs::ops::abs(&kv).context("native mlx-rs runner: forward_probe abs failed")?;
             let max_abs = mlx_rs::ops::max_axis(&abs_kv, -1, /* keep_dims */ false)
                 .context("native mlx-rs runner: forward_probe max_axis failed")?;
+            // Per-row `top1 - top2` gap → [K] f32. `topk_axis` does not sort
+            // its output, so the gap is the spread of the two values rather
+            // than a subtraction in index order.
+            let top2 = mlx_rs::ops::indexing::topk_axis(&kv, 2, -1)
+                .context("native mlx-rs runner: forward_probe topk_axis failed")?;
+            let top2_hi = mlx_rs::ops::max_axis(&top2, -1, /* keep_dims */ false)
+                .context("native mlx-rs runner: forward_probe top2 max failed")?;
+            let top2_lo = mlx_rs::ops::min_axis(&top2, -1, /* keep_dims */ false)
+                .context("native mlx-rs runner: forward_probe top2 min failed")?;
+            let top2_gap = mlx_rs::ops::subtract(&top2_hi, &top2_lo)
+                .context("native mlx-rs runner: forward_probe top2 gap failed")?;
 
             argmaxes
                 .eval()
@@ -2115,14 +2240,19 @@ mod imp {
             max_abs
                 .eval()
                 .context("native mlx-rs runner: forward_probe eval(max_abs) failed")?;
+            top2_gap
+                .eval()
+                .context("native mlx-rs runner: forward_probe eval(top2_gap) failed")?;
 
             let row_argmaxes: Vec<u32> = argmaxes.as_slice::<u32>().to_vec();
             let row_max_abs: Vec<f32> = max_abs.as_slice::<f32>().to_vec();
+            let row_top2_gap: Vec<f32> = top2_gap.as_slice::<f32>().to_vec();
 
             state.position += k;
             Ok(ProbeRows {
                 row_argmaxes,
                 row_max_abs,
+                row_top2_gap,
                 position: state.position,
             })
         }
@@ -2310,6 +2440,9 @@ mod imp {
                     mtp_kv: NativeKvCache::new(),
                     mtp_carried: None,
                     prompt: Vec::new(),
+                    // Snapshots are only taken on text prefixes (image requests
+                    // bypass the prefix cache), so there is no shift to carry.
+                    mrope_delta: 0,
                 },
             );
             Ok(position)
@@ -2436,7 +2569,7 @@ mod imp {
 
         #[test]
         fn native_model_config_accepts_checked_in_qwen3_5_moe_fixture() -> Result<()> {
-            let fixture = include_str!("../../lumen-model/tests/fixtures/qwen3_5_moe_config.json");
+            let fixture = include_str!("../tests/fixtures/qwen3_5_moe_config.json");
             let config: NativeModelConfig = serde_json::from_str(fixture)?;
             let text = config.validate_qwen3_5_moe_contract()?;
 
@@ -2942,6 +3075,30 @@ mod imp {
             Err(anyhow!(
                 "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
             ))
+        }
+
+        // L2 disk tier. Both mirror what the real runner does when no disk
+        // tier is configured (`self.disk.is_none()`): persisting is a no-op
+        // and a lookup is a miss. Erroring instead would be louder but wrong —
+        // the caller treats a failure as "the disk write broke", and nothing
+        // broke here; there is simply no state. Unreachable in practice, since
+        // `load()` above fails long before anything holds a snapshot id.
+        pub(crate) fn persist_snapshot_disk(
+            &mut self,
+            _snapshot_id: u64,
+            _key: &str,
+            _prefix_tokens: &[u32],
+            _last_token: Option<u32>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        pub(crate) fn load_persisted_disk(
+            &mut self,
+            _key: &str,
+            _prompt_ids: &[u32],
+        ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+            Ok(None)
         }
 
         pub(crate) fn take_decode_timing_log(&mut self) -> Option<Vec<(f64, f64)>> {

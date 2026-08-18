@@ -88,6 +88,27 @@ export const ko: Record<string, string> = {
   "metrics.requestsPerMin": "req/min",
 
   // ── 디스크 KV 캐시 카드 ─────────────────────────────────────────
+  "spec.title": "추측 디코딩",
+  "spec.titleHint": "(초안 생성 후 검증)",
+  "spec.kind": "전략",
+  "spec.off": "끄기",
+  "spec.lookup": "Lookup",
+  "spec.mtp": "MTP",
+  "spec.hint.kind":
+    "기본값은 끄기입니다. Lookup은 프롬프트에 이미 있는 n-gram에서 초안을 만듭니다(추가 가중치 없음, 반복 많은 텍스트에 유리). MTP는 모델 자체의 multi-token-prediction 헤드를 쓰며 해당 헤드가 포함된 체크포인트가 필요합니다. 어느 쪽이든 출력은 동일합니다 \u2014 거절된 초안은 버려집니다. 설정 대상:",
+  "spec.draftK": "스텝당 초안 토큰 수",
+  "spec.hint.draftK":
+    "검증 전에 몇 토큰을 초안으로 만들지. 크면 스텝당 더 많이 만들지만 거절될 때 버리는 작업도 커집니다. 보통 1~2가 최적이고, 3을 넘으면 수용률이 절감폭보다 빨리 떨어집니다. 설정 대상:",
+  "batch.title": "배치 처리",
+  "batch.titleHint": "(스텝당 여러 요청 처리)",
+  "batch.enable": "연속 배칭",
+  "batch.off": "끄기",
+  "batch.on": "켜기",
+  "batch.hint.enable":
+    "여러 시퀀스를 한 번의 forward로 디코드합니다. 총 처리량은 올라가고 시퀀스당 속도는 내려갑니다. greedy 요청만 받으며 \u2014 temperature나 top-p가 있으면 단일 시퀀스 디코드로 돌아갑니다. 설정 대상:",
+  "batch.max": "스텝당 최대 시퀀스",
+  "batch.hint.max":
+    "함께 디코드할 시퀀스 상한. 동시 시퀀스마다 자기 KV 캐시를 들고 있으므로 처리량 노브인 동시에 메모리 노브입니다. 설정 대상:",
   "diskkv.title": "디스크 KV 캐시",
   "diskkv.titleHint": "(재시작 후에도 prefix KV 유지)",
   "diskkv.enable": "사용",
@@ -396,9 +417,6 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill 청크 크기",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
     "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048.",
-  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "배치 엔진 prefill 청크 크기 (실험적)",
-  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
-    "실험적: 배치 엔진(BATCHED_ENGINE=1, Gemma GGUF 전용)의 prefill 청크당 토큰 수. 장문 프롬프트의 prefill을 청크로 나누면 한 시퀀스가 거대한 단일 forward를 독점해 다른 배치 시퀀스를 head-of-line 정체시키는 것을 막습니다. 이 값보다 긴 프롬프트만 청킹되며, 짧은 프롬프트는 영향받지 않습니다. 기본 512.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "최대 프롬프트 토큰 (거부 상한)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
     "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다.",

@@ -30,29 +30,36 @@ mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
     use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
-    use std::sync::OnceLock;
 
     /// Block size for KV-cache pre-allocation. Mirrors `mlx_lm.cache.KVCache.step`.
     /// Decode appends in steps of 1 token; the underlying buffer grows by this
     /// many tokens at a time so concat / fresh alloc is amortized 1:KV_CACHE_STEP.
     pub const KV_CACHE_STEP: usize = 256;
 
-    /// Default ON since 2026-05-07 (Phase G2 LANDED): microbench long-prompt
-    /// 35B-mxfp4 n=12 interleaved A/B (PROMPT_LEN=2048, STEPS=1500) showed
-    /// Δ tps +4.67 tok/s (Welch t = +4.33σ), Δ p50 −1.02 ms/step (t = −4.68σ).
-    /// 32-step PyO3 golden bit-identical PASS for both paths. The prior
-    /// 2026-05-06 35B server-level WASH (-0.06σ) reflected dilution at the
-    /// server step (107ms/step → KV concat 0.7ms = 0.65%); microbench
-    /// 17ms/step exposes the same lever at 4% magnitude.
-    /// Set `LUMEN_NATIVE_KV_STEP_PREALLOC=0` to force legacy per-step
-    /// `concatenate_axis` for emergency revert / A/B comparison.
+    lumen_flags::flag! {
+        /// Grow the full-attn KV buffer in `KV_CACHE_STEP` (256) token blocks
+        /// and fill via `slice_update`, instead of a per-step
+        /// `concatenate_axis`. The legacy concat path stays live as the `=0`
+        /// emergency revert.
+        ///
+        /// Default ON since Phase G2: microbench long-prompt 35B-mxfp4 n=12
+        /// interleaved A/B (PROMPT_LEN=2048, STEPS=1500) showed Δtps
+        /// +4.67 tok/s (Welch t = +4.33σ), Δp50 −1.02 ms/step (t = −4.68σ),
+        /// with a 32-step PyO3 golden bit-identical PASS for both paths.
+        ///
+        /// This flag is the ancestor of the whole `lumen_flags` design: it was
+        /// the only one of the audited 370 env gates whose alternate path a
+        /// test could reach, via a hand-rolled thread-local override that the
+        /// macro now generates for every flag.
+        pub(crate) kv_step_prealloc {
+            env: "LUMEN_NATIVE_KV_STEP_PREALLOC",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     fn use_step_prealloc() -> bool {
-        static FLAG: OnceLock<bool> = OnceLock::new();
-        *FLAG.get_or_init(|| {
-            std::env::var("LUMEN_NATIVE_KV_STEP_PREALLOC")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        })
+        kv_step_prealloc::get()
     }
 
     /// Slice helper for `arr[..., start:end, :]` on 4D arrays.
@@ -242,6 +249,25 @@ mod imp {
                 ));
             }
 
+            // A buffer built under one KV dtype must not be extended under
+            // another. This is reachable in exactly one way: `LUMEN_MLX_KV_BF16`
+            // changed between the run that persisted or snapshotted a cache and
+            // the run resuming it, leaving an f32 prefix under a bf16 suffix (or
+            // the reverse). Concatenating those would either promote silently or
+            // fail somewhere far from the cause.
+            if let Some(k) = self.keys.as_ref()
+                && k.dtype() != keys.dtype()
+            {
+                return Err(anyhow!(
+                    "NativeKvCache: cache holds {:?} keys but received {:?}. A KV cache built \
+                         under a different LUMEN_MLX_KV_BF16 setting cannot be extended — discard \
+                         the persisted cache (LUMEN_KV_DISK directory / prefix cache) or restore \
+                         the previous setting.",
+                    k.dtype(),
+                    keys.dtype(),
+                ));
+            }
+
             let prev = self.offset;
             let new_total = prev + s;
 
@@ -275,7 +301,7 @@ mod imp {
             let need_grow = self
                 .keys
                 .as_ref()
-                .map_or(true, |k| new_total > k.shape()[2] as usize);
+                .is_none_or(|k| new_total > k.shape()[2] as usize);
 
             if need_grow {
                 let b = keys.shape()[0];
@@ -297,7 +323,7 @@ mod imp {
                     None => new_k,
                     Some(old) => {
                         // mlx_lm: trim partial last block before concat
-                        let trimmed = if prev % KV_CACHE_STEP != 0 {
+                        let trimmed = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             slice_axis2(&old, 0, prev as i32)?
                         } else {
                             old
@@ -309,7 +335,7 @@ mod imp {
                 self.values = Some(match self.values.take() {
                     None => new_v,
                     Some(old) => {
-                        let trimmed = if prev % KV_CACHE_STEP != 0 {
+                        let trimmed = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             slice_axis2(&old, 0, prev as i32)?
                         } else {
                             old
@@ -596,7 +622,7 @@ mod imp {
             let need_grow = self
                 .keys
                 .as_ref()
-                .map_or(true, |(kp, _, _)| new_total > kp.shape()[2] as usize);
+                .is_none_or(|(kp, _, _)| new_total > kp.shape()[2] as usize);
 
             if need_grow {
                 let b = keys.shape()[0];
@@ -634,7 +660,7 @@ mod imp {
                 self.keys = Some(match self.keys.take() {
                     None => (new_kp, new_ks, new_kb),
                     Some((kp, ks, kb)) => {
-                        let (kp_t, ks_t, kb_t) = if prev % KV_CACHE_STEP != 0 {
+                        let (kp_t, ks_t, kb_t) = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             (
                                 slice_axis2(&kp, 0, prev as i32)?,
                                 slice_axis2(&ks, 0, prev as i32)?,
@@ -655,7 +681,7 @@ mod imp {
                 self.values = Some(match self.values.take() {
                     None => (new_vp, new_vs, new_vb),
                     Some((vp, vs, vb)) => {
-                        let (vp_t, vs_t, vb_t) = if prev % KV_CACHE_STEP != 0 {
+                        let (vp_t, vs_t, vb_t) = if !prev.is_multiple_of(KV_CACHE_STEP) {
                             (
                                 slice_axis2(&vp, 0, prev as i32)?,
                                 slice_axis2(&vs, 0, prev as i32)?,
@@ -1591,8 +1617,8 @@ mod imp {
     /// Memory at 1024-token ring (bits=4 unpacked uint8):
     ///   - codes  : [B, n_kv, 1024, D] uint8 = 1024 × D bytes per (K|V) per layer
     ///   - sigma  : [B, n_kv, 1024, 1] f32   = 4096 bytes per (K|V) per layer
-    /// vs bf16 baseline of 1024 × D × 2 bytes. 2× compression at uint8;
-    /// adding 4-bit packing would push to ~3.5×.
+    ///     vs bf16 baseline of 1024 × D × 2 bytes. 2× compression at uint8;
+    ///     adding 4-bit packing would push to ~3.5×.
     ///
     /// QJL Stage-2 (1-bit residual correction) is deferred — Stage 1 alone
     /// recovers ≥0.99 cosine similarity per the paper.
@@ -2826,6 +2852,12 @@ mod imp {
     }
 }
 
+/// Re-exported at crate root so measurement harnesses can compute the cache's
+/// allocation rounding without hard-coding 256 — a duplicated constant here is
+/// a silent-drift hazard the moment the block size is ever tuned.
+#[cfg(feature = "mlx-native")]
+pub use imp::KV_CACHE_STEP;
+
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d decode loop in runner_native.rs.
 pub(crate) use imp::{
@@ -2842,6 +2874,7 @@ pub(crate) use imp::{
 //       native_cache::lifecycle_tests:: -- --ignored
 #[cfg(all(test, feature = "mlx-native"))]
 mod lifecycle_tests {
+
     use super::imp::{
         NativeArraysCache, NativeKvCache, NativeLayerCache, NativePromptCache,
         NativeRotatingKvCache,
@@ -2960,25 +2993,71 @@ mod lifecycle_tests {
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn rotating_cache_growth_within_max_size() {
-        let mut c = NativeRotatingKvCache::new(8, 0);
-        // Push 1 token at a time up to (max_size - 1) → no eviction yet.
-        for step in 0..7 {
-            let k = make_kv_block(1, 2, 1, 8, step as f32);
-            let v = make_kv_block(1, 2, 1, 8, step as f32 + 100.0);
-            let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
-            let expected_len = step as i32 + 1;
-            assert_eq!(kf.shape()[2], expected_len, "growth step {step}");
-            assert_eq!(c.cached_len(), expected_len as usize);
-            assert_eq!(c.offset(), step + 1);
+        // Run the whole sequence under BOTH sides of the step-prealloc switch.
+        // The logical contract — how many tokens the cache holds and where the
+        // next one lands — is identical; only the physical buffer differs.
+        // This test used to assert the physical shape, which the default path
+        // stopped matching when it began growing in blocks: `kf.shape()[2]` is
+        // the buffer, not the fill. Being `#[ignore]`d, it failed unseen.
+        for prealloc in [false, true] {
+            super::imp::kv_step_prealloc::with(prealloc, || {
+                let mut c = NativeRotatingKvCache::new(8, 0);
+                // Push 1 token at a time up to (max_size - 1) → no eviction yet.
+                for step in 0..7 {
+                    let k = make_kv_block(1, 2, 1, 8, step as f32);
+                    let v = make_kv_block(1, 2, 1, 8, step as f32 + 100.0);
+                    let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
+                    let expected_len = step + 1;
+                    // The *fetched* K is the logical fill, and `offset()` is
+                    // the running token count. Both are identical under either
+                    // path — that is the contract SDPA depends on.
+                    assert_eq!(
+                        kf.shape()[2] as usize,
+                        expected_len,
+                        "prealloc={prealloc} step={step}: fetch is the logical fill"
+                    );
+                    assert_eq!(c.offset(), expected_len, "prealloc={prealloc} step={step}");
+                    // `cached_len()` is by definition `keys.shape()[2]`, the
+                    // *allocation*: legacy grows one token at a time, prealloc
+                    // takes the whole window up front. The original test
+                    // asserted these were equal, which has been false for the
+                    // default path since prealloc landed — and `#[ignore]`d, it
+                    // never said so. Only the invariant is shared.
+                    let buf = c.cached_len();
+                    assert!(
+                        (expected_len..=8).contains(&buf),
+                        "prealloc={prealloc} step={step}: allocation {buf} outside \
+                         [{expected_len}, 8]"
+                    );
+                    // …and the fetched rows must be the pushed blocks, in
+                    // order. Neither the shape nor the counters catch a block
+                    // landing in the wrong slot, or padding leaking in from an
+                    // untrimmed buffer — which is the whole risk of having two
+                    // append strategies.
+                    kf.eval().expect("eval fetched K");
+                    let got = kf.as_slice::<f32>();
+                    for j in 0..=step {
+                        // `make_kv_block` fills element 0 of each block with
+                        // the step number; element 0 of row j sits at j*d
+                        // within each (b,h) plane, and b=h=1 here.
+                        let first = got[j * 8];
+                        assert!(
+                            (first - j as f32).abs() < 1e-3,
+                            "prealloc={prealloc} step={step}: row {j} holds {first}, \
+                             expected the block pushed at step {j}"
+                        );
+                    }
+                }
+                // Next push hits max_size exactly — still no trim (cached 7,
+                // trim_size = 7 - 8 + 1 = 0, append → cached 8).
+                let k = make_kv_block(1, 2, 1, 8, 7.0);
+                let v = make_kv_block(1, 2, 1, 8, 107.0);
+                let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
+                assert_eq!(c.offset(), 8, "prealloc={prealloc}");
+                assert_eq!(c.cached_len(), 8, "prealloc={prealloc}: buffer full");
+                assert_eq!(kf.shape()[2], 8, "prealloc={prealloc}: full buffer");
+            });
         }
-        // Next push hits max_size exactly — still no trim (cached size 7,
-        // trim_size = 7 - 8 + 1 = 0, append → cached size 8).
-        let k = make_kv_block(1, 2, 1, 8, 7.0);
-        let v = make_kv_block(1, 2, 1, 8, 107.0);
-        let (kf, _vf) = c.update_and_fetch(&k, &v).unwrap();
-        assert_eq!(kf.shape()[2], 8);
-        assert_eq!(c.cached_len(), 8);
-        assert_eq!(c.offset(), 8);
     }
 
     #[test]

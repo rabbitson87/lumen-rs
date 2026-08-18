@@ -78,7 +78,7 @@ fn run_one(
     // Inner per-call prefill time is logged by the backend itself; we
     // approximate decode-only time by subtracting the eprintln-traced prefill
     // ms from the total. Simpler approach: call prefill manually first.
-    let t_prefill = Instant::now();
+    let _t_prefill = Instant::now();
     // Mirror chat_streaming's prompt builder (we don't expose it directly).
     // Instead, just do the full chat_streaming and compute decode-only via
     // (total - prefill_ms_observed). For this bench we use the "cheap" trick:

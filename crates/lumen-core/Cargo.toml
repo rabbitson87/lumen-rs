@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "TurboQuant KV cache vector quantization — pure Rust core"
 
+[lints]
+workspace = true
+
 [dependencies]
 faer = { workspace = true }
 rand = { workspace = true }
@@ -15,3 +18,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+lumen-testkit = { workspace = true }

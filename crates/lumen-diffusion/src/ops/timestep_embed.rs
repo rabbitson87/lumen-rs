@@ -24,7 +24,7 @@ mod imp {
     /// - `timesteps`: `[B]` f32 array (already scaled by 1000 if needed).
     /// - returns `[B, dim]`.
     pub fn timestep_embedding(timesteps: &Array, dim: usize) -> Result<Array> {
-        assert!(dim % 2 == 0, "timestep_embedding dim must be even");
+        assert!(dim.is_multiple_of(2), "timestep_embedding dim must be even");
         let half = dim / 2;
         // freqs[i] = exp(-ln(10000) * i / half)
         let ln10000 = (10000.0f32).ln();

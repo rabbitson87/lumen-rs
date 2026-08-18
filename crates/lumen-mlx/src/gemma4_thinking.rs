@@ -129,10 +129,13 @@ impl ChannelBudget {
         self.exceeded() && self.force_close_attempts >= self.max_force_close_attempts
     }
 
+    #[allow(dead_code)] // no caller for some accessors: the streaming path reads the state machine
+    // through `step()` instead.
     pub fn is_active(&self) -> bool {
         self.max_thinking_tokens > 0
     }
 
+    #[allow(dead_code)] // no caller: the streaming path reads state through `step()`.
     pub fn in_thought(&self) -> bool {
         self.in_thought
     }
@@ -141,6 +144,7 @@ impl ChannelBudget {
         self.thought_count
     }
 
+    #[allow(dead_code)] // no caller: `should_hard_break()` is the read that matters.
     pub fn force_close_attempts(&self) -> usize {
         self.force_close_attempts
     }

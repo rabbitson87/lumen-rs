@@ -373,7 +373,7 @@ fn main() -> Result<()> {
                     Some((name, count))
                 })
                 .collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
             let total: u64 = rows.iter().map(|(_, c)| *c).sum();
             for (name, count) in rows.iter().take(20) {
                 let pct = 100.0 * (*count as f64) / (total.max(1) as f64);

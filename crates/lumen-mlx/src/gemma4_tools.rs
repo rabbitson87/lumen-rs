@@ -152,12 +152,12 @@ pub(crate) mod imp {
                 out.push_str(desc);
                 out.push_str("<|\"|>,");
             }
-            if let Some(ty) = resp.get("type").and_then(|t| t.as_str()) {
-                if ty.eq_ignore_ascii_case("object") {
-                    out.push_str("type:<|\"|>");
-                    out.push_str(&ty.to_uppercase());
-                    out.push_str("<|\"|>");
-                }
+            if let Some(ty) = resp.get("type").and_then(|t| t.as_str())
+                && ty.eq_ignore_ascii_case("object")
+            {
+                out.push_str("type:<|\"|>");
+                out.push_str(&ty.to_uppercase());
+                out.push_str("<|\"|>");
             }
             out.push('}');
         }
@@ -279,16 +279,16 @@ pub(crate) mod imp {
                 emitted = true;
             }
 
-            if let Some(req) = value.get("required").and_then(|r| r.as_array()) {
-                if !req.is_empty() {
-                    if emitted {
-                        out.push(',');
-                    }
-                    out.push_str("required:[");
-                    emit_string_array(out, req);
-                    out.push(']');
-                    emitted = true;
+            if let Some(req) = value.get("required").and_then(|r| r.as_array())
+                && !req.is_empty()
+            {
+                if emitted {
+                    out.push(',');
                 }
+                out.push_str("required:[");
+                emit_string_array(out, req);
+                out.push(']');
+                emitted = true;
             }
         }
 

@@ -613,7 +613,10 @@
         const TIMEOUT_MS = 30_000;
         while (
           status.state !== "stopped" &&
-          status.state !== "errored" &&
+          // `crashed`, not `errored` — there is no `errored` in
+          // `LifecycleState`, so this arm was always true and a restart after
+          // a crash spun the full 30 s timeout before starting again.
+          status.state !== "crashed" &&
           waited < TIMEOUT_MS
         ) {
           await new Promise((r) => setTimeout(r, POLL_MS));
@@ -669,6 +672,12 @@
   async function saveQuant() {
     if (!config) return;
     config = await api.updateQuantConfig(config.quant);
+    savedToast();
+  }
+
+  async function saveAdvanced() {
+    if (!config) return;
+    config = await api.updateAdvancedConfig(config.advanced);
     savedToast();
   }
 
@@ -1340,6 +1349,90 @@
     </div>
     <div class={ctxHint}>
       {t("diskkv.hint.ttl")} <code class={inlineCode}>LUMEN_KV_DISK_TTL_SECS</code>.
+    </div>
+  </section>
+  {/if}
+
+  <!-- SPECULATIVE DECODING -->
+  {#if config}
+  <section class="{cardBase} col-span-6">
+    <h2 class={cardH2}>{t("spec.title")} <span class="dim">{t("spec.titleHint")}</span></h2>
+
+    <div class={kvRow}>
+      <span class="dim">{t("spec.kind")}</span>
+      <div class="flex gap-1">
+        <button
+          class={`px-2.5 py-1 min-w-12 ${config.advanced.spec_kind === "off" ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.advanced.spec_kind = "off"; saveAdvanced(); }}
+        >{t("spec.off")}</button>
+        <button
+          class={`px-2.5 py-1 min-w-12 ${config.advanced.spec_kind === "lookup" ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.advanced.spec_kind = "lookup"; saveAdvanced(); }}
+        >{t("spec.lookup")}</button>
+        <button
+          class={`px-2.5 py-1 min-w-12 ${config.advanced.spec_kind === "mtp" ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.advanced.spec_kind = "mtp"; saveAdvanced(); }}
+        >{t("spec.mtp")}</button>
+      </div>
+    </div>
+    <div class={ctxHint}>
+      {t("spec.hint.kind")} <code class={inlineCode}>LUMEN_SPEC</code>.
+    </div>
+
+    <div class={kvRow}>
+      <span class="dim">{t("spec.draftK")}</span>
+      <input
+        type="number"
+        min="1"
+        max="8"
+        step="1"
+        bind:value={config.advanced.spec_draft_n_max}
+        onchange={saveAdvanced}
+        disabled={config.advanced.spec_kind === "off"}
+      />
+    </div>
+    <div class={ctxHint}>
+      {t("spec.hint.draftK")} <code class={inlineCode}>LUMEN_SPEC_K</code>.
+    </div>
+  </section>
+  {/if}
+
+  <!-- BATCHING -->
+  {#if config}
+  <section class="{cardBase} col-span-6">
+    <h2 class={cardH2}>{t("batch.title")} <span class="dim">{t("batch.titleHint")}</span></h2>
+
+    <div class={kvRow}>
+      <span class="dim">{t("batch.enable")}</span>
+      <div class="flex gap-1">
+        <button
+          class={`px-2.5 py-1 min-w-12 ${!config.advanced.batched_engine ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.advanced.batched_engine = false; saveAdvanced(); }}
+        >{t("batch.off")}</button>
+        <button
+          class={`px-2.5 py-1 min-w-12 ${config.advanced.batched_engine ? "primary" : ""}`}
+          onclick={() => { if (!config) return; config.advanced.batched_engine = true; saveAdvanced(); }}
+        >{t("batch.on")}</button>
+      </div>
+    </div>
+    <div class={ctxHint}>
+      {t("batch.hint.enable")} <code class={inlineCode}>LUMEN_MLX_BATCH_DECODE</code>.
+    </div>
+
+    <div class={kvRow}>
+      <span class="dim">{t("batch.max")}</span>
+      <input
+        type="number"
+        min="1"
+        max="32"
+        step="1"
+        bind:value={config.advanced.mlx_batch_max}
+        onchange={saveAdvanced}
+        disabled={!config.advanced.batched_engine}
+      />
+    </div>
+    <div class={ctxHint}>
+      {t("batch.hint.max")} <code class={inlineCode}>LUMEN_MLX_BATCH_MAX</code>.
     </div>
   </section>
   {/if}

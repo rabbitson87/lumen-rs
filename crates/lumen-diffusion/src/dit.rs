@@ -304,10 +304,10 @@ mod imp {
                 }
                 let mut key_shard = HashMap::new();
                 for (k, v) in weight_map {
-                    if let Some(f) = v.as_str() {
-                        if let Some(&si) = file_index.get(f) {
-                            key_shard.insert(k.clone(), si);
-                        }
+                    if let Some(f) = v.as_str()
+                        && let Some(&si) = file_index.get(f)
+                    {
+                        key_shard.insert(k.clone(), si);
                     }
                 }
                 Ok(Self { shards, key_shard })
@@ -904,7 +904,10 @@ mod parity_tests {
     }
 
     #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    #[ignore = "needs a Metal device AND the /tmp/dit_*.bin dump set (latent, \
+                textemb, imgids, txtids, after_double0, after_single, out); no \
+                committed script produces them — see \
+                crates/lumen-mlx/tests/golden/README.md"]
     fn dit_matches_reference() {
         let cfg = DitConfig::klein_4b();
         let s_img = 64usize;

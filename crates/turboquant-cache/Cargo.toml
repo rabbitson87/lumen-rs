@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "KV cache abstraction and implementations for TurboQuant"
 
+[lints]
+workspace = true
+
 [dependencies]
 lumen-core = { workspace = true }
 

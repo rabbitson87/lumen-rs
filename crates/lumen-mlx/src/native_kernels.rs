@@ -36,22 +36,32 @@ mod imp {
 
     static SIGMOID_MUL_SLOT: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
-    /// Whether [`sigmoid_mul_fused`] should be preferred over the explicit
-    /// `sigmoid(gate) * other` two-op composition. Driven by
-    /// `LUMEN_NATIVE_FUSE_SIGMOID_MUL=1`. Default OFF.
-    ///
-    /// History: tested as a global fuse for full-attn gate-mul and MoE
-    /// shared-expert gate-mul in 2026-05-12. Result was decisive **REGRESSION**
-    /// (+6.08σ) — anti-pattern #30 calibration site #3. The op fires ~24
-    /// times/step, below the empirical break-even (~50 fires/step) at which
-    /// compile dispatch CPU cost is recouped by saved Metal kernel work. Kept
-    /// as an opt-in for future shapes where fire count rises above the
-    /// break-even (e.g., expanded MoE shared-expert pattern). See
-    /// `notes/sigmoid_mul_fuse_regression.md`.
+    // Whether [`sigmoid_mul_fused`] should be preferred over the explicit
+    // `sigmoid(gate) * other` two-op composition. Driven by
+    // `LUMEN_NATIVE_FUSE_SIGMOID_MUL=1`. Default OFF.
+    //
+    // History: tested as a global fuse for full-attn gate-mul and MoE
+    // shared-expert gate-mul in 2026-05-12. Result was decisive **REGRESSION**
+    // (+6.08σ) — anti-pattern #30 calibration site #3. The op fires ~24
+    // times/step, below the empirical break-even (~50 fires/step) at which
+    // compile dispatch CPU cost is recouped by saved Metal kernel work. Kept
+    // as an opt-in for future shapes where fire count rises above the
+    // break-even (e.g., expanded MoE shared-expert pattern). See
+    // `notes/sigmoid_mul_fuse_regression.md`.
+    lumen_flags::flag! {
+        /// Compile-wrapped `sigmoid(gate) * other`, bit-identical to the
+        /// two-op composition. Default OFF (anti-pattern #30 calibration).
+        /// (Parse note: previously only `=1` enabled this; the uniform rule
+        /// now accepts any non-`"0"`.)
+        pub(crate) sigmoid_mul_fuse {
+            env: "LUMEN_NATIVE_FUSE_SIGMOID_MUL",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     pub fn sigmoid_mul_fuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_FUSE_SIGMOID_MUL")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        sigmoid_mul_fuse::get()
     }
 
     /// Compile-wrapped `sigmoid(gate) * other` (shapeless). One mlx-c compile

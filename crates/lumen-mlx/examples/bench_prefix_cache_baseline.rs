@@ -9,8 +9,8 @@
 //!   1. Build prefix of P tokens (synthetic) and suffix of S tokens.
 //!   2. Path A (cold) — prefill(prefix ++ suffix) on fresh seq, time TTFT.
 //!   3. Path B (cached, simulated) —
-//!         pre-prefill(prefix), snapshot, ... [now this is the "master" state]
-//!         restore + extend(suffix), time both.
+//!      pre-prefill(prefix), snapshot, ... [now this is the "master" state]
+//!      restore + extend(suffix), time both.
 //!      The pre-prefill cost is amortized; only restore + extend(S) count.
 //!   4. T_savings = T_A - (T_restore + T_extend_S).
 //!

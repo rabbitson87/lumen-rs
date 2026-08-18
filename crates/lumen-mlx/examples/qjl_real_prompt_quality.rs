@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     );
 
     let out_tokens = backend
-        .generate(&prompt_ids, max_tokens, 0.0, 1.0)
+        .generate(&prompt_ids, max_tokens, 0.0, 1.0, &Default::default())
         .context("generate")?;
     let out_text = backend
         .decode(&out_tokens)

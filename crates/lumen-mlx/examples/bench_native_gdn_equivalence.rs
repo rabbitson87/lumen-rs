@@ -18,10 +18,10 @@
 //!   1. Build random q[B,1,Hk,Dk], k[B,1,Hk,Dk], v[B,1,Hv,Dv],
 //!      g[B,1,Hv]∈(0,1), β[B,1,Hv]∈(0,1) for each of n_max positions.
 //!   2. For each N in n_list:
-//!        a. Path A: concat(first N of each input along seq) →
-//!           one kernel call → (y_A:[B,N,Hv,Dv], state_A:[B,Hv,Dv,Dk]).
-//!        b. Path B: state := zeros; for i in 0..N: feed (q_i, k_i, v_i, g_i,
-//!           β_i, state) → kernel → (y_i, state). Concat all y_i → y_B.
+//!      a. Path A: concat(first N of each input along seq) →
+//!      one kernel call → (y_A:[B,N,Hv,Dv], state_A:[B,Hv,Dv,Dk]).
+//!      b. Path B: state := zeros; for i in 0..N: feed (q_i, k_i, v_i, g_i,
+//!      β_i, state) → kernel → (y_i, state). Concat all y_i → y_B.
 //!   3. Compare max-|y_A − y_B| and max-|state_A − state_B|.
 //!
 //! Bit-identical (max diff == 0) is the BAR; fp accumulation noise (1e-5..1e-3)

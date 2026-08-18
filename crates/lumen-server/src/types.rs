@@ -105,6 +105,16 @@ pub struct ChatCompletionRequest {
     /// Qwen 3.6 has a native `required` mode in its template. Wire-up TBD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// OpenAI `parallel_tool_calls`. Absent means `true`, which is the
+    /// documented default.
+    ///
+    /// `tool_choice` decides *whether* a tool is called; this decides *how
+    /// many*. Until it was added the field was accepted and silently dropped —
+    /// no `deny_unknown_fields` here — so a client asking for one call got
+    /// however many the model produced, with a 200 and nothing to indicate the
+    /// parameter had not been honoured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 
     // ── OpenAI structured outputs ──────────────────────────────────
     /// OpenAI `response_format`. When `json_object` / `json_schema`, the
@@ -164,6 +174,7 @@ impl ChatCompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            parallel_tool_calls: self.parallel_tool_calls,
         }
     }
 
@@ -247,7 +258,7 @@ fn is_imatrix_awq_family(model_id: &str) -> bool {
     lower.contains("imatrix") || lower.contains("-awq")
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
     /// Spec: `content` is `string` for system/user/tool roles, `string | null`
@@ -258,52 +269,121 @@ pub struct ChatMessage {
     /// missing / array-of-parts and flatten to a single string so existing
     /// call sites that consume `&str` still work without `.unwrap_or_default()`
     /// scattered everywhere.
-    #[serde(default, deserialize_with = "deserialize_content_lenient")]
+    ///
+    /// Deserialization lives in the hand-written `Deserialize` impl below (and
+    /// its `RawChatMessage` mirror), because one input field — `content` — has
+    /// to populate both this and `images`, which serde's derive can't express.
     pub content: String,
     /// Present on `role:"assistant"` when the previous turn invoked tools.
     /// Carries the model's prior tool calls back into the prompt so the
     /// chat-template can re-render them. Server-emit side puts them in
     /// `ChatMessageResponse.tool_calls`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Required on `role:"tool"` — references the id of the tool call this
     /// message is answering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Optional function name on `role:"tool"`. OpenAI legacy field; some
     /// clients still send it. Not required for routing — `tool_call_id` is
     /// the canonical link.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Decoded bytes of every `image_url` content part on this message, in the
+    /// order they appeared. Empty for text-only messages.
+    ///
+    /// Only `data:` URLs are accepted — the server never fetches remote URLs,
+    /// because that would turn a chat request into an outbound HTTP fetch on
+    /// the caller's behalf (SSRF). Clients must inline the image.
+    pub images: Vec<Vec<u8>>,
 }
 
-fn deserialize_content_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    use serde::de::Error as _;
-    // Accept the four shapes a spec-conformant client may send for `content`:
-    //   "text"  |  null  |  (missing -> handled by serde(default))  |
-    //   [{ "type":"text", "text":"…" }, …]   (OpenAI structured content)
-    match serde_json::Value::deserialize(d)? {
-        serde_json::Value::Null => Ok(String::new()),
-        serde_json::Value::String(s) => Ok(s),
+/// Deserialization mirror of [`ChatMessage`]. `content` stays a raw `Value` so
+/// one pass can split it into flattened text plus decoded images — serde's
+/// derive can't route a single input field into two struct fields.
+#[derive(Deserialize)]
+struct RawChatMessage {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = RawChatMessage::deserialize(d)?;
+        let (content, images) = match raw.content {
+            Some(v) => split_content(v).map_err(D::Error::custom)?,
+            None => (String::new(), Vec::new()),
+        };
+        Ok(ChatMessage {
+            role: raw.role,
+            content,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            name: raw.name,
+            images,
+        })
+    }
+}
+
+/// Split an OpenAI `content` value into flattened text and decoded images.
+///
+/// Accepts the four shapes a spec-conformant client may send:
+/// `"text"` | `null` | missing | `[{ "type":"text", … }, { "type":"image_url", … }]`.
+fn split_content(v: serde_json::Value) -> Result<(String, Vec<Vec<u8>>), String> {
+    match v {
+        serde_json::Value::Null => Ok((String::new(), Vec::new())),
+        serde_json::Value::String(s) => Ok((s, Vec::new())),
         serde_json::Value::Array(parts) => {
-            // Flatten the text parts; ignore non-text parts (e.g. image_url) so
-            // a text-only model still receives the prompt. omp sends a single
-            // text part per turn; multiple parts are joined with newlines.
-            let mut out = String::new();
+            let mut text = String::new();
+            let mut images = Vec::new();
             for p in &parts {
                 if let Some(t) = p.get("text").and_then(serde_json::Value::as_str) {
-                    if !out.is_empty() {
-                        out.push('\n');
+                    if !text.is_empty() {
+                        text.push('\n');
                     }
-                    out.push_str(t);
+                    text.push_str(t);
+                    continue;
+                }
+                let url = p
+                    .get("image_url")
+                    .and_then(|iu| iu.get("url"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(url) = url {
+                    images.push(decode_data_url(url)?);
                 }
             }
-            Ok(out)
+            Ok((text, images))
         }
-        other => Err(D::Error::custom(format!(
+        other => Err(format!(
             "message content must be a string, null, or array of content parts, got {other}"
-        ))),
+        )),
     }
+}
+
+/// Decode a `data:<mime>;base64,<payload>` URL into raw bytes.
+fn decode_data_url(url: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let rest = url.strip_prefix("data:").ok_or_else(|| {
+        format!(
+            "image_url must be a data: URL; remote fetching is not supported (got {}…)",
+            url.chars().take(32).collect::<String>()
+        )
+    })?;
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| "malformed data: URL — missing ','".to_string())?;
+    if !meta.contains("base64") {
+        return Err("image data: URL must be base64-encoded".to_string());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| format!("image_url base64 decode failed: {e}"))
 }
 
 impl ChatMessage {
@@ -317,7 +397,18 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
+    }
+
+    /// True when any of `indices` points at a message carrying an inline image.
+    ///
+    /// Takes indices rather than a slice because the routing decision has to be
+    /// made against the *post-strip* message set: a request whose only image
+    /// rode on a meta-wrapper turn that `strip_client_meta_wrappers_flat`
+    /// removed has no image left to encode, and must take the text path.
+    pub fn any_images_at(messages: &[ChatMessage], indices: &[usize]) -> bool {
+        indices.iter().any(|&i| !messages[i].images.is_empty())
     }
 }
 
@@ -706,9 +797,41 @@ pub struct AnthropicTool {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolChoice {
-    Auto,
-    Any,
-    Tool { name: String },
+    Auto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Tool {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+}
+
+impl AnthropicToolChoice {
+    /// Anthropic hangs `disable_parallel_tool_use` off `tool_choice` itself
+    /// rather than off the request, and it appears on every variant. Reported
+    /// as OpenAI's `parallel_tool_calls` so one representation reaches the
+    /// grammar — see [`lumen_mlx::grammar::ToolCalls`].
+    pub fn parallel_tool_calls(&self) -> Option<bool> {
+        let disabled = match self {
+            Self::Auto {
+                disable_parallel_tool_use,
+            }
+            | Self::Any {
+                disable_parallel_tool_use,
+            }
+            | Self::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+        };
+        disabled.map(|d| !d)
+    }
 }
 
 /// Anthropic Extended Thinking flag, polymorphic on the wire.
@@ -757,6 +880,8 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
+            // /v1/completions has no tools, so no tool-call count to cap.
+            parallel_tool_calls: None,
         }
     }
 }
@@ -774,6 +899,11 @@ impl AnthropicRequest {
             presence_penalty: None,
             frequency_penalty: None,
             stop: self.stop_sequences.clone().unwrap_or_default(),
+            // Anthropic hangs the knob off `tool_choice`, inverted.
+            parallel_tool_calls: self
+                .tool_choice
+                .as_ref()
+                .and_then(|c| c.parallel_tool_calls()),
         }
     }
 }
@@ -868,13 +998,21 @@ impl AnthropicContent {
 
 /// One block in an Anthropic message's `content[]`. Tagged on `type`:
 /// - `text`        — visible text (user/assistant)
+/// - `image`       — inline image (base64 source only)
 /// - `tool_use`    — assistant invoking a tool
 /// - `tool_result` — user message answering a prior tool_use
+///
+/// The tag is exhaustive: an unrecognized `type` fails the request rather than
+/// being dropped, which is what surfaces a genuinely unsupported block instead
+/// of answering as though it were not there.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
     Text {
         text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
     },
     ToolUse {
         id: String,
@@ -895,6 +1033,34 @@ pub enum AnthropicContentBlock {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `image.source` — Anthropic's inline-image envelope.
+///
+/// Only `type: "base64"` is accepted. Anthropic also defines a `url` source,
+/// but fetching one would make the server issue outbound requests on a
+/// caller's behalf (SSRF), which is the same reason the OpenAI path takes
+/// `data:` URLs only.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicImageSource {
+    Base64 {
+        #[serde(default)]
+        media_type: String,
+        data: String,
+    },
+}
+
+impl AnthropicImageSource {
+    /// Decode to raw image bytes.
+    pub fn decode(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        match self {
+            Self::Base64 { data, .. } => base64::engine::general_purpose::STANDARD
+                .decode(data.trim())
+                .map_err(|e| format!("image source base64 decode failed: {e}")),
+        }
+    }
 }
 
 /// Tool-result body — either a plain string or an array of text blocks
@@ -1190,6 +1356,186 @@ pub struct ImageData {
 }
 
 #[cfg(test)]
+mod image_content_serde {
+    use super::*;
+    use serde_json::json;
+
+    /// 1×1 red PNG, base64. Content is irrelevant here — only that the bytes
+    /// survive the data-URL round trip.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn msg(v: serde_json::Value) -> ChatMessage {
+        serde_json::from_value(v).expect("parse ChatMessage")
+    }
+
+    #[test]
+    fn plain_string_content_has_no_images() {
+        let m = msg(json!({ "role": "user", "content": "hello" }));
+        assert_eq!(m.content, "hello");
+        assert!(m.images.is_empty());
+    }
+
+    #[test]
+    fn null_and_missing_content_stay_empty() {
+        assert_eq!(
+            msg(json!({ "role": "assistant", "content": null })).content,
+            ""
+        );
+        assert_eq!(msg(json!({ "role": "assistant" })).content, "");
+    }
+
+    #[test]
+    fn text_parts_still_flatten_with_newlines() {
+        let m = msg(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "line one" },
+                { "type": "text", "text": "line two" },
+            ]
+        }));
+        assert_eq!(m.content, "line one\nline two");
+        assert!(m.images.is_empty());
+    }
+
+    /// The behavior this whole change exists to fix: `image_url` used to be
+    /// dropped on the floor.
+    #[test]
+    fn image_url_part_is_decoded_not_dropped() {
+        let m = msg(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{TINY_PNG_B64}") } },
+            ]
+        }));
+        assert_eq!(m.content, "what is this?");
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(
+            &m.images[0][..8],
+            b"\x89PNG\r\n\x1a\n",
+            "PNG magic survived"
+        );
+    }
+
+    #[test]
+    fn multiple_images_keep_their_order() {
+        let url = format!("data:image/png;base64,{TINY_PNG_B64}");
+        let m = msg(json!({
+            "role": "user",
+            "content": [
+                { "type": "image_url", "image_url": { "url": url } },
+                { "type": "image_url", "image_url": { "url": url } },
+                { "type": "text", "text": "compare" },
+            ]
+        }));
+        assert_eq!(m.images.len(), 2);
+        assert_eq!(m.content, "compare");
+    }
+
+    /// Fetching remote URLs would make the server issue outbound requests on a
+    /// caller's behalf; reject rather than silently answering without the image.
+    #[test]
+    fn remote_image_urls_are_rejected() {
+        let err = serde_json::from_value::<ChatMessage>(json!({
+            "role": "user",
+            "content": [{ "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("data:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn non_base64_data_url_is_rejected() {
+        assert!(serde_json::from_value::<ChatMessage>(json!({
+            "role": "user",
+            "content": [{ "type": "image_url", "image_url": { "url": "data:image/png,rawbytes" } }]
+        }))
+        .is_err());
+    }
+
+    /// Anthropic ships images as a tagged `image` block with a base64
+    /// `source`, not as an `image_url` part. Before this variant existed the
+    /// whole request failed to deserialize on the unknown tag, so
+    /// Anthropic-format clients could not send images at all.
+    #[test]
+    fn anthropic_image_block_decodes() {
+        let msg: AnthropicMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": TINY_PNG_B64 } },
+            ]
+        }))
+        .expect("parse anthropic message");
+        let blocks = match &msg.content {
+            AnthropicContent::Blocks(b) => b.clone(),
+            other => panic!("expected blocks, got {other:?}"),
+        };
+        assert_eq!(blocks.len(), 2);
+        let bytes = match &blocks[1] {
+            AnthropicContentBlock::Image { source } => source.decode().expect("decode"),
+            other => panic!("expected an image block, got {other:?}"),
+        };
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG magic survived");
+        // Text flattening still ignores the image block — images travel on
+        // their own channel, not through `as_text`.
+        assert_eq!(msg.content.as_text(), "what is this?");
+    }
+
+    /// Anthropic also defines a `url` image source. Fetching it would make the
+    /// server issue outbound requests for a caller, so it is refused the same
+    /// way remote `image_url`s are on the OpenAI path.
+    #[test]
+    fn anthropic_url_image_source_is_rejected() {
+        let err = serde_json::from_value::<AnthropicMessage>(json!({
+            "role": "user",
+            "content": [{ "type": "image", "source": {
+                "type": "url", "url": "https://example.com/a.png" } }]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("url") || err.contains("variant"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// An unrecognized block type fails the request rather than being dropped —
+    /// otherwise an unsupported modality would answer as if it were absent.
+    #[test]
+    fn unknown_anthropic_block_type_is_an_error() {
+        assert!(
+            serde_json::from_value::<AnthropicMessage>(json!({
+                "role": "user",
+                "content": [{ "type": "video", "source": {} }]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn any_images_at_only_sees_the_indices_it_is_given() {
+        let url = format!("data:image/png;base64,{TINY_PNG_B64}");
+        let msgs = vec![
+            msg(json!({ "role": "system", "content": "be brief" })),
+            msg(json!({ "role": "user", "content": "ignore me" })),
+            msg(json!({
+                "role": "user",
+                "content": [{ "type": "image_url", "image_url": { "url": url } }]
+            })),
+        ];
+        assert!(ChatMessage::any_images_at(&msgs, &[0, 1, 2]));
+        assert!(ChatMessage::any_images_at(&msgs, &[2]));
+        // The image-bearing turn was stripped → nothing left to encode, so the
+        // request must fall back to the text path rather than the vision one.
+        assert!(!ChatMessage::any_images_at(&msgs, &[0, 1]));
+        assert!(!ChatMessage::any_images_at(&msgs, &[]));
+    }
+}
+
+#[cfg(test)]
 mod tool_calling_serde {
     use super::*;
     use serde_json::json;
@@ -1294,18 +1640,20 @@ mod tool_calling_serde {
     }
 
     #[test]
-    fn openai_array_content_multi_part_joined_and_nontext_ignored() {
+    fn openai_array_content_multi_part_text_is_joined() {
+        // Image parts used to be silently discarded here. They now decode into
+        // `ChatMessage::images` (see the `image_content_serde` module); this
+        // test keeps pinning the text-flattening half of the contract.
         let raw = json!({
             "role": "user",
             "content": [
                 { "type": "text", "text": "line one" },
-                { "type": "image_url", "image_url": { "url": "data:..." } },
                 { "type": "text", "text": "line two" }
             ]
         });
         let msg: ChatMessage = serde_json::from_value(raw).unwrap();
-        // text parts joined with newline; the image part is dropped.
         assert_eq!(msg.content, "line one\nline two");
+        assert!(msg.images.is_empty());
     }
 
     #[test]
@@ -1410,7 +1758,10 @@ mod tool_calling_serde {
         let tools = req.tools.unwrap();
         assert_eq!(tools[0].name, "get_weather");
         assert_eq!(tools[0].input_schema["required"][0], "location");
-        assert!(matches!(req.tool_choice, Some(AnthropicToolChoice::Auto)));
+        assert!(matches!(
+            req.tool_choice,
+            Some(AnthropicToolChoice::Auto { .. })
+        ));
     }
 
     #[test]
@@ -1418,7 +1769,7 @@ mod tool_calling_serde {
         let raw = json!({"type": "tool", "name": "get_weather"});
         let tc: AnthropicToolChoice = serde_json::from_value(raw).unwrap();
         match tc {
-            AnthropicToolChoice::Tool { name } => assert_eq!(name, "get_weather"),
+            AnthropicToolChoice::Tool { name, .. } => assert_eq!(name, "get_weather"),
             _ => panic!("expected Tool"),
         }
     }
@@ -1550,11 +1901,16 @@ mod tool_calling_serde {
             model: "x".into(),
             messages: vec![],
             max_tokens: 16,
+            parallel_tool_calls: None,
             temperature: 0.7,
             top_p: 0.9,
             top_k: None,
             seed: None,
             repeat_penalty: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            stop: None,
             stream: false,
             stream_options: None,
             thinking: false,
@@ -1563,6 +1919,7 @@ mod tool_calling_serde {
             session_id: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
         };
         // Request type is Deserialize-only; we only need to verify
         // round-trip through serde_json::Value when the tools field is

@@ -872,9 +872,6 @@ fn apply_env(
     // ── Advanced ───────────────────────────────────────────────────
     match cfg.advanced.backend_mode {
         BackendMode::Auto => {}
-        BackendMode::Candle => {
-            cmd.env("LUMEN_MLX_BACKEND", "candle");
-        }
         BackendMode::MlxNative => {
             cmd.env("LUMEN_MLX_BACKEND", "mlx-native");
         }
@@ -892,34 +889,21 @@ fn apply_env(
         }
     }
     if let Some(n) = cfg.advanced.spec_draft_n_max {
-        cmd.env("LUMEN_SPEC_DRAFT_N_MAX", n.to_string());
+        // `LUMEN_SPEC_DRAFT_N_MAX` was never read by anything; the runner's
+        // knob is `LUMEN_SPEC_K`.
+        cmd.env("LUMEN_SPEC_K", n.to_string());
     }
     if cfg.advanced.batched_engine {
-        cmd.env("BATCHED_ENGINE", "1");
+        // `BATCHED_ENGINE` drove the Candle scheduler, which is gone. MLX has
+        // its own, behind this flag.
+        cmd.env("LUMEN_MLX_BATCH_DECODE", "1");
     }
-
-    // ── Paged attention ────────────────────────────────────────────
-    let p = &cfg.advanced.paged_attention;
-    if p.enabled {
-        cmd.env("PAGED_KV", "1");
-        if let Some(n) = p.layers {
-            cmd.env("PAGED_LAYERS", n.to_string());
-        }
-        if let Some(n) = p.kv_heads {
-            cmd.env("PAGED_KV_HEADS", n.to_string());
-        }
-        if let Some(n) = p.head_dim_sliding {
-            cmd.env("PAGED_HEAD_DIM_SLIDING", n.to_string());
-        }
-        if let Some(n) = p.head_dim_global {
-            cmd.env("PAGED_HEAD_DIM_GLOBAL", n.to_string());
-        }
-        if let Some(n) = p.global_every {
-            cmd.env("PAGED_GLOBAL_EVERY", n.to_string());
-        }
-        if let Some(n) = p.max_batch {
-            cmd.env("PAGED_MAX_BATCH", n.to_string());
-        }
+    // Batch width for the MLX scheduler above. The five other `PAGED_*` vars
+    // this used to emit went out with the PagedAttention crate — nothing had
+    // read them since the Candle backend was removed, so toggling them in the
+    // app silently did nothing.
+    if let Some(n) = cfg.advanced.mlx_batch_max {
+        cmd.env("LUMEN_MLX_BATCH_MAX", n.to_string());
     }
 
     // ── Free-form overrides ────────────────────────────────────────
@@ -970,15 +954,9 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_WIRED_LIMIT_BYTES",
     "LUMEN_MLX_BACKEND",
     "LUMEN_SPEC",
-    "LUMEN_SPEC_DRAFT_N_MAX",
-    "BATCHED_ENGINE",
-    "PAGED_KV",
-    "PAGED_LAYERS",
-    "PAGED_KV_HEADS",
-    "PAGED_HEAD_DIM_SLIDING",
-    "PAGED_HEAD_DIM_GLOBAL",
-    "PAGED_GLOBAL_EVERY",
-    "PAGED_MAX_BATCH",
+    "LUMEN_SPEC_K",
+    "LUMEN_MLX_BATCH_DECODE",
+    "LUMEN_MLX_BATCH_MAX",
 ];
 
 /// Public wrapper for `resolve_binary` — used by the doctor module so the

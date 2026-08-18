@@ -1,0 +1,29 @@
+[package]
+name = "lumen-testkit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Test-only helpers shared across the lumen crates: numeric comparison, deterministic data, fixtures"
+publish = false
+
+# Deliberately dependency-free.
+#
+# Every helper here takes `&[f32]`, never a framework tensor type. A tensor
+# argument would drag a framework dependency into a crate that exists purely to
+# be depended *on* by tests — and the project is moving off candle, so pinning
+# this crate's API to `candle_core::Tensor` would bake in the thing being
+# removed. Callers hold slices already, or reach them with one `to_vec1()` /
+# `as_slice()`; that conversion belongs at the call site where the tensor type
+# is known.
+#
+# The two dependencies below are the exception the note above anticipates:
+# `arbitrary` and `serde_json` are what the structure-aware generators in
+# `generators.rs` are made of, and neither is a framework tensor type — they are the
+# vocabulary the crates under test already speak at their boundaries.
+[lints]
+workspace = true
+
+[dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+serde_json = "1.0.149"

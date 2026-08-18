@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     let x = mlx_rs::random::normal::<f32>(&[n_heads, dn], None, None, None)?
         .as_dtype(Dtype::Float32)?;
     // scaled_w = ones(dn) * scale_q  (scale folded into the rms_norm weight)
-    let w = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(&Array::from_f32(scale_q))?;
+    let w = mlx_rs::ops::ones::<f32>(&[dn])?.multiply(Array::from_f32(scale_q))?;
     w.eval()?;
 
     // Reference: mlx::fast::rms_norm over the last axis with the folded weight.

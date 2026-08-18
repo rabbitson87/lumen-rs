@@ -246,7 +246,7 @@ pub async fn add_local_model(
     {
         std::os::unix::fs::symlink(&src, &dst).map_err(err)?;
         let cat = state.catalog.lock().await;
-        return models::scan_local(&dst_root, &cat).map_err(err);
+        models::scan_local(&dst_root, &cat).map_err(err)
     }
     #[cfg(not(unix))]
     {

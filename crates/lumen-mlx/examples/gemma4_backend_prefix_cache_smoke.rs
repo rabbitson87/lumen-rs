@@ -59,7 +59,7 @@ fn main() -> Result<()> {
 }"#;
 
     // 3 queries — same system, different user team name.
-    let queries = vec!["맨유 매칭해줘", "바르샤 매칭해줘", "리버풀 매칭해줘"];
+    let queries = ["맨유 매칭해줘", "바르샤 매칭해줘", "리버풀 매칭해줘"];
 
     let max_new_tokens = 200;
     let prefix_key = "moltis-sports-batch-001";
@@ -80,6 +80,7 @@ fn main() -> Result<()> {
                 max_new_tokens,
                 /* temperature */ 0.0,
                 /* top_p */ 1.0,
+                &Default::default(),
                 /* thinking */ false,
                 prefix_key,
                 tools,

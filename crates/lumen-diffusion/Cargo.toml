@@ -20,6 +20,9 @@ license.workspace = true
 # Design docs: .ai/memory/active/flux2-dev-diffusion-port/{PLAN,CONTEXT,CHECKLIST}.md
 # ─────────────────────────────────────────────────────────────────────────────
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.102"
 
@@ -42,6 +45,9 @@ mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675a
     "accelerate",
 ] }
 mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true }
+
+[dev-dependencies]
+lumen-testkit = { workspace = true }
 
 [features]
 default = []

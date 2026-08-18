@@ -101,7 +101,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("build_chat_input for {category}"))?;
 
         let out_tokens = backend
-            .generate(&prompt_ids, max_tokens, 0.0, 1.0)
+            .generate(&prompt_ids, max_tokens, 0.0, 1.0, &Default::default())
             .with_context(|| format!("generate for {category}"))?;
         let out_text = backend
             .decode(&out_tokens)

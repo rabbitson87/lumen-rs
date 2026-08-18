@@ -51,6 +51,33 @@ pub(crate) mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Disable overlap scheduling on the sampled decode path, restoring the
+        /// original fully-synchronous order. Default OFF, i.e. overlap is on.
+        ///
+        /// Output-identical by construction: everything that affects the token
+        /// stream — sampling, `all_tokens.push`, thinking-budget force-close and
+        /// channel-block, the EOS check, the runaway check, the hard break —
+        /// stays synchronous and in the original order. Only the parser advance,
+        /// detokenisation and SSE send of the *previous* token are deferred, and
+        /// the parser is consumed solely by `emit_token_event` / `finalize`.
+        pub(crate) no_overlap {
+            env: "LUMEN_MLX_NO_OVERLAP",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
+    /// Overlap scheduling on, i.e. `LUMEN_MLX_NO_OVERLAP` is not asserted.
+    ///
+    /// Split out of the decode loop so the polarity is reachable from a test.
+    /// The defect it guards was keyed on the variable being *set* rather than
+    /// on its value, and the call site sits inside a decode loop no unit test
+    /// can enter.
+    pub(crate) fn overlap_scheduling_enabled() -> bool {
+        !no_overlap::get()
+    }
+
     /// Background worker that drops MLX's reusable Metal-buffer pool after each
     /// chat completion. MLX keeps freed buffers in a reuse cache that grows with
     /// every request's KV-sized allocations; without a periodic clear, process
@@ -351,11 +378,11 @@ pub(crate) mod imp {
     ///      `ArgumentsDelta` chunk at `<tool_call|>` close.)
     ///   3. Boundary tokens (`<|tool_call>` open / `<tool_call|>`
     ///      close). Suppressed — no event fires.
-    /// Per-token stderr trace. Enabled when `LUMEN_GEMMA4_TOKEN_TRACE` is
-    /// set to a non-empty / non-`0` / non-`false` value. Prints one line
-    /// per sampled token with id + decoded text (special tokens visible)
+    ///      Per-token stderr trace. Enabled when `LUMEN_GEMMA4_TOKEN_TRACE` is
+    ///      set to a non-empty / non-`0` / non-`false` value. Prints one line
+    ///      per sampled token with id + decoded text (special tokens visible)
     /// + parser state transition. Use for debugging reasoning runaway,
-    /// tool-call structure, or channel close failures.
+    ///   tool-call structure, or channel close failures.
     ///
     /// Cheap when off (single env lookup per call, cached on first hit
     /// via a `OnceLock`). Bounded cost when on (one decode per token,
@@ -424,12 +451,12 @@ pub(crate) mod imp {
         // fire the early ToolCallStart event.
         if matches!(state_after, ParseState::ToolCall) {
             let body_chunk = chat.decode(&[token], /* skip_special */ false)?;
-            if !body_chunk.is_empty() {
-                if let Some(name) = parser.observe_tool_text_fragment(&body_chunk) {
-                    on_event(BackendStreamEvent::ToolCallStart {
-                        name: name.as_str(),
-                    })?;
-                }
+            if !body_chunk.is_empty()
+                && let Some(name) = parser.observe_tool_text_fragment(&body_chunk)
+            {
+                on_event(BackendStreamEvent::ToolCallStart {
+                    name: name.as_str(),
+                })?;
             }
         }
         Ok(())
@@ -494,7 +521,7 @@ pub(crate) mod imp {
     /// downstream clients reject). For agentic clients (Moltis-style
     /// matchers, OpenAI-spec tool callers) ON is the safer production
     /// default. Cached on first read.
-    fn gemma4_grammar_lark_enabled() -> bool {
+    pub(crate) fn gemma4_grammar_lark_enabled() -> bool {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
             std::env::var("LUMEN_GEMMA4_GRAMMAR_LARK")
@@ -848,6 +875,7 @@ pub(crate) mod imp {
             &self,
             tools: &[crate::chat_io::ToolDef<'_>],
             choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            calls: crate::grammar::ToolCalls,
         ) -> Option<Gemma4GrammarState> {
             use crate::chat_io::ResolvedToolChoice;
             if !gemma4_grammar_lark_enabled() {
@@ -934,14 +962,14 @@ pub(crate) mod imp {
                 return None;
             }
             let built = if strict {
-                Gemma4GrammarState::new_lark_strict(factory, &tools_json, mode)
+                Gemma4GrammarState::new_lark_strict(factory, &tools_json, mode, calls)
             } else {
-                Gemma4GrammarState::new_lark(factory, &tools_json, mode)
+                Gemma4GrammarState::new_lark(factory, &tools_json, mode, calls)
             };
             match built {
                 Ok(s) => {
                     eprintln!(
-                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?}, strict={strict})",
+                        "[gemma4-backend] Lark grammar active for {} tool(s) (mode={mode:?}, strict={strict}, calls={calls:?})",
                         tools.len()
                     );
                     Some(s)
@@ -1010,6 +1038,7 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             choice: &crate::chat_io::ResolvedToolChoice<'_>,
             response_schema: Option<&serde_json::Value>,
+            calls: crate::grammar::ToolCalls,
         ) -> Option<Gemma4GrammarState> {
             if let Some(schema) = response_schema {
                 if !tools.is_empty() {
@@ -1020,7 +1049,7 @@ pub(crate) mod imp {
                 }
                 return self.build_response_format_grammar(schema);
             }
-            self.build_grammar_state(tools, choice)
+            self.build_grammar_state(tools, choice, calls)
         }
 
         pub fn model_id(&self) -> &str {
@@ -1284,18 +1313,68 @@ pub(crate) mod imp {
             messages: &[(String, String)],
             thinking: bool,
         ) -> Result<Vec<u32>> {
-            self.build_chat_input_with_tools(messages, thinking, &[])
+            self.build_chat_input_with_tools(messages, thinking, &[], false)
+        }
+
+        /// Prompt tokens one attached image adds — its soft-token run plus the
+        /// sentinels and trailing newline. Header-only; no pixel decode.
+        pub fn image_prompt_tokens(&self, encoded: &[u8]) -> Result<usize> {
+            self.model.image_prompt_tokens(encoded)
         }
 
         /// Structured-history variant — accepts `ChatTurn`s carrying
         /// `tool_calls` / tool result data the `(role, content)` shape
         /// can't represent. Used by the turn-2 continuation path
         /// (`chat_with_history`).
+        /// [`Self::build_chat_input_from_history`] with per-turn image
+        /// soft-token counts.
+        ///
+        /// Rejects the jinja path for the same reason the flat renderer does:
+        /// the template emits a single `<|image|>` and expanding it into the
+        /// per-image run is the processor's job, which is not reimplemented
+        /// inside the template engine.
+        pub fn build_chat_input_from_history_with_images(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            image_counts: &[Vec<usize>],
+            close_thought_channel: bool,
+        ) -> Result<Vec<u32>> {
+            if image_counts.iter().all(|c| c.is_empty()) {
+                return self.build_chat_input_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    close_thought_channel,
+                );
+            }
+            if self.jinja_chat.is_some() {
+                return Err(anyhow!(
+                    "image input is not supported with a jinja chat template; \
+                     unset the template to use the built-in Gemma 4 renderer"
+                ));
+            }
+            let ids = self.chat.render_chat_history_with_images(
+                turns,
+                &RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                    close_thought_channel,
+                },
+                tools,
+                image_counts,
+            )?;
+            maybe_dump_prompt(&self.chat, &ids, "from_history_with_images");
+            Ok(ids)
+        }
+
         pub fn build_chat_input_from_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
             thinking: bool,
             tools: &[crate::chat_io::ToolDef<'_>],
+            close_thought_channel: bool,
         ) -> Result<Vec<u32>> {
             let ids = if let Some(j) = &self.jinja_chat {
                 j.render_to_ids(
@@ -1312,6 +1391,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: true,
+                        close_thought_channel,
                     },
                     tools,
                 )?
@@ -1341,6 +1421,9 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: false,
+                        // No generation prompt is emitted, so the thought
+                        // channel has nowhere to be prefilled.
+                        close_thought_channel: false,
                     },
                     tools,
                 )?
@@ -1358,6 +1441,7 @@ pub(crate) mod imp {
             messages: &[(String, String)],
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            close_thought_channel: bool,
         ) -> Result<Vec<u32>> {
             let ids = if let Some(j) = &self.jinja_chat {
                 let turns = pairs_to_turns(messages)?;
@@ -1376,6 +1460,7 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: true,
+                        close_thought_channel,
                     },
                     tools,
                 )?
@@ -1415,6 +1500,9 @@ pub(crate) mod imp {
                     &RenderOptions {
                         enable_thinking: thinking,
                         add_generation_prompt: false,
+                        // No generation prompt is emitted, so the thought
+                        // channel has nowhere to be prefilled.
+                        close_thought_channel: false,
                     },
                     tools,
                 )
@@ -1487,14 +1575,57 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            self.chat_from_history_with_images(
+                turns,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// [`Self::chat_from_history`] with images attached to `User` turns.
+        ///
+        /// `images[i]` holds the encoded byte streams on `turns[i]` — indexed
+        /// by **turn**, since the caller expands one request message into
+        /// several turns. Empty is byte-identical to [`Self::chat_from_history`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_from_history_with_images(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::chat_io::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            let (counts, prepared) = self.measure_turn_images(images)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+                false,
+            )?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
                 sampling: build_sampling_config(temperature, top_p, ov),
             };
-            let stats = self.model.generate(&prompt, &cfg)?;
+            let stats = if prepared.is_empty() {
+                self.model.generate(&prompt, &cfg)?
+            } else {
+                self.model
+                    .generate_with_cache_and_images(&prompt, &prepared, &cfg, None)?
+            };
             eprintln!(
                 "[gemma4] chat_from_history done: {} tokens in {:.0}ms ({:.1} tok/s)",
                 stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
@@ -1521,14 +1652,93 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+            self.chat_with_images(
+                messages,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// Render an image-bearing prompt and return it alongside the images in
+        /// prompt order.
+        ///
+        /// Every image is measured first — the prompt must reserve exactly as
+        /// many `<|image|>` placeholders as the tower will emit soft tokens,
+        /// and that count depends on the image's aspect ratio. Measuring runs
+        /// decode + resize only, not the tower.
+        ///
+        /// The returned `PreparedImage`s are flattened in prompt order, matching
+        /// the placeholder runs the renderer just emitted, which is the pairing
+        /// `encode_images_for_prompt` relies on. They are carried rather than
+        /// re-derived so each image is decoded and resized exactly once.
+        #[allow(clippy::too_many_arguments)]
+        fn build_image_prompt(
+            &self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<(Vec<u32>, Vec<u32>, Vec<crate::gemma4_vision::PreparedImage>)> {
+            let mut counts: Vec<Vec<usize>> = Vec::with_capacity(images.len());
+            let mut flat: Vec<crate::gemma4_vision::PreparedImage> = Vec::new();
+            for per_msg in images {
+                let mut row = Vec::with_capacity(per_msg.len());
+                for bytes in per_msg {
+                    let prepared = self.model.prepare_image(bytes)?;
+                    row.push(prepared.num_soft_tokens);
+                    flat.push(prepared);
+                }
+                counts.push(row);
+            }
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_with_images(
+                messages,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )?;
+            Ok((prompt, prefill_tokens, flat))
+        }
+
+        /// [`Self::chat`] with inline images.
+        ///
+        /// `images[i]` holds the encoded image byte streams attached to
+        /// `messages[i]`. An empty slice is byte-identical to [`Self::chat`].
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_with_images(
+            &mut self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            let (prompt, prefill_tokens, flat) =
+                self.build_image_prompt(messages, images, thinking, tools, tool_choice, false)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
                 sampling: build_sampling_config(temperature, top_p, ov),
             };
-            let stats = self.model.generate(&prompt, &cfg)?;
+            let stats = if flat.is_empty() {
+                self.model.generate(&prompt, &cfg)?
+            } else {
+                self.model
+                    .generate_with_cache_and_images(&prompt, &flat, &cfg, None)?
+            };
             log_chat_done(
                 stats.prompt_tokens,
                 stats.prefill_ms,
@@ -1565,14 +1775,70 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
+            self.build_prompt_and_prefill_with_images(
+                messages,
+                &[],
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
+        }
+
+        /// [`Self::build_prompt_and_prefill`] with per-message image
+        /// soft-token counts. Empty `image_counts` is byte-identical.
+        #[allow(clippy::too_many_arguments)]
+        fn build_prompt_and_prefill_with_images(
+            &self,
+            messages: &[(String, String)],
+            image_counts: &[Vec<usize>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::gemma4_tools::imp::ToolDef<'_>] = match tool_choice {
                 ResolvedToolChoice::None => &[],
                 _ => tools,
             };
-            let mut prompt =
-                self.build_chat_input_with_tools(messages, thinking, effective_tools)?;
+            let has_images = image_counts.iter().any(|c| !c.is_empty());
+
+            let mut prompt = if !has_images {
+                // No images → keep the untouched path, including the
+                // model-supplied jinja template when one is present.
+                self.build_chat_input_with_tools(
+                    messages,
+                    thinking,
+                    effective_tools,
+                    close_thought_channel,
+                )?
+            } else {
+                if self.jinja_chat.is_some() {
+                    // The jinja renderer emits a single `<|image|>`; expanding it
+                    // to the per-image soft-token run is the processor's job and
+                    // we don't reimplement that inside the template engine.
+                    return Err(anyhow!(
+                        "image input is not supported with a jinja chat template; \
+                         unset the template to use the built-in Gemma 4 renderer"
+                    ));
+                }
+                let parsed = Self::parse_role_pairs(messages)?;
+                let ids = self.chat.render_to_ids_with_tools_and_images(
+                    &parsed,
+                    &RenderOptions {
+                        enable_thinking: thinking,
+                        add_generation_prompt: true,
+                        close_thought_channel,
+                    },
+                    effective_tools,
+                    image_counts,
+                )?;
+                maybe_dump_prompt(&self.chat, &ids, "with_images");
+                ids
+            };
             let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
             prompt.extend(prefill.iter().copied());
             Ok((prompt, prefill))
@@ -1585,14 +1851,42 @@ pub(crate) mod imp {
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
+            self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &[],
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
+        }
+
+        /// [`Self::build_prompt_and_prefill_from_history`] with per-turn image
+        /// soft-token counts. Empty counts are byte-identical.
+        #[allow(clippy::too_many_arguments)]
+        fn build_prompt_and_prefill_from_history_with_images(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            image_counts: &[Vec<usize>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
             use crate::chat_io::ResolvedToolChoice;
             let effective_tools: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
                 ResolvedToolChoice::None => &[],
                 _ => tools,
             };
-            let mut prompt =
-                self.build_chat_input_from_history(turns, thinking, effective_tools)?;
+            let mut prompt = self.build_chat_input_from_history_with_images(
+                turns,
+                thinking,
+                effective_tools,
+                image_counts,
+                close_thought_channel,
+            )?;
             let prefill = self.chat.tool_choice_prefill_tokens(tool_choice)?;
             prompt.extend(prefill.iter().copied());
             Ok((prompt, prefill))
@@ -1793,7 +2087,7 @@ pub(crate) mod imp {
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
             }
@@ -2101,7 +2395,7 @@ pub(crate) mod imp {
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
+                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
             }
@@ -2162,7 +2456,12 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}",
                 cache.offset()
             );
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2173,6 +2472,7 @@ pub(crate) mod imp {
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
+                None, /* vision */
                 on_event,
             )
         }
@@ -2196,8 +2496,13 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                false,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!(
                     "chat_streaming_from_history_with_prefix_cache: empty prompt"
@@ -2238,7 +2543,12 @@ pub(crate) mod imp {
                  result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)",
                 cache.offset()
             );
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2249,6 +2559,7 @@ pub(crate) mod imp {
                 grammar,
                 Some(cache),
                 Some((prefix_cache_key.to_string(), trailing_header_len)),
+                None, /* vision */
                 on_event,
             )
         }
@@ -2270,8 +2581,13 @@ pub(crate) mod imp {
             tools: &[crate::chat_io::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                false,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_from_history_with_prefix_cache: empty prompt"));
             }
@@ -2357,9 +2673,19 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice)?;
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema.is_some(),
+            )?;
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2368,8 +2694,87 @@ pub(crate) mod imp {
                 top_p,
                 ov,
                 grammar,
-                None,
-                None,
+                None, /* pre_built_cache */
+                None, /* snapshot_prefix_key */
+                None, /* vision */
+                on_event,
+            )
+        }
+
+        /// [`Self::chat_streaming`] with inline images.
+        ///
+        /// `images[i]` holds the encoded image byte streams attached to
+        /// `messages[i]`. With nothing attached this is byte-identical to
+        /// [`Self::chat_streaming`], so callers can route every request here.
+        ///
+        /// Images are encoded once, up front, and handed to the prefill loop;
+        /// the chunked prefill then splices each image's rows into whichever
+        /// chunk covers them. Decode is pure text and takes the unchanged
+        /// path. Like the non-streaming variant this skips the prefix cache —
+        /// the cached prefix is keyed on text alone, and a vision prompt's
+        /// placeholder rows only mean anything together with the image they
+        /// were spliced from.
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_streaming_with_images(
+            &mut self,
+            messages: &[(String, String)],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            if !images.iter().any(|v| !v.is_empty()) {
+                return self.chat_streaming(
+                    messages,
+                    max_new_tokens,
+                    temperature,
+                    top_p,
+                    ov,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    response_schema,
+                    on_event,
+                );
+            }
+
+            let (prompt, prefill_tokens, flat) = self.build_image_prompt(
+                messages,
+                images,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema.is_some(),
+            )?;
+            // Encode before the prefill loop starts: the runs are prompt-global
+            // and every chunk needs to be able to look up any of them.
+            let vision = self
+                .model
+                .encode_images_for_prompt(&prompt, &flat)
+                .context("chat_streaming: encode images")?;
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
+            self.decode_streaming_with_prompt(
+                prompt,
+                prefill_tokens,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                grammar,
+                None, /* pre_built_cache — images bypass the prefix cache */
+                None, /* snapshot_prefix_key */
+                Some(vision),
                 on_event,
             )
         }
@@ -2394,9 +2799,61 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill_from_history(turns, thinking, tools, tool_choice)?;
-            let grammar = self.select_grammar_state(tools, tool_choice, response_schema);
+            self.chat_streaming_from_history_with_images(
+                turns,
+                &[],
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema,
+                on_event,
+            )
+        }
+
+        /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+        #[allow(clippy::too_many_arguments)]
+        pub fn chat_streaming_from_history_with_images(
+            &mut self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            images: &[Vec<Vec<u8>>],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
+        ) -> Result<ParsedResponse> {
+            let (counts, prepared) = self.measure_turn_images(images)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
+                turns,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+                response_schema.is_some(),
+            )?;
+            let vision = if prepared.is_empty() {
+                None
+            } else {
+                Some(
+                    self.model
+                        .encode_images_for_prompt(&prompt, &prepared)
+                        .context("chat_streaming_from_history: encode images")?,
+                )
+            };
+            let grammar = self.select_grammar_state(
+                tools,
+                tool_choice,
+                response_schema,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+            );
             self.decode_streaming_with_prompt(
                 prompt,
                 prefill_tokens,
@@ -2405,10 +2862,32 @@ pub(crate) mod imp {
                 top_p,
                 ov,
                 grammar,
-                None,
-                None,
+                None, /* pre_built_cache — images bypass the prefix cache */
+                None, /* snapshot_prefix_key */
+                vision,
                 on_event,
             )
+        }
+
+        /// Decode + resize every image once, returning per-turn counts (for the
+        /// renderer) alongside the flattened prepared images in prompt order
+        /// (for the tower).
+        fn measure_turn_images(
+            &self,
+            images: &[Vec<Vec<u8>>],
+        ) -> Result<(Vec<Vec<usize>>, Vec<crate::gemma4_vision::PreparedImage>)> {
+            let mut counts = Vec::with_capacity(images.len());
+            let mut flat = Vec::new();
+            for per_turn in images {
+                let mut row = Vec::with_capacity(per_turn.len());
+                for bytes in per_turn {
+                    let prepared = self.model.prepare_image(bytes)?;
+                    row.push(prepared.num_soft_tokens);
+                    flat.push(prepared);
+                }
+                counts.push(row);
+            }
+            Ok((counts, flat))
         }
 
         fn decode_streaming_with_prompt(
@@ -2446,6 +2925,13 @@ pub(crate) mod imp {
             // requests). `Some((key, 0))` snapshots the full prompt — used
             // when trailing header detection isn't available.
             snapshot_prefix_key: Option<(String, usize)>,
+            // Encoded images for an image-bearing prompt: prompt-global
+            // `(start, len)` placeholder runs paired with their `[len_i,
+            // hidden]` soft tokens, already produced by
+            // `encode_images_for_prompt`. Encoding happens once here, before
+            // the chunk loop, and each chunk splices whichever rows fall in
+            // its window. `None` is the text path, unchanged.
+            vision: Option<(Vec<(usize, usize)>, Vec<mlx_rs::Array>)>,
             mut on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
             // ── Manual prefill + decode loop so we can inject the
@@ -2530,26 +3016,25 @@ pub(crate) mod imp {
                 // clamp also keeps the per-command-buffer intermediate graph
                 // bounded, so it is applied uniformly. Override the budget with
                 // `LUMEN_GEMMA4_PREFILL_SCORES_GB`.
-                let scores_budget_bytes: u64 = std::env::var("LUMEN_GEMMA4_PREFILL_SCORES_GB")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .filter(|&g| g > 0.0)
-                    .map(|g| (g * 1e9) as u64)
-                    .unwrap_or(8_000_000_000);
-                // f32 worst case for the scores accumulator (bf16 only halves it,
-                // so 4 keeps the bound conservative regardless of dtype).
-                const SCORES_BYTES_PER_ELEM: u64 = 4;
-                let heads = self.model.config().text_config.num_attention_heads.max(1) as u64;
-                let kv_upper = (prompt.len() as u64).max(1);
-                let max_safe_chunk = (scores_budget_bytes
-                    / (heads * kv_upper * SCORES_BYTES_PER_ELEM))
-                    .max(256) as usize;
-                let chunk_size = requested_chunk.min(max_safe_chunk);
-                if chunk_size < requested_chunk {
+                // The arithmetic lives in `prefill_budget` so it can be swept at
+                // tier 0; the two backends had it duplicated. Behaviour here is
+                // unchanged by the hoist.
+                let scores_budget_bytes =
+                    crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB");
+                let decision = crate::prefill_budget::clamp_chunk(
+                    requested_chunk,
+                    scores_budget_bytes,
+                    self.model.config().text_config.num_attention_heads,
+                    prompt.len(),
+                );
+                let chunk_size = decision.chunk;
+                if decision.clamped() {
                     eprintln!(
                         "[prefill] chunk clamped {requested_chunk} → {chunk_size} \
-                         (heads={heads} kv_upper={kv_upper} budget={:.1}GB) — \
+                         (heads={} kv_upper={} budget={:.1}GB) — \
                          keeps single-chunk scores under the Metal buffer cap",
+                        decision.heads.max(1),
+                        decision.kv_upper.max(1),
                         scores_budget_bytes as f64 / 1e9
                     );
                 }
@@ -2632,17 +3117,30 @@ pub(crate) mod imp {
                     // (8K × hidden × vocab quantized matmul) whose output is
                     // immediately reduced to a single argmax. Bit-identical
                     // tokens; see playbook_lm_head_last_token_slice.md.
-                    let chunk_logits = self
-                        .model
-                        .forward_last_token(chunk, &mut cache)
-                        .with_context(|| {
-                            format!(
-                                "chat_streaming: prefill chunk {}/{} ({} tokens)",
-                                i + 1,
-                                n_chunks,
-                                chunk.len()
-                            )
-                        })?;
+                    //
+                    // With images attached the chunk goes through the
+                    // soft-token variant instead: the runs are prompt-global,
+                    // so the chunk's absolute start tells the splice which
+                    // rows (if any) land in this window.
+                    let chunk_start = prefill_start + i * chunk_size;
+                    let chunk_logits = match vision.as_ref() {
+                        Some((runs, soft)) => self.model.forward_last_token_with_soft(
+                            chunk,
+                            &mut cache,
+                            chunk_start,
+                            runs,
+                            soft,
+                        ),
+                        None => self.model.forward_last_token(chunk, &mut cache),
+                    }
+                    .with_context(|| {
+                        format!(
+                            "chat_streaming: prefill chunk {}/{} ({} tokens)",
+                            i + 1,
+                            n_chunks,
+                            chunk.len()
+                        )
+                    })?;
                     // EVEN the final chunk gets eval'd. Keeping it lazy in the
                     // multi-chunk regime piles chunk-N's forward graph onto
                     // the subsequent argmax + async_eval call, which then
@@ -2701,10 +3199,13 @@ pub(crate) mod imp {
                 // logits feeding into the decode argmax.
                 if let Some(split) = snapshot_split {
                     let trailing = &prompt[split..];
-                    let trailing_logits = self
-                        .model
-                        .forward_last_token(trailing, &mut cache)
-                        .context("chat_streaming: prefill trailing header")?;
+                    let trailing_logits = match vision.as_ref() {
+                        Some((runs, soft)) => self
+                            .model
+                            .forward_last_token_with_soft(trailing, &mut cache, split, runs, soft),
+                        None => self.model.forward_last_token(trailing, &mut cache),
+                    }
+                    .context("chat_streaming: prefill trailing header")?;
                     trailing_logits
                         .eval()
                         .context("chat_streaming: prefill trailing header eval")?;
@@ -2985,7 +3486,11 @@ pub(crate) mod imp {
                         // decode path) ────────────────────────────────────
                         //
                         // Default ON; `LUMEN_MLX_NO_OVERLAP=1` restores the
-                        // exact original synchronous path.
+                        // exact original synchronous path. Read through the
+                        // registry, so `=0` means "do not disable" — this used
+                        // to be `env::var(..).is_err()`, i.e. keyed on the
+                        // variable being SET at all, so `=0` disabled overlap
+                        // and contradicted the line above.
                         //
                         // Per step we (a) sample token N (blocks on this
                         // step's logits via `last_logits_to_cpu_f32`'s eval),
@@ -3008,7 +3513,7 @@ pub(crate) mod imp {
                         // Only the parser advance + detok + SSE send is
                         // deferred (the parser is consumed solely by
                         // `emit_token_event` and `finalize`).
-                        let overlap_enabled = std::env::var("LUMEN_MLX_NO_OVERLAP").is_err();
+                        let overlap_enabled = overlap_scheduling_enabled();
                         // size-1 FIFO: the previous step's (token, state_before)
                         // whose parser.push + emit was deferred.
                         let mut pending: Option<(u32, ParseState)> = None;
@@ -3130,7 +3635,21 @@ pub(crate) mod imp {
                             let stop_eos = eos.contains(&next_tok);
                             let stop_runaway = runaway.check(&all_tokens);
                             let stop_hard_break = thinking_budget.should_hard_break();
-                            let stopping = stop_eos || stop_runaway.is_some() || stop_hard_break;
+                            // `parallel_tool_calls: false` — the grammar has
+                            // just reported a completed call and the client
+                            // asked for exactly one.
+                            // Read from the request policy, NOT from the
+                            // grammar: `grammar_factory()` returns None on the
+                            // imatrix-AWQ family, and asking a state that does
+                            // not exist made the cap inert exactly there.
+                            let stop_one_call = crate::grammar::ToolCalls::from_parallel_flag(
+                                ov.parallel_tool_calls,
+                            )
+                            .must_stop_after_call_closer(next_tok);
+                            let stopping = stop_eos
+                                || stop_runaway.is_some()
+                                || stop_hard_break
+                                || stop_one_call;
                             let at_budget = all_tokens.len() >= max_new_tokens;
 
                             if overlap_enabled && !stopping && !at_budget {
@@ -3184,6 +3703,14 @@ pub(crate) mod imp {
                             if stop_hard_break {
                                 eprintln!(
                                     "[thinking-budget] hard break at {} tokens — force-close did not help",
+                                    all_tokens.len()
+                                );
+                                break;
+                            }
+                            if stop_one_call {
+                                eprintln!(
+                                    "[tool-calls] parallel_tool_calls=false — ending the turn after \
+                                     one completed call at {} tokens",
                                     all_tokens.len()
                                 );
                                 break;
@@ -3500,7 +4027,7 @@ pub(crate) mod imp {
                                 Some((name, cnt))
                             })
                             .collect();
-                        entries.sort_by(|a, b| b.1.cmp(&a.1));
+                        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
                         let max_show = 25.min(entries.len());
                         eprintln!("[gemma4-primhist-dyn] top-{max_show} per-step:");
                         for (name, cnt) in entries.iter().take(max_show) {
@@ -3591,6 +4118,24 @@ pub(crate) mod imp {
 
         fn dir_present() -> bool {
             Path::new(LMSTUDIO_DIR).exists()
+        }
+
+        /// `LUMEN_MLX_NO_OVERLAP=0` must NOT disable overlap.
+        ///
+        /// The read used to be `env::var(..).is_err()` — keyed on the variable
+        /// being set at all — so `=0`, `=false` and even `=` turned overlap off,
+        /// which is the opposite of what every one of those spellings means and
+        /// the opposite of what the comment beside it promised.
+        #[test]
+        fn zero_does_not_disable_overlap() {
+            // SAFETY: single-threaded test; the value is read through the flag
+            // registry, which applies the uniform `!= "0"` rule.
+            unsafe { std::env::set_var("LUMEN_MLX_NO_OVERLAP", "0") };
+            assert!(
+                overlap_scheduling_enabled(),
+                "setting the variable to 0 must leave overlap ON"
+            );
+            unsafe { std::env::remove_var("LUMEN_MLX_NO_OVERLAP") };
         }
 
         #[test]

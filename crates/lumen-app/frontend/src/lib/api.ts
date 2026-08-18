@@ -53,25 +53,17 @@ export interface ContextConfig {
   default_max_tokens: number;
 }
 
-export type BackendMode = "auto" | "candle" | "mlx-native" | "mlx-pyo3";
+export type BackendMode = "auto" | "mlx-native" | "mlx-pyo3";
 export type SpecKind = "off" | "lookup" | "mtp";
-
-export interface PagedConfig {
-  enabled: boolean;
-  layers: number | null;
-  kv_heads: number | null;
-  head_dim_sliding: number | null;
-  head_dim_global: number | null;
-  global_every: number | null;
-  max_batch: number | null;
-}
 
 export interface AdvancedConfig {
   backend_mode: BackendMode;
   spec_kind: SpecKind;
   spec_draft_n_max: number | null;
   batched_engine: boolean;
-  paged_attention: PagedConfig;
+  /** Sequences the MLX scheduler decodes per step; null uses the server's 8.
+   *  Was `paged_attention.max_batch` before schema v9. */
+  mlx_batch_max: number | null;
 }
 
 export interface PersistentConfig {

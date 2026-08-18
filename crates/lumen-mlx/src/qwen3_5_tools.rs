@@ -85,10 +85,11 @@ const TOOL_INSTRUCTION_BLOCK: &str = "\n\nIf you choose to call a function ONLY 
 /// Render the system prefix containing the `<tools>` block + instruction.
 /// Optional existing system content is appended after the IMPORTANT block,
 /// separated by `\n\n` — matches Qwen's template behavior.
-pub(crate) fn render_tools_system_block(
-    tools: &[ToolDef<'_>],
-    extra_system: Option<&str>,
-) -> String {
+///
+/// `pub` (re-exported `#[doc(hidden)]` from the crate root) so the
+/// `chat_render` fuzz target can reach it. The enclosing module stays private,
+/// so this widens the API by exactly one function.
+pub fn render_tools_system_block(tools: &[ToolDef<'_>], extra_system: Option<&str>) -> String {
     let mut s = String::new();
     s.push_str("<|im_start|>system\n");
     s.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
@@ -210,13 +211,13 @@ pub fn format_qwen3_chat_with_tools(
             None
         };
         s.push_str(&render_tools_system_block(tools, leading_system));
-    } else if let Some((role, content)) = messages.first() {
-        if role.eq_ignore_ascii_case("system") {
-            s.push_str("<|im_start|>system\n");
-            s.push_str(content);
-            s.push_str("<|im_end|>\n");
-            idx = 1;
-        }
+    } else if let Some((role, content)) = messages.first()
+        && role.eq_ignore_ascii_case("system")
+    {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(content);
+        s.push_str("<|im_end|>\n");
+        idx = 1;
     }
 
     while idx < messages.len() {
@@ -479,6 +480,9 @@ impl Qwen35ResponseParser {
         }
     }
 
+    #[allow(dead_code)]
+    // no caller. NOTE: this never ran, so the `defense-in-depth` it claims does
+    // not exist — the engine's downgrade-to-Auto is the only check in the path.
     /// Total accumulated visible bytes so far (live view — for
     /// `completion_tokens_with_tools` post-decode accounting).
     pub fn visible_so_far(&self) -> &str {
@@ -821,14 +825,15 @@ fn parse_param_value(raw: &str) -> JsonValue {
     let looks_json = matches!(first, b'{' | b'[' | b'"' | b't' | b'f' | b'n')
         || first.is_ascii_digit()
         || first == b'-';
-    if looks_json {
-        if let Ok(v) = serde_json::from_str::<JsonValue>(trimmed) {
-            return v;
-        }
+    if looks_json && let Ok(v) = serde_json::from_str::<JsonValue>(trimmed) {
+        return v;
     }
     JsonValue::String(raw.to_string())
 }
 
+#[allow(dead_code)]
+// no caller. NOTE: this never ran, so the `defense-in-depth` it claims does
+// not exist — the engine's downgrade-to-Auto is the only check in the path.
 /// Reject obviously-malformed tool_choice prefill for `Tool(name)` where
 /// the requested name doesn't appear in the tool defs. Engine layer
 /// already downgrades to Auto in that case, but defense-in-depth.
@@ -836,10 +841,10 @@ pub fn validate_tool_choice_against_defs<'a>(
     choice: &ResolvedToolChoice<'a>,
     tools: &[ToolDef<'_>],
 ) -> Result<()> {
-    if let ResolvedToolChoice::Tool(name) = choice {
-        if !tools.iter().any(|t| t.name == *name) {
-            return Err(anyhow!("tool_choice references unknown function: {name}"));
-        }
+    if let ResolvedToolChoice::Tool(name) = choice
+        && !tools.iter().any(|t| t.name == *name)
+    {
+        return Err(anyhow!("tool_choice references unknown function: {name}"));
     }
     Ok(())
 }
@@ -1004,6 +1009,61 @@ mod tests {
         let s = format_qwen3_chat_with_tools_from_history(&turns, false, &[]);
         // Both tool_responses in ONE user turn.
         assert!(s.contains("<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>"));
+    }
+
+    #[test]
+    fn tools_template_carries_an_image_block_ahead_of_its_text() {
+        // Images and tools compose only because they touch different parts of
+        // the prompt: the image block rides inside a user message body, the
+        // tool template wraps around it. Verify the template passes the block
+        // through untouched and in front of the question — the placeholder run
+        // is spliced positionally, so a template that reordered or escaped it
+        // would put the pixels on the wrong rows.
+        let params = weather_tool();
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Get weather"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let body = format!("{}what city is this?", crate::qwen36_vision::IMAGE_BLOCK);
+        let messages = vec![("user".into(), body)];
+        let s = format_qwen3_chat_with_tools(&messages, false, &tools);
+        assert!(
+            s.contains(&format!(
+                "<|im_start|>user\n{}what city is this?<|im_end|>",
+                crate::qwen36_vision::IMAGE_BLOCK
+            )),
+            "image block must survive the tools template, ahead of the text:\n{s}"
+        );
+        assert_eq!(
+            s.matches("<|image_pad|>").count(),
+            1,
+            "exactly one placeholder per image before id-level expansion"
+        );
+    }
+
+    #[test]
+    fn history_template_folds_a_system_turn_into_the_tools_block() {
+        // This is why the structured-history image path refuses anything but a
+        // User turn: a System turn's text does not render where it was written,
+        // it is absorbed into the `<tools>` block. A placeholder attached there
+        // would move relative to the other images, and the k-th placeholder run
+        // would then be spliced with the wrong one.
+        let params = weather_tool();
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Get weather"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let turns = vec![ChatTurn::System("SYSTEM_MARKER"), ChatTurn::User("hi")];
+        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools);
+        assert!(s.contains("SYSTEM_MARKER"), "system text is still present");
+        assert!(
+            !s.contains("<|im_start|>system\nSYSTEM_MARKER"),
+            "system turn is folded into the tools block, not emitted verbatim:\n{s}"
+        );
     }
 
     #[test]

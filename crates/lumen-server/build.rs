@@ -4,7 +4,7 @@
 //! contained executable instead of forcing operators to copy metallib
 //! alongside the binary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -75,8 +75,8 @@ fn locate_target_dirs() -> (PathBuf, PathBuf) {
     (triple_dir, root_dir)
 }
 
-fn climb(start: &PathBuf, levels: usize) -> PathBuf {
-    let mut p = start.clone();
+fn climb(start: &Path, levels: usize) -> PathBuf {
+    let mut p = start.to_path_buf();
     for _ in 0..levels {
         if let Some(parent) = p.parent() {
             p = parent.to_path_buf();
@@ -140,7 +140,7 @@ fn walk(dir: &PathBuf, best: &mut Option<(std::time::SystemTime, PathBuf)>, dept
 /// Diagnostic — locate any mlx-sys-* build directories under `root` and dump
 /// their out/build/ layout so a failed CI run shows what mlx-sys actually
 /// produced (vs guessing). Bounded to 3 levels of recursion under `root`.
-fn list_mlx_sys_dirs(root: &PathBuf) {
+fn list_mlx_sys_dirs(root: &Path) {
     let Ok(rd) = std::fs::read_dir(root.join("release/build")) else {
         // Try other common profile dirs if `release` isn't there.
         for prof in ["debug", "release"] {

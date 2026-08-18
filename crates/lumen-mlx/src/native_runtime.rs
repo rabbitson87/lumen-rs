@@ -53,18 +53,23 @@ pub struct FineTimings {
 #[cfg(feature = "mlx-native")]
 mod imp {
     use std::cell::RefCell;
-    use std::sync::OnceLock;
 
     use super::FineTimings;
 
-    static FINE_TIMING_ENABLED: OnceLock<bool> = OnceLock::new();
+    lumen_flags::flag! {
+        /// Per-step decode timing capture (`take_native_decode_timing_log`).
+        /// Costs an eval barrier per timed stage; default OFF. (Parse note:
+        /// previously a truthy list `1|true|TRUE|yes`; the uniform rule now
+        /// accepts any non-`"0"`.)
+        pub(crate) fine_timing {
+            env: "LUMEN_NATIVE_TIMING",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
 
     fn fine_timing_enabled() -> bool {
-        *FINE_TIMING_ENABLED.get_or_init(|| {
-            std::env::var("LUMEN_NATIVE_TIMING")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false)
-        })
+        fine_timing::get()
     }
 
     thread_local! {

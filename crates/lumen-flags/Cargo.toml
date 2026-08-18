@@ -1,0 +1,18 @@
+[package]
+name = "lumen-flags"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Env-flag macro + registry: every LUMEN_* boolean gate declares its default, kind and doc in one place"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Distributed-slice registry. The alternative is per-crate manual registration
+# lists, and a list maintained next to — but separately from — the `flag!`
+# invocations is exactly the docs-vs-code drift this crate exists to end (370
+# env vars, 27 documented, when the audit ran). linkme collects the entries at
+# link time, so declaring a flag IS registering it.
+linkme = "0.3"

@@ -24,9 +24,9 @@
 //!      [`NativeGemma4Model::take_captured_correction_h`]).
 //!   2. Pull post-softcap logits to CPU (the sampler already does this).
 //!   3. For each critical id k:
-//!        raw_q   = softcap · atanh(logit[k] / softcap)
-//!        delta_k = h · Δ[k, :]
-//!        logit[k] = softcap · tanh((raw_q + delta_k) / softcap)
+//!      raw_q   = softcap · atanh(logit[k] / softcap)
+//!      delta_k = h · Δ[k, :]
+//!      logit[k] = softcap · tanh((raw_q + delta_k) / softcap)
 //!
 //! Step 3 is N matrix-vector products plus 2 atanh/tanh ops — negligible
 //! cost (~20 µs per decode step on M3 Max).
@@ -277,7 +277,7 @@ fn half_decode(u: u16) -> f32 {
                 f <<= 1;
                 shift += 1;
             }
-            let e = (127 - 15 - shift + 1) as u32;
+            let e = 127 - 15 - shift + 1;
             (e, (f & 0x3FF) << 13)
         }
     } else if exp == 0x1F {

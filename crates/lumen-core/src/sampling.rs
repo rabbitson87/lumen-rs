@@ -222,7 +222,10 @@ pub fn softmax_inplace(logits: &mut [f32]) {
         *v = (*v - max).exp();
         sum += *v;
     }
-    if sum <= 0.0 {
+    // Unreachable: `max` is finite (guarded above), so `exp(max - max) == 1`
+    // is always one of the terms. Kept because the alternative is dividing by
+    // a sum nothing proves non-zero.
+    if crate::never!(sum <= 0.0) {
         let u = 1.0 / logits.len() as f32;
         for v in logits.iter_mut() {
             *v = u;
@@ -446,7 +449,14 @@ pub fn sampling_distribution(logits: &mut [f32], recent: &[u32], cfg: &SamplingC
 /// input so it never deadlocks.
 pub fn sample_distribution(probs: &[f32], rng: &mut Xorshift64) -> u32 {
     let mass: f32 = probs.iter().sum();
-    if !(mass > 0.0) {
+    // `!(mass > 0.0)` and NOT `mass <= 0.0`: the two differ on NaN, where
+    // the first is true and the second false. NaN mass is exactly the
+    // degenerate input this guard exists for — a NaN logit anywhere in the
+    // vector poisons the sum — so clippy's suggestion here would reintroduce
+    // the fallthrough it is meant to prevent.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let degenerate = !(mass > 0.0);
+    if degenerate {
         return probs
             .iter()
             .enumerate()
@@ -513,7 +523,14 @@ pub fn sample_residual(p: &[f32], q: &[f32], rng: &mut Xorshift64) -> u32 {
             mass += r;
         }
     }
-    if !(mass > 0.0) {
+    // `!(mass > 0.0)` and NOT `mass <= 0.0`: the two differ on NaN, where
+    // the first is true and the second false. NaN mass is exactly the
+    // degenerate input this guard exists for — a NaN logit anywhere in the
+    // vector poisons the sum — so clippy's suggestion here would reintroduce
+    // the fallthrough it is meant to prevent.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let degenerate = !(mass > 0.0);
+    if degenerate {
         return p
             .iter()
             .enumerate()

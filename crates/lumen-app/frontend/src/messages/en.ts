@@ -94,6 +94,27 @@ export const en: Record<string, string> = {
   "metrics.requestsPerMin": "req/min",
 
   // ── CONTEXT card ────────────────────────────────────────────────
+  "spec.title": "SPECULATIVE DECODING",
+  "spec.titleHint": "(draft tokens, then verify)",
+  "spec.kind": "Strategy",
+  "spec.off": "Off",
+  "spec.lookup": "Lookup",
+  "spec.mtp": "MTP",
+  "spec.hint.kind":
+    "Off is the safe default. Lookup drafts from n-grams already in the prompt (no extra weights, helps on repetitive text). MTP uses the model's own multi-token-prediction head and needs a checkpoint that ships one. Output is unchanged either way \u2014 rejected drafts are discarded. Sets",
+  "spec.draftK": "Draft tokens per step",
+  "spec.hint.draftK":
+    "How many tokens to draft before verifying. Higher drafts more per step but wastes more work when the draft is rejected; 1\u20132 is usually best, and past ~3 acceptance falls faster than the saving grows. Sets",
+  "batch.title": "BATCHING",
+  "batch.titleHint": "(serve several requests per step)",
+  "batch.enable": "Continuous batching",
+  "batch.off": "Off",
+  "batch.on": "On",
+  "batch.hint.enable":
+    "Decode several sequences in one forward pass. Raises total throughput and lowers per-sequence speed. Only greedy requests are admitted \u2014 anything with temperature or top-p falls back to single-sequence decode. Sets",
+  "batch.max": "Max sequences per step",
+  "batch.hint.max":
+    "Upper bound on sequences decoded together. Each concurrent sequence holds its own KV cache, so this is a memory knob as much as a throughput one. Sets",
   "diskkv.title": "DISK KV CACHE",
   "diskkv.titleHint": "(persist prefix KV across restarts)",
   "diskkv.enable": "Enable",
@@ -406,9 +427,6 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill chunk size",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
     "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048.",
-  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.label": "Batched prefill chunk size (experimental)",
-  "env.entry.LUMEN_BATCHED_PREFILL_CHUNK.help":
-    "Experimental: tokens per prefill chunk for the batched engine (BATCHED_ENGINE=1, Gemma GGUF only). Chunking a long prompt's prefill stops one sequence from monopolizing a single giant forward and stalling other batched sequences. Only prompts longer than this are chunked; shorter prompts are unaffected. Default 512.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "Max prompt tokens (reject cap)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
     "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash.",

@@ -85,10 +85,19 @@ mod imp {
 
     static ROUTING_SLOT: OnceLock<Mutex<CompiledMulti>> = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Compile-wrap the MoE routing graph. Default OFF (A/B WASH). (Parse
+        /// note: previously only `=1` enabled this; the uniform rule now
+        /// accepts any non-`"0"`.)
+        pub(crate) routing_compile {
+            env: "LUMEN_NATIVE_COMPILE_ROUTING",
+            default: false,
+            kind: Optimization,
+        }
+    }
+
     fn routing_compile_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_COMPILE_ROUTING")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+        routing_compile::get()
     }
 
     // SwiGLU fusion compile cache. Replaces the explicit
@@ -112,14 +121,19 @@ mod imp {
 
     static SWIGLU_SLOT: OnceLock<Mutex<CompiledMultiRefs>> = OnceLock::new();
 
+    lumen_flags::flag! {
+        /// Fuse `silu(gate) * up` into one compile dispatch. Default ON
+        /// 2026-05-11 — net WIN −0.671 ms (Welch t=−29σ) at n=10 STEPS=300 on
+        /// Qwen3.6-35B-A3B-mxfp4; closes ~62% of the Native-vs-PyO3 decode gap.
+        pub(crate) swiglu_fuse {
+            env: "LUMEN_NATIVE_FUSE_SWIGLU",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
     pub fn swiglu_fuse_enabled() -> bool {
-        // Default ON 2026-05-11 — landed as net WIN -0.671 ms (Welch t=-29σ) at
-        // n=10 STEPS=300 PROMPT_LEN=3 on Qwen3.6-35B-A3B-mxfp4. Closes ~62% of
-        // the 1.07 ms Native vs PyO3 decode gap. Opt out with
-        // LUMEN_NATIVE_FUSE_SWIGLU=0 for parity A/B or rollback debugging.
-        std::env::var("LUMEN_NATIVE_FUSE_SWIGLU")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        swiglu_fuse::get()
     }
 
     /// Fused `silu(gate) * up` (SwiGLU). Public so the Qwen3.5/3.6 DENSE MLP
@@ -181,7 +195,7 @@ mod imp {
         let half = Array::from_f32(0.5).as_dtype(dt)?;
         let one = Array::from_f32(1.0).as_dtype(dt)?;
         let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.7978845608028654_f32).as_dtype(dt)?; // sqrt(2/PI)
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?; // sqrt(2/PI)
 
         let x_squared = gate.multiply(gate)?;
         let x_cubed = x_squared.multiply(gate)?;
@@ -211,11 +225,11 @@ mod imp {
         out.pop().context("gelu_mul_fused: empty output vec")
     }
 
-    /// Env-gated check (shared with SwiGLU — single off-switch for A/B).
+    /// Shares `LUMEN_NATIVE_FUSE_SWIGLU` with [`swiglu_fuse_enabled`] — one
+    /// off-switch for both fusions, so it delegates to the same flag module
+    /// rather than registering the env a second time.
     pub fn gelu_mul_fuse_enabled() -> bool {
-        std::env::var("LUMEN_NATIVE_FUSE_SWIGLU")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        swiglu_fuse::get()
     }
 
     // Sigmoid-gated multiply fusion is shared with full-attn via

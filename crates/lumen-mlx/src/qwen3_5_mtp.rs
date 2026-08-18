@@ -313,17 +313,17 @@ impl Qwen35MtpBlock {
     /// One MTP block forward pass.
     ///
     /// * `embeds`     — `embed_tokens(x_{p+1})`, shape `[B, T, hidden]`. Caller
-    ///                  pre-embeds via the trunk's embedding table.
+    ///   pre-embeds via the trunk's embedding table.
     /// * `h_pre`      — trunk's pre-final-norm hidden at the same T positions,
-    ///                  shape `[B, T, hidden]`. Same dtype as `embeds`.
+    ///   shape `[B, T, hidden]`. Same dtype as `embeds`.
     /// * `cache`      — the MTP block's own KV cache (lifetime: per seq).
-    ///                  Position offset is read from `cache.offset()`.
+    ///   Position offset is read from `cache.offset()`.
     /// * `causal`     — `true` when `T > 1` (verify-batch or prefill-mirror);
-    ///                  `false` for AR decode (single-row queries).
+    ///   `false` for AR decode (single-row queries).
     /// * `trunk_final_norm_weight` — trunk's `final_norm.weight`, used iff
-    ///                  this block lacks its own `shared_head_norm`.
+    ///   this block lacks its own `shared_head_norm`.
     /// * `trunk_lm_head` — trunk's lm_head linear. Always used (Qwen3.6
-    ///                  doesn't ship a dedicated MTP head).
+    ///   doesn't ship a dedicated MTP head).
     ///
     /// Returns `(logits, new_h_pre)`:
     ///   * `logits[..., :, :vocab]` — predictions for `x_{p+2}` per row.
@@ -928,10 +928,13 @@ pub struct Qwen35MtpDrafter {
 }
 
 impl Qwen35MtpDrafter {
+    #[allow(dead_code)] // no caller yet: per-seq KV for the drafter is unimplemented (see the field
+    // comment), so nothing constructs one outside the loader.
     pub fn new(block: Qwen35MtpBlock) -> Self {
         Self { block }
     }
 
+    #[allow(dead_code)] // no caller yet: per-seq drafter KV is unimplemented.
     pub fn block(&self) -> &Qwen35MtpBlock {
         &self.block
     }
@@ -1059,10 +1062,10 @@ pub fn load_block_from_hf(
 
     let mut mtp_to_shard: HashMap<String, String> = HashMap::new();
     for (key, val) in weight_map {
-        if key.starts_with("mtp.") {
-            if let Some(shard) = val.as_str() {
-                mtp_to_shard.insert(key.clone(), shard.to_string());
-            }
+        if key.starts_with("mtp.")
+            && let Some(shard) = val.as_str()
+        {
+            mtp_to_shard.insert(key.clone(), shard.to_string());
         }
     }
     // 3) Load `mtp.*` tensors into a single key->Array map. Two layouts:

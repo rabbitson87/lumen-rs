@@ -579,8 +579,11 @@ async fn handle_streaming(
                 // reasoning + EOS (no visible content) — a known
                 // failure mode on quantized variants whose CoT path is
                 // degraded (channel-token amplification on imatrix-AWQ).
+                //
+                // No `reasoning_open = false` here, unlike the sibling block
+                // above: this one runs at end-of-stream, so the flag is never
+                // read again and the compiler says so.
                 if reasoning_open {
-                    reasoning_open = false;
                     let close_chunk = ChatCompletionChunk {
                         id: id.clone(),
                         object: "chat.completion.chunk".into(),
@@ -639,7 +642,20 @@ async fn handle_streaming(
                 }
                 break;
             }
-            StreamEvent::Error(_) => break,
+            // Relay the message before closing. Dropping it ended the stream
+            // as an empty *success*, so a client that asked for something
+            // unsupported — or blew the context cap — got a blank reply and no
+            // way to tell why.
+            StreamEvent::Error(msg) => {
+                let payload = serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                    }
+                });
+                write_sse(&mut tcp, &payload).await?;
+                break;
+            }
         }
     }
 
