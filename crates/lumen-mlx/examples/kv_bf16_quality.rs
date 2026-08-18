@@ -114,7 +114,7 @@ fn extend_seed(
 ) -> Result<Extended> {
     set_kv_store_bf16(false);
     let msgs = vec![("user".to_string(), prompt.to_string())];
-    let prompt_ids = backend.build_chat_input(&msgs, false)?;
+    let prompt_ids = backend.build_chat_input(&msgs, false, None)?;
     let prompt_len = prompt_ids.len();
 
     let (mut last, mut pos) = backend.prefill(seq_id, &prompt_ids)?;

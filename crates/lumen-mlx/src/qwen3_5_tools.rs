@@ -70,7 +70,8 @@ use anyhow::{Result, anyhow};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::chat_io::{
-    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ResolvedToolChoice, ToolDef,
+    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ReasoningEffort,
+    ResolvedToolChoice, ToolDef,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,9 +90,21 @@ const TOOL_INSTRUCTION_BLOCK: &str = "\n\nIf you choose to call a function ONLY 
 /// `pub` (re-exported `#[doc(hidden)]` from the crate root) so the
 /// `chat_render` fuzz target can reach it. The enclosing module stays private,
 /// so this widens the API by exactly one function.
-pub fn render_tools_system_block(tools: &[ToolDef<'_>], extra_system: Option<&str>) -> String {
+pub fn render_tools_system_block(
+    tools: &[ToolDef<'_>],
+    extra_system: Option<&str>,
+    effort: Option<ReasoningEffort>,
+) -> String {
     let mut s = String::new();
     s.push_str("<|im_start|>system\n");
+    // Qwen 3.8 puts the reasoning-effort sentence at the very top of the system
+    // block — BEFORE `# Tools`, while the user's own system text still goes
+    // after the IMPORTANT block. That asymmetry is why the effort cannot simply
+    // be prepended to `extra_system` by the caller.
+    if let Some(text) = effort.and_then(ReasoningEffort::instructions) {
+        s.push_str(text);
+        s.push_str("\n\n");
+    }
     s.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
     for tool in tools {
         s.push('\n');
@@ -106,6 +119,32 @@ pub fn render_tools_system_block(tools: &[ToolDef<'_>], extra_system: Option<&st
             s.push_str("\n\n");
             s.push_str(trimmed);
         }
+    }
+    s.push_str("<|im_end|>\n");
+    s
+}
+
+/// Render the no-tools system block: the effort sentence (if any), then the
+/// client's system text (if any), in that order.
+///
+/// Returns the empty string when both are absent — Qwen 3.8 emits a system
+/// block for the effort alone, but emits nothing at all when there is neither,
+/// which is what every pre-3.8 checkpoint did unconditionally.
+fn render_system_block(system: Option<&str>, effort: Option<ReasoningEffort>) -> String {
+    let instructions = effort.and_then(ReasoningEffort::instructions);
+    let system = system.filter(|s| !s.is_empty());
+    if instructions.is_none() && system.is_none() {
+        return String::new();
+    }
+    let mut s = String::from("<|im_start|>system\n");
+    if let Some(text) = instructions {
+        s.push_str(text);
+        if system.is_some() {
+            s.push_str("\n\n");
+        }
+    }
+    if let Some(text) = system {
+        s.push_str(text);
     }
     s.push_str("<|im_end|>\n");
     s
@@ -193,6 +232,7 @@ pub fn format_qwen3_chat_with_tools(
     messages: &[(String, String)],
     thinking: bool,
     tools: &[ToolDef<'_>],
+    effort: Option<ReasoningEffort>,
 ) -> String {
     let mut s = String::new();
     let mut idx = 0;
@@ -210,14 +250,17 @@ pub fn format_qwen3_chat_with_tools(
         } else {
             None
         };
-        s.push_str(&render_tools_system_block(tools, leading_system));
+        s.push_str(&render_tools_system_block(tools, leading_system, effort));
     } else if let Some((role, content)) = messages.first()
         && role.eq_ignore_ascii_case("system")
     {
-        s.push_str("<|im_start|>system\n");
-        s.push_str(content);
-        s.push_str("<|im_end|>\n");
+        s.push_str(&render_system_block(Some(content), effort));
         idx = 1;
+    } else {
+        // No system message: 3.8 still emits a system block holding just the
+        // effort sentence. Renders to nothing when there is no effort, which is
+        // the pre-3.8 behaviour byte for byte.
+        s.push_str(&render_system_block(None, effort));
     }
 
     while idx < messages.len() {
@@ -282,6 +325,7 @@ pub fn format_qwen3_chat_with_tools_from_history(
     turns: &[ChatTurn<'_>],
     thinking: bool,
     tools: &[ToolDef<'_>],
+    effort: Option<ReasoningEffort>,
 ) -> String {
     let mut s = String::new();
     let mut idx = 0;
@@ -297,11 +341,9 @@ pub fn format_qwen3_chat_with_tools_from_history(
         None
     };
     if !tools.is_empty() {
-        s.push_str(&render_tools_system_block(tools, leading_system));
-    } else if let Some(text) = leading_system {
-        s.push_str("<|im_start|>system\n");
-        s.push_str(text);
-        s.push_str("<|im_end|>\n");
+        s.push_str(&render_tools_system_block(tools, leading_system, effort));
+    } else if leading_system.is_some() || effort.is_some() {
+        s.push_str(&render_system_block(leading_system, effort));
     }
 
     // Body
@@ -879,7 +921,7 @@ mod tests {
             response: None,
         }];
         let messages = vec![("user".into(), "what is the weather?".into())];
-        let s = format_qwen3_chat_with_tools(&messages, false, &tools);
+        let s = format_qwen3_chat_with_tools(&messages, false, &tools, None);
         assert!(s.contains("<|im_start|>system\n# Tools"));
         assert!(s.contains("<tools>"));
         assert!(s.contains("\"name\":\"get_weather\""));
@@ -930,7 +972,7 @@ mod tests {
             ("system".into(), "You are a helpful assistant.".into()),
             ("user".into(), "weather?".into()),
         ];
-        let s = format_qwen3_chat_with_tools(&messages, false, &tools);
+        let s = format_qwen3_chat_with_tools(&messages, false, &tools, None);
         // System block should contain both the tools block AND the
         // existing system content appended after </IMPORTANT>.
         assert!(s.contains("</IMPORTANT>\n\nYou are a helpful assistant.<|im_end|>"));
@@ -942,7 +984,7 @@ mod tests {
             ("system".into(), "You are X.".into()),
             ("user".into(), "hi".into()),
         ];
-        let s = format_qwen3_chat_with_tools(&messages, false, &[]);
+        let s = format_qwen3_chat_with_tools(&messages, false, &[], None);
         assert!(s.starts_with("<|im_start|>system\nYou are X.<|im_end|>"));
         assert!(s.contains("<|im_start|>user\nhi<|im_end|>"));
         assert!(!s.contains("<tools>"));
@@ -976,7 +1018,7 @@ mod tests {
             },
             ChatTurn::User("anything else?"),
         ];
-        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools);
+        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools, None);
         assert!(s.contains("<tool_call>\n<function=get_weather>"));
         assert!(s.contains("<parameter=city>\nSeoul\n</parameter>"));
         assert!(s.contains("<parameter=unit>\nc\n</parameter>"));
@@ -1006,7 +1048,7 @@ mod tests {
                 content: "r2",
             },
         ];
-        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &[]);
+        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &[], None);
         // Both tool_responses in ONE user turn.
         assert!(s.contains("<|im_start|>user\n<tool_response>\nr1\n</tool_response>\n<tool_response>\nr2\n</tool_response><|im_end|>"));
     }
@@ -1028,7 +1070,7 @@ mod tests {
         }];
         let body = format!("{}what city is this?", crate::qwen36_vision::IMAGE_BLOCK);
         let messages = vec![("user".into(), body)];
-        let s = format_qwen3_chat_with_tools(&messages, false, &tools);
+        let s = format_qwen3_chat_with_tools(&messages, false, &tools, None);
         assert!(
             s.contains(&format!(
                 "<|im_start|>user\n{}what city is this?<|im_end|>",
@@ -1058,7 +1100,7 @@ mod tests {
             response: None,
         }];
         let turns = vec![ChatTurn::System("SYSTEM_MARKER"), ChatTurn::User("hi")];
-        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools);
+        let s = format_qwen3_chat_with_tools_from_history(&turns, false, &tools, None);
         assert!(s.contains("SYSTEM_MARKER"), "system text is still present");
         assert!(
             !s.contains("<|im_start|>system\nSYSTEM_MARKER"),
@@ -1282,6 +1324,142 @@ mod tests {
         assert_eq!(
             qwen35_tool_choice_prefill_str(&ResolvedToolChoice::Tool("get_weather")),
             "<tool_call>\n<function=get_weather>\n"
+        );
+    }
+}
+
+/// Qwen 3.8's `reasoning_effort` block, checked against the shipped
+/// `chat_template.jinja` read as spec.
+///
+/// The load-bearing test is the LAST one: every pre-3.8 checkpoint must render
+/// exactly as it did before this feature existed. The effort is opt-in per
+/// checkpoint precisely so that stays true.
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::{format_qwen3_chat_with_tools, render_system_block, render_tools_system_block};
+    use crate::chat_io::{ReasoningEffort, ToolDef};
+    use serde_json::json;
+
+    const XHIGH_TEXT: &str = "Reasoning effort is set to xhigh.";
+    const LOW_TEXT: &str = "Reasoning effort is set to low.";
+
+    fn tools() -> Vec<ToolDef<'static>> {
+        vec![ToolDef {
+            name: "get_weather",
+            description: Some("Get weather"),
+            parameters: None,
+            response: None,
+        }]
+    }
+
+    #[test]
+    fn with_tools_the_effort_goes_before_the_tools_header_not_after_it() {
+        let s = render_tools_system_block(
+            &tools(),
+            Some("You are terse."),
+            Some(ReasoningEffort::Xhigh),
+        );
+        let effort_at = s.find(XHIGH_TEXT).expect("effort sentence present");
+        let tools_at = s.find("# Tools").expect("tools header present");
+        let system_at = s.find("You are terse.").expect("system content present");
+        assert!(
+            effort_at < tools_at,
+            "template puts the effort sentence ahead of `# Tools`"
+        );
+        assert!(
+            tools_at < system_at,
+            "the client's system text still trails the IMPORTANT block"
+        );
+    }
+
+    #[test]
+    fn medium_renders_no_sentence_because_upstream_leaves_it_empty() {
+        let with = render_tools_system_block(&tools(), None, Some(ReasoningEffort::Medium));
+        let without = render_tools_system_block(&tools(), None, None);
+        assert_eq!(
+            with, without,
+            "upstream sets an instruction string only for xhigh and low"
+        );
+    }
+
+    #[test]
+    fn low_and_xhigh_render_different_prompts() {
+        let lo = render_tools_system_block(&tools(), None, Some(ReasoningEffort::Low));
+        let hi = render_tools_system_block(&tools(), None, Some(ReasoningEffort::Xhigh));
+        assert!(lo.contains(LOW_TEXT) && !lo.contains(XHIGH_TEXT));
+        assert!(hi.contains(XHIGH_TEXT) && !hi.contains(LOW_TEXT));
+    }
+
+    #[test]
+    fn a_system_block_is_created_when_the_request_has_none() {
+        // 3.8 emits a system block holding just the effort sentence.
+        let s = render_system_block(None, Some(ReasoningEffort::Xhigh));
+        assert!(s.starts_with("<|im_start|>system\n"));
+        assert!(s.contains(XHIGH_TEXT));
+        assert!(s.ends_with("<|im_end|>\n"));
+    }
+
+    #[test]
+    fn nothing_at_all_is_emitted_without_system_or_effort() {
+        assert_eq!(render_system_block(None, None), "");
+    }
+
+    #[test]
+    fn the_effort_precedes_the_system_text_in_the_no_tools_branch() {
+        let s = render_system_block(Some("You are terse."), Some(ReasoningEffort::Low));
+        assert_eq!(
+            s,
+            format!(
+                "<|im_start|>system\n{}\n\nYou are terse.<|im_end|>\n",
+                ReasoningEffort::Low.instructions().unwrap()
+            )
+        );
+    }
+
+    // ── The regression this whole design exists to prevent ────────────────
+    #[test]
+    fn a_pre_38_checkpoint_renders_byte_identically() {
+        // `None` is what a 3.5/3.6 checkpoint always resolves to, because
+        // `checkpoint_declares_reasoning_effort` reads the shipped template and
+        // theirs has no such block. Whatever a client sends, these two must be
+        // the same bytes.
+        let msgs = vec![
+            ("system".to_string(), "You are terse.".to_string()),
+            ("user".to_string(), "hi".to_string()),
+        ];
+        let before = format_qwen3_chat_with_tools(&msgs, false, &tools(), None);
+        assert!(!before.contains("Reasoning effort"));
+        assert!(before.contains("You are terse."));
+
+        // …and with no tools either.
+        let plain = format_qwen3_chat_with_tools(&msgs, false, &[], None);
+        assert_eq!(
+            plain,
+            "<|im_start|>system\nYou are terse.<|im_end|>\n\
+             <|im_start|>user\nhi<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "the no-tools, no-effort rendering is the pre-3.8 one, exactly"
+        );
+    }
+
+    #[test]
+    fn tool_json_is_untouched_by_the_effort_block() {
+        let params = json!({"type":"object","properties":{}});
+        let t = vec![ToolDef {
+            name: "f",
+            description: None,
+            parameters: Some(&params),
+            response: None,
+        }];
+        let hi = render_tools_system_block(&t, None, Some(ReasoningEffort::Xhigh));
+        let none = render_tools_system_block(&t, None, None);
+        // The effort contribution is exactly `sentence + "\n\n"` at the head of
+        // the block; deleting it must leave the pre-3.8 rendering byte for byte.
+        let injected = format!("{}\n\n", ReasoningEffort::Xhigh.instructions().unwrap());
+        assert_eq!(
+            hi.replace(&injected, ""),
+            none,
+            "removing the sentence must leave the 3.6 block behind"
         );
     }
 }

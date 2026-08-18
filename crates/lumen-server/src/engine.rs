@@ -68,9 +68,16 @@ impl ModelBackend {
 
     /// Tokenize the chat-templated prompt for accurate `prompt_tokens`. Falls
     /// back to a `len/4` heuristic only if the backend errors during encode.
-    fn count_chat_prompt_tokens(&self, messages: &[(String, String)], thinking: bool) -> u32 {
+    /// `effort` must match what the real request will render with, or the
+    /// count is short by the effort sentence (~40 tokens on Qwen 3.8).
+    fn count_chat_prompt_tokens(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        effort: Option<lumen_mlx::chat_io::ReasoningEffort>,
+    ) -> u32 {
         let res: Result<Vec<u32>> = match self {
-            Self::Mlx(m) => m.build_chat_input(messages, thinking),
+            Self::Mlx(m) => m.build_chat_input(messages, thinking, effort),
         };
         match res {
             Ok(ids) => ids.len() as u32,
@@ -642,10 +649,11 @@ impl InferenceEngine {
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        let prompt_tokens_guard = self
-            .backend
-            .count_chat_prompt_tokens(&messages, thinking_on)
-            + image_tokens;
+        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
+            &messages,
+            thinking_on,
+            req.sampling_overrides().reasoning_effort,
+        ) + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
@@ -734,10 +742,11 @@ impl InferenceEngine {
         // Same text count as the guard above, plus the image runs the model
         // actually prefilled — reporting the text-only figure would under-count
         // an image request by hundreds of tokens.
-        let prompt_tokens = self
-            .backend
-            .count_chat_prompt_tokens(&messages, thinking_on)
-            + image_tokens;
+        let prompt_tokens = self.backend.count_chat_prompt_tokens(
+            &messages,
+            thinking_on,
+            req.sampling_overrides().reasoning_effort,
+        ) + image_tokens;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
@@ -956,9 +965,11 @@ impl InferenceEngine {
         // already used for usage below).
         let anthropic_thinking =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let prompt_tokens_guard = self
-            .backend
-            .count_chat_prompt_tokens(&messages, anthropic_thinking);
+        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
+            &messages,
+            anthropic_thinking,
+            req.sampling_overrides().reasoning_effort,
+        );
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
 
         let mut parsed = if needs_structured {
@@ -1221,6 +1232,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            req.sampling_overrides().reasoning_effort,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1345,6 +1357,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            req.sampling_overrides().reasoning_effort,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1804,6 +1817,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            req.sampling_overrides().reasoning_effort,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -3360,7 +3374,12 @@ impl InferenceEngine {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking)?;
+        // `None`, and provably so rather than by omission: `admit_streaming_mlx`
+        // routes to the non-batched path whenever `thinking` is true (see its
+        // `|| thinking` guard), and Qwen 3.8's template emits the effort block
+        // only when thinking is on. A batched sequence therefore never has an
+        // effort to carry.
+        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking, None)?;
         let prompt_tokens = prompt_ids.len() as u32;
         let eos_tokens = qb.eos_tokens().to_vec();
         let max_new = if max_tokens == 0 { 256 } else { max_tokens };

@@ -92,7 +92,7 @@ fn build_prompt(driver: &dyn MlxBatchedSeqDriver, target: usize) -> Result<Vec<u
             "user".to_string(),
             format!("Summarize the following log:\n{}", filler(words)),
         )];
-        let ids = driver.build_chat_input(&msgs, false)?;
+        let ids = driver.build_chat_input(&msgs, false, None)?;
         let n = ids.len();
         if n >= target {
             if n <= target + target / 20 {

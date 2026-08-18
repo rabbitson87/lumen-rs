@@ -175,7 +175,10 @@ fn replay_chat_render() {
             non_vacuous += 1;
         }
         let declared: Vec<&str> = defs.iter().map(|d| d.name).collect();
-        let rendered = render_tools_system_block(&defs, extra.as_deref());
+        // `None`: the committed seeds were generated before the effort field
+        // existed, and the contract under test (every declared tool appears,
+        // nothing else is injected) is independent of it.
+        let rendered = render_tools_system_block(&defs, extra.as_deref(), None);
         assert_tools_block_contract(&declared, &rendered, extra.as_deref());
         let _ = path;
     }

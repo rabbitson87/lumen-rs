@@ -235,6 +235,21 @@ pub struct SamplingOverrides {
     /// [`grammar::ToolCalls`] — see that type for why the count is separate
     /// from `tool_choice` in the first place.
     pub parallel_tool_calls: Option<bool>,
+    /// Qwen 3.8's `reasoning_effort`, already mapped from the request's
+    /// OpenAI-vocabulary string by [`chat_io::ReasoningEffort::from_request`].
+    ///
+    /// Rides here for the same reason `parallel_tool_calls` does, and the
+    /// reason is stronger: this one is not a sampling knob at all, it changes
+    /// the *rendered prompt*. The alternative was a new parameter on ~30 Qwen
+    /// signatures, and `thinking: bool` — the obvious thing to widen — appears
+    /// in 81 signatures across both families, most of them Gemma 4's, which has
+    /// no such concept.
+    ///
+    /// `None` means "no effort instruction" — either the client sent nothing,
+    /// or it sent one of the values that disable thinking outright. Backends
+    /// that do not understand the concept ignore it, so the field is inert for
+    /// every model except a checkpoint whose own chat template declares it.
+    pub reasoning_effort: Option<crate::chat_io::ReasoningEffort>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
@@ -1107,7 +1122,45 @@ fn gemma4_grammar_would_constrain(
         && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
 }
 
-fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
+/// Does this checkpoint's own chat template declare `reasoning_effort`?
+///
+/// Asked of the shipped `chat_template.jinja`, never of the model id. Qwen kept
+/// `model_type: "qwen3_5"` across 3.5, 3.6 and 3.8 while the template gained a
+/// block in 3.8, so the id tells you nothing the file does not tell you better —
+/// and id-substring matching is exactly what shipped the wrong MTP head shape
+/// (see `mtp_shape_from_text_config`). A repo that renames itself, or a fork
+/// that backports the block, both come out right here.
+///
+/// Absent or unreadable template ⇒ `false`, which renders exactly as before.
+///
+/// `LUMEN_QWEN35_REASONING_EFFORT=0|1` overrides in both directions, for
+/// A/B-ing the prompt change against a single checkpoint.
+fn checkpoint_declares_reasoning_effort(model_id: &str) -> bool {
+    if let Ok(v) = std::env::var("LUMEN_QWEN35_REASONING_EFFORT") {
+        let v = v.trim();
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            return false;
+        }
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return true;
+        }
+    }
+    let dir = std::path::Path::new(model_id);
+    if !dir.is_dir() {
+        // An un-resolved HF id: the weights may not be on disk yet, and
+        // resolving here would mean a network call inside `load`. The template
+        // ships with the snapshot, so a local dir answers; a bare id does not.
+        return false;
+    }
+    std::fs::read_to_string(dir.join("chat_template.jinja"))
+        .map(|t| t.contains("reasoning_effort"))
+        .unwrap_or(false)
+}
+
+fn auto_prefix_key(
+    messages: &[(String, String)],
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<String> {
     let (role, content) = messages.first()?;
     if role != "system" || content.is_empty() {
         return None;
@@ -1116,6 +1169,13 @@ fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     content.hash(&mut h);
+    // The effort sentence is rendered INTO the cached prefix, so it has to be
+    // part of the key. Without it, two requests sharing a system message but
+    // asking for different effort levels collide, and the second is served a
+    // KV cache built from a prompt it never sent — wrong output, no error.
+    effort
+        .map(crate::chat_io::ReasoningEffort::cache_tag)
+        .hash(&mut h);
     Some(format!("auto-{:016x}", h.finish()))
 }
 
@@ -1123,7 +1183,10 @@ fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
 /// turn's content iff it's a `System` turn. Returns `None` when the chat
 /// starts with `User` (no shared prefix worth caching) or when the system
 /// content is empty.
-fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<String> {
+fn auto_prefix_key_from_turns(
+    turns: &[crate::chat_io::ChatTurn<'_>],
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<String> {
     use crate::chat_io::ChatTurn;
     let content = match turns.first()? {
         ChatTurn::System(s) if !s.is_empty() => *s,
@@ -1133,6 +1196,10 @@ fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     content.hash(&mut h);
+    // See `auto_prefix_key` — same collision, same consequence.
+    effort
+        .map(crate::chat_io::ReasoningEffort::cache_tag)
+        .hash(&mut h);
     Some(format!("auto-{:016x}", h.finish()))
 }
 
@@ -1211,12 +1278,27 @@ fn qwen35_tool_grammar_eager_auto() -> bool {
 /// Render the chat-template system-prompt block alone (no trailing assistant
 /// header). Tokenizing this produces the prefix tokens we expect to find at
 /// the start of the full chat-input tokenization.
-fn format_system_prefix(message: &(String, String)) -> String {
+fn format_system_prefix(
+    message: &(String, String),
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> String {
     let (role, content) = message;
     let mut s = String::new();
     s.push_str("<|im_start|>");
     s.push_str(role);
     s.push('\n');
+    // The probe must render the system block EXACTLY as the real prompt does,
+    // effort included — it exists to locate that block's token boundary inside
+    // the full tokenization, and a prefix that differs by a sentence finds
+    // nothing.
+    if let Some(text) = effort.and_then(crate::chat_io::ReasoningEffort::instructions)
+        && role.eq_ignore_ascii_case("system")
+    {
+        s.push_str(text);
+        if !content.is_empty() {
+            s.push_str("\n\n");
+        }
+    }
     s.push_str(content);
     s.push_str("<|im_end|>\n");
     s
@@ -1239,7 +1321,14 @@ fn format_system_prefix(message: &(String, String)) -> String {
 ///    to their inherent methods — the trait only exists so the scheduler can hold
 ///    one `&mut dyn` regardless of family.
 pub trait MlxBatchedSeqDriver {
-    fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>>;
+    /// `effort` carries Qwen 3.8's reasoning-effort level. Families without the
+    /// concept ignore it; passing `None` renders exactly as before.
+    fn build_chat_input(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>>;
     fn eos_tokens(&self) -> &[u32];
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
     fn decode_step_batch(
@@ -1262,8 +1351,13 @@ pub trait MlxBatchedSeqDriver {
 }
 
 impl MlxBatchedSeqDriver for MlxQwen35Backend {
-    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
-        MlxQwen35Backend::build_chat_input(self, m, t)
+    fn build_chat_input(
+        &self,
+        m: &[(String, String)],
+        t: bool,
+        e: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        MlxQwen35Backend::build_chat_input(self, m, t, e)
     }
     fn eos_tokens(&self) -> &[u32] {
         MlxQwen35Backend::eos_tokens(self)
@@ -1289,7 +1383,12 @@ impl MlxBatchedSeqDriver for MlxQwen35Backend {
 
 #[cfg(feature = "mlx-native")]
 impl MlxBatchedSeqDriver for crate::gemma4::Gemma4Backend {
-    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
+    fn build_chat_input(
+        &self,
+        m: &[(String, String)],
+        t: bool,
+        _e: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
         crate::gemma4::Gemma4Backend::build_chat_input(self, m, t)
     }
     fn eos_tokens(&self) -> &[u32] {
@@ -1371,6 +1470,23 @@ impl MlxBackend {
                 let inner = MlxQwen35Backend::load(model_id)?;
                 Ok(Self::Qwen35Family(inner))
             }
+        }
+    }
+
+    /// Per-request reasoning effort, gated on the loaded checkpoint declaring
+    /// the concept.
+    ///
+    /// Both halves matter: the level is the client's (`ov.reasoning_effort`),
+    /// but a 3.6 checkpoint must keep rendering byte-identically no matter what
+    /// a client sends, and a 3.8 one should honour it without the operator
+    /// setting anything. Gemma 4 has no such block, so it is always `None`.
+    fn resolved_effort(
+        &self,
+        ov: &crate::SamplingOverrides,
+    ) -> Option<crate::chat_io::ReasoningEffort> {
+        match self {
+            Self::Qwen35Family(m) if m.wants_reasoning_effort => ov.reasoning_effort,
+            _ => None,
         }
     }
 
@@ -1487,11 +1603,16 @@ impl MlxBackend {
         &self,
         messages: &[(String, String)],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Qwen35Family(m) => m.build_chat_input(messages, thinking),
+            Self::Qwen35Family(m) => m.build_chat_input(messages, thinking, effort),
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => m.build_chat_input(messages, thinking),
+            Self::Gemma4(m) => {
+                // Gemma 4's template has no reasoning-effort block.
+                let _ = effort;
+                m.build_chat_input(messages, thinking)
+            }
         }
     }
 
@@ -1565,6 +1686,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
@@ -1583,6 +1705,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 // Phase 2: when tools are provided, route through the
@@ -1601,14 +1724,22 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        effort,
                     );
                 }
                 let _ = tool_choice;
                 let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})?
+                    m.chat_streaming_session(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        sid,
+                        |_| {},
+                        effort,
+                    )?
                 } else {
                     let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})?
+                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {}, effort)?
                 };
                 Ok(ParsedResponse {
                     visible,
@@ -1653,7 +1784,7 @@ impl MlxBackend {
                 //      the common case for chat UIs).
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key(messages));
+                    .or_else(|| auto_prefix_key(messages, effort));
                 if let Some(k) = key {
                     m.chat_with_prefix_cache(
                         messages,
@@ -1703,6 +1834,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat(
                 messages,
@@ -1769,6 +1901,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 if !tools.is_empty() {
@@ -1781,6 +1914,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        effort,
                     );
                 }
                 let _ = tool_choice;
@@ -1792,6 +1926,7 @@ impl MlxBackend {
                     thinking,
                     seq_id,
                     |_| {},
+                    effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
@@ -1829,6 +1964,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_streaming(
                 messages,
@@ -1880,6 +2016,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut sink,
+                        effort,
                     );
                 }
                 if !tools.is_empty() {
@@ -1893,6 +2030,7 @@ impl MlxBackend {
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
+                        effort,
                     );
                 }
                 let _ = tool_choice;
@@ -1906,6 +2044,7 @@ impl MlxBackend {
                     thinking,
                     seq_id,
                     &mut sink,
+                    effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
@@ -1945,6 +2084,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_from_history(
                 turns,
@@ -2004,6 +2144,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 m.chat_with_tools_from_history(
@@ -2015,6 +2156,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    effort,
                 )
             }
             #[allow(unreachable_patterns)]
@@ -2038,6 +2180,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         match self {
             Self::Qwen35Family(m) => {
                 let _ = (top_p, temperature, ov, session_id);
@@ -2054,6 +2197,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 // Phase 2: structured-history paths ALWAYS go through
@@ -2074,6 +2218,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    effort,
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -2104,7 +2249,7 @@ impl MlxBackend {
                 }
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns));
+                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
                 if let Some(k) = key {
                     m.chat_from_history_with_prefix_cache(
                         turns,
@@ -2156,6 +2301,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
@@ -2177,6 +2323,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut text_adapter,
+                        effort,
                     );
                 }
                 // Phase 2: with tools provided, route through tool-aware
@@ -2196,6 +2343,7 @@ impl MlxBackend {
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
+                        effort,
                     );
                 }
                 let _ = tool_choice;
@@ -2209,6 +2357,7 @@ impl MlxBackend {
                         thinking,
                         sid,
                         &mut text_adapter,
+                        effort,
                     )?
                 } else {
                     let seq_id = m.alloc_seq_id();
@@ -2218,6 +2367,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         &mut text_adapter,
+                        effort,
                     )?
                 };
                 Ok(ParsedResponse {
@@ -2238,7 +2388,7 @@ impl MlxBackend {
                 // only the new suffix → ~5s → ~100ms per turn.
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key(messages));
+                    .or_else(|| auto_prefix_key(messages, effort));
                 if let Some(k) = key {
                     m.chat_streaming_with_prefix_cache(
                         messages,
@@ -2296,6 +2446,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_streaming_from_history(
                 turns,
@@ -2346,6 +2497,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut sink,
+                        effort,
                     );
                 }
                 m.chat_streaming_with_tools_from_history(
@@ -2358,6 +2510,7 @@ impl MlxBackend {
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
+                    effort,
                 )
             }
             #[allow(unreachable_patterns)]
@@ -2385,6 +2538,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
@@ -2407,6 +2561,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut text_adapter,
+                        effort,
                     );
                 }
                 // Phase 2: structured-history streaming ALWAYS routes
@@ -2423,6 +2578,7 @@ impl MlxBackend {
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
+                    effort,
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -2434,7 +2590,7 @@ impl MlxBackend {
                 // multiple prior assistant/tool exchanges).
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns));
+                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
                 if let Some(k) = key {
                     m.chat_streaming_from_history_with_prefix_cache(
                         turns,
@@ -2567,6 +2723,12 @@ pub struct MlxQwen35Backend {
     /// unconstrained sampling rather than erroring. Built once on first
     /// grammar-eligible request; the `Arc` is cloned per request.
     grammar_factory: OnceLock<Option<std::sync::Arc<llguidance::ParserFactory>>>,
+    /// Whether THIS checkpoint's chat template declares `reasoning_effort`
+    /// (Qwen 3.8 does; 3.5 and 3.6 do not). Decided at load by reading the
+    /// shipped `chat_template.jinja` — see
+    /// [`checkpoint_declares_reasoning_effort`] for why the model id is the
+    /// wrong thing to ask.
+    wants_reasoning_effort: bool,
     /// OPT-IN draft-model speculative decode (default OFF). `Some` only when
     /// `LUMEN_MLX_DRAFT_MODEL` is set AND the draft loaded with a vocab size
     /// matching the target. `None` → the entire draft path is dormant and the
@@ -2676,6 +2838,13 @@ impl MlxQwen35Backend {
             }
         }
 
+        let wants_reasoning_effort = checkpoint_declares_reasoning_effort(model_id);
+        if wants_reasoning_effort {
+            eprintln!(
+                "[mlx] reasoning_effort ENABLED (this checkpoint's chat template declares it)"
+            );
+        }
+
         let mut me = Self {
             runner,
             model_id: model_id.to_string(),
@@ -2688,6 +2857,7 @@ impl MlxQwen35Backend {
             session_max,
             prefix_store,
             grammar_factory: OnceLock::new(),
+            wants_reasoning_effort,
             #[cfg(feature = "mlx-native")]
             draft: None,
         };
@@ -3140,6 +3310,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -3152,7 +3323,7 @@ impl MlxQwen35Backend {
             (d.cfg.n_max, d.eos_tokens.clone())
         };
 
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -3446,9 +3617,10 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         let attached = self.attach_image_blocks(messages, images)?;
-        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking))?;
+        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking, effort))?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
         Ok((ids, attached.prepared))
     }
@@ -3508,8 +3680,9 @@ impl MlxQwen35Backend {
         &self,
         messages: &[(String, String)],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<Vec<u32>> {
-        let prompt = format_qwen3_chat(messages, thinking);
+        let prompt = format_qwen3_chat(messages, thinking, effort);
         self.encode(&prompt)
     }
 
@@ -3524,9 +3697,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
         let (ids, prefill, _prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice, effort)?;
         Ok((ids, prefill))
     }
 
@@ -3542,9 +3716,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
-        let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
@@ -3569,6 +3744,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(
         Vec<u32>,
         String,
@@ -3577,7 +3753,7 @@ impl MlxQwen35Backend {
     )> {
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
         let attached = self.attach_image_blocks(messages, images)?;
-        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
@@ -3624,12 +3800,14 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
         let (ids, prefill, _prefill_tokens) = self.build_chat_input_with_tools_from_history_split(
             turns,
             thinking,
             tools,
             tool_choice,
+            effort,
         )?;
         Ok((ids, prefill))
     }
@@ -3642,11 +3820,12 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
         };
-        let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
@@ -3671,6 +3850,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(
         Vec<u32>,
         String,
@@ -3718,7 +3898,8 @@ impl MlxQwen35Backend {
             })
             .collect();
 
-        let prompt_only = format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools);
+        let prompt_only =
+            format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &counts)?;
@@ -4121,9 +4302,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking)?;
+            self.build_response_format_input(messages, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4143,13 +4325,17 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         if !images.iter().any(|v| !v.is_empty()) {
-            return Ok((self.build_chat_input(messages, thinking)?, Vec::new()));
+            return Ok((
+                self.build_chat_input(messages, thinking, effort)?,
+                Vec::new(),
+            ));
         }
         #[cfg(feature = "mlx-native")]
         {
-            self.build_chat_input_with_images(messages, images, thinking)
+            self.build_chat_input_with_images(messages, images, thinking, effort)
         }
         #[cfg(not(feature = "mlx-native"))]
         {
@@ -4170,6 +4356,7 @@ impl MlxQwen35Backend {
         turns: &[crate::chat_io::ChatTurn<'_>],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         use crate::chat_io::ResolvedToolChoice;
         if !images.iter().any(|v| !v.is_empty()) {
@@ -4179,6 +4366,7 @@ impl MlxQwen35Backend {
                     thinking,
                     &[],
                     &ResolvedToolChoice::None,
+                    effort,
                 )?;
             return Ok((ids, Vec::new()));
         }
@@ -4191,6 +4379,7 @@ impl MlxQwen35Backend {
                     thinking,
                     &[],
                     &ResolvedToolChoice::None,
+                    effort,
                 )?;
             Ok((ids, prepared))
         }
@@ -4215,12 +4404,13 @@ impl MlxQwen35Backend {
         seq_id: u64,
         schema: &serde_json::Value,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(&str),
     {
         let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking)?;
+            self.build_response_format_input(messages, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4244,9 +4434,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking)?;
+            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4269,12 +4460,13 @@ impl MlxQwen35Backend {
         seq_id: u64,
         schema: &serde_json::Value,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(&str),
     {
         let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking)?;
+            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4298,11 +4490,20 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        self.chat_streaming_with_images(messages, &[], max_new_tokens, thinking, seq_id, on_token)
+        self.chat_streaming_with_images(
+            messages,
+            &[],
+            max_new_tokens,
+            thinking,
+            seq_id,
+            on_token,
+            effort,
+        )
     }
 
     /// [`Self::chat_streaming`] with inline images.
@@ -4322,6 +4523,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -4344,6 +4546,7 @@ impl MlxQwen35Backend {
                 seq_id,
                 k,
                 on_token,
+                effort,
             );
         }
 
@@ -4362,6 +4565,7 @@ impl MlxQwen35Backend {
                 thinking,
                 seq_id,
                 on_token,
+                effort,
             );
         }
 
@@ -4373,11 +4577,12 @@ impl MlxQwen35Backend {
                 seq_id,
                 cfg,
                 on_token,
+                effort,
             );
         }
 
         if self.prefix_store.enabled()
-            && let Some(key) = auto_prefix_key(messages)
+            && let Some(key) = auto_prefix_key(messages, effort)
         {
             return self.chat_streaming_prefix_cache(
                 messages,
@@ -4386,6 +4591,7 @@ impl MlxQwen35Backend {
                 seq_id,
                 &key,
                 on_token,
+                effort,
             );
         }
 
@@ -4393,9 +4599,12 @@ impl MlxQwen35Backend {
         // image, and prefill has to splice the encoded features over it.
         #[cfg(feature = "mlx-native")]
         let (prompt_ids, prepared) = if has_images {
-            self.build_chat_input_with_images(messages, images, thinking)?
+            self.build_chat_input_with_images(messages, images, thinking, effort)?
         } else {
-            (self.build_chat_input(messages, thinking)?, Vec::new())
+            (
+                self.build_chat_input(messages, thinking, effort)?,
+                Vec::new(),
+            )
         };
         #[cfg(not(feature = "mlx-native"))]
         let prompt_ids = {
@@ -4567,6 +4776,7 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_flat(
             messages,
@@ -4578,6 +4788,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             |_ev| Ok(()),
+            effort,
         )
     }
 
@@ -4597,6 +4808,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4611,6 +4823,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             on_event,
+            effort,
         )
     }
 
@@ -4625,6 +4838,7 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_history(
             turns,
@@ -4636,6 +4850,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             |_ev| Ok(()),
+            effort,
         )
     }
 
@@ -4652,6 +4867,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4666,6 +4882,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             on_event,
+            effort,
         )
     }
 
@@ -4687,6 +4904,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4700,10 +4918,16 @@ impl MlxQwen35Backend {
                 thinking,
                 tools,
                 tool_choice,
+                effort,
             )?
         } else {
-            let (ids, prefill, prefill_tokens) =
-                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         #[cfg(not(feature = "mlx-native"))]
@@ -4713,20 +4937,25 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            let (ids, prefill, prefill_tokens) =
-                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
         let prefix_key = if has_images {
             None
         } else {
-            auto_prefix_key(messages)
+            auto_prefix_key(messages, effort)
         };
         let incremental_boundary = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len(messages, tools)
+            self.detect_system_tools_prefix_len(messages, tools, effort)
                 .ok()
                 .filter(|&b| b > 0 && b < prompt_ids.len())
         };
@@ -4762,6 +4991,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4775,6 +5005,7 @@ impl MlxQwen35Backend {
                 thinking,
                 tools,
                 tool_choice,
+                effort,
             )?
         } else {
             let (ids, prefill, prefill_tokens) = self
@@ -4783,6 +5014,7 @@ impl MlxQwen35Backend {
                     thinking,
                     tools,
                     tool_choice,
+                    effort,
                 )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
@@ -4806,12 +5038,12 @@ impl MlxQwen35Backend {
         let prefix_key = if has_images {
             None
         } else {
-            auto_prefix_key_from_turns(turns)
+            auto_prefix_key_from_turns(turns, effort)
         };
         let incremental_boundary = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len_from_turns(turns, tools)
+            self.detect_system_tools_prefix_len_from_turns(turns, tools, effort)
                 .ok()
                 .filter(|&b| b > 0 && b < prompt_ids.len())
         };
@@ -5253,11 +5485,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         prefix_cache_key: &str,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -5280,7 +5513,7 @@ impl MlxQwen35Backend {
         {
             prompt_ids.len() - header_ids.len()
         } else {
-            let sys = self.detect_system_prefix_len(messages).unwrap_or(0);
+            let sys = self.detect_system_prefix_len(messages, effort).unwrap_or(0);
             if sys > 0 && sys < prompt_ids.len() {
                 sys
             } else {
@@ -5505,14 +5738,18 @@ impl MlxQwen35Backend {
     /// are shareable. Returns 0 if there's no system message or if tokenizing
     /// the system block alone doesn't produce a strict prefix of the full
     /// chat-input (rare but possible due to tokenizer boundary effects).
-    fn detect_system_prefix_len(&self, messages: &[(String, String)]) -> Result<usize> {
+    fn detect_system_prefix_len(
+        &self,
+        messages: &[(String, String)],
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<usize> {
         let Some(first) = messages.first() else {
             return Ok(0);
         };
         if first.0 != "system" || first.1.is_empty() {
             return Ok(0);
         }
-        let block = format_system_prefix(first);
+        let block = format_system_prefix(first, effort);
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
     }
@@ -5524,13 +5761,14 @@ impl MlxQwen35Backend {
     fn detect_system_prefix_len_from_turns(
         &self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         use crate::chat_io::ChatTurn;
         let content = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => *s,
             _ => return Ok(0),
         };
-        let block = format_system_prefix(&("system".to_string(), content.to_string()));
+        let block = format_system_prefix(&("system".to_string(), content.to_string()), effort);
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
     }
@@ -5549,15 +5787,16 @@ impl MlxQwen35Backend {
         &self,
         messages: &[(String, String)],
         tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         if tools.is_empty() {
-            return self.detect_system_prefix_len(messages);
+            return self.detect_system_prefix_len(messages, effort);
         }
         let leading_system = match messages.first() {
             Some((role, text)) if role == "system" && !text.is_empty() => Some(text.as_str()),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
         let ids = self.encode(&block)?;
         Ok(ids.len())
     }
@@ -5567,16 +5806,17 @@ impl MlxQwen35Backend {
         &self,
         turns: &[crate::chat_io::ChatTurn<'_>],
         tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         use crate::chat_io::ChatTurn;
         if tools.is_empty() {
-            return self.detect_system_prefix_len_from_turns(turns);
+            return self.detect_system_prefix_len_from_turns(turns, effort);
         }
         let leading_system = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => Some(*s),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
         let ids = self.encode(&block)?;
         Ok(ids.len())
     }
@@ -5617,11 +5857,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         cfg: spec_decode::SpecConfig,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -5868,11 +6109,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         k: usize,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -6001,11 +6243,12 @@ impl MlxQwen35Backend {
         thinking: bool,
         session_id: &str,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -6286,8 +6529,35 @@ where
 }
 
 /// Qwen3 chat template — same as `format_qwen3_chat` in lumen-model.
-fn format_qwen3_chat(messages: &[(String, String)], thinking: bool) -> String {
+///
+/// `effort` renders Qwen 3.8's reasoning-effort sentence at the head of the
+/// system block, creating one if the conversation has no system message. `None`
+/// (every pre-3.8 checkpoint, and any request that disabled thinking) renders
+/// byte-identically to before.
+fn format_qwen3_chat(
+    messages: &[(String, String)],
+    thinking: bool,
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> String {
     let mut s = String::new();
+    let mut messages = messages;
+    if let Some(text) = effort.and_then(crate::chat_io::ReasoningEffort::instructions) {
+        // Fold the sentence into the leading system message, or emit a system
+        // block for it alone. Matches the template's two no-tools branches.
+        let leading_system = messages
+            .first()
+            .filter(|(role, _)| role.eq_ignore_ascii_case("system"));
+        s.push_str("<|im_start|>system\n");
+        s.push_str(text);
+        if let Some((_, content)) = leading_system {
+            if !content.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(content);
+            }
+            messages = &messages[1..];
+        }
+        s.push_str("<|im_end|>\n");
+    }
     for (role, content) in messages {
         s.push_str("<|im_start|>");
         s.push_str(role);
@@ -6780,9 +7050,9 @@ mod tests {
             ("system".to_string(), "Different system prompt.".into()),
             ("user".to_string(), "Hi".into()),
         ];
-        let k1 = auto_prefix_key(&m1).unwrap();
-        let k2 = auto_prefix_key(&m2).unwrap();
-        let k3 = auto_prefix_key(&m3).unwrap();
+        let k1 = auto_prefix_key(&m1, None).unwrap();
+        let k2 = auto_prefix_key(&m2, None).unwrap();
+        let k3 = auto_prefix_key(&m3, None).unwrap();
         assert_eq!(k1, k2, "same system prompt should produce same key");
         assert_ne!(
             k1, k3,
@@ -6791,13 +7061,42 @@ mod tests {
     }
 
     #[test]
+    fn a_different_reasoning_effort_must_not_reuse_the_same_cached_prefix() {
+        // RED without the effort in the hash: the sentence is rendered INTO the
+        // cached prefix, so two requests sharing a system message but asking
+        // for different effort levels collided and the second was served a KV
+        // cache built from a prompt it never sent — wrong output, no error.
+        use crate::chat_io::ReasoningEffort;
+        let m = vec![
+            (
+                "system".to_string(),
+                "You are a helpful assistant.".to_string(),
+            ),
+            ("user".to_string(), "Hi".to_string()),
+        ];
+        let hi = auto_prefix_key(&m, Some(ReasoningEffort::Xhigh)).unwrap();
+        let lo = auto_prefix_key(&m, Some(ReasoningEffort::Low)).unwrap();
+        let off = auto_prefix_key(&m, None).unwrap();
+        assert_ne!(hi, lo, "xhigh and low render different prompts");
+        assert_ne!(hi, off, "an effort-bearing prompt differs from one without");
+        assert_ne!(lo, off);
+        // Medium renders no sentence, but keying it apart from `None` costs
+        // nothing and keeps the key a function of the request, not of a
+        // rendering detail that upstream could change.
+        assert_ne!(
+            auto_prefix_key(&m, Some(ReasoningEffort::Medium)).unwrap(),
+            off
+        );
+    }
+
+    #[test]
     fn auto_prefix_key_returns_none_without_system() {
         let m = vec![("user".to_string(), "Hi".into())];
-        assert!(auto_prefix_key(&m).is_none());
+        assert!(auto_prefix_key(&m, None).is_none());
         let empty: Vec<(String, String)> = vec![];
-        assert!(auto_prefix_key(&empty).is_none());
+        assert!(auto_prefix_key(&empty, None).is_none());
         let empty_sys = vec![("system".to_string(), "".into())];
-        assert!(auto_prefix_key(&empty_sys).is_none());
+        assert!(auto_prefix_key(&empty_sys, None).is_none());
     }
 
     #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use lumen_mlx::SamplingOverrides;
+use lumen_mlx::chat_io::ReasoningEffort;
 
 /// OpenAI `stop`: accepts either a single string or an array of strings.
 #[derive(Debug, Deserialize)]
@@ -175,6 +176,28 @@ impl ChatCompletionRequest {
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
             parallel_tool_calls: self.parallel_tool_calls,
+            // Only meaningful when thinking is actually on — the upstream
+            // template gates its whole effort block on `enable_thinking`. The
+            // `thinking` resolution here is the same one the request already
+            // goes through, so a client that turns thinking off never gets an
+            // effort instruction, matching the template.
+            reasoning_effort: if self.enable_thinking() {
+                // `reasoning_effort|default('xhigh')` — upstream injects the
+                // xhigh sentence whenever thinking is on, INCLUDING when the
+                // client named no level. Omitting it here would prompt a 3.8
+                // checkpoint differently from every other 3.8 deployment.
+                //
+                // Known divergence: `LUMEN_BACKEND_THINKING_DEFAULT=1` turns
+                // thinking on without a per-request signal, and this resolution
+                // does not see that operator default, so such a request gets no
+                // effort sentence. Explicit per-request signals are unaffected.
+                match self.reasoning_effort.as_deref() {
+                    Some(raw) => ReasoningEffort::from_request(raw),
+                    None => Some(ReasoningEffort::default()),
+                }
+            } else {
+                None
+            },
         }
     }
 
@@ -882,6 +905,9 @@ impl CompletionRequest {
             stop: stop_field_vec(&self.stop),
             // /v1/completions has no tools, so no tool-call count to cap.
             parallel_tool_calls: None,
+            // Raw-prompt completions bypass the chat template entirely, so
+            // there is no system block to prepend an effort instruction to.
+            reasoning_effort: None,
         }
     }
 }
@@ -904,6 +930,11 @@ impl AnthropicRequest {
                 .tool_choice
                 .as_ref()
                 .and_then(|c| c.parallel_tool_calls()),
+            // Anthropic has no `reasoning_effort` — its thinking control is a
+            // token budget, which says nothing about which of Qwen's three
+            // levels was meant. Left at the template's own default rather than
+            // inventing a mapping from `budget_tokens`.
+            reasoning_effort: self.enable_thinking().then(ReasoningEffort::default),
         }
     }
 }
@@ -2088,5 +2119,70 @@ mod tool_calling_serde {
         let raw = serde_json::json!({ "prompt": "p", "size": "513x512" });
         let req: ImageGenerationRequest = serde_json::from_value(raw).unwrap();
         assert!(req.dimensions().is_err());
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_wiring_tests {
+    use super::*;
+
+    fn req(json: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(json).expect("request parses")
+    }
+
+    #[test]
+    fn a_requested_effort_reaches_the_backend_overrides() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }));
+        assert!(r.enable_thinking(), "`high` turns thinking on");
+        assert_eq!(
+            r.sampling_overrides().reasoning_effort,
+            Some(ReasoningEffort::Xhigh),
+            "the effort must survive into SamplingOverrides — it is the only \
+             channel that carries it to the prompt renderer"
+        );
+    }
+
+    #[test]
+    fn low_and_xhigh_are_carried_distinctly() {
+        for (sent, want) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("xhigh", ReasoningEffort::Xhigh),
+        ] {
+            let r = req(serde_json::json!({
+                "model": "q",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": sent,
+            }));
+            assert_eq!(
+                r.sampling_overrides().reasoning_effort,
+                Some(want),
+                "sent {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effort_that_disables_thinking_carries_none() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        }));
+        assert!(!r.enable_thinking());
+        assert_eq!(r.sampling_overrides().reasoning_effort, None);
+    }
+
+    #[test]
+    fn no_field_means_no_effort() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(r.sampling_overrides().reasoning_effort, None);
     }
 }
