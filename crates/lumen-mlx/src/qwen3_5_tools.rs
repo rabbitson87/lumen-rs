@@ -531,6 +531,21 @@ impl Qwen35ResponseParser {
         &self.visible
     }
 
+    /// How many tool calls have been **fully** parsed so far — a live view of
+    /// what `finish()` would return.
+    ///
+    /// Increments only when `</tool_call>` is consumed, so a call that is
+    /// still mid-body does not count. This is the decode loop's stop signal
+    /// for `parallel_tool_calls: false`
+    /// ([`ToolCalls::must_stop_after_completed_calls`]); Qwen's closer is
+    /// literal text rather than a special token, so there is no id to watch
+    /// the way the Gemma 4 loop watches `<tool_call|>`.
+    ///
+    /// [`ToolCalls::must_stop_after_completed_calls`]: crate::grammar::ToolCalls::must_stop_after_completed_calls
+    pub fn completed_calls(&self) -> usize {
+        self.parsed_calls.len()
+    }
+
     /// Force-required-params hook (opt-in via the decode loop).
     ///
     /// When the parser is sitting at a CLEAN decision point inside a
@@ -1244,6 +1259,75 @@ mod tests {
         assert_eq!(resp.tool_calls.len(), 2);
         assert_eq!(resp.tool_calls[0].name, "a");
         assert_eq!(resp.tool_calls[1].name, "b");
+    }
+
+    // ───────────────── parallel_tool_calls on the Qwen path ─────────────────
+
+    /// `completed_calls()` is the decode loop's stop signal, so it must count
+    /// only calls whose `</tool_call>` has actually arrived. Counting at
+    /// `</function>` — or at the point the grammar reports finished — would cut
+    /// the framing `finish()` needs, which is the mistake the Gemma 4 rule
+    /// documents having already made once.
+    #[test]
+    fn completed_calls_counts_only_fully_closed_calls() {
+        let mut p = Qwen35ResponseParser::new();
+        for (chunk, expected) in [
+            ("<tool_call>\n", 0),
+            ("<function=a>\n", 0),
+            ("<parameter=x>\n1\n</parameter>\n", 0),
+            ("</function>\n", 0),
+            ("</tool_call>", 1),
+            ("\n<tool_call>\n<function=b>\n</function>\n", 1),
+            ("</tool_call>", 2),
+        ] {
+            let _ = p.feed(chunk);
+            assert_eq!(
+                p.completed_calls(),
+                expected,
+                "after feeding {chunk:?} the count should be {expected}"
+            );
+        }
+    }
+
+    /// The defect this replaces, without a model: the whole Qwen decode path
+    /// built `ToolCalls::ExactlyOne` correctly and then never consulted it, so
+    /// `parallel_tool_calls: false` was accepted and silently ignored.
+    /// Measured on Qwen3.8-27B, `tool_choice=required` + `parallel_tool_calls
+    /// =false` returned SEVEN identical calls.
+    ///
+    /// Simulates `chat_with_tools_impl`'s loop: feed a chunk, then consult the
+    /// policy at the top of the next iteration. Both settings share one stream
+    /// so the difference is the policy and nothing else.
+    #[test]
+    fn exactly_one_cuts_the_turn_where_one_or_more_keeps_decoding() {
+        let chunks = [
+            "<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n",
+            "</tool_call>",
+            "\n<tool_call>\n<function=b>\n<parameter=y>\nhi\n</parameter>\n</function>\n",
+            "</tool_call>",
+        ];
+        for (calls, want_calls, want_fed) in [
+            (crate::grammar::ToolCalls::ExactlyOne, 1, 2),
+            (crate::grammar::ToolCalls::OneOrMore, 2, 4),
+        ] {
+            let mut p = Qwen35ResponseParser::new();
+            let mut fed = 0;
+            for chunk in chunks {
+                if calls.must_stop_after_completed_calls(p.completed_calls()) {
+                    break;
+                }
+                let _ = p.feed(chunk);
+                fed += 1;
+            }
+            assert_eq!(fed, want_fed, "{calls:?}: wrong number of decode steps");
+            let resp = p.finish();
+            assert_eq!(
+                resp.tool_calls.len(),
+                want_calls,
+                "{calls:?}: wrong number of calls returned"
+            );
+            assert_eq!(resp.tool_calls[0].name, "a");
+        }
     }
 
     #[test]

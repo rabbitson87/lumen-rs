@@ -210,6 +210,36 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "qwen-parallel-tool-calls-inert",
+        symptom: "the fix above covered Gemma 4 only. `must_stop_after_call_closer` \
+                  compares against a Gemma special-token id, and Qwen frames a call \
+                  with the literal text `</tool_call>`, so on the whole Qwen family \
+                  the cap could not fire and nothing said so — \
+                  `ToolCalls::ExactlyOne` was built correctly, handed to the \
+                  grammar builder (where the count is deliberately inert: the \
+                  grammar is one-call-per-activation by construction) and never \
+                  consulted by the decode loop. Measured on Qwen3.8-27B, \
+                  `tool_choice=required` + `parallel_tool_calls=false` returned \
+                  SEVEN identical calls",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        self.stops_after_first_call() && completed >= 1"#,
+            replace: r#"        let _ = completed;
+        false // defect: the cap never fires on the Qwen path"#,
+        }],
+        guards: &[
+            core_mlx_lib(
+                "grammar::tests::the_qwen_one_call_stop_fires_on_the_first_completed_call",
+            ),
+            core_mlx_lib(
+                "qwen3_5_tools::tests::exactly_one_cuts_the_turn_where_one_or_more_keeps_decoding",
+            ),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "parallel-tool-calls-ignored",
         symptom: "a client sending `parallel_tool_calls: false` got HTTP 200 and \
                   as many calls as the model produced — the field was never \
@@ -786,7 +816,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.
         (_, "scratch-path-collision") => "lib.rs",
-        (_, "parallel-tool-calls-not-enforced") => "grammar.rs",
+        (_, "parallel-tool-calls-not-enforced") | (_, "qwen-parallel-tool-calls-inert") => {
+            "grammar.rs"
+        }
         (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),

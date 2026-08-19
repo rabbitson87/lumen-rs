@@ -4977,6 +4977,7 @@ impl MlxQwen35Backend {
             prefill,
             prefill_tokens,
             grammar,
+            calls,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -5066,6 +5067,7 @@ impl MlxQwen35Backend {
             prefill,
             prefill_tokens,
             grammar,
+            calls,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -5102,6 +5104,12 @@ impl MlxQwen35Backend {
         // path). When active, each decode step routes through
         // `decode_step_masked` so disallowed tokens are masked before argmax.
         grammar: Option<crate::grammar::Gemma4GrammarState>,
+        // How many calls this turn may contain (OpenAI `parallel_tool_calls`,
+        // Anthropic `disable_parallel_tool_use`). Enforced HERE and not by the
+        // grammar: the grammar is one-call-per-activation by construction and
+        // is `None` outright whenever the tool grammar is disabled or
+        // `tool_choice` is plain `auto`.
+        calls: crate::grammar::ToolCalls,
         max_new_tokens: usize,
         seq_id: u64,
         // Auto-derived key (from system message hash) or explicit session_id
@@ -5345,6 +5353,26 @@ impl MlxQwen35Backend {
         //      have to be rolled back on the injection/grammar-desync paths.
         // Correctness first: Qwen3.6 stays on the exact synchronous path.
         for step in 1..max_new_tokens {
+            // `parallel_tool_calls: false` — the parser has consumed a
+            // `</tool_call>` and the client asked for exactly one call.
+            //
+            // Evaluated at the TOP of the loop rather than after each of the
+            // three `parser.feed` sites below: the injection branch `continue`s
+            // back here and the tail of the body falls through to here, so one
+            // check covers every path that can complete a call — including the
+            // pre-loop feed of the first decoded token.
+            //
+            // Ordering matters. This sits ahead of the force-required-params
+            // injection so a closed call is never re-opened to force a
+            // parameter into it.
+            if calls.must_stop_after_completed_calls(parser.completed_calls()) {
+                eprintln!(
+                    "[tool-calls] parallel_tool_calls=false — ending the turn after \
+                     one completed call at {} tokens",
+                    generated.len()
+                );
+                break;
+            }
             // Force-required-params injection (opt-in). If the previous feed
             // left the parser at a clean tool-call-body boundary with a
             // REQUIRED param still missing, inject `<parameter=KEY>\n` so the
