@@ -210,6 +210,35 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "mtp-norm-double-fold",
+        symptom: "the MTP head's RMSNorm `+1` fold was applied unconditionally, \
+                  which is right for a raw HF snapshot and WRONG for every MTPLX \
+                  Speed bundle — those ship the head pre-folded, so the load \
+                  folded it twice. Invisible by construction: 1.37 + 1 is a \
+                  bounded scale change, not the sign inversion the fold exists to \
+                  prevent, so output stayed bit-exact lossless and only the \
+                  accept rate fell. Measured 5 paired prompts per model, K=2 \
+                  GEN=320 greedy: Qwen3.8-27B loses 0.055 accept on 5/5 prompts \
+                  (t=12.1), Qwen3.6-27B 0.046 on 4/5. A single prompt cannot see \
+                  it — the one prompt measured during the 3.8 port came out 0.018 \
+                  the other way and was recorded as no signal",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    mean_of_means < MTP_NORM_RUNG_THRESHOLD"#,
+            replace: r#"    let _ = mean_of_means;
+    true // defect: fold every checkpoint, including the pre-folded ones"#,
+        }],
+        guards: &[
+            mlx(
+                "qwen3_5_mtp::norm_convention_tests::the_two_rungs_are_classified_and_are_far_from_the_threshold",
+            ),
+            mlx("qwen3_5_mtp::norm_convention_tests::the_boundary_is_pinned"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "qwen-parallel-tool-calls-inert",
         symptom: "the fix above covered Gemma 4 only. `must_stop_after_call_closer` \
                   compares against a Gemma special-token id, and Qwen frames a call \
@@ -803,6 +832,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
         (_, "config-null-moe-fields") | (_, "qwen-nested-eos-token-id") => "qwen35_config.rs",
         (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
+        (_, "mtp-norm-double-fold") => "qwen3_5_mtp.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
         (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",

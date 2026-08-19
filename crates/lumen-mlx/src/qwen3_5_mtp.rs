@@ -1072,6 +1072,60 @@ impl MtpLoadQuant {
     }
 }
 
+/// The six `mtp.*` norms stored in the zero-centered-gamma convention.
+///
+/// `post_attention_layernorm` is deliberately absent: it ships absolute even in
+/// the raw HF export (matched == raw, rel-MAE 0), so including it would drag the
+/// statistic toward the wrong rung.
+const MTP_FOLDED_NORM_KEYS: [&str; 6] = [
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+];
+
+/// Midpoint of the two observed rungs (~0.28 raw, ~1.28 already folded), which
+/// are 1.0 apart by construction — the gap IS the fold. ~0.5 of margin either
+/// way, so this is a separation, not a tuned constant.
+const MTP_NORM_RUNG_THRESHOLD: f32 = 0.75;
+
+/// Does a checkpoint whose folded norms average `mean_of_means` still need the
+/// `+1`?
+///
+/// Split out from the Array plumbing so both rungs and the boundary are
+/// testable without a checkpoint or a GPU.
+pub fn mtp_norms_need_plus_one(mean_of_means: f32) -> bool {
+    mean_of_means < MTP_NORM_RUNG_THRESHOLD
+}
+
+/// Mean of the per-tensor means over [`MTP_FOLDED_NORM_KEYS`], or `None` when
+/// none of them is present.
+///
+/// Averages over whatever IS present — `mtp.norm.weight` is optional per the
+/// llama.cpp / DeepSeek-V3 spec, and the rungs are 1.0 apart, so a missing
+/// tensor cannot move the answer across the threshold.
+fn mtp_norm_mean_of_means(tensors: &std::collections::HashMap<String, Array>) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut n = 0usize;
+    for key in MTP_FOLDED_NORM_KEYS {
+        let Some(arr) = tensors.get(key) else {
+            continue;
+        };
+        let Ok(mean) = arr
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .and_then(|a| a.mean(None))
+            .map(|m| m.item::<f32>())
+        else {
+            continue;
+        };
+        sum += mean;
+        n += 1;
+    }
+    (n > 0).then(|| sum / n as f32)
+}
+
 /// Load a Qwen3.5/3.6 MTP block from an HF original snapshot directory.
 ///
 /// `hf_dir` is the snapshot root holding `model.safetensors.index.json`
@@ -1297,10 +1351,48 @@ pub fn load_block_from_hf(
     // trunk works without this because mlx-community's conversion already
     // folded the trunk norms. Without the fold, e.g. pre_fc_norm_embedding
     // (raw mean -0.73) multiplies by a negative scale → garbage drafts,
-    // 0% accept. Gated for A/B; default ON once validated.
-    let fold_plus_one = std::env::var("LUMEN_MTP_NORM_PLUS_ONE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    // 0% accept.
+    //
+    // But the MTPLX bundles ship the head with the `+1` ALREADY folded in, and
+    // folding unconditionally therefore double-folds every checkpoint most
+    // users actually run. That does not produce garbage — 1.28 + 1 is a bounded
+    // scale change, not the sign inversion above — which is exactly why it hid:
+    // output stays bit-exact lossless and only the accept rate drops. Measured,
+    // 5 prompts paired per model, K=2 GEN=320 greedy:
+    //
+    //   Qwen3.8-27B-MTPLX  fold OFF beats ON on 5/5 prompts, mean +0.055 accept
+    //                      (sd 0.010, t=12.1) — btree/rust/math/hist/dialog all
+    //   Qwen3.6-27B-MTPLX  4/5, mean +0.046 (sd 0.052, t=1.95; one tie, one -0.022)
+    //
+    // A single prompt is not enough to see this: the one 3.8 prompt measured
+    // during the 3.8 port came out +0.018 the OTHER way, and that lone number
+    // was read as "no signal" and shipped.
+    //
+    // So decide it from the weights instead of assuming. Mean-of-means over the
+    // folded norms lands on a ladder exactly 1.0 apart — raw HF ≈ 0.28,
+    // already-folded MTPLX ≈ 1.28 — because that is what the difference IS.
+    let norm_mean = mtp_norm_mean_of_means(&tensors);
+    let fold_plus_one = match std::env::var("LUMEN_MTP_NORM_PLUS_ONE").ok().as_deref() {
+        // Both old behaviours stay reachable for A/B.
+        Some("0") => false,
+        Some("1") => true,
+        _ => norm_mean.is_none_or(mtp_norms_need_plus_one),
+    };
+    match norm_mean {
+        Some(m) => eprintln!(
+            "[mtp-norm] mean-of-means {m:.3} → {} rung; fold(+1)={fold_plus_one}",
+            if mtp_norms_need_plus_one(m) {
+                "raw"
+            } else {
+                "already-folded"
+            }
+        ),
+        // Not a silent auto-decision: a path whose failure is invisible must say
+        // which way it went and why.
+        None => eprintln!(
+            "[mtp-norm] no norm tensors to measure — defaulting to fold(+1)={fold_plus_one}"
+        ),
+    }
     let p1 = |a: Array| -> Result<Array> {
         if fold_plus_one {
             let one = Array::from_f32(1.0).as_dtype(a.dtype())?;
@@ -1872,6 +1964,59 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
 /// the derived values to exactly what those branches produced, so the refactor
 /// is provably inert for the two shipped checkpoints before a third depends on
 /// it — and then show the case the substring rule got wrong.
+#[cfg(test)]
+mod norm_convention_tests {
+    use super::{MTP_NORM_RUNG_THRESHOLD, mtp_norms_need_plus_one};
+
+    /// The two rungs, as measured — not as assumed.
+    ///
+    /// Read straight out of the safetensors of four checkpoints (and
+    /// cross-checked against an independent Python read of the same bytes):
+    /// raw HF `Qwen3.6-35B-A3B` mtp.* averages **0.351**, while every MTPLX
+    /// Speed bundle averages **~1.37** (3.8-27B 1.373, 3.6-27B 1.367,
+    /// 3.5-9B 1.387). They are ~1.0 apart because the gap IS the fold.
+    #[test]
+    fn the_two_rungs_are_classified_and_are_far_from_the_threshold() {
+        assert!(
+            mtp_norms_need_plus_one(0.351),
+            "raw HF Qwen3.6-35B-A3B must still be folded"
+        );
+        for (label, m) in [("3.8-27B", 1.373), ("3.6-27B", 1.367), ("3.5-9B", 1.387)] {
+            assert!(
+                !mtp_norms_need_plus_one(m),
+                "{label} ships pre-folded; folding again costs accept rate"
+            );
+        }
+        // Margin, not a tuned constant: nothing observed sits near the line.
+        for m in [0.351, 1.367, 1.373, 1.387] {
+            assert!(
+                (m - MTP_NORM_RUNG_THRESHOLD).abs() > 0.35,
+                "{m} is within 0.35 of the threshold — the rungs are no longer separated"
+            );
+        }
+    }
+
+    /// Exactly at the threshold counts as already-folded. Stated so the
+    /// boundary is a decision rather than an accident of `<` vs `<=`.
+    #[test]
+    fn the_boundary_is_pinned() {
+        assert!(mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD - 0.001));
+        assert!(!mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD));
+        assert!(!mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD + 0.001));
+    }
+
+    /// A raw checkpoint whose norms average NEGATIVE is the failure the fold
+    /// exists for: `pre_fc_norm_embedding` at mean -0.73 multiplies by a
+    /// negative scale, which inverts signs and gives 0% accept. Unlike the
+    /// double-fold this one is loud, and it must stay on the fold side.
+    #[test]
+    fn negative_means_are_raw() {
+        for m in [-0.73, -0.1, 0.0] {
+            assert!(mtp_norms_need_plus_one(m), "{m} must be treated as raw");
+        }
+    }
+}
+
 #[cfg(test)]
 mod shape_derivation_tests {
     use super::{MtpMlpConfig, mtp_shape_from_text_config};
