@@ -230,8 +230,8 @@ before pushing.
 | Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
 | Qwen3.6-35B-A3B-mxfp4 N=1 decode | 13.9 ms/step p50, **71.6 tok/s** | — |
 | Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode | 14.85 ms/step p50, **67.3 tok/s** | — |
-| Qwen3.8-27B MTPLX, MTP K=2 greedy | **accept 0.494**, output bit-exact vs non-MTP (320/320) | fold A/B: `LUMEN_MTP_NORM_PLUS_ONE=0` → accept 0.476 |
-| Qwen3.6-27B MTPLX, MTP K=2 greedy | **accept 0.476** | `LUMEN_MTP_NORM_PLUS_ONE=0` → accept 0.567 |
+| Qwen3.8-27B MTPLX, MTP K=2 greedy | **accept 0.476–0.690** by prompt, output bit-exact vs non-MTP (320/320) | fold A/B: `LUMEN_MTP_NORM_PLUS_ONE=1` costs 0.055 accept |
+| Qwen3.6-27B MTPLX, MTP K=2 greedy | **accept 0.479–0.631** by prompt | `LUMEN_MTP_NORM_PLUS_ONE=1` costs 0.046 accept |
 
 **Compare accept, not speedup, on the MTP rows.** `accept_rate` is
 deterministic for a given (model, prompt, GEN, K) because the decode is greedy,
@@ -240,9 +240,19 @@ two timings taken under whatever load existed at the time: a verification re-run
 measured baseline throughput at 4.8 tok/s and 10.8 tok/s for the same class of
 model minutes apart. Treat it as indicative only.
 
-Both fold settings are lossless and both net a speedup — the difference between
-them is ~1-2σ and points in opposite directions on the two checkpoints, which is
-why no auto-detector was built (task 008, `LUMEN_MTP_NORM_PLUS_ONE`).
+**And vary the prompt.** Accept rate is deterministic per prompt but spans
+~0.40–0.69 *across* prompts on the same checkpoint, which is far wider than the
+effects worth measuring. A one-prompt A/B is not a measurement: the 3.8 norm-fold
+question was called "noise" on a single prompt that came out +0.018 the wrong
+way, and the same comparison over 5 paired prompts is +0.055 the other way at
+t=12.1. Pair on the prompt and report the mean difference with its spread.
+
+`LUMEN_MTP_NORM_PLUS_ONE` is three-state: unset **detects** the checkpoint's
+RMSNorm convention from the weights (mean-of-means over the six zero-centered
+norms — ~0.35 raw HF, ~1.37 already-folded MTPLX, threshold 0.75), `0` never
+folds, `1` always folds. Both fold settings are lossless in every condition
+measured; the fold only moves accept rate, which is why folding twice went
+unnoticed for as long as it did.
 
 The Candle A/B columns are gone with the backend. Their last recorded values,
 for the record: Candle N=1 was 22.0 ms / 45.5 tok/s, and at PROMPT_LEN=2048 it
@@ -411,7 +421,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.494 / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt) |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
