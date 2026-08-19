@@ -2736,7 +2736,7 @@ fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> 
 /// non-alphanumeric, so `read` can't grab `thread`), remap it to the full name.
 /// Ambiguous or absent matches are left untouched. Keeps stock omp working
 /// without renaming tools.
-fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
+fn remap_tool_call_names(calls: &mut Vec<ParsedToolCall>, tools: &[ToolDef<'_>]) {
     if calls.is_empty() || tools.is_empty() {
         return;
     }
@@ -2771,8 +2771,68 @@ fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
                 c.name, full
             );
             c.name = full.to_string();
+            continue;
+        }
+        // Bug A's mirror image: the emitted name is LONGER than a declared one
+        // and ends with it, because the model stuttered its opening bytes.
+        // Measured on Qwen3.8-27B: `<function=geget_weather>` for a declared
+        // `get_weather`, on the second call of a turn — after the one-call
+        // grammar released and the tail decoded unconstrained.
+        //
+        // Repaired only when the extra prefix is itself a prefix of the
+        // declared name, which is what makes it a stutter rather than a
+        // different word. Without that guard a declared `list` would swallow an
+        // emitted `blacklist`; with it, `black` is not a prefix of `list` and
+        // nothing happens.
+        if let Some(full) = unique_stutter_match(emitted, tools) {
+            eprintln!(
+                "[mlx] tool-name resolved {:?} -> {:?} (stutter)",
+                c.name, full
+            );
+            c.name = full.to_string();
         }
     }
+
+    // Whatever is still unmatched is a name the client never declared, and
+    // handing one over is a contract violation: the client looks up a function
+    // it does not have. Dropping is the conservative half; saying so is the
+    // other half, because "accepted and then silently not applied" is the
+    // failure mode this file keeps paying for.
+    let declared = |c: &ParsedToolCall| tools.iter().any(|t| t.name == c.name);
+    if !calls.iter().all(declared) {
+        for c in calls.iter().filter(|c| !declared(c)) {
+            eprintln!(
+                "[mlx] tool-call DROPPED: {:?} is not among the {} declared tools",
+                c.name,
+                tools.len()
+            );
+        }
+        calls.retain(declared);
+    }
+}
+
+/// The one declared tool that `emitted` is a stutter of, if exactly one is.
+///
+/// `emitted` must end with the declared name and the leading remainder must be
+/// a prefix of it — `ge` + `get_weather`. Ambiguity yields `None`; so does a
+/// remainder that is merely extra text.
+fn unique_stutter_match<'a>(emitted: &str, tools: &'a [ToolDef<'a>]) -> Option<&'a str> {
+    let mut hit: Option<&str> = None;
+    for t in tools {
+        let n = t.name;
+        if n.len() >= emitted.len() || !emitted.ends_with(n) {
+            continue;
+        }
+        let extra = &emitted[..emitted.len() - n.len()];
+        if extra.is_empty() || !n.starts_with(extra) {
+            continue;
+        }
+        if hit.is_some() {
+            return None; // ambiguous
+        }
+        hit = Some(n);
+    }
+    hit
 }
 
 fn parsed_to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<ToolCall> {
@@ -3458,39 +3518,100 @@ mod tool_name_resolve_tests {
             td("bash"),
         ];
         // Exact native name is kept (exact match wins over suffix).
-        let mut a = [tc("read")];
+        let mut a = vec![tc("read")];
         remap_tool_call_names(&mut a, &tools);
         assert_eq!(a[0].name, "read");
         // Abbreviated MCP names → full namespaced names.
-        let mut b = [tc("ctx_read")];
+        let mut b = vec![tc("ctx_read")];
         remap_tool_call_names(&mut b, &tools);
         assert_eq!(b[0].name, "mcp__lean_ctx_ctx_read");
-        let mut c = [tc("ctx_tree")];
+        let mut c = vec![tc("ctx_tree")];
         remap_tool_call_names(&mut c, &tools);
         assert_eq!(c[0].name, "mcp__lean_ctx_ctx_tree");
     }
 
+    /// A name that resolves to nothing is DROPPED, not forwarded.
+    ///
+    /// Forwarding it is a contract violation — the client looks up a function
+    /// it never declared. Measured on Qwen3.8-27B: `geget_weather` reached the
+    /// response for a client that had declared only `get_weather`.
     #[test]
-    fn leaves_unknown_and_ambiguous_untouched() {
+    fn an_unresolvable_name_is_dropped_not_forwarded() {
         let tools = [td("mcp__a_get"), td("mcp__b_get")];
-        // Ambiguous suffix `get` matches two tools → unchanged.
-        let mut a = [tc("get")];
+        // Ambiguous suffix `get` matches two tools → cannot be resolved.
+        let mut a = vec![tc("get")];
         remap_tool_call_names(&mut a, &tools);
-        assert_eq!(a[0].name, "get");
-        // No suffix match at all → unchanged.
-        let mut b = [tc("nonexistent")];
+        assert!(a.is_empty(), "ambiguous name must not reach the client");
+        // No match at all.
+        let mut b = vec![tc("nonexistent")];
         remap_tool_call_names(&mut b, &tools);
-        assert_eq!(b[0].name, "nonexistent");
+        assert!(b.is_empty(), "undeclared name must not reach the client");
+        // Dropping is per call, not per turn: the valid ones survive, in order.
+        let mut c = vec![tc("mcp__a_get"), tc("nonexistent"), tc("mcp__b_get")];
+        remap_tool_call_names(&mut c, &tools);
+        let kept: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(kept, ["mcp__a_get", "mcp__b_get"]);
+    }
+
+    /// The `geget_weather` case: the model stuttered the opening bytes of a
+    /// declared name once the one-call grammar released and the tail decoded
+    /// unconstrained.
+    #[test]
+    fn resolves_a_stuttered_name() {
+        let tools = [td("get_weather"), td("bash")];
+        for emitted in ["geget_weather", "gget_weather", "get_get_weather"] {
+            let mut a = vec![tc(emitted)];
+            remap_tool_call_names(&mut a, &tools);
+            assert_eq!(
+                a.first().map(|c| c.name.as_str()),
+                Some("get_weather"),
+                "{emitted}"
+            );
+        }
+    }
+
+    /// The stutter repair must not turn a different word into a declared tool.
+    ///
+    /// The extra prefix has to be a prefix of the declared name — that is what
+    /// makes it a stutter. `black` is not a prefix of `list`, so `blacklist`
+    /// stays unresolved (and is therefore dropped, per the rule above).
+    #[test]
+    fn a_longer_word_is_not_a_stutter() {
+        let tools = [td("list")];
+        let mut a = vec![tc("blacklist")];
+        remap_tool_call_names(&mut a, &tools);
+        assert!(a.is_empty(), "blacklist is not a stutter of list");
+
+        // `rrrun` against `run` + `rrun` is NOT ambiguous and must resolve:
+        // `run` is rejected (`rr` is not a prefix of `run`), leaving `rrun`
+        // alone. Pinned because it reads like a two-candidate case and is not —
+        // the prefix guard already eliminated one.
+        let tools = [td("run"), td("rrun")];
+        let mut b = vec![tc("rrrun")];
+        remap_tool_call_names(&mut b, &tools);
+        assert_eq!(b.first().map(|c| c.name.as_str()), Some("rrun"));
+
+        // Genuine ambiguity needs self-similar names, and then nothing is
+        // guessed: `aaaa` is a one-`a` stutter of `aaa` and a two-`a` stutter
+        // of `aa`, so it resolves to neither and is dropped.
+        let tools = [td("aa"), td("aaa")];
+        let mut c = vec![tc("aaaa")];
+        remap_tool_call_names(&mut c, &tools);
+        assert!(c.is_empty(), "two candidates must resolve to neither");
     }
 
     #[test]
     fn requires_separator_boundary() {
         // `read` must NOT be rewritten to `thread` — the suffix has no
-        // separator before it.
+        // separator before it. It is now dropped rather than forwarded, which
+        // keeps the original point (never `thread`) and adds the new one.
         let tools = [td("thread")];
-        let mut a = [tc("read")];
+        let mut a = vec![tc("read")];
         remap_tool_call_names(&mut a, &tools);
-        assert_eq!(a[0].name, "read");
+        assert!(
+            a.is_empty(),
+            "read must not become thread, and must not reach the client either"
+        );
     }
 }
 

@@ -239,6 +239,31 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "undeclared-tool-name-forwarded",
+        symptom: "a tool call named something the client never declared was \
+                  forwarded verbatim, so the client looked up a function it does \
+                  not have. Measured on Qwen3.8-27B: with `tool_choice=required` \
+                  and `parallel_tool_calls` unset, the second call of the turn \
+                  came back as `geget_weather` for a client that had declared \
+                  only `get_weather`. The raw decode dump shows the MODEL wrote \
+                  it — after the one-call-per-activation grammar released, the \
+                  tail of the turn decoded unconstrained. `remap_tool_call_names` \
+                  repaired the opposite direction (a name shorter than the \
+                  declared one) and passed anything else straight through",
+        revert: &[Mutation {
+            path: SRV,
+            find: r#"        calls.retain(declared);"#,
+            replace: r#"        // defect: log it and forward it anyway"#,
+        }],
+        guards: &[
+            srv("engine::tool_name_resolve_tests::an_unresolvable_name_is_dropped_not_forwarded"),
+            srv("engine::tool_name_resolve_tests::requires_separator_boundary"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "qwen-parallel-tool-calls-not-consulted",
         symptom: "the WIRING half of the defect below, and the half no guard \
                   covered when it shipped. `ToolCalls::ExactlyOne` was resolved \
@@ -866,7 +891,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
-        (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
+        (_, "tool-choice-none")
+        | (_, "anthropic-turn-images")
+        | (_, "undeclared-tool-name-forwarded") => "engine.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.
