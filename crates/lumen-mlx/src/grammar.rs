@@ -161,9 +161,17 @@ impl ToolCalls {
     /// the request asked for exactly one.
     ///
     /// The Qwen 3.5/3.6/3.8 counterpart of [`must_stop_after_call_closer`].
-    /// The token-watching form does not transfer: Qwen frames a call with the
-    /// literal text `<tool_call>…</tool_call>`, which the tokenizer is free to
-    /// split across BPE pieces, so there is no single id to compare against.
+    ///
+    /// The token-watching form does not transfer, though not for the reason it
+    /// looks like. Qwen *does* tokenise `</tool_call>` as one id — 248059 on
+    /// 3.5-9B, 3.6-27B and 3.8-27B alike. What it does not have is a *constant*:
+    /// that id is an entry in the checkpoint's `added_tokens`, not a fixed part
+    /// of the format the way Gemma's `TOK_TOOL_CALL_CLOSE` is, so watching it
+    /// would mean reading the tokenizer at grammar-build time and carrying a
+    /// per-checkpoint id into the decode loop.
+    ///
+    /// The parser already knows the answer without asking the tokenizer
+    /// anything, so it is the cheaper and more portable place to ask.
     ///
     /// The count comes from `Qwen35ResponseParser`, which increments only when
     /// it consumes `</tool_call>`. That is the same boundary the Gemma rule

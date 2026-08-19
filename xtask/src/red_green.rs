@@ -239,6 +239,29 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "qwen-parallel-tool-calls-not-consulted",
+        symptom: "the WIRING half of the defect below, and the half no guard \
+                  covered when it shipped. `ToolCalls::ExactlyOne` was resolved \
+                  correctly and the parser counted completed calls correctly — \
+                  both pure pieces were right the whole time. What was missing \
+                  was `chat_with_tools_impl` asking either of them, so tests over \
+                  the two pieces passed in both states. This guard drives the \
+                  real decode loop over a scripted token stream, no model and no \
+                  GPU, which is what makes the omission visible",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            if calls.must_stop_after_completed_calls(parser.completed_calls()) {"#,
+            replace: r#"            if false {
+                let _ = &calls; // defect: the decode loop never consults the cap"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_tool_decode_loop_consults_parallel_tool_calls",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "qwen-parallel-tool-calls-inert",
         symptom: "the fix above covered Gemma 4 only. `must_stop_after_call_closer` \
                   compares against a Gemma special-token id, and Qwen frames a call \
@@ -835,7 +858,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "mtp-norm-double-fold") => "qwen3_5_mtp.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
-        (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
+        (_, "gemma-nonstreaming-grammar")
+        | (_, "qwen-first-token-mask")
+        | (_, "qwen-parallel-tool-calls-not-consulted") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

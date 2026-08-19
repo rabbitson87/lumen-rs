@@ -575,6 +575,101 @@ enum RunnerImpl {
     #[cfg(feature = "mlx-pyo3")]
     Pyo3(Pyo3Runner),
     Native(NativeMlxRunner),
+    /// Test-only: replays a fixed token script so the decode loops can be
+    /// driven with no model, no weights and no GPU. See [`TokenScriptRunner`].
+    #[cfg(test)]
+    Scripted(TokenScriptRunner),
+}
+
+/// A runner that hands back a pre-written list of token ids, one per step.
+///
+/// Exists so decode-loop *policy* can be tested end to end. Everything the
+/// loops decide — when to stop, what to feed the parser, what to emit — is
+/// downstream of "the model produced this token next", and that is the only
+/// thing this fakes. Nothing here touches MLX, so a guard built on it runs in
+/// the `default = []` build in milliseconds.
+///
+/// Written because the claim that this needed a trait refactor was wrong:
+/// `RunnerImpl` was already an enum behind `&dyn Runner`, so a test variant
+/// costs one arm in each accessor.
+#[cfg(test)]
+pub(crate) struct TokenScriptRunner {
+    /// Tokens handed out in order, one per `prefill`/`decode_step`/`extend`.
+    script: Vec<u32>,
+    /// Index of the next token to hand out.
+    next: usize,
+    /// Returned once the script runs dry, so a loop that fails to stop on its
+    /// own terminates rather than hanging the test.
+    eos: u32,
+}
+
+#[cfg(test)]
+impl TokenScriptRunner {
+    pub(crate) fn new(script: Vec<u32>, eos: u32) -> Self {
+        Self {
+            script,
+            next: 0,
+            eos,
+        }
+    }
+
+    fn pop(&mut self) -> u32 {
+        let tok = self.script.get(self.next).copied().unwrap_or(self.eos);
+        self.next += 1;
+        tok
+    }
+
+    /// How many tokens the loop actually consumed — i.e. how early it stopped.
+    pub(crate) fn consumed(&self) -> usize {
+        self.next
+    }
+}
+
+#[cfg(test)]
+impl Runner for TokenScriptRunner {
+    fn name(&self) -> &'static str {
+        "token-script"
+    }
+    fn prefill(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Ok((self.pop(), tokens.len()))
+    }
+    fn decode_step(
+        &mut self,
+        _seq_id: u64,
+        _last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        Ok((self.pop(), position + 1))
+    }
+    fn remove_seq(&mut self, _seq_id: u64) -> Result<()> {
+        Ok(())
+    }
+    fn extend(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Ok((self.pop(), tokens.len()))
+    }
+    fn forward_probe(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
+        Ok(ProbeRows {
+            row_argmaxes: vec![self.eos; tokens.len()],
+            row_max_abs: vec![1.0; tokens.len()],
+            row_top2_gap: vec![1.0; tokens.len()],
+            position: tokens.len(),
+        })
+    }
+    fn snapshot_state(&mut self, _seq_id: u64) -> Result<u64> {
+        Ok(1)
+    }
+    fn restore_state(&mut self, _seq_id: u64, _snapshot_id: u64) -> Result<usize> {
+        Ok(0)
+    }
+    fn release_snapshot(&mut self, _snapshot_id: u64) -> Result<()> {
+        Ok(())
+    }
+    fn snapshot_state_deep(&mut self, _seq_id: u64) -> Result<(u64, usize)> {
+        Ok((1, 0))
+    }
+    fn fork_from_snapshot(&mut self, _snapshot_id: u64, _dst_seq_id: u64) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 impl RunnerImpl {
@@ -584,6 +679,8 @@ impl RunnerImpl {
             #[cfg(feature = "mlx-pyo3")]
             Self::Pyo3(r) => r,
             Self::Native(r) => r,
+            #[cfg(test)]
+            Self::Scripted(r) => r,
         }
     }
 
@@ -593,6 +690,8 @@ impl RunnerImpl {
             #[cfg(feature = "mlx-pyo3")]
             Self::Pyo3(r) => r,
             Self::Native(r) => r,
+            #[cfg(test)]
+            Self::Scripted(r) => r,
         }
     }
 
@@ -2771,6 +2870,49 @@ struct AttachedImages {
     prepared: Vec<crate::qwen36_vision::PreparedImage>,
     /// `counts[k]` is how many placeholder rows `prepared[k]` occupies.
     counts: Vec<usize>,
+}
+
+#[cfg(test)]
+impl MlxQwen35Backend {
+    /// A backend wired to a [`TokenScriptRunner`] and a caller-supplied
+    /// tokenizer, for driving the decode loops with no model.
+    ///
+    /// Everything the loops read is here; everything they do not is left at the
+    /// inert value. `prefix_store` is built from env but every test passes
+    /// `prefix_cache_key: None`, which disables reuse per request regardless of
+    /// what the environment says — so the harness cannot be perturbed by a
+    /// developer's shell.
+    pub(crate) fn with_token_script(
+        script: Vec<u32>,
+        eos: u32,
+        tokenizer: Tokenizer,
+        vocab_size: usize,
+    ) -> Self {
+        Self {
+            runner: RunnerImpl::Scripted(TokenScriptRunner::new(script, eos)),
+            model_id: "token-script".to_string(),
+            eos_tokens: vec![eos],
+            vocab_size,
+            tokenizer: Some(tokenizer),
+            next_seq_id: AtomicU64::new(1),
+            sessions: std::collections::HashMap::new(),
+            session_ttl: None,
+            session_max: None,
+            prefix_store: prefix_cache::PrefixCacheStore::from_env(),
+            grammar_factory: OnceLock::new(),
+            wants_reasoning_effort: false,
+            #[cfg(feature = "mlx-native")]
+            draft: None,
+        }
+    }
+
+    /// How many scripted tokens the loop consumed before returning.
+    pub(crate) fn scripted_tokens_consumed(&self) -> usize {
+        match &self.runner {
+            RunnerImpl::Scripted(r) => r.consumed(),
+            _ => unreachable!("only built by with_token_script"),
+        }
+    }
 }
 
 impl MlxQwen35Backend {
@@ -7139,6 +7281,137 @@ mod tests {
         assert!(auto_prefix_key(&empty, None).is_none());
         let empty_sys = vec![("system".to_string(), "".into())];
         assert!(auto_prefix_key(&empty_sys, None).is_none());
+    }
+
+    // ───────── the tool decode loop, driven with no model ─────────
+
+    /// A WordLevel tokenizer whose "words" are whole chunks of Qwen tool-call
+    /// syntax, with a `Fuse` decoder so `decode` is plain concatenation.
+    ///
+    /// This is not a stand-in for a real tokenizer and does not need to be. The
+    /// decode loop's contract is "turn token ids into text, feed the parser,
+    /// decide when to stop"; what matters is that a scripted id sequence
+    /// produces exactly the byte stream a real checkpoint would. Chunk
+    /// boundaries are deliberately awkward (`\n` is its own id, the framing is
+    /// split across ids) so the parser's incremental path is what runs.
+    const SCRIPT_TOKENIZER: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": {"type": "Fuse"},
+        "model": {
+            "type": "WordLevel",
+            "unk_token": "<unk>",
+            "vocab": {
+                "<unk>": 0,
+                "<tool_call>": 1,
+                "\n": 2,
+                "<function=get_weather>": 3,
+                "<parameter=city>": 4,
+                "Seoul": 5,
+                "Tokyo": 6,
+                "</parameter>": 7,
+                "</function>": 8,
+                "</tool_call>": 9,
+                "<eos>": 10
+            }
+        }
+    }"#;
+
+    /// One complete `get_weather` call for `city`, as the model would frame it.
+    fn scripted_call(city: u32) -> Vec<u32> {
+        vec![1, 2, 3, 2, 4, 2, city, 2, 7, 2, 8, 2, 9]
+    }
+
+    /// Run the shared tool decode loop over a scripted two-call stream.
+    /// Returns the parsed response plus how many tokens the loop consumed.
+    fn run_tool_loop(calls: crate::grammar::ToolCalls) -> (crate::chat_io::ParsedResponse, usize) {
+        const EOS: u32 = 10;
+        let mut script = scripted_call(5); // Seoul
+        script.push(2); // the newline between calls
+        script.extend(scripted_call(6)); // Tokyo
+        script.push(EOS);
+        let n_scripted = script.len();
+
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("script tokenizer");
+        let mut backend = MlxQwen35Backend::with_token_script(script, EOS, tokenizer, 11);
+        let parsed = backend
+            .chat_with_tools_impl(
+                vec![42],      // prompt: one arbitrary token
+                String::new(), // no tool_choice prefill
+                Vec::new(),
+                None, // no grammar — the case where a grammar-derived cap goes inert
+                calls,
+                n_scripted + 8, // budget deliberately longer than the script
+                7,
+                None, // prefix caching off for this request
+                None,
+                Default::default(),
+                Vec::new(),
+                |_| Ok(()),
+            )
+            .expect("tool decode loop");
+        let consumed = backend.scripted_tokens_consumed();
+        (parsed, consumed)
+    }
+
+    /// The wiring, not the policy: `chat_with_tools_impl` must actually consult
+    /// `ToolCalls`.
+    ///
+    /// This is the guard that did not exist when the defect shipped. The policy
+    /// method and the parser count were both correct in isolation the whole
+    /// time — what was missing was the decode loop asking. A test that only
+    /// exercises the two pure pieces passes either way, which is exactly how
+    /// `parallel_tool_calls: false` reached production accepted-and-ignored on
+    /// the entire Qwen family.
+    ///
+    /// Grammar is `None` here on purpose: that is `tool_choice: auto`, and the
+    /// case where hanging the cap off the grammar would have gone quietly
+    /// inert.
+    #[test]
+    fn the_tool_decode_loop_consults_parallel_tool_calls() {
+        let (one, consumed_one) = run_tool_loop(crate::grammar::ToolCalls::ExactlyOne);
+        assert_eq!(
+            one.tool_calls.len(),
+            1,
+            "ExactlyOne must cut the turn after the first completed call"
+        );
+        assert_eq!(one.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            one.tool_calls[0]
+                .arguments
+                .get("city")
+                .and_then(|v| v.as_str()),
+            Some("Seoul")
+        );
+
+        let (many, consumed_many) = run_tool_loop(crate::grammar::ToolCalls::OneOrMore);
+        assert_eq!(
+            many.tool_calls.len(),
+            2,
+            "OneOrMore must let the model keep calling"
+        );
+        assert_eq!(many.tool_calls[1].name, "get_weather");
+        assert_eq!(
+            many.tool_calls[1]
+                .arguments
+                .get("city")
+                .and_then(|v| v.as_str()),
+            Some("Tokyo")
+        );
+
+        // Stopping EARLY is the point — the cap must save the decode, not just
+        // trim the result afterwards. Both arms see the identical script.
+        assert!(
+            consumed_one < consumed_many,
+            "ExactlyOne consumed {consumed_one} tokens and OneOrMore {consumed_many}: \
+             the cap has to end the turn, not filter the output"
+        );
     }
 
     #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to
