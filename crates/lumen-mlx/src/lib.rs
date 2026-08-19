@@ -192,8 +192,8 @@ pub fn flags_link_anchor() {}
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
-    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
-    smoke_forward_with_synth_trunk,
+    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, mtp_shape_from_text_config,
+    run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
 };
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
