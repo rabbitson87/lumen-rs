@@ -12,8 +12,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lumen_mlx::chat_io::ToolDef;
 use lumen_mlx::chat_io::ReasoningEffort;
+use lumen_mlx::chat_io::ToolDef;
 use lumen_mlx::render_tools_system_block;
 use lumen_testkit::generators::ToolSet;
 use lumen_testkit::invariants::assert_tools_block_contract;

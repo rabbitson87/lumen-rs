@@ -1122,6 +1122,23 @@ fn gemma4_grammar_would_constrain(
         && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
 }
 
+lumen_flags::flag! {
+    /// Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
+    ///
+    /// **`Behavior`, not `Optimization`: this changes the prompt.** ON means
+    /// "inject the effort sentence when the checkpoint's `chat_template.jinja`
+    /// declares the block" — so it is inert for every 3.5/3.6 checkpoint, which
+    /// declares no such thing. `=0` suppresses it even on 3.8, which is the
+    /// A/B hatch. The equivalence matrix must never flip this expecting
+    /// identical output: on a 3.8 checkpoint the two settings render different
+    /// system blocks by design.
+    pub(crate) reasoning_effort_enabled {
+        env: "LUMEN_QWEN35_REASONING_EFFORT",
+        default: true,
+        kind: Behavior,
+    }
+}
+
 /// Does this checkpoint's own chat template declare `reasoning_effort`?
 ///
 /// Asked of the shipped `chat_template.jinja`, never of the model id. Qwen kept
@@ -1133,17 +1150,13 @@ fn gemma4_grammar_would_constrain(
 ///
 /// Absent or unreadable template ⇒ `false`, which renders exactly as before.
 ///
-/// `LUMEN_QWEN35_REASONING_EFFORT=0|1` overrides in both directions, for
-/// A/B-ing the prompt change against a single checkpoint.
+/// `LUMEN_QWEN35_REASONING_EFFORT=0` suppresses the block entirely, for A/B-ing
+/// the prompt change against a checkpoint that does declare it. There is
+/// deliberately no force-ON: injecting the sentence into a 3.6 checkpoint would
+/// feed it a string it was never trained on, which is not a mode worth having.
 fn checkpoint_declares_reasoning_effort(model_id: &str) -> bool {
-    if let Ok(v) = std::env::var("LUMEN_QWEN35_REASONING_EFFORT") {
-        let v = v.trim();
-        if v == "0" || v.eq_ignore_ascii_case("false") {
-            return false;
-        }
-        if v == "1" || v.eq_ignore_ascii_case("true") {
-            return true;
-        }
+    if !reasoning_effort_enabled::get() {
+        return false;
     }
     let dir = std::path::Path::new(model_id);
     if !dir.is_dir() {
@@ -4613,7 +4626,7 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            self.build_chat_input(messages, thinking)?
+            self.build_chat_input(messages, thinking, effort)?
         };
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
@@ -5031,6 +5044,7 @@ impl MlxQwen35Backend {
                     thinking,
                     tools,
                     tool_choice,
+                    effort,
                 )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };

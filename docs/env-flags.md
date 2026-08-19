@@ -32,6 +32,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 
 ## Details
 
@@ -261,3 +262,17 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  Costs an eval barrier per timed stage; default OFF. (Parse note:
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
+
+### `LUMEN_QWEN35_REASONING_EFFORT`
+
+*Behavior, default on.*
+
+Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
+
+ **`Behavior`, not `Optimization`: this changes the prompt.** ON means
+ "inject the effort sentence when the checkpoint's `chat_template.jinja`
+ declares the block" — so it is inert for every 3.5/3.6 checkpoint, which
+ declares no such thing. `=0` suppresses it even on 3.8, which is the
+ A/B hatch. The equivalence matrix must never flip this expecting
+ identical output: on a 3.8 checkpoint the two settings render different
+ system blocks by design.

@@ -235,8 +235,8 @@ MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
 checkpoint default of 280, which keeps peak memory near the text-only
 footprint on a 36 GB machine.
 
-Qwen 3.6 is the same flag, with a token budget instead of a soft-token
-one (`LUMEN_VISION_MAX_IMAGE_TOKENS`, default 1024):
+Qwen 3.6 **and 3.8** are the same flag, with a token budget instead of a
+soft-token one (`LUMEN_VISION_MAX_IMAGE_TOKENS`, default 1024):
 
 ```bash
 LUMEN_VISION=1 \
@@ -272,6 +272,32 @@ LUMEN_VISION=1 MODEL_ID=~/models/mlx-community--gemma-4-26b-a4b-it-4bit \
   cargo run --release --features mlx-native -p lumen-mlx \
   --example gemma4_vision_describe -- some-image.png "What is this?"
 ```
+
+### Reasoning effort (Qwen 3.8 only)
+
+Qwen 3.8's chat template prepends an instruction sentence to the system prompt
+when thinking is on, and the model was tuned with it there. lumen injects it
+automatically — the capability is read from the checkpoint's own
+`chat_template.jinja`, so 3.5 / 3.6 render exactly as before and no flag is
+needed to get 3.8 right:
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"q","messages":[{"role":"user","content":"..."}],
+       "reasoning_effort":"low"}'
+```
+
+OpenAI's scale (`minimal|low|medium|high`) is mapped onto Qwen's
+(`low|medium|xhigh`): `high` becomes `xhigh`, `minimal` turns thinking off
+entirely, and an unrecognized value falls back to the default rather than
+failing the request. `medium` deliberately injects nothing — that is upstream's
+own behaviour. Thinking on with no level named gets `xhigh`, matching the
+template's `default('xhigh')`.
+
+Set `LUMEN_QWEN35_REASONING_EFFORT=0` to suppress the block on a checkpoint that
+declares it (an A/B hatch). There is no force-ON: a 3.6 checkpoint was never
+trained on that sentence.
 
 ## 7. Common A/B switches
 
