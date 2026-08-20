@@ -523,25 +523,28 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
 
 /// Split one `git grep` output line into `(file, line_no, text)`.
 ///
-/// `sep` is `:` for a match line and `-` for an `-A`/`-B` context line. The
-/// filename may itself contain the separator, so the split is anchored on the
-/// LAST separator that precedes a parsable line number rather than the first.
+/// `sep` is `:` for a match line and `-` for an `-A`/`-B` context line, and the
+/// filename contains that separator on essentially every path in this repo
+/// (`lumen-mlx`, `turboquant-cache`), so the split cannot anchor on the first
+/// one.
+///
+/// It anchors on the `.rs` extension instead. The obvious alternative — walk
+/// separators until the field between two of them parses as a number — is
+/// wrong, and quietly: `crates/foo-2-bar/src/x.rs-5-…` splits at the first
+/// candidate and yields file `crates/foo`, line 2. That names no real file, so
+/// the cutoff it belongs to is dropped and the flags in that file silently stop
+/// being audited — which is the exact failure this scan was just repaired for.
+/// No crate is named that way today; the parser should not be the reason.
 fn split_grep_line(line: &str, sep: char) -> Option<(String, usize, String)> {
-    let mut search_from = 0usize;
-    while let Some(rel) = line[search_from..].find(sep) {
-        let first = search_from + rel;
-        let rest = &line[first + 1..];
-        let second = rest.find(sep)? + first + 1;
-        if let Ok(no) = line[first + 1..second].parse::<usize>() {
-            return Some((
-                line[..first].to_string(),
-                no,
-                line[second + 1..].to_string(),
-            ));
-        }
-        search_from = first + 1;
-    }
-    None
+    // The grep is restricted to `crates/*/src/*.rs`, so the first `.rs` followed
+    // by the separator ends the filename.
+    let marker = format!(".rs{sep}");
+    let at = line.find(&marker)?;
+    let file = &line[..at + 3];
+    let rest = &line[at + marker.len()..];
+    let end = rest.find(sep)?;
+    let no = rest[..end].parse::<usize>().ok()?;
+    Some((file.to_string(), no, rest[end + 1..].to_string()))
 }
 
 fn render_docs(flags: &[Flag]) -> String {
@@ -673,6 +676,17 @@ mod tests {
         // Text containing the separator stays intact.
         let (_, _, text) = split_grep_line("crates/a-b/src/x.rs-3-    env: \"A-B\",", '-').unwrap();
         assert_eq!(text, "    env: \"A-B\",");
+
+        // A NUMERIC path segment must not be mistaken for the line number.
+        // Walking separators until a field parses as a number gets this wrong,
+        // silently: it returns ("crates/foo", 2, "bar/src/x.rs-5-…"), a file
+        // that does not exist, so the cutoff is dropped and every flag in the
+        // real file stops being audited.
+        let (file, no, text) =
+            split_grep_line("crates/foo-2-bar/src/x.rs-5-mod tests {", '-').unwrap();
+        assert_eq!(file, "crates/foo-2-bar/src/x.rs");
+        assert_eq!(no, 5);
+        assert_eq!(text, "mod tests {");
 
         // A line with no line number is not a grep record.
         assert!(split_grep_line("--", '-').is_none());

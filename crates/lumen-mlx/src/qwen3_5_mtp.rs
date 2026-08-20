@@ -1091,6 +1091,24 @@ const MTP_FOLDED_NORM_KEYS: [&str; 6] = [
 /// way, so this is a separation, not a tuned constant.
 const MTP_NORM_RUNG_THRESHOLD: f32 = 0.75;
 
+/// The off-switch vocabulary used across this repo (`runaway.rs`,
+/// `lumen_flags`): `0` / `false` / `off` / `no`, case-insensitive.
+fn is_falsy(v: &str) -> bool {
+    v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("no")
+}
+
+/// The on-switch counterpart. Separate from `!is_falsy` on purpose: this flag is
+/// three-state, so "not off" is not the same as "on".
+fn is_truthy(v: &str) -> bool {
+    v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("yes")
+}
+
 /// Does a checkpoint whose folded norms average `mean_of_means` still need the
 /// `+1`?
 ///
@@ -1372,11 +1390,26 @@ pub fn load_block_from_hf(
     // folded norms lands on a ladder exactly 1.0 apart — raw HF ≈ 0.28,
     // already-folded MTPLX ≈ 1.28 — because that is what the difference IS.
     let norm_mean = mtp_norm_mean_of_means(&tensors);
-    let fold_plus_one = match std::env::var("LUMEN_MTP_NORM_PLUS_ONE").ok().as_deref() {
-        // Both old behaviours stay reachable for A/B.
-        Some("0") => false,
-        Some("1") => true,
-        _ => norm_mean.is_none_or(mtp_norms_need_plus_one),
+    let detected = norm_mean.is_none_or(mtp_norms_need_plus_one);
+    // Both old behaviours stay reachable for A/B. The vocabulary is the repo's,
+    // not this call site's: matching only `"0"`/`"1"` would read `=false` as
+    // "not 0, so detect" and `=off` the same way, which is the `=0`-means-on
+    // class of bug already in the red-green catalogue
+    // (`no-overlap-keyed-on-presence`).
+    let fold_plus_one = match std::env::var("LUMEN_MTP_NORM_PLUS_ONE") {
+        Err(_) => detected,
+        Ok(raw) => match raw.trim() {
+            "" => detected,
+            v if is_falsy(v) => false,
+            v if is_truthy(v) => true,
+            v => {
+                eprintln!(
+                    "[mtp-norm] LUMEN_MTP_NORM_PLUS_ONE={v:?} is neither on nor off — detecting \
+                     from the weights instead"
+                );
+                detected
+            }
+        },
     };
     match norm_mean {
         Some(m) => eprintln!(
@@ -2009,6 +2042,29 @@ mod norm_convention_tests {
     /// exists for: `pre_fc_norm_embedding` at mean -0.73 multiplies by a
     /// negative scale, which inverts signs and gives 0% accept. Unlike the
     /// double-fold this one is loud, and it must stay on the fold side.
+    /// Three states means the override cannot be parsed as "anything but 0".
+    ///
+    /// `=false` and `=off` must mean OFF, not "not the string 0, therefore
+    /// detect" — the `=0`-turned-it-on class of bug this repo already has a
+    /// red-green entry for. Unrecognised values fall back to detection, which
+    /// is the safe reading, and say so rather than deciding silently.
+    #[test]
+    fn the_override_speaks_the_repos_on_off_vocabulary() {
+        for v in ["0", "false", "FALSE", "Off", "no", " 0 "] {
+            assert!(super::is_falsy(v.trim()), "{v:?} must read as off");
+            assert!(!super::is_truthy(v.trim()), "{v:?} must not read as on");
+        }
+        for v in ["1", "true", "TRUE", "On", "yes", " 1 "] {
+            assert!(super::is_truthy(v.trim()), "{v:?} must read as on");
+            assert!(!super::is_falsy(v.trim()), "{v:?} must not read as off");
+        }
+        // Neither — these fall through to detection.
+        for v in ["auto", "detect", "2", ""] {
+            assert!(!super::is_falsy(v));
+            assert!(!super::is_truthy(v));
+        }
+    }
+
     #[test]
     fn negative_means_are_raw() {
         for m in [-0.73, -0.1, 0.0] {
