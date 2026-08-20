@@ -42,6 +42,27 @@ pub async fn handle(
     Ok(())
 }
 
+/// What `message_start` should report as `input_tokens`, and what is left over.
+///
+/// Anthropic names the prompt size exactly once, in the *first* event of the
+/// stream — before a single token has been decoded. Our engine only learns the
+/// figure at the same moment, so it sends it ahead of prefill as
+/// [`StreamEvent::Start`]; everything else arrives later and cannot be used
+/// here. The returned event is whatever showed up instead and must be handled
+/// by the caller's loop rather than dropped.
+///
+/// Falling back to `0` is deliberate: a stream that never sends `Start` (an
+/// error before decode, or a future backend that skips it) still gets a
+/// well-formed `message_start` instead of hanging on an event that may never
+/// come. `0` is what the field was hardcoded to for the whole life of this
+/// route, so the fallback is exactly the old behaviour and nothing worse.
+fn message_start_input_tokens(first: Option<StreamEvent>) -> (u32, Option<StreamEvent>) {
+    match first {
+        Some(StreamEvent::Start { prompt_tokens }) => (prompt_tokens, None),
+        other => (0, other),
+    }
+}
+
 /// Anthropic SSE streaming format:
 /// event: message_start → event: content_block_start → event: content_block_delta (×N)
 /// → event: content_block_stop → event: message_delta → event: message_stop
@@ -82,9 +103,23 @@ async fn handle_streaming(
             .as_secs()
     );
 
-    // message_start
+    // message_start — the one place Anthropic's format has for `input_tokens`,
+    // and it goes out before the first token. The engine sends `Start` as soon
+    // as it has counted the prompt (ahead of prefill), so waiting for it here
+    // costs a channel hop, not a generation.
+    //
+    // It used to be hardcoded `0` with a comment claiming the real figure was
+    // "surfaced in message_start above" — it was not, and an Anthropic SDK
+    // accumulating usage across the stream reported 0 input tokens for a
+    // 289-token tool prompt.
+    //
+    // Anything other than `Start` first (an immediate `Error`, or a backend
+    // that never learned to send it) is carried into the loop below and
+    // `message_start` goes out with `0` as before, rather than blocking the
+    // stream on an event that may never come.
+    let (input_tokens, mut carry) = message_start_input_tokens(token_rx.recv().await);
     let start = format!(
-        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":1}}}}}}\n\n"
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":1}}}}}}\n\n"
     );
     tcp.write_all(start.as_bytes()).await?;
 
@@ -110,7 +145,8 @@ async fn handle_streaming(
     // pattern. Static bytes — no allocation per send.
     let ping_event: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
 
-    let mut carry: Option<StreamEvent> = None;
+    // `carry` is already live from the `message_start` peek above — anything
+    // that arrived instead of `Start` is still unhandled and enters here.
     loop {
         let event_opt: Option<StreamEvent> = match carry.take() {
             Some(e) => Some(e),
@@ -129,6 +165,9 @@ async fn handle_streaming(
             None => break,
         };
         match event {
+            // Already consumed above; `message_start` is on the wire, so a
+            // second one has nowhere to go.
+            StreamEvent::Start { .. } => {}
             StreamEvent::Delta(text) => {
                 if !text_block_open {
                     tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
@@ -226,7 +265,14 @@ async fn handle_streaming(
 
                 tcp.write_all(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
                     .await?;
-                let _ = prompt_tokens; // surfaced in message_start above
+                // Anthropic's format reports `input_tokens` once, in
+                // `message_start`, and that is where it now goes — from the
+                // `Start` event, not from here. `Done` carries the same figure
+                // for the OpenAI route's benefit; on this path it is redundant.
+                debug_assert!(
+                    carry.is_some() || input_tokens == prompt_tokens,
+                    "message_start reported {input_tokens} input tokens, Done says {prompt_tokens}",
+                );
                 break;
             }
             // Relay it as an Anthropic `error` event rather than dropping it —
@@ -283,5 +329,38 @@ mod tests {
             .trim_end_matches("\n\n");
         let v: serde_json::Value = serde_json::from_str(json_part).unwrap();
         assert_eq!(v["delta"]["text"], "tab:\tnewline:\n\"quoted\"");
+    }
+
+    /// `message_start` must carry the real prompt size.
+    ///
+    /// It was hardcoded `0`, under a comment in the `Done` arm claiming the
+    /// figure was "surfaced in message_start above" — it never was. Measured on
+    /// Qwen3.8-27B: a 289-token tool prompt streamed to an Anthropic client
+    /// that accumulates usage across the stream, and the client's final message
+    /// said 0 input tokens. Unlike OpenAI, there is no later event to correct
+    /// it: the format states `input_tokens` once, first.
+    #[test]
+    fn message_start_reports_the_prompt_size_the_engine_measured() {
+        let (n, carry) =
+            message_start_input_tokens(Some(StreamEvent::Start { prompt_tokens: 289 }));
+        assert_eq!(n, 289, "the count the engine sent has to reach the wire");
+        assert!(carry.is_none(), "Start is consumed, not replayed");
+    }
+
+    /// A stream that opens with anything else still gets a well-formed
+    /// `message_start`, and the event is handed back rather than swallowed —
+    /// dropping it would lose an `Error` and truncate the stream in silence.
+    #[test]
+    fn a_stream_that_never_sends_start_still_opens_and_keeps_its_first_event() {
+        let (n, carry) = message_start_input_tokens(Some(StreamEvent::Delta("hello".to_string())));
+        assert_eq!(n, 0);
+        assert!(
+            matches!(carry, Some(StreamEvent::Delta(ref t)) if t == "hello"),
+            "the first event must survive into the main loop",
+        );
+
+        let (n, carry) = message_start_input_tokens(None);
+        assert_eq!(n, 0);
+        assert!(carry.is_none());
     }
 }

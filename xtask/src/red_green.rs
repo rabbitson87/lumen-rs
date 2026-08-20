@@ -289,6 +289,30 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "anthropic-stream-zero-input-tokens",
+        symptom: "the Anthropic streaming route reported `input_tokens: 0` for \
+                  every request. `message_start` is the one place the format \
+                  names the prompt size and it goes out before the first token, \
+                  so the field was hardcoded `0` — under a comment in the `Done` \
+                  arm claiming the real figure was \"surfaced in message_start \
+                  above\", which it never was. An SDK that accumulates usage \
+                  across the stream therefore billed a 289-token tool prompt as \
+                  0, and unlike OpenAI there is no later event to correct it. \
+                  Fixed by sending the count ahead of prefill as \
+                  `StreamEvent::Start`",
+        revert: &[Mutation {
+            path: SRV,
+            find: r#"        Some(StreamEvent::Start { prompt_tokens }) => (prompt_tokens, None),"#,
+            replace: r#"        Some(StreamEvent::Start { prompt_tokens }) => { let _ = prompt_tokens; (0, None) } // defect: hardcoded zero"#,
+        }],
+        guards: &[srv(
+            "routes::messages::tests::message_start_reports_the_prompt_size_the_engine_measured",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "undeclared-tool-name-forwarded",
         symptom: "a tool call named something the client never declared was \
                   forwarded verbatim, so the client looked up a function it does \
@@ -946,6 +970,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-choice-none")
         | (_, "anthropic-turn-images")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.

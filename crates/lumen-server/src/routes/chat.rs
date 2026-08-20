@@ -329,6 +329,11 @@ async fn handle_streaming(
             None => break,
         };
         match event {
+            // OpenAI carries usage in the *final* chunk, so the early count is
+            // nothing this route needs. It exists for Anthropic, whose
+            // `message_start` has to state `input_tokens` before the first
+            // token exists.
+            StreamEvent::Start { .. } => {}
             StreamEvent::Delta(text) => {
                 if stream_timing {
                     let now = std::time::Instant::now();

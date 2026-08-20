@@ -1893,6 +1893,11 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
+        // `message_start` carries `input_tokens` and goes out before the first
+        // token, so the count has to travel ahead of decode rather than with
+        // `Done`. Sent after the guard: a rejected request emits `error` and no
+        // `message_start` at all.
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -2942,6 +2947,15 @@ pub enum StreamEvent {
     /// Closes the tool-call envelope. OpenAI clients ignore this;
     /// Anthropic clients use it to emit `content_block_stop`.
     ToolCallStop { index: u32 },
+    /// The prompt has been counted; decode has not started yet.
+    ///
+    /// OpenAI reports usage in the *final* chunk, so `Done` is soon enough
+    /// there. Anthropic puts `input_tokens` in `message_start`, which is on the
+    /// wire before the first token — a count that only arrives with `Done` is
+    /// hours late by the format's own ordering, and the route was filling the
+    /// field with a hardcoded `0`. Emitted immediately after the count and
+    /// before prefill, so the wait costs nothing.
+    Start { prompt_tokens: u32 },
     /// Generation complete with token counts and a finish-reason hint.
     Done {
         prompt_tokens: u32,
