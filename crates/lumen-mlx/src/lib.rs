@@ -1592,7 +1592,12 @@ impl MlxBackend {
     /// but a 3.6 checkpoint must keep rendering byte-identically no matter what
     /// a client sends, and a 3.8 one should honour it without the operator
     /// setting anything. Gemma 4 has no such block, so it is always `None`.
-    fn resolved_effort(
+    ///
+    /// **Public because anything that renders or MEASURES a prompt has to ask
+    /// the same question.** The token counter used the raw `ov.reasoning_effort`
+    /// instead, and on a 3.5 checkpoint reported 54 `prompt_tokens` for a prompt
+    /// that really was 12 — the gate was right, the accounting was not.
+    pub fn resolved_effort(
         &self,
         ov: &crate::SamplingOverrides,
     ) -> Option<crate::chat_io::ReasoningEffort> {
@@ -7358,6 +7363,38 @@ mod tests {
             .expect("tool decode loop");
         let consumed = backend.scripted_tokens_consumed();
         (parsed, consumed)
+    }
+
+    /// A checkpoint that does not declare `reasoning_effort` must report `None`
+    /// no matter what the client asks for — and everything that renders OR
+    /// MEASURES a prompt has to go through here to get that answer.
+    ///
+    /// Found by running it, not by reading it: on Qwen3.5-9B, whose template has
+    /// no `reasoning_effort`, a `thinking: true` request prefilled **12** tokens
+    /// and reported **54**. The renderer asked this function and was right; the
+    /// token counter used the client's raw value and was not, so `usage` was
+    /// 4.5x over and the context guard was reading the same inflated figure.
+    #[test]
+    fn effort_is_gated_on_the_checkpoint_declaring_it() {
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("tokenizer");
+        let ov = SamplingOverrides {
+            reasoning_effort: Some(crate::chat_io::ReasoningEffort::Low),
+            ..Default::default()
+        };
+
+        // A 3.5 / 3.6 checkpoint: the level is dropped, whatever was asked.
+        let pre_38 = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer.clone(), 11);
+        assert!(!pre_38.wants_reasoning_effort);
+        assert_eq!(MlxBackend::Qwen35Family(pre_38).resolved_effort(&ov), None);
+
+        // A 3.8 checkpoint: honoured without the operator setting anything.
+        let mut v38 = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer, 11);
+        v38.wants_reasoning_effort = true;
+        assert_eq!(
+            MlxBackend::Qwen35Family(v38).resolved_effort(&ov),
+            Some(crate::chat_io::ReasoningEffort::Low)
+        );
     }
 
     /// The wiring, not the policy: `chat_with_tools_impl` must actually consult

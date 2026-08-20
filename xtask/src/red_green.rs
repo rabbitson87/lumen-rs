@@ -239,6 +239,30 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "effort-ungated-in-token-count",
+        symptom: "`usage.prompt_tokens` counted a reasoning-effort sentence the \
+                  prompt did not contain. The renderer asks `resolved_effort`, \
+                  which drops the level on a checkpoint whose chat template never \
+                  declares `reasoning_effort`; the token counter used the \
+                  client's raw `ov.reasoning_effort` instead. Measured on \
+                  Qwen3.5-9B: a `thinking: true` request prefilled 12 tokens and \
+                  reported 54, and `reasoning_effort: low` reported 42. The same \
+                  figure feeds the context guard, so a request near the limit \
+                  could be refused for tokens it never had. Found by driving a \
+                  real session, not by any gate",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            Self::Qwen35Family(m) if m.wants_reasoning_effort => ov.reasoning_effort,"#,
+            replace: r#"            Self::Qwen35Family(_) => ov.reasoning_effort, // defect: ungated"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::effort_is_gated_on_the_checkpoint_declaring_it",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "undeclared-tool-name-forwarded",
         symptom: "a tool call named something the client never declared was \
                   forwarded verbatim, so the client looked up a function it does \
@@ -885,7 +909,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
         (_, "gemma-nonstreaming-grammar")
         | (_, "qwen-first-token-mask")
-        | (_, "qwen-parallel-tool-calls-not-consulted") => "lib.rs",
+        | (_, "qwen-parallel-tool-calls-not-consulted")
+        | (_, "effort-ungated-in-token-count") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

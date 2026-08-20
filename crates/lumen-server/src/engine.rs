@@ -68,16 +68,28 @@ impl ModelBackend {
 
     /// Tokenize the chat-templated prompt for accurate `prompt_tokens`. Falls
     /// back to a `len/4` heuristic only if the backend errors during encode.
-    /// `effort` must match what the real request will render with, or the
-    /// count is short by the effort sentence (~40 tokens on Qwen 3.8).
+    ///
+    /// Takes the whole `SamplingOverrides` rather than a pre-extracted effort
+    /// **so that it cannot be handed a different one than the renderer uses**.
+    /// It was, and the earlier version of this comment named the hazard exactly
+    /// ("`effort` must match what the real request will render with") while all
+    /// six call sites passed the raw `ov.reasoning_effort`. On a checkpoint that
+    /// does not declare `reasoning_effort` the renderer correctly drops it and
+    /// the counter did not: measured on Qwen3.5-9B, a `thinking: true` request
+    /// prefilled 12 tokens and reported 54. Wrong usage, and the same figure
+    /// feeds the context guard, so a request near the limit could be rejected
+    /// for tokens it never had.
+    ///
+    /// Now there is one source: `resolved_effort`, the same call the decode
+    /// paths make.
     fn count_chat_prompt_tokens(
         &self,
         messages: &[(String, String)],
         thinking: bool,
-        effort: Option<lumen_mlx::chat_io::ReasoningEffort>,
+        ov: &lumen_mlx::SamplingOverrides,
     ) -> u32 {
         let res: Result<Vec<u32>> = match self {
-            Self::Mlx(m) => m.build_chat_input(messages, thinking, effort),
+            Self::Mlx(m) => m.build_chat_input(messages, thinking, m.resolved_effort(ov)),
         };
         match res {
             Ok(ids) => ids.len() as u32,
@@ -652,7 +664,7 @@ impl InferenceEngine {
         let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
             &messages,
             thinking_on,
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         ) + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
@@ -745,7 +757,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             thinking_on,
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         ) + image_tokens;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
@@ -968,7 +980,7 @@ impl InferenceEngine {
         let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
             &messages,
             anthropic_thinking,
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         );
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
 
@@ -1232,7 +1244,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1357,7 +1369,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1817,7 +1829,7 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            req.sampling_overrides().reasoning_effort,
+            &req.sampling_overrides(),
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
