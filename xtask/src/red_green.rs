@@ -263,6 +263,32 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "tool-schema-uncounted-in-usage",
+        symptom: "`usage.prompt_tokens` omitted the entire tool-schema block. \
+                  The counter rendered through the tool-free `build_chat_input` \
+                  while the request decoded through the tool-aware renderer, so \
+                  the error was zero at zero tools and grew with the client's \
+                  schema. Measured on Qwen3.8-27B with ONE tool declared: \
+                  OpenAI reported 39 prompt tokens against a 279-token prefill, \
+                  Anthropic 20 against 259 — 7x under. An agentic client \
+                  shipping thirty tools is billed for a fraction of its prompt, \
+                  and `guard_prompt_fits` admits on that same fraction, so a \
+                  prompt over the context cap passes the guard and fails deeper \
+                  in. Found by driving a real session; every gate was green",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
+                    .map(|(ids, _prefill)| ids)"#,
+            replace: r#"                { let _ = (tools, tool_choice); m.build_chat_input(messages, thinking, effort) } // defect: tool block uncounted"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_prompt_count_renders_the_tool_block_the_model_is_shown",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "undeclared-tool-name-forwarded",
         symptom: "a tool call named something the client never declared was \
                   forwarded verbatim, so the client looked up a function it does \
@@ -910,7 +936,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-nonstreaming-grammar")
         | (_, "qwen-first-token-mask")
         | (_, "qwen-parallel-tool-calls-not-consulted")
-        | (_, "effort-ungated-in-token-count") => "lib.rs",
+        | (_, "effort-ungated-in-token-count")
+        | (_, "tool-schema-uncounted-in-usage") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

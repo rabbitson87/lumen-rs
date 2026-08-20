@@ -1469,6 +1469,33 @@ pub(crate) mod imp {
             Ok(ids)
         }
 
+        /// The prompt the tool-aware decode paths actually prefill —
+        /// `tool_choice` prefill included, and the `None` choice already
+        /// stripped of tool definitions.
+        ///
+        /// [`Self::build_chat_input_with_tools`] stops one step short of that:
+        /// it renders the turns but not the `<|tool_call>` (+ `call:NAME{`)
+        /// suffix that `Required` / `Tool(name)` append. That is the right
+        /// answer for a renderer and the wrong one for a token count, which has
+        /// to match what the model was fed to the token.
+        pub fn build_chat_input_prefilled(
+            &self,
+            messages: &[(String, String)],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<Vec<u32>> {
+            self.build_prompt_and_prefill(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
+            .map(|(prompt, _prefill)| prompt)
+        }
+
         /// Like `build_chat_input_with_tools` but without the trailing
         /// `<start_of_turn>model\n` generation prompt (and the empty thought
         /// channel that gets appended when `thinking=false`). Used by

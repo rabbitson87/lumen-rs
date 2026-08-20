@@ -82,14 +82,37 @@ impl ModelBackend {
     ///
     /// Now there is one source: `resolved_effort`, the same call the decode
     /// paths make.
+    ///
+    /// The tool trio is here for the same reason. This used to render with no
+    /// tools at all, so every tool-bearing request reported the messages and
+    /// omitted the schema block that dominates the prompt — 39 tokens against a
+    /// 279-token prefill on Qwen3.8-27B. Take the same `tools` / `tool_choice` /
+    /// schema-presence the `chat*` call on this path is about to take, and the
+    /// count is the prefill.
+    ///
+    /// One approximation survives on purpose: a structured-history request
+    /// (prior `tool_calls`, `role:"tool"`) decodes from `ChatTurn`s while this
+    /// still counts the flattened `(role, content)` pairs. That gap is turn
+    /// framing — tens of tokens — where the one just closed was the entire tool
+    /// schema.
     fn count_chat_prompt_tokens(
         &self,
         messages: &[(String, String)],
         thinking: bool,
         ov: &lumen_mlx::SamplingOverrides,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        structured: bool,
     ) -> u32 {
         let res: Result<Vec<u32>> = match self {
-            Self::Mlx(m) => m.build_chat_input(messages, thinking, m.resolved_effort(ov)),
+            Self::Mlx(m) => m.build_chat_input_prefilled(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                structured,
+                m.resolved_effort(ov),
+            ),
         };
         match res {
             Ok(ids) => ids.len() as u32,
@@ -665,6 +688,9 @@ impl InferenceEngine {
             &messages,
             thinking_on,
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            req.response_json_schema().is_some(),
         ) + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
@@ -758,6 +784,9 @@ impl InferenceEngine {
             &messages,
             thinking_on,
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            req.response_json_schema().is_some(),
         ) + image_tokens;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
@@ -981,6 +1010,10 @@ impl InferenceEngine {
             &messages,
             anthropic_thinking,
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            // The Anthropic Messages API has no `response_format`.
+            false,
         );
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
 
@@ -1245,6 +1278,9 @@ impl InferenceEngine {
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            false,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1364,12 +1400,27 @@ impl InferenceEngine {
                 .unwrap_or(0)
         );
 
+        // Resolved here rather than just before the decode call because the
+        // token count below has to render the same tool block the model will be
+        // given; counting first and resolving after is how the schema block went
+        // unreported. Pure functions of `req`, so hoisting them is inert.
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+        // OpenAI `response_format` → JSON-schema constrained decoding
+        // (Gemma 4 only). `None` when absent / `text` → exact existing path.
+        let response_schema = req.response_json_schema();
+
         // Includes the image soft-token runs; this figure feeds both the
         // context guard below and the `usage` block at the end of the stream.
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            response_schema.is_some(),
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1407,14 +1458,6 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-
-        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
-        let tool_choice =
-            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
-        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
-        // OpenAI `response_format` → JSON-schema constrained decoding
-        // (Gemma 4 only). `None` when absent / `text` → exact existing path.
-        let response_schema = req.response_json_schema();
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -1826,10 +1869,20 @@ impl InferenceEngine {
             None
         };
 
+        // Hoisted above the count for the same reason as the OpenAI stream: the
+        // count has to render the tool block the model is about to be shown.
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
             &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            false,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1840,11 +1893,6 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-
-        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
-        let tool_choice =
-            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
-        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers

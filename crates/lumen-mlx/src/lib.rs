@@ -1733,6 +1733,51 @@ impl MlxBackend {
         }
     }
 
+    /// [`Self::build_chat_input`] rendered the way the request will actually be
+    /// prefilled — tool block, `tool_choice` prefill and `response_format`
+    /// reshaping included.
+    ///
+    /// The plain form is for callers that genuinely have no tools. Using it to
+    /// *count* a tool request silently drops the whole schema block, which is
+    /// most of the prompt: measured on Qwen3.8-27B, a one-tool request reported
+    /// 39 prompt tokens against a 279-token prefill, and the Anthropic path 20
+    /// against 259. That figure is both what the client is billed by and what
+    /// the context guard admits on, so it under-reports and over-admits in the
+    /// same breath.
+    ///
+    /// `structured` is the `response_format` schema's presence, and it is not a
+    /// rounding detail — the two families reshape in opposite directions. Qwen
+    /// routes to `chat_response_format`, which renders with **no tool block at
+    /// all**; Gemma keeps the tools and closes the thought channel instead.
+    /// Approximating it away would trade one family's error for the other's.
+    pub fn build_chat_input_prefilled(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        structured: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Qwen35Family(m) => {
+                if structured {
+                    // `chat_response_format` builds through
+                    // `build_response_format_input`, which is `build_chat_input`
+                    // for a text prompt — tools never reach the template.
+                    return m.build_chat_input(messages, thinking, effort);
+                }
+                m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
+                    .map(|(ids, _prefill)| ids)
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = effort;
+                m.build_chat_input_prefilled(messages, thinking, tools, tool_choice, structured)
+            }
+        }
+    }
+
     /// Prompt tokens the attached images will add on top of the rendered text.
     ///
     /// `build_chat_input` only sees `(role, content)` strings, so an image
@@ -5368,8 +5413,18 @@ impl MlxQwen35Backend {
             )?
         };
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        // `prompt=` is stated separately when the two differ, because they
+        // legitimately do: an active grammar holds the last prompt token back
+        // for a masked decode step, so the prefill is one short of the prompt
+        // the client is billed for. Without it the log reads like an off-by-one
+        // in `usage.prompt_tokens` every time `tool_choice` is `required`.
+        let held_back = if hold_back_last {
+            format!(" (prompt={}, 1 held for the masked step)", prompt_ids.len())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
+            "[mlx] seq {seq_id} prefill-tools: {} tokens{held_back} in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
             prefill_ids.len(),
             prefill_ids.len() as f64 / (prefill_ms / 1000.0)
         );
@@ -7394,6 +7449,100 @@ mod tests {
         assert_eq!(
             MlxBackend::Qwen35Family(v38).resolved_effort(&ov),
             Some(crate::chat_io::ReasoningEffort::Low)
+        );
+    }
+
+    /// `usage.prompt_tokens` has to count the tool block, because the model was
+    /// shown it.
+    ///
+    /// Measured on Qwen3.8-27B before this landed: a one-tool request reported
+    /// **39** prompt tokens against a **279**-token prefill, and the Anthropic
+    /// path 20 against 259. Neither renderer was wrong — the counter simply
+    /// called the tool-free one, so the error was zero at zero tools and grew
+    /// with the client's schema. An agentic client shipping thirty tools is
+    /// billed for a fraction of its prompt and admitted past a context guard
+    /// reading the same fraction.
+    ///
+    /// Three things are pinned here, and the middle one is the point: the count
+    /// is not merely *larger* with tools, it is byte-for-byte the sequence the
+    /// decode path prefills.
+    #[test]
+    fn the_prompt_count_renders_the_tool_block_the_model_is_shown() {
+        use crate::chat_io::{ResolvedToolChoice, ToolDef};
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("tokenizer");
+        let backend = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer, 11);
+        let msgs = vec![("user".to_string(), "weather?".to_string())];
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        });
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Current conditions for a city"),
+            parameters: Some(&params),
+            response: None,
+        }];
+
+        // What the decode path renders, taken from the decode path itself.
+        let (decode_ids, _prefill) = backend
+            .build_chat_input_with_tools(&msgs, false, &tools, &ResolvedToolChoice::Auto, None)
+            .expect("tool render");
+
+        let backend = MlxBackend::Qwen35Family(backend);
+        let bare = backend.build_chat_input(&msgs, false, None).expect("bare");
+        let counted = backend
+            .build_chat_input_prefilled(
+                &msgs,
+                false,
+                &tools,
+                &ResolvedToolChoice::Auto,
+                false,
+                None,
+            )
+            .expect("counted");
+
+        // Same messages either way, so every extra token is schema.
+        assert!(
+            counted.len() > bare.len() + 20,
+            "the tool block has to show up in the count: {} tools vs {} bare",
+            counted.len(),
+            bare.len(),
+        );
+        assert_eq!(
+            counted, decode_ids,
+            "the count must be the prefill, not an approximation of it",
+        );
+
+        // `Required` appends `<tool_call>\n<function=` to the prompt — tokens
+        // the model is fed, so tokens the client is told about.
+        let required = backend
+            .build_chat_input_prefilled(
+                &msgs,
+                false,
+                &tools,
+                &ResolvedToolChoice::Required,
+                false,
+                None,
+            )
+            .expect("required");
+        assert!(
+            required.len() > counted.len(),
+            "the tool_choice prefill is part of the prompt: {} required vs {} auto",
+            required.len(),
+            counted.len(),
+        );
+
+        // `response_format` routes Qwen through `chat_response_format`, which
+        // renders with no tool block at all. Counting the tools there would be
+        // the same defect with the sign flipped.
+        let structured = backend
+            .build_chat_input_prefilled(&msgs, false, &tools, &ResolvedToolChoice::Auto, true, None)
+            .expect("structured");
+        assert_eq!(
+            structured, bare,
+            "response_format drops the tool block on Qwen; the count has to drop it too",
         );
     }
 
