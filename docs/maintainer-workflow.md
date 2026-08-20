@@ -421,9 +421,21 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not) |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
+
+**Checking `usage.prompt_tokens` is honest.** Every prefill logs its own length
+(`prefill:` plain, `prefill-tools:`, `prefill-rf:`), so the invariant is
+readable from one request: the reported figure must equal that number. Two
+things make a *correct* server look wrong here. An active grammar
+(`tool_choice: required`) holds the last prompt token back for a masked decode
+step, so the line also states `prompt=N` — compare against that, not the prefill
+length. And a structured-history request still counts the flattened
+`(role, content)` pairs while decoding from `ChatTurn`s, which is a known
+turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
+figure feeds `guard_prompt_fits` as well as the client's bill, so it
+under-reports and over-admits together.
 
 The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
 are gone with the backend. GGUF has no MLX equivalent, so that capability was
