@@ -263,6 +263,30 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "mtp-drops-sampling-knobs",
+        symptom: "the MTP speculative path rebuilt its `SamplingConfig` from a \
+                  few scalars with `..default()`, silently dropping `top_k`, \
+                  `min_p` and every penalty. MTP auto-enables on a checkpoint \
+                  that ships an MTP head, so that was the LIVE decode path: \
+                  measured on Qwen3.8-27B, `top_k: 1` at temperature 1.5 \
+                  returned 3/3 distinct garbled replies instead of collapsing \
+                  to the argmax, and `repeat_penalty: 1.8` changed nothing at \
+                  all. Found immediately after wiring request temperature — \
+                  fixing the entry points was not enough, because the value \
+                  reached a second place that threw most of it away",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    (c.repeat_penalty - 1.0).abs() < 1e-6"#,
+            replace: r#"    true || (c.repeat_penalty - 1.0).abs() < 1e-6 // defect: penalties silently dropped"#,
+        }],
+        guards: &[mlx(
+            "tests::speculative_decode_refuses_sampling_it_cannot_reproduce",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "qwen-sampling-discarded",
         symptom: "`temperature` and `top_p` were accepted and ignored on the \
                   entire Qwen family — all four entry points on `MlxBackend` \
@@ -988,7 +1012,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parallel-tool-calls-not-consulted")
         | (_, "effort-ungated-in-token-count")
         | (_, "tool-schema-uncounted-in-usage")
-        | (_, "qwen-sampling-discarded") => "lib.rs",
+        | (_, "qwen-sampling-discarded")
+        | (_, "mtp-drops-sampling-knobs") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

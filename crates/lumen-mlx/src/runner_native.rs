@@ -2175,9 +2175,7 @@ mod imp {
             seq_id: u64,
             committed_token: u32,
             n_draft: usize,
-            temperature: f32,
-            top_p: f32,
-            seed: u64,
+            sampling: &lumen_core::sampling::SamplingConfig,
         ) -> Result<MtpStepOutput> {
             let model = self
                 .model
@@ -2198,9 +2196,7 @@ mod imp {
                     committed_token,
                     n_draft,
                     state.mtp_carried.take(),
-                    temperature,
-                    top_p,
-                    seed,
+                    sampling,
                 )
                 .with_context(|| {
                     format!("native mlx-rs runner: mtp_step orchestration (seq_id={seq_id})")

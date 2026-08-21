@@ -1024,14 +1024,10 @@ impl RunnerImpl {
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: u64,
+        sampling: &lumen_core::sampling::SamplingConfig,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         match self {
-            Self::Native(r) => {
-                r.mtp_step(seq_id, committed_token, n_draft, temperature, top_p, seed)
-            }
+            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, sampling),
             _ => Err(anyhow!(
                 "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
                  set LUMEN_MLX_BACKEND=native"
@@ -1198,6 +1194,35 @@ fn effective_qwen35_mtp_k() -> Option<usize> {
         Ok(_) => None,
         Err(_) => Some(k_env().unwrap_or(1)),
     }
+}
+
+/// Can the MTP speculative path serve this request's sampling policy?
+///
+/// `temperature`, `top_p`, `top_k` and `min_p` are functions of one position's
+/// logits, so the drafter and the verifier compute the same thing and Leviathan
+/// acceptance stays exact. The penalties are not: they depend on the tokens
+/// emitted *before* the position being sampled, and inside a speculative cycle
+/// each draft position has a different history depending on how many earlier
+/// drafts get accepted. Applying them with the wrong window would not merely
+/// weaken the penalty — it would make `p` and `q` disagree about what
+/// distribution they are, and the acceptance rule's guarantee that the committed
+/// stream is distributed as `p` depends on both being the real ones.
+///
+/// So a penalised request leaves the speculative path and decodes through the
+/// ordinary loop, where the window is exact. It costs the MTP speedup for that
+/// request and buys a correct answer, which is the right way round. The
+/// alternative shipped for a while and was worse than either: MTP rebuilt its
+/// config with `..default()`, so the penalty was silently *dropped* and the
+/// client got neither the speed-up cost nor the penalty.
+#[cfg(feature = "mlx-native")]
+fn mtp_sampling_is_supported(cfg: Option<&lumen_core::sampling::SamplingConfig>) -> bool {
+    let Some(c) = cfg else {
+        return true; // greedy — nothing to honour
+    };
+    (c.repeat_penalty - 1.0).abs() < 1e-6
+        && c.presence_penalty == 0.0
+        && c.frequency_penalty == 0.0
+        && c.dry.is_disabled()
 }
 
 /// Should prefill stop one token short so the first *generated* token can be
@@ -3521,12 +3546,10 @@ impl MlxQwen35Backend {
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
-        temperature: f32,
-        top_p: f32,
-        seed: u64,
+        sampling: &lumen_core::sampling::SamplingConfig,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         self.runner
-            .qwen35_mtp_step(seq_id, committed_token, n_draft, temperature, top_p, seed)
+            .qwen35_mtp_step(seq_id, committed_token, n_draft, sampling)
     }
 
     /// Env-driven MTP auto-enable hook called at the end of `load()`.
@@ -4960,6 +4983,7 @@ impl MlxQwen35Backend {
         #[cfg(feature = "mlx-native")]
         if !has_images
             && self.qwen35_mtp_enabled()
+            && mtp_sampling_is_supported(self.sampling.as_ref())
             && let Some(k) = effective_qwen35_mtp_k()
         {
             return self.chat_streaming_qwen35_mtp(
@@ -6609,18 +6633,19 @@ impl MlxQwen35Backend {
         // `temperature: 1.5` got greedy output and no error. The env vars stay
         // as an operator override for A/B measurement — that is what they were
         // added for — but they no longer decide the request's regime.
-        let (req_temp, req_topp, mtp_seed) = self
-            .sampling
-            .map(|c| (c.temperature, c.top_p, c.seed))
-            .unwrap_or((0.0, 1.0, 0));
-        let mtp_temp: f32 = std::env::var("LUMEN_MTP_TEMP")
+        let mut mtp_cfg = self.sampling.unwrap_or_default();
+        if let Some(t) = std::env::var("LUMEN_MTP_TEMP")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(req_temp);
-        let mtp_topp: f32 = std::env::var("LUMEN_MTP_TOPP")
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            mtp_cfg.temperature = t;
+        }
+        if let Some(p) = std::env::var("LUMEN_MTP_TOPP")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(req_topp);
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            mtp_cfg.top_p = p;
+        }
         let t_decode = std::time::Instant::now();
         let mut cycles: usize = 0;
         let mut accepted_total: usize = 0;
@@ -6629,7 +6654,7 @@ impl MlxQwen35Backend {
         while generated.len() < max_new_tokens && !stop {
             let t_cycle = std::time::Instant::now();
             let out = self
-                .qwen35_mtp_step(seq_id, last, k, mtp_temp, mtp_topp, mtp_seed)
+                .qwen35_mtp_step(seq_id, last, k, &mtp_cfg)
                 .with_context(|| {
                     format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
                 })?;
@@ -7761,6 +7786,84 @@ mod tests {
             0,
             "a seedless request must draw a fresh seed, not replay one stream",
         );
+    }
+
+    /// The speculative path may only serve sampling it can reproduce exactly.
+    ///
+    /// MTP used to rebuild its `SamplingConfig` from a few scalars with
+    /// `..default()`, which silently dropped `top_k`, `min_p` and every penalty
+    /// — and since MTP auto-enables on a checkpoint that ships an MTP head,
+    /// that was the live path. Measured on Qwen3.8-27B: `top_k: 1` at
+    /// temperature 1.5 returned 3/3 distinct garbled replies instead of
+    /// collapsing to the argmax, and `repeat_penalty: 1.8` changed nothing.
+    ///
+    /// Passing the whole struct fixes the position-independent knobs. The
+    /// penalties are different in kind: they depend on the tokens emitted
+    /// before the position being sampled, and inside a speculative cycle each
+    /// draft position has a different history depending on how many earlier
+    /// drafts were accepted. Getting that window wrong would not just weaken
+    /// the penalty, it would make `p` and `q` disagree about which distribution
+    /// they are — and Leviathan acceptance only guarantees the committed stream
+    /// is distributed as `p` when both are the real ones. So those requests
+    /// leave the speculative path instead.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn speculative_decode_refuses_sampling_it_cannot_reproduce() {
+        use lumen_core::sampling::SamplingConfig;
+
+        // Greedy and the position-independent knobs are all reproducible by the
+        // drafter, so they stay on the fast path.
+        assert!(mtp_sampling_is_supported(None), "greedy is fine");
+        for cfg in [
+            SamplingConfig {
+                temperature: 1.2,
+                ..Default::default()
+            },
+            SamplingConfig {
+                temperature: 1.0,
+                top_p: 0.9,
+                top_k: 40,
+                min_p: 0.05,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                mtp_sampling_is_supported(Some(&cfg)),
+                "temperature/top_p/top_k/min_p are per-position and must not \
+                 cost the speculative path",
+            );
+        }
+
+        // Each history-dependent penalty must take the request off it.
+        for (name, cfg) in [
+            (
+                "repeat_penalty",
+                SamplingConfig {
+                    repeat_penalty: 1.1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "presence_penalty",
+                SamplingConfig {
+                    presence_penalty: 0.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "frequency_penalty",
+                SamplingConfig {
+                    frequency_penalty: 0.5,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(
+                !mtp_sampling_is_supported(Some(&cfg)),
+                "{name} depends on emitted history, which a speculative cycle \
+                 cannot reproduce per draft position",
+            );
+        }
     }
 
     /// `usage.prompt_tokens` has to count the tool block, because the model was
