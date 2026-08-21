@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -917,6 +918,122 @@ fn apply_env(
     }
 }
 
+/// The exact environment [`ServerSupervisor::start`] would hand the server for
+/// this config, without spawning anything.
+///
+/// Exposed because "the server behaves the same when the app starts it" is a
+/// claim that needs checking, and the check cannot go through the button: a
+/// Tauri webview is not scriptable without an Accessibility grant, so the UI
+/// launch would otherwise be the one path nothing ever exercises. It is also
+/// two dozen variables wide, several of which change server decisions — this
+/// makes that surface enumerable instead of implied.
+pub fn launch_env(
+    cfg: &PersistentConfig,
+    model_id: &str,
+    active_model_bytes: Option<u64>,
+    image_model_id: Option<&str>,
+    serve: ServeKind,
+) -> BTreeMap<String, String> {
+    let mut cmd = Command::new("/usr/bin/true");
+    apply_env(
+        &mut cmd,
+        cfg,
+        model_id,
+        active_model_bytes,
+        image_model_id,
+        serve,
+    );
+    cmd.as_std()
+        .get_envs()
+        .filter_map(|(k, v)| {
+            Some((
+                k.to_string_lossy().into_owned(),
+                v?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod launch_env_tests {
+    use super::*;
+
+    /// The env a default-config UI launch hands the server.
+    fn ui_launch_env(model_id: &str) -> BTreeMap<String, String> {
+        launch_env(
+            &PersistentConfig::default(),
+            model_id,
+            None,
+            None,
+            ServeKind::Chat,
+        )
+    }
+
+    /// Starting the server from the desktop app is a materially wider launch
+    /// than `MODEL_ID=… lumen-server`: it sets two dozen variables the manual
+    /// one never does. Verifying behaviour only through the bare launch and
+    /// calling it "verified" would leave the path most users actually take
+    /// unexercised — and two of these variables change decisions that a
+    /// verification pass would otherwise attribute to the model.
+    ///
+    /// The load-bearing one is `LUMEN_PREFILL_CHUNK`. Its name says "chunk",
+    /// the CONTEXT card presents it as one, and the server *also* reads it as
+    /// the legacy fallback for the prompt-size reject cap
+    /// (`resolve_prompt_cap`: `LUMEN_MAX_PROMPT_TOKENS` → `LUMEN_PREFILL_CHUNK`
+    /// → 16384). The app never sets `LUMEN_MAX_PROMPT_TOKENS`, so the CONTEXT
+    /// card silently *is* the reject cap under a UI launch, at a different
+    /// value from the bare default. That is exactly the guard the tool-schema
+    /// count feeds, so it is pinned here rather than rediscovered.
+    #[test]
+    fn the_ui_launch_hands_the_server_a_different_prompt_cap_than_a_bare_one() {
+        let env = ui_launch_env("/models/Qwen3.8-27B-MTPLX-Speed");
+
+        assert_eq!(
+            env.get("MODEL_ID").map(String::as_str),
+            Some("/models/Qwen3.8-27B-MTPLX-Speed"),
+            "the resolved on-disk path is what reaches the server, not the HF id",
+        );
+
+        // The reject cap, arriving under a name that does not say so.
+        assert_eq!(
+            env.get("LUMEN_PREFILL_CHUNK").map(String::as_str),
+            Some("40960")
+        );
+        assert!(
+            !env.contains_key("LUMEN_MAX_PROMPT_TOKENS"),
+            "the app has no control for the clear name, which is why the legacy \
+             one is load-bearing",
+        );
+
+        // Speculative decoding is left OFF by the app at default, which is what
+        // lets the server's own MTP auto-enable fire — that auto-enable is
+        // gated on `LUMEN_SPEC` being unset, so an app that always set it would
+        // silently disable self-speculation for every UI user.
+        assert!(
+            !env.contains_key("LUMEN_SPEC"),
+            "spec_kind: Off must not emit LUMEN_SPEC, or auto-MTP never engages",
+        );
+        // Same shape: backend_mode Auto must leave the server's own family
+        // detection alone.
+        assert!(!env.contains_key("LUMEN_MLX_BACKEND"));
+    }
+
+    /// Every variable the app emits has to be one the server actually reads.
+    /// A typo here is invisible: the subprocess starts, ignores the unknown
+    /// name, and the UI control it belongs to does nothing at all — which is
+    /// how the `PAGED_*` vars survived the crate they configured being deleted.
+    #[test]
+    fn every_emitted_variable_is_declared_as_a_typed_key() {
+        let env = ui_launch_env("/models/x");
+        let typed: std::collections::BTreeSet<&str> = TYPED_ENV_KEYS.iter().copied().collect();
+        let stray: Vec<&String> = env.keys().filter(|k| !typed.contains(k.as_str())).collect();
+        assert!(
+            stray.is_empty(),
+            "emitted but not declared in TYPED_ENV_KEYS: {stray:?}",
+        );
+    }
+}
+
 /// The set of env var names that have dedicated typed UI controls. Used by
 /// the UI to flag `env_overrides` entries that shadow a typed field.
 pub const TYPED_ENV_KEYS: &[&str] = &[
@@ -939,6 +1056,12 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "TQ_BITS",
     "TQ_QJL_M",
     "TQ_SEED",
+    // The KV-quant card's two base controls. They were emitted but never
+    // declared, so `env_overrides` could shadow them with no warning — and
+    // overrides are applied last, so the card would silently stop working
+    // while still showing the user's chosen value.
+    "LUMEN_GEMMA4_QUANT_KV_MODE",
+    "LUMEN_GEMMA4_QUANT_KV_BITS",
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT",
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_BITS",
     "LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT_QJL",
