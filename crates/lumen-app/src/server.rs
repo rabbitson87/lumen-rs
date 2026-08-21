@@ -921,6 +921,12 @@ fn apply_env(
 /// The exact environment [`ServerSupervisor::start`] would hand the server for
 /// this config, without spawning anything.
 ///
+/// `dead_code` is allowed because this module is compiled **twice**: once into
+/// the lib (where `examples/ui_launch.rs` calls this — examples can only reach
+/// the public surface, which is why the lib exists at all) and once into the
+/// bin, via `main.rs`'s `mod server;`. The bin has no caller, and the lint is
+/// telling the truth about that copy.
+///
 /// Exposed because "the server behaves the same when the app starts it" is a
 /// claim that needs checking, and the launch is two dozen variables wide with
 /// several of them changing server decisions — this makes that surface
@@ -931,6 +937,7 @@ fn apply_env(
 /// grant, but posting a `CGEvent` to the HID tap is the same layer a physical
 /// mouse feeds and needs no grant. That is the real end-to-end check; this is
 /// the one that runs unattended.
+#[allow(dead_code)]
 pub fn launch_env(
     cfg: &PersistentConfig,
     model_id: &str,
