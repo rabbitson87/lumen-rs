@@ -922,11 +922,15 @@ fn apply_env(
 /// this config, without spawning anything.
 ///
 /// Exposed because "the server behaves the same when the app starts it" is a
-/// claim that needs checking, and the check cannot go through the button: a
-/// Tauri webview is not scriptable without an Accessibility grant, so the UI
-/// launch would otherwise be the one path nothing ever exercises. It is also
-/// two dozen variables wide, several of which change server decisions — this
-/// makes that surface enumerable instead of implied.
+/// claim that needs checking, and the launch is two dozen variables wide with
+/// several of them changing server decisions — this makes that surface
+/// enumerable instead of implied, and reachable from a test or a script.
+///
+/// The button itself *is* drivable, for the record: AppleScript UI scripting
+/// (`System Events … click at`) fails with `-25204` without an Accessibility
+/// grant, but posting a `CGEvent` to the HID tap is the same layer a physical
+/// mouse feeds and needs no grant. That is the real end-to-end check; this is
+/// the one that runs unattended.
 pub fn launch_env(
     cfg: &PersistentConfig,
     model_id: &str,

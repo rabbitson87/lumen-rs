@@ -8,11 +8,16 @@
 //! `LUMEN_PREFILL_CHUNK` doubles as the prompt-size reject cap, and an emitted
 //! `LUMEN_SPEC` would disable the server's own MTP auto-enable.
 //!
-//! None of that is reachable from a test that only drives the HTTP API, and the
-//! button itself is not scriptable: a Tauri webview needs an Accessibility
-//! grant to receive synthetic clicks. So this reproduces the launch exactly —
-//! same config source, same id resolution as `commands::start_server`, same
-//! `apply_env` — and either prints it or runs it.
+//! None of that is reachable from a test that only drives the HTTP API. This
+//! reproduces the launch exactly — same config source, same id resolution as
+//! `commands::start_server`, same `apply_env` — and either prints it or runs
+//! it, so the surface can be inspected without a display.
+//!
+//! It is not a substitute for pressing the button, which is drivable: posting a
+//! `CGEvent` to the HID tap clicks a Tauri webview with no Accessibility grant
+//! (AppleScript's `System Events … click at` is the one that needs it and fails
+//! with `-25204`). Do that when the question is whether the UI works; use this
+//! when the question is what the UI hands the server.
 //!
 //! ```text
 //! cargo run -p lumen-app --example ui_launch -- --model Qwen3.8      # print

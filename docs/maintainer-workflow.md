@@ -445,8 +445,13 @@ and sets ~22 more environment variables, and one of them is load-bearing here:
 and `LUMEN_MAX_PROMPT_TOKENS`, which it does not. So the UI silently launches
 with a different reject cap than a bare run.
 `cargo run -p lumen-app --example ui_launch -- --model <substring> [--run]`
-reproduces that launch exactly (a Tauri webview cannot be clicked without an
-Accessibility grant, so the button is not automatable). It refuses to launch a
+reproduces that launch exactly, without a display. To drive the real button,
+post a `CGEvent` to the HID tap (`CGEvent(mouseEventSource:...)` +
+`post(tap: .cghidEventTap)`, ~40 lines of Swift) — that is the layer a physical
+mouse feeds and needs no permission. AppleScript UI scripting
+(`System Events … click at`) is the one that requires an Accessibility grant and
+fails with `-25204`; a failure there is not evidence the UI is unautomatable.
+`ui_launch` refuses to launch a
 model the MODELS card would have greyed out — which is worth knowing before
 trusting any hand-verification: a local directory only appears in the UI when it
 is named `<org>--<repo>` matching a catalog id, so a hand-shortened download name
