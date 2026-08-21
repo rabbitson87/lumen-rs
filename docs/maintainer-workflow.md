@@ -418,7 +418,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | Path | Status | Validation evidence |
 |---|---|---|
 | `/v1/embeddings` (Qwen3-Embedding-0.6B MLX 8-bit) | ✅ validated | `embedding_parity` — worst per-item cosine 0.9988 vs the captured Candle reference, P@1 0.960 / MRR 0.980 identical, 2.20 ms/item warm (4.6× the Candle path it replaced) |
-| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
+| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
 | `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not) |
@@ -436,6 +436,13 @@ length. And a structured-history request still counts the flattened
 turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
 figure feeds `guard_prompt_fits` as well as the client's bill, so it
 under-reports and over-admits together.
+
+Check both families, and do not reason from one to the other. With a
+`response_format` schema *and* tools attached, Qwen renders **without the tool
+block** (it routes to `chat_response_format`) while Gemma keeps the tools and
+closes the thought channel instead — measured 19 tokens against 108 for the same
+request. A count that is right for one family by approximation is wrong for the
+other by more than it saved.
 
 The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
 are gone with the backend. GGUF has no MLX equivalent, so that capability was
