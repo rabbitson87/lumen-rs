@@ -437,6 +437,21 @@ turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
 figure feeds `guard_prompt_fits` as well as the client's bill, so it
 under-reports and over-admits together.
 
+Check it through the **desktop app's** launch too, not just
+`MODEL_ID=… lumen-server`. The app resolves the model id against the local scan
+and sets ~22 more environment variables, and one of them is load-bearing here:
+`LUMEN_PREFILL_CHUNK` is presented by the CONTEXT card as a chunk size and is
+*also* the legacy fallback for the prompt-size reject cap, which the app sets
+and `LUMEN_MAX_PROMPT_TOKENS`, which it does not. So the UI silently launches
+with a different reject cap than a bare run.
+`cargo run -p lumen-app --example ui_launch -- --model <substring> [--run]`
+reproduces that launch exactly (a Tauri webview cannot be clicked without an
+Accessibility grant, so the button is not automatable). It refuses to launch a
+model the MODELS card would have greyed out — which is worth knowing before
+trusting any hand-verification: a local directory only appears in the UI when it
+is named `<org>--<repo>` matching a catalog id, so a hand-shortened download name
+is invisible there while working perfectly from the command line.
+
 Check both families, and do not reason from one to the other. With a
 `response_format` schema *and* tools attached, Qwen renders **without the tool
 block** (it routes to `chat_response_format`) while Gemma keeps the tools and
