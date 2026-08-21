@@ -221,7 +221,7 @@ fn main() -> Result<()> {
 
     // Warmup cycle (drops JIT-compile + cache-grow on the MTP path).
     for _ in 0..warmup {
-        let w = qwen.qwen35_mtp_step(seq_b, last_b, k, 0.0, 1.0)?;
+        let w = qwen.qwen35_mtp_step(seq_b, last_b, k, 0.0, 1.0, 0)?;
         last_b = *w.committed.last().expect("warmup: non-empty commit");
     }
 
@@ -237,7 +237,7 @@ fn main() -> Result<()> {
     let mut mtp_tokens: Vec<u32> = Vec::new();
     while emitted < target_emit {
         let t0 = Instant::now();
-        let out = qwen.qwen35_mtp_step(seq_b, last_b, k, 0.0, 1.0)?;
+        let out = qwen.qwen35_mtp_step(seq_b, last_b, k, 0.0, 1.0, 0)?;
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
         cycle_ms.push(dt);
         accepted_total += out.n_accepted;

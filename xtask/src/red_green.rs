@@ -263,6 +263,32 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "qwen-sampling-discarded",
+        symptom: "`temperature` and `top_p` were accepted and ignored on the \
+                  entire Qwen family — all four entry points on `MlxBackend` \
+                  opened with `let _ = (top_p, temperature, ov)`, so decoding \
+                  was greedy whatever the client sent, and no error said so. \
+                  Measured on Qwen3.8-27B: `temperature: 1.5, top_p: 1.0` \
+                  returned byte-identical text 4/4, with MTP on AND off. The \
+                  doc comment above `chat` claimed the opposite (\"its sampling \
+                  is configured via REPEAT_PENALTY env and request-level \
+                  temperature\") — `REPEAT_PENALTY` was read nowhere on that \
+                  path either. It survived because every test and every \
+                  by-hand check ran at temperature 0, where correct and broken \
+                  emit the same bytes",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            temperature: temperature.max(0.0),"#,
+            replace: r#"            temperature: 0.0, // defect: request temperature discarded"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::a_request_asking_for_randomness_gets_a_sampler",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "tool-schema-uncounted-in-usage",
         symptom: "`usage.prompt_tokens` omitted the entire tool-schema block. \
                   The counter rendered through the tool-free `build_chat_input` \
@@ -961,7 +987,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-first-token-mask")
         | (_, "qwen-parallel-tool-calls-not-consulted")
         | (_, "effort-ungated-in-token-count")
-        | (_, "tool-schema-uncounted-in-usage") => "lib.rs",
+        | (_, "tool-schema-uncounted-in-usage")
+        | (_, "qwen-sampling-discarded") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

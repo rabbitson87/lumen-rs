@@ -421,7 +421,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not) |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache` |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
@@ -456,6 +456,14 @@ model the MODELS card would have greyed out — which is worth knowing before
 trusting any hand-verification: a local directory only appears in the UI when it
 is named `<org>--<repo>` matching a catalog id, so a hand-shortened download name
 is invisible there while working perfectly from the command line.
+
+**And check it at a non-zero temperature.** Two family-wide defects have now
+been found whose common property is that the broken and the correct code emit
+the same bytes under the conditions everything was tested at:
+`usage.prompt_tokens` omitted the tool block and was exact at zero tools, and
+`temperature` was discarded and was correct at zero temperature. A gate that
+only ever exercises the degenerate value cannot see either. When a knob has a
+value at which it does nothing, test the other values.
 
 Check both families, and do not reason from one to the other. With a
 `response_format` schema *and* tools attached, Qwen renders **without the tool

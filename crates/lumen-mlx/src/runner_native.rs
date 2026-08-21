@@ -1905,6 +1905,40 @@ mod imp {
             Ok((next_tok, state.position))
         }
 
+        /// [`Self::decode_step_masked`] with the final pick handed to the
+        /// caller instead of hardcoded to argmax.
+        ///
+        /// The forward, the KV advance and the linear-attn conv/SSM state
+        /// advance are identical to both siblings — only the choice of token
+        /// out of the host logit buffer differs, which is exactly the property
+        /// that lets sampling and a grammar mask compose in one callback
+        /// without either one touching the recurrent state.
+        pub(crate) fn decode_step_pick(
+            &mut self,
+            seq_id: u64,
+            last_token: u32,
+            pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
+        ) -> Result<(u32, usize)> {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
+            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: decode_step_pick on unknown seq_id {seq_id}")
+            })?;
+            let logits = model
+                .forward_with_opts(&[last_token], &mut state.cache, /* last_only */ true)
+                .with_context(|| {
+                    format!("native mlx-rs runner: sampled decode forward (seq_id={seq_id})")
+                })?;
+            let mut buf = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
+                .context("native mlx-rs runner: sampled decode last-logits-to-cpu failed")?;
+            let next_tok =
+                pick(&mut buf).context("native mlx-rs runner: sampler callback failed")?;
+            state.position += 1;
+            Ok((next_tok, state.position))
+        }
+
         pub(crate) fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
             self.seqs.remove(&seq_id);
             // Long-prompt repeated-request degradation fix: drop MLX's
@@ -2143,6 +2177,7 @@ mod imp {
             n_draft: usize,
             temperature: f32,
             top_p: f32,
+            seed: u64,
         ) -> Result<MtpStepOutput> {
             let model = self
                 .model
@@ -2165,6 +2200,7 @@ mod imp {
                     state.mtp_carried.take(),
                     temperature,
                     top_p,
+                    seed,
                 )
                 .with_context(|| {
                     format!("native mlx-rs runner: mtp_step orchestration (seq_id={seq_id})")

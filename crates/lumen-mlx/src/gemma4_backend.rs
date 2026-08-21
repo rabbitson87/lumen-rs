@@ -323,17 +323,7 @@ pub(crate) mod imp {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(64)
         });
-        let seed: u64 = ov.seed.unwrap_or_else(|| {
-            std::env::var("LUMEN_SAMPLE_SEED")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x9E3779B97F4A7C15)
-                })
-        });
+        let seed: u64 = crate::resolve_sampling_seed(ov);
         let cfg = SamplingConfig {
             temperature,
             top_p,

@@ -894,6 +894,25 @@ impl RunnerImpl {
         }
     }
 
+    /// [`Self::decode_step_masked`] with the pick handed to the caller — the
+    /// one primitive both sampling and "sampling under a grammar" are built
+    /// from. Native-only for the same reason the masked form is.
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_pick(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
+    ) -> Result<(u32, usize)> {
+        match self {
+            Self::Native(r) => r.decode_step_pick(seq_id, last_token, pick),
+            _ => Err(anyhow!(
+                "sampling is only supported on the native (mlx-rs) backend; \
+                 set LUMEN_MLX_BACKEND=native"
+            )),
+        }
+    }
+
     /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
     /// Phase 2 S3 wiring — see `qwen3_5_moe::mtp_step` for cycle semantics.
     #[cfg(feature = "mlx-native")]
@@ -1007,9 +1026,12 @@ impl RunnerImpl {
         n_draft: usize,
         temperature: f32,
         top_p: f32,
+        seed: u64,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         match self {
-            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, temperature, top_p),
+            Self::Native(r) => {
+                r.mtp_step(seq_id, committed_token, n_draft, temperature, top_p, seed)
+            }
             _ => Err(anyhow!(
                 "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
                  set LUMEN_MLX_BACKEND=native"
@@ -1852,7 +1874,11 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) takes precedence over tools — when a
                 // JSON schema is present, the whole assistant message is
                 // constrained to that schema (matching Gemma4's
@@ -2345,7 +2371,12 @@ impl MlxBackend {
         let effort = self.resolved_effort(ov);
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov, session_id);
+                let _ = session_id;
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — see flat
                 // `chat` path. The structured-history renderer is reused (no
                 // tools) so assistant.tool_calls / role:tool turns still render.
@@ -2467,7 +2498,11 @@ impl MlxBackend {
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — the whole
                 // assistant message is JSON-schema constrained and streamed as
                 // `BackendStreamEvent::Text` deltas (no tool demux).
@@ -2704,7 +2739,12 @@ impl MlxBackend {
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov, session_id);
+                let _ = session_id;
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — streamed as
                 // `BackendStreamEvent::Text` deltas; structured-history renderer
                 // reused with no tools.
@@ -2867,6 +2907,33 @@ fn detect_mlx_family(model_id: &str) -> MlxFamily {
     MlxFamily::Qwen35
 }
 
+/// The PRNG seed for one request: the client's `seed`, else `LUMEN_SAMPLE_SEED`,
+/// else the wall clock.
+///
+/// The wall-clock fallback is the load-bearing part. `Xorshift64::new` maps a
+/// zero seed to a fixed constant (a zero state would lock the generator), so a
+/// config that leaves `seed` at its `0` default does not sample *randomly* — it
+/// replays one fixed stream, and every request with the same prompt comes back
+/// byte-identical. That reads exactly like sampling being ignored, which is the
+/// bug this was written alongside.
+///
+/// Shared by both families so the precedence cannot drift apart: this is
+/// policy, and Qwen and Gemma answering `seed` differently would be a defect
+/// nobody would think to test for.
+pub(crate) fn resolve_sampling_seed(ov: &SamplingOverrides) -> u64 {
+    ov.seed.unwrap_or_else(|| {
+        std::env::var("LUMEN_SAMPLE_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E3779B97F4A7C15)
+            })
+    })
+}
+
 pub struct MlxQwen35Backend {
     runner: RunnerImpl,
     pub model_id: String,
@@ -2898,6 +2965,27 @@ pub struct MlxQwen35Backend {
     /// `NativeMlxRunner` (second model + its own seq/KV state).
     #[cfg(feature = "mlx-native")]
     draft: Option<DraftRunner>,
+    /// Sampling for the request currently being served. `None` is greedy and
+    /// is the state after every greedy request, so nothing leaks between them:
+    /// each entry point sets this unconditionally before decoding.
+    ///
+    /// It lives here rather than as a parameter because roughly ten decode
+    /// loops in this crate call [`Self::decode_step`], and every one of them
+    /// needs it. Threading it through all ten would be a large diff whose only
+    /// new behaviour is inside that one wrapper.
+    sampling: Option<lumen_core::sampling::SamplingConfig>,
+    /// Sampler PRNG. Reseeded from `SamplingConfig::seed` whenever sampling is
+    /// configured, so `seed` in the request means what clients expect: same
+    /// prompt + same seed → same tokens.
+    rng: lumen_core::sampling::Xorshift64,
+    /// Recently generated tokens per sequence, for the repeat / presence /
+    /// frequency penalties — which are functions of history that the decode
+    /// loops own and `decode_step` cannot see.
+    ///
+    /// Keyed by `seq_id` rather than kept as one window because the
+    /// speculative-decode paths run a draft sequence and the main sequence
+    /// through the same wrapper, and a shared window would blend the two.
+    recent: std::collections::HashMap<u64, std::collections::VecDeque<u32>>,
 }
 
 /// Isolated draft model + its resolved config for greedy spec decode.
@@ -2953,6 +3041,9 @@ impl MlxQwen35Backend {
             wants_reasoning_effort: false,
             #[cfg(feature = "mlx-native")]
             draft: None,
+            sampling: None,
+            rng: lumen_core::sampling::Xorshift64::new(0),
+            recent: std::collections::HashMap::new(),
         }
     }
 
@@ -3065,6 +3156,9 @@ impl MlxQwen35Backend {
             wants_reasoning_effort,
             #[cfg(feature = "mlx-native")]
             draft: None,
+            sampling: None,
+            rng: lumen_core::sampling::Xorshift64::new(0),
+            recent: std::collections::HashMap::new(),
         };
         // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
         // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
@@ -3087,6 +3181,103 @@ impl MlxQwen35Backend {
 
     pub fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         self.runner.prefill(seq_id, tokens)
+    }
+
+    /// Translate a request's sampling knobs into a Qwen [`SamplingConfig`],
+    /// or `None` when the result would be greedy.
+    ///
+    /// Qwen gets its own builder rather than sharing Gemma's because Gemma's
+    /// rewrites an incoming `0.7` to `1.0` — the server's serde default is 0.7,
+    /// so Gemma reads that exact value as "the client said nothing" and
+    /// substitutes what Gemma wants. Its own comment records why that must not
+    /// be copied here: *"1.0 is too hot for Qwen"*. So 0.7 means 0.7.
+    ///
+    /// Returning `None` for the greedy case is what keeps every existing
+    /// output bit-identical: the caller then runs the untouched argmax path
+    /// rather than a sampler that would merely be *equivalent* to argmax.
+    pub(crate) fn qwen_sampling_config(
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+    ) -> Option<lumen_core::sampling::SamplingConfig> {
+        use lumen_core::sampling::SamplingConfig;
+        let cfg = SamplingConfig {
+            temperature: temperature.max(0.0),
+            top_p: if (0.0..1.0).contains(&top_p) && top_p > 0.0 {
+                top_p
+            } else {
+                1.0
+            },
+            top_k: ov.top_k.unwrap_or(0),
+            min_p: ov.min_p.unwrap_or(0.0),
+            repeat_penalty: ov.repeat_penalty.unwrap_or(1.0),
+            presence_penalty: ov.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: ov.frequency_penalty.unwrap_or(0.0),
+            seed: resolve_sampling_seed(ov),
+            ..SamplingConfig::default()
+        };
+        if cfg.is_greedy() { None } else { Some(cfg) }
+    }
+
+    /// Install the sampling policy for the request about to be decoded.
+    ///
+    /// Called unconditionally by every entry point, including with `None`, so a
+    /// greedy request can never inherit the previous request's temperature.
+    pub fn set_sampling(&mut self, cfg: Option<lumen_core::sampling::SamplingConfig>) {
+        self.rng = lumen_core::sampling::Xorshift64::new(cfg.as_ref().map(|c| c.seed).unwrap_or(0));
+        self.recent.clear();
+        self.sampling = cfg;
+    }
+
+    /// One decode step under a grammar, sampled when the request asked for it.
+    ///
+    /// Mask first, then sample from what survives — so a constrained turn is
+    /// still a *sampled* turn. Leaving this greedy would have made
+    /// `temperature` silently inert for exactly the requests that use tools or
+    /// `response_format`, which is most agentic traffic.
+    ///
+    /// With no sampling policy it is the untouched masked-argmax call.
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_grammar(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        g: &mut crate::grammar::Gemma4GrammarState,
+    ) -> Result<(u32, usize)> {
+        if let Some(cfg) = self.sampling {
+            use lumen_core::sampling::{sample_distribution, sampling_distribution};
+            let Self {
+                runner,
+                rng,
+                recent,
+                ..
+            } = self;
+            let history: Vec<u32> = recent
+                .get(&seq_id)
+                .map(|w| w.iter().copied().collect())
+                .unwrap_or_default();
+            let mut chosen = 0u32;
+            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
+                g.apply_mask_to_logits(buf)?;
+                let probs = sampling_distribution(buf, &history, &cfg);
+                chosen = sample_distribution(&probs, rng);
+                Ok(chosen)
+            })?;
+            self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
+            return Ok(out);
+        }
+        let mut mask = |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
+        self.runner
+            .decode_step_masked(seq_id, last_token, &mut mask)
+    }
+
+    /// Record a sampled token in this sequence's penalty window.
+    fn note_sampled(&mut self, seq_id: u64, tok: u32, keep: usize) {
+        let window = self.recent.entry(seq_id).or_default();
+        window.push_back(tok);
+        while window.len() > keep.max(1) {
+            window.pop_front();
+        }
     }
 
     /// Prompt tokens one attached image adds — its merged-token run plus the
@@ -3116,12 +3307,43 @@ impl MlxQwen35Backend {
         self.runner.prefill_with_images(seq_id, tokens, images)
     }
 
+    /// One decode step, sampled when the request asked for it.
+    ///
+    /// With no sampling policy this is the untouched call it always was —
+    /// which is the point: greedy output stays bit-identical rather than
+    /// merely equivalent, so every existing test and every recorded
+    /// measurement still describes the same bytes.
     pub fn decode_step(
         &mut self,
         seq_id: u64,
         last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)> {
+        #[cfg(feature = "mlx-native")]
+        if let Some(cfg) = self.sampling {
+            use lumen_core::sampling::{sample_distribution, sampling_distribution};
+            // Destructured so the borrow checker sees `runner` and `rng` as the
+            // disjoint fields they are — the closure needs `rng` while the call
+            // needs `runner`.
+            let Self {
+                runner,
+                rng,
+                recent,
+                ..
+            } = self;
+            let history: Vec<u32> = recent
+                .get(&seq_id)
+                .map(|w| w.iter().copied().collect())
+                .unwrap_or_default();
+            let mut chosen = 0u32;
+            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
+                let probs = sampling_distribution(buf, &history, &cfg);
+                chosen = sample_distribution(&probs, rng);
+                Ok(chosen)
+            })?;
+            self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
+            return Ok(out);
+        }
         self.runner.decode_step(seq_id, last_token, position)
     }
 
@@ -3301,9 +3523,10 @@ impl MlxQwen35Backend {
         n_draft: usize,
         temperature: f32,
         top_p: f32,
+        seed: u64,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         self.runner
-            .qwen35_mtp_step(seq_id, committed_token, n_draft, temperature, top_p)
+            .qwen35_mtp_step(seq_id, committed_token, n_draft, temperature, top_p, seed)
     }
 
     /// Env-driven MTP auto-enable hook called at the end of `load()`.
@@ -4359,9 +4582,7 @@ impl MlxQwen35Backend {
             let final_tok = prompt_ids[split];
             let stepped = {
                 let g = grammar.as_mut().expect("grammar active implies Some");
-                let mut mask =
-                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
-                self.runner.decode_step_masked(seq_id, final_tok, &mut mask)
+                self.decode_step_grammar(seq_id, final_tok, g)
             };
             let (n, p) = stepped?;
             last = n;
@@ -4439,10 +4660,7 @@ impl MlxQwen35Backend {
                 {
                     let stepped = {
                         let g = grammar.as_mut().expect("grammar_active implies Some");
-                        let mut mask = |buf: &mut [f32]| -> Result<()> {
-                            g.apply_mask_to_logits(buf).map(|_| ())
-                        };
-                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                        self.decode_step_grammar(seq_id, last, g)
                     };
                     let (next, new_pos) = stepped?;
                     let observe_err = grammar.as_mut().and_then(|g| g.observe(next).err());
@@ -5469,9 +5687,7 @@ impl MlxQwen35Backend {
                 let g = grammar
                     .as_mut()
                     .expect("hold_back_last implies an active grammar");
-                let mut mask =
-                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
-                self.runner.decode_step_masked(seq_id, held, &mut mask)
+                self.decode_step_grammar(seq_id, held, g)
             };
             match stepped {
                 Ok((next, new_pos)) => {
@@ -5637,10 +5853,7 @@ impl MlxQwen35Backend {
                     // None` reassignment.
                     let stepped = {
                         let g = grammar.as_mut().expect("grammar_active implies Some");
-                        let mut mask = |buf: &mut [f32]| -> Result<()> {
-                            g.apply_mask_to_logits(buf).map(|_| ())
-                        };
-                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                        self.decode_step_grammar(seq_id, last, g)
                     };
                     let (next, new_pos) = stepped?;
                     // Advance the matcher with the sampled token. A desync here
@@ -6385,18 +6598,29 @@ impl MlxQwen35Backend {
             return Ok(out);
         }
 
-        // MTP acceptance regime. Default greedy (temp 0 = exact argmax-match,
-        // lossless). `LUMEN_MTP_TEMP>0` switches to Leviathan rejection
-        // sampling (accept min(1,p/q) + residual) so accept rate rises toward
-        // the sampling regime; `LUMEN_MTP_TOPP` sets the nucleus.
+        // MTP acceptance regime. Greedy (temp 0) is exact argmax-match and
+        // lossless; `temperature > 0` switches to Leviathan rejection sampling
+        // (accept `min(1,p/q)` + residual), which keeps the committed stream a
+        // valid sample at that temperature.
+        //
+        // The request's temperature is the default, taken from the sampling
+        // policy the entry point installed. It used to read `LUMEN_MTP_TEMP`
+        // alone and default to 0.0, which meant a client asking for
+        // `temperature: 1.5` got greedy output and no error. The env vars stay
+        // as an operator override for A/B measurement — that is what they were
+        // added for — but they no longer decide the request's regime.
+        let (req_temp, req_topp, mtp_seed) = self
+            .sampling
+            .map(|c| (c.temperature, c.top_p, c.seed))
+            .unwrap_or((0.0, 1.0, 0));
         let mtp_temp: f32 = std::env::var("LUMEN_MTP_TEMP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(req_temp);
         let mtp_topp: f32 = std::env::var("LUMEN_MTP_TOPP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(req_topp);
         let t_decode = std::time::Instant::now();
         let mut cycles: usize = 0;
         let mut accepted_total: usize = 0;
@@ -6405,7 +6629,7 @@ impl MlxQwen35Backend {
         while generated.len() < max_new_tokens && !stop {
             let t_cycle = std::time::Instant::now();
             let out = self
-                .qwen35_mtp_step(seq_id, last, k, mtp_temp, mtp_topp)
+                .qwen35_mtp_step(seq_id, last, k, mtp_temp, mtp_topp, mtp_seed)
                 .with_context(|| {
                     format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
                 })?;
@@ -7449,6 +7673,93 @@ mod tests {
         assert_eq!(
             MlxBackend::Qwen35Family(v38).resolved_effort(&ov),
             Some(crate::chat_io::ReasoningEffort::Low)
+        );
+    }
+
+    /// A request that asks for randomness has to get a sampler.
+    ///
+    /// `temperature` and `top_p` were accepted and discarded on the entire Qwen
+    /// family — `MlxBackend::chat` and its three siblings each opened with
+    /// `let _ = (top_p, temperature, ov)`, so decoding was greedy no matter what
+    /// the client sent, with no error. Measured on Qwen3.8-27B before the fix:
+    /// `temperature: 1.5, top_p: 1.0` returned byte-identical text 4/4, with MTP
+    /// both on and off.
+    ///
+    /// It hid because every test and every by-hand check ran at
+    /// `temperature: 0`, where correct and broken produce the same bytes. So
+    /// this pins both directions: greedy must stay `None` (the untouched argmax
+    /// path, bit-identical), and anything else must produce a config.
+    #[test]
+    fn a_request_asking_for_randomness_gets_a_sampler() {
+        use crate::SamplingOverrides;
+        let plain = SamplingOverrides::default();
+
+        // Greedy stays greedy — `None` routes to the original argmax call, so
+        // existing outputs are unchanged rather than merely equivalent.
+        assert!(
+            MlxQwen35Backend::qwen_sampling_config(0.0, 1.0, &plain).is_none(),
+            "temperature 0 must not build a sampler",
+        );
+
+        let hot = MlxQwen35Backend::qwen_sampling_config(1.5, 0.9, &plain)
+            .expect("temperature 1.5 must sample");
+        assert_eq!(hot.temperature, 1.5);
+        assert_eq!(hot.top_p, 0.9);
+        assert!(!hot.is_greedy());
+
+        // top_p alone is not randomness: nucleus filtering with temperature 0
+        // still leaves the argmax on top, so it must not silently turn a greedy
+        // request into a sampled one.
+        assert!(
+            MlxQwen35Backend::qwen_sampling_config(0.0, 0.5, &plain).is_none(),
+            "top_p without temperature is still greedy",
+        );
+
+        // A penalty IS a behaviour change at temperature 0 — it can move the
+        // argmax — so it has to build a config even though nothing is random.
+        let penalised = MlxQwen35Backend::qwen_sampling_config(
+            0.0,
+            1.0,
+            &SamplingOverrides {
+                repeat_penalty: Some(1.1),
+                ..Default::default()
+            },
+        )
+        .expect("a repeat penalty changes the output, so it must be applied");
+        assert_eq!(penalised.temperature, 0.0);
+
+        // Qwen must NOT inherit Gemma's 0.7 → 1.0 substitution; Gemma's own
+        // comment says 1.0 is too hot here.
+        let default_temp =
+            MlxQwen35Backend::qwen_sampling_config(0.7, 1.0, &plain).expect("0.7 samples");
+        assert_eq!(
+            default_temp.temperature, 0.7,
+            "0.7 means 0.7 on Qwen, not Gemma's substituted 1.0",
+        );
+
+        // `seed` has to reach the config or reproducible sampling is a lie.
+        let seeded = MlxQwen35Backend::qwen_sampling_config(
+            1.0,
+            1.0,
+            &SamplingOverrides {
+                seed: Some(12345),
+                ..Default::default()
+            },
+        )
+        .expect("seeded request samples");
+        assert_eq!(seeded.seed, 12345);
+
+        // And a request that names no seed must not land on the degenerate one.
+        // `Xorshift64::new(0)` substitutes a fixed constant rather than locking
+        // at zero, so a `seed: 0` default samples *the same stream every time* —
+        // measured: `temperature: 1.5` gave 4/4 byte-identical replies, which
+        // looks exactly like sampling still being ignored.
+        assert_ne!(
+            MlxQwen35Backend::qwen_sampling_config(1.0, 1.0, &plain)
+                .expect("samples")
+                .seed,
+            0,
+            "a seedless request must draw a fresh seed, not replay one stream",
         );
     }
 

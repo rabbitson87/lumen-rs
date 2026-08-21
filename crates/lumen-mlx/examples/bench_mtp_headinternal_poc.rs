@@ -197,7 +197,7 @@ fn main() -> Result<()> {
         let (mut last, _) = qwen.prefill(seq, cp)?;
         let mut emitted = 0usize;
         while emitted < per {
-            let out = qwen.qwen35_mtp_step(seq, last, k, 0.0, 1.0)?;
+            let out = qwen.qwen35_mtp_step(seq, last, k, 0.0, 1.0, 0)?;
             emitted += out.committed.len();
             last = *out.committed.last().expect("commit non-empty");
         }

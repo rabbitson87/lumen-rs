@@ -4375,6 +4375,7 @@ mod imp {
             carried_hidden: Option<Array>,
             temperature: f32,
             top_p: f32,
+            seed: u64,
         ) -> Result<MtpStepOutput> {
             if n_draft == 0 {
                 return Err(anyhow!("mtp_step: n_draft must be >= 1"));
@@ -4390,6 +4391,10 @@ mod imp {
             let cfg = SamplingConfig {
                 temperature,
                 top_p: if top_p > 0.0 { top_p } else { 1.0 },
+                // Carried from the request. Left at the `0` default this
+                // silently replays one fixed stream every call, which reads as
+                // "sampling is ignored" from outside.
+                seed,
                 ..SamplingConfig::default()
             };
             // 1-forward restructure (MTPLX-style): drop the per-cycle Step-A
