@@ -1297,12 +1297,32 @@ pub struct AnthropicResponse {
     pub usage: AnthropicUsage,
 }
 
+/// What we put in a `thinking` block's `signature`.
+///
+/// Anthropic signs its thinking blocks so the trace can be verified when the
+/// client replays it. We have no key and nothing to verify against, but the
+/// field is not optional in the SDK types (`ThinkingBlock.signature: str`), so
+/// omitting it would make a strict client fail to parse a response it otherwise
+/// understands. A short, obviously-not-base64 constant says what it is and
+/// cannot be mistaken for a real signature — and if someone replays one of our
+/// blocks to the actual Anthropic API, being rejected is the correct outcome.
+///
+/// The input side accepts any signature and ignores it, so this round-trips.
+pub const LUMEN_THINKING_SIGNATURE: &str = "lumen-unsigned";
+
 /// One block in an Anthropic response's `content[]`. Mirrors the request-side
 /// `AnthropicContentBlock` for the variants the server actually emits — we
 /// never emit `tool_result` (that's a client-side message back to us).
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicResponseBlock {
+    /// Extended-thinking trace. Per the Messages API this comes **first** in
+    /// `content[]`, ahead of any text or tool_use, and is only present when the
+    /// request enabled thinking.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     Text {
         text: String,
     },
@@ -1311,6 +1331,16 @@ pub enum AnthropicResponseBlock {
         name: String,
         input: serde_json::Value,
     },
+}
+
+impl AnthropicResponseBlock {
+    /// A thinking block carrying our own (unverifiable) signature.
+    pub fn thinking(trace: impl Into<String>) -> Self {
+        Self::Thinking {
+            thinking: trace.into(),
+            signature: LUMEN_THINKING_SIGNATURE.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2410,6 +2440,30 @@ mod reasoning_round_trip {
         }))
         .expect("redacted blocks must not fail the request");
         assert_eq!(m.content.as_text(), "42");
+    }
+
+    /// The loop, closed: our own response block, parsed back as a request.
+    ///
+    /// The two sides are separate types (`AnthropicResponseBlock` is emit-only),
+    /// so nothing but a test makes them agree. This is the property the whole
+    /// round-trip rests on — a client that echoes our `content[]` back has to
+    /// produce a prompt carrying the trace, or the KV cannot be extended.
+    #[test]
+    fn an_anthropic_thinking_block_we_emitted_parses_back_as_one_we_accept() {
+        let emitted = AnthropicResponseBlock::thinking("six times seven");
+        let wire = serde_json::to_value(&emitted).expect("serializes");
+        assert_eq!(wire["type"], "thinking");
+
+        let replayed: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [wire, {"type": "text", "text": "42"}],
+        }))
+        .expect("our own output must be valid input");
+        assert_eq!(
+            replayed.content.as_text(),
+            "<think>\nsix times seven\n</think>\n\n42",
+            "the trace has to reach the renderer, not merely survive the parse"
+        );
     }
 
     #[test]

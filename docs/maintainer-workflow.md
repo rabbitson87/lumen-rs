@@ -421,7 +421,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and an Anthropic turn replaying a `thinking` block is answered rather than rejected |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and the Anthropic trace round-trips in both directions — a replayed `thinking` block is answered rather than rejected, and our own `content[]` handed straight back reuses KV (`reuse cached=321 suffix=15` / 283 ms streaming and not, against `divergent` → 2237 ms when the block is dropped), with the SSE indices coming out `thinking@0, text@1, tool_use@2` |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
@@ -478,6 +478,31 @@ Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope insid
 `content` (ours again, under `LUMEN_REASONING_IN_CONTENT=1`). They are folded to
 one representation in `ChatMessage`'s `Deserialize` so the renderers, the
 prefix-cache key and the token count cannot each decide separately.
+
+**A round trip has two halves, and the second one is easy to declare done.**
+Accepting a `thinking` block on input made an Anthropic conversation *able* to
+carry its trace; it did not make one carry it, because the route emitted no
+thinking block for a client to replay. Check the loop with the client's own
+output, not with a hand-written message: take `content[]` off turn 1, put it back
+verbatim as the assistant turn, and read the prefill log. And measure the
+negative arm in the same run — the same conversation with the block stripped —
+or "it reused KV" is an assertion about one number.
+
+**When a wire format identifies things by position, give the positions an
+owner.** Anthropic streams every delta with an index into the final `content[]`.
+Those indices were hardcoded (text pinned to `0`, tools from `1`), which is
+correct exactly until something can precede the text. A misindexed delta is still
+well-formed JSON, so the failure is a client silently assembling one block's
+bytes into another — nothing errors. The loop wrote straight to a socket and so
+could not be tested at all; `BlockStream` writes frames into a buffer instead,
+which is what let the ordering become an assertion.
+
+**Surfaces that share a backend do not share coverage.** The same turn streamed
+`thinking@0, text@1` without tools and `text@0, tool_use@1` with them, because
+the tool-aware parser accumulated the trace for `finish()` and never emitted it
+as it arrived. Non-streaming was right, streaming was empty, and the agentic path
+was the broken one. Whenever a value is both accumulated and streamed, check that
+the two agree — a test that only reads `finish()` cannot see the difference.
 
 **A parser that starts at the beginning of the output is not at the beginning of
 the turn.** Qwen's generation prompt ends *inside* the thinking block

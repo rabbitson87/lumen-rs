@@ -424,6 +424,88 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "anthropic-output-drops-thinking-block",
+        symptom: "the Anthropic route emitted no `thinking` content block, on \
+                  either surface — the non-streaming assembler simply never \
+                  built one, and the SSE loop discarded `ReasoningDelta` under \
+                  a comment saying proper wiring was 'deferred'. So an \
+                  Anthropic client could not see the trace, and — the part that \
+                  costs something — could not hand it back, which is what a \
+                  thinking-enabled conversation needs to extend its KV instead \
+                  of re-prefilling every turn. Measured on Qwen3.8-27B once the \
+                  block existed: a client echoing our own `content[]` back gets \
+                  `reuse cached=321 suffix=15` in 283 ms where one that drops \
+                  the block gets `divergent prompt` and a 2237 ms re-prefill. \
+                  Gated on the request's own thinking flag, which on this API \
+                  is the client's alone, so a caller that never opted in sees \
+                  exactly the `content[]` it saw before",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    if emit_thinking && !reasoning.is_empty() {",
+            replace: "    if false && !reasoning.is_empty() { // defect: the trace is dropped",
+        }],
+        guards: &[srv(
+            "engine::anthropic_thinking_blocks::the_trace_comes_first_then_text_then_tools",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-stream-block-indices-pinned",
+        symptom: "Anthropic identifies every streaming delta by its index into \
+                  the final `content[]`, and the SSE loop hardcoded them: text \
+                  was pinned to `index:0` by a `const` prefix and tool blocks \
+                  started at 1. That was correct only while nothing could \
+                  precede the text — a `thinking` block ahead of it shifts every \
+                  later index by one, and a delta carrying the wrong index is \
+                  still well-formed JSON, so the failure is a client quietly \
+                  assembling one block's bytes into another. Fixed by giving the \
+                  indices an owner (`BlockStream`) that emits the block \
+                  lifecycle frames and can be read back by a test, which the \
+                  loop writing straight to a socket could not be",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        self.next_index = idx.saturating_add(1);",
+            replace: "        self.next_index = 0; // defect: every block claims index 0",
+        }],
+        guards: &[
+            srv(
+                "routes::messages::tests::a_thinking_block_takes_index_zero_and_pushes_the_rest_along",
+            ),
+            srv(
+                "routes::messages::tests::without_a_trace_text_is_still_index_zero_and_tools_start_at_one",
+            ),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-tool-stream-drops-the-trace",
+        symptom: "the tool-aware Qwen parser accumulated the reasoning for \
+                  `finish()` but never emitted it as it arrived, so the \
+                  non-streaming answer carried the trace and the streaming one \
+                  had none at all. Found against the running server while \
+                  verifying the Anthropic thinking block: a thinking-enabled \
+                  request WITH tools streamed `text@0, tool_use@1` and nothing \
+                  else, where the same request without tools streamed \
+                  `thinking@0, text@1`. The tool path is the agentic one, so \
+                  this was the case where it mattered most — and it cost the \
+                  OpenAI route its `delta.reasoning` on exactly the same turns",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                events.push(Qwen35ParseEvent::Reasoning(chunk));",
+            replace: "                let _ = &chunk; // defect: kept but never streamed",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::the_tool_parser_streams_the_trace_instead_of_only_keeping_it",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "tools-replay-doubles-think-block",
         symptom: "the tool-calling renderer prefixed its own empty `<think>` \
                   block to whatever the assistant turn's text already was. With \
@@ -1207,7 +1289,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "anthropic-thinking-block-rejected") => "types.rs",
         (_, "tools-replay-doubles-think-block")
         | (_, "qwen-plain-path-never-split-reasoning")
-        | (_, "qwen-thinking-trace-served-as-the-answer") => "qwen3_5_tools.rs",
+        | (_, "qwen-thinking-trace-served-as-the-answer")
+        | (_, "qwen-tool-stream-drops-the-trace") => "qwen3_5_tools.rs",
+        (_, "anthropic-output-drops-thinking-block") => "engine.rs",
+        (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

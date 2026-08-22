@@ -1304,34 +1304,14 @@ impl InferenceEngine {
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
-        // Assemble content[] per Anthropic spec: any leading visible text
-        // as a `text` block, then one `tool_use` block per parsed tool call.
-        // stop_reason="tool_use" when tool calls present, else "end_turn".
         let has_tool_calls = !parsed.tool_calls.is_empty();
-        let mut content: Vec<AnthropicResponseBlock> = Vec::new();
-        let visible = parsed.visible.trim();
-        if !visible.is_empty() {
-            content.push(AnthropicResponseBlock::Text {
-                text: visible.to_string(),
-            });
-        }
-        if has_tool_calls {
-            for call in &parsed.tool_calls {
-                content.push(AnthropicResponseBlock::ToolUse {
-                    id: format!("toolu_{}", gen_id()),
-                    name: call.name.clone(),
-                    input: call.arguments.clone(),
-                });
-            }
-        }
-        // If the model produced nothing visible AND no tool calls, fall
-        // back to an empty text block so the response still conforms to
-        // the spec (content[] cannot be empty).
-        if content.is_empty() {
-            content.push(AnthropicResponseBlock::Text {
-                text: String::new(),
-            });
-        }
+        let content = anthropic_content_blocks(
+            &parsed.reasoning,
+            &parsed.visible,
+            &parsed.tool_calls,
+            req.enable_thinking(),
+            || format!("toolu_{}", gen_id()),
+        );
         // A matched stop sequence (only meaningful without tool calls) maps to
         // Anthropic's stop_reason="stop_sequence" + the matched string.
         let stop_seq_hit = if has_tool_calls { None } else { matched_stop };
@@ -2251,6 +2231,55 @@ impl InferenceEngine {
             }],
         }
     }
+}
+
+/// Assemble an Anthropic `content[]` array, in the order the Messages API
+/// defines: `thinking` first, then `text`, then one `tool_use` per call.
+///
+/// `emit_thinking` is the *request's* flag, not the backend's. On this API the
+/// two are the same thing — `AnthropicRequest::enable_thinking_with_backend_default`
+/// ignores the backend default on purpose — but naming the parameter after the
+/// request keeps it obvious that a client which never asked for extended
+/// thinking must not start receiving a block type it does not expect.
+fn anthropic_content_blocks(
+    reasoning: &str,
+    visible: &str,
+    tool_calls: &[lumen_mlx::chat_io::ParsedToolCall],
+    emit_thinking: bool,
+    mut new_tool_id: impl FnMut() -> String,
+) -> Vec<AnthropicResponseBlock> {
+    let mut content: Vec<AnthropicResponseBlock> = Vec::new();
+    let reasoning = reasoning.trim();
+    if emit_thinking && !reasoning.is_empty() {
+        content.push(AnthropicResponseBlock::thinking(reasoning));
+    }
+    let visible = visible.trim();
+    if !visible.is_empty() {
+        content.push(AnthropicResponseBlock::Text {
+            text: visible.to_string(),
+        });
+    }
+    for call in tool_calls {
+        content.push(AnthropicResponseBlock::ToolUse {
+            id: new_tool_id(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        });
+    }
+    // No text and no tool calls: fall back to an empty text block so the
+    // response still conforms (`content[]` cannot be empty). Keyed on that
+    // rather than on `content.is_empty()`, because a turn that spent its whole
+    // budget thinking now leaves a thinking block behind and a client reading
+    // `content[0].text` should still find one.
+    if !content
+        .iter()
+        .any(|b| !matches!(b, AnthropicResponseBlock::Thinking { .. }))
+    {
+        content.push(AnthropicResponseBlock::Text {
+            text: String::new(),
+        });
+    }
+    content
 }
 
 fn unix_timestamp() -> u64 {
@@ -3976,5 +4005,92 @@ mod phase_1_4_dispatch_tests {
         // is just a normal text turn — the structured path would add
         // no value here.
         assert!(!needs_structured_history(&msgs));
+    }
+}
+
+/// The non-streaming half of the Anthropic trace round-trip.
+///
+/// The Messages API puts `thinking` first in `content[]`, ahead of text and
+/// tool_use, and only when the request enabled extended thinking. Lumen emitted
+/// no thinking block at all, so an Anthropic client could neither see the trace
+/// nor hand it back — and handing it back is what lets a `thinking`-enabled
+/// conversation extend its KV instead of re-prefilling every turn.
+#[cfg(test)]
+mod anthropic_thinking_blocks {
+    use super::{AnthropicResponseBlock, anthropic_content_blocks};
+    use lumen_mlx::chat_io::ParsedToolCall;
+
+    fn ids() -> impl FnMut() -> String {
+        let mut n = 0;
+        move || {
+            n += 1;
+            format!("toolu_{n}")
+        }
+    }
+
+    fn kinds(blocks: &[AnthropicResponseBlock]) -> Vec<&'static str> {
+        blocks
+            .iter()
+            .map(|b| match b {
+                AnthropicResponseBlock::Thinking { .. } => "thinking",
+                AnthropicResponseBlock::Text { .. } => "text",
+                AnthropicResponseBlock::ToolUse { .. } => "tool_use",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_trace_comes_first_then_text_then_tools() {
+        let call = ParsedToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Seoul"}),
+        };
+        let blocks = anthropic_content_blocks("  weighing it up  ", "Red", &[call], true, ids());
+        assert_eq!(kinds(&blocks), ["thinking", "text", "tool_use"]);
+        let v = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(v["type"], "thinking");
+        assert_eq!(
+            v["thinking"], "weighing it up",
+            "trimmed, like the template"
+        );
+        assert_eq!(
+            v["signature"],
+            super::LUMEN_THINKING_SIGNATURE,
+            "the SDK types signature as required, so it cannot be omitted"
+        );
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_for_thinking_gets_no_thinking_block() {
+        // The no-regression case, and the one that decides whether this is safe
+        // to ship on by default: every request that leaves `thinking` unset must
+        // see exactly the content[] it saw before.
+        let blocks = anthropic_content_blocks("weighing it up", "Red", &[], false, ids());
+        assert_eq!(kinds(&blocks), ["text"]);
+    }
+
+    #[test]
+    fn no_trace_means_no_block_even_with_thinking_on() {
+        for trace in ["", "   ", "\n"] {
+            let blocks = anthropic_content_blocks(trace, "Red", &[], true, ids());
+            assert_eq!(kinds(&blocks), ["text"], "blank trace {trace:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_that_only_thought_still_carries_an_empty_text_block() {
+        // `content[]` must not be empty, and a client reading `content[0].text`
+        // after a budget-exhausted turn should still find a text block rather
+        // than index past the end.
+        let blocks = anthropic_content_blocks("still thinking", "", &[], true, ids());
+        assert_eq!(kinds(&blocks), ["thinking", "text"]);
+        let v = serde_json::to_value(&blocks[1]).unwrap();
+        assert_eq!(v["text"], "");
+    }
+
+    #[test]
+    fn an_empty_turn_is_unchanged() {
+        let blocks = anthropic_content_blocks("", "", &[], true, ids());
+        assert_eq!(kinds(&blocks), ["text"]);
     }
 }

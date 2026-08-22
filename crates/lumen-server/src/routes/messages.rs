@@ -72,6 +72,12 @@ async fn handle_streaming(
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
     let model = req.model.clone();
+    // Read before the request moves into the engine. `AnthropicRequest`'s
+    // thinking flag is the client's own — unlike the OpenAI one it does not
+    // fall through to a backend default — so this is exactly "did the caller
+    // ask for extended thinking?", which is the spec's condition for a
+    // `thinking` block appearing in the response at all.
+    let emit_thinking = req.enable_thinking();
     let mut tcp = response.into_body().stream;
 
     tcp.write_all(
@@ -123,19 +129,16 @@ async fn handle_streaming(
     );
     tcp.write_all(start.as_bytes()).await?;
 
-    // Phase 1.5: content_block_start is now LAZY — we don't pre-emit it
-    // because tool-only responses have no leading text. The first text
-    // Delta opens a text block (index 0); the first ToolCallStart opens
-    // a tool_use block at whichever wire index is next. The static
-    // delta_prefix / delta_suffix below stays pinned to `index:0` since
-    // visible text Deltas always precede tool_calls in our backends.
-    let delta_prefix: &[u8] = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":";
+    // Phase 1.5: content_block_start is LAZY — we don't pre-emit it because
+    // tool-only responses have no leading text. `BlockStream` owns which block
+    // is open and what index it got; the delta prefix is rebuilt whenever that
+    // index changes, because a `thinking` block ahead of the text moves every
+    // later index by one and a delta pinned to `index:0` would land on the
+    // wrong block while still parsing as valid JSON.
     let delta_suffix: &[u8] = b"}}\n\n";
-    let mut buf: Vec<u8> = Vec::with_capacity(delta_prefix.len() + delta_suffix.len() + 256);
-
-    let mut wire_index: u32 = 0;
-    let mut text_block_open: bool = false;
-    let mut current_tool_wire_index: Option<u32> = None;
+    let mut delta_prefix: Vec<u8> = Vec::with_capacity(128);
+    let mut buf: Vec<u8> = Vec::with_capacity(384);
+    let mut blocks = BlockStream::new();
 
     // Phase 1.6: Anthropic SSE `ping` keepalive. Matches real Claude
     // wire — when prefill is long-running (≥1s with no decoded token
@@ -169,18 +172,14 @@ async fn handle_streaming(
             // second one has nowhere to go.
             StreamEvent::Start { .. } => {}
             StreamEvent::Delta(text) => {
-                if !text_block_open {
-                    tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
-                    text_block_open = true;
-                    // text block always claims index 0; tool blocks start at 1
-                    wire_index = 1;
-                }
                 buf.clear();
-                append_anthropic_delta(&mut buf, delta_prefix, delta_suffix, &text);
+                let idx = blocks.open_text(&mut buf);
+                set_text_delta_prefix(&mut delta_prefix, idx);
+                append_anthropic_delta(&mut buf, &delta_prefix, delta_suffix, &text);
                 loop {
                     match token_rx.try_recv() {
                         Ok(StreamEvent::Delta(more)) => {
-                            append_anthropic_delta(&mut buf, delta_prefix, delta_suffix, &more);
+                            append_anthropic_delta(&mut buf, &delta_prefix, delta_suffix, &more);
                         }
                         Ok(other) => {
                             carry = Some(other);
@@ -191,37 +190,43 @@ async fn handle_streaming(
                 }
                 tcp.write_all(&buf).await?;
             }
-            StreamEvent::ReasoningDelta(_text) => {
-                // Anthropic Messages API has a dedicated `thinking`
-                // content block type for extended reasoning, distinct
-                // from the OpenAI `delta.reasoning` field. Proper
-                // wiring (start `content_block_start` with
-                // `{"type":"thinking"}`, emit `thinking_delta` chunks,
-                // close with `content_block_stop`) is deferred — for
-                // now we silently discard reasoning tokens on the
-                // Anthropic SSE path so the model output still
-                // terminates cleanly without leaking reasoning into
-                // the visible text block. OpenAI clients still get
-                // the full reasoning via `/v1/chat/completions`.
+            StreamEvent::ReasoningDelta(text) => {
+                // The Messages API's own channel for the trace. This used to be
+                // discarded outright, so an Anthropic client could not see the
+                // reasoning and — worse — could not hand it back on the next
+                // turn, which is what a `thinking`-enabled conversation needs to
+                // extend its KV instead of re-prefilling.
+                //
+                // Gated on the request's own flag: a client that did not enable
+                // thinking must not start receiving a block type it never asked
+                // for.
+                if !emit_thinking {
+                    continue;
+                }
+                buf.clear();
+                let idx = blocks.open_thinking(&mut buf);
+                append_thinking_delta(&mut buf, idx, &text);
+                loop {
+                    match token_rx.try_recv() {
+                        Ok(StreamEvent::ReasoningDelta(more)) => {
+                            append_thinking_delta(&mut buf, idx, &more);
+                        }
+                        Ok(other) => {
+                            carry = Some(other);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                tcp.write_all(&buf).await?;
             }
             StreamEvent::ToolCallStart { id, name, .. } => {
-                if text_block_open {
-                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
-                    text_block_open = false;
-                }
-                let idx = wire_index;
-                let id_json =
-                    serde_json::to_string(&id).map_err(|e| SendableError::from(e.to_string()))?;
-                let name_json =
-                    serde_json::to_string(&name).map_err(|e| SendableError::from(e.to_string()))?;
-                let evt = format!(
-                    "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"tool_use\",\"id\":{id_json},\"name\":{name_json},\"input\":{{}}}}}}\n\n"
-                );
-                tcp.write_all(evt.as_bytes()).await?;
-                current_tool_wire_index = Some(idx);
+                buf.clear();
+                blocks.open_tool(&mut buf, &id, &name);
+                tcp.write_all(&buf).await?;
             }
             StreamEvent::ToolCallArgumentsDelta { partial_json, .. } => {
-                let idx = current_tool_wire_index.unwrap_or(wire_index);
+                let idx = blocks.current_tool_index();
                 // partial_json is the raw JSON object string; double-encode it
                 // into the wire envelope's `partial_json` string field.
                 let pj = serde_json::to_string(&partial_json)
@@ -232,30 +237,23 @@ async fn handle_streaming(
                 tcp.write_all(evt.as_bytes()).await?;
             }
             StreamEvent::ToolCallStop { .. } => {
-                if let Some(idx) = current_tool_wire_index.take() {
-                    let evt = format!(
-                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"
-                    );
-                    tcp.write_all(evt.as_bytes()).await?;
-                    wire_index = idx.saturating_add(1);
-                }
+                buf.clear();
+                blocks.close_open(&mut buf);
+                tcp.write_all(&buf).await?;
             }
             StreamEvent::Done {
                 prompt_tokens,
                 completion_tokens: output_tokens,
                 finish_reason,
             } => {
-                // Close any lingering text block.
-                if text_block_open {
-                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
-                }
-                // If the model produced nothing AND no tool calls, emit a
-                // pro-forma empty text block so downstream parsers never see
-                // a content[] array that's effectively empty.
-                if wire_index == 0 && current_tool_wire_index.is_none() {
-                    tcp.write_all(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").await?;
-                    tcp.write_all(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").await?;
-                }
+                // Close whatever is still open, and — if the turn produced no
+                // text and no tool calls — add the pro-forma empty text block
+                // so downstream parsers never see a `content[]` that is
+                // effectively empty. A trace on its own does not count as an
+                // answer, so a thinking-only turn still gets one.
+                buf.clear();
+                blocks.finish(&mut buf);
+                tcp.write_all(&buf).await?;
 
                 let stop_reason = finish_reason.anthropic_str();
                 let delta = format!(
@@ -296,6 +294,168 @@ fn append_anthropic_delta(buf: &mut Vec<u8>, prefix: &[u8], suffix: &[u8], text:
     buf.extend_from_slice(prefix);
     serde_json::to_writer(&mut *buf, text).expect("write to Vec cannot fail");
     buf.extend_from_slice(suffix);
+}
+
+/// Rebuild the `text_delta` envelope for `index`. Cheap, and only the index
+/// varies — but it does vary now, so it cannot stay a `const`.
+fn set_text_delta_prefix(prefix: &mut Vec<u8>, index: u32) {
+    prefix.clear();
+    prefix.extend_from_slice(
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":"
+        )
+        .as_bytes(),
+    );
+}
+
+fn append_thinking_delta(buf: &mut Vec<u8>, index: u32, text: &str) {
+    buf.extend_from_slice(
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":"
+        )
+        .as_bytes(),
+    );
+    serde_json::to_writer(&mut *buf, text).expect("write to Vec cannot fail");
+    buf.extend_from_slice(b"}}\n\n");
+}
+
+/// Which block, if any, is currently open.
+#[derive(Debug, PartialEq)]
+enum OpenBlock {
+    Thinking(u32),
+    Text(u32),
+    Tool(u32),
+}
+
+/// Assigns `content[]` indices and emits the block-lifecycle SSE frames.
+///
+/// Anthropic's streaming format identifies every delta by an index into the
+/// final `content[]` array, and the order is fixed: `thinking` first, then
+/// `text`, then `tool_use`. Before thinking blocks existed the loop could
+/// hardcode `index:0` for text and start tools at 1; with a block that may or
+/// may not precede them, every index becomes conditional — which is exactly the
+/// kind of bookkeeping that breaks a client silently, since a misindexed delta
+/// is still well-formed JSON.
+///
+/// So it lives here, writing frames into a caller-owned buffer (which keeps the
+/// loop's delta batching) and answerable by a test that reads the frames back.
+struct BlockStream {
+    next_index: u32,
+    open: Option<OpenBlock>,
+    /// Whether any block other than `thinking` was ever opened. A trace on its
+    /// own is not an answer, so this decides the pro-forma empty text block.
+    emitted_answer: bool,
+}
+
+impl BlockStream {
+    fn new() -> Self {
+        Self {
+            next_index: 0,
+            open: None,
+            emitted_answer: false,
+        }
+    }
+
+    fn close_open(&mut self, out: &mut Vec<u8>) {
+        let Some(open) = self.open.take() else { return };
+        let idx = match open {
+            OpenBlock::Thinking(i) => {
+                // Anthropic closes a thinking block with the signature it will
+                // expect back on a replay. Ours is a constant — see
+                // `LUMEN_THINKING_SIGNATURE` — but the frame has to be there or
+                // a client assembling the block finds no signature at all.
+                let sig = serde_json::to_string(crate::types::LUMEN_THINKING_SIGNATURE)
+                    .expect("a str always serializes");
+                out.extend_from_slice(
+                    format!(
+                        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"signature_delta\",\"signature\":{sig}}}}}\n\n"
+                    )
+                    .as_bytes(),
+                );
+                i
+            }
+            OpenBlock::Text(i) | OpenBlock::Tool(i) => i,
+        };
+        out.extend_from_slice(
+            format!(
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"
+            )
+            .as_bytes(),
+        );
+        self.next_index = idx.saturating_add(1);
+    }
+
+    /// Open a thinking block if one is not already open. Returns its index.
+    fn open_thinking(&mut self, out: &mut Vec<u8>) -> u32 {
+        if let Some(OpenBlock::Thinking(i)) = self.open {
+            return i;
+        }
+        self.close_open(out);
+        let idx = self.next_index;
+        out.extend_from_slice(
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}}}\n\n"
+            )
+            .as_bytes(),
+        );
+        self.open = Some(OpenBlock::Thinking(idx));
+        idx
+    }
+
+    /// Open a text block if one is not already open. Returns its index.
+    fn open_text(&mut self, out: &mut Vec<u8>) -> u32 {
+        if let Some(OpenBlock::Text(i)) = self.open {
+            return i;
+        }
+        self.close_open(out);
+        let idx = self.next_index;
+        out.extend_from_slice(
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n"
+            )
+            .as_bytes(),
+        );
+        self.open = Some(OpenBlock::Text(idx));
+        self.emitted_answer = true;
+        idx
+    }
+
+    fn open_tool(&mut self, out: &mut Vec<u8>, id: &str, name: &str) -> u32 {
+        self.close_open(out);
+        let idx = self.next_index;
+        let id_json = serde_json::to_string(id).expect("a str always serializes");
+        let name_json = serde_json::to_string(name).expect("a str always serializes");
+        out.extend_from_slice(
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"tool_use\",\"id\":{id_json},\"name\":{name_json},\"input\":{{}}}}}}\n\n"
+            )
+            .as_bytes(),
+        );
+        self.open = Some(OpenBlock::Tool(idx));
+        self.emitted_answer = true;
+        idx
+    }
+
+    /// Index a tool-argument delta belongs to. Falls back the way the previous
+    /// code did — to whatever index is next — when no tool block is open.
+    fn current_tool_index(&self) -> u32 {
+        match self.open {
+            Some(OpenBlock::Tool(i)) => i,
+            _ => self.next_index,
+        }
+    }
+
+    /// Close whatever is open and, if nothing but a thinking block was ever
+    /// emitted, add the pro-forma empty text block so a client reading
+    /// `content[].text` still finds one.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        let needs_placeholder = !self.emitted_answer;
+        self.close_open(out);
+        if needs_placeholder {
+            self.open_text(out);
+            self.close_open(out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +505,166 @@ mod tests {
             message_start_input_tokens(Some(StreamEvent::Start { prompt_tokens: 289 }));
         assert_eq!(n, 289, "the count the engine sent has to reach the wire");
         assert!(carry.is_none(), "Start is consumed, not replayed");
+    }
+
+    /// Parse the SSE frames a `BlockStream` wrote into `(event, json)` pairs,
+    /// so a test can assert on what a client would actually see rather than on
+    /// a byte string.
+    fn frames(buf: &[u8]) -> Vec<(String, serde_json::Value)> {
+        std::str::from_utf8(buf)
+            .expect("frames are utf-8")
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| {
+                let (ev, data) = f.split_once('\n').expect("event line then data line");
+                let ev = ev
+                    .strip_prefix("event: ")
+                    .expect("event: prefix")
+                    .to_string();
+                let data = data.strip_prefix("data: ").expect("data: prefix");
+                (ev, serde_json::from_str(data).expect("data is json"))
+            })
+            .collect()
+    }
+
+    /// Shape of each frame, as `type[:index]`, for comparing whole sequences.
+    fn shape(buf: &[u8]) -> Vec<String> {
+        frames(buf)
+            .into_iter()
+            .map(|(_, v)| {
+                let kind = match v["type"].as_str().expect("typed frame") {
+                    "content_block_start" => format!("start:{}", v["content_block"]["type"]),
+                    "content_block_delta" => format!("delta:{}", v["delta"]["type"]),
+                    other => other.to_string(),
+                };
+                format!("{kind}@{}", v["index"])
+            })
+            .collect()
+    }
+
+    /// The trace gets its own block at index 0, and everything after it shifts.
+    ///
+    /// Anthropic identifies every delta by its index into the final `content[]`,
+    /// so a misindexed delta is still well-formed JSON that lands on the wrong
+    /// block. Before this, text was pinned to `index:0` by a `const` prefix and
+    /// tools started at 1 — correct only while nothing could precede them.
+    #[test]
+    fn a_thinking_block_takes_index_zero_and_pushes_the_rest_along() {
+        let mut b = BlockStream::new();
+        let mut out = Vec::new();
+        let ti = b.open_thinking(&mut out);
+        append_thinking_delta(&mut out, ti, "weighing it up");
+        let xi = b.open_text(&mut out);
+        let mut prefix = Vec::new();
+        set_text_delta_prefix(&mut prefix, xi);
+        append_anthropic_delta(&mut out, &prefix, SUFFIX, "Red");
+        b.open_tool(&mut out, "toolu_1", "get_weather");
+        b.finish(&mut out);
+
+        assert_eq!(
+            shape(&out),
+            [
+                "start:\"thinking\"@0",
+                "delta:\"thinking_delta\"@0",
+                // the signature closes the thinking block, per the API
+                "delta:\"signature_delta\"@0",
+                "content_block_stop@0",
+                "start:\"text\"@1",
+                "delta:\"text_delta\"@1",
+                "content_block_stop@1",
+                "start:\"tool_use\"@2",
+                "content_block_stop@2",
+            ]
+        );
+        let f = frames(&out);
+        assert_eq!(f[1].1["delta"]["thinking"], "weighing it up");
+        assert_eq!(
+            f[2].1["delta"]["signature"],
+            crate::types::LUMEN_THINKING_SIGNATURE
+        );
+        assert_eq!(f[5].1["delta"]["text"], "Red");
+    }
+
+    /// Without a trace the indices must be what they always were — this is the
+    /// no-regression half, and it covers every request that does not enable
+    /// thinking, which is most of them.
+    #[test]
+    fn without_a_trace_text_is_still_index_zero_and_tools_start_at_one() {
+        let mut b = BlockStream::new();
+        let mut out = Vec::new();
+        let xi = b.open_text(&mut out);
+        assert_eq!(xi, 0);
+        let mut prefix = Vec::new();
+        set_text_delta_prefix(&mut prefix, xi);
+        append_anthropic_delta(&mut out, &prefix, SUFFIX, "hi");
+        assert_eq!(b.open_tool(&mut out, "toolu_1", "f"), 1);
+        b.close_open(&mut out);
+        assert_eq!(b.open_tool(&mut out, "toolu_2", "g"), 2);
+        b.finish(&mut out);
+
+        assert_eq!(
+            shape(&out),
+            [
+                "start:\"text\"@0",
+                "delta:\"text_delta\"@0",
+                "content_block_stop@0",
+                "start:\"tool_use\"@1",
+                "content_block_stop@1",
+                "start:\"tool_use\"@2",
+                "content_block_stop@2",
+            ]
+        );
+        // And the text delta envelope is byte-identical to the old `const`.
+        assert!(
+            std::str::from_utf8(&out).unwrap().contains(
+                "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+            ),
+            "the index-0 text delta must not have changed shape",
+        );
+    }
+
+    /// A tool-only turn still puts the first tool at index 0.
+    #[test]
+    fn a_tool_only_turn_starts_at_index_zero() {
+        let mut b = BlockStream::new();
+        let mut out = Vec::new();
+        assert_eq!(b.open_tool(&mut out, "toolu_1", "f"), 0);
+        b.finish(&mut out);
+        assert_eq!(
+            shape(&out),
+            ["start:\"tool_use\"@0", "content_block_stop@0"]
+        );
+    }
+
+    /// A turn that produced only a trace is not an answer, so the pro-forma
+    /// empty text block still goes out — after the thinking block, at index 1.
+    #[test]
+    fn a_thinking_only_turn_still_gets_its_placeholder_text_block() {
+        let mut b = BlockStream::new();
+        let mut out = Vec::new();
+        let ti = b.open_thinking(&mut out);
+        append_thinking_delta(&mut out, ti, "…");
+        b.finish(&mut out);
+        assert_eq!(
+            shape(&out),
+            [
+                "start:\"thinking\"@0",
+                "delta:\"thinking_delta\"@0",
+                "delta:\"signature_delta\"@0",
+                "content_block_stop@0",
+                "start:\"text\"@1",
+                "content_block_stop@1",
+            ]
+        );
+    }
+
+    /// An empty turn is unchanged: one empty text block at index 0.
+    #[test]
+    fn an_empty_turn_still_emits_one_empty_text_block() {
+        let mut b = BlockStream::new();
+        let mut out = Vec::new();
+        b.finish(&mut out);
+        assert_eq!(shape(&out), ["start:\"text\"@0", "content_block_stop@0"]);
     }
 
     /// A stream that opens with anything else still gets a well-formed

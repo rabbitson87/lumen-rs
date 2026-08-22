@@ -558,6 +558,16 @@ pub enum Qwen35ParseEvent {
     /// User-visible text delta (outside any `<tool_call>` span and
     /// outside any `<think>` reasoning span — those are stripped).
     Text(String),
+    /// Reasoning delta — bytes from inside the `<think>` span.
+    ///
+    /// The trace was always accumulated for `finish()`, but never surfaced as
+    /// it arrived, so a *streaming* tool-aware turn dropped it entirely: the
+    /// Anthropic route had no `thinking` block to open and the OpenAI route no
+    /// `delta.reasoning` to send. Measured against the running server — a
+    /// `thinking`-enabled request with tools attached streamed
+    /// `text@0, tool_use@1` and no trace at all, while the same request without
+    /// tools streamed `thinking@0, text@1`.
+    Reasoning(String),
     /// The opening of a tool_call has been observed and the function
     /// name has been fully accumulated. Fires exactly once per
     /// `<tool_call>...</tool_call>` block, between the `<function=NAME>`
@@ -655,7 +665,7 @@ impl Qwen35ResponseParser {
         loop {
             let progressed = match &self.state {
                 State::Visible => self.try_advance_visible(&mut events),
-                State::Thinking => self.try_advance_thinking(),
+                State::Thinking => self.try_advance_thinking(&mut events),
                 State::InToolCallHeader => self.try_advance_header(&mut events),
                 State::InToolCallBody => self.try_advance_body(),
                 State::InParameterValue { .. } => self.try_advance_value(),
@@ -782,10 +792,13 @@ impl Qwen35ResponseParser {
         }
     }
 
-    fn try_advance_thinking(&mut self) -> bool {
+    fn try_advance_thinking(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
         if let Some(idx) = self.buffer.find("</think>") {
             let prefix = self.buffer[..idx].to_string();
             self.reasoning.push_str(&prefix);
+            if !prefix.is_empty() {
+                events.push(Qwen35ParseEvent::Reasoning(prefix.clone()));
+            }
             let mut consumed = idx + "</think>".len();
             // The template writes `'</think>\n\n' + content`, so the blank line
             // is part of the delimiter and not the start of the answer. Taking
@@ -809,6 +822,7 @@ impl Qwen35ResponseParser {
             if self.buffer.len() > keep {
                 let chunk: String = self.buffer.drain(..self.buffer.len() - keep).collect();
                 self.reasoning.push_str(&chunk);
+                events.push(Qwen35ParseEvent::Reasoning(chunk));
                 true
             } else {
                 false
@@ -1498,6 +1512,37 @@ mod tests {
         let mut s = ThinkingSplitter::new(false);
         assert_eq!(s.feed("Red"), (String::new(), "Red".to_string()));
         assert_eq!(s.finish(), "");
+    }
+
+    /// The trace has to be emitted as it arrives, not only accumulated.
+    ///
+    /// `finish()` always carried it, so the non-streaming answer was right
+    /// while the streaming one silently had no trace at all — measured against
+    /// the running server, a `thinking`-enabled Anthropic request *with tools*
+    /// streamed `text@0, tool_use@1` and nothing else, where the same request
+    /// without tools streamed `thinking@0, text@1`. The tool-aware path is the
+    /// agentic one, so that was the case where it mattered most.
+    #[test]
+    fn the_tool_parser_streams_the_trace_instead_of_only_keeping_it() {
+        let mut p = Qwen35ResponseParser::with_thinking_open();
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        // Fed one chunk at a time, the way decode delivers it.
+        for chunk in ["weigh", "ing it up", "\n</thi", "nk>\n\nRed"] {
+            for ev in p.feed(chunk) {
+                match ev {
+                    Qwen35ParseEvent::Reasoning(t) => reasoning.push_str(&t),
+                    Qwen35ParseEvent::Text(t) => text.push_str(&t),
+                    Qwen35ParseEvent::ToolCallStart { .. } => unreachable!("no tools here"),
+                }
+            }
+        }
+        assert_eq!(reasoning.trim(), "weighing it up");
+        assert_eq!(text.trim(), "Red");
+        // …and the accumulated view still agrees with the streamed one.
+        let resp = p.finish();
+        assert_eq!(resp.reasoning.trim(), "weighing it up");
+        assert_eq!(resp.visible.trim(), "Red");
     }
 
     /// The thinking-OFF turn must be untouched: there the prompt closes the

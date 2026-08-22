@@ -7144,6 +7144,7 @@ where
     use crate::qwen3_5_tools::Qwen35ParseEvent;
     match ev {
         Qwen35ParseEvent::Text(text) => on_event(BackendStreamEvent::Text(&text)),
+        Qwen35ParseEvent::Reasoning(text) => on_event(BackendStreamEvent::Reasoning(&text)),
         Qwen35ParseEvent::ToolCallStart { name } => {
             on_event(BackendStreamEvent::ToolCallStart { name: &name })
         }
