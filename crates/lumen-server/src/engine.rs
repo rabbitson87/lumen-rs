@@ -1037,17 +1037,13 @@ impl InferenceEngine {
                     if m.role != "assistant" {
                         return String::new();
                     }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
+                    // `as_text` flattens exactly the Text blocks this used to
+                    // walk by hand, and also folds a replayed `thinking` block
+                    // into the leading `<think>` envelope the renderer reads.
+                    // Calling it rather than re-deriving it is what keeps this
+                    // path and the flat one (which already went through
+                    // `as_text`) from disagreeing about what a turn contains.
+                    m.content.as_text()
                 })
                 .collect();
             let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
@@ -1919,17 +1915,13 @@ impl InferenceEngine {
                     if m.role != "assistant" {
                         return String::new();
                     }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
+                    // `as_text` flattens exactly the Text blocks this used to
+                    // walk by hand, and also folds a replayed `thinking` block
+                    // into the leading `<think>` envelope the renderer reads.
+                    // Calling it rather than re-deriving it is what keeps this
+                    // path and the flat one (which already went through
+                    // `as_text`) from disagreeing about what a turn contains.
+                    m.content.as_text()
                 })
                 .collect();
             let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req

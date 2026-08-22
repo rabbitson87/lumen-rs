@@ -291,6 +291,162 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "reasoning-trace-has-no-wire-field",
+        symptom: "a `thinking: true` session could not reuse one KV token. The \
+                  generation prompt stops at an open `<think>` block and the \
+                  model writes the trace itself, so the tokens in the cache \
+                  contain reasoning — but the request type had nowhere to put \
+                  it, so the replayed turn re-rendered with an empty block and \
+                  diverged from its own KV at that point. The trace was not \
+                  even unavailable: the server emits it as \
+                  `ChatMessageResponse.reasoning`, so a client handing our own \
+                  response object back was returning it and being ignored. \
+                  Fixed by reading the three spellings that reach us — \
+                  `reasoning_content` (DeepSeek/vLLM, and Qwen's own template's \
+                  field name), `reasoning` (ours), and the `<think>` envelope \
+                  already inside `content` — and folding them into the one \
+                  representation the renderers read",
+        revert: &[
+            Mutation {
+                path: SRV,
+                find: r#"    if !role.eq_ignore_ascii_case("assistant") {"#,
+                replace: "    if true {\n        // defect: the trace never reaches the prompt",
+            },
+            Mutation {
+                path: MLX,
+                find: "            let (reasoning, visible) = \
+                       crate::chat_io::split_reasoning_envelope(content);",
+                replace: "            let (reasoning, visible) = (\"\", content.as_str()); \
+                          // defect: trace dropped",
+            },
+        ],
+        guards: &[
+            srv("types::reasoning_round_trip::the_deepseek_field_name_is_accepted"),
+            srv("types::reasoning_round_trip::the_field_lumen_emits_is_a_field_lumen_reads"),
+            mlx("tests::a_replayed_thinking_turn_matches_what_the_model_was_fed"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-thinking-block-rejected",
+        symptom: "the Anthropic Messages API *requires* a client to replay the \
+                  thinking blocks of any assistant turn it sends back once \
+                  extended thinking is on. `AnthropicContentBlock` is \
+                  deliberately exhaustive, and `thinking` was not one of its \
+                  variants — so a client doing exactly what the spec demands \
+                  had the whole request rejected with `unknown variant \
+                  \"thinking\"`, not just the block dropped. Fixed by accepting \
+                  `thinking` (folded into the reasoning envelope so the trace \
+                  reaches the prompt) and `redacted_thinking` (accepted and \
+                  ignored — the payload is encrypted, and the client had no \
+                  choice about receiving it), while an unrecognized type still \
+                  fails",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    Thinking {\n        #[serde(default)]\n        thinking: String,",
+            replace: "    #[serde(rename = \"thinking_defect_replay\")]\n    Thinking {\n        \
+                      #[serde(default)]\n        thinking: String,",
+        }],
+        guards: &[srv(
+            "types::reasoning_round_trip::an_anthropic_thinking_block_is_accepted_and_kept",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-thinking-trace-served-as-the-answer",
+        symptom: "with thinking on, the Qwen *prompt* opens the `<think>` block \
+                  and the model writes its trace with no opener of its own, \
+                  closing with a bare `</think>`. The parser started in \
+                  `Visible` and so never entered the thinking state at all. \
+                  Measured on Qwen3.8-27B: a `thinking:true` request came back \
+                  with **no `reasoning` field**, the raw chain-of-thought as \
+                  `content`, and the stray close tag sitting in the middle of \
+                  the answer — `\"We need answer user's simple request: … \
+                  red.\\n</think>\\n\\nRed\"`. The default is that `content` \
+                  carries the visible answer alone, so every thinking-on turn \
+                  ever served violated it. The state cannot be recovered after \
+                  the fact: visible text streams as it arrives, so by the time \
+                  the close tag shows up the trace has already gone out as \
+                  content deltas",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        Self {\n            state: State::Thinking,\n            \
+                   in_think: true,\n            ..Self::new()\n        }",
+            replace: "        Self::new() // defect: the prompt's open block is invisible",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::a_prompt_opened_think_block_is_reasoning_not_visible_text",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-plain-path-never-split-reasoning",
+        symptom: "the no-tools Qwen path runs no parser at all — it returned \
+                  the whole decode as `visible` with `reasoning: String::new()` \
+                  hardcoded, on both the streaming and non-streaming entry \
+                  points. So the trace reached the client as the answer even \
+                  though the tool path had separated it correctly for turns \
+                  that happened to declare a tool. Fixed with a splitter that \
+                  routes trace bytes to `BackendStreamEvent::Reasoning` as they \
+                  arrive, holding back any tail that could still grow into \
+                  `</think>` across a decode-step boundary. Gating it on the \
+                  thinking flag is load-bearing: a thinking-off reply carries \
+                  no close tag and is byte-indistinguishable from a trace that \
+                  ran out of budget, so an ungated split answered `content: \
+                  \"\"`, `reasoning: \"Red\"` — caught by hand against the \
+                  running server, after the whole suite was green",
+        revert: &[
+            Mutation {
+                path: MLX,
+                find: "    let Some(idx) = text.find(\"</think>\") else {\n        \
+                       return (text, \"\");",
+                replace: "    let Some(idx) = text.find(\"\\u{0}never\") else {\n        \
+                          return (\"\", text);",
+            },
+            Mutation {
+                path: MLX,
+                find: "            phase: if thinking_open {\n                Phase::Trace",
+                replace: "            phase: if false {\n                Phase::Trace",
+            },
+        ],
+        guards: &[
+            mlx("qwen3_5_tools::tests::the_plain_path_splits_a_prompt_opened_trace"),
+            mlx("qwen3_5_tools::tests::the_streaming_splitter_holds_a_tag_split_across_chunks"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "tools-replay-doubles-think-block",
+        symptom: "the tool-calling renderer prefixed its own empty `<think>` \
+                  block to whatever the assistant turn's text already was. With \
+                  `LUMEN_REASONING_IN_CONTENT=1` — or any client echoing that \
+                  content back — the trace is already in there, so the turn \
+                  rendered as `<think>\\n\\n</think>\\n\\n<think>\\n…`, two \
+                  nested blocks in a shape no Qwen template emits, and the \
+                  reasoning landed in the visible-text slot. Fixed by splitting \
+                  the envelope out and rendering the trace inside the one block \
+                  the template defines",
+        revert: &[Mutation {
+            path: MLX,
+            find: "    let (reasoning, visible) = split_reasoning_envelope(content);",
+            replace: "    let (reasoning, visible) = (\"\", content); // defect: block not split",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::a_replayed_tool_turn_carries_the_trace_it_was_given",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "mtp-drops-sampling-knobs",
         symptom: "the MTP speculative path rebuilt its `SamplingConfig` from a \
                   few scalars with `..default()`, silently dropping `top_k`, \
@@ -1043,6 +1199,15 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block") => "lib.rs",
+        // One defect, two files: the wire had no field for the trace *and* the
+        // renderer had nowhere to put one. Reverting either half is enough to
+        // lose the KV, so both are mutated together.
+        (SRV, "reasoning-trace-has-no-wire-field") => "types.rs",
+        (MLX, "reasoning-trace-has-no-wire-field") => "lib.rs",
+        (_, "anthropic-thinking-block-rejected") => "types.rs",
+        (_, "tools-replay-doubles-think-block")
+        | (_, "qwen-plain-path-never-split-reasoning")
+        | (_, "qwen-thinking-trace-served-as-the-answer") => "qwen3_5_tools.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

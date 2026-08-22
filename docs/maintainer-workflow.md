@@ -421,7 +421,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens) |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and an Anthropic turn replaying a `thinking` block is answered rather than rejected |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
@@ -467,6 +467,30 @@ plain one was rendering 3.8 with 3.6's non-default branch, which cost every
 branch is the *default* is the thing to check: `preserve_thinking is undefined`
 (3.8) and `(preserve_thinking is defined and ... is true)` (3.6) mention the same
 name and mean opposite things, and no client sends it.
+
+**A field the server emits is a field the server has to read.** `thinking: true`
+sessions could not reuse a single KV token, because the model writes its trace
+into an open `<think>` block and the request type had nowhere to return it — yet
+the response had been handing that trace to the client as `reasoning` all along.
+Any time an output field describes model state, ask what happens when it comes
+back. Three spellings do: `reasoning_content` (DeepSeek/vLLM, and the name
+Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope inside
+`content` (ours again, under `LUMEN_REASONING_IN_CONTENT=1`). They are folded to
+one representation in `ChatMessage`'s `Deserialize` so the renderers, the
+prefix-cache key and the token count cannot each decide separately.
+
+**A parser that starts at the beginning of the output is not at the beginning of
+the turn.** Qwen's generation prompt ends *inside* the thinking block
+(`<think>\n`), so the model emits its trace with no opening tag and closes with a
+bare `</think>`. Every thinking-on turn was therefore served with the raw
+chain-of-thought as `content` and the stray close tag mid-answer, on a path whose
+documented default is that `content` holds the visible reply alone. The state
+cannot be recovered afterwards — visible text streams as it arrives — so it has
+to be threaded from the prompt. And the gate matters as much as the split: a
+thinking-off reply carries no close tag and is byte-identical to a trace that ran
+out of budget, so splitting unconditionally answers `content: ""`. That one was
+caught by hand against the running server with the whole suite green, which is
+the third time this file has had to record that.
 
 **And check it at a non-zero temperature.** Two family-wide defects have now
 been found whose common property is that the broken and the correct code emit

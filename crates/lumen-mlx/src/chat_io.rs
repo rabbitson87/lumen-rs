@@ -436,6 +436,109 @@ pub fn strip_client_meta_wrappers_flat_indexed(messages: &mut Vec<(String, Strin
     kept
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Reasoning-trace round-trip
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Opening tag of the reasoning envelope.
+pub const REASONING_OPEN: &str = "<think>";
+/// Closing tag of the reasoning envelope.
+pub const REASONING_CLOSE: &str = "</think>";
+
+/// Wrap a reasoning trace and the visible reply into the single string an
+/// assistant turn's `content` carries through the renderers.
+///
+/// This is deliberately the *same* envelope `LUMEN_REASONING_IN_CONTENT=1`
+/// already emits on the response side, so a client that echoes our `content`
+/// back verbatim and a client that returns the trace in a dedicated
+/// `reasoning_content` field converge on one representation before anything
+/// downstream has to care which it was.
+///
+/// The alternative — a third field on `ChatTurn::Assistant` and on the flat
+/// `(role, content)` pair — would have to be threaded through 55 flat and 16
+/// structured call sites to change the same rendered bytes. The envelope
+/// reaches both paths, both APIs, the prefix-cache key and the token count at
+/// once, because all of them already agree that the turn's text is its content.
+pub fn join_reasoning_envelope(reasoning: &str, visible: &str) -> String {
+    let reasoning = reasoning.trim();
+    format!("{REASONING_OPEN}\n{reasoning}\n{REASONING_CLOSE}\n\n{visible}")
+}
+
+/// Split an assistant turn's text back into `(reasoning, visible)`.
+///
+/// Returns `("", content)` unchanged when there is no envelope — which is what
+/// makes every existing caller byte-identical, since a turn without a trace
+/// renders exactly as it did before.
+///
+/// Only a *leading* envelope counts. A `<think>` further into the reply is the
+/// model talking about the tag, not a trace, and rewriting it would corrupt the
+/// turn.
+pub fn split_reasoning_envelope(content: &str) -> (&str, &str) {
+    let Some(rest) = content.strip_prefix(REASONING_OPEN) else {
+        return ("", content);
+    };
+    let Some(end) = rest.find(REASONING_CLOSE) else {
+        // An unterminated `<think>` is a truncated turn, not an envelope.
+        return ("", content);
+    };
+    let reasoning = rest[..end].trim();
+    let visible = rest[end + REASONING_CLOSE.len()..].trim_start();
+    (reasoning, visible)
+}
+
+/// Whether `content` already carries a reasoning envelope. Used to keep a
+/// client that sends *both* the envelope and the dedicated field from getting
+/// two nested blocks.
+pub fn has_reasoning_envelope(content: &str) -> bool {
+    !split_reasoning_envelope(content).0.is_empty()
+}
+
+#[cfg(test)]
+mod reasoning_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_without_a_trace_is_returned_untouched() {
+        // The property every existing call site depends on: no envelope, no
+        // change. This is what makes the split safe to apply unconditionally.
+        for s in [
+            "",
+            "hello",
+            "a <think> mid-sentence",
+            "<think> unterminated",
+        ] {
+            assert_eq!(split_reasoning_envelope(s), ("", s), "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn the_split_recovers_exactly_what_the_join_wrote() {
+        let joined = join_reasoning_envelope("  let me think  ", "the answer");
+        assert_eq!(joined, "<think>\nlet me think\n</think>\n\nthe answer");
+        assert_eq!(
+            split_reasoning_envelope(&joined),
+            ("let me think", "the answer")
+        );
+    }
+
+    #[test]
+    fn an_empty_trace_round_trips_as_the_empty_block() {
+        // `<think>\n\n</think>\n\n` is what a `thinking:false` generation
+        // prompt ends with, so this case has to stay byte-exact or the
+        // non-thinking replay stops matching the KV it is trying to extend.
+        let joined = join_reasoning_envelope("", "hi");
+        assert_eq!(joined, "<think>\n\n</think>\n\nhi");
+        assert_eq!(split_reasoning_envelope(&joined), ("", "hi"));
+    }
+
+    #[test]
+    fn a_multi_line_trace_survives_the_round_trip() {
+        let trace = "step one\nstep two\n\nstep three";
+        let joined = join_reasoning_envelope(trace, "done");
+        assert_eq!(split_reasoning_envelope(&joined), (trace, "done"));
+    }
+}
+
 #[cfg(test)]
 mod meta_wrapper_tests {
     use super::*;

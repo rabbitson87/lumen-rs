@@ -1999,9 +1999,24 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {}, effort)?
                 };
+                // With thinking ON the prompt opened the `<think>` block, so
+                // the model's output starts mid-trace and closes with a bare
+                // `</think>`. Splitting it here is what stops the raw
+                // chain-of-thought — and the stray close tag — from being
+                // handed to the client as the answer.
+                //
+                // The gate is load-bearing, not defensive: with thinking OFF
+                // the prompt already closed the block, so the reply carries no
+                // `</think>` at all and an ungated split reads the whole answer
+                // as trace — `content: ""`, `reasoning: "Red"`.
+                let (reasoning, visible) = if thinking {
+                    crate::qwen3_5_tools::split_open_think(&visible)
+                } else {
+                    ("", visible.as_str())
+                };
                 Ok(ParsedResponse {
-                    visible,
-                    reasoning: String::new(),
+                    visible: visible.to_string(),
+                    reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })
             }
@@ -2614,32 +2629,67 @@ impl MlxBackend {
                     );
                 }
                 let _ = tool_choice;
-                let mut text_adapter = |chunk: &str| {
-                    let _ = on_event(BackendStreamEvent::Text(chunk));
+                // The trace has to be routed as it arrives, not split at the
+                // end: visible deltas go out to the client immediately, so once
+                // a reasoning byte has been sent as `Text` there is no taking
+                // it back. The splitter holds any tail that could still grow
+                // into `</think>` across a decode-step boundary.
+                let mut splitter = crate::qwen3_5_tools::ThinkingSplitter::new(thinking);
+                let visible = {
+                    let mut text_adapter = |chunk: &str| {
+                        let (reasoning, visible) = splitter.feed(chunk);
+                        if !reasoning.is_empty() {
+                            let _ = on_event(BackendStreamEvent::Reasoning(&reasoning));
+                        }
+                        if !visible.is_empty() {
+                            let _ = on_event(BackendStreamEvent::Text(&visible));
+                        }
+                    };
+                    if let Some(sid) = session_id {
+                        m.chat_streaming_session(
+                            messages,
+                            max_new_tokens,
+                            thinking,
+                            sid,
+                            &mut text_adapter,
+                            effort,
+                        )?
+                    } else {
+                        let seq_id = m.alloc_seq_id();
+                        m.chat_streaming(
+                            messages,
+                            max_new_tokens,
+                            thinking,
+                            seq_id,
+                            &mut text_adapter,
+                            effort,
+                        )?
+                    }
                 };
-                let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(
-                        messages,
-                        max_new_tokens,
-                        thinking,
-                        sid,
-                        &mut text_adapter,
-                        effort,
-                    )?
+                // A tail still held at the end never closed, so it was all
+                // trace — flush it rather than dropping it.
+                let tail = splitter.finish();
+                if !tail.is_empty() {
+                    let _ = on_event(BackendStreamEvent::Reasoning(&tail));
+                }
+                // With thinking ON the prompt opened the `<think>` block, so
+                // the model's output starts mid-trace and closes with a bare
+                // `</think>`. Splitting it here is what stops the raw
+                // chain-of-thought — and the stray close tag — from being
+                // handed to the client as the answer.
+                //
+                // The gate is load-bearing, not defensive: with thinking OFF
+                // the prompt already closed the block, so the reply carries no
+                // `</think>` at all and an ungated split reads the whole answer
+                // as trace — `content: ""`, `reasoning: "Red"`.
+                let (reasoning, visible) = if thinking {
+                    crate::qwen3_5_tools::split_open_think(&visible)
                 } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(
-                        messages,
-                        max_new_tokens,
-                        thinking,
-                        seq_id,
-                        &mut text_adapter,
-                        effort,
-                    )?
+                    ("", visible.as_str())
                 };
                 Ok(ParsedResponse {
-                    visible,
-                    reasoning: String::new(),
+                    visible: visible.to_string(),
+                    reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })
             }
@@ -5490,6 +5540,7 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
+            thinking,
             on_event,
         )
     }
@@ -5580,6 +5631,7 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
+            thinking,
             on_event,
         )
     }
@@ -5634,6 +5686,11 @@ impl MlxQwen35Backend {
         // Empty for a text-only request, which then prefills byte-identically
         // to the pre-vision path.
         prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
+        // Whether the generation prompt left the `<think>` block OPEN. With
+        // thinking on the template ends at `<think>\n` and the model writes its
+        // trace with no opener, so the parser has to be told — it cannot see a
+        // tag that the prompt, not the model, emitted.
+        thinking: bool,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -5645,7 +5702,11 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
 
-        let mut parser = Qwen35ResponseParser::new();
+        let mut parser = if thinking {
+            Qwen35ResponseParser::with_thinking_open()
+        } else {
+            Qwen35ResponseParser::new()
+        };
         // Prime the parser with the prefill so its state machine
         // transitions OUT of Visible BEFORE the model starts generating.
         // Events from the prefill are SUPPRESSED — the engine assigns
@@ -7128,17 +7189,30 @@ fn format_qwen3_chat(
         // generation prompt ended with, on the checkpoints whose template keeps
         // it (`preserve_thinking` defaulting to true — 3.8 yes, 3.6 no).
         //
-        // `reasoning_content` is empty because the request type has no field
-        // for it: an OpenAI client cannot send the model's reasoning back, so
-        // the trace is gone by the time we re-render. The template renders an
-        // empty one as `<think>\n\n</think>\n\n`, which is byte-identical to
-        // what a `thinking: false` generation prompt emitted — so for those
-        // turns the replay is an exact token-prefix of what the model was fed,
-        // and the session can extend its KV instead of re-prefilling.
+        // The trace itself rides inside `content` as the `<think>…</think>`
+        // envelope, which is both what `LUMEN_REASONING_IN_CONTENT=1` emits and
+        // what the server folds a `reasoning_content` / `reasoning` request
+        // field into. A turn with no trace splits to an empty one and renders
+        // `<think>\n\n</think>\n\n` — byte-identical to what a `thinking:false`
+        // generation prompt emitted, so the replay stays an exact token-prefix
+        // of what the model was fed and the session extends its KV.
+        //
+        // With a trace, the same holds for `thinking:true`: the block is
+        // refilled with the reasoning the model produced, which is the only
+        // way that turn can be a prefix of its own KV.
         if preserve_thinking && role.eq_ignore_ascii_case("assistant") {
-            s.push_str("<think>\n\n</think>\n\n");
+            let (reasoning, visible) = crate::chat_io::split_reasoning_envelope(content);
+            s.push_str("<think>\n");
+            s.push_str(reasoning);
+            s.push_str("\n</think>\n\n");
+            s.push_str(visible);
+        } else {
+            // `preserve_thinking:false` checkpoints render the turn verbatim,
+            // envelope included. That is deliberate: 3.6's template drops
+            // reasoning from history, but the tokens in the KV have it, so
+            // passing the content through unchanged is what still matches.
+            s.push_str(content);
         }
-        s.push_str(content);
         s.push_str("<|im_end|>\n");
     }
     s.push_str("<|im_start|>assistant\n");
@@ -7745,6 +7819,7 @@ mod tests {
                 None,
                 Default::default(),
                 Vec::new(),
+                false, // the scripted turn emits its own tags; no open block
                 |_| Ok(()),
             )
             .expect("tool decode loop");
@@ -7934,6 +8009,63 @@ mod tests {
             preserved.starts_with(&format!("{turn1_prompt}A1<|im_end|>\n")),
             "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
              reused:\nturn1={turn1_prompt:?}\nturn2={preserved:?}",
+        );
+    }
+
+    /// The same property, for a turn that was generated with thinking ON.
+    ///
+    /// A `thinking:true` generation prompt ends at `<think>\n` and the model
+    /// writes the trace itself, so the tokens in the KV contain reasoning that
+    /// an empty block cannot reproduce. Returning the trace — as
+    /// `reasoning_content`, as `reasoning`, or inside `content` — is the only
+    /// way the replay can be a prefix of the KV it wants to extend.
+    #[test]
+    fn a_replayed_thinking_turn_matches_what_the_model_was_fed() {
+        use crate::chat_io::join_reasoning_envelope;
+
+        // Turn 1: prompt the model actually saw, thinking ON.
+        let turn1 = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let turn1_prompt = format_qwen3_chat(&turn1, true, None, true);
+        assert!(
+            turn1_prompt.ends_with("<|im_start|>assistant\n<think>\n"),
+            "thinking-on generation prompt stops at the open block:\n{turn1_prompt:?}",
+        );
+        // …and what the model then produced, verbatim.
+        let generated = "let me work it out\n</think>\n\nA1<|im_end|>";
+        let kv = format!("{turn1_prompt}{generated}");
+
+        // Turn 2: the client returns the trace, so the turn re-renders as the
+        // exact bytes above plus the new user turn.
+        let convo = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+            (
+                "assistant".to_string(),
+                join_reasoning_envelope("let me work it out", "A1"),
+            ),
+            ("user".to_string(), "U2".to_string()),
+        ];
+        let turn2 = format_qwen3_chat(&convo, true, None, true);
+        assert!(
+            turn2.starts_with(&format!("{kv}\n")),
+            "a returned trace must reproduce the generated tokens:\nkv  ={kv:?}\nturn2={turn2:?}",
+        );
+
+        // Without the trace the replay diverges inside the block — correct
+        // output still, but every token after it has to be prefilled again.
+        let without = [
+            convo[0].clone(),
+            convo[1].clone(),
+            ("assistant".to_string(), "A1".to_string()),
+            convo[3].clone(),
+        ];
+        let turn2_no_trace = format_qwen3_chat(&without, true, None, true);
+        assert!(
+            !turn2_no_trace.starts_with(&format!("{kv}\n")),
+            "this is the state being fixed; if it now matches, the test lost its point",
         );
     }
 

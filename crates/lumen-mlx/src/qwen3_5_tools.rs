@@ -71,7 +71,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::chat_io::{
     AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ReasoningEffort,
-    ResolvedToolChoice, ToolDef,
+    ResolvedToolChoice, ToolDef, split_reasoning_envelope,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,21 +170,150 @@ fn tool_def_to_json(tool: &ToolDef<'_>) -> JsonValue {
     JsonValue::Object(obj)
 }
 
+/// Split a plain (no-tools) turn generated with thinking ON into
+/// `(reasoning, visible)`.
+///
+/// With thinking on the *prompt* ends at `<think>\n`, so the model's output
+/// begins mid-trace and closes with a bare `</think>` — there is no opener in
+/// the generated text to key on. Everything up to that close tag is the trace;
+/// the `\n\n` the template pairs with the tag is part of the delimiter.
+///
+/// No close tag means the model spent its whole budget thinking and never
+/// reached an answer. Reporting that as reasoning with empty visible text is
+/// the truthful shape, and it is what the tool path's parser already does.
+pub fn split_open_think(text: &str) -> (&str, &str) {
+    let Some(idx) = text.find("</think>") else {
+        return (text, "");
+    };
+    let mut rest = &text[idx + "</think>".len()..];
+    for sep in ["\n\n", "\n"] {
+        if let Some(stripped) = rest.strip_prefix(sep) {
+            rest = stripped;
+            break;
+        }
+    }
+    (&text[..idx], rest)
+}
+
+/// Streaming counterpart of [`split_open_think`] for the plain path's
+/// `on_token` callback, which sees deltas and cannot wait for the whole turn.
+///
+/// Holds back any tail that could still grow into `</think>` so a tag split
+/// across two decode steps is not emitted as visible text.
+pub struct ThinkingSplitter {
+    phase: Phase,
+    held: String,
+}
+
+#[derive(PartialEq)]
+enum Phase {
+    /// Inside the block the prompt opened — bytes are the trace.
+    Trace,
+    /// The close tag has arrived but its trailing separator may not have. The
+    /// tag and the `\n\n` can land in different decode steps, so the separator
+    /// has to be eaten lazily or it reaches the client as a leading blank line.
+    AfterTag,
+    /// Everything from here is the answer.
+    Visible,
+}
+
+impl ThinkingSplitter {
+    /// `thinking_open` mirrors [`qwen3_generation_header`]: true when the
+    /// prompt left the block open and the model is writing its trace now.
+    pub fn new(thinking_open: bool) -> Self {
+        Self {
+            phase: if thinking_open {
+                Phase::Trace
+            } else {
+                Phase::Visible
+            },
+            held: String::new(),
+        }
+    }
+
+    /// Feed one decoded delta; returns `(reasoning_delta, visible_delta)`.
+    pub fn feed(&mut self, delta: &str) -> (String, String) {
+        if self.phase == Phase::Visible {
+            return (String::new(), delta.to_string());
+        }
+        self.held.push_str(delta);
+        let mut reasoning = String::new();
+        if self.phase == Phase::Trace {
+            match self.held.find("</think>") {
+                Some(idx) => {
+                    reasoning = self.held[..idx].to_string();
+                    self.held.drain(..idx + "</think>".len());
+                    self.phase = Phase::AfterTag;
+                }
+                None => {
+                    // Keep back only what could still become the close tag.
+                    let keep = partial_tail_len(&self.held, "</think>");
+                    let flush: String = self.held.drain(..self.held.len() - keep).collect();
+                    return (flush, String::new());
+                }
+            }
+        }
+        // `Phase::AfterTag`: eat at most one separator, but only once enough
+        // bytes are in hand to tell `\n` from `\n\n` — and the tag itself may
+        // have ended the chunk, so an empty hand means "not yet", not "none".
+        if self.held.is_empty() || self.held == "\n" {
+            return (reasoning, String::new());
+        }
+        if self.held.starts_with("\n\n") {
+            self.held.drain(.."\n\n".len());
+        } else if self.held.starts_with('\n') {
+            self.held.drain(.."\n".len());
+        }
+        self.phase = Phase::Visible;
+        (reasoning, std::mem::take(&mut self.held))
+    }
+
+    /// Anything still held when decoding stops was never closed, so it was all
+    /// trace — except a lone separator, which belongs to the delimiter.
+    pub fn finish(self) -> String {
+        match self.phase {
+            Phase::Trace => self.held,
+            _ => String::new(),
+        }
+    }
+}
+
+/// Length of the longest suffix of `s` that is a proper prefix of `needle`.
+fn partial_tail_len(s: &str, needle: &str) -> usize {
+    (1..needle.len())
+        .rev()
+        .find(|&n| {
+            s.len() >= n && s.is_char_boundary(s.len() - n) && needle.starts_with(&s[s.len() - n..])
+        })
+        .unwrap_or(0)
+}
+
 /// Render the assistant-turn opening (without tool_calls):
-///   `<|im_start|>assistant\n<think>\n\n</think>\n\n{content}`
-/// or with thinking enabled:
-///   `<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{content}`
-fn render_assistant_open(content: &str, thinking: bool) -> String {
+///   `<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{visible}`
+///
+/// `reasoning` comes out of the turn's own text — see
+/// [`split_reasoning_envelope`]. A turn that carries no trace splits to an
+/// empty one and renders `<think>\n\n</think>\n\n{content}`, byte for byte what
+/// this emitted before the trace could be returned at all.
+///
+/// Splitting is also what stops a client from getting *two* blocks: with
+/// `LUMEN_REASONING_IN_CONTENT=1` the trace is already inside `content`, and
+/// prefixing an empty block in front of it produced
+/// `<think>\n\n</think>\n\n<think>\n…` — a shape no Qwen template ever emits.
+///
+/// The block is emitted unconditionally, not gated on `preserve_thinking`.
+/// Every checkpoint's *generation* prompt ends with one, so this is the
+/// rendering that reproduces the tokens the model was actually fed; 3.6's
+/// template drops it from history instead, which is self-consistent for
+/// upstream but would cost this path the KV it can otherwise extend.
+fn render_assistant_open(content: &str, _thinking: bool) -> String {
+    let (reasoning, visible) = split_reasoning_envelope(content);
     let mut s = String::new();
     s.push_str("<|im_start|>assistant\n");
-    if thinking {
-        // Replay-mode: we don't have the original reasoning trace from the
-        // client; emit empty thinking block to satisfy template.
-        s.push_str("<think>\n\n</think>\n\n");
-    } else {
-        s.push_str("<think>\n\n</think>\n\n");
-    }
-    s.push_str(content);
+    s.push_str("<think>\n");
+    s.push_str(reasoning);
+    s.push_str("\n</think>\n\n");
+    s.push_str(visible);
     s
 }
 
@@ -367,7 +496,11 @@ pub fn format_qwen3_chat_with_tools_from_history(
             }
             ChatTurn::Assistant { text, tool_calls } => {
                 let content = *text;
-                let has_content = !content.trim().is_empty();
+                // The separator before the first `<tool_call>` follows the
+                // *visible* reply, so it has to be decided after the reasoning
+                // envelope is off — a turn that is pure trace plus tool calls
+                // has no visible text to separate from.
+                let has_content = !split_reasoning_envelope(content).1.trim().is_empty();
                 s.push_str(&render_assistant_open(content, thinking));
                 if !tool_calls.is_empty() {
                     for (i, call) in tool_calls.iter().enumerate() {
@@ -488,6 +621,27 @@ impl Qwen35ResponseParser {
             in_think: false,
             parsed_calls: Vec::new(),
             pending: None,
+        }
+    }
+
+    /// A parser for a turn whose **prompt** already opened the thinking block.
+    ///
+    /// `qwen3_generation_header(true)` ends at `<think>\n`, so with thinking on
+    /// the model writes its trace with no opener of its own and closes with a
+    /// bare `</think>`. Starting in [`State::Visible`] therefore never entered
+    /// the thinking state at all: the whole chain-of-thought was accumulated as
+    /// visible text, `reasoning` came back empty, and the stray close tag was
+    /// handed to the client in the middle of the answer.
+    ///
+    /// The state cannot be recovered later from the token stream. Visible text
+    /// is emitted as it arrives, so by the time the `</think>` shows up the
+    /// trace has already been streamed out as content deltas — which is why
+    /// this is a constructor and not a fixup in `try_advance_visible`.
+    pub fn with_thinking_open() -> Self {
+        Self {
+            state: State::Thinking,
+            in_think: true,
+            ..Self::new()
         }
     }
 
@@ -632,7 +786,19 @@ impl Qwen35ResponseParser {
         if let Some(idx) = self.buffer.find("</think>") {
             let prefix = self.buffer[..idx].to_string();
             self.reasoning.push_str(&prefix);
-            self.buffer.drain(..idx + "</think>".len());
+            let mut consumed = idx + "</think>".len();
+            // The template writes `'</think>\n\n' + content`, so the blank line
+            // is part of the delimiter and not the start of the answer. Taking
+            // it here is what stops a thinking-on reply reaching the client as
+            // `"\n\nRed"`. At most one separator, so an answer that genuinely
+            // opens with a blank line keeps it.
+            for sep in ["\n\n", "\n"] {
+                if self.buffer[consumed..].starts_with(sep) {
+                    consumed += sep.len();
+                    break;
+                }
+            }
+            self.buffer.drain(..consumed);
             self.state = State::Visible;
             true
         } else {
@@ -1044,6 +1210,70 @@ mod tests {
         assert!(s.contains("</tool_response><|im_end|>\n<|im_start|>user\nanything else?"));
     }
 
+    /// The agentic path's half of the reasoning round-trip.
+    ///
+    /// Two things are asserted together because they are the same line of code:
+    /// a turn with no trace must render exactly as it always did (the empty
+    /// block), and a turn that carries one must render *that* trace rather than
+    /// an empty block with the envelope stranded in the visible text — which is
+    /// the doubled `<think>\n\n</think>\n\n<think>\n…` this used to emit.
+    #[test]
+    fn a_replayed_tool_turn_carries_the_trace_it_was_given() {
+        use crate::chat_io::join_reasoning_envelope;
+
+        let plain = vec![ChatTurn::Assistant {
+            text: "hello",
+            tool_calls: &[],
+        }];
+        let s = format_qwen3_chat_with_tools_from_history(&plain, true, &[], None);
+        assert!(
+            s.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nhello<|im_end|>"),
+            "a turn without a trace must be unchanged:\n{s}",
+        );
+
+        let with_trace = join_reasoning_envelope("checking the map", "hello");
+        let turns = vec![ChatTurn::Assistant {
+            text: &with_trace,
+            tool_calls: &[],
+        }];
+        let s = format_qwen3_chat_with_tools_from_history(&turns, true, &[], None);
+        assert!(
+            s.contains(
+                "<|im_start|>assistant\n<think>\nchecking the map\n</think>\n\nhello<|im_end|>"
+            ),
+            "the returned trace belongs inside the block:\n{s}",
+        );
+        assert!(
+            !s.contains("</think>\n\n<think>"),
+            "two blocks is a shape no Qwen template emits:\n{s}",
+        );
+    }
+
+    /// A turn that is pure reasoning plus tool calls has no visible text, so it
+    /// must not get the `\n\n` separator that follows visible text. Before the
+    /// split, the envelope counted as content and the separator went in.
+    #[test]
+    fn a_trace_only_tool_turn_gets_no_visible_text_separator() {
+        use crate::chat_io::join_reasoning_envelope;
+
+        let args = json!({"city": "Seoul"});
+        let tc = vec![AssistantToolCall {
+            id: "call_1",
+            name: "get_weather",
+            arguments: &args,
+        }];
+        let text = join_reasoning_envelope("need the weather", "");
+        let turns = vec![ChatTurn::Assistant {
+            text: &text,
+            tool_calls: tc.as_slice(),
+        }];
+        let s = format_qwen3_chat_with_tools_from_history(&turns, true, &[], None);
+        assert!(
+            s.contains("</think>\n\n<tool_call>\n<function=get_weather>"),
+            "no visible text means no extra separator before the call:\n{s}",
+        );
+    }
+
     #[test]
     fn render_batched_tool_responses() {
         let turns = vec![
@@ -1163,6 +1393,123 @@ mod tests {
         assert!(!text_evs.iter().any(|t| t.contains("secret")));
         let resp = p.finish();
         assert_eq!(resp.reasoning, "secret reasoning");
+    }
+
+    /// With thinking ON the prompt — not the model — emits the `<think>`
+    /// opener, so the output starts mid-trace and closes with a bare
+    /// `</think>`.
+    ///
+    /// Measured on Qwen3.8-27B before this existed: a `thinking:true` request
+    /// came back with no `reasoning` field at all, `content` holding the raw
+    /// chain-of-thought, and a stray `</think>` sitting in the middle of the
+    /// visible answer:
+    ///
+    /// ```text
+    /// content: "We need answer user's simple request: … red.\n</think>\n\nRed"
+    /// ```
+    #[test]
+    fn a_prompt_opened_think_block_is_reasoning_not_visible_text() {
+        let mut p = Qwen35ResponseParser::with_thinking_open();
+        let evs = p.feed("weighing it up\n</think>\n\nRed");
+        let text: String = evs
+            .iter()
+            .filter_map(|e| match e {
+                Qwen35ParseEvent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "Red",
+            "the trace must not reach the client as content"
+        );
+        let resp = p.finish();
+        assert_eq!(resp.reasoning.trim(), "weighing it up");
+        assert_eq!(resp.visible.trim(), "Red");
+        assert!(
+            !resp.visible.contains("</think>"),
+            "the close tag is a delimiter, not part of the answer: {:?}",
+            resp.visible
+        );
+    }
+
+    /// The plain (no-tools) path has no parser at all — it returned the whole
+    /// decode as `visible` with `reasoning: String::new()` hardcoded. Measured
+    /// on Qwen3.8-27B, a `thinking:true` request came back with no `reasoning`
+    /// key and this as its content:
+    ///
+    /// ```text
+    /// "We need answer user's simple request: … red.\n</think>\n\nRed"
+    /// ```
+    #[test]
+    fn the_plain_path_splits_a_prompt_opened_trace() {
+        assert_eq!(
+            split_open_think("weighing it up\n</think>\n\nRed"),
+            ("weighing it up\n", "Red")
+        );
+        // One separator only — an answer that really starts with a blank line
+        // keeps it.
+        assert_eq!(split_open_think("t\n</think>\n\n\nRed"), ("t\n", "\nRed"));
+        // Never closed: the model spent the budget thinking and reached no
+        // answer. Saying so beats presenting the trace as the reply.
+        assert_eq!(split_open_think("still thinking"), ("still thinking", ""));
+    }
+
+    /// …which is exactly why the callers must gate it on the thinking flag.
+    ///
+    /// A thinking-OFF reply carries no `</think>` — the prompt closed the block
+    /// — so it is indistinguishable from a trace that ran out of budget. Caught
+    /// by hand against the running server, not by the suite: an ungated split
+    /// answered `content: ""`, `reasoning: "Red"` for a plain request.
+    #[test]
+    fn a_thinking_off_reply_looks_exactly_like_an_unclosed_trace() {
+        assert_eq!(split_open_think("Red"), ("Red", ""));
+        // The distinction is not in the bytes, so it cannot be recovered here.
+        // It lives in the prompt, which is why `thinking` is threaded to the
+        // call sites rather than sniffed from the reply.
+        let mut off = ThinkingSplitter::new(false);
+        assert_eq!(off.feed("Red"), (String::new(), "Red".to_string()));
+    }
+
+    /// A `</think>` split across two decode steps must not leak as visible
+    /// text — once a byte is streamed as content the client has it.
+    #[test]
+    fn the_streaming_splitter_holds_a_tag_split_across_chunks() {
+        for cut in 1.."</think>".len() {
+            let (a, b) = "</think>".split_at(cut);
+            let mut s = ThinkingSplitter::new(true);
+            let mut reasoning = String::new();
+            let mut visible = String::new();
+            for chunk in ["trace", a, b, "\n\nRed"] {
+                let (r, v) = s.feed(chunk);
+                reasoning.push_str(&r);
+                visible.push_str(&v);
+            }
+            reasoning.push_str(&s.finish());
+            assert_eq!(
+                visible, "Red",
+                "cut after {cut} leaked the tag or the trace"
+            );
+            assert_eq!(reasoning, "trace", "cut after {cut}");
+        }
+    }
+
+    #[test]
+    fn the_streaming_splitter_is_a_pass_through_when_thinking_is_off() {
+        let mut s = ThinkingSplitter::new(false);
+        assert_eq!(s.feed("Red"), (String::new(), "Red".to_string()));
+        assert_eq!(s.finish(), "");
+    }
+
+    /// The thinking-OFF turn must be untouched: there the prompt closes the
+    /// block itself, so the model's output is visible text from the first byte
+    /// and starting in the thinking state would swallow the whole answer.
+    #[test]
+    fn a_prompt_closed_think_block_leaves_the_answer_visible() {
+        let mut p = Qwen35ResponseParser::new();
+        p.feed("Red");
+        let resp = p.finish();
+        assert_eq!(resp.visible, "Red");
+        assert_eq!(resp.reasoning, "");
     }
 
     #[test]
