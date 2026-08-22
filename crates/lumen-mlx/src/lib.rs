@@ -1316,6 +1316,51 @@ fn checkpoint_declares_reasoning_effort(model_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Does this checkpoint's template keep a `<think>` block on **replayed**
+/// assistant turns?
+///
+/// The two spellings differ in their default, and the default is the whole
+/// question because no client sends `preserve_thinking`:
+///
+/// ```text
+/// 3.6:  (preserve_thinking is defined and preserve_thinking is true) or …   → false
+/// 3.8:   preserve_thinking is undefined or preserve_thinking is true  or …   → true
+/// ```
+///
+/// So 3.8 renders a past assistant turn as
+/// `<|im_start|>assistant\n<think>\n…\n</think>\n\n{content}` and 3.6 renders it
+/// without the block. Rendering 3.8 the 3.6 way is not cosmetic: the generation
+/// prompt for a turn ends with that same block, so a replayed turn that omits it
+/// is not a token-prefix of what the model was actually fed. That is what made
+/// `session_id` re-prefill the entire conversation every turn — measured on
+/// Qwen3.8-27B, a replayed assistant turn occupied 16 tokens of framing where
+/// generation had produced 2, and the reuse check failed at the first one.
+///
+/// Sniffed from the shipped template rather than the model id, for the reason
+/// [`checkpoint_declares_reasoning_effort`] gives: the id is the wrong thing to
+/// ask and the next version rename would silently mis-answer it. Absent or
+/// unreadable template ⇒ `false`, i.e. exactly the previous rendering.
+fn checkpoint_preserves_thinking_on_replay(model_id: &str) -> bool {
+    let dir = std::path::Path::new(model_id);
+    if !dir.is_dir() {
+        return false;
+    }
+    std::fs::read_to_string(dir.join("chat_template.jinja"))
+        .map(|t| template_preserves_thinking(&t))
+        .unwrap_or(false)
+}
+
+/// The template-text half of [`checkpoint_preserves_thinking_on_replay`], split
+/// out so it can be tested against both spellings without a checkpoint on disk.
+///
+/// Keys on `preserve_thinking is undefined`, which is precisely the clause that
+/// makes the block the *default* branch. Matching on the bare name would answer
+/// `true` for 3.6, whose template mentions `preserve_thinking` only to require
+/// that it be explicitly set.
+fn template_preserves_thinking(template: &str) -> bool {
+    template.contains("preserve_thinking is undefined")
+}
+
 fn auto_prefix_key(
     messages: &[(String, String)],
     effort: Option<crate::chat_io::ReasoningEffort>,
@@ -2983,6 +3028,10 @@ pub struct MlxQwen35Backend {
     /// [`checkpoint_declares_reasoning_effort`] for why the model id is the
     /// wrong thing to ask.
     wants_reasoning_effort: bool,
+    /// Whether THIS checkpoint's template keeps a `<think>` block on replayed
+    /// assistant turns — see [`checkpoint_preserves_thinking_on_replay`]. Decided
+    /// at load from the shipped template, never from the model id.
+    preserves_thinking_on_replay: bool,
     /// OPT-IN draft-model speculative decode (default OFF). `Some` only when
     /// `LUMEN_MLX_DRAFT_MODEL` is set AND the draft loaded with a vocab size
     /// matching the target. `None` → the entire draft path is dormant and the
@@ -3064,6 +3113,7 @@ impl MlxQwen35Backend {
             prefix_store: prefix_cache::PrefixCacheStore::from_env(),
             grammar_factory: OnceLock::new(),
             wants_reasoning_effort: false,
+            preserves_thinking_on_replay: false,
             #[cfg(feature = "mlx-native")]
             draft: None,
             sampling: None,
@@ -3160,6 +3210,13 @@ impl MlxQwen35Backend {
         }
 
         let wants_reasoning_effort = checkpoint_declares_reasoning_effort(model_id);
+        let preserves_thinking_on_replay = checkpoint_preserves_thinking_on_replay(model_id);
+        if preserves_thinking_on_replay {
+            eprintln!(
+                "[mlx] preserve_thinking ENABLED (this checkpoint's template keeps \
+                 <think> on replayed assistant turns)"
+            );
+        }
         if wants_reasoning_effort {
             eprintln!(
                 "[mlx] reasoning_effort ENABLED (this checkpoint's chat template declares it)"
@@ -3179,6 +3236,7 @@ impl MlxQwen35Backend {
             prefix_store,
             grammar_factory: OnceLock::new(),
             wants_reasoning_effort,
+            preserves_thinking_on_replay,
             #[cfg(feature = "mlx-native")]
             draft: None,
             sampling: None,
@@ -4071,7 +4129,12 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         let attached = self.attach_image_blocks(messages, images)?;
-        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking, effort))?;
+        let ids = self.encode(&format_qwen3_chat(
+            &attached.messages,
+            thinking,
+            effort,
+            self.preserves_thinking_on_replay,
+        ))?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
         Ok((ids, attached.prepared))
     }
@@ -4133,7 +4196,12 @@ impl MlxQwen35Backend {
         thinking: bool,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<Vec<u32>> {
-        let prompt = format_qwen3_chat(messages, thinking, effort);
+        let prompt = format_qwen3_chat(
+            messages,
+            thinking,
+            effort,
+            self.preserves_thinking_on_replay,
+        );
         self.encode(&prompt)
     }
 
@@ -7031,6 +7099,7 @@ fn format_qwen3_chat(
     messages: &[(String, String)],
     thinking: bool,
     effort: Option<crate::chat_io::ReasoningEffort>,
+    preserve_thinking: bool,
 ) -> String {
     let mut s = String::new();
     let mut messages = messages;
@@ -7055,6 +7124,20 @@ fn format_qwen3_chat(
         s.push_str("<|im_start|>");
         s.push_str(role);
         s.push('\n');
+        // A replayed assistant turn carries the same `<think>` block the
+        // generation prompt ended with, on the checkpoints whose template keeps
+        // it (`preserve_thinking` defaulting to true — 3.8 yes, 3.6 no).
+        //
+        // `reasoning_content` is empty because the request type has no field
+        // for it: an OpenAI client cannot send the model's reasoning back, so
+        // the trace is gone by the time we re-render. The template renders an
+        // empty one as `<think>\n\n</think>\n\n`, which is byte-identical to
+        // what a `thinking: false` generation prompt emitted — so for those
+        // turns the replay is an exact token-prefix of what the model was fed,
+        // and the session can extend its KV instead of re-prefilling.
+        if preserve_thinking && role.eq_ignore_ascii_case("assistant") {
+            s.push_str("<think>\n\n</think>\n\n");
+        }
         s.push_str(content);
         s.push_str("<|im_end|>\n");
     }
@@ -7785,6 +7868,72 @@ mod tests {
                 .seed,
             0,
             "a seedless request must draw a fresh seed, not replay one stream",
+        );
+    }
+
+    /// A replayed assistant turn must be a token-prefix of what the model was
+    /// actually fed, on the checkpoints whose template says so.
+    ///
+    /// The two spellings differ only in their default, and no client sends
+    /// `preserve_thinking`, so the default decides everything:
+    ///
+    /// * 3.6 — `(preserve_thinking is defined and preserve_thinking is true)`
+    /// * 3.8 — `preserve_thinking is undefined or preserve_thinking is true`
+    ///
+    /// Rendering 3.8 the 3.6 way is not cosmetic. A `thinking: false` generation
+    /// prompt ends with `<think>\n\n</think>\n\n`, and the model's reply follows
+    /// it; a replay that drops the block diverges from the KV at that exact
+    /// token. Measured on Qwen3.8-27B: the replayed turn occupied 16 tokens of
+    /// framing where generation had produced 2, `prompt.starts_with(stored)`
+    /// failed at the first assistant token, and `session_id` re-prefilled the
+    /// whole conversation every turn while reporting nothing.
+    ///
+    /// Matching on the bare name would answer `true` for 3.6, whose template
+    /// mentions `preserve_thinking` only to require that it be set explicitly —
+    /// so the discriminator is the `is undefined` clause.
+    #[test]
+    fn a_replayed_assistant_turn_matches_what_the_model_was_fed() {
+        // The two real clauses, verbatim from the shipped templates.
+        assert!(template_preserves_thinking(
+            "{%- if preserve_thinking is undefined or preserve_thinking is true or \
+             (loop.index0 > ns.last_query_index) %}"
+        ));
+        assert!(!template_preserves_thinking(
+            "{%- if (preserve_thinking is defined and preserve_thinking is true) or \
+             (loop.index0 > ns.last_query_index) %}"
+        ));
+        // A template with no such branch at all (3.5) keeps the old rendering.
+        assert!(!template_preserves_thinking(
+            "{%- elif message.role == \"assistant\" %}"
+        ));
+
+        let convo = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+            ("assistant".to_string(), "A1".to_string()),
+            ("user".to_string(), "U2".to_string()),
+        ];
+
+        // 3.6 must render byte-identically to before this existed.
+        let legacy = format_qwen3_chat(&convo, false, None, false);
+        assert!(
+            legacy.contains("<|im_start|>assistant\nA1<|im_end|>"),
+            "a checkpoint that does not preserve thinking must be unchanged:\n{legacy}",
+        );
+
+        // 3.8 replays the block, and the result must literally extend the
+        // previous turn's generation prompt — that is the property the session
+        // reuse check tests, so assert it rather than the substring alone.
+        let preserved = format_qwen3_chat(&convo, false, None, true);
+        assert!(
+            preserved.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>"),
+            "3.8 replays the think block:\n{preserved}",
+        );
+        let turn1_prompt = format_qwen3_chat(&convo[..2], false, None, true);
+        assert!(
+            preserved.starts_with(&format!("{turn1_prompt}A1<|im_end|>\n")),
+            "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
+             reused:\nturn1={turn1_prompt:?}\nturn2={preserved:?}",
         );
     }
 

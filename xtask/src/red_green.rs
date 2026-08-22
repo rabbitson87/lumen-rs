@@ -263,6 +263,34 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "replay-drops-think-block",
+        symptom: "`session_id` never reused a single KV token on the Qwen path. \
+                  A `thinking: false` generation prompt ends with \
+                  `<think>\\n\\n</think>\\n\\n` and the reply follows it, but the \
+                  replayed assistant turn was rendered without that block — so \
+                  the new prompt was not a token-prefix of what the model had \
+                  been fed, `prompt.starts_with(stored)` failed at the first \
+                  assistant token, and every turn cold-prefilled the entire \
+                  conversation while reporting nothing. Measured on \
+                  Qwen3.8-27B: a replayed turn occupied 16 tokens of framing \
+                  where generation produced 2. It was also a prompt-fidelity \
+                  bug — 3.8's template defaults `preserve_thinking` to true, so \
+                  lumen was rendering the non-default branch. With a \
+                  6324-token system prompt the fix takes turn 2 from a 48 s \
+                  cold prefill to 0.44 s",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    template.contains("preserve_thinking is undefined")"#,
+            replace: r#"    { let _ = template; false } // defect: replay drops the think block"#,
+        }],
+        guards: &[mlx(
+            "tests::a_replayed_assistant_turn_matches_what_the_model_was_fed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "mtp-drops-sampling-knobs",
         symptom: "the MTP speculative path rebuilt its `SamplingConfig` from a \
                   few scalars with `..default()`, silently dropping `top_k`, \
@@ -1013,7 +1041,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "effort-ungated-in-token-count")
         | (_, "tool-schema-uncounted-in-usage")
         | (_, "qwen-sampling-discarded")
-        | (_, "mtp-drops-sampling-knobs") => "lib.rs",
+        | (_, "mtp-drops-sampling-knobs")
+        | (_, "replay-drops-think-block") => "lib.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
