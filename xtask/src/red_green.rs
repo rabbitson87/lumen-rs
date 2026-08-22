@@ -424,6 +424,38 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "session-reuse-needs-a-nonstandard-field",
+        symptom: "KV reuse on the Qwen plain-chat path was reachable only \
+                  through `session_id` — a Lumen extension that neither the \
+                  OpenAI nor the Anthropic request defines, so no stock client \
+                  sends it and every one of them re-prefilled the entire \
+                  conversation on every turn. The tool path had auto-keyed \
+                  itself from the system hash for ages, and the Gemma arm did \
+                  too; only Qwen's flat path still demanded the field. Fixed by \
+                  letting the prompt identify its own conversation: a session's \
+                  stored tokens are what the model was fed plus what it \
+                  generated, so a session whose tokens are a strict prefix of \
+                  this prompt IS this conversation one turn earlier. That is \
+                  also the gate reuse was always guarded by, so a guessed key \
+                  costs a prefill and never an answer — verified by output: the \
+                  auto path is byte-identical to the explicit-`session_id` path \
+                  on the same conversation. Measured on Qwen3.8-27B with no \
+                  `session_id` anywhere: turn 1 4.55 s, then 0.41 s and 0.40 s",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        .filter(|(_, s)| s.extends(prompt_ids))\n        \
+                   .max_by_key(|(_, s)| s.tokens.len())",
+            replace: "        .filter(|(_, s)| { let _ = (s, prompt_ids); false })\n        \
+                      .max_by_key(|(_, s)| s.tokens.len())",
+        }],
+        guards: &[mlx(
+            "tests::a_prompt_finds_its_own_conversation_without_being_told_which",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "anthropic-output-drops-thinking-block",
         symptom: "the Anthropic route emitted no `thinking` content block, on \
                   either surface — the non-streaming assembler simply never \
@@ -1280,7 +1312,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "tool-schema-uncounted-in-usage")
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
-        | (_, "replay-drops-think-block") => "lib.rs",
+        | (_, "replay-drops-think-block")
+        | (_, "session-reuse-needs-a-nonstandard-field") => "lib.rs",
         // One defect, two files: the wire had no field for the trace *and* the
         // renderer had nowhere to put one. Reverting either half is enough to
         // lose the KV, so both are mutated together.

@@ -1146,6 +1146,61 @@ struct SessionState {
     last_access: Instant,
 }
 
+impl SessionState {
+    /// Is this session exactly `prompt_ids`, one turn earlier?
+    ///
+    /// `tokens` is what the model was fed plus what it generated, so a strict
+    /// prefix match means the KV behind this sequence is a prefix of the KV this
+    /// prompt needs — the suffix can be appended instead of re-prefilling the
+    /// whole conversation. It is also the *only* thing that makes reuse safe, so
+    /// key selection can be a guess: a wrong guess costs a prefill, never an
+    /// answer.
+    fn extends(&self, prompt_ids: &[u32]) -> bool {
+        !self.tokens.is_empty()
+            && prompt_ids.len() > self.tokens.len()
+            && prompt_ids.starts_with(&self.tokens)
+    }
+}
+
+/// Key prefix for sessions the server invented rather than the client naming.
+const AUTO_SESSION_PREFIX: &str = "auto/";
+
+/// How many server-invented sessions to keep alive.
+///
+/// Bounded where an explicit session is not, and deliberately: a client that
+/// names a session has said it will come back, while an auto session is our
+/// guess, and each one holds a whole conversation's KV until it is evicted. Two
+/// covers the case this exists for — a conversation growing turn by turn — plus
+/// one alternate interleaved with it. `LUMEN_MLX_SESSION_MAX` still caps the
+/// pool as a whole for an operator who wants a harder bound.
+const AUTO_SESSION_MAX: usize = 2;
+
+lumen_flags::flag! {
+    /// Reuse a conversation's KV without the client naming a session.
+    ///
+    /// Neither the OpenAI nor the Anthropic request has a conversation id, and
+    /// `session_id` is a Lumen extension no stock client sends — so without
+    /// this, every spec-conformant client re-prefilled its whole conversation
+    /// on every turn. ON matches the prompt against live sessions by token
+    /// prefix instead, which needs no cooperation and cannot be wrong: the same
+    /// `starts_with` gate guards the reuse itself.
+    ///
+    /// **`Behavior`, not `Optimization`, and measured rather than assumed.**
+    /// Extending a KV cache and prefilling the same prompt whole are different
+    /// reduction orders, so their logits differ in the last bits and a greedy
+    /// argmax can flip on a near-tie. On Qwen3.8-27B the answers matched
+    /// ("Blue", "Yellow") while the reasoning traces were worded differently.
+    /// Each path is deterministic and stable across runs; they just are not
+    /// each other, so the equivalence matrix must never flip this. Not a new
+    /// property — the explicit-`session_id` path has always had it, and this
+    /// output is byte-identical to that path's.
+    pub(crate) auto_session_enabled {
+        env: "LUMEN_MLX_AUTO_SESSION",
+        default: true,
+        kind: Behavior,
+    }
+}
+
 /// Read session-eviction limits from env. Both default to "no limit".
 ///
 /// - `LUMEN_MLX_SESSION_TTL_SECS=N` — drop sessions idle > N seconds.
@@ -1986,19 +2041,21 @@ impl MlxBackend {
                     );
                 }
                 let _ = tool_choice;
-                let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(
-                        messages,
-                        max_new_tokens,
-                        thinking,
-                        sid,
-                        |_| {},
-                        effort,
-                    )?
-                } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {}, effort)?
-                };
+                // Always the session path. Without an explicit id the prompt
+                // identifies its own conversation (see `resolve_session_key`),
+                // which is the only way reuse is reachable from a stock OpenAI
+                // or Anthropic request — neither carries a conversation id, and
+                // `session_id` is a Lumen extension no such client sends. Before
+                // this, a client that did not know about it re-prefilled the
+                // whole conversation on every turn.
+                let visible = m.chat_streaming_session(
+                    messages,
+                    max_new_tokens,
+                    thinking,
+                    session_id,
+                    |_| {},
+                    effort,
+                )?;
                 // With thinking ON the prompt opened the `<think>` block, so
                 // the model's output starts mid-trace and closes with a bare
                 // `</think>`. Splitting it here is what stops the raw
@@ -2645,26 +2702,17 @@ impl MlxBackend {
                             let _ = on_event(BackendStreamEvent::Text(&visible));
                         }
                     };
-                    if let Some(sid) = session_id {
-                        m.chat_streaming_session(
-                            messages,
-                            max_new_tokens,
-                            thinking,
-                            sid,
-                            &mut text_adapter,
-                            effort,
-                        )?
-                    } else {
-                        let seq_id = m.alloc_seq_id();
-                        m.chat_streaming(
-                            messages,
-                            max_new_tokens,
-                            thinking,
-                            seq_id,
-                            &mut text_adapter,
-                            effort,
-                        )?
-                    }
+                    // See the non-streaming twin: the session path is
+                    // unconditional now, because the prompt identifies its own
+                    // conversation when the client cannot.
+                    m.chat_streaming_session(
+                        messages,
+                        max_new_tokens,
+                        thinking,
+                        session_id,
+                        &mut text_adapter,
+                        effort,
+                    )?
                 };
                 // A tail still held at the end never closed, so it was all
                 // trace — flush it rather than dropping it.
@@ -3062,6 +3110,11 @@ pub struct MlxQwen35Backend {
     tokenizer: Option<Tokenizer>,
     next_seq_id: AtomicU64,
     sessions: std::collections::HashMap<String, SessionState>,
+    /// Monotonic counter for `auto/N` session keys.
+    auto_session_seq: u64,
+    /// Cap on server-invented sessions; `0` disables them. See
+    /// [`read_auto_session_max`].
+    auto_session_max: usize,
     session_ttl: Option<Duration>,
     session_max: Option<usize>,
     prefix_store: prefix_cache::PrefixCacheStore,
@@ -3158,6 +3211,12 @@ impl MlxQwen35Backend {
             tokenizer: Some(tokenizer),
             next_seq_id: AtomicU64::new(1),
             sessions: std::collections::HashMap::new(),
+            auto_session_seq: 0,
+            auto_session_max: if auto_session_enabled::get() {
+                AUTO_SESSION_MAX
+            } else {
+                0
+            },
             session_ttl: None,
             session_max: None,
             prefix_store: prefix_cache::PrefixCacheStore::from_env(),
@@ -3281,6 +3340,12 @@ impl MlxQwen35Backend {
             tokenizer,
             next_seq_id: AtomicU64::new(1),
             sessions: std::collections::HashMap::new(),
+            auto_session_seq: 0,
+            auto_session_max: if auto_session_enabled::get() {
+                AUTO_SESSION_MAX
+            } else {
+                0
+            },
             session_ttl,
             session_max,
             prefix_store,
@@ -6863,7 +6928,7 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         max_new_tokens: usize,
         thinking: bool,
-        session_id: &str,
+        session_id: Option<&str>,
         mut on_token: F,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
@@ -6876,14 +6941,11 @@ impl MlxQwen35Backend {
         }
 
         self.evict_stale_sessions();
+        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
 
         // Decide: reuse existing session, or start fresh.
-        let (seq_id, mut last, mut pos, fresh) = match self.sessions.get(session_id) {
-            Some(state)
-                if !state.tokens.is_empty()
-                    && prompt_ids.len() > state.tokens.len()
-                    && prompt_ids.starts_with(&state.tokens) =>
-            {
+        let (seq_id, mut last, mut pos, fresh) = match self.sessions.get(session_id.as_str()) {
+            Some(state) if state.extends(&prompt_ids) => {
                 let suffix = prompt_ids[state.tokens.len()..].to_vec();
                 let seq_id = state.seq_id;
                 let cached_len = state.tokens.len();
@@ -6963,8 +7025,48 @@ impl MlxQwen35Backend {
                 last_access: Instant::now(),
             },
         );
+        self.evict_excess_auto_sessions();
 
         Ok(out)
+    }
+
+    /// Which session key this request should use.
+    ///
+    /// An explicit id is taken as given — the client is managing the session and
+    /// gets exactly the behaviour it always had. Without one, the prompt itself
+    /// identifies the conversation: see [`longest_prefix_session`]. Only when
+    /// nothing matches is a new `auto/N` key minted, and only if auto sessions
+    /// are enabled at all.
+    ///
+    /// Returning a fresh key when auto sessions are off is what keeps the old
+    /// behaviour intact: nothing will ever match it, so the turn cold-prefills
+    /// and `evict_excess_auto_sessions` drops it again immediately.
+    fn resolve_session_key(&mut self, session_id: Option<&str>, prompt_ids: &[u32]) -> String {
+        if let Some(id) = session_id {
+            return id.to_string();
+        }
+        if self.auto_session_max > 0
+            && let Some(k) = longest_prefix_session(&self.sessions, prompt_ids)
+        {
+            return k;
+        }
+        self.auto_session_seq += 1;
+        format!("{AUTO_SESSION_PREFIX}{}", self.auto_session_seq)
+    }
+
+    /// Drop auto sessions past the cap, oldest first, releasing their KV.
+    fn evict_excess_auto_sessions(&mut self) {
+        for key in pick_auto_session_victims(&self.sessions, self.auto_session_max) {
+            if let Some(state) = self.sessions.remove(&key) {
+                let _ = self.runner.remove_seq(state.seq_id);
+                eprintln!(
+                    "[mlx] session={key:?} evicted (auto-session cap {}); freed seq {} ({} tokens)",
+                    self.auto_session_max,
+                    state.seq_id,
+                    state.tokens.len()
+                );
+            }
+        }
     }
 
     /// Non-streaming completion (raw text path used by `/v1/completions`) with
@@ -7081,6 +7183,57 @@ impl MlxQwen35Backend {
             }
         }
     }
+}
+
+/// Which live session a prompt should extend, when the client named none.
+///
+/// A session's `tokens` are what the model was fed plus what it generated, so a
+/// session whose tokens are a strict prefix of this prompt **is** this
+/// conversation one turn earlier — no id required, and none available: neither
+/// the OpenAI nor the Anthropic request has a conversation identifier, and
+/// `session_id` is a Lumen extension no stock client sends. Matching on the
+/// tokens instead is what makes reuse reachable from a spec-conformant request.
+///
+/// The longest match wins, so a conversation that has grown extends its own
+/// newest state rather than an older snapshot of itself.
+///
+/// Explicit sessions are candidates too: a client that named a session on turn
+/// one and omitted it on turn two still continues the same conversation.
+fn longest_prefix_session(
+    sessions: &std::collections::HashMap<String, SessionState>,
+    prompt_ids: &[u32],
+) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|(_, s)| s.extends(prompt_ids))
+        .max_by_key(|(_, s)| s.tokens.len())
+        .map(|(k, _)| k.clone())
+}
+
+/// LRU victims among the **auto** sessions only, once they exceed `max`.
+///
+/// Explicit sessions are exempt: naming one is the client saying it will come
+/// back, while an auto session is our guess, and each holds a whole
+/// conversation's KV until dropped. `max == 0` means auto sessions are off, in
+/// which case every one of them is a victim.
+fn pick_auto_session_victims(
+    sessions: &std::collections::HashMap<String, SessionState>,
+    max: usize,
+) -> Vec<String> {
+    let mut autos: Vec<(&String, Instant)> = sessions
+        .iter()
+        .filter(|(k, _)| k.starts_with(AUTO_SESSION_PREFIX))
+        .map(|(k, s)| (k, s.last_access))
+        .collect();
+    if autos.len() <= max {
+        return Vec::new();
+    }
+    // Oldest first, drop until the cap is met.
+    autos.sort_by_key(|&(_, t)| t);
+    autos[..autos.len() - max]
+        .iter()
+        .map(|(k, _)| (*k).clone())
+        .collect()
 }
 
 /// Pure helper for `evict_stale_sessions`: picks (key, human_reason) pairs
@@ -7616,6 +7769,114 @@ mod tests {
             tokens: vec![1, 2, 3],
             last_access,
         }
+    }
+
+    fn session_with(tokens: Vec<u32>, last_access: Instant) -> SessionState {
+        SessionState {
+            seq_id: 0,
+            tokens,
+            last_access,
+        }
+    }
+
+    /// A stock OpenAI or Anthropic request carries no conversation id, and
+    /// `session_id` is a Lumen extension no such client sends — so before this,
+    /// every one of them re-prefilled the whole conversation, every turn.
+    ///
+    /// The prompt identifies its own conversation instead: a session's tokens
+    /// are what the model was fed plus what it generated, so a strict prefix
+    /// match is that conversation, one turn earlier.
+    #[test]
+    fn a_prompt_finds_its_own_conversation_without_being_told_which() {
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert("auto/1".to_string(), session_with(vec![1, 2, 3], now));
+        // A longer state of the SAME conversation must win, so a growing chat
+        // extends its newest turn rather than an older snapshot of itself.
+        map.insert("auto/2".to_string(), session_with(vec![1, 2, 3, 4, 5], now));
+        // …and an unrelated conversation must not match at all.
+        map.insert("auto/3".to_string(), session_with(vec![9, 9], now));
+
+        assert_eq!(
+            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6]).as_deref(),
+            Some("auto/2")
+        );
+        // An explicit session is a candidate too — a client may name one on
+        // turn 1 and omit it afterwards.
+        map.insert(
+            "mine".to_string(),
+            session_with(vec![1, 2, 3, 4, 5, 6], now),
+        );
+        assert_eq!(
+            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6, 7]).as_deref(),
+            Some("mine")
+        );
+    }
+
+    /// The guard that makes guessing a key safe at all.
+    #[test]
+    fn a_session_only_extends_a_prompt_that_actually_continues_it() {
+        let now = Instant::now();
+        let s = session_with(vec![1, 2, 3], now);
+        assert!(s.extends(&[1, 2, 3, 4]));
+        // Identical, not longer: there is nothing to append, and re-running it
+        // as an extension would decode from the wrong position.
+        assert!(!s.extends(&[1, 2, 3]));
+        assert!(!s.extends(&[1, 2]));
+        // Divergent at the last token — the case a system-hash key would get
+        // wrong and this cannot.
+        assert!(!s.extends(&[1, 2, 4, 5]));
+        // An empty session has no KV to reuse.
+        assert!(!session_with(Vec::new(), now).extends(&[1, 2, 3]));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("auto/1".to_string(), s);
+        assert!(longest_prefix_session(&map, &[7, 8, 9]).is_none());
+    }
+
+    /// Auto sessions are capped where explicit ones are not: naming a session
+    /// is the client saying it will come back, while an auto one is our guess,
+    /// and each holds a whole conversation's KV until dropped.
+    #[test]
+    fn only_the_sessions_the_server_invented_are_capped() {
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "auto/1".to_string(),
+            session_with(vec![1], now - Duration::from_secs(30)),
+        );
+        map.insert(
+            "auto/2".to_string(),
+            session_with(vec![2], now - Duration::from_secs(20)),
+        );
+        map.insert(
+            "auto/3".to_string(),
+            session_with(vec![3], now - Duration::from_secs(10)),
+        );
+        map.insert(
+            "named".to_string(),
+            session_with(vec![4], now - Duration::from_secs(99)),
+        );
+
+        // Oldest auto first; the named one is exempt however stale it is.
+        assert_eq!(
+            pick_auto_session_victims(&map, 2),
+            vec!["auto/1".to_string()]
+        );
+        assert_eq!(
+            pick_auto_session_victims(&map, 1),
+            vec!["auto/1".to_string(), "auto/2".to_string()]
+        );
+        // `0` disables auto sessions — every one of them goes, the named one stays.
+        assert_eq!(
+            pick_auto_session_victims(&map, 0),
+            vec![
+                "auto/1".to_string(),
+                "auto/2".to_string(),
+                "auto/3".to_string()
+            ]
+        );
+        assert!(pick_auto_session_victims(&map, 8).is_empty());
     }
 
     #[test]

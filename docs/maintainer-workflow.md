@@ -421,7 +421,7 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
-| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and the Anthropic trace round-trips in both directions — a replayed `thinking` block is answered rather than rejected, and our own `content[]` handed straight back reuses KV (`reuse cached=321 suffix=15` / 283 ms streaming and not, against `divergent` → 2237 ms when the block is dropped), with the SSE indices coming out `thinking@0, text@1, tool_use@2` |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and the Anthropic trace round-trips in both directions — a replayed `thinking` block is answered rather than rejected, and our own `content[]` handed straight back reuses KV (`reuse cached=321 suffix=15` / 283 ms streaming and not, against `divergent` → 2237 ms when the block is dropped), with the SSE indices coming out `thinking@0, text@1, tool_use@2`; a stock client sending **no `session_id` at all** reuses KV on both APIs (OpenAI turn 1 4.55 s → 0.41 s → 0.40 s; Anthropic 2.12 s → 0.93 s), byte-identical to the explicit-`session_id` path |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
 
@@ -478,6 +478,32 @@ Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope insid
 `content` (ours again, under `LUMEN_REASONING_IN_CONTENT=1`). They are folded to
 one representation in `ChatMessage`'s `Deserialize` so the renderers, the
 prefix-cache key and the token count cannot each decide separately.
+
+**A feature reachable only through a non-standard field is not reachable.**
+KV reuse on the Qwen plain-chat path needed `session_id`, which is a Lumen
+extension: neither the OpenAI nor the Anthropic request defines it, so no stock
+client sends one and every one of them re-prefilled its whole conversation, every
+turn. Every measurement of the win had been taken with `session_id` set by hand,
+which is why it looked fine. When you verify an optimization, send the request a
+real client would send — and note that the tool path and the Gemma arm had
+auto-keyed themselves for ages, so this was one arm of three, again.
+
+The fix is to let the prompt identify its own conversation: a session's stored
+tokens are what the model was fed plus what it generated, so a session whose
+tokens are a strict prefix of this prompt *is* this conversation one turn
+earlier. That is also the gate reuse was already guarded by, which is what makes
+guessing safe — a wrong guess costs a prefill, never an answer. Verified by
+output rather than by argument: the auto path is byte-identical to the
+explicit-`session_id` path on the same conversation.
+
+**Reuse is not bit-identical to a cold prefill, and that is worth stating.**
+Extending a KV cache and prefilling the same prompt whole are different reduction
+orders, so a greedy argmax can flip on a near-tie. Measured on Qwen3.8-27B: the
+answers matched ("Blue", "Yellow") while the reasoning traces were worded
+differently. Each path is deterministic and stable across runs — they are just
+not each other. The session path has always had this; `LUMEN_MLX_AUTO_SESSION`
+only changes who reaches it, which is why it is registered `Behavior` and the
+equivalence matrix must never flip it.
 
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to

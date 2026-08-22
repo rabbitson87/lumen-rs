@@ -17,6 +17,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
@@ -89,6 +90,29 @@ Fuse routing into the expert dispatch, replacing the two-slot
 *Optimization, default on.*
 
 Fuse the attention logit softcap. Output-identical.
+
+### `LUMEN_MLX_AUTO_SESSION`
+
+*Behavior, default on.*
+
+Reuse a conversation's KV without the client naming a session.
+
+ Neither the OpenAI nor the Anthropic request has a conversation id, and
+ `session_id` is a Lumen extension no stock client sends — so without
+ this, every spec-conformant client re-prefilled its whole conversation
+ on every turn. ON matches the prompt against live sessions by token
+ prefix instead, which needs no cooperation and cannot be wrong: the same
+ `starts_with` gate guards the reuse itself.
+
+ **`Behavior`, not `Optimization`, and measured rather than assumed.**
+ Extending a KV cache and prefilling the same prompt whole are different
+ reduction orders, so their logits differ in the last bits and a greedy
+ argmax can flip on a near-tie. On Qwen3.8-27B the answers matched
+ ("Blue", "Yellow") while the reasoning traces were worded differently.
+ Each path is deterministic and stable across runs; they just are not
+ each other, so the equivalence matrix must never flip this. Not a new
+ property — the explicit-`session_id` path has always had it, and this
+ output is byte-identical to that path's.
 
 ### `LUMEN_MLX_KV_BF16`
 
