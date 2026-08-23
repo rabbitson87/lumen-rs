@@ -3023,26 +3023,11 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => {
                 let _ = (temperature, top_p, ov);
-                if let Some(sid) = session_id {
-                    return m.completion_session(input_ids, max_new_tokens, sid);
-                }
-                let seq_id = m.alloc_seq_id();
-                let (mut last, mut pos) = m.prefill(seq_id, input_ids)?;
-                let mut out: Vec<u32> = vec![last];
-                let eos = m.eos_tokens().to_vec();
-                if !eos.contains(&last) {
-                    for _ in 1..max_new_tokens {
-                        let (n, p) = m.decode_step(seq_id, last, pos)?;
-                        last = n;
-                        pos = p;
-                        out.push(n);
-                        if eos.contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                m.remove_seq(seq_id).ok();
-                Ok(out)
+                // Unconditional, like the chat twin: without an explicit id the
+                // prompt identifies its own continuation, so a client that
+                // re-sends prompt + completion + more extends the KV instead of
+                // prefilling all of it again.
+                m.completion_session(input_ids, max_new_tokens, session_id)
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
@@ -7093,7 +7078,7 @@ impl MlxQwen35Backend {
         &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
-        session_id: &str,
+        session_id: Option<&str>,
     ) -> Result<Vec<u32>> {
         if input_ids.is_empty() {
             return Err(anyhow!("empty prompt"));
@@ -7102,13 +7087,13 @@ impl MlxQwen35Backend {
         self.evict_stale_sessions();
 
         let prompt_ids: Vec<u32> = input_ids.to_vec();
+        // Same resolution as the chat path: `/v1/completions` has no
+        // conversation id either, and a client extending a raw prompt with what
+        // the model just wrote is the same prefix relationship a chat turn is.
+        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
 
-        let (seq_id, mut last, mut pos) = match self.sessions.get(session_id) {
-            Some(state)
-                if !state.tokens.is_empty()
-                    && prompt_ids.len() > state.tokens.len()
-                    && prompt_ids.starts_with(&state.tokens) =>
-            {
+        let (seq_id, mut last, mut pos) = match self.sessions.get(session_id.as_str()) {
+            Some(state) if state.extends(&prompt_ids) => {
                 let suffix = prompt_ids[state.tokens.len()..].to_vec();
                 let seq_id = state.seq_id;
                 let cached_len = state.tokens.len();
@@ -7166,6 +7151,7 @@ impl MlxQwen35Backend {
                 last_access: Instant::now(),
             },
         );
+        self.evict_excess_auto_sessions();
 
         Ok(generated)
     }

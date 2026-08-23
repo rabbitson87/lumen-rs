@@ -498,6 +498,9 @@ the streaming surface, so splitting the batch surface alone would trade one
 inconsistency for another.
 
 **A feature reachable only through a non-standard field is not reachable.**
+(`/v1/chat/completions`, `/v1/messages` and `/v1/completions` all resolve the
+session from the prompt now; only the last still had an explicit-id-or-nothing
+branch, whose no-session fallback was deleted rather than left unreachable.)
 KV reuse on the Qwen plain-chat path needed `session_id`, which is a Lumen
 extension: neither the OpenAI nor the Anthropic request defines it, so no stock
 client sends one and every one of them re-prefilled its whole conversation, every
