@@ -70,8 +70,8 @@ use anyhow::{Result, anyhow};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::chat_io::{
-    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, ReasoningEffort,
-    ResolvedToolChoice, ToolDef, split_reasoning_envelope,
+    AssistantToolCall, ChatTurn, ParsedResponse, ParsedToolCall, REASONING_CLOSE, REASONING_OPEN,
+    ReasoningEffort, ResolvedToolChoice, ToolDef, split_reasoning_envelope,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +170,70 @@ fn tool_def_to_json(tool: &ToolDef<'_>) -> JsonValue {
     JsonValue::Object(obj)
 }
 
+/// Remove any `</think>` the model closed without having opened one itself.
+///
+/// A reasoning-first checkpoint sometimes writes a short trace and closes it
+/// even when the prompt handed it an already-closed block — measured on
+/// Qwen3.8-27B, `'Blue\n</think>\n\nBlue'` for a thinking-**off** request. Never
+/// at temperature 0 (0/16) and rarely when sampling (1/32 at 0.8, 2/6 at the
+/// 0.7 default), so it is the model's doing and not a prompt defect: the
+/// rendered generation prompt ends with a closed `<think>\n\n</think>\n\n`.
+///
+/// Dropping it rather than re-reading it as a delimiter is deliberate. The
+/// tool-aware parser has always dropped an unbalanced close, so this is what
+/// makes the two paths agree — the same reply currently comes back differently
+/// depending only on whether the request carried tools. And the text before the
+/// tag cannot be moved to `reasoning` on the streaming surface, because it has
+/// already gone out as content deltas; splitting non-streaming alone would make
+/// the two surfaces disagree instead.
+///
+/// A *balanced* pair is left alone: a model quoting `<think>…</think>` in its
+/// answer is showing the syntax, not delimiting anything.
+pub fn strip_unbalanced_think_close(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut depth = 0usize;
+    strip_think_close_tracking(text, &mut depth)
+}
+
+/// [`strip_unbalanced_think_close`] with the open-tag depth owned by the
+/// caller, so a streaming splitter can carry it across deltas.
+///
+/// Chunk-local depth would be useless here: a balanced `<think>…</think>` the
+/// model quotes almost always spans several decode steps, so every close would
+/// look unbalanced and the protection would never fire.
+fn strip_think_close_tracking<'a>(text: &'a str, depth: &mut usize) -> std::borrow::Cow<'a, str> {
+    if !text.contains(REASONING_CLOSE) {
+        *depth += text.matches(REASONING_OPEN).count();
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let open = rest.find(REASONING_OPEN);
+        let close = rest.find(REASONING_CLOSE);
+        match (open, close) {
+            (Some(o), c) if c.is_none_or(|c| o < c) => {
+                *depth += 1;
+                out.push_str(&rest[..o + REASONING_OPEN.len()]);
+                rest = &rest[o + REASONING_OPEN.len()..];
+            }
+            (_, Some(c)) => {
+                out.push_str(&rest[..c]);
+                if *depth > 0 {
+                    *depth -= 1;
+                    out.push_str(REASONING_CLOSE);
+                }
+                rest = &rest[c + REASONING_CLOSE.len()..];
+            }
+            // No close left — nothing further to strip.
+            (Some(_), None) | (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Split a plain (no-tools) turn generated with thinking ON into
 /// `(reasoning, visible)`.
 ///
@@ -203,6 +267,8 @@ pub fn split_open_think(text: &str) -> (&str, &str) {
 pub struct ThinkingSplitter {
     phase: Phase,
     held: String,
+    /// Open `<think>` tags the model has emitted itself, carried across deltas.
+    open_depth: usize,
 }
 
 #[derive(PartialEq)]
@@ -228,13 +294,23 @@ impl ThinkingSplitter {
                 Phase::Visible
             },
             held: String::new(),
+            open_depth: 0,
         }
     }
 
     /// Feed one decoded delta; returns `(reasoning_delta, visible_delta)`.
     pub fn feed(&mut self, delta: &str) -> (String, String) {
         if self.phase == Phase::Visible {
-            return (String::new(), delta.to_string());
+            // A reasoning-first checkpoint sometimes closes a block it never
+            // opened, even on a thinking-off turn. Hold back only what could
+            // still grow into the tag (≤7 bytes, so no measurable latency) and
+            // drop it when it completes — see `strip_unbalanced_think_close`
+            // for why dropping rather than re-splitting.
+            self.held.push_str(delta);
+            let keep = partial_tail_len(&self.held, REASONING_CLOSE);
+            let flushable: String = self.held.drain(..self.held.len() - keep).collect();
+            let visible = strip_think_close_tracking(&flushable, &mut self.open_depth);
+            return (String::new(), visible.into_owned());
         }
         self.held.push_str(delta);
         let mut reasoning = String::new();
@@ -268,12 +344,17 @@ impl ThinkingSplitter {
         (reasoning, std::mem::take(&mut self.held))
     }
 
-    /// Anything still held when decoding stops was never closed, so it was all
-    /// trace — except a lone separator, which belongs to the delimiter.
-    pub fn finish(self) -> String {
+    /// Tails still held when decoding stops, as `(reasoning, visible)`.
+    ///
+    /// In `Trace` the held bytes were never closed, so they were all trace. In
+    /// `Visible` they are a partial close tag that never completed and belong
+    /// to the answer. In `AfterTag` they can only be the delimiter's own
+    /// separator, which is dropped.
+    pub fn finish(self) -> (String, String) {
         match self.phase {
-            Phase::Trace => self.held,
-            _ => String::new(),
+            Phase::Trace => (self.held, String::new()),
+            Phase::Visible => (String::new(), self.held),
+            Phase::AfterTag => (String::new(), String::new()),
         }
     }
 }
@@ -1498,7 +1579,7 @@ mod tests {
                 reasoning.push_str(&r);
                 visible.push_str(&v);
             }
-            reasoning.push_str(&s.finish());
+            reasoning.push_str(&s.finish().0);
             assert_eq!(
                 visible, "Red",
                 "cut after {cut} leaked the tag or the trace"
@@ -1511,7 +1592,71 @@ mod tests {
     fn the_streaming_splitter_is_a_pass_through_when_thinking_is_off() {
         let mut s = ThinkingSplitter::new(false);
         assert_eq!(s.feed("Red"), (String::new(), "Red".to_string()));
-        assert_eq!(s.finish(), "");
+        assert_eq!(s.finish(), (String::new(), String::new()));
+    }
+
+    /// A reasoning-first checkpoint sometimes closes a block it never opened,
+    /// even on a thinking-OFF turn where the prompt handed it a closed one.
+    ///
+    /// Measured on Qwen3.8-27B: `'Blue\n</think>\n\nBlue'`. Never at
+    /// temperature 0 (0/16), rarely when sampling (1/32 at 0.8, 2/6 at the 0.7
+    /// default) — so it is the model's doing, not a prompt defect: the rendered
+    /// generation prompt ends with a closed `<think>\n\n</think>\n\n`.
+    ///
+    /// The tool-aware parser has always dropped an unbalanced close, so the
+    /// same reply used to come back differently depending only on whether the
+    /// request carried tools.
+    #[test]
+    fn a_stray_close_tag_never_reaches_the_answer() {
+        assert_eq!(
+            strip_unbalanced_think_close("Blue\n</think>\n\nBlue"),
+            "Blue\n\n\nBlue"
+        );
+        // Nothing to strip: borrowed, not rebuilt.
+        assert!(matches!(
+            strip_unbalanced_think_close("just an answer"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A model showing the syntax is not delimiting anything.
+        assert_eq!(
+            strip_unbalanced_think_close("use <think>x</think> like so"),
+            "use <think>x</think> like so"
+        );
+        // …but a second, unmatched close after a balanced pair still goes.
+        assert_eq!(
+            strip_unbalanced_think_close("<think>a</think>b</think>c"),
+            "<think>a</think>bc"
+        );
+    }
+
+    /// The streaming surface has to reach the same answer as the batch one,
+    /// including when the tag is split across decode steps and when a balanced
+    /// pair spans them — chunk-local depth would call every close unbalanced.
+    #[test]
+    fn the_streaming_splitter_drops_a_stray_close_the_same_way() {
+        for chunks in [
+            vec!["Blue\n", "</think>", "\n\nBlue"],
+            vec!["Blue\n<", "/think", ">\n\nBlue"],
+            vec!["Blue\n</thi", "nk>\n\nBlue"],
+        ] {
+            let mut s = ThinkingSplitter::new(false);
+            let mut visible = String::new();
+            for c in &chunks {
+                visible.push_str(&s.feed(c).1);
+            }
+            let (r, v) = s.finish();
+            visible.push_str(&v);
+            assert!(r.is_empty());
+            assert_eq!(visible, "Blue\n\n\nBlue", "chunks {chunks:?}");
+        }
+        // Balanced across chunks: nothing is dropped.
+        let mut s = ThinkingSplitter::new(false);
+        let mut visible = String::new();
+        for c in ["use <think>", "x", "</think> like so"] {
+            visible.push_str(&s.feed(c).1);
+        }
+        visible.push_str(&s.finish().1);
+        assert_eq!(visible, "use <think>x</think> like so");
     }
 
     /// The trace has to be emitted as it arrives, not only accumulated.

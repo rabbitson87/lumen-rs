@@ -2071,8 +2071,14 @@ impl MlxBackend {
                 } else {
                     ("", visible.as_str())
                 };
+                // A reasoning-first checkpoint sometimes closes a block it
+                // never opened. The tool-aware parser has always dropped that
+                // stray tag; doing the same here is what stops the identical
+                // reply coming back differently depending only on whether the
+                // request carried tools.
+                let visible = crate::qwen3_5_tools::strip_unbalanced_think_close(visible);
                 Ok(ParsedResponse {
-                    visible: visible.to_string(),
+                    visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })
@@ -2714,11 +2720,15 @@ impl MlxBackend {
                         effort,
                     )?
                 };
-                // A tail still held at the end never closed, so it was all
-                // trace — flush it rather than dropping it.
-                let tail = splitter.finish();
-                if !tail.is_empty() {
-                    let _ = on_event(BackendStreamEvent::Reasoning(&tail));
+                // Tails still held at the end: an unclosed trace, or a partial
+                // close tag that never completed and therefore belongs to the
+                // answer. Flush both rather than dropping either.
+                let (reasoning_tail, visible_tail) = splitter.finish();
+                if !reasoning_tail.is_empty() {
+                    let _ = on_event(BackendStreamEvent::Reasoning(&reasoning_tail));
+                }
+                if !visible_tail.is_empty() {
+                    let _ = on_event(BackendStreamEvent::Text(&visible_tail));
                 }
                 // With thinking ON the prompt opened the `<think>` block, so
                 // the model's output starts mid-trace and closes with a bare
@@ -2735,8 +2745,14 @@ impl MlxBackend {
                 } else {
                     ("", visible.as_str())
                 };
+                // A reasoning-first checkpoint sometimes closes a block it
+                // never opened. The tool-aware parser has always dropped that
+                // stray tag; doing the same here is what stops the identical
+                // reply coming back differently depending only on whether the
+                // request carried tools.
+                let visible = crate::qwen3_5_tools::strip_unbalanced_think_close(visible);
                 Ok(ParsedResponse {
-                    visible: visible.to_string(),
+                    visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })

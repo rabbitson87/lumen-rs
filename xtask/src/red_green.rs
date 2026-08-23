@@ -424,6 +424,41 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "stray-think-close-reaches-the-answer",
+        symptom: "a reasoning-first checkpoint sometimes closes a `<think>` \
+                  block it never opened, even on a thinking-OFF turn where the \
+                  prompt handed it an already-closed one. Measured on \
+                  Qwen3.8-27B: `'Blue\\n</think>\\n\\nBlue'` — never at \
+                  temperature 0 (0/16), rarely when sampling (1/32 at 0.8, 2/6 \
+                  at the 0.7 default), so it is the model's doing and not a \
+                  prompt defect: the rendered generation prompt ends with a \
+                  closed `<think>\\n\\n</think>\\n\\n`, checked by rendering it. \
+                  The tool-aware parser has dropped an unbalanced close since \
+                  it was written, so the identical reply came back one way with \
+                  tools attached and another way without — the plain path \
+                  handed the raw delimiter to the client. Dropping rather than \
+                  re-reading it as a delimiter is deliberate: the text before \
+                  it cannot be moved to `reasoning` on the streaming surface \
+                  because it has already gone out as content deltas, so \
+                  splitting the batch surface alone would make the two \
+                  disagree instead. A balanced pair the model quotes is left \
+                  alone, and the depth is carried across deltas because such a \
+                  pair almost always spans decode steps",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                out.push_str(&rest[..c]);\n                if *depth > 0 {",
+            replace: "                out.push_str(&rest[..c]);\n                \
+                      if true { // defect: the stray tag survives",
+        }],
+        guards: &[
+            mlx("qwen3_5_tools::tests::a_stray_close_tag_never_reaches_the_answer"),
+            mlx("qwen3_5_tools::tests::the_streaming_splitter_drops_a_stray_close_the_same_way"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "session-reuse-needs-a-nonstandard-field",
         symptom: "KV reuse on the Qwen plain-chat path was reachable only \
                   through `session_id` — a Lumen extension that neither the \
@@ -1323,7 +1358,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tools-replay-doubles-think-block")
         | (_, "qwen-plain-path-never-split-reasoning")
         | (_, "qwen-thinking-trace-served-as-the-answer")
-        | (_, "qwen-tool-stream-drops-the-trace") => "qwen3_5_tools.rs",
+        | (_, "qwen-tool-stream-drops-the-trace")
+        | (_, "stray-think-close-reaches-the-answer") => "qwen3_5_tools.rs",
         (_, "anthropic-output-drops-thinking-block") => "engine.rs",
         (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",

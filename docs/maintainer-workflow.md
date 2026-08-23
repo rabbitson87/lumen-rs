@@ -479,6 +479,24 @@ Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope insid
 one representation in `ChatMessage`'s `Deserialize` so the renderers, the
 prefix-cache key and the token count cannot each decide separately.
 
+**Before blaming the model, render the prompt.** A thinking-OFF reply came back
+as `'Blue\n</think>\n\nBlue'`, and the obvious reading — "we rendered the prompt
+wrong" — was wrong: rendering the exact conversation through
+`format_qwen3_chat` showed the generation prompt ending with a properly closed
+`<think>\n\n</think>\n\n`. It really is the checkpoint, and only when sampling
+(0/16 at temperature 0, 1/32 at 0.8, 2/6 at the 0.7 default), which is also why
+it looked like a one-off. Reproduce at the temperature the default actually uses
+before calling anything rare.
+
+Filtering it is still right, and **not** as a model-specific special case: the
+tool-aware parser has dropped an unbalanced close since it was written, so the
+identical reply came back one way with tools attached and another way without.
+Fixing the plain path is making three surfaces agree, not patching one model.
+Note what the fix does *not* do — it drops the tag rather than re-reading it as a
+delimiter, because the text before it has already gone out as content deltas on
+the streaming surface, so splitting the batch surface alone would trade one
+inconsistency for another.
+
 **A feature reachable only through a non-standard field is not reachable.**
 KV reuse on the Qwen plain-chat path needed `session_id`, which is a Lumen
 extension: neither the OpenAI nor the Anthropic request defines it, so no stock
