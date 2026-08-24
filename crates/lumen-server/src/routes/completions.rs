@@ -26,7 +26,7 @@ pub async fn handle(
             *response.status_mut() = StatusCode::from_u16(200)?;
         }
         Err(e) => {
-            let err = ErrorResponse::new(format!("inference error: {e}"), 500);
+            let err = ErrorResponse::new(crate::types::inference_error_message(&e), 500);
             response.body_mut().set_arena_json(&err)?;
             *response.status_mut() = StatusCode::from_u16(500)?;
         }

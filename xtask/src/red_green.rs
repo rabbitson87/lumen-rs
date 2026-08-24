@@ -459,6 +459,33 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "inference-error-drops-its-cause",
+        symptom: "an inference failure reached the client naming only its \
+                  outermost context. A Metal out-of-memory arrived as \
+                  `\"inference error: native mlx-rs runner: prefill forward \
+                  (seq_id=3)\"` — true, and useless: the link that says the GPU \
+                  ran out of memory was one level down and anyhow's plain \
+                  `Display` prints only the head of the chain. All three routes \
+                  formatted with `{e}` independently, so the loss was in three \
+                  places at once. With `{e:#}` the same failure now carries \
+                  `[METAL] Command buffer execution failed: Insufficient Memory \
+                  (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)` all \
+                  the way to the client, on the batch and streaming surfaces of \
+                  both APIs. Folded into one shared helper so a fourth route \
+                  cannot quietly reintroduce the lossy form",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    format!(\"inference error: {e:#}\")",
+            replace: "    format!(\"inference error: {e}\") // defect: cause dropped",
+        }],
+        guards: &[srv(
+            "types::inference_error_carries_its_cause::the_root_cause_survives_into_the_message",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "session-reuse-needs-a-nonstandard-field",
         symptom: "KV reuse on the Qwen plain-chat path was reachable only \
                   through `session_id` — a Lumen extension that neither the \
@@ -1354,7 +1381,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         // lose the KV, so both are mutated together.
         (SRV, "reasoning-trace-has-no-wire-field") => "types.rs",
         (MLX, "reasoning-trace-has-no-wire-field") => "lib.rs",
-        (_, "anthropic-thinking-block-rejected") => "types.rs",
+        (_, "anthropic-thinking-block-rejected") | (_, "inference-error-drops-its-cause") => {
+            "types.rs"
+        }
         (_, "tools-replay-doubles-think-block")
         | (_, "qwen-plain-path-never-split-reasoning")
         | (_, "qwen-thinking-trace-served-as-the-answer")

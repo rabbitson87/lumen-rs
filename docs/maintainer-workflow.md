@@ -479,6 +479,39 @@ Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope insid
 one representation in `ChatMessage`'s `Deserialize` so the renderers, the
 prefix-cache key and the token count cannot each decide separately.
 
+**A GPU out-of-memory killed the process, and the reason it could not be
+caught was one line in our own fork.** `mlx/backend/metal/eval.cpp` called
+`check_error` from inside `addCompletedHandler` — a callback the Metal driver
+invokes on its own dispatch thread. Nothing on that stack catches, so a failed
+command buffer threw into nothing and libc++ terminated: one oversized request
+took down every other client's session. It could not be caught downstream
+either, and not for want of trying — mlx-c already wraps `mlx_eval` in
+try/catch and would have turned it into a status code, but that handler is on a
+different thread.
+
+The fix is to record the failure in the callback and throw it on the calling
+thread at the next entry point. What makes that work is that `gpu::eval` is
+called *inline* from `eval_impl` rather than on a scheduler thread — check that
+before assuming the same trick transfers to another backend. The error slot is
+cleared when thrown, so one request's out-of-memory does not fail the next.
+
+Two things to know when re-verifying:
+
+- **Reproduce it cheaply.** Raising the prompt size until the GPU fails costs
+  minutes per attempt and can take the machine with it — a 120K-token prompt
+  rebooted a 36 GB M3 Max. `LUMEN_MEMORY_LIMIT_GB` does **not** protect you: it
+  is a soft threshold that makes allocation wait, not a cap, and the process
+  grows past it. Defeat the chunk clamp instead
+  (`LUMEN_QWEN35_PREFILL_SCORES_GB=100000 LUMEN_QWEN35_PREFILL_CHUNK=65536`) and
+  a ~20K prompt attempts a buffer far beyond the Metal per-buffer cap, failing
+  in **7 seconds** while allocating nothing. Same code path, no risk.
+- **The fix lives in the MLX fork, so no red-green entry can guard it.** It
+  reaches a clean build only through `rabbitson87/mlx`'s `lumen-rs-patches`
+  branch, which `FetchContent` pins by name. Verifying locally with
+  `MLX_LOCAL_SOURCE_DIR` proves the patch, not the pin — check
+  `CMakeCache.txt`'s `mlx_SOURCE_DIR` to see which source actually compiled.
+  (`_deps/mlx-src` is left behind by earlier builds and is not evidence.)
+
 **Before blaming the model, render the prompt.** A thinking-OFF reply came back
 as `'Blue\n</think>\n\nBlue'`, and the obvious reading — "we rendered the prompt
 wrong" — was wrong: rendering the exact conversation through

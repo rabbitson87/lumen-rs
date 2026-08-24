@@ -790,6 +790,21 @@ pub struct ModelObject {
     pub owned_by: String,
 }
 
+/// The message an inference failure reaches the client with.
+///
+/// `{e:#}` and not `{e}`: anyhow's plain `Display` prints only the outermost
+/// context, so a Metal out-of-memory arrived as "prefill forward (seq_id=3)"
+/// with the part naming what actually went wrong dropped on the floor. The
+/// alternate form appends the cause chain, which is how
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory` becomes something an operator
+/// can act on rather than a shrug.
+///
+/// Shared by all three routes so the next one added cannot quietly use the
+/// lossy form.
+pub fn inference_error_message(e: &anyhow::Error) -> String {
+    format!("inference error: {e:#}")
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
@@ -2476,5 +2491,35 @@ mod reasoning_round_trip {
             "content": [{"type": "server_tool_use", "id": "x", "name": "y", "input": {}}],
         }));
         assert!(r.is_err(), "unknown block types must still be rejected");
+    }
+}
+
+/// An inference failure must arrive naming its cause.
+///
+/// A Metal out-of-memory reached the client as `"prefill forward (seq_id=3)"`
+/// — true, and useless: the message that says the GPU ran out of memory was one
+/// link down the chain and `{e}` prints only the head of it.
+#[cfg(test)]
+mod inference_error_carries_its_cause {
+    use super::inference_error_message;
+
+    #[test]
+    fn the_root_cause_survives_into_the_message() {
+        let e = anyhow::anyhow!(
+            "[METAL] Command buffer execution failed: Insufficient Memory \
+             (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+        .context("argmax_last_token: scalar read failed")
+        .context("native mlx-rs runner: prefill forward (seq_id=3)");
+
+        let msg = inference_error_message(&e);
+        assert!(
+            msg.contains("prefill forward (seq_id=3)"),
+            "the outermost context still leads: {msg}"
+        );
+        assert!(
+            msg.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the cause is the whole point of the message: {msg}"
+        );
     }
 }

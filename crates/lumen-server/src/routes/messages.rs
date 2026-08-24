@@ -32,7 +32,7 @@ pub async fn handle(
             *response.status_mut() = StatusCode::from_u16(200)?;
         }
         Err(e) => {
-            let err = AnthropicError::new(format!("inference error: {e}"));
+            let err = AnthropicError::new(crate::types::inference_error_message(&e));
             response.body_mut().set_arena_json(&err)?;
             *response.status_mut() = StatusCode::from_u16(500)?;
         }
