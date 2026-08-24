@@ -1185,11 +1185,17 @@ lumen_flags::flag! {
     /// prefix instead, which needs no cooperation and cannot be wrong: the same
     /// `starts_with` gate guards the reuse itself.
     ///
-    /// **`Behavior`, not `Optimization`, and measured rather than assumed.**
-    /// Extending a KV cache and prefilling the same prompt whole are different
-    /// reduction orders, so their logits differ in the last bits and a greedy
-    /// argmax can flip on a near-tie. On Qwen3.8-27B the answers matched
-    /// ("Blue", "Yellow") while the reasoning traces were worded differently.
+    /// **`Behavior`, not `Optimization`, and the mechanism is measured rather
+    /// than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
+    /// arms over the same tokens and localizes it: `extend` reproduces a bulk
+    /// prefill **bit-identically**, so the cache handoff is exact. What is not
+    /// exact is the decode path in between — the tokens between two prompts
+    /// advanced the cache one at a time, and a single-token forward is a
+    /// different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
+    /// reduction order differs. Measured on Qwen3.8-27B: identical for 43
+    /// tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
+    /// cover this — 256 vs 2048 are both GEMM.)
+    ///
     /// Each path is deterministic and stable across runs; they just are not
     /// each other, so the equivalence matrix must never flip this. Not a new
     /// property — the explicit-`session_id` path has always had it, and this
@@ -8273,6 +8279,138 @@ mod tests {
             preserved.starts_with(&format!("{turn1_prompt}A1<|im_end|>\n")),
             "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
              reused:\nturn1={turn1_prompt:?}\nturn2={preserved:?}",
+        );
+    }
+
+    /// Does reusing a session's KV give the same tokens as prefilling the
+    /// whole prompt?
+    ///
+    /// `prefill_chunk_equivalence` already established that splitting a
+    /// *prefill* into chunks is output-invariant — bit-identical ids at
+    /// 256/512/1024/2048 on 8K and 20K prompts, because RoPE and the causal
+    /// sentinel key off `cache.offset()` and the linear-attention layers carry
+    /// their conv/SSM state through the cache. `extend` calls that same
+    /// `forward_chunked` on that same cache, so the argument should cover
+    /// session reuse too.
+    ///
+    /// It does not, in practice: a `session_id` conversation and the same
+    /// conversation cold-prefilled produce different reasoning traces on
+    /// Qwen3.8-27B, deterministically, and identically across runs on each
+    /// side. That was written off as reduction-order noise, which is
+    /// inconsistent with chunk invariance — hence this.
+    ///
+    /// Exactly one thing session reuse does that chunked prefill does not: the
+    /// tokens between the two prompts went through the cache **one at a time**
+    /// as decode steps rather than inside a bulk chunk. The three arms separate
+    /// that from `extend` itself, so the answer names a mechanism instead of a
+    /// suspicion.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn session_reuse_reproduces_a_cold_prefill() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let n_gen: usize = std::env::var("LUMEN_EQUIV_GEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48);
+
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("this equivalence only concerns the Qwen path");
+        };
+
+        let convo = [(
+            "user".to_string(),
+            "Summarize the history of the printing press in detail.".to_string(),
+        )];
+        let p = m.build_chat_input(&convo, false, None).expect("prompt");
+        let follow = [
+            ("user".to_string(), "x".to_string()),
+            ("assistant".to_string(), "y".to_string()),
+            ("user".to_string(), "And another one.".to_string()),
+        ];
+        let rendered = m.build_chat_input(&follow, false, None).expect("suffix");
+        let s: Vec<u32> = rendered[rendered.len().saturating_sub(16)..].to_vec();
+
+        fn decode_n(
+            m: &mut MlxQwen35Backend,
+            seq: u64,
+            first: u32,
+            pos: usize,
+            n: usize,
+        ) -> Vec<u32> {
+            let (mut last, mut pos) = (first, pos);
+            let mut out = vec![first];
+            for _ in 1..n {
+                let (tok, p) = m.decode_step(seq, last, pos).expect("decode");
+                out.push(tok);
+                last = tok;
+                pos = p;
+            }
+            out
+        }
+
+        // Arm C — what a session actually does: prefill, decode, then extend.
+        let (first, pos) = m.prefill(1, &p).expect("prefill P");
+        let g = decode_n(m, 1, first, pos, n_gen);
+        let (cf, cp) = m.runner.extend(1, &s).expect("extend after decode");
+        let c = decode_n(m, 1, cf, cp, n_gen);
+        m.remove_seq(1).ok();
+
+        let mut p_plus_g = p.clone();
+        p_plus_g.extend_from_slice(&g);
+        let mut full = p_plus_g.clone();
+        full.extend_from_slice(&s);
+
+        // Arm A — the same tokens, cold.
+        let (af, ap) = m.prefill(2, &full).expect("prefill full");
+        let a = decode_n(m, 2, af, ap, n_gen);
+        m.remove_seq(2).ok();
+
+        // Arm B — bulk prefill up to the suffix, then extend. Isolates `extend`
+        // from the single-token decode path.
+        let (_bf, _bp) = m.prefill(3, &p_plus_g).expect("prefill P+G");
+        let (bf, bp) = m.runner.extend(3, &s).expect("extend after bulk");
+        let b = decode_n(m, 3, bf, bp, n_gen);
+        m.remove_seq(3).ok();
+
+        let diff = |x: &[u32], y: &[u32]| x.iter().zip(y).position(|(i, j)| i != j);
+        let ab = diff(&a, &b);
+        let ac = diff(&a, &c);
+        eprintln!("prompt={} gen={} suffix={}", p.len(), g.len(), s.len());
+        eprintln!("  A cold    {:?}", &a[..a.len().min(10)]);
+        eprintln!("  B extend  {:?}", &b[..b.len().min(10)]);
+        eprintln!("  C session {:?}", &c[..c.len().min(10)]);
+        eprintln!("  A vs B: {ab:?}   A vs C: {ac:?}");
+        eprintln!(
+            "  verdict: {}",
+            match (ab, ac) {
+                (None, None) => "reuse is exact",
+                (None, Some(_)) => "the single-token DECODE path is not bulk-equivalent",
+                (Some(_), _) => "`extend` itself diverges from prefill",
+            }
+        );
+        // `extend` is exact and must stay that way — this is the invariant
+        // worth guarding, and it held: A and B were bit-identical.
+        assert_eq!(ab, None, "extend must reproduce a bulk prefill exactly");
+        // The session arm is NOT asserted equal, because it is not: measured
+        // divergence at token 44 of 48, with the first 43 identical. The cause
+        // is the only thing left once `extend` is exonerated — the tokens
+        // between the two prompts advanced the cache one at a time, and a
+        // single-token forward is a different matmul shape (M=1, GEMV) from a
+        // bulk chunk (M=N, GEMM), so the reduction order differs and a near-tie
+        // argmax eventually flips. Chunk invariance does not cover this: 256 vs
+        // 2048 are both GEMM.
+        //
+        // What IS asserted is that the immediate next-token prediction agrees.
+        // A cache that had genuinely diverged would not survive one token, let
+        // alone forty-three, so this separates "float drift" from "wrong KV"
+        // without inventing a threshold.
+        assert!(
+            ac.is_none_or(|i| i > 0),
+            "the first token after reuse must match a cold prefill; \
+             diverging immediately means the reused KV is wrong, not imprecise"
         );
     }
 

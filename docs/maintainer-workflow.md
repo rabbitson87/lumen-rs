@@ -517,14 +517,34 @@ guessing safe — a wrong guess costs a prefill, never an answer. Verified by
 output rather than by argument: the auto path is byte-identical to the
 explicit-`session_id` path on the same conversation.
 
-**Reuse is not bit-identical to a cold prefill, and that is worth stating.**
-Extending a KV cache and prefilling the same prompt whole are different reduction
-orders, so a greedy argmax can flip on a near-tie. Measured on Qwen3.8-27B: the
-answers matched ("Blue", "Yellow") while the reasoning traces were worded
-differently. Each path is deterministic and stable across runs — they are just
-not each other. The session path has always had this; `LUMEN_MLX_AUTO_SESSION`
-only changes who reaches it, which is why it is registered `Behavior` and the
-equivalence matrix must never flip it.
+**Reuse is not bit-identical to a cold prefill — and "it's just float noise"
+was the wrong answer until it was measured.** The first version of this
+paragraph blamed incremental attention in general, which contradicts a result
+already on record: `prefill_chunk_equivalence` shows chunking a prefill is
+bit-invariant at 256/512/1024/2048 on 8K and 20K prompts, and `extend` calls the
+same `forward_chunked` on the same cache. Those two claims cannot both be true.
+
+`session_reuse_reproduces_a_cold_prefill` settles it with three arms over the
+same tokens — cold `prefill(P+G+S)`, `prefill(P+G)` then `extend(S)`, and a real
+session (`prefill(P)`, decode `|G|`, `extend(S)`):
+
+| arm | vs cold |
+|---|---|
+| `extend` after a bulk prefill | **bit-identical** |
+| a real session | identical for 43 tokens, flips at 44 |
+
+So `extend` is exact and the cache handoff is not the source. What differs is the
+decode path in between: those tokens advanced the cache **one at a time**, and a
+single-token forward is a different matmul shape (M=1, GEMV) from a bulk chunk
+(M=N, GEMM). Chunk invariance never covered that case — 256 and 2048 are both
+GEMM. The test hard-asserts the `extend` arm and only reports the session arm,
+because a permanently-red test is worse than none; what it does assert there is
+that the *first* token matches, which separates float drift from a wrong KV
+without inventing a threshold.
+
+`LUMEN_MLX_AUTO_SESSION` is registered `Behavior` for this reason and the
+equivalence matrix must never flip it. The session path has always had the drift;
+the flag only changes who reaches it.
 
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to
