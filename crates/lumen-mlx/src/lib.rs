@@ -8310,10 +8310,12 @@ mod tests {
         let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
             return;
         };
-        let n_gen: usize = std::env::var("LUMEN_EQUIV_GEN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(48);
+        // Long enough for a near-tie to show up (the measured divergence was at
+        // 44), short enough to keep the three arms under a minute. Edit here
+        // rather than reaching for an env var: the flag ratchet in
+        // `cargo xtask flags` counts every hand-rolled `env::var`, and a
+        // test-only knob is not worth spending one on.
+        let n_gen: usize = 48;
 
         let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
         let MlxBackend::Qwen35Family(m) = &mut backend else {

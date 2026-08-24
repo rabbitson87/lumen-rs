@@ -104,11 +104,17 @@ Reuse a conversation's KV without the client naming a session.
  prefix instead, which needs no cooperation and cannot be wrong: the same
  `starts_with` gate guards the reuse itself.
 
- **`Behavior`, not `Optimization`, and measured rather than assumed.**
- Extending a KV cache and prefilling the same prompt whole are different
- reduction orders, so their logits differ in the last bits and a greedy
- argmax can flip on a near-tie. On Qwen3.8-27B the answers matched
- ("Blue", "Yellow") while the reasoning traces were worded differently.
+ **`Behavior`, not `Optimization`, and the mechanism is measured rather
+ than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
+ arms over the same tokens and localizes it: `extend` reproduces a bulk
+ prefill **bit-identically**, so the cache handoff is exact. What is not
+ exact is the decode path in between — the tokens between two prompts
+ advanced the cache one at a time, and a single-token forward is a
+ different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
+ reduction order differs. Measured on Qwen3.8-27B: identical for 43
+ tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
+ cover this — 256 vs 2048 are both GEMM.)
+
  Each path is deterministic and stable across runs; they just are not
  each other, so the equivalence matrix must never flip this. Not a new
  property — the explicit-`session_id` path has always had it, and this
