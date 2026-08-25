@@ -140,6 +140,87 @@ pub enum ResolvedToolChoice<'a> {
     Tool(&'a str),
 }
 
+/// Reasoning-effort level, as Qwen 3.8's chat template understands it.
+///
+/// 3.8 added a block that prepends an instruction sentence to the system
+/// prompt when thinking is on. The model was tuned with that sentence present,
+/// so omitting it prompts a 3.8 checkpoint the way a 3.6 one expects. Only
+/// three levels exist upstream, and an unrecognized one makes the template
+/// `raise_exception`.
+///
+/// `Medium` deliberately carries no text — that is the upstream template's own
+/// behaviour (it sets the instruction string only for `xhigh` and `low`), not
+/// an omission here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Xhigh,
+    Medium,
+    Low,
+}
+
+impl Default for ReasoningEffort {
+    /// The template's own default (`reasoning_effort|default('xhigh')`).
+    fn default() -> Self {
+        Self::Xhigh
+    }
+}
+
+impl ReasoningEffort {
+    /// Map an OpenAI-style `reasoning_effort` string onto Qwen's vocabulary.
+    ///
+    /// The two scales do not agree: OpenAI ships `minimal|low|medium|high`,
+    /// Qwen expects `low|medium|xhigh`. `"high"` is therefore both the most
+    /// likely input and one the upstream template would refuse, so it maps to
+    /// `Xhigh` (each is the top of its own scale).
+    ///
+    /// Returns `None` for the values that mean "do not think at all"
+    /// (`minimal`, `none`, `off`, `disabled`, empty) — those already turn
+    /// thinking off one layer up in `enable_thinking_with_backend_default`, and
+    /// the template emits no instruction when thinking is off.
+    ///
+    /// An unrecognized value falls back to the default rather than erroring: a
+    /// server should not fail a request over a spelling it does not know, and
+    /// the alternative is propagating the template's `raise_exception`.
+    pub fn from_request(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "none" | "off" | "disabled" | "" => None,
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" | "xhigh" => Some(Self::Xhigh),
+            _ => Some(Self::default()),
+        }
+    }
+
+    /// The instruction sentence to prepend to the system block, verbatim from
+    /// Qwen 3.8's `chat_template.jinja` so the model sees the exact phrasing it
+    /// was trained on. `None` for `Medium`, which upstream leaves empty.
+    pub fn instructions(self) -> Option<&'static str> {
+        match self {
+            Self::Xhigh => Some(
+                "Reasoning effort is set to xhigh. Please think carefully through the task, \
+                 validate key assumptions, consider plausible alternatives, and prioritize \
+                 correctness, consistency, and clarity in the final answer.",
+            ),
+            Self::Low => Some(
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving \
+                 directly to the conclusion without unnecessary elaboration.",
+            ),
+            Self::Medium => None,
+        }
+    }
+
+    /// Short, stable tag for cache keys. MUST distinguish every level that can
+    /// change the rendered prompt — see `auto_prefix_key`, where a shared key
+    /// across levels would serve an `xhigh` prefix to a `low` request.
+    pub fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Xhigh => "xh",
+            Self::Medium => "md",
+            Self::Low => "lo",
+        }
+    }
+}
+
 /// Heuristic: does this user-role message look like a client-injected
 /// meta-instruction wrapper (e.g. "If you have fully completed the task,
 /// call the task_complete tool now. Otherwise return your final answer.")?
@@ -355,6 +436,109 @@ pub fn strip_client_meta_wrappers_flat_indexed(messages: &mut Vec<(String, Strin
     kept
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Reasoning-trace round-trip
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Opening tag of the reasoning envelope.
+pub const REASONING_OPEN: &str = "<think>";
+/// Closing tag of the reasoning envelope.
+pub const REASONING_CLOSE: &str = "</think>";
+
+/// Wrap a reasoning trace and the visible reply into the single string an
+/// assistant turn's `content` carries through the renderers.
+///
+/// This is deliberately the *same* envelope `LUMEN_REASONING_IN_CONTENT=1`
+/// already emits on the response side, so a client that echoes our `content`
+/// back verbatim and a client that returns the trace in a dedicated
+/// `reasoning_content` field converge on one representation before anything
+/// downstream has to care which it was.
+///
+/// The alternative — a third field on `ChatTurn::Assistant` and on the flat
+/// `(role, content)` pair — would have to be threaded through 55 flat and 16
+/// structured call sites to change the same rendered bytes. The envelope
+/// reaches both paths, both APIs, the prefix-cache key and the token count at
+/// once, because all of them already agree that the turn's text is its content.
+pub fn join_reasoning_envelope(reasoning: &str, visible: &str) -> String {
+    let reasoning = reasoning.trim();
+    format!("{REASONING_OPEN}\n{reasoning}\n{REASONING_CLOSE}\n\n{visible}")
+}
+
+/// Split an assistant turn's text back into `(reasoning, visible)`.
+///
+/// Returns `("", content)` unchanged when there is no envelope — which is what
+/// makes every existing caller byte-identical, since a turn without a trace
+/// renders exactly as it did before.
+///
+/// Only a *leading* envelope counts. A `<think>` further into the reply is the
+/// model talking about the tag, not a trace, and rewriting it would corrupt the
+/// turn.
+pub fn split_reasoning_envelope(content: &str) -> (&str, &str) {
+    let Some(rest) = content.strip_prefix(REASONING_OPEN) else {
+        return ("", content);
+    };
+    let Some(end) = rest.find(REASONING_CLOSE) else {
+        // An unterminated `<think>` is a truncated turn, not an envelope.
+        return ("", content);
+    };
+    let reasoning = rest[..end].trim();
+    let visible = rest[end + REASONING_CLOSE.len()..].trim_start();
+    (reasoning, visible)
+}
+
+/// Whether `content` already carries a reasoning envelope. Used to keep a
+/// client that sends *both* the envelope and the dedicated field from getting
+/// two nested blocks.
+pub fn has_reasoning_envelope(content: &str) -> bool {
+    !split_reasoning_envelope(content).0.is_empty()
+}
+
+#[cfg(test)]
+mod reasoning_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_without_a_trace_is_returned_untouched() {
+        // The property every existing call site depends on: no envelope, no
+        // change. This is what makes the split safe to apply unconditionally.
+        for s in [
+            "",
+            "hello",
+            "a <think> mid-sentence",
+            "<think> unterminated",
+        ] {
+            assert_eq!(split_reasoning_envelope(s), ("", s), "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn the_split_recovers_exactly_what_the_join_wrote() {
+        let joined = join_reasoning_envelope("  let me think  ", "the answer");
+        assert_eq!(joined, "<think>\nlet me think\n</think>\n\nthe answer");
+        assert_eq!(
+            split_reasoning_envelope(&joined),
+            ("let me think", "the answer")
+        );
+    }
+
+    #[test]
+    fn an_empty_trace_round_trips_as_the_empty_block() {
+        // `<think>\n\n</think>\n\n` is what a `thinking:false` generation
+        // prompt ends with, so this case has to stay byte-exact or the
+        // non-thinking replay stops matching the KV it is trying to extend.
+        let joined = join_reasoning_envelope("", "hi");
+        assert_eq!(joined, "<think>\n\n</think>\n\nhi");
+        assert_eq!(split_reasoning_envelope(&joined), ("", "hi"));
+    }
+
+    #[test]
+    fn a_multi_line_trace_survives_the_round_trip() {
+        let trace = "step one\nstep two\n\nstep three";
+        let joined = join_reasoning_envelope(trace, "done");
+        assert_eq!(split_reasoning_envelope(&joined), (trace, "done"));
+    }
+}
+
 #[cfg(test)]
 mod meta_wrapper_tests {
     use super::*;
@@ -438,5 +622,74 @@ mod meta_wrapper_tests {
             vec![0, 1]
         );
         assert_eq!(msgs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_mapping_tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn openai_high_maps_onto_qwens_xhigh() {
+        // The scales disagree: OpenAI ships minimal|low|medium|high, Qwen wants
+        // low|medium|xhigh. "high" is the likeliest input AND one the upstream
+        // template would `raise_exception` on, so it must land on the top of
+        // Qwen's scale rather than pass through.
+        assert_eq!(
+            ReasoningEffort::from_request("high"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(
+            ReasoningEffort::from_request("xhigh"),
+            Some(ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn the_thinking_disabling_values_carry_no_effort() {
+        for v in ["minimal", "none", "off", "disabled", "", "  "] {
+            assert_eq!(
+                ReasoningEffort::from_request(v),
+                None,
+                "{v:?} should carry no effort"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_value_falls_back_instead_of_failing_the_request() {
+        // The upstream template raises on an unrecognized effort. A server
+        // should not turn a spelling it does not know into a 500.
+        assert_eq!(
+            ReasoningEffort::from_request("turbo"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn case_and_padding_are_tolerated() {
+        assert_eq!(
+            ReasoningEffort::from_request("  LOW "),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            ReasoningEffort::from_request("Medium"),
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn only_medium_has_no_sentence_and_every_level_keys_apart() {
+        assert!(ReasoningEffort::Medium.instructions().is_none());
+        assert!(ReasoningEffort::Xhigh.instructions().is_some());
+        assert!(ReasoningEffort::Low.instructions().is_some());
+        let tags = [
+            ReasoningEffort::Xhigh.cache_tag(),
+            ReasoningEffort::Medium.cache_tag(),
+            ReasoningEffort::Low.cache_tag(),
+        ];
+        let uniq: std::collections::HashSet<_> = tags.iter().collect();
+        assert_eq!(uniq.len(), 3, "cache tags must distinguish every level");
     }
 }

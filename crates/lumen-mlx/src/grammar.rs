@@ -150,8 +150,45 @@ impl ToolCalls {
     ///
     /// Gemma 4 specific — Qwen 3.6 closes with the literal text
     /// `</tool_call>`, which is inside its grammar rather than a special token.
+    /// Its counterpart is [`must_stop_after_completed_calls`].
+    ///
+    /// [`must_stop_after_completed_calls`]: ToolCalls::must_stop_after_completed_calls
     pub fn must_stop_after_call_closer(self, token: u32) -> bool {
         self.stops_after_first_call() && token == TOK_TOOL_CALL_CLOSE
+    }
+
+    /// The turn should end now: `completed` calls have been fully parsed and
+    /// the request asked for exactly one.
+    ///
+    /// The Qwen 3.5/3.6/3.8 counterpart of [`must_stop_after_call_closer`].
+    ///
+    /// The token-watching form does not transfer, though not for the reason it
+    /// looks like. Qwen *does* tokenise `</tool_call>` as one id — 248059 on
+    /// 3.5-9B, 3.6-27B and 3.8-27B alike. What it does not have is a *constant*:
+    /// that id is an entry in the checkpoint's `added_tokens`, not a fixed part
+    /// of the format the way Gemma's `TOK_TOOL_CALL_CLOSE` is, so watching it
+    /// would mean reading the tokenizer at grammar-build time and carrying a
+    /// per-checkpoint id into the decode loop.
+    ///
+    /// The parser already knows the answer without asking the tokenizer
+    /// anything, so it is the cheaper and more portable place to ask.
+    ///
+    /// The count comes from `Qwen35ResponseParser`, which increments only when
+    /// it consumes `</tool_call>`. That is the same boundary the Gemma rule
+    /// picked and for the same reason: the grammar covers the call *body*, so
+    /// stopping when the grammar reports `finished` cuts the framing the
+    /// response parser needs.
+    ///
+    /// Like its sibling this deliberately does not consult the grammar. On the
+    /// Qwen path `build_qwen35_tool_grammar` returns `None` whenever
+    /// `LUMEN_QWEN35_TOOL_GRAMMAR` is off or `tool_choice` is `auto` without
+    /// the eager opt-in, which is exactly where a grammar-derived cap would go
+    /// quietly inert — the failure mode already paid for once on the
+    /// imatrix-AWQ family.
+    ///
+    /// [`must_stop_after_call_closer`]: ToolCalls::must_stop_after_call_closer
+    pub fn must_stop_after_completed_calls(self, completed: usize) -> bool {
+        self.stops_after_first_call() && completed >= 1
     }
 
     /// Resolve from OpenAI's `parallel_tool_calls`, whose absence means the
@@ -2067,6 +2104,41 @@ mod tests {
         assert!(
             !ToolCalls::from_parallel_flag(None).must_stop_after_call_closer(TOK_TOOL_CALL_CLOSE)
         );
+    }
+
+    /// The Qwen counterpart of the rule above. `must_stop_after_call_closer`
+    /// compares against a Gemma 4 special-token id, so on the Qwen path — where
+    /// the closer is the literal text `</tool_call>` and can be split across BPE
+    /// pieces — it can never fire. That is exactly how the cap came to be
+    /// accepted-and-ignored for the entire family: measured on Qwen3.8-27B,
+    /// `tool_choice=required` + `parallel_tool_calls=false` returned seven
+    /// identical calls.
+    #[test]
+    fn the_qwen_one_call_stop_fires_on_the_first_completed_call() {
+        let one = ToolCalls::ExactlyOne;
+        assert!(
+            !one.must_stop_after_completed_calls(0),
+            "nothing is complete yet — cutting here would truncate the call"
+        );
+        assert!(one.must_stop_after_completed_calls(1));
+        // Defensive: the loop checks after every feed, but a chunk carrying two
+        // closers at once must still stop rather than fall through.
+        assert!(one.must_stop_after_completed_calls(2));
+
+        // The default keeps decoding no matter how many calls have landed.
+        for completed in [0, 1, 2, 7] {
+            assert!(
+                !ToolCalls::OneOrMore.must_stop_after_completed_calls(completed),
+                "OneOrMore must never cut the turn ({completed} completed)"
+            );
+        }
+
+        // Reachable from the request flag alone — no grammar, no model. The
+        // Qwen grammar is `None` whenever the tool grammar is off or
+        // `tool_choice` is plain `auto`, which is where a grammar-derived cap
+        // would go inert.
+        assert!(ToolCalls::from_parallel_flag(Some(false)).must_stop_after_completed_calls(1));
+        assert!(!ToolCalls::from_parallel_flag(None).must_stop_after_completed_calls(1));
     }
 
     #[test]

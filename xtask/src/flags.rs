@@ -442,27 +442,60 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
         .args(["grep", "-n", "env: \"", "--", "crates/*/src/*.rs"])
         .output()
         .map_err(|e| e.to_string())?;
+    // `-A 1` because only a `#[cfg(test)]` on a **module** may be treated as the
+    // start of test-only territory. Matching the bare attribute counted any
+    // test-gated item — a struct, an impl block, an enum variant — as the file's
+    // cutoff, and a production `flag!` declared BELOW one then silently stopped
+    // being audited. That happened for real: adding a `#[cfg(test)]` runner
+    // variant near the top of `lumen-mlx/src/lib.rs` dropped
+    // `LUMEN_QWEN35_REASONING_EFFORT` out of the count. Nothing failed, because
+    // the check only errors on declared-but-unregistered — the flag just quietly
+    // stopped being watched, which is the failure this tool exists to prevent.
     let cfg_test = Command::new("git")
         .current_dir(repo_root())
-        .args(["grep", "-n", "#\\[cfg(test)\\]", "--", "crates/*/src/*.rs"])
+        .args([
+            "grep",
+            "-n",
+            "-A",
+            "1",
+            "#\\[cfg(test)\\]",
+            "--",
+            "crates/*/src/*.rs",
+        ])
         .output()
         .map_err(|e| e.to_string())?;
 
-    // file -> first `#[cfg(test)]` line, if any.
+    // file -> first `#[cfg(test)] mod` line, if any.
     let mut test_mod_at: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    // `git grep -A 1` emits `file:NN:text` for a hit and `file-NN-text` for the
+    // trailing context line, so a hit and its successor are paired by order.
+    let mut pending: Option<(String, usize)> = None;
     for line in String::from_utf8_lossy(&cfg_test.stdout).lines() {
-        let mut parts = line.splitn(3, ':');
-        let (Some(file), Some(no)) = (parts.next(), parts.next()) else {
+        if let Some((file, no, _)) = split_grep_line(line, ':') {
+            pending = Some((file, no));
+            continue;
+        }
+        let Some((file, _, text)) = split_grep_line(line, '-') else {
+            pending = None;
             continue;
         };
-        let Ok(no) = no.parse::<usize>() else {
+        // Only the line directly after the attribute, in the same file.
+        let Some((attr_file, attr_no)) = pending.take() else {
             continue;
         };
+        if attr_file != file {
+            continue;
+        }
+        let t = text.trim_start();
+        if !(t.starts_with("mod ") || t.starts_with("pub mod ") || t.starts_with("pub(crate) mod "))
+        {
+            continue;
+        }
         test_mod_at
-            .entry(file.to_string())
-            .and_modify(|e| *e = (*e).min(no))
-            .or_insert(no);
+            .entry(attr_file)
+            .and_modify(|e| *e = (*e).min(attr_no))
+            .or_insert(attr_no);
     }
 
     let mut envs = Vec::new();
@@ -486,6 +519,32 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
     envs.sort();
     envs.dedup();
     Ok(envs)
+}
+
+/// Split one `git grep` output line into `(file, line_no, text)`.
+///
+/// `sep` is `:` for a match line and `-` for an `-A`/`-B` context line, and the
+/// filename contains that separator on essentially every path in this repo
+/// (`lumen-mlx`, `turboquant-cache`), so the split cannot anchor on the first
+/// one.
+///
+/// It anchors on the `.rs` extension instead. The obvious alternative — walk
+/// separators until the field between two of them parses as a number — is
+/// wrong, and quietly: `crates/foo-2-bar/src/x.rs-5-…` splits at the first
+/// candidate and yields file `crates/foo`, line 2. That names no real file, so
+/// the cutoff it belongs to is dropped and the flags in that file silently stop
+/// being audited — which is the exact failure this scan was just repaired for.
+/// No crate is named that way today; the parser should not be the reason.
+fn split_grep_line(line: &str, sep: char) -> Option<(String, usize, String)> {
+    // The grep is restricted to `crates/*/src/*.rs`, so the first `.rs` followed
+    // by the separator ends the filename.
+    let marker = format!(".rs{sep}");
+    let at = line.find(&marker)?;
+    let file = &line[..at + 3];
+    let rest = &line[at + marker.len()..];
+    let end = rest.find(sep)?;
+    let no = rest[..end].parse::<usize>().ok()?;
+    Some((file.to_string(), no, rest[end + 1..].to_string()))
 }
 
 fn render_docs(flags: &[Flag]) -> String {
@@ -595,6 +654,44 @@ fn repo_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path in this repo contains `-`, which is also `git grep`'s
+    /// context-line separator, so the split cannot anchor on the first one.
+    #[test]
+    fn grep_lines_split_on_the_separator_that_precedes_the_line_number() {
+        // Context line (`-`): the hyphens inside `lumen-mlx` must not win.
+        let (file, no, text) =
+            split_grep_line("crates/lumen-mlx/src/lib.rs-7276-mod tests {", '-').unwrap();
+        assert_eq!(file, "crates/lumen-mlx/src/lib.rs");
+        assert_eq!(no, 7276);
+        assert_eq!(text, "mod tests {");
+
+        // Match line (`:`).
+        let (file, no, text) =
+            split_grep_line("crates/lumen-flags/src/lib.rs:12:#[cfg(test)]", ':').unwrap();
+        assert_eq!(file, "crates/lumen-flags/src/lib.rs");
+        assert_eq!(no, 12);
+        assert_eq!(text, "#[cfg(test)]");
+
+        // Text containing the separator stays intact.
+        let (_, _, text) = split_grep_line("crates/a-b/src/x.rs-3-    env: \"A-B\",", '-').unwrap();
+        assert_eq!(text, "    env: \"A-B\",");
+
+        // A NUMERIC path segment must not be mistaken for the line number.
+        // Walking separators until a field parses as a number gets this wrong,
+        // silently: it returns ("crates/foo", 2, "bar/src/x.rs-5-…"), a file
+        // that does not exist, so the cutoff is dropped and every flag in the
+        // real file stops being audited.
+        let (file, no, text) =
+            split_grep_line("crates/foo-2-bar/src/x.rs-5-mod tests {", '-').unwrap();
+        assert_eq!(file, "crates/foo-2-bar/src/x.rs");
+        assert_eq!(no, 5);
+        assert_eq!(text, "mod tests {");
+
+        // A line with no line number is not a grep record.
+        assert!(split_grep_line("--", '-').is_none());
+        assert!(split_grep_line("crates/x.rs-nope-text", '-').is_none());
+    }
 
     /// The token scanner has to find a variable wherever a doc happens to spell
     /// it — bare, in backticks, in a table cell, with a value attached.

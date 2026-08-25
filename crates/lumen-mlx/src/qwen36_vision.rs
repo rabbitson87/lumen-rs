@@ -166,6 +166,32 @@ pub mod imp {
                 cfg.patch_size as i32,
                 cfg.in_channels as i32,
             ];
+            // Some builds ship the tower straight from torch, unpermuted:
+            // `[out, in, kT, kH, kW]` instead of MLX's `[out, kT, kH, kW, in]`.
+            // (Observed: the Qwen3.8-27B MTPLX bundle, whose vision weights live
+            // in a separate `model-vision.safetensors`, while the 3.6 build's
+            // inline tower is already channel-last.) The two are unambiguous —
+            // `in_channels` is 3 and the spatial dims are 16, so the position of
+            // the 3 identifies the layout — so absorb it rather than refusing a
+            // checkpoint that is merely stored in the other convention.
+            //
+            // This must happen BEFORE the flatten below: that reshape is what
+            // fixes a patch row's feature order to `(t, py, px, c)`, and
+            // flattening a torch-layout kernel would silently pair every weight
+            // with the wrong input feature.
+            let torch_layout = [
+                cfg.hidden_size as i32,
+                cfg.in_channels as i32,
+                cfg.temporal_patch_size as i32,
+                cfg.patch_size as i32,
+                cfg.patch_size as i32,
+            ];
+            let proj = if proj.shape() == torch_layout && torch_layout != expect {
+                mlx_rs::ops::transpose_axes(&proj, &super::TORCH_TO_MLX_PATCH_AXES)
+                    .context("permute torch-layout patch_embed kernel to MLX channel-last")?
+            } else {
+                proj
+            };
             if proj.shape() != expect {
                 return Err(anyhow!(
                     "patch_embed.proj.weight is {:?}, expected {expect:?} \
@@ -1382,5 +1408,72 @@ mod tests {
             "mean-valued pixel should normalize to ~0, got {}",
             out[0]
         );
+    }
+}
+
+/// Axis order that turns a torch `[out, in, kT, kH, kW]` patch-embedding kernel
+/// into MLX's `[out, kT, kH, kW, in]`. Shared with the test that pins it — a
+/// private copy in the test would let the loader drift without failing.
+const TORCH_TO_MLX_PATCH_AXES: [i32; 5] = [0, 2, 3, 4, 1];
+
+/// The patch-embedding kernel's storage layout.
+///
+/// A checkpoint that ships the tower straight from torch stores the Conv3d
+/// kernel as `[out, in, kT, kH, kW]`; MLX wants `[out, kT, kH, kW, in]`. The
+/// loader absorbs the difference, and it must get the axis order exactly right:
+/// the flatten that follows is what fixes a patch row's feature order to
+/// `(t, py, px, c)`, so a wrong permutation pairs every weight with the wrong
+/// input feature and produces plausible-looking garbage rather than an error.
+#[cfg(all(test, feature = "mlx-native"))]
+mod patch_embed_layout_tests {
+    use mlx_rs::Array;
+
+    /// RED before the fix: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed` ships
+    /// `[1152, 3, 2, 16, 16]` and the loader refused it outright —
+    /// "patch_embed.proj.weight is [...], expected [...]". The 3.6 build's
+    /// inline tower is already channel-last, which is why this only surfaced on
+    /// a checkpoint whose vision weights live in a separate file.
+    /// RED before the fix: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed` ships
+    /// `[1152, 3, 2, 16, 16]` and the loader refused it outright —
+    /// "patch_embed.proj.weight is [...], expected [...]". The 3.6 build's
+    /// inline tower is already channel-last, which is why this only surfaced on
+    /// a checkpoint whose vision weights live in a separate file.
+    ///
+    /// Compared through MLX ops rather than `as_slice`: a permuted array is a
+    /// lazy view over the source buffer, so reading its bytes directly compares
+    /// the ORIGINAL order and fails against correct code.
+    #[test]
+    fn the_torch_permutation_moves_in_channels_last_without_disturbing_the_rest() {
+        // [out=1, in=3, kT=1, kH=1, kW=2] — only `in` and `kW` vary, so a wrong
+        // axis order cannot coincidentally produce the right answer.
+        let src = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 3, 1, 1, 2]);
+        let out =
+            mlx_rs::ops::transpose_axes(&src, &super::TORCH_TO_MLX_PATCH_AXES).expect("permute");
+        assert_eq!(
+            out.shape(),
+            &[1, 1, 1, 2, 3],
+            "in_channels must end up last"
+        );
+
+        // Source is (i, w) row-major: [i0w0, i0w1, i1w0, i1w1, i2w0, i2w1].
+        // Channel-last means (w, i): [i0w0, i1w0, i2w0, i0w1, i1w1, i2w1].
+        let want = Array::from_slice(&[0.0f32, 2.0, 4.0, 1.0, 3.0, 5.0], &[1, 1, 1, 2, 3]);
+        let same = mlx_rs::ops::all_close(&out, &want, 0.0, 0.0, None).expect("compare");
+        assert!(
+            same.item::<bool>(),
+            "axis order wrong: the permutation must reorder (i, w) into (w, i)"
+        );
+    }
+
+    /// The layouts are distinguishable by shape alone, which is what makes
+    /// absorbing them safe: `in_channels` is 3 while the spatial dims are the
+    /// patch size (16), so the position of the 3 identifies the convention.
+    #[test]
+    fn the_two_layouts_are_unambiguous_at_the_real_dimensions() {
+        let mlx_layout = [1152, 2, 16, 16, 3];
+        let torch_layout = [1152, 3, 2, 16, 16];
+        assert_ne!(mlx_layout, torch_layout);
+        assert_eq!(*mlx_layout.last().unwrap(), 3, "MLX: channels last");
+        assert_eq!(torch_layout[1], 3, "torch: channels at index 1");
     }
 }

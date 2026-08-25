@@ -65,13 +65,20 @@ fn run_one(backend: &mut MlxQwen35Backend, label: &str, user: &str) -> Result<Ru
     let t_start = Instant::now();
     let mut first_tok_time: Option<Instant> = None;
     let mut n_tokens = 0;
-    let text = backend.chat_streaming(&msgs, max_new, false, seq_id, |s| {
-        if first_tok_time.is_none() && !s.is_empty() {
-            first_tok_time = Some(Instant::now());
-        }
-        n_tokens += 1;
-        let _ = s;
-    })?;
+    let text = backend.chat_streaming(
+        &msgs,
+        max_new,
+        false,
+        seq_id,
+        |s| {
+            if first_tok_time.is_none() && !s.is_empty() {
+                first_tok_time = Some(Instant::now());
+            }
+            n_tokens += 1;
+            let _ = s;
+        },
+        None,
+    )?;
 
     let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = first_tok_time
@@ -111,7 +118,7 @@ fn main() -> Result<()> {
         ("user".into(), "Hi".to_string()),
     ];
     let warm_seq = backend.alloc_seq_id();
-    let _ = backend.chat_streaming(&warm_msgs, 8, false, warm_seq, |_| {})?;
+    let _ = backend.chat_streaming(&warm_msgs, 8, false, warm_seq, |_| {}, None)?;
     eprintln!("[bench] warmup complete (different sys prompt, separate cache key)");
 
     let queries = [

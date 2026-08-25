@@ -236,7 +236,7 @@ fn main() -> Result<()> {
         let (mut last_c, _p) = qwen.prefill(seq_c, &prompt)?;
         let mut emitted = 0usize;
         while emitted < calib_gen {
-            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, 0.0, 1.0)?;
+            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
             emitted += out.committed.len();
             last_c = *out.committed.last().expect("calib commit non-empty");
         }
@@ -262,7 +262,7 @@ fn main() -> Result<()> {
         let (mut last_c, _p) = qwen.prefill(seq_c, &prompt)?;
         let mut emitted = 0usize;
         while emitted < calib_gen {
-            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, 0.0, 1.0)?;
+            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
             emitted += out.committed.len();
             last_c = *out.committed.last().expect("proc-calib commit non-empty");
         }
@@ -304,7 +304,7 @@ fn main() -> Result<()> {
             let (mut last_c, _p) = qwen.prefill(seq_c, cp)?;
             let mut emitted = 0usize;
             while emitted < per {
-                let out = qwen.qwen35_mtp_step(seq_c, last_c, k, 0.0, 1.0)?;
+                let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
                 emitted += out.committed.len();
                 last_c = *out.committed.last().expect("c4-calib commit non-empty");
             }
@@ -372,7 +372,7 @@ fn main() -> Result<()> {
     let seq_b: u64 = 2002;
     let (mut last_b, _pos_b) = qwen.prefill(seq_b, ab_prompt)?;
     for _ in 0..warmup {
-        let w = qwen.qwen35_mtp_step(seq_b, last_b, k, mtp_temp, mtp_topp)?;
+        let w = qwen.qwen35_mtp_step(seq_b, last_b, k, &Default::default())?;
         last_b = *w.committed.last().expect("warmup commit");
     }
     let mut emitted = 0usize;
@@ -382,7 +382,7 @@ fn main() -> Result<()> {
     let mut mtp_tokens: Vec<u32> = Vec::new();
     while emitted < n_gen {
         let t0 = Instant::now();
-        let out = qwen.qwen35_mtp_step(seq_b, last_b, k, mtp_temp, mtp_topp)?;
+        let out = qwen.qwen35_mtp_step(seq_b, last_b, k, &Default::default())?;
         cycle_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         accepted_total += out.n_accepted;
         attempted_total += out.n_attempted;

@@ -4373,8 +4373,7 @@ mod imp {
             committed_token: u32,
             n_draft: usize,
             carried_hidden: Option<Array>,
-            temperature: f32,
-            top_p: f32,
+            sampling: &SamplingConfig,
         ) -> Result<MtpStepOutput> {
             if n_draft == 0 {
                 return Err(anyhow!("mtp_step: n_draft must be >= 1"));
@@ -4387,10 +4386,26 @@ mod imp {
             // sampling regime (MTPLX ~70% @ temp 0.6) instead of greedy ~57%.
             // Penalties are disabled here (per-position window consistency
             // between p and q is hard to guarantee); temp/top_p/top_k drive it.
+            // The caller's config, verbatim except for a `top_p` guard.
+            //
+            // This used to be rebuilt here from a handful of scalars with
+            // `..default()`, which silently dropped `top_k`, `min_p` and every
+            // penalty: measured on Qwen3.8-27B, `top_k: 1` at temperature 1.5
+            // returned 3/3 distinct garbled replies instead of collapsing to
+            // the argmax. Taking the whole struct is what stops the next knob
+            // from being dropped the same way.
+            //
+            // History-dependent penalties are the one thing this cannot honour
+            // — see `mtp_sampling_is_supported`, which keeps such requests off
+            // this path entirely rather than letting them run with the penalty
+            // quietly disabled.
             let cfg = SamplingConfig {
-                temperature,
-                top_p: if top_p > 0.0 { top_p } else { 1.0 },
-                ..SamplingConfig::default()
+                top_p: if sampling.top_p > 0.0 {
+                    sampling.top_p
+                } else {
+                    1.0
+                },
+                ..*sampling
             };
             // 1-forward restructure (MTPLX-style): drop the per-cycle Step-A
             // trunk forward by carrying the verify hidden across cycles. The

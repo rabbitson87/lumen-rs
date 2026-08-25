@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use lumen_mlx::SamplingOverrides;
+use lumen_mlx::chat_io::ReasoningEffort;
 
 /// OpenAI `stop`: accepts either a single string or an array of strings.
 #[derive(Debug, Deserialize)]
@@ -175,6 +176,28 @@ impl ChatCompletionRequest {
             frequency_penalty: self.frequency_penalty,
             stop: stop_field_vec(&self.stop),
             parallel_tool_calls: self.parallel_tool_calls,
+            // Only meaningful when thinking is actually on — the upstream
+            // template gates its whole effort block on `enable_thinking`. The
+            // `thinking` resolution here is the same one the request already
+            // goes through, so a client that turns thinking off never gets an
+            // effort instruction, matching the template.
+            reasoning_effort: if self.enable_thinking() {
+                // `reasoning_effort|default('xhigh')` — upstream injects the
+                // xhigh sentence whenever thinking is on, INCLUDING when the
+                // client named no level. Omitting it here would prompt a 3.8
+                // checkpoint differently from every other 3.8 deployment.
+                //
+                // Known divergence: `LUMEN_BACKEND_THINKING_DEFAULT=1` turns
+                // thinking on without a per-request signal, and this resolution
+                // does not see that operator default, so such a request gets no
+                // effort sentence. Explicit per-request signals are unaffected.
+                match self.reasoning_effort.as_deref() {
+                    Some(raw) => ReasoningEffort::from_request(raw),
+                    None => Some(ReasoningEffort::default()),
+                }
+            } else {
+                None
+            },
         }
     }
 
@@ -310,6 +333,17 @@ struct RawChatMessage {
     tool_call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// The model's reasoning trace, returned by the client on a replayed
+    /// assistant turn. `reasoning_content` is the DeepSeek / vLLM / SGLang
+    /// spelling — and the name Qwen's own `chat_template.jinja` reads.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// The spelling **Lumen itself emits** (`ChatMessageResponse.reasoning`,
+    /// `ChatStreamDelta.reasoning`, matching Ollama's OpenAI-compat layer). A
+    /// client that hands our own response object back has to work, so the field
+    /// we write is a field we read.
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -320,6 +354,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
             Some(v) => split_content(v).map_err(D::Error::custom)?,
             None => (String::new(), Vec::new()),
         };
+        let content = fold_reasoning_into_content(
+            &raw.role,
+            content,
+            raw.reasoning_content.as_deref(),
+            raw.reasoning.as_deref(),
+        );
         Ok(ChatMessage {
             role: raw.role,
             content,
@@ -328,6 +368,43 @@ impl<'de> Deserialize<'de> for ChatMessage {
             name: raw.name,
             images,
         })
+    }
+}
+
+/// Normalize however the client returned the reasoning trace into the one
+/// representation the renderers read: the `<think>…</think>` envelope at the
+/// head of the assistant turn's `content`.
+///
+/// Three spellings reach us and all three mean the same thing —
+/// `reasoning_content` (DeepSeek/vLLM, and Qwen's template's own field name),
+/// `reasoning` (what we emit), and the envelope already inside `content` (what
+/// we emit under `LUMEN_REASONING_IN_CONTENT=1`). Canonicalizing here, in the
+/// one place every request passes through, is what keeps the renderers, the
+/// prefix-cache key and the token count from each deciding separately.
+///
+/// Non-assistant roles are left alone: only the assistant has a trace, and a
+/// user turn that happens to open with `<think>` is the user's text.
+fn fold_reasoning_into_content(
+    role: &str,
+    content: String,
+    reasoning_content: Option<&str>,
+    reasoning: Option<&str>,
+) -> String {
+    if !role.eq_ignore_ascii_case("assistant") {
+        return content;
+    }
+    // An envelope already in `content` wins — it is the trace in situ, and
+    // wrapping it again would nest two blocks.
+    if lumen_mlx::chat_io::has_reasoning_envelope(&content) {
+        return content;
+    }
+    let trace = reasoning_content
+        .or(reasoning)
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    match trace {
+        Some(t) => lumen_mlx::chat_io::join_reasoning_envelope(t, &content),
+        None => content,
     }
 }
 
@@ -713,6 +790,21 @@ pub struct ModelObject {
     pub owned_by: String,
 }
 
+/// The message an inference failure reaches the client with.
+///
+/// `{e:#}` and not `{e}`: anyhow's plain `Display` prints only the outermost
+/// context, so a Metal out-of-memory arrived as "prefill forward (seq_id=3)"
+/// with the part naming what actually went wrong dropped on the floor. The
+/// alternate form appends the cause chain, which is how
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory` becomes something an operator
+/// can act on rather than a shrug.
+///
+/// Shared by all three routes so the next one added cannot quietly use the
+/// lossy form.
+pub fn inference_error_message(e: &anyhow::Error) -> String {
+    format!("inference error: {e:#}")
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
@@ -882,6 +974,9 @@ impl CompletionRequest {
             stop: stop_field_vec(&self.stop),
             // /v1/completions has no tools, so no tool-call count to cap.
             parallel_tool_calls: None,
+            // Raw-prompt completions bypass the chat template entirely, so
+            // there is no system block to prepend an effort instruction to.
+            reasoning_effort: None,
         }
     }
 }
@@ -904,6 +999,11 @@ impl AnthropicRequest {
                 .tool_choice
                 .as_ref()
                 .and_then(|c| c.parallel_tool_calls()),
+            // Anthropic has no `reasoning_effort` — its thinking control is a
+            // token budget, which says nothing about which of Qwen's three
+            // levels was meant. Left at the template's own default rather than
+            // inventing a mapping from `budget_tokens`.
+            reasoning_effort: self.enable_thinking().then(ReasoningEffort::default),
         }
     }
 }
@@ -970,17 +1070,38 @@ impl AnthropicContent {
     /// Flatten to a single text string — drops tool_use / tool_result blocks.
     /// Used by the chat-template path that doesn't yet understand tools;
     /// tool-aware callers should iterate `Blocks(...)` directly.
+    ///
+    /// A `thinking` block becomes the leading `<think>…</think>` envelope, the
+    /// same shape the OpenAI path folds `reasoning_content` into, so a replayed
+    /// assistant turn renders with the trace the model actually produced —
+    /// which is what lets it be a prefix of its own KV. `redacted_thinking`
+    /// carries no readable trace and contributes nothing.
     pub fn as_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
-            Self::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    AnthropicContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Self::Blocks(blocks) => {
+                let visible = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        AnthropicContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trace = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        AnthropicContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if trace.trim().is_empty() {
+                    visible
+                } else {
+                    lumen_mlx::chat_io::join_reasoning_envelope(&trace, &visible)
+                }
+            }
         }
     }
 
@@ -997,19 +1118,44 @@ impl AnthropicContent {
 }
 
 /// One block in an Anthropic message's `content[]`. Tagged on `type`:
-/// - `text`        — visible text (user/assistant)
-/// - `image`       — inline image (base64 source only)
-/// - `tool_use`    — assistant invoking a tool
-/// - `tool_result` — user message answering a prior tool_use
+/// - `text`              — visible text (user/assistant)
+/// - `image`             — inline image (base64 source only)
+/// - `tool_use`          — assistant invoking a tool
+/// - `tool_result`       — user message answering a prior tool_use
+/// - `thinking`          — the assistant's extended-thinking trace, replayed
+/// - `redacted_thinking` — the same, encrypted server-side
 ///
 /// The tag is exhaustive: an unrecognized `type` fails the request rather than
 /// being dropped, which is what surfaces a genuinely unsupported block instead
 /// of answering as though it were not there.
+///
+/// That exhaustiveness is why `thinking` has to be listed. The Anthropic
+/// Messages API *requires* a client to return the thinking blocks of any
+/// assistant turn it replays once extended thinking is on, so a client doing
+/// exactly what the spec demands was getting `unknown variant "thinking"` —
+/// the whole request rejected over a block we only needed to read.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
     Text {
         text: String,
+    },
+    /// Extended-thinking trace. `signature` is Anthropic's integrity token; we
+    /// have nothing to verify it against and nothing that would accept it back,
+    /// so it is accepted and ignored rather than made to fail the request.
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Encrypted thinking. The payload is opaque by construction — there is no
+    /// trace to recover from it, so it contributes nothing to the prompt. Still
+    /// accepted, because rejecting it would fail a conversation for carrying a
+    /// block the client had no choice about.
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
     },
     Image {
         source: AnthropicImageSource,
@@ -1166,12 +1312,32 @@ pub struct AnthropicResponse {
     pub usage: AnthropicUsage,
 }
 
+/// What we put in a `thinking` block's `signature`.
+///
+/// Anthropic signs its thinking blocks so the trace can be verified when the
+/// client replays it. We have no key and nothing to verify against, but the
+/// field is not optional in the SDK types (`ThinkingBlock.signature: str`), so
+/// omitting it would make a strict client fail to parse a response it otherwise
+/// understands. A short, obviously-not-base64 constant says what it is and
+/// cannot be mistaken for a real signature — and if someone replays one of our
+/// blocks to the actual Anthropic API, being rejected is the correct outcome.
+///
+/// The input side accepts any signature and ignores it, so this round-trips.
+pub const LUMEN_THINKING_SIGNATURE: &str = "lumen-unsigned";
+
 /// One block in an Anthropic response's `content[]`. Mirrors the request-side
 /// `AnthropicContentBlock` for the variants the server actually emits — we
 /// never emit `tool_result` (that's a client-side message back to us).
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicResponseBlock {
+    /// Extended-thinking trace. Per the Messages API this comes **first** in
+    /// `content[]`, ahead of any text or tool_use, and is only present when the
+    /// request enabled thinking.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     Text {
         text: String,
     },
@@ -1180,6 +1346,16 @@ pub enum AnthropicResponseBlock {
         name: String,
         input: serde_json::Value,
     },
+}
+
+impl AnthropicResponseBlock {
+    /// A thinking block carrying our own (unverifiable) signature.
+    pub fn thinking(trace: impl Into<String>) -> Self {
+        Self::Thinking {
+            thinking: trace.into(),
+            signature: LUMEN_THINKING_SIGNATURE.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2088,5 +2264,262 @@ mod tool_calling_serde {
         let raw = serde_json::json!({ "prompt": "p", "size": "513x512" });
         let req: ImageGenerationRequest = serde_json::from_value(raw).unwrap();
         assert!(req.dimensions().is_err());
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_wiring_tests {
+    use super::*;
+
+    fn req(json: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(json).expect("request parses")
+    }
+
+    #[test]
+    fn a_requested_effort_reaches_the_backend_overrides() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }));
+        assert!(r.enable_thinking(), "`high` turns thinking on");
+        assert_eq!(
+            r.sampling_overrides().reasoning_effort,
+            Some(ReasoningEffort::Xhigh),
+            "the effort must survive into SamplingOverrides — it is the only \
+             channel that carries it to the prompt renderer"
+        );
+    }
+
+    #[test]
+    fn low_and_xhigh_are_carried_distinctly() {
+        for (sent, want) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("xhigh", ReasoningEffort::Xhigh),
+        ] {
+            let r = req(serde_json::json!({
+                "model": "q",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": sent,
+            }));
+            assert_eq!(
+                r.sampling_overrides().reasoning_effort,
+                Some(want),
+                "sent {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effort_that_disables_thinking_carries_none() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        }));
+        assert!(!r.enable_thinking());
+        assert_eq!(r.sampling_overrides().reasoning_effort, None);
+    }
+
+    #[test]
+    fn no_field_means_no_effort() {
+        let r = req(serde_json::json!({
+            "model": "q",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(r.sampling_overrides().reasoning_effort, None);
+    }
+}
+
+/// The reasoning trace's round trip: what a client sends back, and whether the
+/// renderer can find it.
+///
+/// A `thinking:true` generation prompt stops at an open `<think>` block and the
+/// model writes the trace itself, so the KV holds tokens no empty block can
+/// reproduce. Until the request type had somewhere to put the trace, a session
+/// re-prefilled the whole conversation on every turn — correct output, and the
+/// entire point of `session_id` silently lost.
+#[cfg(test)]
+mod reasoning_round_trip {
+    use super::*;
+
+    fn msg(json: serde_json::Value) -> ChatMessage {
+        serde_json::from_value(json).expect("message parses")
+    }
+
+    #[test]
+    fn the_deepseek_field_name_is_accepted() {
+        // `reasoning_content` is vLLM's and SGLang's spelling — and the field
+        // Qwen's own chat_template.jinja reads.
+        let m = msg(serde_json::json!({
+            "role": "assistant",
+            "content": "42",
+            "reasoning_content": "six times seven",
+        }));
+        assert_eq!(m.content, "<think>\nsix times seven\n</think>\n\n42");
+    }
+
+    #[test]
+    fn the_field_lumen_emits_is_a_field_lumen_reads() {
+        // `ChatMessageResponse.reasoning` is what we put on the wire, so a
+        // client that hands our own response object straight back has to work.
+        // Failing this would mean the server could not consume its own output.
+        let m = msg(serde_json::json!({
+            "role": "assistant",
+            "content": "42",
+            "reasoning": "six times seven",
+        }));
+        assert_eq!(m.content, "<think>\nsix times seven\n</think>\n\n42");
+    }
+
+    #[test]
+    fn an_envelope_already_in_content_is_not_wrapped_twice() {
+        // `LUMEN_REASONING_IN_CONTENT=1` puts the trace inside `content`. A
+        // client echoing that back must not end up with nested blocks, whether
+        // or not it also sets the dedicated field.
+        let echoed = "<think>\nsix times seven\n</think>\n\n42";
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"reasoning": "six times seven"}),
+        ] {
+            let mut body = serde_json::json!({"role": "assistant", "content": echoed});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    body[k] = v.clone();
+                }
+            }
+            assert_eq!(msg(body).content, echoed);
+        }
+    }
+
+    #[test]
+    fn a_turn_without_a_trace_is_untouched() {
+        // The no-regression case: every request that does not carry reasoning
+        // must render exactly the bytes it did before this field existed.
+        let m = msg(serde_json::json!({"role": "assistant", "content": "42"}));
+        assert_eq!(m.content, "42");
+        // An empty or whitespace-only trace is no trace.
+        for blank in ["", "   ", "\n"] {
+            let m = msg(serde_json::json!({
+                "role": "assistant", "content": "42", "reasoning_content": blank,
+            }));
+            assert_eq!(m.content, "42", "blank {blank:?} must not open a block");
+        }
+    }
+
+    #[test]
+    fn only_the_assistant_has_a_trace() {
+        // A user turn opening with `<think>` is the user's text, and a stray
+        // field on a user message is not a reason to rewrite what they typed.
+        let m = msg(serde_json::json!({
+            "role": "user",
+            "content": "<think> is a tag I use",
+            "reasoning_content": "not mine",
+        }));
+        assert_eq!(m.content, "<think> is a tag I use");
+    }
+
+    #[test]
+    fn an_anthropic_thinking_block_is_accepted_and_kept() {
+        // The Messages API *requires* a client to replay the thinking blocks of
+        // any assistant turn it sends back once extended thinking is on. The
+        // block tag is exhaustive, so before `thinking` was listed, a client
+        // doing exactly what the spec demands had its whole request rejected
+        // with `unknown variant`.
+        let m: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "six times seven", "signature": "sig"},
+                {"type": "text", "text": "42"},
+            ],
+        }))
+        .expect("a spec-conformant replay must parse");
+        assert_eq!(
+            m.content.as_text(),
+            "<think>\nsix times seven\n</think>\n\n42",
+            "the trace has to reach the renderer, not just survive parsing"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_parses_and_contributes_nothing() {
+        // The payload is encrypted — there is no trace to recover. Accepting it
+        // is still right: the client had no choice about receiving it.
+        let m: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": "EncryptedBlob=="},
+                {"type": "text", "text": "42"},
+            ],
+        }))
+        .expect("redacted blocks must not fail the request");
+        assert_eq!(m.content.as_text(), "42");
+    }
+
+    /// The loop, closed: our own response block, parsed back as a request.
+    ///
+    /// The two sides are separate types (`AnthropicResponseBlock` is emit-only),
+    /// so nothing but a test makes them agree. This is the property the whole
+    /// round-trip rests on — a client that echoes our `content[]` back has to
+    /// produce a prompt carrying the trace, or the KV cannot be extended.
+    #[test]
+    fn an_anthropic_thinking_block_we_emitted_parses_back_as_one_we_accept() {
+        let emitted = AnthropicResponseBlock::thinking("six times seven");
+        let wire = serde_json::to_value(&emitted).expect("serializes");
+        assert_eq!(wire["type"], "thinking");
+
+        let replayed: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [wire, {"type": "text", "text": "42"}],
+        }))
+        .expect("our own output must be valid input");
+        assert_eq!(
+            replayed.content.as_text(),
+            "<think>\nsix times seven\n</think>\n\n42",
+            "the trace has to reach the renderer, not merely survive the parse"
+        );
+    }
+
+    #[test]
+    fn an_unknown_block_type_still_fails() {
+        // Widening the enum must not turn it into a shrug. An unrecognized
+        // block is a genuinely unsupported feature and has to say so rather
+        // than be answered as though it were not there.
+        let r: Result<AnthropicMessage, _> = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "server_tool_use", "id": "x", "name": "y", "input": {}}],
+        }));
+        assert!(r.is_err(), "unknown block types must still be rejected");
+    }
+}
+
+/// An inference failure must arrive naming its cause.
+///
+/// A Metal out-of-memory reached the client as `"prefill forward (seq_id=3)"`
+/// — true, and useless: the message that says the GPU ran out of memory was one
+/// link down the chain and `{e}` prints only the head of it.
+#[cfg(test)]
+mod inference_error_carries_its_cause {
+    use super::inference_error_message;
+
+    #[test]
+    fn the_root_cause_survives_into_the_message() {
+        let e = anyhow::anyhow!(
+            "[METAL] Command buffer execution failed: Insufficient Memory \
+             (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+        .context("argmax_last_token: scalar read failed")
+        .context("native mlx-rs runner: prefill forward (seq_id=3)");
+
+        let msg = inference_error_message(&e);
+        assert!(
+            msg.contains("prefill forward (seq_id=3)"),
+            "the outermost context still leads: {msg}"
+        );
+        assert!(
+            msg.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the cause is the whole point of the message: {msg}"
+        );
     }
 }

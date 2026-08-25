@@ -192,8 +192,8 @@ pub fn flags_link_anchor() {}
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
     HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
-    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, run_step_b_synthetic_bench,
-    smoke_forward_with_synth_trunk,
+    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, mtp_shape_from_text_config,
+    run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
 };
 mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
@@ -235,6 +235,21 @@ pub struct SamplingOverrides {
     /// [`grammar::ToolCalls`] — see that type for why the count is separate
     /// from `tool_choice` in the first place.
     pub parallel_tool_calls: Option<bool>,
+    /// Qwen 3.8's `reasoning_effort`, already mapped from the request's
+    /// OpenAI-vocabulary string by [`chat_io::ReasoningEffort::from_request`].
+    ///
+    /// Rides here for the same reason `parallel_tool_calls` does, and the
+    /// reason is stronger: this one is not a sampling knob at all, it changes
+    /// the *rendered prompt*. The alternative was a new parameter on ~30 Qwen
+    /// signatures, and `thinking: bool` — the obvious thing to widen — appears
+    /// in 81 signatures across both families, most of them Gemma 4's, which has
+    /// no such concept.
+    ///
+    /// `None` means "no effort instruction" — either the client sent nothing,
+    /// or it sent one of the values that disable thinking outright. Backends
+    /// that do not understand the concept ignore it, so the field is inert for
+    /// every model except a checkpoint whose own chat template declares it.
+    pub reasoning_effort: Option<crate::chat_io::ReasoningEffort>,
 }
 
 /// Output of `Runner::forward_probe`: per-row argmaxes + max-abs logit + new
@@ -560,6 +575,101 @@ enum RunnerImpl {
     #[cfg(feature = "mlx-pyo3")]
     Pyo3(Pyo3Runner),
     Native(NativeMlxRunner),
+    /// Test-only: replays a fixed token script so the decode loops can be
+    /// driven with no model, no weights and no GPU. See [`TokenScriptRunner`].
+    #[cfg(test)]
+    Scripted(TokenScriptRunner),
+}
+
+/// A runner that hands back a pre-written list of token ids, one per step.
+///
+/// Exists so decode-loop *policy* can be tested end to end. Everything the
+/// loops decide — when to stop, what to feed the parser, what to emit — is
+/// downstream of "the model produced this token next", and that is the only
+/// thing this fakes. Nothing here touches MLX, so a guard built on it runs in
+/// the `default = []` build in milliseconds.
+///
+/// Written because the claim that this needed a trait refactor was wrong:
+/// `RunnerImpl` was already an enum behind `&dyn Runner`, so a test variant
+/// costs one arm in each accessor.
+#[cfg(test)]
+pub(crate) struct TokenScriptRunner {
+    /// Tokens handed out in order, one per `prefill`/`decode_step`/`extend`.
+    script: Vec<u32>,
+    /// Index of the next token to hand out.
+    next: usize,
+    /// Returned once the script runs dry, so a loop that fails to stop on its
+    /// own terminates rather than hanging the test.
+    eos: u32,
+}
+
+#[cfg(test)]
+impl TokenScriptRunner {
+    pub(crate) fn new(script: Vec<u32>, eos: u32) -> Self {
+        Self {
+            script,
+            next: 0,
+            eos,
+        }
+    }
+
+    fn pop(&mut self) -> u32 {
+        let tok = self.script.get(self.next).copied().unwrap_or(self.eos);
+        self.next += 1;
+        tok
+    }
+
+    /// How many tokens the loop actually consumed — i.e. how early it stopped.
+    pub(crate) fn consumed(&self) -> usize {
+        self.next
+    }
+}
+
+#[cfg(test)]
+impl Runner for TokenScriptRunner {
+    fn name(&self) -> &'static str {
+        "token-script"
+    }
+    fn prefill(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Ok((self.pop(), tokens.len()))
+    }
+    fn decode_step(
+        &mut self,
+        _seq_id: u64,
+        _last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        Ok((self.pop(), position + 1))
+    }
+    fn remove_seq(&mut self, _seq_id: u64) -> Result<()> {
+        Ok(())
+    }
+    fn extend(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Ok((self.pop(), tokens.len()))
+    }
+    fn forward_probe(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
+        Ok(ProbeRows {
+            row_argmaxes: vec![self.eos; tokens.len()],
+            row_max_abs: vec![1.0; tokens.len()],
+            row_top2_gap: vec![1.0; tokens.len()],
+            position: tokens.len(),
+        })
+    }
+    fn snapshot_state(&mut self, _seq_id: u64) -> Result<u64> {
+        Ok(1)
+    }
+    fn restore_state(&mut self, _seq_id: u64, _snapshot_id: u64) -> Result<usize> {
+        Ok(0)
+    }
+    fn release_snapshot(&mut self, _snapshot_id: u64) -> Result<()> {
+        Ok(())
+    }
+    fn snapshot_state_deep(&mut self, _seq_id: u64) -> Result<(u64, usize)> {
+        Ok((1, 0))
+    }
+    fn fork_from_snapshot(&mut self, _snapshot_id: u64, _dst_seq_id: u64) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 impl RunnerImpl {
@@ -569,6 +679,8 @@ impl RunnerImpl {
             #[cfg(feature = "mlx-pyo3")]
             Self::Pyo3(r) => r,
             Self::Native(r) => r,
+            #[cfg(test)]
+            Self::Scripted(r) => r,
         }
     }
 
@@ -578,6 +690,8 @@ impl RunnerImpl {
             #[cfg(feature = "mlx-pyo3")]
             Self::Pyo3(r) => r,
             Self::Native(r) => r,
+            #[cfg(test)]
+            Self::Scripted(r) => r,
         }
     }
 
@@ -780,6 +894,25 @@ impl RunnerImpl {
         }
     }
 
+    /// [`Self::decode_step_masked`] with the pick handed to the caller — the
+    /// one primitive both sampling and "sampling under a grammar" are built
+    /// from. Native-only for the same reason the masked form is.
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_pick(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
+    ) -> Result<(u32, usize)> {
+        match self {
+            Self::Native(r) => r.decode_step_pick(seq_id, last_token, pick),
+            _ => Err(anyhow!(
+                "sampling is only supported on the native (mlx-rs) backend; \
+                 set LUMEN_MLX_BACKEND=native"
+            )),
+        }
+    }
+
     /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
     /// Phase 2 S3 wiring — see `qwen3_5_moe::mtp_step` for cycle semantics.
     #[cfg(feature = "mlx-native")]
@@ -891,11 +1024,10 @@ impl RunnerImpl {
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
-        temperature: f32,
-        top_p: f32,
+        sampling: &lumen_core::sampling::SamplingConfig,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         match self {
-            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, temperature, top_p),
+            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, sampling),
             _ => Err(anyhow!(
                 "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
                  set LUMEN_MLX_BACKEND=native"
@@ -1014,6 +1146,67 @@ struct SessionState {
     last_access: Instant,
 }
 
+impl SessionState {
+    /// Is this session exactly `prompt_ids`, one turn earlier?
+    ///
+    /// `tokens` is what the model was fed plus what it generated, so a strict
+    /// prefix match means the KV behind this sequence is a prefix of the KV this
+    /// prompt needs — the suffix can be appended instead of re-prefilling the
+    /// whole conversation. It is also the *only* thing that makes reuse safe, so
+    /// key selection can be a guess: a wrong guess costs a prefill, never an
+    /// answer.
+    fn extends(&self, prompt_ids: &[u32]) -> bool {
+        !self.tokens.is_empty()
+            && prompt_ids.len() > self.tokens.len()
+            && prompt_ids.starts_with(&self.tokens)
+    }
+}
+
+/// Key prefix for sessions the server invented rather than the client naming.
+const AUTO_SESSION_PREFIX: &str = "auto/";
+
+/// How many server-invented sessions to keep alive.
+///
+/// Bounded where an explicit session is not, and deliberately: a client that
+/// names a session has said it will come back, while an auto session is our
+/// guess, and each one holds a whole conversation's KV until it is evicted. Two
+/// covers the case this exists for — a conversation growing turn by turn — plus
+/// one alternate interleaved with it. `LUMEN_MLX_SESSION_MAX` still caps the
+/// pool as a whole for an operator who wants a harder bound.
+const AUTO_SESSION_MAX: usize = 2;
+
+lumen_flags::flag! {
+    /// Reuse a conversation's KV without the client naming a session.
+    ///
+    /// Neither the OpenAI nor the Anthropic request has a conversation id, and
+    /// `session_id` is a Lumen extension no stock client sends — so without
+    /// this, every spec-conformant client re-prefilled its whole conversation
+    /// on every turn. ON matches the prompt against live sessions by token
+    /// prefix instead, which needs no cooperation and cannot be wrong: the same
+    /// `starts_with` gate guards the reuse itself.
+    ///
+    /// **`Behavior`, not `Optimization`, and the mechanism is measured rather
+    /// than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
+    /// arms over the same tokens and localizes it: `extend` reproduces a bulk
+    /// prefill **bit-identically**, so the cache handoff is exact. What is not
+    /// exact is the decode path in between — the tokens between two prompts
+    /// advanced the cache one at a time, and a single-token forward is a
+    /// different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
+    /// reduction order differs. Measured on Qwen3.8-27B: identical for 43
+    /// tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
+    /// cover this — 256 vs 2048 are both GEMM.)
+    ///
+    /// Each path is deterministic and stable across runs; they just are not
+    /// each other, so the equivalence matrix must never flip this. Not a new
+    /// property — the explicit-`session_id` path has always had it, and this
+    /// output is byte-identical to that path's.
+    pub(crate) auto_session_enabled {
+        env: "LUMEN_MLX_AUTO_SESSION",
+        default: true,
+        kind: Behavior,
+    }
+}
+
 /// Read session-eviction limits from env. Both default to "no limit".
 ///
 /// - `LUMEN_MLX_SESSION_TTL_SECS=N` — drop sessions idle > N seconds.
@@ -1064,6 +1257,35 @@ fn effective_qwen35_mtp_k() -> Option<usize> {
     }
 }
 
+/// Can the MTP speculative path serve this request's sampling policy?
+///
+/// `temperature`, `top_p`, `top_k` and `min_p` are functions of one position's
+/// logits, so the drafter and the verifier compute the same thing and Leviathan
+/// acceptance stays exact. The penalties are not: they depend on the tokens
+/// emitted *before* the position being sampled, and inside a speculative cycle
+/// each draft position has a different history depending on how many earlier
+/// drafts get accepted. Applying them with the wrong window would not merely
+/// weaken the penalty — it would make `p` and `q` disagree about what
+/// distribution they are, and the acceptance rule's guarantee that the committed
+/// stream is distributed as `p` depends on both being the real ones.
+///
+/// So a penalised request leaves the speculative path and decodes through the
+/// ordinary loop, where the window is exact. It costs the MTP speedup for that
+/// request and buys a correct answer, which is the right way round. The
+/// alternative shipped for a while and was worse than either: MTP rebuilt its
+/// config with `..default()`, so the penalty was silently *dropped* and the
+/// client got neither the speed-up cost nor the penalty.
+#[cfg(feature = "mlx-native")]
+fn mtp_sampling_is_supported(cfg: Option<&lumen_core::sampling::SamplingConfig>) -> bool {
+    let Some(c) = cfg else {
+        return true; // greedy — nothing to honour
+    };
+    (c.repeat_penalty - 1.0).abs() < 1e-6
+        && c.presence_penalty == 0.0
+        && c.frequency_penalty == 0.0
+        && c.dry.is_disabled()
+}
+
 /// Should prefill stop one token short so the first *generated* token can be
 /// masked?
 ///
@@ -1107,7 +1329,103 @@ fn gemma4_grammar_would_constrain(
         && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
 }
 
-fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
+lumen_flags::flag! {
+    /// Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
+    ///
+    /// **`Behavior`, not `Optimization`: this changes the prompt.** ON means
+    /// "inject the effort sentence when the checkpoint's `chat_template.jinja`
+    /// declares the block" — so it is inert for every 3.5/3.6 checkpoint, which
+    /// declares no such thing. `=0` suppresses it even on 3.8, which is the
+    /// A/B hatch. The equivalence matrix must never flip this expecting
+    /// identical output: on a 3.8 checkpoint the two settings render different
+    /// system blocks by design.
+    pub(crate) reasoning_effort_enabled {
+        env: "LUMEN_QWEN35_REASONING_EFFORT",
+        default: true,
+        kind: Behavior,
+    }
+}
+
+/// Does this checkpoint's own chat template declare `reasoning_effort`?
+///
+/// Asked of the shipped `chat_template.jinja`, never of the model id. Qwen kept
+/// `model_type: "qwen3_5"` across 3.5, 3.6 and 3.8 while the template gained a
+/// block in 3.8, so the id tells you nothing the file does not tell you better —
+/// and id-substring matching is exactly what shipped the wrong MTP head shape
+/// (see `mtp_shape_from_text_config`). A repo that renames itself, or a fork
+/// that backports the block, both come out right here.
+///
+/// Absent or unreadable template ⇒ `false`, which renders exactly as before.
+///
+/// `LUMEN_QWEN35_REASONING_EFFORT=0` suppresses the block entirely, for A/B-ing
+/// the prompt change against a checkpoint that does declare it. There is
+/// deliberately no force-ON: injecting the sentence into a 3.6 checkpoint would
+/// feed it a string it was never trained on, which is not a mode worth having.
+fn checkpoint_declares_reasoning_effort(model_id: &str) -> bool {
+    if !reasoning_effort_enabled::get() {
+        return false;
+    }
+    let dir = std::path::Path::new(model_id);
+    if !dir.is_dir() {
+        // An un-resolved HF id: the weights may not be on disk yet, and
+        // resolving here would mean a network call inside `load`. The template
+        // ships with the snapshot, so a local dir answers; a bare id does not.
+        return false;
+    }
+    std::fs::read_to_string(dir.join("chat_template.jinja"))
+        .map(|t| t.contains("reasoning_effort"))
+        .unwrap_or(false)
+}
+
+/// Does this checkpoint's template keep a `<think>` block on **replayed**
+/// assistant turns?
+///
+/// The two spellings differ in their default, and the default is the whole
+/// question because no client sends `preserve_thinking`:
+///
+/// ```text
+/// 3.6:  (preserve_thinking is defined and preserve_thinking is true) or …   → false
+/// 3.8:   preserve_thinking is undefined or preserve_thinking is true  or …   → true
+/// ```
+///
+/// So 3.8 renders a past assistant turn as
+/// `<|im_start|>assistant\n<think>\n…\n</think>\n\n{content}` and 3.6 renders it
+/// without the block. Rendering 3.8 the 3.6 way is not cosmetic: the generation
+/// prompt for a turn ends with that same block, so a replayed turn that omits it
+/// is not a token-prefix of what the model was actually fed. That is what made
+/// `session_id` re-prefill the entire conversation every turn — measured on
+/// Qwen3.8-27B, a replayed assistant turn occupied 16 tokens of framing where
+/// generation had produced 2, and the reuse check failed at the first one.
+///
+/// Sniffed from the shipped template rather than the model id, for the reason
+/// [`checkpoint_declares_reasoning_effort`] gives: the id is the wrong thing to
+/// ask and the next version rename would silently mis-answer it. Absent or
+/// unreadable template ⇒ `false`, i.e. exactly the previous rendering.
+fn checkpoint_preserves_thinking_on_replay(model_id: &str) -> bool {
+    let dir = std::path::Path::new(model_id);
+    if !dir.is_dir() {
+        return false;
+    }
+    std::fs::read_to_string(dir.join("chat_template.jinja"))
+        .map(|t| template_preserves_thinking(&t))
+        .unwrap_or(false)
+}
+
+/// The template-text half of [`checkpoint_preserves_thinking_on_replay`], split
+/// out so it can be tested against both spellings without a checkpoint on disk.
+///
+/// Keys on `preserve_thinking is undefined`, which is precisely the clause that
+/// makes the block the *default* branch. Matching on the bare name would answer
+/// `true` for 3.6, whose template mentions `preserve_thinking` only to require
+/// that it be explicitly set.
+fn template_preserves_thinking(template: &str) -> bool {
+    template.contains("preserve_thinking is undefined")
+}
+
+fn auto_prefix_key(
+    messages: &[(String, String)],
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<String> {
     let (role, content) = messages.first()?;
     if role != "system" || content.is_empty() {
         return None;
@@ -1116,6 +1434,13 @@ fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     content.hash(&mut h);
+    // The effort sentence is rendered INTO the cached prefix, so it has to be
+    // part of the key. Without it, two requests sharing a system message but
+    // asking for different effort levels collide, and the second is served a
+    // KV cache built from a prompt it never sent — wrong output, no error.
+    effort
+        .map(crate::chat_io::ReasoningEffort::cache_tag)
+        .hash(&mut h);
     Some(format!("auto-{:016x}", h.finish()))
 }
 
@@ -1123,7 +1448,10 @@ fn auto_prefix_key(messages: &[(String, String)]) -> Option<String> {
 /// turn's content iff it's a `System` turn. Returns `None` when the chat
 /// starts with `User` (no shared prefix worth caching) or when the system
 /// content is empty.
-fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<String> {
+fn auto_prefix_key_from_turns(
+    turns: &[crate::chat_io::ChatTurn<'_>],
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<String> {
     use crate::chat_io::ChatTurn;
     let content = match turns.first()? {
         ChatTurn::System(s) if !s.is_empty() => *s,
@@ -1133,6 +1461,10 @@ fn auto_prefix_key_from_turns(turns: &[crate::chat_io::ChatTurn<'_>]) -> Option<
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     content.hash(&mut h);
+    // See `auto_prefix_key` — same collision, same consequence.
+    effort
+        .map(crate::chat_io::ReasoningEffort::cache_tag)
+        .hash(&mut h);
     Some(format!("auto-{:016x}", h.finish()))
 }
 
@@ -1211,12 +1543,27 @@ fn qwen35_tool_grammar_eager_auto() -> bool {
 /// Render the chat-template system-prompt block alone (no trailing assistant
 /// header). Tokenizing this produces the prefix tokens we expect to find at
 /// the start of the full chat-input tokenization.
-fn format_system_prefix(message: &(String, String)) -> String {
+fn format_system_prefix(
+    message: &(String, String),
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> String {
     let (role, content) = message;
     let mut s = String::new();
     s.push_str("<|im_start|>");
     s.push_str(role);
     s.push('\n');
+    // The probe must render the system block EXACTLY as the real prompt does,
+    // effort included — it exists to locate that block's token boundary inside
+    // the full tokenization, and a prefix that differs by a sentence finds
+    // nothing.
+    if let Some(text) = effort.and_then(crate::chat_io::ReasoningEffort::instructions)
+        && role.eq_ignore_ascii_case("system")
+    {
+        s.push_str(text);
+        if !content.is_empty() {
+            s.push_str("\n\n");
+        }
+    }
     s.push_str(content);
     s.push_str("<|im_end|>\n");
     s
@@ -1239,7 +1586,14 @@ fn format_system_prefix(message: &(String, String)) -> String {
 ///    to their inherent methods — the trait only exists so the scheduler can hold
 ///    one `&mut dyn` regardless of family.
 pub trait MlxBatchedSeqDriver {
-    fn build_chat_input(&self, messages: &[(String, String)], thinking: bool) -> Result<Vec<u32>>;
+    /// `effort` carries Qwen 3.8's reasoning-effort level. Families without the
+    /// concept ignore it; passing `None` renders exactly as before.
+    fn build_chat_input(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>>;
     fn eos_tokens(&self) -> &[u32];
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
     fn decode_step_batch(
@@ -1262,8 +1616,13 @@ pub trait MlxBatchedSeqDriver {
 }
 
 impl MlxBatchedSeqDriver for MlxQwen35Backend {
-    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
-        MlxQwen35Backend::build_chat_input(self, m, t)
+    fn build_chat_input(
+        &self,
+        m: &[(String, String)],
+        t: bool,
+        e: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        MlxQwen35Backend::build_chat_input(self, m, t, e)
     }
     fn eos_tokens(&self) -> &[u32] {
         MlxQwen35Backend::eos_tokens(self)
@@ -1289,7 +1648,12 @@ impl MlxBatchedSeqDriver for MlxQwen35Backend {
 
 #[cfg(feature = "mlx-native")]
 impl MlxBatchedSeqDriver for crate::gemma4::Gemma4Backend {
-    fn build_chat_input(&self, m: &[(String, String)], t: bool) -> Result<Vec<u32>> {
+    fn build_chat_input(
+        &self,
+        m: &[(String, String)],
+        t: bool,
+        _e: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
         crate::gemma4::Gemma4Backend::build_chat_input(self, m, t)
     }
     fn eos_tokens(&self) -> &[u32] {
@@ -1371,6 +1735,28 @@ impl MlxBackend {
                 let inner = MlxQwen35Backend::load(model_id)?;
                 Ok(Self::Qwen35Family(inner))
             }
+        }
+    }
+
+    /// Per-request reasoning effort, gated on the loaded checkpoint declaring
+    /// the concept.
+    ///
+    /// Both halves matter: the level is the client's (`ov.reasoning_effort`),
+    /// but a 3.6 checkpoint must keep rendering byte-identically no matter what
+    /// a client sends, and a 3.8 one should honour it without the operator
+    /// setting anything. Gemma 4 has no such block, so it is always `None`.
+    ///
+    /// **Public because anything that renders or MEASURES a prompt has to ask
+    /// the same question.** The token counter used the raw `ov.reasoning_effort`
+    /// instead, and on a 3.5 checkpoint reported 54 `prompt_tokens` for a prompt
+    /// that really was 12 — the gate was right, the accounting was not.
+    pub fn resolved_effort(
+        &self,
+        ov: &crate::SamplingOverrides,
+    ) -> Option<crate::chat_io::ReasoningEffort> {
+        match self {
+            Self::Qwen35Family(m) if m.wants_reasoning_effort => ov.reasoning_effort,
+            _ => None,
         }
     }
 
@@ -1487,11 +1873,61 @@ impl MlxBackend {
         &self,
         messages: &[(String, String)],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Qwen35Family(m) => m.build_chat_input(messages, thinking),
+            Self::Qwen35Family(m) => m.build_chat_input(messages, thinking, effort),
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => m.build_chat_input(messages, thinking),
+            Self::Gemma4(m) => {
+                // Gemma 4's template has no reasoning-effort block.
+                let _ = effort;
+                m.build_chat_input(messages, thinking)
+            }
+        }
+    }
+
+    /// [`Self::build_chat_input`] rendered the way the request will actually be
+    /// prefilled — tool block, `tool_choice` prefill and `response_format`
+    /// reshaping included.
+    ///
+    /// The plain form is for callers that genuinely have no tools. Using it to
+    /// *count* a tool request silently drops the whole schema block, which is
+    /// most of the prompt: measured on Qwen3.8-27B, a one-tool request reported
+    /// 39 prompt tokens against a 279-token prefill, and the Anthropic path 20
+    /// against 259. That figure is both what the client is billed by and what
+    /// the context guard admits on, so it under-reports and over-admits in the
+    /// same breath.
+    ///
+    /// `structured` is the `response_format` schema's presence, and it is not a
+    /// rounding detail — the two families reshape in opposite directions. Qwen
+    /// routes to `chat_response_format`, which renders with **no tool block at
+    /// all**; Gemma keeps the tools and closes the thought channel instead.
+    /// Approximating it away would trade one family's error for the other's.
+    pub fn build_chat_input_prefilled(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        structured: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Qwen35Family(m) => {
+                if structured {
+                    // `chat_response_format` builds through
+                    // `build_response_format_input`, which is `build_chat_input`
+                    // for a text prompt — tools never reach the template.
+                    return m.build_chat_input(messages, thinking, effort);
+                }
+                m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
+                    .map(|(ids, _prefill)| ids)
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = effort;
+                m.build_chat_input_prefilled(messages, thinking, tools, tool_choice, structured)
+            }
         }
     }
 
@@ -1565,10 +2001,15 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) takes precedence over tools — when a
                 // JSON schema is present, the whole assistant message is
                 // constrained to that schema (matching Gemma4's
@@ -1583,6 +2024,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 // Phase 2: when tools are provided, route through the
@@ -1601,18 +2043,49 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        effort,
                     );
                 }
                 let _ = tool_choice;
-                let visible = if let Some(sid) = session_id {
-                    m.chat_streaming_session(messages, max_new_tokens, thinking, sid, |_| {})?
+                // Always the session path. Without an explicit id the prompt
+                // identifies its own conversation (see `resolve_session_key`),
+                // which is the only way reuse is reachable from a stock OpenAI
+                // or Anthropic request — neither carries a conversation id, and
+                // `session_id` is a Lumen extension no such client sends. Before
+                // this, a client that did not know about it re-prefilled the
+                // whole conversation on every turn.
+                let visible = m.chat_streaming_session(
+                    messages,
+                    max_new_tokens,
+                    thinking,
+                    session_id,
+                    |_| {},
+                    effort,
+                )?;
+                // With thinking ON the prompt opened the `<think>` block, so
+                // the model's output starts mid-trace and closes with a bare
+                // `</think>`. Splitting it here is what stops the raw
+                // chain-of-thought — and the stray close tag — from being
+                // handed to the client as the answer.
+                //
+                // The gate is load-bearing, not defensive: with thinking OFF
+                // the prompt already closed the block, so the reply carries no
+                // `</think>` at all and an ungated split reads the whole answer
+                // as trace — `content: ""`, `reasoning: "Red"`.
+                let (reasoning, visible) = if thinking {
+                    crate::qwen3_5_tools::split_open_think(&visible)
                 } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(messages, max_new_tokens, thinking, seq_id, |_| {})?
+                    ("", visible.as_str())
                 };
+                // A reasoning-first checkpoint sometimes closes a block it
+                // never opened. The tool-aware parser has always dropped that
+                // stray tag; doing the same here is what stops the identical
+                // reply coming back differently depending only on whether the
+                // request carried tools.
+                let visible = crate::qwen3_5_tools::strip_unbalanced_think_close(visible);
                 Ok(ParsedResponse {
-                    visible,
-                    reasoning: String::new(),
+                    visible: visible.into_owned(),
+                    reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })
             }
@@ -1653,7 +2126,7 @@ impl MlxBackend {
                 //      the common case for chat UIs).
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key(messages));
+                    .or_else(|| auto_prefix_key(messages, effort));
                 if let Some(k) = key {
                     m.chat_with_prefix_cache(
                         messages,
@@ -1703,6 +2176,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat(
                 messages,
@@ -1769,6 +2243,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 if !tools.is_empty() {
@@ -1781,6 +2256,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        effort,
                     );
                 }
                 let _ = tool_choice;
@@ -1792,6 +2268,7 @@ impl MlxBackend {
                     thinking,
                     seq_id,
                     |_| {},
+                    effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
@@ -1829,6 +2306,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_streaming(
                 messages,
@@ -1880,6 +2358,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut sink,
+                        effort,
                     );
                 }
                 if !tools.is_empty() {
@@ -1893,6 +2372,7 @@ impl MlxBackend {
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
+                        effort,
                     );
                 }
                 let _ = tool_choice;
@@ -1906,6 +2386,7 @@ impl MlxBackend {
                     thinking,
                     seq_id,
                     &mut sink,
+                    effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
@@ -1945,6 +2426,7 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_from_history(
                 turns,
@@ -2004,6 +2486,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 m.chat_with_tools_from_history(
@@ -2015,6 +2498,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    effort,
                 )
             }
             #[allow(unreachable_patterns)]
@@ -2038,9 +2522,15 @@ impl MlxBackend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         response_schema: Option<&serde_json::Value>,
     ) -> Result<crate::chat_io::ParsedResponse> {
+        let effort = self.resolved_effort(ov);
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov, session_id);
+                let _ = session_id;
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — see flat
                 // `chat` path. The structured-history renderer is reused (no
                 // tools) so assistant.tool_calls / role:tool turns still render.
@@ -2054,6 +2544,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
+                        effort,
                     );
                 }
                 // Phase 2: structured-history paths ALWAYS go through
@@ -2074,6 +2565,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    effort,
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -2104,7 +2596,7 @@ impl MlxBackend {
                 }
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns));
+                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
                 if let Some(k) = key {
                     m.chat_from_history_with_prefix_cache(
                         turns,
@@ -2156,10 +2648,15 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::{BackendStreamEvent, ParsedResponse};
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — the whole
                 // assistant message is JSON-schema constrained and streamed as
                 // `BackendStreamEvent::Text` deltas (no tool demux).
@@ -2177,6 +2674,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut text_adapter,
+                        effort,
                     );
                 }
                 // Phase 2: with tools provided, route through tool-aware
@@ -2196,33 +2694,72 @@ impl MlxBackend {
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                         on_event,
+                        effort,
                     );
                 }
                 let _ = tool_choice;
-                let mut text_adapter = |chunk: &str| {
-                    let _ = on_event(BackendStreamEvent::Text(chunk));
-                };
-                let visible = if let Some(sid) = session_id {
+                // The trace has to be routed as it arrives, not split at the
+                // end: visible deltas go out to the client immediately, so once
+                // a reasoning byte has been sent as `Text` there is no taking
+                // it back. The splitter holds any tail that could still grow
+                // into `</think>` across a decode-step boundary.
+                let mut splitter = crate::qwen3_5_tools::ThinkingSplitter::new(thinking);
+                let visible = {
+                    let mut text_adapter = |chunk: &str| {
+                        let (reasoning, visible) = splitter.feed(chunk);
+                        if !reasoning.is_empty() {
+                            let _ = on_event(BackendStreamEvent::Reasoning(&reasoning));
+                        }
+                        if !visible.is_empty() {
+                            let _ = on_event(BackendStreamEvent::Text(&visible));
+                        }
+                    };
+                    // See the non-streaming twin: the session path is
+                    // unconditional now, because the prompt identifies its own
+                    // conversation when the client cannot.
                     m.chat_streaming_session(
                         messages,
                         max_new_tokens,
                         thinking,
-                        sid,
+                        session_id,
                         &mut text_adapter,
-                    )?
-                } else {
-                    let seq_id = m.alloc_seq_id();
-                    m.chat_streaming(
-                        messages,
-                        max_new_tokens,
-                        thinking,
-                        seq_id,
-                        &mut text_adapter,
+                        effort,
                     )?
                 };
+                // Tails still held at the end: an unclosed trace, or a partial
+                // close tag that never completed and therefore belongs to the
+                // answer. Flush both rather than dropping either.
+                let (reasoning_tail, visible_tail) = splitter.finish();
+                if !reasoning_tail.is_empty() {
+                    let _ = on_event(BackendStreamEvent::Reasoning(&reasoning_tail));
+                }
+                if !visible_tail.is_empty() {
+                    let _ = on_event(BackendStreamEvent::Text(&visible_tail));
+                }
+                // With thinking ON the prompt opened the `<think>` block, so
+                // the model's output starts mid-trace and closes with a bare
+                // `</think>`. Splitting it here is what stops the raw
+                // chain-of-thought — and the stray close tag — from being
+                // handed to the client as the answer.
+                //
+                // The gate is load-bearing, not defensive: with thinking OFF
+                // the prompt already closed the block, so the reply carries no
+                // `</think>` at all and an ungated split reads the whole answer
+                // as trace — `content: ""`, `reasoning: "Red"`.
+                let (reasoning, visible) = if thinking {
+                    crate::qwen3_5_tools::split_open_think(&visible)
+                } else {
+                    ("", visible.as_str())
+                };
+                // A reasoning-first checkpoint sometimes closes a block it
+                // never opened. The tool-aware parser has always dropped that
+                // stray tag; doing the same here is what stops the identical
+                // reply coming back differently depending only on whether the
+                // request carried tools.
+                let visible = crate::qwen3_5_tools::strip_unbalanced_think_close(visible);
                 Ok(ParsedResponse {
-                    visible,
-                    reasoning: String::new(),
+                    visible: visible.into_owned(),
+                    reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
                 })
             }
@@ -2238,7 +2775,7 @@ impl MlxBackend {
                 // only the new suffix → ~5s → ~100ms per turn.
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key(messages));
+                    .or_else(|| auto_prefix_key(messages, effort));
                 if let Some(k) = key {
                     m.chat_streaming_with_prefix_cache(
                         messages,
@@ -2296,6 +2833,7 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         if !images.iter().any(|v| !v.is_empty()) {
             return self.chat_streaming_from_history(
                 turns,
@@ -2346,6 +2884,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut sink,
+                        effort,
                     );
                 }
                 m.chat_streaming_with_tools_from_history(
@@ -2358,6 +2897,7 @@ impl MlxBackend {
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
+                    effort,
                 )
             }
             #[allow(unreachable_patterns)]
@@ -2385,10 +2925,16 @@ impl MlxBackend {
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
+        let effort = self.resolved_effort(ov);
         use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (top_p, temperature, ov, session_id);
+                let _ = session_id;
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // response_format (WS-F #1) precedence over tools — streamed as
                 // `BackendStreamEvent::Text` deltas; structured-history renderer
                 // reused with no tools.
@@ -2407,6 +2953,7 @@ impl MlxBackend {
                         seq_id,
                         schema,
                         &mut text_adapter,
+                        effort,
                     );
                 }
                 // Phase 2: structured-history streaming ALWAYS routes
@@ -2423,6 +2970,7 @@ impl MlxBackend {
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
                     on_event,
+                    effort,
                 )
             }
             #[cfg(feature = "mlx-native")]
@@ -2434,7 +2982,7 @@ impl MlxBackend {
                 // multiple prior assistant/tool exchanges).
                 let key = session_id
                     .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns));
+                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
                 if let Some(k) = key {
                     m.chat_streaming_from_history_with_prefix_cache(
                         turns,
@@ -2481,26 +3029,11 @@ impl MlxBackend {
         match self {
             Self::Qwen35Family(m) => {
                 let _ = (temperature, top_p, ov);
-                if let Some(sid) = session_id {
-                    return m.completion_session(input_ids, max_new_tokens, sid);
-                }
-                let seq_id = m.alloc_seq_id();
-                let (mut last, mut pos) = m.prefill(seq_id, input_ids)?;
-                let mut out: Vec<u32> = vec![last];
-                let eos = m.eos_tokens().to_vec();
-                if !eos.contains(&last) {
-                    for _ in 1..max_new_tokens {
-                        let (n, p) = m.decode_step(seq_id, last, pos)?;
-                        last = n;
-                        pos = p;
-                        out.push(n);
-                        if eos.contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                m.remove_seq(seq_id).ok();
-                Ok(out)
+                // Unconditional, like the chat twin: without an explicit id the
+                // prompt identifies its own continuation, so a client that
+                // re-sends prompt + completion + more extends the KV instead of
+                // prefilling all of it again.
+                m.completion_session(input_ids, max_new_tokens, session_id)
             }
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
@@ -2549,6 +3082,33 @@ fn detect_mlx_family(model_id: &str) -> MlxFamily {
     MlxFamily::Qwen35
 }
 
+/// The PRNG seed for one request: the client's `seed`, else `LUMEN_SAMPLE_SEED`,
+/// else the wall clock.
+///
+/// The wall-clock fallback is the load-bearing part. `Xorshift64::new` maps a
+/// zero seed to a fixed constant (a zero state would lock the generator), so a
+/// config that leaves `seed` at its `0` default does not sample *randomly* — it
+/// replays one fixed stream, and every request with the same prompt comes back
+/// byte-identical. That reads exactly like sampling being ignored, which is the
+/// bug this was written alongside.
+///
+/// Shared by both families so the precedence cannot drift apart: this is
+/// policy, and Qwen and Gemma answering `seed` differently would be a defect
+/// nobody would think to test for.
+pub(crate) fn resolve_sampling_seed(ov: &SamplingOverrides) -> u64 {
+    ov.seed.unwrap_or_else(|| {
+        std::env::var("LUMEN_SAMPLE_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E3779B97F4A7C15)
+            })
+    })
+}
+
 pub struct MlxQwen35Backend {
     runner: RunnerImpl,
     pub model_id: String,
@@ -2557,6 +3117,11 @@ pub struct MlxQwen35Backend {
     tokenizer: Option<Tokenizer>,
     next_seq_id: AtomicU64,
     sessions: std::collections::HashMap<String, SessionState>,
+    /// Monotonic counter for `auto/N` session keys.
+    auto_session_seq: u64,
+    /// Cap on server-invented sessions; `0` disables them. See
+    /// [`read_auto_session_max`].
+    auto_session_max: usize,
     session_ttl: Option<Duration>,
     session_max: Option<usize>,
     prefix_store: prefix_cache::PrefixCacheStore,
@@ -2567,6 +3132,16 @@ pub struct MlxQwen35Backend {
     /// unconstrained sampling rather than erroring. Built once on first
     /// grammar-eligible request; the `Arc` is cloned per request.
     grammar_factory: OnceLock<Option<std::sync::Arc<llguidance::ParserFactory>>>,
+    /// Whether THIS checkpoint's chat template declares `reasoning_effort`
+    /// (Qwen 3.8 does; 3.5 and 3.6 do not). Decided at load by reading the
+    /// shipped `chat_template.jinja` — see
+    /// [`checkpoint_declares_reasoning_effort`] for why the model id is the
+    /// wrong thing to ask.
+    wants_reasoning_effort: bool,
+    /// Whether THIS checkpoint's template keeps a `<think>` block on replayed
+    /// assistant turns — see [`checkpoint_preserves_thinking_on_replay`]. Decided
+    /// at load from the shipped template, never from the model id.
+    preserves_thinking_on_replay: bool,
     /// OPT-IN draft-model speculative decode (default OFF). `Some` only when
     /// `LUMEN_MLX_DRAFT_MODEL` is set AND the draft loaded with a vocab size
     /// matching the target. `None` → the entire draft path is dormant and the
@@ -2574,6 +3149,27 @@ pub struct MlxQwen35Backend {
     /// `NativeMlxRunner` (second model + its own seq/KV state).
     #[cfg(feature = "mlx-native")]
     draft: Option<DraftRunner>,
+    /// Sampling for the request currently being served. `None` is greedy and
+    /// is the state after every greedy request, so nothing leaks between them:
+    /// each entry point sets this unconditionally before decoding.
+    ///
+    /// It lives here rather than as a parameter because roughly ten decode
+    /// loops in this crate call [`Self::decode_step`], and every one of them
+    /// needs it. Threading it through all ten would be a large diff whose only
+    /// new behaviour is inside that one wrapper.
+    sampling: Option<lumen_core::sampling::SamplingConfig>,
+    /// Sampler PRNG. Reseeded from `SamplingConfig::seed` whenever sampling is
+    /// configured, so `seed` in the request means what clients expect: same
+    /// prompt + same seed → same tokens.
+    rng: lumen_core::sampling::Xorshift64,
+    /// Recently generated tokens per sequence, for the repeat / presence /
+    /// frequency penalties — which are functions of history that the decode
+    /// loops own and `decode_step` cannot see.
+    ///
+    /// Keyed by `seq_id` rather than kept as one window because the
+    /// speculative-decode paths run a draft sequence and the main sequence
+    /// through the same wrapper, and a shared window would blend the two.
+    recent: std::collections::HashMap<u64, std::collections::VecDeque<u32>>,
 }
 
 /// Isolated draft model + its resolved config for greedy spec decode.
@@ -2596,6 +3192,59 @@ struct AttachedImages {
     prepared: Vec<crate::qwen36_vision::PreparedImage>,
     /// `counts[k]` is how many placeholder rows `prepared[k]` occupies.
     counts: Vec<usize>,
+}
+
+#[cfg(test)]
+impl MlxQwen35Backend {
+    /// A backend wired to a [`TokenScriptRunner`] and a caller-supplied
+    /// tokenizer, for driving the decode loops with no model.
+    ///
+    /// Everything the loops read is here; everything they do not is left at the
+    /// inert value. `prefix_store` is built from env but every test passes
+    /// `prefix_cache_key: None`, which disables reuse per request regardless of
+    /// what the environment says — so the harness cannot be perturbed by a
+    /// developer's shell.
+    pub(crate) fn with_token_script(
+        script: Vec<u32>,
+        eos: u32,
+        tokenizer: Tokenizer,
+        vocab_size: usize,
+    ) -> Self {
+        Self {
+            runner: RunnerImpl::Scripted(TokenScriptRunner::new(script, eos)),
+            model_id: "token-script".to_string(),
+            eos_tokens: vec![eos],
+            vocab_size,
+            tokenizer: Some(tokenizer),
+            next_seq_id: AtomicU64::new(1),
+            sessions: std::collections::HashMap::new(),
+            auto_session_seq: 0,
+            auto_session_max: if auto_session_enabled::get() {
+                AUTO_SESSION_MAX
+            } else {
+                0
+            },
+            session_ttl: None,
+            session_max: None,
+            prefix_store: prefix_cache::PrefixCacheStore::from_env(),
+            grammar_factory: OnceLock::new(),
+            wants_reasoning_effort: false,
+            preserves_thinking_on_replay: false,
+            #[cfg(feature = "mlx-native")]
+            draft: None,
+            sampling: None,
+            rng: lumen_core::sampling::Xorshift64::new(0),
+            recent: std::collections::HashMap::new(),
+        }
+    }
+
+    /// How many scripted tokens the loop consumed before returning.
+    pub(crate) fn scripted_tokens_consumed(&self) -> usize {
+        match &self.runner {
+            RunnerImpl::Scripted(r) => r.consumed(),
+            _ => unreachable!("only built by with_token_script"),
+        }
+    }
 }
 
 impl MlxQwen35Backend {
@@ -2676,6 +3325,20 @@ impl MlxQwen35Backend {
             }
         }
 
+        let wants_reasoning_effort = checkpoint_declares_reasoning_effort(model_id);
+        let preserves_thinking_on_replay = checkpoint_preserves_thinking_on_replay(model_id);
+        if preserves_thinking_on_replay {
+            eprintln!(
+                "[mlx] preserve_thinking ENABLED (this checkpoint's template keeps \
+                 <think> on replayed assistant turns)"
+            );
+        }
+        if wants_reasoning_effort {
+            eprintln!(
+                "[mlx] reasoning_effort ENABLED (this checkpoint's chat template declares it)"
+            );
+        }
+
         let mut me = Self {
             runner,
             model_id: model_id.to_string(),
@@ -2684,12 +3347,23 @@ impl MlxQwen35Backend {
             tokenizer,
             next_seq_id: AtomicU64::new(1),
             sessions: std::collections::HashMap::new(),
+            auto_session_seq: 0,
+            auto_session_max: if auto_session_enabled::get() {
+                AUTO_SESSION_MAX
+            } else {
+                0
+            },
             session_ttl,
             session_max,
             prefix_store,
             grammar_factory: OnceLock::new(),
+            wants_reasoning_effort,
+            preserves_thinking_on_replay,
             #[cfg(feature = "mlx-native")]
             draft: None,
+            sampling: None,
+            rng: lumen_core::sampling::Xorshift64::new(0),
+            recent: std::collections::HashMap::new(),
         };
         // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
         // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
@@ -2712,6 +3386,103 @@ impl MlxQwen35Backend {
 
     pub fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         self.runner.prefill(seq_id, tokens)
+    }
+
+    /// Translate a request's sampling knobs into a Qwen [`SamplingConfig`],
+    /// or `None` when the result would be greedy.
+    ///
+    /// Qwen gets its own builder rather than sharing Gemma's because Gemma's
+    /// rewrites an incoming `0.7` to `1.0` — the server's serde default is 0.7,
+    /// so Gemma reads that exact value as "the client said nothing" and
+    /// substitutes what Gemma wants. Its own comment records why that must not
+    /// be copied here: *"1.0 is too hot for Qwen"*. So 0.7 means 0.7.
+    ///
+    /// Returning `None` for the greedy case is what keeps every existing
+    /// output bit-identical: the caller then runs the untouched argmax path
+    /// rather than a sampler that would merely be *equivalent* to argmax.
+    pub(crate) fn qwen_sampling_config(
+        temperature: f32,
+        top_p: f32,
+        ov: &crate::SamplingOverrides,
+    ) -> Option<lumen_core::sampling::SamplingConfig> {
+        use lumen_core::sampling::SamplingConfig;
+        let cfg = SamplingConfig {
+            temperature: temperature.max(0.0),
+            top_p: if (0.0..1.0).contains(&top_p) && top_p > 0.0 {
+                top_p
+            } else {
+                1.0
+            },
+            top_k: ov.top_k.unwrap_or(0),
+            min_p: ov.min_p.unwrap_or(0.0),
+            repeat_penalty: ov.repeat_penalty.unwrap_or(1.0),
+            presence_penalty: ov.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: ov.frequency_penalty.unwrap_or(0.0),
+            seed: resolve_sampling_seed(ov),
+            ..SamplingConfig::default()
+        };
+        if cfg.is_greedy() { None } else { Some(cfg) }
+    }
+
+    /// Install the sampling policy for the request about to be decoded.
+    ///
+    /// Called unconditionally by every entry point, including with `None`, so a
+    /// greedy request can never inherit the previous request's temperature.
+    pub fn set_sampling(&mut self, cfg: Option<lumen_core::sampling::SamplingConfig>) {
+        self.rng = lumen_core::sampling::Xorshift64::new(cfg.as_ref().map(|c| c.seed).unwrap_or(0));
+        self.recent.clear();
+        self.sampling = cfg;
+    }
+
+    /// One decode step under a grammar, sampled when the request asked for it.
+    ///
+    /// Mask first, then sample from what survives — so a constrained turn is
+    /// still a *sampled* turn. Leaving this greedy would have made
+    /// `temperature` silently inert for exactly the requests that use tools or
+    /// `response_format`, which is most agentic traffic.
+    ///
+    /// With no sampling policy it is the untouched masked-argmax call.
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_grammar(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        g: &mut crate::grammar::Gemma4GrammarState,
+    ) -> Result<(u32, usize)> {
+        if let Some(cfg) = self.sampling {
+            use lumen_core::sampling::{sample_distribution, sampling_distribution};
+            let Self {
+                runner,
+                rng,
+                recent,
+                ..
+            } = self;
+            let history: Vec<u32> = recent
+                .get(&seq_id)
+                .map(|w| w.iter().copied().collect())
+                .unwrap_or_default();
+            let mut chosen = 0u32;
+            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
+                g.apply_mask_to_logits(buf)?;
+                let probs = sampling_distribution(buf, &history, &cfg);
+                chosen = sample_distribution(&probs, rng);
+                Ok(chosen)
+            })?;
+            self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
+            return Ok(out);
+        }
+        let mut mask = |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
+        self.runner
+            .decode_step_masked(seq_id, last_token, &mut mask)
+    }
+
+    /// Record a sampled token in this sequence's penalty window.
+    fn note_sampled(&mut self, seq_id: u64, tok: u32, keep: usize) {
+        let window = self.recent.entry(seq_id).or_default();
+        window.push_back(tok);
+        while window.len() > keep.max(1) {
+            window.pop_front();
+        }
     }
 
     /// Prompt tokens one attached image adds — its merged-token run plus the
@@ -2741,12 +3512,43 @@ impl MlxQwen35Backend {
         self.runner.prefill_with_images(seq_id, tokens, images)
     }
 
+    /// One decode step, sampled when the request asked for it.
+    ///
+    /// With no sampling policy this is the untouched call it always was —
+    /// which is the point: greedy output stays bit-identical rather than
+    /// merely equivalent, so every existing test and every recorded
+    /// measurement still describes the same bytes.
     pub fn decode_step(
         &mut self,
         seq_id: u64,
         last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)> {
+        #[cfg(feature = "mlx-native")]
+        if let Some(cfg) = self.sampling {
+            use lumen_core::sampling::{sample_distribution, sampling_distribution};
+            // Destructured so the borrow checker sees `runner` and `rng` as the
+            // disjoint fields they are — the closure needs `rng` while the call
+            // needs `runner`.
+            let Self {
+                runner,
+                rng,
+                recent,
+                ..
+            } = self;
+            let history: Vec<u32> = recent
+                .get(&seq_id)
+                .map(|w| w.iter().copied().collect())
+                .unwrap_or_default();
+            let mut chosen = 0u32;
+            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
+                let probs = sampling_distribution(buf, &history, &cfg);
+                chosen = sample_distribution(&probs, rng);
+                Ok(chosen)
+            })?;
+            self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
+            return Ok(out);
+        }
         self.runner.decode_step(seq_id, last_token, position)
     }
 
@@ -2924,19 +3726,19 @@ impl MlxQwen35Backend {
         seq_id: u64,
         committed_token: u32,
         n_draft: usize,
-        temperature: f32,
-        top_p: f32,
+        sampling: &lumen_core::sampling::SamplingConfig,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
         self.runner
-            .qwen35_mtp_step(seq_id, committed_token, n_draft, temperature, top_p)
+            .qwen35_mtp_step(seq_id, committed_token, n_draft, sampling)
     }
 
     /// Env-driven MTP auto-enable hook called at the end of `load()`.
     /// Triggered by `LUMEN_QWEN35_MTP=1`. Resolves the HF-original snapshot
     /// directory holding the bf16 `mtp.*` tensors from
-    /// `LUMEN_QWEN35_HF_ORIGINAL` (required when MTP is enabled), detects the
-    /// trunk variant (27B Dense vs 35B-A3B MoE) from the model_id substring,
-    /// loads the block via `load_block_from_hf` (AFFINE4 group_size=64), and
+    /// `LUMEN_QWEN35_HF_ORIGINAL` (required when MTP is enabled), derives the
+    /// head shape (Dense vs MoE, dims) from the trunk's own `config.json` via
+    /// [`crate::qwen3_5_mtp::mtp_shape_from_text_config`], loads the block via
+    /// `load_block_from_hf` (AFFINE4 group_size=64), and
     /// installs it through `enable_qwen35_mtp`. Returns `Err` only when the
     /// user-facing config is broken (env present but path missing / invalid
     /// dims / dtype) — propagated by the caller as a non-fatal warning so
@@ -3005,55 +3807,33 @@ impl MlxQwen35Backend {
                 }
             },
         };
-        // Dim detection from model_id — same substring rules as the server's
-        // `is_qwen3_5_dense`. 27B = Dense; everything else under the Qwen3.6
-        // family with mtp.* = MoE (35B-A3B currently).
-        let lower = self.model_id.to_lowercase();
-        let is_27b_dense = (lower.contains("qwen3.6") || lower.contains("qwen3_5"))
-            && !lower.contains("a3b")
-            && !lower.contains("moe")
-            && (lower.contains("27b") || lower.contains("-27-") || lower.contains("-dense"));
-        let (dims, mlp_cfg, label) = if is_27b_dense {
-            (
-                crate::qwen3_5_mtp::Qwen35MtpDims {
-                    hidden_size: 5120,
-                    num_attention_heads: 24,
-                    num_key_value_heads: 4,
-                    head_dim: 256,
-                    rope_theta: 10_000_000.0,
-                    rope_dim: 64,
-                    rms_norm_eps: 1e-6,
-                    attn_output_gate: true,
-                },
-                crate::qwen3_5_mtp::MtpMlpConfig::Dense {
-                    intermediate_size: 17_408,
-                },
-                "Qwen3.6-27B (Dense)",
-            )
-        } else {
-            // Default to the 35B-A3B MoE shape — matches the published
-            // checkpoint and the bench_qwen35_mtp_loader_smoke.rs 35b branch.
-            (
-                crate::qwen3_5_mtp::Qwen35MtpDims {
-                    hidden_size: 2048,
-                    num_attention_heads: 16,
-                    num_key_value_heads: 2,
-                    head_dim: 256,
-                    rope_theta: 10_000_000.0,
-                    rope_dim: 64,
-                    rms_norm_eps: 1e-6,
-                    attn_output_gate: true,
-                },
-                crate::qwen3_5_mtp::MtpMlpConfig::Moe(crate::qwen3_5_mtp::MtpMoeConfig {
-                    num_experts: 256,
-                    num_experts_per_tok: 8,
-                    moe_intermediate_size: 512,
-                    shared_expert_intermediate_size: 512,
-                    norm_topk_prob: true,
-                }),
-                "Qwen3.6-35B-A3B (MoE)",
-            )
+        // Head shape comes from the TRUNK's own config.json, not from the model
+        // id. The previous rule tested the id for `"qwen3.6" | "qwen3_5"` (the
+        // server's `is_qwen3_5_dense` spelling) and fell through to the 35B-A3B
+        // MoE shape for anything else — so a Qwen3.8 repo, whose trunk is the
+        // same 27B dense architecture, silently asked for hidden=2048 + MoE and
+        // failed at load. Every value those two branches hardcoded is already
+        // parsed here.
+        let trunk_dir = crate::runner_native::resolve_model_dir(&self.model_id)
+            .with_context(|| format!("resolve trunk dir for MTP dims ({})", self.model_id))?;
+        let trunk_cfg =
+            crate::qwen35_config::NativeModelConfig::load(&trunk_dir.join("config.json"))
+                .with_context(|| {
+                    format!(
+                        "read trunk config.json for MTP dims ({})",
+                        trunk_dir.display()
+                    )
+                })?;
+        let (dims, mlp_cfg) =
+            crate::qwen3_5_mtp::mtp_shape_from_text_config(&trunk_cfg.text_config)?;
+        let label = match mlp_cfg {
+            crate::qwen3_5_mtp::MtpMlpConfig::Dense { .. } => "Dense",
+            crate::qwen3_5_mtp::MtpMlpConfig::Moe(_) => "MoE",
         };
+        let label = format!(
+            "{label} hidden={} heads={}/{} head_dim={}",
+            dims.hidden_size, dims.num_attention_heads, dims.num_key_value_heads, dims.head_dim
+        );
         let quant = crate::qwen3_5_mtp::MtpLoadQuant::Affine4 { group_size: 64 };
         let t0 = std::time::Instant::now();
         let block = crate::qwen3_5_mtp::load_block_from_hf(&hf_path, dims, mlp_cfg, quant)
@@ -3161,6 +3941,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -3173,7 +3954,7 @@ impl MlxQwen35Backend {
             (d.cfg.n_max, d.eos_tokens.clone())
         };
 
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -3467,9 +4248,15 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         let attached = self.attach_image_blocks(messages, images)?;
-        let ids = self.encode(&format_qwen3_chat(&attached.messages, thinking))?;
+        let ids = self.encode(&format_qwen3_chat(
+            &attached.messages,
+            thinking,
+            effort,
+            self.preserves_thinking_on_replay,
+        ))?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
         Ok((ids, attached.prepared))
     }
@@ -3529,8 +4316,14 @@ impl MlxQwen35Backend {
         &self,
         messages: &[(String, String)],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<Vec<u32>> {
-        let prompt = format_qwen3_chat(messages, thinking);
+        let prompt = format_qwen3_chat(
+            messages,
+            thinking,
+            effort,
+            self.preserves_thinking_on_replay,
+        );
         self.encode(&prompt)
     }
 
@@ -3545,9 +4338,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
         let (ids, prefill, _prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice, effort)?;
         Ok((ids, prefill))
     }
 
@@ -3563,9 +4357,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
-        let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
@@ -3590,6 +4385,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(
         Vec<u32>,
         String,
@@ -3598,7 +4394,7 @@ impl MlxQwen35Backend {
     )> {
         use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
         let attached = self.attach_image_blocks(messages, images)?;
-        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools(&attached.messages, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &attached.counts)?;
@@ -3645,12 +4441,14 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
         let (ids, prefill, _prefill_tokens) = self.build_chat_input_with_tools_from_history_split(
             turns,
             thinking,
             tools,
             tool_choice,
+            effort,
         )?;
         Ok((ids, prefill))
     }
@@ -3663,11 +4461,12 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String, Vec<u32>)> {
         use crate::qwen3_5_tools::{
             format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
         };
-        let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools);
+        let prompt_only = format_qwen3_chat_with_tools_from_history(turns, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         Ok((ids, prefill, prefill_tokens))
@@ -3692,6 +4491,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(
         Vec<u32>,
         String,
@@ -3739,7 +4539,8 @@ impl MlxQwen35Backend {
             })
             .collect();
 
-        let prompt_only = format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools);
+        let prompt_only =
+            format_qwen3_chat_with_tools_from_history(&rewritten, thinking, tools, effort);
         let prefill = qwen35_tool_choice_prefill_str(tool_choice);
         let (ids, prefill_tokens) = self.encode_with_prefill_split(&prompt_only, &prefill)?;
         let ids = self.expand_image_placeholders(&ids, &counts)?;
@@ -3994,9 +4795,7 @@ impl MlxQwen35Backend {
             let final_tok = prompt_ids[split];
             let stepped = {
                 let g = grammar.as_mut().expect("grammar active implies Some");
-                let mut mask =
-                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
-                self.runner.decode_step_masked(seq_id, final_tok, &mut mask)
+                self.decode_step_grammar(seq_id, final_tok, g)
             };
             let (n, p) = stepped?;
             last = n;
@@ -4074,10 +4873,7 @@ impl MlxQwen35Backend {
                 {
                     let stepped = {
                         let g = grammar.as_mut().expect("grammar_active implies Some");
-                        let mut mask = |buf: &mut [f32]| -> Result<()> {
-                            g.apply_mask_to_logits(buf).map(|_| ())
-                        };
-                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                        self.decode_step_grammar(seq_id, last, g)
                     };
                     let (next, new_pos) = stepped?;
                     let observe_err = grammar.as_mut().and_then(|g| g.observe(next).err());
@@ -4142,9 +4938,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking)?;
+            self.build_response_format_input(messages, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4164,13 +4961,17 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         if !images.iter().any(|v| !v.is_empty()) {
-            return Ok((self.build_chat_input(messages, thinking)?, Vec::new()));
+            return Ok((
+                self.build_chat_input(messages, thinking, effort)?,
+                Vec::new(),
+            ));
         }
         #[cfg(feature = "mlx-native")]
         {
-            self.build_chat_input_with_images(messages, images, thinking)
+            self.build_chat_input_with_images(messages, images, thinking, effort)
         }
         #[cfg(not(feature = "mlx-native"))]
         {
@@ -4191,6 +4992,7 @@ impl MlxQwen35Backend {
         turns: &[crate::chat_io::ChatTurn<'_>],
         images: &[Vec<Vec<u8>>],
         thinking: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         use crate::chat_io::ResolvedToolChoice;
         if !images.iter().any(|v| !v.is_empty()) {
@@ -4200,6 +5002,7 @@ impl MlxQwen35Backend {
                     thinking,
                     &[],
                     &ResolvedToolChoice::None,
+                    effort,
                 )?;
             return Ok((ids, Vec::new()));
         }
@@ -4212,6 +5015,7 @@ impl MlxQwen35Backend {
                     thinking,
                     &[],
                     &ResolvedToolChoice::None,
+                    effort,
                 )?;
             Ok((ids, prepared))
         }
@@ -4236,12 +5040,13 @@ impl MlxQwen35Backend {
         seq_id: u64,
         schema: &serde_json::Value,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(&str),
     {
         let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking)?;
+            self.build_response_format_input(messages, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4265,9 +5070,10 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking)?;
+            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4290,12 +5096,13 @@ impl MlxQwen35Backend {
         seq_id: u64,
         schema: &serde_json::Value,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(&str),
     {
         let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking)?;
+            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -4319,11 +5126,20 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        self.chat_streaming_with_images(messages, &[], max_new_tokens, thinking, seq_id, on_token)
+        self.chat_streaming_with_images(
+            messages,
+            &[],
+            max_new_tokens,
+            thinking,
+            seq_id,
+            on_token,
+            effort,
+        )
     }
 
     /// [`Self::chat_streaming`] with inline images.
@@ -4343,6 +5159,7 @@ impl MlxQwen35Backend {
         thinking: bool,
         seq_id: u64,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
@@ -4356,6 +5173,7 @@ impl MlxQwen35Backend {
         #[cfg(feature = "mlx-native")]
         if !has_images
             && self.qwen35_mtp_enabled()
+            && mtp_sampling_is_supported(self.sampling.as_ref())
             && let Some(k) = effective_qwen35_mtp_k()
         {
             return self.chat_streaming_qwen35_mtp(
@@ -4365,6 +5183,7 @@ impl MlxQwen35Backend {
                 seq_id,
                 k,
                 on_token,
+                effort,
             );
         }
 
@@ -4383,6 +5202,7 @@ impl MlxQwen35Backend {
                 thinking,
                 seq_id,
                 on_token,
+                effort,
             );
         }
 
@@ -4394,11 +5214,12 @@ impl MlxQwen35Backend {
                 seq_id,
                 cfg,
                 on_token,
+                effort,
             );
         }
 
         if self.prefix_store.enabled()
-            && let Some(key) = auto_prefix_key(messages)
+            && let Some(key) = auto_prefix_key(messages, effort)
         {
             return self.chat_streaming_prefix_cache(
                 messages,
@@ -4407,6 +5228,7 @@ impl MlxQwen35Backend {
                 seq_id,
                 &key,
                 on_token,
+                effort,
             );
         }
 
@@ -4414,9 +5236,12 @@ impl MlxQwen35Backend {
         // image, and prefill has to splice the encoded features over it.
         #[cfg(feature = "mlx-native")]
         let (prompt_ids, prepared) = if has_images {
-            self.build_chat_input_with_images(messages, images, thinking)?
+            self.build_chat_input_with_images(messages, images, thinking, effort)?
         } else {
-            (self.build_chat_input(messages, thinking)?, Vec::new())
+            (
+                self.build_chat_input(messages, thinking, effort)?,
+                Vec::new(),
+            )
         };
         #[cfg(not(feature = "mlx-native"))]
         let prompt_ids = {
@@ -4425,7 +5250,7 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            self.build_chat_input(messages, thinking)?
+            self.build_chat_input(messages, thinking, effort)?
         };
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
@@ -4588,6 +5413,7 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_flat(
             messages,
@@ -4599,6 +5425,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             |_ev| Ok(()),
+            effort,
         )
     }
 
@@ -4618,6 +5445,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4632,6 +5460,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             on_event,
+            effort,
         )
     }
 
@@ -4646,6 +5475,7 @@ impl MlxQwen35Backend {
         tools: &[crate::chat_io::ToolDef<'_>],
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse> {
         self.chat_with_tools_history(
             turns,
@@ -4657,6 +5487,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             |_ev| Ok(()),
+            effort,
         )
     }
 
@@ -4673,6 +5504,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4687,6 +5519,7 @@ impl MlxQwen35Backend {
             tool_choice,
             calls,
             on_event,
+            effort,
         )
     }
 
@@ -4708,6 +5541,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4721,10 +5555,16 @@ impl MlxQwen35Backend {
                 thinking,
                 tools,
                 tool_choice,
+                effort,
             )?
         } else {
-            let (ids, prefill, prefill_tokens) =
-                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         #[cfg(not(feature = "mlx-native"))]
@@ -4734,20 +5574,25 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            let (ids, prefill, prefill_tokens) =
-                self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice)?;
+            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
         let prefix_key = if has_images {
             None
         } else {
-            auto_prefix_key(messages)
+            auto_prefix_key(messages, effort)
         };
         let incremental_boundary = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len(messages, tools)
+            self.detect_system_tools_prefix_len(messages, tools, effort)
                 .ok()
                 .filter(|&b| b > 0 && b < prompt_ids.len())
         };
@@ -4756,6 +5601,7 @@ impl MlxQwen35Backend {
             prefill,
             prefill_tokens,
             grammar,
+            calls,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -4766,6 +5612,7 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
+            thinking,
             on_event,
         )
     }
@@ -4783,6 +5630,7 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         calls: crate::grammar::ToolCalls,
         on_event: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
@@ -4796,6 +5644,7 @@ impl MlxQwen35Backend {
                 thinking,
                 tools,
                 tool_choice,
+                effort,
             )?
         } else {
             let (ids, prefill, prefill_tokens) = self
@@ -4804,6 +5653,7 @@ impl MlxQwen35Backend {
                     thinking,
                     tools,
                     tool_choice,
+                    effort,
                 )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
@@ -4820,6 +5670,7 @@ impl MlxQwen35Backend {
                     thinking,
                     tools,
                     tool_choice,
+                    effort,
                 )?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
@@ -4827,12 +5678,12 @@ impl MlxQwen35Backend {
         let prefix_key = if has_images {
             None
         } else {
-            auto_prefix_key_from_turns(turns)
+            auto_prefix_key_from_turns(turns, effort)
         };
         let incremental_boundary = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len_from_turns(turns, tools)
+            self.detect_system_tools_prefix_len_from_turns(turns, tools, effort)
                 .ok()
                 .filter(|&b| b > 0 && b < prompt_ids.len())
         };
@@ -4841,6 +5692,7 @@ impl MlxQwen35Backend {
             prefill,
             prefill_tokens,
             grammar,
+            calls,
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
@@ -4851,6 +5703,7 @@ impl MlxQwen35Backend {
                 Default::default()
             },
             prepared,
+            thinking,
             on_event,
         )
     }
@@ -4877,6 +5730,12 @@ impl MlxQwen35Backend {
         // path). When active, each decode step routes through
         // `decode_step_masked` so disallowed tokens are masked before argmax.
         grammar: Option<crate::grammar::Gemma4GrammarState>,
+        // How many calls this turn may contain (OpenAI `parallel_tool_calls`,
+        // Anthropic `disable_parallel_tool_use`). Enforced HERE and not by the
+        // grammar: the grammar is one-call-per-activation by construction and
+        // is `None` outright whenever the tool grammar is disabled or
+        // `tool_choice` is plain `auto`.
+        calls: crate::grammar::ToolCalls,
         max_new_tokens: usize,
         seq_id: u64,
         // Auto-derived key (from system message hash) or explicit session_id
@@ -4899,6 +5758,11 @@ impl MlxQwen35Backend {
         // Empty for a text-only request, which then prefills byte-identically
         // to the pre-vision path.
         prepared_images: Vec<crate::qwen36_vision::PreparedImage>,
+        // Whether the generation prompt left the `<think>` block OPEN. With
+        // thinking on the template ends at `<think>\n` and the model writes its
+        // trace with no opener, so the parser has to be told — it cannot see a
+        // tag that the prompt, not the model, emitted.
+        thinking: bool,
         mut on_event: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
@@ -4910,7 +5774,11 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
 
-        let mut parser = Qwen35ResponseParser::new();
+        let mut parser = if thinking {
+            Qwen35ResponseParser::with_thinking_open()
+        } else {
+            Qwen35ResponseParser::new()
+        };
         // Prime the parser with the prefill so its state machine
         // transitions OUT of Visible BEFORE the model starts generating.
         // Events from the prefill are SUPPRESSED — the engine assigns
@@ -4988,8 +5856,18 @@ impl MlxQwen35Backend {
             )?
         };
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        // `prompt=` is stated separately when the two differ, because they
+        // legitimately do: an active grammar holds the last prompt token back
+        // for a masked decode step, so the prefill is one short of the prompt
+        // the client is billed for. Without it the log reads like an off-by-one
+        // in `usage.prompt_tokens` every time `tool_choice` is `required`.
+        let held_back = if hold_back_last {
+            format!(" (prompt={}, 1 held for the masked step)", prompt_ids.len())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[mlx] seq {seq_id} prefill-tools: {} tokens in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
+            "[mlx] seq {seq_id} prefill-tools: {} tokens{held_back} in {prefill_ms:.0}ms ({:.1} tok/s) -> tok={last}",
             prefill_ids.len(),
             prefill_ids.len() as f64 / (prefill_ms / 1000.0)
         );
@@ -5034,9 +5912,7 @@ impl MlxQwen35Backend {
                 let g = grammar
                     .as_mut()
                     .expect("hold_back_last implies an active grammar");
-                let mut mask =
-                    |buf: &mut [f32]| -> Result<()> { g.apply_mask_to_logits(buf).map(|_| ()) };
-                self.runner.decode_step_masked(seq_id, held, &mut mask)
+                self.decode_step_grammar(seq_id, held, g)
             };
             match stepped {
                 Ok((next, new_pos)) => {
@@ -5120,6 +5996,26 @@ impl MlxQwen35Backend {
         //      have to be rolled back on the injection/grammar-desync paths.
         // Correctness first: Qwen3.6 stays on the exact synchronous path.
         for step in 1..max_new_tokens {
+            // `parallel_tool_calls: false` — the parser has consumed a
+            // `</tool_call>` and the client asked for exactly one call.
+            //
+            // Evaluated at the TOP of the loop rather than after each of the
+            // three `parser.feed` sites below: the injection branch `continue`s
+            // back here and the tail of the body falls through to here, so one
+            // check covers every path that can complete a call — including the
+            // pre-loop feed of the first decoded token.
+            //
+            // Ordering matters. This sits ahead of the force-required-params
+            // injection so a closed call is never re-opened to force a
+            // parameter into it.
+            if calls.must_stop_after_completed_calls(parser.completed_calls()) {
+                eprintln!(
+                    "[tool-calls] parallel_tool_calls=false — ending the turn after \
+                     one completed call at {} tokens",
+                    generated.len()
+                );
+                break;
+            }
             // Force-required-params injection (opt-in). If the previous feed
             // left the parser at a clean tool-call-body boundary with a
             // REQUIRED param still missing, inject `<parameter=KEY>\n` so the
@@ -5182,10 +6078,7 @@ impl MlxQwen35Backend {
                     // None` reassignment.
                     let stepped = {
                         let g = grammar.as_mut().expect("grammar_active implies Some");
-                        let mut mask = |buf: &mut [f32]| -> Result<()> {
-                            g.apply_mask_to_logits(buf).map(|_| ())
-                        };
-                        self.runner.decode_step_masked(seq_id, last, &mut mask)
+                        self.decode_step_grammar(seq_id, last, g)
                     };
                     let (next, new_pos) = stepped?;
                     // Advance the matcher with the sampled token. A desync here
@@ -5274,11 +6167,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         prefix_cache_key: &str,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -5301,7 +6195,7 @@ impl MlxQwen35Backend {
         {
             prompt_ids.len() - header_ids.len()
         } else {
-            let sys = self.detect_system_prefix_len(messages).unwrap_or(0);
+            let sys = self.detect_system_prefix_len(messages, effort).unwrap_or(0);
             if sys > 0 && sys < prompt_ids.len() {
                 sys
             } else {
@@ -5526,14 +6420,18 @@ impl MlxQwen35Backend {
     /// are shareable. Returns 0 if there's no system message or if tokenizing
     /// the system block alone doesn't produce a strict prefix of the full
     /// chat-input (rare but possible due to tokenizer boundary effects).
-    fn detect_system_prefix_len(&self, messages: &[(String, String)]) -> Result<usize> {
+    fn detect_system_prefix_len(
+        &self,
+        messages: &[(String, String)],
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<usize> {
         let Some(first) = messages.first() else {
             return Ok(0);
         };
         if first.0 != "system" || first.1.is_empty() {
             return Ok(0);
         }
-        let block = format_system_prefix(first);
+        let block = format_system_prefix(first, effort);
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
     }
@@ -5545,13 +6443,14 @@ impl MlxQwen35Backend {
     fn detect_system_prefix_len_from_turns(
         &self,
         turns: &[crate::chat_io::ChatTurn<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         use crate::chat_io::ChatTurn;
         let content = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => *s,
             _ => return Ok(0),
         };
-        let block = format_system_prefix(&("system".to_string(), content.to_string()));
+        let block = format_system_prefix(&("system".to_string(), content.to_string()), effort);
         let sys_ids = self.encode(&block)?;
         Ok(sys_ids.len())
     }
@@ -5570,15 +6469,16 @@ impl MlxQwen35Backend {
         &self,
         messages: &[(String, String)],
         tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         if tools.is_empty() {
-            return self.detect_system_prefix_len(messages);
+            return self.detect_system_prefix_len(messages, effort);
         }
         let leading_system = match messages.first() {
             Some((role, text)) if role == "system" && !text.is_empty() => Some(text.as_str()),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
         let ids = self.encode(&block)?;
         Ok(ids.len())
     }
@@ -5588,16 +6488,17 @@ impl MlxQwen35Backend {
         &self,
         turns: &[crate::chat_io::ChatTurn<'_>],
         tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<usize> {
         use crate::chat_io::ChatTurn;
         if tools.is_empty() {
-            return self.detect_system_prefix_len_from_turns(turns);
+            return self.detect_system_prefix_len_from_turns(turns, effort);
         }
         let leading_system = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => Some(*s),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system);
+        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
         let ids = self.encode(&block)?;
         Ok(ids.len())
     }
@@ -5638,11 +6539,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         cfg: spec_decode::SpecConfig,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -5889,11 +6791,12 @@ impl MlxQwen35Backend {
         seq_id: u64,
         k: usize,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
@@ -5920,18 +6823,30 @@ impl MlxQwen35Backend {
             return Ok(out);
         }
 
-        // MTP acceptance regime. Default greedy (temp 0 = exact argmax-match,
-        // lossless). `LUMEN_MTP_TEMP>0` switches to Leviathan rejection
-        // sampling (accept min(1,p/q) + residual) so accept rate rises toward
-        // the sampling regime; `LUMEN_MTP_TOPP` sets the nucleus.
-        let mtp_temp: f32 = std::env::var("LUMEN_MTP_TEMP")
+        // MTP acceptance regime. Greedy (temp 0) is exact argmax-match and
+        // lossless; `temperature > 0` switches to Leviathan rejection sampling
+        // (accept `min(1,p/q)` + residual), which keeps the committed stream a
+        // valid sample at that temperature.
+        //
+        // The request's temperature is the default, taken from the sampling
+        // policy the entry point installed. It used to read `LUMEN_MTP_TEMP`
+        // alone and default to 0.0, which meant a client asking for
+        // `temperature: 1.5` got greedy output and no error. The env vars stay
+        // as an operator override for A/B measurement — that is what they were
+        // added for — but they no longer decide the request's regime.
+        let mut mtp_cfg = self.sampling.unwrap_or_default();
+        if let Some(t) = std::env::var("LUMEN_MTP_TEMP")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let mtp_topp: f32 = std::env::var("LUMEN_MTP_TOPP")
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            mtp_cfg.temperature = t;
+        }
+        if let Some(p) = std::env::var("LUMEN_MTP_TOPP")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            mtp_cfg.top_p = p;
+        }
         let t_decode = std::time::Instant::now();
         let mut cycles: usize = 0;
         let mut accepted_total: usize = 0;
@@ -5940,7 +6855,7 @@ impl MlxQwen35Backend {
         while generated.len() < max_new_tokens && !stop {
             let t_cycle = std::time::Instant::now();
             let out = self
-                .qwen35_mtp_step(seq_id, last, k, mtp_temp, mtp_topp)
+                .qwen35_mtp_step(seq_id, last, k, &mtp_cfg)
                 .with_context(|| {
                     format!("[mlx-mtp] seq {seq_id} mtp_step cycle {cycles} failed")
                 })?;
@@ -6020,26 +6935,24 @@ impl MlxQwen35Backend {
         messages: &[(String, String)],
         max_new_tokens: usize,
         thinking: bool,
-        session_id: &str,
+        session_id: Option<&str>,
         mut on_token: F,
+        effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
-        let prompt_ids = self.build_chat_input(messages, thinking)?;
+        let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
             return Err(anyhow!("empty prompt after tokenization"));
         }
 
         self.evict_stale_sessions();
+        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
 
         // Decide: reuse existing session, or start fresh.
-        let (seq_id, mut last, mut pos, fresh) = match self.sessions.get(session_id) {
-            Some(state)
-                if !state.tokens.is_empty()
-                    && prompt_ids.len() > state.tokens.len()
-                    && prompt_ids.starts_with(&state.tokens) =>
-            {
+        let (seq_id, mut last, mut pos, fresh) = match self.sessions.get(session_id.as_str()) {
+            Some(state) if state.extends(&prompt_ids) => {
                 let suffix = prompt_ids[state.tokens.len()..].to_vec();
                 let seq_id = state.seq_id;
                 let cached_len = state.tokens.len();
@@ -6119,8 +7032,48 @@ impl MlxQwen35Backend {
                 last_access: Instant::now(),
             },
         );
+        self.evict_excess_auto_sessions();
 
         Ok(out)
+    }
+
+    /// Which session key this request should use.
+    ///
+    /// An explicit id is taken as given — the client is managing the session and
+    /// gets exactly the behaviour it always had. Without one, the prompt itself
+    /// identifies the conversation: see [`longest_prefix_session`]. Only when
+    /// nothing matches is a new `auto/N` key minted, and only if auto sessions
+    /// are enabled at all.
+    ///
+    /// Returning a fresh key when auto sessions are off is what keeps the old
+    /// behaviour intact: nothing will ever match it, so the turn cold-prefills
+    /// and `evict_excess_auto_sessions` drops it again immediately.
+    fn resolve_session_key(&mut self, session_id: Option<&str>, prompt_ids: &[u32]) -> String {
+        if let Some(id) = session_id {
+            return id.to_string();
+        }
+        if self.auto_session_max > 0
+            && let Some(k) = longest_prefix_session(&self.sessions, prompt_ids)
+        {
+            return k;
+        }
+        self.auto_session_seq += 1;
+        format!("{AUTO_SESSION_PREFIX}{}", self.auto_session_seq)
+    }
+
+    /// Drop auto sessions past the cap, oldest first, releasing their KV.
+    fn evict_excess_auto_sessions(&mut self) {
+        for key in pick_auto_session_victims(&self.sessions, self.auto_session_max) {
+            if let Some(state) = self.sessions.remove(&key) {
+                let _ = self.runner.remove_seq(state.seq_id);
+                eprintln!(
+                    "[mlx] session={key:?} evicted (auto-session cap {}); freed seq {} ({} tokens)",
+                    self.auto_session_max,
+                    state.seq_id,
+                    state.tokens.len()
+                );
+            }
+        }
     }
 
     /// Non-streaming completion (raw text path used by `/v1/completions`) with
@@ -6131,7 +7084,7 @@ impl MlxQwen35Backend {
         &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
-        session_id: &str,
+        session_id: Option<&str>,
     ) -> Result<Vec<u32>> {
         if input_ids.is_empty() {
             return Err(anyhow!("empty prompt"));
@@ -6140,13 +7093,13 @@ impl MlxQwen35Backend {
         self.evict_stale_sessions();
 
         let prompt_ids: Vec<u32> = input_ids.to_vec();
+        // Same resolution as the chat path: `/v1/completions` has no
+        // conversation id either, and a client extending a raw prompt with what
+        // the model just wrote is the same prefix relationship a chat turn is.
+        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
 
-        let (seq_id, mut last, mut pos) = match self.sessions.get(session_id) {
-            Some(state)
-                if !state.tokens.is_empty()
-                    && prompt_ids.len() > state.tokens.len()
-                    && prompt_ids.starts_with(&state.tokens) =>
-            {
+        let (seq_id, mut last, mut pos) = match self.sessions.get(session_id.as_str()) {
+            Some(state) if state.extends(&prompt_ids) => {
                 let suffix = prompt_ids[state.tokens.len()..].to_vec();
                 let seq_id = state.seq_id;
                 let cached_len = state.tokens.len();
@@ -6204,6 +7157,7 @@ impl MlxQwen35Backend {
                 last_access: Instant::now(),
             },
         );
+        self.evict_excess_auto_sessions();
 
         Ok(generated)
     }
@@ -6237,6 +7191,57 @@ impl MlxQwen35Backend {
             }
         }
     }
+}
+
+/// Which live session a prompt should extend, when the client named none.
+///
+/// A session's `tokens` are what the model was fed plus what it generated, so a
+/// session whose tokens are a strict prefix of this prompt **is** this
+/// conversation one turn earlier — no id required, and none available: neither
+/// the OpenAI nor the Anthropic request has a conversation identifier, and
+/// `session_id` is a Lumen extension no stock client sends. Matching on the
+/// tokens instead is what makes reuse reachable from a spec-conformant request.
+///
+/// The longest match wins, so a conversation that has grown extends its own
+/// newest state rather than an older snapshot of itself.
+///
+/// Explicit sessions are candidates too: a client that named a session on turn
+/// one and omitted it on turn two still continues the same conversation.
+fn longest_prefix_session(
+    sessions: &std::collections::HashMap<String, SessionState>,
+    prompt_ids: &[u32],
+) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|(_, s)| s.extends(prompt_ids))
+        .max_by_key(|(_, s)| s.tokens.len())
+        .map(|(k, _)| k.clone())
+}
+
+/// LRU victims among the **auto** sessions only, once they exceed `max`.
+///
+/// Explicit sessions are exempt: naming one is the client saying it will come
+/// back, while an auto session is our guess, and each holds a whole
+/// conversation's KV until dropped. `max == 0` means auto sessions are off, in
+/// which case every one of them is a victim.
+fn pick_auto_session_victims(
+    sessions: &std::collections::HashMap<String, SessionState>,
+    max: usize,
+) -> Vec<String> {
+    let mut autos: Vec<(&String, Instant)> = sessions
+        .iter()
+        .filter(|(k, _)| k.starts_with(AUTO_SESSION_PREFIX))
+        .map(|(k, s)| (k, s.last_access))
+        .collect();
+    if autos.len() <= max {
+        return Vec::new();
+    }
+    // Oldest first, drop until the cap is met.
+    autos.sort_by_key(|&(_, t)| t);
+    autos[..autos.len() - max]
+        .iter()
+        .map(|(k, _)| (*k).clone())
+        .collect()
 }
 
 /// Pure helper for `evict_stale_sessions`: picks (key, human_reason) pairs
@@ -6300,6 +7305,7 @@ where
     use crate::qwen3_5_tools::Qwen35ParseEvent;
     match ev {
         Qwen35ParseEvent::Text(text) => on_event(BackendStreamEvent::Text(&text)),
+        Qwen35ParseEvent::Reasoning(text) => on_event(BackendStreamEvent::Reasoning(&text)),
         Qwen35ParseEvent::ToolCallStart { name } => {
             on_event(BackendStreamEvent::ToolCallStart { name: &name })
         }
@@ -6307,13 +7313,68 @@ where
 }
 
 /// Qwen3 chat template — same as `format_qwen3_chat` in lumen-model.
-fn format_qwen3_chat(messages: &[(String, String)], thinking: bool) -> String {
+///
+/// `effort` renders Qwen 3.8's reasoning-effort sentence at the head of the
+/// system block, creating one if the conversation has no system message. `None`
+/// (every pre-3.8 checkpoint, and any request that disabled thinking) renders
+/// byte-identically to before.
+fn format_qwen3_chat(
+    messages: &[(String, String)],
+    thinking: bool,
+    effort: Option<crate::chat_io::ReasoningEffort>,
+    preserve_thinking: bool,
+) -> String {
     let mut s = String::new();
+    let mut messages = messages;
+    if let Some(text) = effort.and_then(crate::chat_io::ReasoningEffort::instructions) {
+        // Fold the sentence into the leading system message, or emit a system
+        // block for it alone. Matches the template's two no-tools branches.
+        let leading_system = messages
+            .first()
+            .filter(|(role, _)| role.eq_ignore_ascii_case("system"));
+        s.push_str("<|im_start|>system\n");
+        s.push_str(text);
+        if let Some((_, content)) = leading_system {
+            if !content.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(content);
+            }
+            messages = &messages[1..];
+        }
+        s.push_str("<|im_end|>\n");
+    }
     for (role, content) in messages {
         s.push_str("<|im_start|>");
         s.push_str(role);
         s.push('\n');
-        s.push_str(content);
+        // A replayed assistant turn carries the same `<think>` block the
+        // generation prompt ended with, on the checkpoints whose template keeps
+        // it (`preserve_thinking` defaulting to true — 3.8 yes, 3.6 no).
+        //
+        // The trace itself rides inside `content` as the `<think>…</think>`
+        // envelope, which is both what `LUMEN_REASONING_IN_CONTENT=1` emits and
+        // what the server folds a `reasoning_content` / `reasoning` request
+        // field into. A turn with no trace splits to an empty one and renders
+        // `<think>\n\n</think>\n\n` — byte-identical to what a `thinking:false`
+        // generation prompt emitted, so the replay stays an exact token-prefix
+        // of what the model was fed and the session extends its KV.
+        //
+        // With a trace, the same holds for `thinking:true`: the block is
+        // refilled with the reasoning the model produced, which is the only
+        // way that turn can be a prefix of its own KV.
+        if preserve_thinking && role.eq_ignore_ascii_case("assistant") {
+            let (reasoning, visible) = crate::chat_io::split_reasoning_envelope(content);
+            s.push_str("<think>\n");
+            s.push_str(reasoning);
+            s.push_str("\n</think>\n\n");
+            s.push_str(visible);
+        } else {
+            // `preserve_thinking:false` checkpoints render the turn verbatim,
+            // envelope included. That is deliberate: 3.6's template drops
+            // reasoning from history, but the tokens in the KV have it, so
+            // passing the content through unchanged is what still matches.
+            s.push_str(content);
+        }
         s.push_str("<|im_end|>\n");
     }
     s.push_str("<|im_start|>assistant\n");
@@ -6718,6 +7779,114 @@ mod tests {
         }
     }
 
+    fn session_with(tokens: Vec<u32>, last_access: Instant) -> SessionState {
+        SessionState {
+            seq_id: 0,
+            tokens,
+            last_access,
+        }
+    }
+
+    /// A stock OpenAI or Anthropic request carries no conversation id, and
+    /// `session_id` is a Lumen extension no such client sends — so before this,
+    /// every one of them re-prefilled the whole conversation, every turn.
+    ///
+    /// The prompt identifies its own conversation instead: a session's tokens
+    /// are what the model was fed plus what it generated, so a strict prefix
+    /// match is that conversation, one turn earlier.
+    #[test]
+    fn a_prompt_finds_its_own_conversation_without_being_told_which() {
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert("auto/1".to_string(), session_with(vec![1, 2, 3], now));
+        // A longer state of the SAME conversation must win, so a growing chat
+        // extends its newest turn rather than an older snapshot of itself.
+        map.insert("auto/2".to_string(), session_with(vec![1, 2, 3, 4, 5], now));
+        // …and an unrelated conversation must not match at all.
+        map.insert("auto/3".to_string(), session_with(vec![9, 9], now));
+
+        assert_eq!(
+            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6]).as_deref(),
+            Some("auto/2")
+        );
+        // An explicit session is a candidate too — a client may name one on
+        // turn 1 and omit it afterwards.
+        map.insert(
+            "mine".to_string(),
+            session_with(vec![1, 2, 3, 4, 5, 6], now),
+        );
+        assert_eq!(
+            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6, 7]).as_deref(),
+            Some("mine")
+        );
+    }
+
+    /// The guard that makes guessing a key safe at all.
+    #[test]
+    fn a_session_only_extends_a_prompt_that_actually_continues_it() {
+        let now = Instant::now();
+        let s = session_with(vec![1, 2, 3], now);
+        assert!(s.extends(&[1, 2, 3, 4]));
+        // Identical, not longer: there is nothing to append, and re-running it
+        // as an extension would decode from the wrong position.
+        assert!(!s.extends(&[1, 2, 3]));
+        assert!(!s.extends(&[1, 2]));
+        // Divergent at the last token — the case a system-hash key would get
+        // wrong and this cannot.
+        assert!(!s.extends(&[1, 2, 4, 5]));
+        // An empty session has no KV to reuse.
+        assert!(!session_with(Vec::new(), now).extends(&[1, 2, 3]));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("auto/1".to_string(), s);
+        assert!(longest_prefix_session(&map, &[7, 8, 9]).is_none());
+    }
+
+    /// Auto sessions are capped where explicit ones are not: naming a session
+    /// is the client saying it will come back, while an auto one is our guess,
+    /// and each holds a whole conversation's KV until dropped.
+    #[test]
+    fn only_the_sessions_the_server_invented_are_capped() {
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "auto/1".to_string(),
+            session_with(vec![1], now - Duration::from_secs(30)),
+        );
+        map.insert(
+            "auto/2".to_string(),
+            session_with(vec![2], now - Duration::from_secs(20)),
+        );
+        map.insert(
+            "auto/3".to_string(),
+            session_with(vec![3], now - Duration::from_secs(10)),
+        );
+        map.insert(
+            "named".to_string(),
+            session_with(vec![4], now - Duration::from_secs(99)),
+        );
+
+        // Oldest auto first; the named one is exempt however stale it is.
+        assert_eq!(
+            pick_auto_session_victims(&map, 2),
+            vec!["auto/1".to_string()]
+        );
+        assert_eq!(
+            pick_auto_session_victims(&map, 1),
+            vec!["auto/1".to_string(), "auto/2".to_string()]
+        );
+        // `0` disables auto sessions — every one of them goes, the named one stays.
+        assert_eq!(
+            pick_auto_session_victims(&map, 0),
+            vec![
+                "auto/1".to_string(),
+                "auto/2".to_string(),
+                "auto/3".to_string()
+            ]
+        );
+        assert!(pick_auto_session_victims(&map, 8).is_empty());
+    }
+
     #[test]
     fn pick_eviction_victims_no_limits_keeps_all() {
         let mut map = std::collections::HashMap::new();
@@ -6801,9 +7970,9 @@ mod tests {
             ("system".to_string(), "Different system prompt.".into()),
             ("user".to_string(), "Hi".into()),
         ];
-        let k1 = auto_prefix_key(&m1).unwrap();
-        let k2 = auto_prefix_key(&m2).unwrap();
-        let k3 = auto_prefix_key(&m3).unwrap();
+        let k1 = auto_prefix_key(&m1, None).unwrap();
+        let k2 = auto_prefix_key(&m2, None).unwrap();
+        let k3 = auto_prefix_key(&m3, None).unwrap();
         assert_eq!(k1, k2, "same system prompt should produce same key");
         assert_ne!(
             k1, k3,
@@ -6812,13 +7981,722 @@ mod tests {
     }
 
     #[test]
+    fn a_different_reasoning_effort_must_not_reuse_the_same_cached_prefix() {
+        // RED without the effort in the hash: the sentence is rendered INTO the
+        // cached prefix, so two requests sharing a system message but asking
+        // for different effort levels collided and the second was served a KV
+        // cache built from a prompt it never sent — wrong output, no error.
+        use crate::chat_io::ReasoningEffort;
+        let m = vec![
+            (
+                "system".to_string(),
+                "You are a helpful assistant.".to_string(),
+            ),
+            ("user".to_string(), "Hi".to_string()),
+        ];
+        let hi = auto_prefix_key(&m, Some(ReasoningEffort::Xhigh)).unwrap();
+        let lo = auto_prefix_key(&m, Some(ReasoningEffort::Low)).unwrap();
+        let off = auto_prefix_key(&m, None).unwrap();
+        assert_ne!(hi, lo, "xhigh and low render different prompts");
+        assert_ne!(hi, off, "an effort-bearing prompt differs from one without");
+        assert_ne!(lo, off);
+        // Medium renders no sentence, but keying it apart from `None` costs
+        // nothing and keeps the key a function of the request, not of a
+        // rendering detail that upstream could change.
+        assert_ne!(
+            auto_prefix_key(&m, Some(ReasoningEffort::Medium)).unwrap(),
+            off
+        );
+    }
+
+    #[test]
     fn auto_prefix_key_returns_none_without_system() {
         let m = vec![("user".to_string(), "Hi".into())];
-        assert!(auto_prefix_key(&m).is_none());
+        assert!(auto_prefix_key(&m, None).is_none());
         let empty: Vec<(String, String)> = vec![];
-        assert!(auto_prefix_key(&empty).is_none());
+        assert!(auto_prefix_key(&empty, None).is_none());
         let empty_sys = vec![("system".to_string(), "".into())];
-        assert!(auto_prefix_key(&empty_sys).is_none());
+        assert!(auto_prefix_key(&empty_sys, None).is_none());
+    }
+
+    // ───────── the tool decode loop, driven with no model ─────────
+
+    /// A WordLevel tokenizer whose "words" are whole chunks of Qwen tool-call
+    /// syntax, with a `Fuse` decoder so `decode` is plain concatenation.
+    ///
+    /// This is not a stand-in for a real tokenizer and does not need to be. The
+    /// decode loop's contract is "turn token ids into text, feed the parser,
+    /// decide when to stop"; what matters is that a scripted id sequence
+    /// produces exactly the byte stream a real checkpoint would. Chunk
+    /// boundaries are deliberately awkward (`\n` is its own id, the framing is
+    /// split across ids) so the parser's incremental path is what runs.
+    const SCRIPT_TOKENIZER: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": {"type": "Fuse"},
+        "model": {
+            "type": "WordLevel",
+            "unk_token": "<unk>",
+            "vocab": {
+                "<unk>": 0,
+                "<tool_call>": 1,
+                "\n": 2,
+                "<function=get_weather>": 3,
+                "<parameter=city>": 4,
+                "Seoul": 5,
+                "Tokyo": 6,
+                "</parameter>": 7,
+                "</function>": 8,
+                "</tool_call>": 9,
+                "<eos>": 10
+            }
+        }
+    }"#;
+
+    /// One complete `get_weather` call for `city`, as the model would frame it.
+    fn scripted_call(city: u32) -> Vec<u32> {
+        vec![1, 2, 3, 2, 4, 2, city, 2, 7, 2, 8, 2, 9]
+    }
+
+    /// Run the shared tool decode loop over a scripted two-call stream.
+    /// Returns the parsed response plus how many tokens the loop consumed.
+    fn run_tool_loop(calls: crate::grammar::ToolCalls) -> (crate::chat_io::ParsedResponse, usize) {
+        const EOS: u32 = 10;
+        let mut script = scripted_call(5); // Seoul
+        script.push(2); // the newline between calls
+        script.extend(scripted_call(6)); // Tokyo
+        script.push(EOS);
+        let n_scripted = script.len();
+
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("script tokenizer");
+        let mut backend = MlxQwen35Backend::with_token_script(script, EOS, tokenizer, 11);
+        let parsed = backend
+            .chat_with_tools_impl(
+                vec![42],      // prompt: one arbitrary token
+                String::new(), // no tool_choice prefill
+                Vec::new(),
+                None, // no grammar — the case where a grammar-derived cap goes inert
+                calls,
+                n_scripted + 8, // budget deliberately longer than the script
+                7,
+                None, // prefix caching off for this request
+                None,
+                Default::default(),
+                Vec::new(),
+                false, // the scripted turn emits its own tags; no open block
+                |_| Ok(()),
+            )
+            .expect("tool decode loop");
+        let consumed = backend.scripted_tokens_consumed();
+        (parsed, consumed)
+    }
+
+    /// A checkpoint that does not declare `reasoning_effort` must report `None`
+    /// no matter what the client asks for — and everything that renders OR
+    /// MEASURES a prompt has to go through here to get that answer.
+    ///
+    /// Found by running it, not by reading it: on Qwen3.5-9B, whose template has
+    /// no `reasoning_effort`, a `thinking: true` request prefilled **12** tokens
+    /// and reported **54**. The renderer asked this function and was right; the
+    /// token counter used the client's raw value and was not, so `usage` was
+    /// 4.5x over and the context guard was reading the same inflated figure.
+    #[test]
+    fn effort_is_gated_on_the_checkpoint_declaring_it() {
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("tokenizer");
+        let ov = SamplingOverrides {
+            reasoning_effort: Some(crate::chat_io::ReasoningEffort::Low),
+            ..Default::default()
+        };
+
+        // A 3.5 / 3.6 checkpoint: the level is dropped, whatever was asked.
+        let pre_38 = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer.clone(), 11);
+        assert!(!pre_38.wants_reasoning_effort);
+        assert_eq!(MlxBackend::Qwen35Family(pre_38).resolved_effort(&ov), None);
+
+        // A 3.8 checkpoint: honoured without the operator setting anything.
+        let mut v38 = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer, 11);
+        v38.wants_reasoning_effort = true;
+        assert_eq!(
+            MlxBackend::Qwen35Family(v38).resolved_effort(&ov),
+            Some(crate::chat_io::ReasoningEffort::Low)
+        );
+    }
+
+    /// A request that asks for randomness has to get a sampler.
+    ///
+    /// `temperature` and `top_p` were accepted and discarded on the entire Qwen
+    /// family — `MlxBackend::chat` and its three siblings each opened with
+    /// `let _ = (top_p, temperature, ov)`, so decoding was greedy no matter what
+    /// the client sent, with no error. Measured on Qwen3.8-27B before the fix:
+    /// `temperature: 1.5, top_p: 1.0` returned byte-identical text 4/4, with MTP
+    /// both on and off.
+    ///
+    /// It hid because every test and every by-hand check ran at
+    /// `temperature: 0`, where correct and broken produce the same bytes. So
+    /// this pins both directions: greedy must stay `None` (the untouched argmax
+    /// path, bit-identical), and anything else must produce a config.
+    #[test]
+    fn a_request_asking_for_randomness_gets_a_sampler() {
+        use crate::SamplingOverrides;
+        let plain = SamplingOverrides::default();
+
+        // Greedy stays greedy — `None` routes to the original argmax call, so
+        // existing outputs are unchanged rather than merely equivalent.
+        assert!(
+            MlxQwen35Backend::qwen_sampling_config(0.0, 1.0, &plain).is_none(),
+            "temperature 0 must not build a sampler",
+        );
+
+        let hot = MlxQwen35Backend::qwen_sampling_config(1.5, 0.9, &plain)
+            .expect("temperature 1.5 must sample");
+        assert_eq!(hot.temperature, 1.5);
+        assert_eq!(hot.top_p, 0.9);
+        assert!(!hot.is_greedy());
+
+        // top_p alone is not randomness: nucleus filtering with temperature 0
+        // still leaves the argmax on top, so it must not silently turn a greedy
+        // request into a sampled one.
+        assert!(
+            MlxQwen35Backend::qwen_sampling_config(0.0, 0.5, &plain).is_none(),
+            "top_p without temperature is still greedy",
+        );
+
+        // A penalty IS a behaviour change at temperature 0 — it can move the
+        // argmax — so it has to build a config even though nothing is random.
+        let penalised = MlxQwen35Backend::qwen_sampling_config(
+            0.0,
+            1.0,
+            &SamplingOverrides {
+                repeat_penalty: Some(1.1),
+                ..Default::default()
+            },
+        )
+        .expect("a repeat penalty changes the output, so it must be applied");
+        assert_eq!(penalised.temperature, 0.0);
+
+        // Qwen must NOT inherit Gemma's 0.7 → 1.0 substitution; Gemma's own
+        // comment says 1.0 is too hot here.
+        let default_temp =
+            MlxQwen35Backend::qwen_sampling_config(0.7, 1.0, &plain).expect("0.7 samples");
+        assert_eq!(
+            default_temp.temperature, 0.7,
+            "0.7 means 0.7 on Qwen, not Gemma's substituted 1.0",
+        );
+
+        // `seed` has to reach the config or reproducible sampling is a lie.
+        let seeded = MlxQwen35Backend::qwen_sampling_config(
+            1.0,
+            1.0,
+            &SamplingOverrides {
+                seed: Some(12345),
+                ..Default::default()
+            },
+        )
+        .expect("seeded request samples");
+        assert_eq!(seeded.seed, 12345);
+
+        // And a request that names no seed must not land on the degenerate one.
+        // `Xorshift64::new(0)` substitutes a fixed constant rather than locking
+        // at zero, so a `seed: 0` default samples *the same stream every time* —
+        // measured: `temperature: 1.5` gave 4/4 byte-identical replies, which
+        // looks exactly like sampling still being ignored.
+        assert_ne!(
+            MlxQwen35Backend::qwen_sampling_config(1.0, 1.0, &plain)
+                .expect("samples")
+                .seed,
+            0,
+            "a seedless request must draw a fresh seed, not replay one stream",
+        );
+    }
+
+    /// A replayed assistant turn must be a token-prefix of what the model was
+    /// actually fed, on the checkpoints whose template says so.
+    ///
+    /// The two spellings differ only in their default, and no client sends
+    /// `preserve_thinking`, so the default decides everything:
+    ///
+    /// * 3.6 — `(preserve_thinking is defined and preserve_thinking is true)`
+    /// * 3.8 — `preserve_thinking is undefined or preserve_thinking is true`
+    ///
+    /// Rendering 3.8 the 3.6 way is not cosmetic. A `thinking: false` generation
+    /// prompt ends with `<think>\n\n</think>\n\n`, and the model's reply follows
+    /// it; a replay that drops the block diverges from the KV at that exact
+    /// token. Measured on Qwen3.8-27B: the replayed turn occupied 16 tokens of
+    /// framing where generation had produced 2, `prompt.starts_with(stored)`
+    /// failed at the first assistant token, and `session_id` re-prefilled the
+    /// whole conversation every turn while reporting nothing.
+    ///
+    /// Matching on the bare name would answer `true` for 3.6, whose template
+    /// mentions `preserve_thinking` only to require that it be set explicitly —
+    /// so the discriminator is the `is undefined` clause.
+    #[test]
+    fn a_replayed_assistant_turn_matches_what_the_model_was_fed() {
+        // The two real clauses, verbatim from the shipped templates.
+        assert!(template_preserves_thinking(
+            "{%- if preserve_thinking is undefined or preserve_thinking is true or \
+             (loop.index0 > ns.last_query_index) %}"
+        ));
+        assert!(!template_preserves_thinking(
+            "{%- if (preserve_thinking is defined and preserve_thinking is true) or \
+             (loop.index0 > ns.last_query_index) %}"
+        ));
+        // A template with no such branch at all (3.5) keeps the old rendering.
+        assert!(!template_preserves_thinking(
+            "{%- elif message.role == \"assistant\" %}"
+        ));
+
+        let convo = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+            ("assistant".to_string(), "A1".to_string()),
+            ("user".to_string(), "U2".to_string()),
+        ];
+
+        // 3.6 must render byte-identically to before this existed.
+        let legacy = format_qwen3_chat(&convo, false, None, false);
+        assert!(
+            legacy.contains("<|im_start|>assistant\nA1<|im_end|>"),
+            "a checkpoint that does not preserve thinking must be unchanged:\n{legacy}",
+        );
+
+        // 3.8 replays the block, and the result must literally extend the
+        // previous turn's generation prompt — that is the property the session
+        // reuse check tests, so assert it rather than the substring alone.
+        let preserved = format_qwen3_chat(&convo, false, None, true);
+        assert!(
+            preserved.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>"),
+            "3.8 replays the think block:\n{preserved}",
+        );
+        let turn1_prompt = format_qwen3_chat(&convo[..2], false, None, true);
+        assert!(
+            preserved.starts_with(&format!("{turn1_prompt}A1<|im_end|>\n")),
+            "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
+             reused:\nturn1={turn1_prompt:?}\nturn2={preserved:?}",
+        );
+    }
+
+    /// Does reusing a session's KV give the same tokens as prefilling the
+    /// whole prompt?
+    ///
+    /// `prefill_chunk_equivalence` already established that splitting a
+    /// *prefill* into chunks is output-invariant — bit-identical ids at
+    /// 256/512/1024/2048 on 8K and 20K prompts, because RoPE and the causal
+    /// sentinel key off `cache.offset()` and the linear-attention layers carry
+    /// their conv/SSM state through the cache. `extend` calls that same
+    /// `forward_chunked` on that same cache, so the argument should cover
+    /// session reuse too.
+    ///
+    /// It does not, in practice: a `session_id` conversation and the same
+    /// conversation cold-prefilled produce different reasoning traces on
+    /// Qwen3.8-27B, deterministically, and identically across runs on each
+    /// side. That was written off as reduction-order noise, which is
+    /// inconsistent with chunk invariance — hence this.
+    ///
+    /// Exactly one thing session reuse does that chunked prefill does not: the
+    /// tokens between the two prompts went through the cache **one at a time**
+    /// as decode steps rather than inside a bulk chunk. The three arms separate
+    /// that from `extend` itself, so the answer names a mechanism instead of a
+    /// suspicion.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn session_reuse_reproduces_a_cold_prefill() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        // Long enough for a near-tie to show up (the measured divergence was at
+        // 44), short enough to keep the three arms under a minute. Edit here
+        // rather than reaching for an env var: the flag ratchet in
+        // `cargo xtask flags` counts every hand-rolled `env::var`, and a
+        // test-only knob is not worth spending one on.
+        let n_gen: usize = 48;
+
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("this equivalence only concerns the Qwen path");
+        };
+
+        let convo = [(
+            "user".to_string(),
+            "Summarize the history of the printing press in detail.".to_string(),
+        )];
+        let p = m.build_chat_input(&convo, false, None).expect("prompt");
+        let follow = [
+            ("user".to_string(), "x".to_string()),
+            ("assistant".to_string(), "y".to_string()),
+            ("user".to_string(), "And another one.".to_string()),
+        ];
+        let rendered = m.build_chat_input(&follow, false, None).expect("suffix");
+        let s: Vec<u32> = rendered[rendered.len().saturating_sub(16)..].to_vec();
+
+        fn decode_n(
+            m: &mut MlxQwen35Backend,
+            seq: u64,
+            first: u32,
+            pos: usize,
+            n: usize,
+        ) -> Vec<u32> {
+            let (mut last, mut pos) = (first, pos);
+            let mut out = vec![first];
+            for _ in 1..n {
+                let (tok, p) = m.decode_step(seq, last, pos).expect("decode");
+                out.push(tok);
+                last = tok;
+                pos = p;
+            }
+            out
+        }
+
+        // Arm C — what a session actually does: prefill, decode, then extend.
+        let (first, pos) = m.prefill(1, &p).expect("prefill P");
+        let g = decode_n(m, 1, first, pos, n_gen);
+        let (cf, cp) = m.runner.extend(1, &s).expect("extend after decode");
+        let c = decode_n(m, 1, cf, cp, n_gen);
+        m.remove_seq(1).ok();
+
+        let mut p_plus_g = p.clone();
+        p_plus_g.extend_from_slice(&g);
+        let mut full = p_plus_g.clone();
+        full.extend_from_slice(&s);
+
+        // Arm A — the same tokens, cold.
+        let (af, ap) = m.prefill(2, &full).expect("prefill full");
+        let a = decode_n(m, 2, af, ap, n_gen);
+        m.remove_seq(2).ok();
+
+        // Arm B — bulk prefill up to the suffix, then extend. Isolates `extend`
+        // from the single-token decode path.
+        let (_bf, _bp) = m.prefill(3, &p_plus_g).expect("prefill P+G");
+        let (bf, bp) = m.runner.extend(3, &s).expect("extend after bulk");
+        let b = decode_n(m, 3, bf, bp, n_gen);
+        m.remove_seq(3).ok();
+
+        let diff = |x: &[u32], y: &[u32]| x.iter().zip(y).position(|(i, j)| i != j);
+        let ab = diff(&a, &b);
+        let ac = diff(&a, &c);
+        eprintln!("prompt={} gen={} suffix={}", p.len(), g.len(), s.len());
+        eprintln!("  A cold    {:?}", &a[..a.len().min(10)]);
+        eprintln!("  B extend  {:?}", &b[..b.len().min(10)]);
+        eprintln!("  C session {:?}", &c[..c.len().min(10)]);
+        eprintln!("  A vs B: {ab:?}   A vs C: {ac:?}");
+        eprintln!(
+            "  verdict: {}",
+            match (ab, ac) {
+                (None, None) => "reuse is exact",
+                (None, Some(_)) => "the single-token DECODE path is not bulk-equivalent",
+                (Some(_), _) => "`extend` itself diverges from prefill",
+            }
+        );
+        // `extend` is exact and must stay that way — this is the invariant
+        // worth guarding, and it held: A and B were bit-identical.
+        assert_eq!(ab, None, "extend must reproduce a bulk prefill exactly");
+        // The session arm is NOT asserted equal, because it is not: measured
+        // divergence at token 44 of 48, with the first 43 identical. The cause
+        // is the only thing left once `extend` is exonerated — the tokens
+        // between the two prompts advanced the cache one at a time, and a
+        // single-token forward is a different matmul shape (M=1, GEMV) from a
+        // bulk chunk (M=N, GEMM), so the reduction order differs and a near-tie
+        // argmax eventually flips. Chunk invariance does not cover this: 256 vs
+        // 2048 are both GEMM.
+        //
+        // What IS asserted is that the immediate next-token prediction agrees.
+        // A cache that had genuinely diverged would not survive one token, let
+        // alone forty-three, so this separates "float drift" from "wrong KV"
+        // without inventing a threshold.
+        assert!(
+            ac.is_none_or(|i| i > 0),
+            "the first token after reuse must match a cold prefill; \
+             diverging immediately means the reused KV is wrong, not imprecise"
+        );
+    }
+
+    /// The same property, for a turn that was generated with thinking ON.
+    ///
+    /// A `thinking:true` generation prompt ends at `<think>\n` and the model
+    /// writes the trace itself, so the tokens in the KV contain reasoning that
+    /// an empty block cannot reproduce. Returning the trace — as
+    /// `reasoning_content`, as `reasoning`, or inside `content` — is the only
+    /// way the replay can be a prefix of the KV it wants to extend.
+    #[test]
+    fn a_replayed_thinking_turn_matches_what_the_model_was_fed() {
+        use crate::chat_io::join_reasoning_envelope;
+
+        // Turn 1: prompt the model actually saw, thinking ON.
+        let turn1 = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let turn1_prompt = format_qwen3_chat(&turn1, true, None, true);
+        assert!(
+            turn1_prompt.ends_with("<|im_start|>assistant\n<think>\n"),
+            "thinking-on generation prompt stops at the open block:\n{turn1_prompt:?}",
+        );
+        // …and what the model then produced, verbatim.
+        let generated = "let me work it out\n</think>\n\nA1<|im_end|>";
+        let kv = format!("{turn1_prompt}{generated}");
+
+        // Turn 2: the client returns the trace, so the turn re-renders as the
+        // exact bytes above plus the new user turn.
+        let convo = [
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+            (
+                "assistant".to_string(),
+                join_reasoning_envelope("let me work it out", "A1"),
+            ),
+            ("user".to_string(), "U2".to_string()),
+        ];
+        let turn2 = format_qwen3_chat(&convo, true, None, true);
+        assert!(
+            turn2.starts_with(&format!("{kv}\n")),
+            "a returned trace must reproduce the generated tokens:\nkv  ={kv:?}\nturn2={turn2:?}",
+        );
+
+        // Without the trace the replay diverges inside the block — correct
+        // output still, but every token after it has to be prefilled again.
+        let without = [
+            convo[0].clone(),
+            convo[1].clone(),
+            ("assistant".to_string(), "A1".to_string()),
+            convo[3].clone(),
+        ];
+        let turn2_no_trace = format_qwen3_chat(&without, true, None, true);
+        assert!(
+            !turn2_no_trace.starts_with(&format!("{kv}\n")),
+            "this is the state being fixed; if it now matches, the test lost its point",
+        );
+    }
+
+    /// The speculative path may only serve sampling it can reproduce exactly.
+    ///
+    /// MTP used to rebuild its `SamplingConfig` from a few scalars with
+    /// `..default()`, which silently dropped `top_k`, `min_p` and every penalty
+    /// — and since MTP auto-enables on a checkpoint that ships an MTP head,
+    /// that was the live path. Measured on Qwen3.8-27B: `top_k: 1` at
+    /// temperature 1.5 returned 3/3 distinct garbled replies instead of
+    /// collapsing to the argmax, and `repeat_penalty: 1.8` changed nothing.
+    ///
+    /// Passing the whole struct fixes the position-independent knobs. The
+    /// penalties are different in kind: they depend on the tokens emitted
+    /// before the position being sampled, and inside a speculative cycle each
+    /// draft position has a different history depending on how many earlier
+    /// drafts were accepted. Getting that window wrong would not just weaken
+    /// the penalty, it would make `p` and `q` disagree about which distribution
+    /// they are — and Leviathan acceptance only guarantees the committed stream
+    /// is distributed as `p` when both are the real ones. So those requests
+    /// leave the speculative path instead.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn speculative_decode_refuses_sampling_it_cannot_reproduce() {
+        use lumen_core::sampling::SamplingConfig;
+
+        // Greedy and the position-independent knobs are all reproducible by the
+        // drafter, so they stay on the fast path.
+        assert!(mtp_sampling_is_supported(None), "greedy is fine");
+        for cfg in [
+            SamplingConfig {
+                temperature: 1.2,
+                ..Default::default()
+            },
+            SamplingConfig {
+                temperature: 1.0,
+                top_p: 0.9,
+                top_k: 40,
+                min_p: 0.05,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                mtp_sampling_is_supported(Some(&cfg)),
+                "temperature/top_p/top_k/min_p are per-position and must not \
+                 cost the speculative path",
+            );
+        }
+
+        // Each history-dependent penalty must take the request off it.
+        for (name, cfg) in [
+            (
+                "repeat_penalty",
+                SamplingConfig {
+                    repeat_penalty: 1.1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "presence_penalty",
+                SamplingConfig {
+                    presence_penalty: 0.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "frequency_penalty",
+                SamplingConfig {
+                    frequency_penalty: 0.5,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(
+                !mtp_sampling_is_supported(Some(&cfg)),
+                "{name} depends on emitted history, which a speculative cycle \
+                 cannot reproduce per draft position",
+            );
+        }
+    }
+
+    /// `usage.prompt_tokens` has to count the tool block, because the model was
+    /// shown it.
+    ///
+    /// Measured on Qwen3.8-27B before this landed: a one-tool request reported
+    /// **39** prompt tokens against a **279**-token prefill, and the Anthropic
+    /// path 20 against 259. Neither renderer was wrong — the counter simply
+    /// called the tool-free one, so the error was zero at zero tools and grew
+    /// with the client's schema. An agentic client shipping thirty tools is
+    /// billed for a fraction of its prompt and admitted past a context guard
+    /// reading the same fraction.
+    ///
+    /// Three things are pinned here, and the middle one is the point: the count
+    /// is not merely *larger* with tools, it is byte-for-byte the sequence the
+    /// decode path prefills.
+    #[test]
+    fn the_prompt_count_renders_the_tool_block_the_model_is_shown() {
+        use crate::chat_io::{ResolvedToolChoice, ToolDef};
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("tokenizer");
+        let backend = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer, 11);
+        let msgs = vec![("user".to_string(), "weather?".to_string())];
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        });
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Current conditions for a city"),
+            parameters: Some(&params),
+            response: None,
+        }];
+
+        // What the decode path renders, taken from the decode path itself.
+        let (decode_ids, _prefill) = backend
+            .build_chat_input_with_tools(&msgs, false, &tools, &ResolvedToolChoice::Auto, None)
+            .expect("tool render");
+
+        let backend = MlxBackend::Qwen35Family(backend);
+        let bare = backend.build_chat_input(&msgs, false, None).expect("bare");
+        let counted = backend
+            .build_chat_input_prefilled(
+                &msgs,
+                false,
+                &tools,
+                &ResolvedToolChoice::Auto,
+                false,
+                None,
+            )
+            .expect("counted");
+
+        // Same messages either way, so every extra token is schema.
+        assert!(
+            counted.len() > bare.len() + 20,
+            "the tool block has to show up in the count: {} tools vs {} bare",
+            counted.len(),
+            bare.len(),
+        );
+        assert_eq!(
+            counted, decode_ids,
+            "the count must be the prefill, not an approximation of it",
+        );
+
+        // `Required` appends `<tool_call>\n<function=` to the prompt — tokens
+        // the model is fed, so tokens the client is told about.
+        let required = backend
+            .build_chat_input_prefilled(
+                &msgs,
+                false,
+                &tools,
+                &ResolvedToolChoice::Required,
+                false,
+                None,
+            )
+            .expect("required");
+        assert!(
+            required.len() > counted.len(),
+            "the tool_choice prefill is part of the prompt: {} required vs {} auto",
+            required.len(),
+            counted.len(),
+        );
+
+        // `response_format` routes Qwen through `chat_response_format`, which
+        // renders with no tool block at all. Counting the tools there would be
+        // the same defect with the sign flipped.
+        let structured = backend
+            .build_chat_input_prefilled(&msgs, false, &tools, &ResolvedToolChoice::Auto, true, None)
+            .expect("structured");
+        assert_eq!(
+            structured, bare,
+            "response_format drops the tool block on Qwen; the count has to drop it too",
+        );
+    }
+
+    /// The wiring, not the policy: `chat_with_tools_impl` must actually consult
+    /// `ToolCalls`.
+    ///
+    /// This is the guard that did not exist when the defect shipped. The policy
+    /// method and the parser count were both correct in isolation the whole
+    /// time — what was missing was the decode loop asking. A test that only
+    /// exercises the two pure pieces passes either way, which is exactly how
+    /// `parallel_tool_calls: false` reached production accepted-and-ignored on
+    /// the entire Qwen family.
+    ///
+    /// Grammar is `None` here on purpose: that is `tool_choice: auto`, and the
+    /// case where hanging the cap off the grammar would have gone quietly
+    /// inert.
+    #[test]
+    fn the_tool_decode_loop_consults_parallel_tool_calls() {
+        let (one, consumed_one) = run_tool_loop(crate::grammar::ToolCalls::ExactlyOne);
+        assert_eq!(
+            one.tool_calls.len(),
+            1,
+            "ExactlyOne must cut the turn after the first completed call"
+        );
+        assert_eq!(one.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            one.tool_calls[0]
+                .arguments
+                .get("city")
+                .and_then(|v| v.as_str()),
+            Some("Seoul")
+        );
+
+        let (many, consumed_many) = run_tool_loop(crate::grammar::ToolCalls::OneOrMore);
+        assert_eq!(
+            many.tool_calls.len(),
+            2,
+            "OneOrMore must let the model keep calling"
+        );
+        assert_eq!(many.tool_calls[1].name, "get_weather");
+        assert_eq!(
+            many.tool_calls[1]
+                .arguments
+                .get("city")
+                .and_then(|v| v.as_str()),
+            Some("Tokyo")
+        );
+
+        // Stopping EARLY is the point — the cap must save the decode, not just
+        // trim the result afterwards. Both arms see the identical script.
+        assert!(
+            consumed_one < consumed_many,
+            "ExactlyOne consumed {consumed_one} tokens and OneOrMore {consumed_many}: \
+             the cap has to end the turn, not filter the output"
+        );
     }
 
     #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to

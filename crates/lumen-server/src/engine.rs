@@ -68,9 +68,51 @@ impl ModelBackend {
 
     /// Tokenize the chat-templated prompt for accurate `prompt_tokens`. Falls
     /// back to a `len/4` heuristic only if the backend errors during encode.
-    fn count_chat_prompt_tokens(&self, messages: &[(String, String)], thinking: bool) -> u32 {
+    ///
+    /// Takes the whole `SamplingOverrides` rather than a pre-extracted effort
+    /// **so that it cannot be handed a different one than the renderer uses**.
+    /// It was, and the earlier version of this comment named the hazard exactly
+    /// ("`effort` must match what the real request will render with") while all
+    /// six call sites passed the raw `ov.reasoning_effort`. On a checkpoint that
+    /// does not declare `reasoning_effort` the renderer correctly drops it and
+    /// the counter did not: measured on Qwen3.5-9B, a `thinking: true` request
+    /// prefilled 12 tokens and reported 54. Wrong usage, and the same figure
+    /// feeds the context guard, so a request near the limit could be rejected
+    /// for tokens it never had.
+    ///
+    /// Now there is one source: `resolved_effort`, the same call the decode
+    /// paths make.
+    ///
+    /// The tool trio is here for the same reason. This used to render with no
+    /// tools at all, so every tool-bearing request reported the messages and
+    /// omitted the schema block that dominates the prompt — 39 tokens against a
+    /// 279-token prefill on Qwen3.8-27B. Take the same `tools` / `tool_choice` /
+    /// schema-presence the `chat*` call on this path is about to take, and the
+    /// count is the prefill.
+    ///
+    /// One approximation survives on purpose: a structured-history request
+    /// (prior `tool_calls`, `role:"tool"`) decodes from `ChatTurn`s while this
+    /// still counts the flattened `(role, content)` pairs. That gap is turn
+    /// framing — tens of tokens — where the one just closed was the entire tool
+    /// schema.
+    fn count_chat_prompt_tokens(
+        &self,
+        messages: &[(String, String)],
+        thinking: bool,
+        ov: &lumen_mlx::SamplingOverrides,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        structured: bool,
+    ) -> u32 {
         let res: Result<Vec<u32>> = match self {
-            Self::Mlx(m) => m.build_chat_input(messages, thinking),
+            Self::Mlx(m) => m.build_chat_input_prefilled(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                structured,
+                m.resolved_effort(ov),
+            ),
         };
         match res {
             Ok(ids) => ids.len() as u32,
@@ -642,10 +684,14 @@ impl InferenceEngine {
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        let prompt_tokens_guard = self
-            .backend
-            .count_chat_prompt_tokens(&messages, thinking_on)
-            + image_tokens;
+        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
+            &messages,
+            thinking_on,
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            req.response_json_schema().is_some(),
+        ) + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
@@ -734,10 +780,14 @@ impl InferenceEngine {
         // Same text count as the guard above, plus the image runs the model
         // actually prefilled — reporting the text-only figure would under-count
         // an image request by hundreds of tokens.
-        let prompt_tokens = self
-            .backend
-            .count_chat_prompt_tokens(&messages, thinking_on)
-            + image_tokens;
+        let prompt_tokens = self.backend.count_chat_prompt_tokens(
+            &messages,
+            thinking_on,
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            req.response_json_schema().is_some(),
+        ) + image_tokens;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
@@ -956,9 +1006,15 @@ impl InferenceEngine {
         // already used for usage below).
         let anthropic_thinking =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let prompt_tokens_guard = self
-            .backend
-            .count_chat_prompt_tokens(&messages, anthropic_thinking);
+        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
+            &messages,
+            anthropic_thinking,
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            // The Anthropic Messages API has no `response_format`.
+            false,
+        );
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
 
         let mut parsed = if needs_structured {
@@ -981,17 +1037,13 @@ impl InferenceEngine {
                     if m.role != "assistant" {
                         return String::new();
                     }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
+                    // `as_text` flattens exactly the Text blocks this used to
+                    // walk by hand, and also folds a replayed `thinking` block
+                    // into the leading `<think>` envelope the renderer reads.
+                    // Calling it rather than re-deriving it is what keeps this
+                    // path and the flat one (which already went through
+                    // `as_text`) from disagreeing about what a turn contains.
+                    m.content.as_text()
                 })
                 .collect();
             let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
@@ -1221,6 +1273,10 @@ impl InferenceEngine {
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            false,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1248,34 +1304,14 @@ impl InferenceEngine {
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
-        // Assemble content[] per Anthropic spec: any leading visible text
-        // as a `text` block, then one `tool_use` block per parsed tool call.
-        // stop_reason="tool_use" when tool calls present, else "end_turn".
         let has_tool_calls = !parsed.tool_calls.is_empty();
-        let mut content: Vec<AnthropicResponseBlock> = Vec::new();
-        let visible = parsed.visible.trim();
-        if !visible.is_empty() {
-            content.push(AnthropicResponseBlock::Text {
-                text: visible.to_string(),
-            });
-        }
-        if has_tool_calls {
-            for call in &parsed.tool_calls {
-                content.push(AnthropicResponseBlock::ToolUse {
-                    id: format!("toolu_{}", gen_id()),
-                    name: call.name.clone(),
-                    input: call.arguments.clone(),
-                });
-            }
-        }
-        // If the model produced nothing visible AND no tool calls, fall
-        // back to an empty text block so the response still conforms to
-        // the spec (content[] cannot be empty).
-        if content.is_empty() {
-            content.push(AnthropicResponseBlock::Text {
-                text: String::new(),
-            });
-        }
+        let content = anthropic_content_blocks(
+            &parsed.reasoning,
+            &parsed.visible,
+            &parsed.tool_calls,
+            req.enable_thinking(),
+            || format!("toolu_{}", gen_id()),
+        );
         // A matched stop sequence (only meaningful without tool calls) maps to
         // Anthropic's stop_reason="stop_sequence" + the matched string.
         let stop_seq_hit = if has_tool_calls { None } else { matched_stop };
@@ -1340,11 +1376,27 @@ impl InferenceEngine {
                 .unwrap_or(0)
         );
 
+        // Resolved here rather than just before the decode call because the
+        // token count below has to render the same tool block the model will be
+        // given; counting first and resolving after is how the schema block went
+        // unreported. Pure functions of `req`, so hoisting them is inert.
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+        // OpenAI `response_format` → JSON-schema constrained decoding
+        // (Gemma 4 only). `None` when absent / `text` → exact existing path.
+        let response_schema = req.response_json_schema();
+
         // Includes the image soft-token runs; this figure feeds both the
         // context guard below and the `usage` block at the end of the stream.
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            response_schema.is_some(),
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1382,14 +1434,6 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-
-        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
-        let tool_choice =
-            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
-        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
-        // OpenAI `response_format` → JSON-schema constrained decoding
-        // (Gemma 4 only). `None` when absent / `text` → exact existing path.
-        let response_schema = req.response_json_schema();
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -1801,9 +1845,20 @@ impl InferenceEngine {
             None
         };
 
+        // Hoisted above the count for the same reason as the OpenAI stream: the
+        // count has to render the tool block the model is about to be shown.
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+
         let prompt_tokens = self.backend.count_chat_prompt_tokens(
             &messages,
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+            &req.sampling_overrides(),
+            &tools_owned,
+            &tool_choice,
+            false,
         ) + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
@@ -1814,11 +1869,11 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
-
-        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
-        let tool_choice =
-            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
-        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+        // `message_start` carries `input_tokens` and goes out before the first
+        // token, so the count has to travel ahead of decode rather than with
+        // `Done`. Sent after the guard: a rejected request emits `error` and no
+        // `message_start` at all.
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -1840,17 +1895,13 @@ impl InferenceEngine {
                     if m.role != "assistant" {
                         return String::new();
                     }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
+                    // `as_text` flattens exactly the Text blocks this used to
+                    // walk by hand, and also folds a replayed `thinking` block
+                    // into the leading `<think>` envelope the renderer reads.
+                    // Calling it rather than re-deriving it is what keeps this
+                    // path and the flat one (which already went through
+                    // `as_text`) from disagreeing about what a turn contains.
+                    m.content.as_text()
                 })
                 .collect();
             let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
@@ -2180,6 +2231,55 @@ impl InferenceEngine {
             }],
         }
     }
+}
+
+/// Assemble an Anthropic `content[]` array, in the order the Messages API
+/// defines: `thinking` first, then `text`, then one `tool_use` per call.
+///
+/// `emit_thinking` is the *request's* flag, not the backend's. On this API the
+/// two are the same thing — `AnthropicRequest::enable_thinking_with_backend_default`
+/// ignores the backend default on purpose — but naming the parameter after the
+/// request keeps it obvious that a client which never asked for extended
+/// thinking must not start receiving a block type it does not expect.
+fn anthropic_content_blocks(
+    reasoning: &str,
+    visible: &str,
+    tool_calls: &[lumen_mlx::chat_io::ParsedToolCall],
+    emit_thinking: bool,
+    mut new_tool_id: impl FnMut() -> String,
+) -> Vec<AnthropicResponseBlock> {
+    let mut content: Vec<AnthropicResponseBlock> = Vec::new();
+    let reasoning = reasoning.trim();
+    if emit_thinking && !reasoning.is_empty() {
+        content.push(AnthropicResponseBlock::thinking(reasoning));
+    }
+    let visible = visible.trim();
+    if !visible.is_empty() {
+        content.push(AnthropicResponseBlock::Text {
+            text: visible.to_string(),
+        });
+    }
+    for call in tool_calls {
+        content.push(AnthropicResponseBlock::ToolUse {
+            id: new_tool_id(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        });
+    }
+    // No text and no tool calls: fall back to an empty text block so the
+    // response still conforms (`content[]` cannot be empty). Keyed on that
+    // rather than on `content.is_empty()`, because a turn that spent its whole
+    // budget thinking now leaves a thinking block behind and a client reading
+    // `content[0].text` should still find one.
+    if !content
+        .iter()
+        .any(|b| !matches!(b, AnthropicResponseBlock::Thinking { .. }))
+    {
+        content.push(AnthropicResponseBlock::Text {
+            text: String::new(),
+        });
+    }
+    content
 }
 
 fn unix_timestamp() -> u64 {
@@ -2722,7 +2822,7 @@ fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> 
 /// non-alphanumeric, so `read` can't grab `thread`), remap it to the full name.
 /// Ambiguous or absent matches are left untouched. Keeps stock omp working
 /// without renaming tools.
-fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
+fn remap_tool_call_names(calls: &mut Vec<ParsedToolCall>, tools: &[ToolDef<'_>]) {
     if calls.is_empty() || tools.is_empty() {
         return;
     }
@@ -2757,8 +2857,68 @@ fn remap_tool_call_names(calls: &mut [ParsedToolCall], tools: &[ToolDef<'_>]) {
                 c.name, full
             );
             c.name = full.to_string();
+            continue;
+        }
+        // Bug A's mirror image: the emitted name is LONGER than a declared one
+        // and ends with it, because the model stuttered its opening bytes.
+        // Measured on Qwen3.8-27B: `<function=geget_weather>` for a declared
+        // `get_weather`, on the second call of a turn — after the one-call
+        // grammar released and the tail decoded unconstrained.
+        //
+        // Repaired only when the extra prefix is itself a prefix of the
+        // declared name, which is what makes it a stutter rather than a
+        // different word. Without that guard a declared `list` would swallow an
+        // emitted `blacklist`; with it, `black` is not a prefix of `list` and
+        // nothing happens.
+        if let Some(full) = unique_stutter_match(emitted, tools) {
+            eprintln!(
+                "[mlx] tool-name resolved {:?} -> {:?} (stutter)",
+                c.name, full
+            );
+            c.name = full.to_string();
         }
     }
+
+    // Whatever is still unmatched is a name the client never declared, and
+    // handing one over is a contract violation: the client looks up a function
+    // it does not have. Dropping is the conservative half; saying so is the
+    // other half, because "accepted and then silently not applied" is the
+    // failure mode this file keeps paying for.
+    let declared = |c: &ParsedToolCall| tools.iter().any(|t| t.name == c.name);
+    if !calls.iter().all(declared) {
+        for c in calls.iter().filter(|c| !declared(c)) {
+            eprintln!(
+                "[mlx] tool-call DROPPED: {:?} is not among the {} declared tools",
+                c.name,
+                tools.len()
+            );
+        }
+        calls.retain(declared);
+    }
+}
+
+/// The one declared tool that `emitted` is a stutter of, if exactly one is.
+///
+/// `emitted` must end with the declared name and the leading remainder must be
+/// a prefix of it — `ge` + `get_weather`. Ambiguity yields `None`; so does a
+/// remainder that is merely extra text.
+fn unique_stutter_match<'a>(emitted: &str, tools: &'a [ToolDef<'a>]) -> Option<&'a str> {
+    let mut hit: Option<&str> = None;
+    for t in tools {
+        let n = t.name;
+        if n.len() >= emitted.len() || !emitted.ends_with(n) {
+            continue;
+        }
+        let extra = &emitted[..emitted.len() - n.len()];
+        if extra.is_empty() || !n.starts_with(extra) {
+            continue;
+        }
+        if hit.is_some() {
+            return None; // ambiguous
+        }
+        hit = Some(n);
+    }
+    hit
 }
 
 fn parsed_to_openai_tool_calls(calls: &[ParsedToolCall]) -> Vec<ToolCall> {
@@ -2808,6 +2968,15 @@ pub enum StreamEvent {
     /// Closes the tool-call envelope. OpenAI clients ignore this;
     /// Anthropic clients use it to emit `content_block_stop`.
     ToolCallStop { index: u32 },
+    /// The prompt has been counted; decode has not started yet.
+    ///
+    /// OpenAI reports usage in the *final* chunk, so `Done` is soon enough
+    /// there. Anthropic puts `input_tokens` in `message_start`, which is on the
+    /// wire before the first token — a count that only arrives with `Done` is
+    /// hours late by the format's own ordering, and the route was filling the
+    /// field with a hardcoded `0`. Emitted immediately after the count and
+    /// before prefill, so the wait costs nothing.
+    Start { prompt_tokens: u32 },
     /// Generation complete with token counts and a finish-reason hint.
     Done {
         prompt_tokens: u32,
@@ -3360,7 +3529,12 @@ impl InferenceEngine {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking)?;
+        // `None`, and provably so rather than by omission: `admit_streaming_mlx`
+        // routes to the non-batched path whenever `thinking` is true (see its
+        // `|| thinking` guard), and Qwen 3.8's template emits the effort block
+        // only when thinking is on. A batched sequence therefore never has an
+        // effort to carry.
+        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking, None)?;
         let prompt_tokens = prompt_ids.len() as u32;
         let eos_tokens = qb.eos_tokens().to_vec();
         let max_new = if max_tokens == 0 { 256 } else { max_tokens };
@@ -3439,39 +3613,100 @@ mod tool_name_resolve_tests {
             td("bash"),
         ];
         // Exact native name is kept (exact match wins over suffix).
-        let mut a = [tc("read")];
+        let mut a = vec![tc("read")];
         remap_tool_call_names(&mut a, &tools);
         assert_eq!(a[0].name, "read");
         // Abbreviated MCP names → full namespaced names.
-        let mut b = [tc("ctx_read")];
+        let mut b = vec![tc("ctx_read")];
         remap_tool_call_names(&mut b, &tools);
         assert_eq!(b[0].name, "mcp__lean_ctx_ctx_read");
-        let mut c = [tc("ctx_tree")];
+        let mut c = vec![tc("ctx_tree")];
         remap_tool_call_names(&mut c, &tools);
         assert_eq!(c[0].name, "mcp__lean_ctx_ctx_tree");
     }
 
+    /// A name that resolves to nothing is DROPPED, not forwarded.
+    ///
+    /// Forwarding it is a contract violation — the client looks up a function
+    /// it never declared. Measured on Qwen3.8-27B: `geget_weather` reached the
+    /// response for a client that had declared only `get_weather`.
     #[test]
-    fn leaves_unknown_and_ambiguous_untouched() {
+    fn an_unresolvable_name_is_dropped_not_forwarded() {
         let tools = [td("mcp__a_get"), td("mcp__b_get")];
-        // Ambiguous suffix `get` matches two tools → unchanged.
-        let mut a = [tc("get")];
+        // Ambiguous suffix `get` matches two tools → cannot be resolved.
+        let mut a = vec![tc("get")];
         remap_tool_call_names(&mut a, &tools);
-        assert_eq!(a[0].name, "get");
-        // No suffix match at all → unchanged.
-        let mut b = [tc("nonexistent")];
+        assert!(a.is_empty(), "ambiguous name must not reach the client");
+        // No match at all.
+        let mut b = vec![tc("nonexistent")];
         remap_tool_call_names(&mut b, &tools);
-        assert_eq!(b[0].name, "nonexistent");
+        assert!(b.is_empty(), "undeclared name must not reach the client");
+        // Dropping is per call, not per turn: the valid ones survive, in order.
+        let mut c = vec![tc("mcp__a_get"), tc("nonexistent"), tc("mcp__b_get")];
+        remap_tool_call_names(&mut c, &tools);
+        let kept: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(kept, ["mcp__a_get", "mcp__b_get"]);
+    }
+
+    /// The `geget_weather` case: the model stuttered the opening bytes of a
+    /// declared name once the one-call grammar released and the tail decoded
+    /// unconstrained.
+    #[test]
+    fn resolves_a_stuttered_name() {
+        let tools = [td("get_weather"), td("bash")];
+        for emitted in ["geget_weather", "gget_weather", "get_get_weather"] {
+            let mut a = vec![tc(emitted)];
+            remap_tool_call_names(&mut a, &tools);
+            assert_eq!(
+                a.first().map(|c| c.name.as_str()),
+                Some("get_weather"),
+                "{emitted}"
+            );
+        }
+    }
+
+    /// The stutter repair must not turn a different word into a declared tool.
+    ///
+    /// The extra prefix has to be a prefix of the declared name — that is what
+    /// makes it a stutter. `black` is not a prefix of `list`, so `blacklist`
+    /// stays unresolved (and is therefore dropped, per the rule above).
+    #[test]
+    fn a_longer_word_is_not_a_stutter() {
+        let tools = [td("list")];
+        let mut a = vec![tc("blacklist")];
+        remap_tool_call_names(&mut a, &tools);
+        assert!(a.is_empty(), "blacklist is not a stutter of list");
+
+        // `rrrun` against `run` + `rrun` is NOT ambiguous and must resolve:
+        // `run` is rejected (`rr` is not a prefix of `run`), leaving `rrun`
+        // alone. Pinned because it reads like a two-candidate case and is not —
+        // the prefix guard already eliminated one.
+        let tools = [td("run"), td("rrun")];
+        let mut b = vec![tc("rrrun")];
+        remap_tool_call_names(&mut b, &tools);
+        assert_eq!(b.first().map(|c| c.name.as_str()), Some("rrun"));
+
+        // Genuine ambiguity needs self-similar names, and then nothing is
+        // guessed: `aaaa` is a one-`a` stutter of `aaa` and a two-`a` stutter
+        // of `aa`, so it resolves to neither and is dropped.
+        let tools = [td("aa"), td("aaa")];
+        let mut c = vec![tc("aaaa")];
+        remap_tool_call_names(&mut c, &tools);
+        assert!(c.is_empty(), "two candidates must resolve to neither");
     }
 
     #[test]
     fn requires_separator_boundary() {
         // `read` must NOT be rewritten to `thread` — the suffix has no
-        // separator before it.
+        // separator before it. It is now dropped rather than forwarded, which
+        // keeps the original point (never `thread`) and adds the new one.
         let tools = [td("thread")];
-        let mut a = [tc("read")];
+        let mut a = vec![tc("read")];
         remap_tool_call_names(&mut a, &tools);
-        assert_eq!(a[0].name, "read");
+        assert!(
+            a.is_empty(),
+            "read must not become thread, and must not reach the client either"
+        );
     }
 }
 
@@ -3770,5 +4005,92 @@ mod phase_1_4_dispatch_tests {
         // is just a normal text turn — the structured path would add
         // no value here.
         assert!(!needs_structured_history(&msgs));
+    }
+}
+
+/// The non-streaming half of the Anthropic trace round-trip.
+///
+/// The Messages API puts `thinking` first in `content[]`, ahead of text and
+/// tool_use, and only when the request enabled extended thinking. Lumen emitted
+/// no thinking block at all, so an Anthropic client could neither see the trace
+/// nor hand it back — and handing it back is what lets a `thinking`-enabled
+/// conversation extend its KV instead of re-prefilling every turn.
+#[cfg(test)]
+mod anthropic_thinking_blocks {
+    use super::{AnthropicResponseBlock, anthropic_content_blocks};
+    use lumen_mlx::chat_io::ParsedToolCall;
+
+    fn ids() -> impl FnMut() -> String {
+        let mut n = 0;
+        move || {
+            n += 1;
+            format!("toolu_{n}")
+        }
+    }
+
+    fn kinds(blocks: &[AnthropicResponseBlock]) -> Vec<&'static str> {
+        blocks
+            .iter()
+            .map(|b| match b {
+                AnthropicResponseBlock::Thinking { .. } => "thinking",
+                AnthropicResponseBlock::Text { .. } => "text",
+                AnthropicResponseBlock::ToolUse { .. } => "tool_use",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_trace_comes_first_then_text_then_tools() {
+        let call = ParsedToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Seoul"}),
+        };
+        let blocks = anthropic_content_blocks("  weighing it up  ", "Red", &[call], true, ids());
+        assert_eq!(kinds(&blocks), ["thinking", "text", "tool_use"]);
+        let v = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(v["type"], "thinking");
+        assert_eq!(
+            v["thinking"], "weighing it up",
+            "trimmed, like the template"
+        );
+        assert_eq!(
+            v["signature"],
+            super::LUMEN_THINKING_SIGNATURE,
+            "the SDK types signature as required, so it cannot be omitted"
+        );
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_for_thinking_gets_no_thinking_block() {
+        // The no-regression case, and the one that decides whether this is safe
+        // to ship on by default: every request that leaves `thinking` unset must
+        // see exactly the content[] it saw before.
+        let blocks = anthropic_content_blocks("weighing it up", "Red", &[], false, ids());
+        assert_eq!(kinds(&blocks), ["text"]);
+    }
+
+    #[test]
+    fn no_trace_means_no_block_even_with_thinking_on() {
+        for trace in ["", "   ", "\n"] {
+            let blocks = anthropic_content_blocks(trace, "Red", &[], true, ids());
+            assert_eq!(kinds(&blocks), ["text"], "blank trace {trace:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_that_only_thought_still_carries_an_empty_text_block() {
+        // `content[]` must not be empty, and a client reading `content[0].text`
+        // after a budget-exhausted turn should still find a text block rather
+        // than index past the end.
+        let blocks = anthropic_content_blocks("still thinking", "", &[], true, ids());
+        assert_eq!(kinds(&blocks), ["thinking", "text"]);
+        let v = serde_json::to_value(&blocks[1]).unwrap();
+        assert_eq!(v["text"], "");
+    }
+
+    #[test]
+    fn an_empty_turn_is_unchanged() {
+        let blocks = anthropic_content_blocks("", "", &[], true, ids());
+        assert_eq!(kinds(&blocks), ["text"]);
     }
 }

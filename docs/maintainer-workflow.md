@@ -230,6 +230,29 @@ before pushing.
 | Gemma 4 26B-A4B decode (custom flash-attn) | ~18.8 ms/step | mlx default sdpa (`LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0`): ~19.9 ms |
 | Qwen3.6-35B-A3B-mxfp4 N=1 decode | 13.9 ms/step p50, **71.6 tok/s** | — |
 | Qwen3.6-35B-A3B-mxfp4 PROMPT_LEN=2048 decode | 14.85 ms/step p50, **67.3 tok/s** | — |
+| Qwen3.8-27B MTPLX, MTP K=2 greedy | **accept 0.476–0.690** by prompt, output bit-exact vs non-MTP (320/320) | fold A/B: `LUMEN_MTP_NORM_PLUS_ONE=1` costs 0.055 accept |
+| Qwen3.6-27B MTPLX, MTP K=2 greedy | **accept 0.479–0.631** by prompt | `LUMEN_MTP_NORM_PLUS_ONE=1` costs 0.046 accept |
+
+**Compare accept, not speedup, on the MTP rows.** `accept_rate` is
+deterministic for a given (model, prompt, GEN, K) because the decode is greedy,
+so it reproduces exactly. The `speedup` the same harness prints is a ratio of
+two timings taken under whatever load existed at the time: a verification re-run
+measured baseline throughput at 4.8 tok/s and 10.8 tok/s for the same class of
+model minutes apart. Treat it as indicative only.
+
+**And vary the prompt.** Accept rate is deterministic per prompt but spans
+~0.40–0.69 *across* prompts on the same checkpoint, which is far wider than the
+effects worth measuring. A one-prompt A/B is not a measurement: the 3.8 norm-fold
+question was called "noise" on a single prompt that came out +0.018 the wrong
+way, and the same comparison over 5 paired prompts is +0.055 the other way at
+t=12.1. Pair on the prompt and report the mean difference with its spread.
+
+`LUMEN_MTP_NORM_PLUS_ONE` is three-state: unset **detects** the checkpoint's
+RMSNorm convention from the weights (mean-of-means over the six zero-centered
+norms — ~0.35 raw HF, ~1.37 already-folded MTPLX, threshold 0.75), `0` never
+folds, `1` always folds. Both fold settings are lossless in every condition
+measured; the fold only moves accept rate, which is why folding twice went
+unnoticed for as long as it did.
 
 The Candle A/B columns are gone with the backend. Their last recorded values,
 for the record: Candle N=1 was 22.0 ms / 45.5 tok/s, and at PROMPT_LEN=2048 it
@@ -395,11 +418,219 @@ Update this table whenever a path graduates from "WIP" to "validated".
 | Path | Status | Validation evidence |
 |---|---|---|
 | `/v1/embeddings` (Qwen3-Embedding-0.6B MLX 8-bit) | ✅ validated | `embedding_parity` — worst per-item cosine 0.9988 vs the captured Candle reference, P@1 0.960 / MRR 0.980 identical, 2.20 ms/item warm (4.6× the Candle path it replaced) |
-| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms |
+| `/v1/chat/completions` (Gemma 4 26B-A4B MLX 4-bit) | ✅ validated | `bench_gemma4_native_e2e` ~18.8 ms/step, matches mlx-lm within 1 ms; `usage.prompt_tokens` equals the logged prefill on the same nine request shapes as the Qwen row (0/1/8/30 tools → 15/89/572/2130) |
 | `/v1/chat/completions` (Qwen3.6-35B-A3B-mxfp4) | ✅ validated | `bench_mlx_e2e` p50 13.94 ms / **71.6 tok/s** (PROMPT_LEN=8), 14.85 ms / 67.3 tok/s (PROMPT_LEN=2048) |
 | `/v1/chat/completions` (Qwen3.6-27B-4bit dense) | ⚠ partially validated | Same code path; only the 35B-A3B variant has bench numbers |
+| `/v1/chat/completions` (Qwen3.8-27B MTPLX) | ✅ validated | Chat answers and terminates (`finish_reason: stop`), tool calls emit correct name+args, MTP auto-enables with no env vars at accept 0.476–0.690 across 5 prompts / bit-exact output, image input describes the committed probe (`qwen36_vision_e2e`, 609 merged tokens), `reasoning_effort` injects at the template's positions (prompt_tokens 41/53/11 for low/xhigh/medium on a bare prompt), `parallel_tool_calls: false` caps the turn at one call on both the streaming and non-streaming surfaces, `usage.prompt_tokens` equals the logged prefill on all nine request shapes (0/1/8/30 tools → 18/281/715/2119, `tool_choice` required/none, `response_format`, OpenAI + Anthropic, streaming + not), `temperature` samples (0.9 → 4/4 distinct) while 0 stays deterministic and `seed` is reproducible, `/v1/completions`, stop sequences, 14K-token chunked prefill, 2 concurrent requests, KV-disk tier, `DELETE /v1/sessions` + `/v1/prefix-cache`, `session_id` reuses KV across turns (6324-token system prompt: turn 1 47.98 s → turn 2 0.44 s, suffix 15 tokens), and with `thinking: true` when the client returns the trace (4259-token system prompt: prefill 31.5 s → **0.30 s**, `cached=4301 suffix=15`; a client that drops it still cold-prefills, correctly), thinking-on turns separate `reasoning` from `content` on the plain, tools and streaming surfaces while both thinking-off levers stay byte-identical, and the Anthropic trace round-trips in both directions — a replayed `thinking` block is answered rather than rejected, and our own `content[]` handed straight back reuses KV (`reuse cached=321 suffix=15` / 283 ms streaming and not, against `divergent` → 2237 ms when the block is dropped), with the SSE indices coming out `thinking@0, text@1, tool_use@2`; a stock client sending **no `session_id` at all** reuses KV on both APIs (OpenAI turn 1 4.55 s → 0.41 s → 0.40 s; Anthropic 2.12 s → 0.93 s), byte-identical to the explicit-`session_id` path |
 | `/v1/images/generations` (FLUX.2-dev) | ✅ validated | 512² generations; see the diffusion port notes |
 | PagedAttention | ❌ **removed**, with the measurement on record | Deleted, not parked — see below |
+
+**Checking `usage.prompt_tokens` is honest.** Every prefill logs its own length
+(`prefill:` plain, `prefill-tools:`, `prefill-rf:`), so the invariant is
+readable from one request: the reported figure must equal that number. Two
+things make a *correct* server look wrong here. An active grammar
+(`tool_choice: required`) holds the last prompt token back for a masked decode
+step, so the line also states `prompt=N` — compare against that, not the prefill
+length. And a structured-history request still counts the flattened
+`(role, content)` pairs while decoding from `ChatTurn`s, which is a known
+turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
+figure feeds `guard_prompt_fits` as well as the client's bill, so it
+under-reports and over-admits together.
+
+Check it through the **desktop app's** launch too, not just
+`MODEL_ID=… lumen-server`. The app resolves the model id against the local scan
+and sets ~22 more environment variables, and one of them is load-bearing here:
+`LUMEN_PREFILL_CHUNK` is presented by the CONTEXT card as a chunk size and is
+*also* the legacy fallback for the prompt-size reject cap, which the app sets
+and `LUMEN_MAX_PROMPT_TOKENS`, which it does not. So the UI silently launches
+with a different reject cap than a bare run.
+`cargo run -p lumen-app --example ui_launch -- --model <substring> [--run]`
+reproduces that launch exactly, without a display. To drive the real button,
+post a `CGEvent` to the HID tap (`CGEvent(mouseEventSource:...)` +
+`post(tap: .cghidEventTap)`, ~40 lines of Swift) — that is the layer a physical
+mouse feeds and needs no permission. AppleScript UI scripting
+(`System Events … click at`) is the one that requires an Accessibility grant and
+fails with `-25204`; a failure there is not evidence the UI is unautomatable.
+`ui_launch` refuses to launch a
+model the MODELS card would have greyed out — which is worth knowing before
+trusting any hand-verification: a local directory only appears in the UI when it
+is named `<org>--<repo>` matching a catalog id, so a hand-shortened download name
+is invisible there while working perfectly from the command line.
+
+**When two renderers exist, check both.** `format_qwen3_chat` (plain) and
+`render_assistant_open` (tools) disagreed for a long time about whether a
+replayed assistant turn keeps its `<think>` block, and task 008 concluded
+`preserve_thinking` was "a no-op for lumen" after reading only the second. The
+plain one was rendering 3.8 with 3.6's non-default branch, which cost every
+`session_id` conversation its KV cache — 48 s of cold prefill per turn on a
+6324-token system prompt, reported as nothing at all. Whether a template's
+branch is the *default* is the thing to check: `preserve_thinking is undefined`
+(3.8) and `(preserve_thinking is defined and ... is true)` (3.6) mention the same
+name and mean opposite things, and no client sends it.
+
+**A field the server emits is a field the server has to read.** `thinking: true`
+sessions could not reuse a single KV token, because the model writes its trace
+into an open `<think>` block and the request type had nowhere to return it — yet
+the response had been handing that trace to the client as `reasoning` all along.
+Any time an output field describes model state, ask what happens when it comes
+back. Three spellings do: `reasoning_content` (DeepSeek/vLLM, and the name
+Qwen's own template reads), `reasoning` (ours), and the `<think>` envelope inside
+`content` (ours again, under `LUMEN_REASONING_IN_CONTENT=1`). They are folded to
+one representation in `ChatMessage`'s `Deserialize` so the renderers, the
+prefix-cache key and the token count cannot each decide separately.
+
+**A GPU out-of-memory killed the process, and the reason it could not be
+caught was one line in our own fork.** `mlx/backend/metal/eval.cpp` called
+`check_error` from inside `addCompletedHandler` — a callback the Metal driver
+invokes on its own dispatch thread. Nothing on that stack catches, so a failed
+command buffer threw into nothing and libc++ terminated: one oversized request
+took down every other client's session. It could not be caught downstream
+either, and not for want of trying — mlx-c already wraps `mlx_eval` in
+try/catch and would have turned it into a status code, but that handler is on a
+different thread.
+
+The fix is to record the failure in the callback and throw it on the calling
+thread at the next entry point. What makes that work is that `gpu::eval` is
+called *inline* from `eval_impl` rather than on a scheduler thread — check that
+before assuming the same trick transfers to another backend. The error slot is
+cleared when thrown, so one request's out-of-memory does not fail the next.
+
+Two things to know when re-verifying:
+
+- **Reproduce it cheaply.** Raising the prompt size until the GPU fails costs
+  minutes per attempt and can take the machine with it — a 120K-token prompt
+  rebooted a 36 GB M3 Max. `LUMEN_MEMORY_LIMIT_GB` does **not** protect you: it
+  is a soft threshold that makes allocation wait, not a cap, and the process
+  grows past it. Defeat the chunk clamp instead
+  (`LUMEN_QWEN35_PREFILL_SCORES_GB=100000 LUMEN_QWEN35_PREFILL_CHUNK=65536`) and
+  a ~20K prompt attempts a buffer far beyond the Metal per-buffer cap, failing
+  in **7 seconds** while allocating nothing. Same code path, no risk.
+- **The fix lives in the MLX fork, so no red-green entry can guard it.** It
+  reaches a clean build only through `rabbitson87/mlx`'s `lumen-rs-patches`
+  branch, which `FetchContent` pins by name. Verifying locally with
+  `MLX_LOCAL_SOURCE_DIR` proves the patch, not the pin — check
+  `CMakeCache.txt`'s `mlx_SOURCE_DIR` to see which source actually compiled.
+  (`_deps/mlx-src` is left behind by earlier builds and is not evidence.)
+
+**Before blaming the model, render the prompt.** A thinking-OFF reply came back
+as `'Blue\n</think>\n\nBlue'`, and the obvious reading — "we rendered the prompt
+wrong" — was wrong: rendering the exact conversation through
+`format_qwen3_chat` showed the generation prompt ending with a properly closed
+`<think>\n\n</think>\n\n`. It really is the checkpoint, and only when sampling
+(0/16 at temperature 0, 1/32 at 0.8, 2/6 at the 0.7 default), which is also why
+it looked like a one-off. Reproduce at the temperature the default actually uses
+before calling anything rare.
+
+Filtering it is still right, and **not** as a model-specific special case: the
+tool-aware parser has dropped an unbalanced close since it was written, so the
+identical reply came back one way with tools attached and another way without.
+Fixing the plain path is making three surfaces agree, not patching one model.
+Note what the fix does *not* do — it drops the tag rather than re-reading it as a
+delimiter, because the text before it has already gone out as content deltas on
+the streaming surface, so splitting the batch surface alone would trade one
+inconsistency for another.
+
+**A feature reachable only through a non-standard field is not reachable.**
+(`/v1/chat/completions`, `/v1/messages` and `/v1/completions` all resolve the
+session from the prompt now; only the last still had an explicit-id-or-nothing
+branch, whose no-session fallback was deleted rather than left unreachable.)
+KV reuse on the Qwen plain-chat path needed `session_id`, which is a Lumen
+extension: neither the OpenAI nor the Anthropic request defines it, so no stock
+client sends one and every one of them re-prefilled its whole conversation, every
+turn. Every measurement of the win had been taken with `session_id` set by hand,
+which is why it looked fine. When you verify an optimization, send the request a
+real client would send — and note that the tool path and the Gemma arm had
+auto-keyed themselves for ages, so this was one arm of three, again.
+
+The fix is to let the prompt identify its own conversation: a session's stored
+tokens are what the model was fed plus what it generated, so a session whose
+tokens are a strict prefix of this prompt *is* this conversation one turn
+earlier. That is also the gate reuse was already guarded by, which is what makes
+guessing safe — a wrong guess costs a prefill, never an answer. Verified by
+output rather than by argument: the auto path is byte-identical to the
+explicit-`session_id` path on the same conversation.
+
+**Reuse is not bit-identical to a cold prefill — and "it's just float noise"
+was the wrong answer until it was measured.** The first version of this
+paragraph blamed incremental attention in general, which contradicts a result
+already on record: `prefill_chunk_equivalence` shows chunking a prefill is
+bit-invariant at 256/512/1024/2048 on 8K and 20K prompts, and `extend` calls the
+same `forward_chunked` on the same cache. Those two claims cannot both be true.
+
+`session_reuse_reproduces_a_cold_prefill` settles it with three arms over the
+same tokens — cold `prefill(P+G+S)`, `prefill(P+G)` then `extend(S)`, and a real
+session (`prefill(P)`, decode `|G|`, `extend(S)`):
+
+| arm | vs cold |
+|---|---|
+| `extend` after a bulk prefill | **bit-identical** |
+| a real session | identical for 43 tokens, flips at 44 |
+
+So `extend` is exact and the cache handoff is not the source. What differs is the
+decode path in between: those tokens advanced the cache **one at a time**, and a
+single-token forward is a different matmul shape (M=1, GEMV) from a bulk chunk
+(M=N, GEMM). Chunk invariance never covered that case — 256 and 2048 are both
+GEMM. The test hard-asserts the `extend` arm and only reports the session arm,
+because a permanently-red test is worse than none; what it does assert there is
+that the *first* token matches, which separates float drift from a wrong KV
+without inventing a threshold.
+
+`LUMEN_MLX_AUTO_SESSION` is registered `Behavior` for this reason and the
+equivalence matrix must never flip it. The session path has always had the drift;
+the flag only changes who reaches it.
+
+**A round trip has two halves, and the second one is easy to declare done.**
+Accepting a `thinking` block on input made an Anthropic conversation *able* to
+carry its trace; it did not make one carry it, because the route emitted no
+thinking block for a client to replay. Check the loop with the client's own
+output, not with a hand-written message: take `content[]` off turn 1, put it back
+verbatim as the assistant turn, and read the prefill log. And measure the
+negative arm in the same run — the same conversation with the block stripped —
+or "it reused KV" is an assertion about one number.
+
+**When a wire format identifies things by position, give the positions an
+owner.** Anthropic streams every delta with an index into the final `content[]`.
+Those indices were hardcoded (text pinned to `0`, tools from `1`), which is
+correct exactly until something can precede the text. A misindexed delta is still
+well-formed JSON, so the failure is a client silently assembling one block's
+bytes into another — nothing errors. The loop wrote straight to a socket and so
+could not be tested at all; `BlockStream` writes frames into a buffer instead,
+which is what let the ordering become an assertion.
+
+**Surfaces that share a backend do not share coverage.** The same turn streamed
+`thinking@0, text@1` without tools and `text@0, tool_use@1` with them, because
+the tool-aware parser accumulated the trace for `finish()` and never emitted it
+as it arrived. Non-streaming was right, streaming was empty, and the agentic path
+was the broken one. Whenever a value is both accumulated and streamed, check that
+the two agree — a test that only reads `finish()` cannot see the difference.
+
+**A parser that starts at the beginning of the output is not at the beginning of
+the turn.** Qwen's generation prompt ends *inside* the thinking block
+(`<think>\n`), so the model emits its trace with no opening tag and closes with a
+bare `</think>`. Every thinking-on turn was therefore served with the raw
+chain-of-thought as `content` and the stray close tag mid-answer, on a path whose
+documented default is that `content` holds the visible reply alone. The state
+cannot be recovered afterwards — visible text streams as it arrives — so it has
+to be threaded from the prompt. And the gate matters as much as the split: a
+thinking-off reply carries no close tag and is byte-identical to a trace that ran
+out of budget, so splitting unconditionally answers `content: ""`. That one was
+caught by hand against the running server with the whole suite green, which is
+the third time this file has had to record that.
+
+**And check it at a non-zero temperature.** Two family-wide defects have now
+been found whose common property is that the broken and the correct code emit
+the same bytes under the conditions everything was tested at:
+`usage.prompt_tokens` omitted the tool block and was exact at zero tools, and
+`temperature` was discarded and was correct at zero temperature. A gate that
+only ever exercises the degenerate value cannot see either. When a knob has a
+value at which it does nothing, test the other values.
+
+Check both families, and do not reason from one to the other. With a
+`response_format` schema *and* tools attached, Qwen renders **without the tool
+block** (it routes to `chat_response_format`) while Gemma keeps the tools and
+closes the thought channel instead — measured 19 tokens against 108 for the same
+request. A count that is right for one family by approximation is wrong for the
+other by more than it saved.
 
 The Candle rows (Candle continuous batching, GGUF Gemma, Candle Qwen legacy)
 are gone with the backend. GGUF has no MLX equivalent, so that capability was

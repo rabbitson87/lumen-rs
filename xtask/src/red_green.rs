@@ -210,6 +210,597 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "mtp-norm-double-fold",
+        symptom: "the MTP head's RMSNorm `+1` fold was applied unconditionally, \
+                  which is right for a raw HF snapshot and WRONG for every MTPLX \
+                  Speed bundle — those ship the head pre-folded, so the load \
+                  folded it twice. Invisible by construction: 1.37 + 1 is a \
+                  bounded scale change, not the sign inversion the fold exists to \
+                  prevent, so output stayed bit-exact lossless and only the \
+                  accept rate fell. Measured 5 paired prompts per model, K=2 \
+                  GEN=320 greedy: Qwen3.8-27B loses 0.055 accept on 5/5 prompts \
+                  (t=12.1), Qwen3.6-27B 0.046 on 4/5. A single prompt cannot see \
+                  it — the one prompt measured during the 3.8 port came out 0.018 \
+                  the other way and was recorded as no signal",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    mean_of_means < MTP_NORM_RUNG_THRESHOLD"#,
+            replace: r#"    let _ = mean_of_means;
+    true // defect: fold every checkpoint, including the pre-folded ones"#,
+        }],
+        guards: &[
+            mlx(
+                "qwen3_5_mtp::norm_convention_tests::the_two_rungs_are_classified_and_are_far_from_the_threshold",
+            ),
+            mlx("qwen3_5_mtp::norm_convention_tests::the_boundary_is_pinned"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "effort-ungated-in-token-count",
+        symptom: "`usage.prompt_tokens` counted a reasoning-effort sentence the \
+                  prompt did not contain. The renderer asks `resolved_effort`, \
+                  which drops the level on a checkpoint whose chat template never \
+                  declares `reasoning_effort`; the token counter used the \
+                  client's raw `ov.reasoning_effort` instead. Measured on \
+                  Qwen3.5-9B: a `thinking: true` request prefilled 12 tokens and \
+                  reported 54, and `reasoning_effort: low` reported 42. The same \
+                  figure feeds the context guard, so a request near the limit \
+                  could be refused for tokens it never had. Found by driving a \
+                  real session, not by any gate",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            Self::Qwen35Family(m) if m.wants_reasoning_effort => ov.reasoning_effort,"#,
+            replace: r#"            Self::Qwen35Family(_) => ov.reasoning_effort, // defect: ungated"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::effort_is_gated_on_the_checkpoint_declaring_it",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "replay-drops-think-block",
+        symptom: "`session_id` never reused a single KV token on the Qwen path. \
+                  A `thinking: false` generation prompt ends with \
+                  `<think>\\n\\n</think>\\n\\n` and the reply follows it, but the \
+                  replayed assistant turn was rendered without that block — so \
+                  the new prompt was not a token-prefix of what the model had \
+                  been fed, `prompt.starts_with(stored)` failed at the first \
+                  assistant token, and every turn cold-prefilled the entire \
+                  conversation while reporting nothing. Measured on \
+                  Qwen3.8-27B: a replayed turn occupied 16 tokens of framing \
+                  where generation produced 2. It was also a prompt-fidelity \
+                  bug — 3.8's template defaults `preserve_thinking` to true, so \
+                  lumen was rendering the non-default branch. With a \
+                  6324-token system prompt the fix takes turn 2 from a 48 s \
+                  cold prefill to 0.44 s",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    template.contains("preserve_thinking is undefined")"#,
+            replace: r#"    { let _ = template; false } // defect: replay drops the think block"#,
+        }],
+        guards: &[mlx(
+            "tests::a_replayed_assistant_turn_matches_what_the_model_was_fed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "reasoning-trace-has-no-wire-field",
+        symptom: "a `thinking: true` session could not reuse one KV token. The \
+                  generation prompt stops at an open `<think>` block and the \
+                  model writes the trace itself, so the tokens in the cache \
+                  contain reasoning — but the request type had nowhere to put \
+                  it, so the replayed turn re-rendered with an empty block and \
+                  diverged from its own KV at that point. The trace was not \
+                  even unavailable: the server emits it as \
+                  `ChatMessageResponse.reasoning`, so a client handing our own \
+                  response object back was returning it and being ignored. \
+                  Fixed by reading the three spellings that reach us — \
+                  `reasoning_content` (DeepSeek/vLLM, and Qwen's own template's \
+                  field name), `reasoning` (ours), and the `<think>` envelope \
+                  already inside `content` — and folding them into the one \
+                  representation the renderers read",
+        revert: &[
+            Mutation {
+                path: SRV,
+                find: r#"    if !role.eq_ignore_ascii_case("assistant") {"#,
+                replace: "    if true {\n        // defect: the trace never reaches the prompt",
+            },
+            Mutation {
+                path: MLX,
+                find: "            let (reasoning, visible) = \
+                       crate::chat_io::split_reasoning_envelope(content);",
+                replace: "            let (reasoning, visible) = (\"\", content.as_str()); \
+                          // defect: trace dropped",
+            },
+        ],
+        guards: &[
+            srv("types::reasoning_round_trip::the_deepseek_field_name_is_accepted"),
+            srv("types::reasoning_round_trip::the_field_lumen_emits_is_a_field_lumen_reads"),
+            mlx("tests::a_replayed_thinking_turn_matches_what_the_model_was_fed"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-thinking-block-rejected",
+        symptom: "the Anthropic Messages API *requires* a client to replay the \
+                  thinking blocks of any assistant turn it sends back once \
+                  extended thinking is on. `AnthropicContentBlock` is \
+                  deliberately exhaustive, and `thinking` was not one of its \
+                  variants — so a client doing exactly what the spec demands \
+                  had the whole request rejected with `unknown variant \
+                  \"thinking\"`, not just the block dropped. Fixed by accepting \
+                  `thinking` (folded into the reasoning envelope so the trace \
+                  reaches the prompt) and `redacted_thinking` (accepted and \
+                  ignored — the payload is encrypted, and the client had no \
+                  choice about receiving it), while an unrecognized type still \
+                  fails",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    Thinking {\n        #[serde(default)]\n        thinking: String,",
+            replace: "    #[serde(rename = \"thinking_defect_replay\")]\n    Thinking {\n        \
+                      #[serde(default)]\n        thinking: String,",
+        }],
+        guards: &[srv(
+            "types::reasoning_round_trip::an_anthropic_thinking_block_is_accepted_and_kept",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-thinking-trace-served-as-the-answer",
+        symptom: "with thinking on, the Qwen *prompt* opens the `<think>` block \
+                  and the model writes its trace with no opener of its own, \
+                  closing with a bare `</think>`. The parser started in \
+                  `Visible` and so never entered the thinking state at all. \
+                  Measured on Qwen3.8-27B: a `thinking:true` request came back \
+                  with **no `reasoning` field**, the raw chain-of-thought as \
+                  `content`, and the stray close tag sitting in the middle of \
+                  the answer — `\"We need answer user's simple request: … \
+                  red.\\n</think>\\n\\nRed\"`. The default is that `content` \
+                  carries the visible answer alone, so every thinking-on turn \
+                  ever served violated it. The state cannot be recovered after \
+                  the fact: visible text streams as it arrives, so by the time \
+                  the close tag shows up the trace has already gone out as \
+                  content deltas",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        Self {\n            state: State::Thinking,\n            \
+                   in_think: true,\n            ..Self::new()\n        }",
+            replace: "        Self::new() // defect: the prompt's open block is invisible",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::a_prompt_opened_think_block_is_reasoning_not_visible_text",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-plain-path-never-split-reasoning",
+        symptom: "the no-tools Qwen path runs no parser at all — it returned \
+                  the whole decode as `visible` with `reasoning: String::new()` \
+                  hardcoded, on both the streaming and non-streaming entry \
+                  points. So the trace reached the client as the answer even \
+                  though the tool path had separated it correctly for turns \
+                  that happened to declare a tool. Fixed with a splitter that \
+                  routes trace bytes to `BackendStreamEvent::Reasoning` as they \
+                  arrive, holding back any tail that could still grow into \
+                  `</think>` across a decode-step boundary. Gating it on the \
+                  thinking flag is load-bearing: a thinking-off reply carries \
+                  no close tag and is byte-indistinguishable from a trace that \
+                  ran out of budget, so an ungated split answered `content: \
+                  \"\"`, `reasoning: \"Red\"` — caught by hand against the \
+                  running server, after the whole suite was green",
+        revert: &[
+            Mutation {
+                path: MLX,
+                find: "    let Some(idx) = text.find(\"</think>\") else {\n        \
+                       return (text, \"\");",
+                replace: "    let Some(idx) = text.find(\"\\u{0}never\") else {\n        \
+                          return (\"\", text);",
+            },
+            Mutation {
+                path: MLX,
+                find: "            phase: if thinking_open {\n                Phase::Trace",
+                replace: "            phase: if false {\n                Phase::Trace",
+            },
+        ],
+        guards: &[
+            mlx("qwen3_5_tools::tests::the_plain_path_splits_a_prompt_opened_trace"),
+            mlx("qwen3_5_tools::tests::the_streaming_splitter_holds_a_tag_split_across_chunks"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "stray-think-close-reaches-the-answer",
+        symptom: "a reasoning-first checkpoint sometimes closes a `<think>` \
+                  block it never opened, even on a thinking-OFF turn where the \
+                  prompt handed it an already-closed one. Measured on \
+                  Qwen3.8-27B: `'Blue\\n</think>\\n\\nBlue'` — never at \
+                  temperature 0 (0/16), rarely when sampling (1/32 at 0.8, 2/6 \
+                  at the 0.7 default), so it is the model's doing and not a \
+                  prompt defect: the rendered generation prompt ends with a \
+                  closed `<think>\\n\\n</think>\\n\\n`, checked by rendering it. \
+                  The tool-aware parser has dropped an unbalanced close since \
+                  it was written, so the identical reply came back one way with \
+                  tools attached and another way without — the plain path \
+                  handed the raw delimiter to the client. Dropping rather than \
+                  re-reading it as a delimiter is deliberate: the text before \
+                  it cannot be moved to `reasoning` on the streaming surface \
+                  because it has already gone out as content deltas, so \
+                  splitting the batch surface alone would make the two \
+                  disagree instead. A balanced pair the model quotes is left \
+                  alone, and the depth is carried across deltas because such a \
+                  pair almost always spans decode steps",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                out.push_str(&rest[..c]);\n                if *depth > 0 {",
+            replace: "                out.push_str(&rest[..c]);\n                \
+                      if true { // defect: the stray tag survives",
+        }],
+        guards: &[
+            mlx("qwen3_5_tools::tests::a_stray_close_tag_never_reaches_the_answer"),
+            mlx("qwen3_5_tools::tests::the_streaming_splitter_drops_a_stray_close_the_same_way"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "inference-error-drops-its-cause",
+        symptom: "an inference failure reached the client naming only its \
+                  outermost context. A Metal out-of-memory arrived as \
+                  `\"inference error: native mlx-rs runner: prefill forward \
+                  (seq_id=3)\"` — true, and useless: the link that says the GPU \
+                  ran out of memory was one level down and anyhow's plain \
+                  `Display` prints only the head of the chain. All three routes \
+                  formatted with `{e}` independently, so the loss was in three \
+                  places at once. With `{e:#}` the same failure now carries \
+                  `[METAL] Command buffer execution failed: Insufficient Memory \
+                  (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)` all \
+                  the way to the client, on the batch and streaming surfaces of \
+                  both APIs. Folded into one shared helper so a fourth route \
+                  cannot quietly reintroduce the lossy form",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    format!(\"inference error: {e:#}\")",
+            replace: "    format!(\"inference error: {e}\") // defect: cause dropped",
+        }],
+        guards: &[srv(
+            "types::inference_error_carries_its_cause::the_root_cause_survives_into_the_message",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "session-reuse-needs-a-nonstandard-field",
+        symptom: "KV reuse on the Qwen plain-chat path was reachable only \
+                  through `session_id` — a Lumen extension that neither the \
+                  OpenAI nor the Anthropic request defines, so no stock client \
+                  sends it and every one of them re-prefilled the entire \
+                  conversation on every turn. The tool path had auto-keyed \
+                  itself from the system hash for ages, and the Gemma arm did \
+                  too; only Qwen's flat path still demanded the field. Fixed by \
+                  letting the prompt identify its own conversation: a session's \
+                  stored tokens are what the model was fed plus what it \
+                  generated, so a session whose tokens are a strict prefix of \
+                  this prompt IS this conversation one turn earlier. That is \
+                  also the gate reuse was always guarded by, so a guessed key \
+                  costs a prefill and never an answer — verified by output: the \
+                  auto path is byte-identical to the explicit-`session_id` path \
+                  on the same conversation. Measured on Qwen3.8-27B with no \
+                  `session_id` anywhere: turn 1 4.55 s, then 0.41 s and 0.40 s",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        .filter(|(_, s)| s.extends(prompt_ids))\n        \
+                   .max_by_key(|(_, s)| s.tokens.len())",
+            replace: "        .filter(|(_, s)| { let _ = (s, prompt_ids); false })\n        \
+                      .max_by_key(|(_, s)| s.tokens.len())",
+        }],
+        guards: &[mlx(
+            "tests::a_prompt_finds_its_own_conversation_without_being_told_which",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-output-drops-thinking-block",
+        symptom: "the Anthropic route emitted no `thinking` content block, on \
+                  either surface — the non-streaming assembler simply never \
+                  built one, and the SSE loop discarded `ReasoningDelta` under \
+                  a comment saying proper wiring was 'deferred'. So an \
+                  Anthropic client could not see the trace, and — the part that \
+                  costs something — could not hand it back, which is what a \
+                  thinking-enabled conversation needs to extend its KV instead \
+                  of re-prefilling every turn. Measured on Qwen3.8-27B once the \
+                  block existed: a client echoing our own `content[]` back gets \
+                  `reuse cached=321 suffix=15` in 283 ms where one that drops \
+                  the block gets `divergent prompt` and a 2237 ms re-prefill. \
+                  Gated on the request's own thinking flag, which on this API \
+                  is the client's alone, so a caller that never opted in sees \
+                  exactly the `content[]` it saw before",
+        revert: &[Mutation {
+            path: SRV,
+            find: "    if emit_thinking && !reasoning.is_empty() {",
+            replace: "    if false && !reasoning.is_empty() { // defect: the trace is dropped",
+        }],
+        guards: &[srv(
+            "engine::anthropic_thinking_blocks::the_trace_comes_first_then_text_then_tools",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-stream-block-indices-pinned",
+        symptom: "Anthropic identifies every streaming delta by its index into \
+                  the final `content[]`, and the SSE loop hardcoded them: text \
+                  was pinned to `index:0` by a `const` prefix and tool blocks \
+                  started at 1. That was correct only while nothing could \
+                  precede the text — a `thinking` block ahead of it shifts every \
+                  later index by one, and a delta carrying the wrong index is \
+                  still well-formed JSON, so the failure is a client quietly \
+                  assembling one block's bytes into another. Fixed by giving the \
+                  indices an owner (`BlockStream`) that emits the block \
+                  lifecycle frames and can be read back by a test, which the \
+                  loop writing straight to a socket could not be",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        self.next_index = idx.saturating_add(1);",
+            replace: "        self.next_index = 0; // defect: every block claims index 0",
+        }],
+        guards: &[
+            srv(
+                "routes::messages::tests::a_thinking_block_takes_index_zero_and_pushes_the_rest_along",
+            ),
+            srv(
+                "routes::messages::tests::without_a_trace_text_is_still_index_zero_and_tools_start_at_one",
+            ),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-tool-stream-drops-the-trace",
+        symptom: "the tool-aware Qwen parser accumulated the reasoning for \
+                  `finish()` but never emitted it as it arrived, so the \
+                  non-streaming answer carried the trace and the streaming one \
+                  had none at all. Found against the running server while \
+                  verifying the Anthropic thinking block: a thinking-enabled \
+                  request WITH tools streamed `text@0, tool_use@1` and nothing \
+                  else, where the same request without tools streamed \
+                  `thinking@0, text@1`. The tool path is the agentic one, so \
+                  this was the case where it mattered most — and it cost the \
+                  OpenAI route its `delta.reasoning` on exactly the same turns",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                events.push(Qwen35ParseEvent::Reasoning(chunk));",
+            replace: "                let _ = &chunk; // defect: kept but never streamed",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::the_tool_parser_streams_the_trace_instead_of_only_keeping_it",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "tools-replay-doubles-think-block",
+        symptom: "the tool-calling renderer prefixed its own empty `<think>` \
+                  block to whatever the assistant turn's text already was. With \
+                  `LUMEN_REASONING_IN_CONTENT=1` — or any client echoing that \
+                  content back — the trace is already in there, so the turn \
+                  rendered as `<think>\\n\\n</think>\\n\\n<think>\\n…`, two \
+                  nested blocks in a shape no Qwen template emits, and the \
+                  reasoning landed in the visible-text slot. Fixed by splitting \
+                  the envelope out and rendering the trace inside the one block \
+                  the template defines",
+        revert: &[Mutation {
+            path: MLX,
+            find: "    let (reasoning, visible) = split_reasoning_envelope(content);",
+            replace: "    let (reasoning, visible) = (\"\", content); // defect: block not split",
+        }],
+        guards: &[mlx(
+            "qwen3_5_tools::tests::a_replayed_tool_turn_carries_the_trace_it_was_given",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "mtp-drops-sampling-knobs",
+        symptom: "the MTP speculative path rebuilt its `SamplingConfig` from a \
+                  few scalars with `..default()`, silently dropping `top_k`, \
+                  `min_p` and every penalty. MTP auto-enables on a checkpoint \
+                  that ships an MTP head, so that was the LIVE decode path: \
+                  measured on Qwen3.8-27B, `top_k: 1` at temperature 1.5 \
+                  returned 3/3 distinct garbled replies instead of collapsing \
+                  to the argmax, and `repeat_penalty: 1.8` changed nothing at \
+                  all. Found immediately after wiring request temperature — \
+                  fixing the entry points was not enough, because the value \
+                  reached a second place that threw most of it away",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"    (c.repeat_penalty - 1.0).abs() < 1e-6"#,
+            replace: r#"    true || (c.repeat_penalty - 1.0).abs() < 1e-6 // defect: penalties silently dropped"#,
+        }],
+        guards: &[mlx(
+            "tests::speculative_decode_refuses_sampling_it_cannot_reproduce",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-sampling-discarded",
+        symptom: "`temperature` and `top_p` were accepted and ignored on the \
+                  entire Qwen family — all four entry points on `MlxBackend` \
+                  opened with `let _ = (top_p, temperature, ov)`, so decoding \
+                  was greedy whatever the client sent, and no error said so. \
+                  Measured on Qwen3.8-27B: `temperature: 1.5, top_p: 1.0` \
+                  returned byte-identical text 4/4, with MTP on AND off. The \
+                  doc comment above `chat` claimed the opposite (\"its sampling \
+                  is configured via REPEAT_PENALTY env and request-level \
+                  temperature\") — `REPEAT_PENALTY` was read nowhere on that \
+                  path either. It survived because every test and every \
+                  by-hand check ran at temperature 0, where correct and broken \
+                  emit the same bytes",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            temperature: temperature.max(0.0),"#,
+            replace: r#"            temperature: 0.0, // defect: request temperature discarded"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::a_request_asking_for_randomness_gets_a_sampler",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "tool-schema-uncounted-in-usage",
+        symptom: "`usage.prompt_tokens` omitted the entire tool-schema block. \
+                  The counter rendered through the tool-free `build_chat_input` \
+                  while the request decoded through the tool-aware renderer, so \
+                  the error was zero at zero tools and grew with the client's \
+                  schema. Measured on Qwen3.8-27B with ONE tool declared: \
+                  OpenAI reported 39 prompt tokens against a 279-token prefill, \
+                  Anthropic 20 against 259 — 7x under. An agentic client \
+                  shipping thirty tools is billed for a fraction of its prompt, \
+                  and `guard_prompt_fits` admits on that same fraction, so a \
+                  prompt over the context cap passes the guard and fails deeper \
+                  in. Found by driving a real session; every gate was green",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                m.build_chat_input_with_tools(messages, thinking, tools, tool_choice, effort)
+                    .map(|(ids, _prefill)| ids)"#,
+            replace: r#"                { let _ = (tools, tool_choice); m.build_chat_input(messages, thinking, effort) } // defect: tool block uncounted"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_prompt_count_renders_the_tool_block_the_model_is_shown",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-stream-zero-input-tokens",
+        symptom: "the Anthropic streaming route reported `input_tokens: 0` for \
+                  every request. `message_start` is the one place the format \
+                  names the prompt size and it goes out before the first token, \
+                  so the field was hardcoded `0` — under a comment in the `Done` \
+                  arm claiming the real figure was \"surfaced in message_start \
+                  above\", which it never was. An SDK that accumulates usage \
+                  across the stream therefore billed a 289-token tool prompt as \
+                  0, and unlike OpenAI there is no later event to correct it. \
+                  Fixed by sending the count ahead of prefill as \
+                  `StreamEvent::Start`",
+        revert: &[Mutation {
+            path: SRV,
+            find: r#"        Some(StreamEvent::Start { prompt_tokens }) => (prompt_tokens, None),"#,
+            replace: r#"        Some(StreamEvent::Start { prompt_tokens }) => { let _ = prompt_tokens; (0, None) } // defect: hardcoded zero"#,
+        }],
+        guards: &[srv(
+            "routes::messages::tests::message_start_reports_the_prompt_size_the_engine_measured",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "undeclared-tool-name-forwarded",
+        symptom: "a tool call named something the client never declared was \
+                  forwarded verbatim, so the client looked up a function it does \
+                  not have. Measured on Qwen3.8-27B: with `tool_choice=required` \
+                  and `parallel_tool_calls` unset, the second call of the turn \
+                  came back as `geget_weather` for a client that had declared \
+                  only `get_weather`. The raw decode dump shows the MODEL wrote \
+                  it — after the one-call-per-activation grammar released, the \
+                  tail of the turn decoded unconstrained. `remap_tool_call_names` \
+                  repaired the opposite direction (a name shorter than the \
+                  declared one) and passed anything else straight through",
+        revert: &[Mutation {
+            path: SRV,
+            find: r#"        calls.retain(declared);"#,
+            replace: r#"        // defect: log it and forward it anyway"#,
+        }],
+        guards: &[
+            srv("engine::tool_name_resolve_tests::an_unresolvable_name_is_dropped_not_forwarded"),
+            srv("engine::tool_name_resolve_tests::requires_separator_boundary"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-parallel-tool-calls-not-consulted",
+        symptom: "the WIRING half of the defect below, and the half no guard \
+                  covered when it shipped. `ToolCalls::ExactlyOne` was resolved \
+                  correctly and the parser counted completed calls correctly — \
+                  both pure pieces were right the whole time. What was missing \
+                  was `chat_with_tools_impl` asking either of them, so tests over \
+                  the two pieces passed in both states. This guard drives the \
+                  real decode loop over a scripted token stream, no model and no \
+                  GPU, which is what makes the omission visible",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"            if calls.must_stop_after_completed_calls(parser.completed_calls()) {"#,
+            replace: r#"            if false {
+                let _ = &calls; // defect: the decode loop never consults the cap"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_tool_decode_loop_consults_parallel_tool_calls",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "qwen-parallel-tool-calls-inert",
+        symptom: "the fix above covered Gemma 4 only. `must_stop_after_call_closer` \
+                  compares against a Gemma special-token id, and Qwen frames a call \
+                  with the literal text `</tool_call>`, so on the whole Qwen family \
+                  the cap could not fire and nothing said so — \
+                  `ToolCalls::ExactlyOne` was built correctly, handed to the \
+                  grammar builder (where the count is deliberately inert: the \
+                  grammar is one-call-per-activation by construction) and never \
+                  consulted by the decode loop. Measured on Qwen3.8-27B, \
+                  `tool_choice=required` + `parallel_tool_calls=false` returned \
+                  SEVEN identical calls",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"        self.stops_after_first_call() && completed >= 1"#,
+            replace: r#"        let _ = completed;
+        false // defect: the cap never fires on the Qwen path"#,
+        }],
+        guards: &[
+            core_mlx_lib(
+                "grammar::tests::the_qwen_one_call_stop_fires_on_the_first_completed_call",
+            ),
+            core_mlx_lib(
+                "qwen3_5_tools::tests::exactly_one_cuts_the_turn_where_one_or_more_keeps_decoding",
+            ),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "parallel-tool-calls-ignored",
         symptom: "a client sending `parallel_tool_calls: false` got HTTP 200 and \
                   as many calls as the model produced — the field was never \
@@ -773,20 +1364,49 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
         (_, "config-null-moe-fields") | (_, "qwen-nested-eos-token-id") => "qwen35_config.rs",
         (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
+        (_, "mtp-norm-double-fold") => "qwen3_5_mtp.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
-        (_, "gemma-nonstreaming-grammar") | (_, "qwen-first-token-mask") => "lib.rs",
+        (_, "gemma-nonstreaming-grammar")
+        | (_, "qwen-first-token-mask")
+        | (_, "qwen-parallel-tool-calls-not-consulted")
+        | (_, "effort-ungated-in-token-count")
+        | (_, "tool-schema-uncounted-in-usage")
+        | (_, "qwen-sampling-discarded")
+        | (_, "mtp-drops-sampling-knobs")
+        | (_, "replay-drops-think-block")
+        | (_, "session-reuse-needs-a-nonstandard-field") => "lib.rs",
+        // One defect, two files: the wire had no field for the trace *and* the
+        // renderer had nowhere to put one. Reverting either half is enough to
+        // lose the KV, so both are mutated together.
+        (SRV, "reasoning-trace-has-no-wire-field") => "types.rs",
+        (MLX, "reasoning-trace-has-no-wire-field") => "lib.rs",
+        (_, "anthropic-thinking-block-rejected") | (_, "inference-error-drops-its-cause") => {
+            "types.rs"
+        }
+        (_, "tools-replay-doubles-think-block")
+        | (_, "qwen-plain-path-never-split-reasoning")
+        | (_, "qwen-thinking-trace-served-as-the-answer")
+        | (_, "qwen-tool-stream-drops-the-trace")
+        | (_, "stray-think-close-reaches-the-answer") => "qwen3_5_tools.rs",
+        (_, "anthropic-output-drops-thinking-block") => "engine.rs",
+        (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
-        (_, "tool-choice-none") | (_, "anthropic-turn-images") => "engine.rs",
+        (_, "tool-choice-none")
+        | (_, "anthropic-turn-images")
+        | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three
         // round-trip tests, and a file for it would be more ceremony than code.
         (_, "scratch-path-collision") => "lib.rs",
-        (_, "parallel-tool-calls-not-enforced") => "grammar.rs",
+        (_, "parallel-tool-calls-not-enforced") | (_, "qwen-parallel-tool-calls-inert") => {
+            "grammar.rs"
+        }
         (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
         _ => unreachable!("no file mapped for {}", defect.name),

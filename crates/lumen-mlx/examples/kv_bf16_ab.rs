@@ -96,7 +96,7 @@ fn build_prompt(
             "user".to_string(),
             format!("Summarize the following log:\n{}", filler(seq_ix, words)),
         )];
-        let ids = driver.build_chat_input(&msgs, false)?;
+        let ids = driver.build_chat_input(&msgs, false, None)?;
         let n = ids.len();
         if n >= target {
             if n <= target + target / 20 {

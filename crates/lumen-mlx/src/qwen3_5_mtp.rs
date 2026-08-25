@@ -180,6 +180,60 @@ pub enum MtpMlpConfig {
     Moe(MtpMoeConfig),
 }
 
+/// Derive the MTP head's shape from the **trunk's** `text_config`.
+///
+/// The head reuses the trunk's attention dims and MLP topology, so every value
+/// here is already in the parsed config — there is nothing to infer from the
+/// model id. Callers previously selected between two hardcoded structs by
+/// testing the id for `"qwen3.6" | "qwen3_5"`, which silently picked the wrong
+/// shape for any id outside that spelling (a Qwen3.8 repo fell into the 35B-A3B
+/// MoE branch). Deriving instead means a new family member needs no code.
+///
+/// `attn_output_gate` stays `true`: the whole qwen3_5 family ships the doubled
+/// Q projection (`q_proj` out = `num_heads · head_dim · 2`), and the trunk's own
+/// full-attn layer assumes the same. `load_block_from_hf` validates the loaded
+/// `q_proj` against the shape this implies, so a checkpoint that ever breaks the
+/// assumption fails loudly at load rather than computing something plausible.
+pub fn mtp_shape_from_text_config(
+    tc: &crate::qwen35_config::NativeTextConfig,
+) -> Result<(Qwen35MtpDims, MtpMlpConfig)> {
+    use crate::qwen35_config::MlpKind;
+
+    let dims = Qwen35MtpDims {
+        hidden_size: tc.hidden_size,
+        num_attention_heads: tc.num_attention_heads,
+        num_key_value_heads: tc.num_key_value_heads,
+        head_dim: tc.head_dim,
+        rope_theta: tc.rope_theta,
+        rope_dim: tc.rope_dim(),
+        rms_norm_eps: tc.rms_norm_eps,
+        attn_output_gate: true,
+    };
+
+    let mlp = match tc.mlp_kind() {
+        MlpKind::Dense => {
+            if tc.intermediate_size == 0 {
+                return Err(anyhow!(
+                    "mtp_shape_from_text_config: dense trunk has intermediate_size=0 \
+                     (expected e.g. 17408 for the 27B)"
+                ));
+            }
+            MtpMlpConfig::Dense {
+                intermediate_size: tc.intermediate_size,
+            }
+        }
+        MlpKind::Moe => MtpMlpConfig::Moe(MtpMoeConfig {
+            num_experts: tc.num_experts as i32,
+            num_experts_per_tok: tc.num_experts_per_tok as i32,
+            moe_intermediate_size: tc.moe_intermediate_size,
+            shared_expert_intermediate_size: tc.shared_expert_intermediate_size,
+            norm_topk_prob: tc.norm_topk_prob,
+        }),
+    };
+
+    Ok((dims, mlp))
+}
+
 /// Full resolved MTP block — input, attention, MLP, output norm/head.
 /// Constructed once at server startup by the loader from the HF-original
 /// `mtp.*` shards (see future `qwen3_5_mtp_loader.rs`).
@@ -1018,6 +1072,78 @@ impl MtpLoadQuant {
     }
 }
 
+/// The six `mtp.*` norms stored in the zero-centered-gamma convention.
+///
+/// `post_attention_layernorm` is deliberately absent: it ships absolute even in
+/// the raw HF export (matched == raw, rel-MAE 0), so including it would drag the
+/// statistic toward the wrong rung.
+const MTP_FOLDED_NORM_KEYS: [&str; 6] = [
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+];
+
+/// Midpoint of the two observed rungs (~0.28 raw, ~1.28 already folded), which
+/// are 1.0 apart by construction — the gap IS the fold. ~0.5 of margin either
+/// way, so this is a separation, not a tuned constant.
+const MTP_NORM_RUNG_THRESHOLD: f32 = 0.75;
+
+/// The off-switch vocabulary used across this repo (`runaway.rs`,
+/// `lumen_flags`): `0` / `false` / `off` / `no`, case-insensitive.
+fn is_falsy(v: &str) -> bool {
+    v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("no")
+}
+
+/// The on-switch counterpart. Separate from `!is_falsy` on purpose: this flag is
+/// three-state, so "not off" is not the same as "on".
+fn is_truthy(v: &str) -> bool {
+    v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("yes")
+}
+
+/// Does a checkpoint whose folded norms average `mean_of_means` still need the
+/// `+1`?
+///
+/// Split out from the Array plumbing so both rungs and the boundary are
+/// testable without a checkpoint or a GPU.
+pub fn mtp_norms_need_plus_one(mean_of_means: f32) -> bool {
+    mean_of_means < MTP_NORM_RUNG_THRESHOLD
+}
+
+/// Mean of the per-tensor means over [`MTP_FOLDED_NORM_KEYS`], or `None` when
+/// none of them is present.
+///
+/// Averages over whatever IS present — `mtp.norm.weight` is optional per the
+/// llama.cpp / DeepSeek-V3 spec, and the rungs are 1.0 apart, so a missing
+/// tensor cannot move the answer across the threshold.
+fn mtp_norm_mean_of_means(tensors: &std::collections::HashMap<String, Array>) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut n = 0usize;
+    for key in MTP_FOLDED_NORM_KEYS {
+        let Some(arr) = tensors.get(key) else {
+            continue;
+        };
+        let Ok(mean) = arr
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .and_then(|a| a.mean(None))
+            .map(|m| m.item::<f32>())
+        else {
+            continue;
+        };
+        sum += mean;
+        n += 1;
+    }
+    (n > 0).then(|| sum / n as f32)
+}
+
 /// Load a Qwen3.5/3.6 MTP block from an HF original snapshot directory.
 ///
 /// `hf_dir` is the snapshot root holding `model.safetensors.index.json`
@@ -1243,10 +1369,63 @@ pub fn load_block_from_hf(
     // trunk works without this because mlx-community's conversion already
     // folded the trunk norms. Without the fold, e.g. pre_fc_norm_embedding
     // (raw mean -0.73) multiplies by a negative scale → garbage drafts,
-    // 0% accept. Gated for A/B; default ON once validated.
-    let fold_plus_one = std::env::var("LUMEN_MTP_NORM_PLUS_ONE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    // 0% accept.
+    //
+    // But the MTPLX bundles ship the head with the `+1` ALREADY folded in, and
+    // folding unconditionally therefore double-folds every checkpoint most
+    // users actually run. That does not produce garbage — 1.28 + 1 is a bounded
+    // scale change, not the sign inversion above — which is exactly why it hid:
+    // output stays bit-exact lossless and only the accept rate drops. Measured,
+    // 5 prompts paired per model, K=2 GEN=320 greedy:
+    //
+    //   Qwen3.8-27B-MTPLX  fold OFF beats ON on 5/5 prompts, mean +0.055 accept
+    //                      (sd 0.010, t=12.1) — btree/rust/math/hist/dialog all
+    //   Qwen3.6-27B-MTPLX  4/5, mean +0.046 (sd 0.052, t=1.95; one tie, one -0.022)
+    //
+    // A single prompt is not enough to see this: the one 3.8 prompt measured
+    // during the 3.8 port came out +0.018 the OTHER way, and that lone number
+    // was read as "no signal" and shipped.
+    //
+    // So decide it from the weights instead of assuming. Mean-of-means over the
+    // folded norms lands on a ladder exactly 1.0 apart — raw HF ≈ 0.28,
+    // already-folded MTPLX ≈ 1.28 — because that is what the difference IS.
+    let norm_mean = mtp_norm_mean_of_means(&tensors);
+    let detected = norm_mean.is_none_or(mtp_norms_need_plus_one);
+    // Both old behaviours stay reachable for A/B. The vocabulary is the repo's,
+    // not this call site's: matching only `"0"`/`"1"` would read `=false` as
+    // "not 0, so detect" and `=off` the same way, which is the `=0`-means-on
+    // class of bug already in the red-green catalogue
+    // (`no-overlap-keyed-on-presence`).
+    let fold_plus_one = match std::env::var("LUMEN_MTP_NORM_PLUS_ONE") {
+        Err(_) => detected,
+        Ok(raw) => match raw.trim() {
+            "" => detected,
+            v if is_falsy(v) => false,
+            v if is_truthy(v) => true,
+            v => {
+                eprintln!(
+                    "[mtp-norm] LUMEN_MTP_NORM_PLUS_ONE={v:?} is neither on nor off — detecting \
+                     from the weights instead"
+                );
+                detected
+            }
+        },
+    };
+    match norm_mean {
+        Some(m) => eprintln!(
+            "[mtp-norm] mean-of-means {m:.3} → {} rung; fold(+1)={fold_plus_one}",
+            if mtp_norms_need_plus_one(m) {
+                "raw"
+            } else {
+                "already-folded"
+            }
+        ),
+        // Not a silent auto-decision: a path whose failure is invisible must say
+        // which way it went and why.
+        None => eprintln!(
+            "[mtp-norm] no norm tensors to measure — defaulting to fold(+1)={fold_plus_one}"
+        ),
+    }
     let p1 = |a: Array| -> Result<Array> {
         if fold_plus_one {
             let one = Array::from_f32(1.0).as_dtype(a.dtype())?;
@@ -1805,4 +1984,262 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
     }
 
     Ok(report)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shape derivation regressions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Guards for [`mtp_shape_from_text_config`].
+///
+/// The derivation replaced two hardcoded `Qwen35MtpDims` structs that were
+/// selected by testing the model id for `"qwen3.6" | "qwen3_5"`. These tests pin
+/// the derived values to exactly what those branches produced, so the refactor
+/// is provably inert for the two shipped checkpoints before a third depends on
+/// it — and then show the case the substring rule got wrong.
+#[cfg(test)]
+mod norm_convention_tests {
+    use super::{MTP_NORM_RUNG_THRESHOLD, mtp_norms_need_plus_one};
+
+    /// The two rungs, as measured — not as assumed.
+    ///
+    /// Read straight out of the safetensors of four checkpoints (and
+    /// cross-checked against an independent Python read of the same bytes):
+    /// raw HF `Qwen3.6-35B-A3B` mtp.* averages **0.351**, while every MTPLX
+    /// Speed bundle averages **~1.37** (3.8-27B 1.373, 3.6-27B 1.367,
+    /// 3.5-9B 1.387). They are ~1.0 apart because the gap IS the fold.
+    #[test]
+    fn the_two_rungs_are_classified_and_are_far_from_the_threshold() {
+        assert!(
+            mtp_norms_need_plus_one(0.351),
+            "raw HF Qwen3.6-35B-A3B must still be folded"
+        );
+        for (label, m) in [("3.8-27B", 1.373), ("3.6-27B", 1.367), ("3.5-9B", 1.387)] {
+            assert!(
+                !mtp_norms_need_plus_one(m),
+                "{label} ships pre-folded; folding again costs accept rate"
+            );
+        }
+        // Margin, not a tuned constant: nothing observed sits near the line.
+        for m in [0.351, 1.367, 1.373, 1.387] {
+            assert!(
+                (m - MTP_NORM_RUNG_THRESHOLD).abs() > 0.35,
+                "{m} is within 0.35 of the threshold — the rungs are no longer separated"
+            );
+        }
+    }
+
+    /// Exactly at the threshold counts as already-folded. Stated so the
+    /// boundary is a decision rather than an accident of `<` vs `<=`.
+    #[test]
+    fn the_boundary_is_pinned() {
+        assert!(mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD - 0.001));
+        assert!(!mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD));
+        assert!(!mtp_norms_need_plus_one(MTP_NORM_RUNG_THRESHOLD + 0.001));
+    }
+
+    /// A raw checkpoint whose norms average NEGATIVE is the failure the fold
+    /// exists for: `pre_fc_norm_embedding` at mean -0.73 multiplies by a
+    /// negative scale, which inverts signs and gives 0% accept. Unlike the
+    /// double-fold this one is loud, and it must stay on the fold side.
+    /// Three states means the override cannot be parsed as "anything but 0".
+    ///
+    /// `=false` and `=off` must mean OFF, not "not the string 0, therefore
+    /// detect" — the `=0`-turned-it-on class of bug this repo already has a
+    /// red-green entry for. Unrecognised values fall back to detection, which
+    /// is the safe reading, and say so rather than deciding silently.
+    #[test]
+    fn the_override_speaks_the_repos_on_off_vocabulary() {
+        for v in ["0", "false", "FALSE", "Off", "no", " 0 "] {
+            assert!(super::is_falsy(v.trim()), "{v:?} must read as off");
+            assert!(!super::is_truthy(v.trim()), "{v:?} must not read as on");
+        }
+        for v in ["1", "true", "TRUE", "On", "yes", " 1 "] {
+            assert!(super::is_truthy(v.trim()), "{v:?} must read as on");
+            assert!(!super::is_falsy(v.trim()), "{v:?} must not read as off");
+        }
+        // Neither — these fall through to detection.
+        for v in ["auto", "detect", "2", ""] {
+            assert!(!super::is_falsy(v));
+            assert!(!super::is_truthy(v));
+        }
+    }
+
+    #[test]
+    fn negative_means_are_raw() {
+        for m in [-0.73, -0.1, 0.0] {
+            assert!(mtp_norms_need_plus_one(m), "{m} must be treated as raw");
+        }
+    }
+}
+
+#[cfg(test)]
+mod shape_derivation_tests {
+    use super::{MtpMlpConfig, mtp_shape_from_text_config};
+    use crate::qwen35_config::NativeModelConfig;
+
+    /// Mirrors `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed/config.json`
+    /// (and `mlx-community/Qwen3.6-27B-4bit`) — the dense 27B trunk. Layer
+    /// count trimmed to 4; nothing in the MTP shape reads it.
+    const DENSE_27B: &str = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120, "head_dim": 256,
+            "num_attention_heads": 24, "num_key_value_heads": 4,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "intermediate_size": 17408
+        },
+        "quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"}
+    }"#;
+
+    /// Mirrors `mlx-community/Qwen3.6-35B-A3B-mxfp4/config.json` — the MoE trunk.
+    const MOE_35B: &str = r#"{
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 2048, "head_dim": 256,
+            "num_attention_heads": 16, "num_key_value_heads": 2,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "num_experts": 256, "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512
+        },
+        "quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    }"#;
+
+    /// Copied from the shipped `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed/
+    /// config.json` (layer list trimmed to 4). Kept as its own fixture rather
+    /// than aliased to `DENSE_27B` so it keeps testing the real file's shape if
+    /// a future 3.8 respin drifts.
+    ///
+    /// Two things about it are deliberate. It carries rope inside
+    /// `rope_parameters` with the key spelled `"type"` — the MTPLX builds write
+    /// that where the official repo writes `"rope_type"` — and it carries no
+    /// flat `rope_theta`. Both are inert: `NativeRopeParameters` reads only the
+    /// mrope fields, and `rope_theta` falls back to the 10e6 default that the
+    /// nested block also specifies. The assertion below pins that they stay
+    /// inert.
+    const DENSE_27B_V38: &str = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120, "head_dim": 256,
+            "num_attention_heads": 24, "num_key_value_heads": 4,
+            "num_hidden_layers": 4, "vocab_size": 248320,
+            "rms_norm_eps": 1e-6, "full_attention_interval": 4,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "partial_rotary_factor": 0.25,
+            "intermediate_size": 17408,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "type": "default"
+            }
+        },
+        "quantization_config": {"group_size": 32, "bits": 4, "mode": "affine"}
+    }"#;
+
+    fn shape(raw: &str) -> (super::Qwen35MtpDims, MtpMlpConfig) {
+        let cfg: NativeModelConfig = serde_json::from_str(raw).expect("fixture parses");
+        mtp_shape_from_text_config(&cfg.text_config).expect("shape derives")
+    }
+
+    #[test]
+    fn dense_27b_derives_the_previously_hardcoded_shape() {
+        let (d, mlp) = shape(DENSE_27B);
+        // Exactly the struct the `is_27b_dense` branch built.
+        assert_eq!(d.hidden_size, 5120);
+        assert_eq!(d.num_attention_heads, 24);
+        assert_eq!(d.num_key_value_heads, 4);
+        assert_eq!(d.head_dim, 256);
+        assert_eq!(d.rope_theta, 10_000_000.0);
+        assert_eq!(d.rope_dim, 64);
+        assert_eq!(d.rms_norm_eps, 1e-6);
+        assert!(d.attn_output_gate);
+        match mlp {
+            MtpMlpConfig::Dense { intermediate_size } => assert_eq!(intermediate_size, 17_408),
+            MtpMlpConfig::Moe(_) => panic!("dense trunk must not derive a MoE head"),
+        }
+    }
+
+    #[test]
+    fn moe_35b_derives_the_previously_hardcoded_shape() {
+        let (d, mlp) = shape(MOE_35B);
+        // Exactly the struct the `else` (35B-A3B) branch built.
+        assert_eq!(d.hidden_size, 2048);
+        assert_eq!(d.num_attention_heads, 16);
+        assert_eq!(d.num_key_value_heads, 2);
+        assert_eq!(d.head_dim, 256);
+        assert_eq!(d.rope_theta, 10_000_000.0);
+        assert_eq!(d.rope_dim, 64);
+        assert_eq!(d.rms_norm_eps, 1e-6);
+        assert!(d.attn_output_gate);
+        match mlp {
+            MtpMlpConfig::Moe(m) => {
+                assert_eq!(m.num_experts, 256);
+                assert_eq!(m.num_experts_per_tok, 8);
+                assert_eq!(m.moe_intermediate_size, 512);
+                assert_eq!(m.shared_expert_intermediate_size, 512);
+                assert!(m.norm_topk_prob);
+            }
+            MtpMlpConfig::Dense { .. } => panic!("MoE trunk must not derive a dense head"),
+        }
+    }
+
+    // ── The defect the derivation fixes ──────────────────────────────────
+    // RED: `try_enable_qwen35_mtp_from_env` picked the head shape by testing
+    // the model id for `"qwen3.6" | "qwen3_5"`. `Qwen3.8-27B-MTPLX-…` matches
+    // neither, so it fell through to the 35B-A3B branch and asked for
+    // hidden=2048 + a 256-expert MoE MLP against a 5120-wide dense head.
+    #[test]
+    fn a_trunk_whose_id_carries_no_known_version_string_still_derives_its_own_shape() {
+        let (v38, mlp) = shape(DENSE_27B_V38);
+        assert_eq!(
+            v38.hidden_size, 5120,
+            "shape must follow the config, not the model id"
+        );
+        assert!(
+            matches!(mlp, MtpMlpConfig::Dense { .. }),
+            "a dense trunk must not fall through to the MoE default"
+        );
+
+        // The claim this port rests on: 3.8's trunk is the same architecture as
+        // 3.6's, so the derived head shape is identical field for field. If a
+        // respin ever changes that, this fails here rather than as a shape
+        // mismatch deep inside `load_block_from_hf`.
+        let (v36, _) = shape(DENSE_27B);
+        assert_eq!(v38.hidden_size, v36.hidden_size);
+        assert_eq!(v38.num_attention_heads, v36.num_attention_heads);
+        assert_eq!(v38.num_key_value_heads, v36.num_key_value_heads);
+        assert_eq!(v38.head_dim, v36.head_dim);
+        assert_eq!(v38.rms_norm_eps, v36.rms_norm_eps);
+        assert_eq!(v38.attn_output_gate, v36.attn_output_gate);
+        // Pins that MTPLX's `"type"`-spelled rope block and its missing flat
+        // `rope_theta` stay inert — both resolve to the same rope as 3.6's.
+        assert_eq!(
+            v38.rope_theta, v36.rope_theta,
+            "rope_theta must still be 10e6"
+        );
+        assert_eq!(v38.rope_dim, v36.rope_dim, "rope_dim must still be 64");
+    }
+
+    #[test]
+    fn a_dense_trunk_missing_intermediate_size_is_an_error_not_a_zero_wide_mlp() {
+        let raw = DENSE_27B.replace(r#""intermediate_size": 17408"#, r#""intermediate_size": 0"#);
+        let cfg: NativeModelConfig = serde_json::from_str(&raw).expect("fixture parses");
+        let err = mtp_shape_from_text_config(&cfg.text_config)
+            .expect_err("a zero-wide dense MLP must not be silently accepted");
+        assert!(
+            err.to_string().contains("intermediate_size"),
+            "error should name the missing field, got: {err}"
+        );
+    }
 }

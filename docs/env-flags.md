@@ -17,6 +17,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
@@ -32,6 +33,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 
 ## Details
 
@@ -88,6 +90,35 @@ Fuse routing into the expert dispatch, replacing the two-slot
 *Optimization, default on.*
 
 Fuse the attention logit softcap. Output-identical.
+
+### `LUMEN_MLX_AUTO_SESSION`
+
+*Behavior, default on.*
+
+Reuse a conversation's KV without the client naming a session.
+
+ Neither the OpenAI nor the Anthropic request has a conversation id, and
+ `session_id` is a Lumen extension no stock client sends — so without
+ this, every spec-conformant client re-prefilled its whole conversation
+ on every turn. ON matches the prompt against live sessions by token
+ prefix instead, which needs no cooperation and cannot be wrong: the same
+ `starts_with` gate guards the reuse itself.
+
+ **`Behavior`, not `Optimization`, and the mechanism is measured rather
+ than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
+ arms over the same tokens and localizes it: `extend` reproduces a bulk
+ prefill **bit-identically**, so the cache handoff is exact. What is not
+ exact is the decode path in between — the tokens between two prompts
+ advanced the cache one at a time, and a single-token forward is a
+ different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
+ reduction order differs. Measured on Qwen3.8-27B: identical for 43
+ tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
+ cover this — 256 vs 2048 are both GEMM.)
+
+ Each path is deterministic and stable across runs; they just are not
+ each other, so the equivalence matrix must never flip this. Not a new
+ property — the explicit-`session_id` path has always had it, and this
+ output is byte-identical to that path's.
 
 ### `LUMEN_MLX_KV_BF16`
 
@@ -261,3 +292,17 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  Costs an eval barrier per timed stage; default OFF. (Parse note:
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
+
+### `LUMEN_QWEN35_REASONING_EFFORT`
+
+*Behavior, default on.*
+
+Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
+
+ **`Behavior`, not `Optimization`: this changes the prompt.** ON means
+ "inject the effort sentence when the checkpoint's `chat_template.jinja`
+ declares the block" — so it is inert for every 3.5/3.6 checkpoint, which
+ declares no such thing. `=0` suppresses it even on 3.8, which is the
+ A/B hatch. The equivalence matrix must never flip this expecting
+ identical output: on a 3.8 checkpoint the two settings render different
+ system blocks by design.
