@@ -1,6 +1,6 @@
 //! Gemma 4 tokenizer + chat template.
 //!
-//! Wraps a HuggingFace `tokenizers::Tokenizer` (loaded from `tokenizer.json`)
+//! Wraps the model's [`TextTokenizer`](crate::text_tokenizer::TextTokenizer) (loaded from `tokenizer.json`)
 //! and exposes the minimal subset of Gemma 4's chat template needed for the
 //! initial OpenAI-compatible HTTP shim:
 //!   • BOS / EOS / special-turn / channel / think tokens
@@ -20,7 +20,9 @@
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use std::path::Path;
-    use tokenizers::Tokenizer;
+    use std::sync::Arc;
+
+    use crate::text_tokenizer::TextTokenizer;
 
     // ────────── Hard-coded special-token IDs ─────────────────────────────
     // Sourced from `tokenizer.json` of `gemma-4-26b-a4b-mlx-4bit`. They are
@@ -178,10 +180,11 @@ pub(crate) mod imp {
         }
     }
 
-    /// Loaded tokenizer + chat-template state. Cheap to clone (it carries a
-    /// single `Tokenizer` which is itself `Arc`-internally).
+    /// Loaded tokenizer + chat-template state. The tokenizer sits behind an
+    /// `Arc` so the opt-in jinja renderer shares it rather than loading a
+    /// second copy (~240 MB resident for Gemma 4's 262K vocab).
     pub struct Gemma4ChatTemplate {
-        tokenizer: Tokenizer,
+        tokenizer: Arc<TextTokenizer>,
     }
 
     impl Gemma4ChatTemplate {
@@ -195,7 +198,7 @@ pub(crate) mod imp {
         pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
             let p = path.as_ref();
             let tokenizer =
-                Tokenizer::from_file(p).map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
+                TextTokenizer::from_file(p).map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
             // Sanity: confirm a couple of the constants resolve to the
             // strings we think they do. Catches a swapped tokenizer file.
             let bos = tokenizer
@@ -218,10 +221,12 @@ pub(crate) mod imp {
                     turn_open
                 ));
             }
-            Ok(Self { tokenizer })
+            Ok(Self {
+                tokenizer: Arc::new(tokenizer),
+            })
         }
 
-        pub fn tokenizer(&self) -> &Tokenizer {
+        pub fn tokenizer(&self) -> &Arc<TextTokenizer> {
             &self.tokenizer
         }
 
@@ -229,11 +234,9 @@ pub(crate) mod imp {
         /// BOS/EOS. Used internally by `render_to_ids` for the textual
         /// segments between special tokens.
         pub fn encode_plain(&self, text: &str) -> Result<Vec<u32>> {
-            let enc = self
-                .tokenizer
+            self.tokenizer
                 .encode(text, /* add_special_tokens */ false)
-                .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
-            Ok(enc.get_ids().to_vec())
+                .map_err(|e| anyhow!("tokenizer encode: {e}"))
         }
 
         /// Decode token ids back to a string. Skips special tokens by

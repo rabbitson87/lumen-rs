@@ -701,7 +701,7 @@ pub(crate) mod imp {
             let chat = Gemma4ChatTemplate::from_dir(dir)
                 .with_context(|| format!("Gemma4Backend::from_dir({dir:?}): tokenizer load"))?;
             let jinja_chat = if env_jinja_renderer_on() {
-                match JinjaChatTemplate::from_dir(dir) {
+                match JinjaChatTemplate::from_dir_with_tokenizer(dir, chat.tokenizer().clone()) {
                     Ok(j) => {
                         eprintln!(
                             "[gemma4] minijinja renderer ACTIVE (LUMEN_USE_JINJA_RENDERER=1)"
@@ -1271,6 +1271,12 @@ pub(crate) mod imp {
 
         pub fn chat_template(&self) -> &Gemma4ChatTemplate {
             &self.chat
+        }
+
+        /// Cumulative tokenizer work. The jinja renderer shares this
+        /// tokenizer, so its encodes are counted here too.
+        pub fn tokenize_stats(&self) -> Arc<crate::text_tokenizer::TokenizeStats> {
+            self.chat.tokenizer().stats().clone()
         }
 
         // ── Trait-shape API used by `lumen-server` ─────────────────

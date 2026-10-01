@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use hf_hub::api::sync::ApiBuilder;
+#[cfg(test)]
 use tokenizers::Tokenizer;
 
 pub mod chat_io;
@@ -61,6 +62,10 @@ pub mod prefill_budget;
 /// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
 pub mod qwen35_config;
 pub mod qwen36_vision;
+/// Every chat-path encode/decode, and what it cost. Ungated: the Qwen backend
+/// tokenizes in every build.
+pub mod text_tokenizer;
+pub use text_tokenizer::{TextTokenizer, TokenizeSnapshot, TokenizeStats};
 /// Resource-bounded image decoding shared by both image towers.
 mod vision_image;
 /// Placeholder-run bookkeeping shared by both image towers.
@@ -523,7 +528,7 @@ impl Runner for NativeMlxRunner {
 
 /// Loads the HF tokenizer that mirrors what mlx_lm uses internally. We keep a
 /// Rust copy so encode/decode happen without crossing the Python boundary.
-fn load_tokenizer_via_hub(model_id: &str) -> Result<Tokenizer> {
+fn load_tokenizer_via_hub(model_id: &str) -> Result<TextTokenizer> {
     // If `model_id` is itself a local directory (the desktop control plane
     // passes absolute paths for models already on disk), try `tokenizer.json`
     // from that directory before reaching out to HF Hub. Avoids 404s for repos
@@ -532,7 +537,7 @@ fn load_tokenizer_via_hub(model_id: &str) -> Result<Tokenizer> {
     if local.is_dir() {
         let tj = local.join("tokenizer.json");
         if tj.is_file() {
-            return Tokenizer::from_file(&tj).map_err(|e| anyhow!("tokenizer from_file: {e}"));
+            return TextTokenizer::from_file(&tj).map_err(|e| anyhow!("tokenizer from_file: {e}"));
         }
     }
     let api = ApiBuilder::new().build().context("hf_hub api init")?;
@@ -540,7 +545,7 @@ fn load_tokenizer_via_hub(model_id: &str) -> Result<Tokenizer> {
     let path = repo
         .get("tokenizer.json")
         .context("download tokenizer.json")?;
-    Tokenizer::from_file(&path).map_err(|e| anyhow!("tokenizer from_file: {e}"))
+    TextTokenizer::from_file(&path).map_err(|e| anyhow!("tokenizer from_file: {e}"))
 }
 
 /// Resolve the on-disk `tokenizer.json` path for `model_id`, mirroring
@@ -1705,6 +1710,17 @@ impl MlxBackend {
         #[cfg(not(feature = "mlx-native"))]
         {
             false
+        }
+    }
+
+    /// Cumulative work done by the chat model's tokenizer — every encode and
+    /// decode the chat path makes, whichever renderer made it. The engine
+    /// prints the per-request delta (`[tokenize]`).
+    pub fn tokenize_stats(&self) -> Option<std::sync::Arc<TokenizeStats>> {
+        match self {
+            Self::Qwen35Family(m) => m.tokenize_stats(),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(g) => Some(g.tokenize_stats()),
         }
     }
 
@@ -3114,7 +3130,7 @@ pub struct MlxQwen35Backend {
     pub model_id: String,
     pub eos_tokens: Vec<u32>,
     pub vocab_size: usize,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<TextTokenizer>,
     next_seq_id: AtomicU64,
     sessions: std::collections::HashMap<String, SessionState>,
     /// Monotonic counter for `auto/N` session keys.
@@ -3215,7 +3231,7 @@ impl MlxQwen35Backend {
             model_id: "token-script".to_string(),
             eos_tokens: vec![eos],
             vocab_size,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(TextTokenizer::from_hf(tokenizer)),
             next_seq_id: AtomicU64::new(1),
             sessions: std::collections::HashMap::new(),
             auto_session_seq: 0,
@@ -4199,10 +4215,8 @@ impl MlxQwen35Backend {
             .tokenizer
             .as_ref()
             .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
-        let enc = tok
-            .encode(text, true)
-            .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
-        Ok(enc.get_ids().to_vec())
+        tok.encode(text, true)
+            .map_err(|e| anyhow!("tokenizer encode: {e}"))
     }
 
     /// Encode WITHOUT special tokens — for injecting literal control text
@@ -4213,10 +4227,8 @@ impl MlxQwen35Backend {
             .tokenizer
             .as_ref()
             .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
-        let enc = tok
-            .encode(text, false)
-            .map_err(|e| anyhow!("tokenizer encode_raw: {e}"))?;
-        Ok(enc.get_ids().to_vec())
+        tok.encode(text, false)
+            .map_err(|e| anyhow!("tokenizer encode_raw: {e}"))
     }
 
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
@@ -4226,6 +4238,12 @@ impl MlxQwen35Backend {
             .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
         tok.decode(tokens, true)
             .map_err(|e| anyhow!("tokenizer decode: {e}"))
+    }
+
+    /// Cumulative tokenizer work for this model; `None` when the tokenizer
+    /// failed to load (encode is disabled then too).
+    pub fn tokenize_stats(&self) -> Option<std::sync::Arc<TokenizeStats>> {
+        self.tokenizer.as_ref().map(|t| t.stats().clone())
     }
 
     /// [`Self::build_chat_input`] with inline images.

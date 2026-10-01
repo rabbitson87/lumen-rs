@@ -21,9 +21,10 @@ pub(crate) mod imp {
     use minijinja::{Environment, value::Value as MJValue};
     use serde_json::{Map, Value as JsonValue, json};
     use std::path::Path;
-    use tokenizers::Tokenizer;
+    use std::sync::Arc;
 
     use crate::chat_io::{ChatTurn, ToolDef};
+    use crate::text_tokenizer::TextTokenizer;
 
     /// Options controlling chat-template rendering. Mirrors the subset of
     /// jinja globals consumed by Gemma 4 / Qwen templates.
@@ -46,7 +47,7 @@ pub(crate) mod imp {
     /// the cost of evaluating the AST.
     pub struct JinjaChatTemplate {
         env: Environment<'static>,
-        tokenizer: Tokenizer,
+        tokenizer: Arc<TextTokenizer>,
         bos_token: String,
         /// Cached owned template source (Environment::add_template
         /// borrows it for the lifetime of the env).
@@ -58,7 +59,29 @@ pub(crate) mod imp {
         /// `chat_template.jinja` and `tokenizer.json` (+ `tokenizer_config.json`
         /// for the `bos_token` literal).
         pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self> {
-            let dir = dir.as_ref();
+            Self::build(dir.as_ref(), |path| {
+                TextTokenizer::from_file(path)
+                    .map(Arc::new)
+                    .map_err(|e| anyhow!("tokenizer load {path:?}: {e}"))
+            })
+        }
+
+        /// [`Self::from_dir`] sharing a tokenizer the caller already loaded
+        /// from the same directory, instead of reading `tokenizer.json` again.
+        pub fn from_dir_with_tokenizer<P: AsRef<Path>>(
+            dir: P,
+            tokenizer: Arc<TextTokenizer>,
+        ) -> Result<Self> {
+            Self::build(dir.as_ref(), |_| Ok(tokenizer))
+        }
+
+        /// The tokenizer is obtained between reading the template and the BOS
+        /// literal — the order `from_dir` always had, so a directory missing
+        /// several files still reports the same one first.
+        fn build(
+            dir: &Path,
+            tokenizer: impl FnOnce(&Path) -> Result<Arc<TextTokenizer>>,
+        ) -> Result<Self> {
             let template_path = dir.join("chat_template.jinja");
             let tokenizer_path = dir.join("tokenizer.json");
             let config_path = dir.join("tokenizer_config.json");
@@ -66,8 +89,7 @@ pub(crate) mod imp {
             let template_src = std::fs::read_to_string(&template_path)
                 .with_context(|| format!("read chat_template.jinja at {template_path:?}"))?;
 
-            let tokenizer = Tokenizer::from_file(&tokenizer_path)
-                .map_err(|e| anyhow!("tokenizer load {tokenizer_path:?}: {e}"))?;
+            let tokenizer = tokenizer(&tokenizer_path)?;
 
             let bos_token = read_bos_token(&config_path)
                 .with_context(|| format!("read bos_token from {config_path:?}"))?;
@@ -103,7 +125,7 @@ pub(crate) mod imp {
             })
         }
 
-        pub fn tokenizer(&self) -> &Tokenizer {
+        pub fn tokenizer(&self) -> &Arc<TextTokenizer> {
             &self.tokenizer
         }
 
@@ -134,11 +156,9 @@ pub(crate) mod imp {
             tools: Option<&[ToolDef<'_>]>,
         ) -> Result<Vec<u32>> {
             let s = self.render_to_string(messages, opts, tools)?;
-            let enc = self
-                .tokenizer
-                .encode(s, /* add_special_tokens */ false)
-                .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
-            Ok(enc.get_ids().to_vec())
+            self.tokenizer
+                .encode(&s, /* add_special_tokens */ false)
+                .map_err(|e| anyhow!("tokenizer encode: {e}"))
         }
 
         fn build_context(

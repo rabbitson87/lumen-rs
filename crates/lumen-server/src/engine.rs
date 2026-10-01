@@ -10,6 +10,50 @@ use lumen_mlx::chat_io::{
     ResolvedToolChoice, ToolDef,
 };
 
+/// Prints the tokenizer work one request did when it goes out of scope, so a
+/// guard rejection or an early `?` return is still reported.
+///
+/// Nothing else times tokenization: the prefill timers start after the prompt
+/// is built, so a request that encoded its system+tools head three times read
+/// exactly like one that encoded it once.
+///
+/// It reads deltas of the backend's cumulative [`lumen_mlx::TokenizeStats`].
+/// Every request it wraps is served to completion before the next one starts —
+/// the sequential loop, and the batched loop's inline fallback, which pauses
+/// the batch — so the delta is that request's own work.
+struct TokenizeSpan {
+    req: &'static str,
+    stats: Option<Arc<lumen_mlx::TokenizeStats>>,
+    start: lumen_mlx::TokenizeSnapshot,
+}
+
+impl TokenizeSpan {
+    fn begin(backend: &ModelBackend, req: &'static str) -> Self {
+        let stats = backend.tokenize_stats();
+        let start = stats.as_ref().map(|s| s.snapshot()).unwrap_or_default();
+        Self { req, stats, start }
+    }
+}
+
+impl Drop for TokenizeSpan {
+    fn drop(&mut self) {
+        let Some(stats) = &self.stats else { return };
+        let d = stats.snapshot().since(&self.start);
+        if d.encode_calls == 0 && d.decode_calls == 0 {
+            return;
+        }
+        eprintln!(
+            "[tokenize] req={} encodes={} enc_tokens={} encode_ms={:.1} decodes={} decode_ms={:.1}",
+            self.req,
+            d.encode_calls,
+            d.encode_tokens,
+            d.encode_ns as f64 / 1e6,
+            d.decode_calls,
+            d.decode_ns as f64 / 1e6,
+        );
+    }
+}
+
 /// Model backend — supports multiple architectures.
 /// The engine's model backend.
 ///
@@ -52,6 +96,12 @@ impl ModelBackend {
                 })
                 .unwrap_or(false)
         })
+    }
+
+    fn tokenize_stats(&self) -> Option<Arc<lumen_mlx::TokenizeStats>> {
+        match self {
+            Self::Mlx(m) => m.tokenize_stats(),
+        }
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -573,6 +623,7 @@ impl InferenceEngine {
         &mut self,
         req: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "chat");
         // Detect turn-2+ shape: any message carries tool_calls (assistant
         // replay) or role=="tool" (tool result). When present we route
         // through the structured `chat_from_history` path which can stitch
@@ -909,6 +960,7 @@ impl InferenceEngine {
 
     /// Handle a completion request.
     pub fn completion(&mut self, req: &CompletionRequest) -> Result<CompletionResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "completion");
         let input_ids = self.backend.encode(&req.prompt)?;
         let prompt_tokens = input_ids.len() as u32;
 
@@ -957,6 +1009,7 @@ impl InferenceEngine {
 
     /// Handle an Anthropic Messages API request.
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "messages");
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
@@ -1344,6 +1397,7 @@ impl InferenceEngine {
         req: &ChatCompletionRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "chat-stream");
         let ov = req.sampling_overrides();
         let mut messages: Vec<(String, String)> = req
             .messages
@@ -1805,6 +1859,7 @@ impl InferenceEngine {
         req: &AnthropicRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "messages-stream");
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
 
