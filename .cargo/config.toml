@@ -6,6 +6,12 @@
 # Override locally by setting `PYO3_PYTHON` in your shell before running cargo.
 [env]
 PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
+# fastokens (a lumen-mlx dev-dependency, task 016) links PCRE2 through
+# pcre2-sys, which prefers any libpcre2 pkg-config can find — Homebrew's, on a
+# typical Mac — over its vendored copy. Static keeps binaries self-contained
+# and the regex Unicode tables identical on every machine, which a parity
+# measurement depends on.
+PCRE2_SYS_STATIC = "1"
 
 # `cargo xtask …` runs the workspace task runner. Kept out of `default-members`
 # so it never slows down a plain `cargo build` at the root.

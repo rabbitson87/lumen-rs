@@ -104,6 +104,12 @@ tempfile = "3.10"
 # libFuzzer targets so the deterministic driver and the soak driver walk the
 # same inputs.
 lumen-testkit = { path = "../lumen-testkit" }
+# Task 016: `examples/tokenizer_parity.rs` measures whether fastokens encodes
+# bit-identically to HF `tokenizers` on our tokenizers, and how much faster.
+# Dev-only — nothing the server links. Pinned exactly: it is 0.x, and 0.3.2 is
+# the first release with both the ByteLevel heap-overflow fix (#62) and the
+# chunk-boundary id fix (#69). No default features: they pull hf-hub 0.4.
+fastokens = { version = "=0.3.2", default-features = false }
 
 # ── Examples that cannot build under `default = []` ───────────────────────────
 #
