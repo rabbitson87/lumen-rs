@@ -295,14 +295,12 @@ async fn main() -> Result<(), SendableError> {
             .warmup()
             .map_err(|e| SendableError::from(format!("warmup failed: {e}")))?;
 
-        // Channel-based engine: no Mutex, requests queue through channel.
-        // Hand the shared lifetime-stats accumulator to the handle BEFORE moving
-        // the engine into its task, so `GET /v1/loads` reads the same atomics the
-        // engine bumps at each chat completion.
-        let load_stats = engine.load_stats();
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let handle = EngineHandle::new(tx, load_stats);
-        tokio::spawn(async move { engine.run(rx).await });
+        // Channel-based engine: no Mutex, requests queue through a channel to
+        // the engine's own thread (see `InferenceEngine::start` for why it is
+        // not a tokio task).
+        let handle = engine
+            .start()
+            .map_err(|e| SendableError::from(format!("engine thread: {e}")))?;
         Some(handle)
     } else {
         None

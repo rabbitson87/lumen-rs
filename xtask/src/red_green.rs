@@ -762,6 +762,27 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "streams-delivered-in-one-burst",
+        symptom: "every streaming response, OpenAI and Anthropic, reached the \
+                  client in one burst when generation finished — 80 Qwen 9B \
+                  deltas all at 2,894 ms of a 2,894 ms stream, Anthropic's \
+                  message_start included — so time to first token was the \
+                  whole generation. The engine ran as a tokio task that never \
+                  yields, and the SSE writer it woke waited on the engine's own \
+                  worker until the request was done",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        std::thread::Builder::new()\n            .name(\"lumen-engine\".into())\n            .spawn(move || {\n                tokio::runtime::Builder::new_current_thread()\n                    .enable_all()\n                    .build()\n                    .expect(\"engine runtime\")\n                    .block_on(self.run(rx))\n            })?;",
+            replace: "        tokio::spawn(async move { self.run(rx).await }); // defect: engine on a tokio worker",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::streaming_delivery::tokens_reach_the_client_while_the_engine_generates",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "anthropic-stream-zero-input-tokens",
         symptom: "the Anthropic streaming route reported `input_tokens: 0` for \
                   every request. `message_start` is the one place the format \
@@ -1463,6 +1484,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-choice-none")
         | (_, "anthropic-turn-images")
         | (_, "anthropic-batch-guard-omits-images")
+        | (_, "streams-delivered-in-one-burst")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
         (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of

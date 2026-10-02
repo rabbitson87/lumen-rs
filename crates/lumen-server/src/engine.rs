@@ -606,6 +606,32 @@ impl InferenceEngine {
         Arc::clone(&self.load_stats)
     }
 
+    /// Runs the engine on a thread of its own; requests reach it through the
+    /// returned handle.
+    ///
+    /// A request runs start to finish without an `.await`: prefill and every
+    /// decode step block the thread. As a tokio task that stalled every stream.
+    /// The engine's first `try_send` woke the SSE writer onto the engine's own
+    /// worker (its LIFO slot, which other workers do not steal from), so the
+    /// writer ran only after the request finished and the client got every
+    /// token in one burst at the end — measured on Qwen 9B, all 80 deltas at
+    /// 2,894 ms of a 2,894 ms stream. Woken from a thread outside the runtime,
+    /// writers go through the shared queue and write while the engine works.
+    pub fn start(self) -> std::io::Result<EngineHandle> {
+        let load_stats = self.load_stats();
+        let (tx, rx) = mpsc::channel(32);
+        std::thread::Builder::new()
+            .name("lumen-engine".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("engine runtime")
+                    .block_on(self.run(rx))
+            })?;
+        Ok(EngineHandle::new(tx, load_stats))
+    }
+
     /// Run warmup forward passes to compile all Metal shaders and stabilize GPU power state.
     pub fn warmup(&mut self) -> Result<()> {
         let skip = std::env::var("SKIP_WARMUP").is_ok();
@@ -4421,5 +4447,74 @@ mod anthropic_batch_image_admission {
                 "{shape}: reported a different figure than it was admitted on"
             );
         }
+    }
+}
+
+/// Every streaming response arrived in one burst when generation finished:
+/// the engine ran as a tokio task that never yields, so the writer it woke
+/// waited on the engine's own worker until the request was done.
+#[cfg(test)]
+mod streaming_delivery {
+    use super::StreamEvent;
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn tokens_reach_the_client_while_the_engine_generates() {
+        let Some(engine) = gemma4(false) else {
+            return;
+        };
+        // The server's shape: a multi-threaded runtime, the engine started from
+        // inside it, and the stream consumed by a task on one of its workers —
+        // a `block_on` future would be woken by thread park and hide the stall.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ctx = rt.enter();
+        let handle = engine.start().expect("engine thread");
+        let body = json!({
+            "model": "gemma-4",
+            "messages": [{"role": "user", "content": "Count from 1 to 60, separated by spaces."}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "stream": true,
+            "chat_template_kwargs": {"enable_thinking": false},
+        });
+        let request = move || -> ChatCompletionRequest {
+            serde_json::from_value(body.clone()).expect("a valid chat request")
+        };
+        let deltas = rt
+            .block_on(rt.spawn(async move {
+                // The first request also materializes the weights; time the second.
+                let mut warm_up = handle
+                    .chat_completion_streaming(request())
+                    .await
+                    .expect("stream");
+                while warm_up.recv().await.is_some() {}
+                let mut rx = handle
+                    .chat_completion_streaming(request())
+                    .await
+                    .expect("stream");
+                let t0 = Instant::now();
+                let mut at = Vec::new();
+                while let Some(event) = rx.recv().await {
+                    if let StreamEvent::Delta(_) = event {
+                        at.push(t0.elapsed());
+                    }
+                }
+                at
+            }))
+            .expect("consumer task");
+        assert!(deltas.len() >= 16, "only {} deltas", deltas.len());
+        let (first, last) = (deltas[0], deltas[deltas.len() - 1]);
+        assert!(
+            first < last / 2,
+            "the first token arrived at {first:?} of a {last:?} stream: delivered in one burst"
+        );
     }
 }
