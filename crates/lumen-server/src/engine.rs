@@ -2455,6 +2455,16 @@ fn effective_prompt_cap_for(backend: &ModelBackend) -> (u32, u32, Option<u32>) {
 /// an `Err` whose message explains the cause + the fix.
 fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
     let (effective, operator_cap, max_ctx) = effective_prompt_cap_for(backend);
+    refuse_oversized_prompt(prompt_tokens, effective, operator_cap, max_ctx)
+}
+
+/// The decision [`guard_prompt_fits`] makes once the limits are known.
+fn refuse_oversized_prompt(
+    prompt_tokens: u32,
+    effective: u32,
+    operator_cap: u32,
+    max_ctx: Option<u32>,
+) -> Result<()> {
     if prompt_tokens <= effective {
         return Ok(());
     }
@@ -2483,10 +2493,27 @@ fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
              longer prefill."
         ),
     };
-    Err(anyhow::anyhow!(
+    Err(PromptTooLarge(format!(
         "prompt too large: {prompt_tokens} tokens > limit {effective}.{hint}"
     ))
+    .into())
 }
+
+/// A prompt [`guard_prompt_fits`] refused.
+///
+/// Typed so the routes can tell it from an inference failure: it is the
+/// client's to fix, so it goes out as 400 rather than 500 — and SDKs retry a
+/// 5xx, which for an oversized prompt only repeats the refusal.
+#[derive(Debug)]
+pub struct PromptTooLarge(String);
+
+impl std::fmt::Display for PromptTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PromptTooLarge {}
 
 /// Streaming analogue of [`first_json_value_end`]: a stateful tracker fed the
 /// decoded text chunks of a `response_format` stream. It emits text up to and
@@ -4557,5 +4584,33 @@ mod streaming_delivery {
             first < last / 2,
             "the first token arrived at {first:?} of a {last:?} stream: delivered in one burst"
         );
+    }
+}
+
+/// A refused prompt is the client's error (400), an inference failure the
+/// server's (500) — the status is what an SDK's retry policy keys on.
+#[cfg(test)]
+mod prompt_refusal_status {
+    use super::refuse_oversized_prompt;
+    use crate::types::inference_error_status;
+
+    #[test]
+    fn a_refused_prompt_goes_out_as_a_client_error() {
+        let refused = refuse_oversized_prompt(9, 8, 8, None).expect_err("over the cap");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("prompt too large: 9 tokens > limit 8.")
+        );
+        assert_eq!(inference_error_status(&refused), 400);
+        // A route that adds context keeps the classification.
+        assert_eq!(inference_error_status(&refused.context("chat")), 400);
+    }
+
+    #[test]
+    fn everything_else_stays_a_server_error() {
+        refuse_oversized_prompt(8, 8, 8, None).expect("at the cap is admitted");
+        let failed = anyhow::anyhow!("prefill forward (seq_id=3)");
+        assert_eq!(inference_error_status(&failed), 500);
     }
 }

@@ -32,9 +32,15 @@ pub async fn handle(
             *response.status_mut() = StatusCode::from_u16(200)?;
         }
         Err(e) => {
-            let err = AnthropicError::new(crate::types::inference_error_message(&e));
+            let status = crate::types::inference_error_status(&e);
+            let mut err = AnthropicError::new(crate::types::inference_error_message(&e));
+            // Anthropic's own type for a server-side failure; the default
+            // `invalid_request_error` stays for the 400.
+            if status == 500 {
+                err.error.r#type = "api_error".into();
+            }
             response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(500)?;
+            *response.status_mut() = StatusCode::from_u16(status)?;
         }
     }
 

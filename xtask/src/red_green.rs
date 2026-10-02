@@ -827,6 +827,24 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "prompt-refusal-reported-as-server-error",
+        symptom: "a prompt the size guard refused went out as HTTP 500 on every \
+                  batch route — a server error, which the OpenAI and Anthropic \
+                  SDKs retry, resending a prompt that can only be refused again; \
+                  the Anthropic body even said invalid_request_error",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        400\n    } else {\n        500\n    }",
+            replace: "        500 // defect: refusals reported as server errors\n    } else {\n        500\n    }",
+        }],
+        guards: &[srv(
+            "engine::prompt_refusal_status::a_refused_prompt_goes_out_as_a_client_error",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1555,6 +1573,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "server-binds-every-interface")
         | (_, "api-key-not-enforced")
         | (_, "cors-setting-ignored") => "access.rs",
+        (_, "prompt-refusal-reported-as-server-error") => "types.rs",
         (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three
