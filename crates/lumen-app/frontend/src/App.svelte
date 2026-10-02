@@ -1790,20 +1790,6 @@
 
         <h3 class="{cardSection} {colSpanFull}">{t("debug.loader")}</h3>
         <div class={kvRow}>
-          <span class="dim">{t("debug.tokenizer")}</span>
-          <input
-            type="text"
-            placeholder={t("debug.tokenizer.placeholder")}
-            value={config.server.tokenizer_id ?? ""}
-            oninput={(e) => {
-              if (!config) return;
-              const v = (e.target as HTMLInputElement).value;
-              config.server.tokenizer_id = v === "" ? null : v;
-            }}
-            onchange={saveServer}
-          />
-        </div>
-        <div class={kvRow}>
           <span class="dim">{t("debug.weightsDir")}</span>
           <input
             type="text"

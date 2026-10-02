@@ -49,7 +49,8 @@ safetensors shards). None of the model weights are committed to this
 repo. Useful env vars:
 
 - `EMBEDDING_MODEL_ID` — Qwen3-Embedding-0.6B (MLX 8-bit quant)
-- `MODEL_ID` / `LUMEN_GEMMA4_DIR` — Gemma 4 26B-A4B (MLX 3- or 4-bit)
-- `LUMEN_QWEN35_SHARDS` — Qwen3.6-27B / Qwen3.5-30B-A3B (mxfp4)
+- `MODEL_ID` — the chat model, as a Hub id or a local checkpoint directory:
+  Gemma 4 26B-A4B (MLX 3- or 4-bit), Qwen3.5/3.6 (mxfp4)
+- `LUMEN_GEMMA4_DIR` — where Gemma 4 weights live when `MODEL_ID` is a Hub id
 
 See each example's module docs for the exact format expected.

@@ -155,10 +155,8 @@ export const ko: Record<string, string> = {
   "debug.memoryBypass.label": "모든 캡 무시",
   "debug.memoryBypass.hint": "wired+cache+memory를 모두 우회, MLX/macOS에 위임",
   "debug.loader": "로더 오버라이드",
-  "debug.tokenizer": "토크나이저",
-  "debug.tokenizer.placeholder": "HF repo id (오버라이드)",
-  "debug.weightsDir": "가중치 경로",
-  "debug.weightsDir.placeholder": "활성 모델에서 자동 설정",
+  "debug.weightsDir": "Gemma 4 가중치 경로",
+  "debug.weightsDir.placeholder": "이 앱에서 받지 않은 Gemma 4 모델에만",
   "debug.skipWarmup": "워밍업 생략",
   "debug.skipWarmup.hint": "부팅 빠름, 첫 요청 느림",
 

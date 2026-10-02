@@ -102,7 +102,7 @@ huggingface-cli download \
   mlx-community/Qwen3.6-35B-A3B-mxfp4 \
   --local-dir ~/models/qwen3.6-35b-a3b-mxfp4
 
-export LUMEN_QWEN35_SHARDS=~/models/qwen3.6-35b-a3b-mxfp4
+# Serve it by passing the directory as MODEL_ID (§3).
 ```
 
 ## 4. Run the bundled examples
