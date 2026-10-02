@@ -33,12 +33,17 @@
 //! `PCRE2_SYS_STATIC=1` so PCRE2 is the vendored build, not Homebrew's.
 //!
 //! ```text
-//! cargo run --release -p lumen-mlx --example tokenizer_parity
-//! cargo run --release -p lumen-mlx --example tokenizer_parity -- a/tokenizer.json b/tokenizer.json
+//! cargo run --release -p lumen-mlx --features tokenizer-parity --example tokenizer_parity
+//! cargo run --release -p lumen-mlx --features tokenizer-parity --example tokenizer_parity \
+//!   -- a/tokenizer.json b/tokenizer.json
 //! # timing only, fastokens on one thread (algorithm vs parallelism):
-//! FASTOKENS_BPE_THREADS=1 RAYON_NUM_THREADS=1 \
-//!   cargo run --release -p lumen-mlx --example tokenizer_parity -- --bench-only
+//! FASTOKENS_BPE_THREADS=1 RAYON_NUM_THREADS=1 cargo run --release -p lumen-mlx \
+//!   --features tokenizer-parity --example tokenizer_parity -- --bench-only
 //! ```
+//!
+//! The feature exists only for this example. fastokens is kept out of every
+//! default build graph because its pcre2-sys switches on `cc`'s `parallel`
+//! feature, which re-keys every C build script, mlx-sys included.
 //!
 //! Exits 1 if any id differs outside the code-point sweep. Sweep divergences
 //! are printed with their code points and decided on separately (plan T5).
@@ -993,10 +998,10 @@ fn split_at_specials<'a>(text: &'a str, specials: &[&str]) -> Vec<&'a str> {
     'outer: while !rest.is_empty() {
         let mut best: Option<(usize, usize)> = None;
         for sp in specials {
-            if let Some(i) = rest.find(sp) {
-                if best.is_none_or(|(b, _)| i < b) {
-                    best = Some((i, sp.len()));
-                }
+            if let Some(i) = rest.find(sp)
+                && best.is_none_or(|(b, _)| i < b)
+            {
+                best = Some((i, sp.len()));
             }
         }
         match best {

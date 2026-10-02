@@ -19,6 +19,16 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 tokenizers = "0.23.1"
+# Task 016: `examples/tokenizer_parity.rs` measures whether fastokens encodes
+# bit-identically to HF `tokenizers` on our tokenizers, and how much faster.
+# Nothing the server links. Optional behind `tokenizer-parity` rather than a
+# dev-dependency on purpose: its pcre2-sys turns on `cc`'s `parallel` feature,
+# which re-keys every C build script in the graph — mlx-sys's included — so as
+# a dev-dependency it forced a full MLX rebuild into every test build. Pinned
+# exactly: 0.x, and 0.3.2 is the first release with both the ByteLevel
+# heap-overflow fix (#62) and the chunk-boundary id fix (#69). No default
+# features: they pull hf-hub 0.4.
+fastokens = { version = "=0.3.2", default-features = false, optional = true }
 hf-hub = "0.5.0"
 # Phase 2 — grammar-constrained tool calling. JSON Schema → token mask
 # converter used by Gemma 4 lazy-trigger tool calling (mirrors
@@ -96,6 +106,9 @@ mlx-native = [
     "dep:objc2-foundation",
 ]
 mlx-native-metal = ["mlx-native", "mlx-rs/metal"]
+# Task 016's fastokens-vs-HF parity/speed harness (`examples/tokenizer_parity`).
+# Kept out of every default build graph — see the `fastokens` dependency.
+tokenizer-parity = ["dep:fastokens"]
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
@@ -104,12 +117,6 @@ tempfile = "3.10"
 # libFuzzer targets so the deterministic driver and the soak driver walk the
 # same inputs.
 lumen-testkit = { path = "../lumen-testkit" }
-# Task 016: `examples/tokenizer_parity.rs` measures whether fastokens encodes
-# bit-identically to HF `tokenizers` on our tokenizers, and how much faster.
-# Dev-only — nothing the server links. Pinned exactly: it is 0.x, and 0.3.2 is
-# the first release with both the ByteLevel heap-overflow fix (#62) and the
-# chunk-boundary id fix (#69). No default features: they pull hf-hub 0.4.
-fastokens = { version = "=0.3.2", default-features = false }
 
 # ── Examples that cannot build under `default = []` ───────────────────────────
 #
@@ -230,3 +237,8 @@ name = "gemma4_config_faults"
 [[test]]
 name = "weights_faults"
 required-features = ["mlx-native"]
+
+# Needs fastokens, which only the `tokenizer-parity` feature brings in.
+[[example]]
+name = "tokenizer_parity"
+required-features = ["tokenizer-parity"]
