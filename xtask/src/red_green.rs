@@ -884,6 +884,25 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "greedy-decode-drops-the-grammar",
+        symptom: "on Gemma 4 a grammar was applied only by the sampled decode \
+                  branch, so a greedy request (temperature 0, penalties off — \
+                  `repeat_penalty: 1.0` from the client is enough) decoded with \
+                  no mask: response_format and forced tool calls came back as \
+                  free text",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                    .or_else(|| grammar.is_some().then(SamplingConfig::default));",
+            replace: "                    ; // defect: greedy decode ignores the grammar",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_greedy_grammar::a_greedy_request_still_gets_its_schema",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1599,7 +1618,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "anthropic-output-drops-thinking-block") => "engine.rs",
         (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
-        (_, "gemma-cached-stream-thought-channel") => "gemma4_backend.rs",
+        (_, "gemma-cached-stream-thought-channel") | (_, "greedy-decode-drops-the-grammar") => {
+            "gemma4_backend.rs"
+        }
         (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",

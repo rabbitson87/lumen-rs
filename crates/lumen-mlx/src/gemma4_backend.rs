@@ -3374,7 +3374,14 @@ pub(crate) mod imp {
                 }
                 let eos = self.model.eos_tokens().to_vec();
 
-                let sampling_cfg = build_sampling_config(temperature, top_p, ov);
+                // Only the sampled branch below applies a grammar; the greedy
+                // and MTP branches never read it. So a greedy request that
+                // carries one — temperature 0 with every penalty off, which a
+                // client's `repeat_penalty: 1.0` is enough for — decoded
+                // unconstrained. Send it through the sampled branch at
+                // temperature 0: the same argmax, with the mask applied.
+                let sampling_cfg = build_sampling_config(temperature, top_p, ov)
+                    .or_else(|| grammar.is_some().then(SamplingConfig::default));
 
                 // ── MTP decode branch (DEFAULT OFF — opt-in only) ──
                 //

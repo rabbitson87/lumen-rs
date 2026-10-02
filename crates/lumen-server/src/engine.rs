@@ -4579,6 +4579,53 @@ mod gemma_structured_stream {
     }
 }
 
+/// A grammar was applied only on the sampled decode branch, so a greedy
+/// request — temperature 0 with every penalty off — decoded unconstrained:
+/// `response_format` became a suggestion.
+#[cfg(test)]
+mod gemma_greedy_grammar {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_greedy_request_still_gets_its_schema() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // Nothing in the prompt asks for JSON: only the grammar can produce it.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+            "max_tokens": 48,
+            "temperature": 0,
+            "repeat_penalty": 1.0,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sum",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }))
+        .expect("a valid chat request");
+        let resp = engine
+            .chat_completion(&req)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        let text = resp.choices[0].message.content.clone().unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("not the requested JSON ({e}): {text:?}"));
+        assert!(value["answer"].is_i64(), "{text}");
+    }
+}
+
 /// Every streaming response arrived in one burst when generation finished:
 /// the engine ran as a tokio task that never yields, so the writer it woke
 /// waited on the engine's own worker until the request was done.
