@@ -40,7 +40,7 @@ const DEFAULT_BRANCHES: usize = 4;
 
 /// Default for incremental chunked-prefill boundary caching (Phase 0). **ON**:
 /// on a cold MISS the stable head (system + rendered tools, via the tools-aware
-/// boundary in `lib.rs::detect_system_tools_prefix_len*`) is snapshotted as a
+/// boundary in `lib.rs::system_tools_head*`) is snapshotted as a
 /// `pinned_boundary` branch so a later same-system/same-tools but divergent-tail
 /// prompt (e.g. a client compaction/resume) FORKS the ~48K head instead of
 /// cold-prefilling it again (~98s → ~1-2s on the agentic path). Set
@@ -142,7 +142,7 @@ pub struct PrefixCacheStore {
     /// MISS with a supplied shared-prefix boundary snapshots the head as a
     /// `pinned_boundary` branch before extending the tail, so a later
     /// prefix-sharing-but-divergent prompt forks the head instead of cold-
-    /// prefilling. Default OFF (bit-identical desktop behaviour).
+    /// prefilling. Default ON — see [`DEFAULT_INCREMENTAL`].
     incremental: bool,
 }
 
@@ -205,6 +205,22 @@ impl PrefixCacheStore {
         }
     }
 
+    /// [`Self::prefill_optionally_cached_with`] with the boundary given as a
+    /// value — the shape most tests want (test-only).
+    #[cfg(test)]
+    fn prefill_optionally_cached<R: SnapshotRunner>(
+        &mut self,
+        runner: &mut R,
+        seq_id: u64,
+        prompt_ids: &[u32],
+        key: Option<&str>,
+        incremental_boundary: Option<usize>,
+    ) -> Result<(u32, usize)> {
+        self.prefill_optionally_cached_with(runner, seq_id, prompt_ids, key, move || {
+            incremental_boundary
+        })
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -231,21 +247,26 @@ impl PrefixCacheStore {
     /// feature is disabled. Snapshot failures are logged but non-fatal — the
     /// request completes, just without (re)populating the cache.
     ///
-    /// `incremental_boundary` (Phase 0) is `Some(sys_len)` when the caller knows
-    /// the length, in tokens, of a shared prefix (the system-prompt block) that
+    /// `boundary` (Phase 0) yields `Some(sys_len)` when the caller knows the
+    /// length, in tokens, of a shared prefix (the system-prompt block) that
     /// later divergent requests are likely to share. On a cold MISS with the
     /// `incremental` policy enabled and a valid boundary (`0 < b < len`), the
     /// head `prompt_ids[..b]` is snapshotted as a `pinned_boundary` branch before
     /// the tail is extended — so a future `[sys + differentTail]` request forks
     /// the head instead of cold-prefilling. `None` (or feature off / invalid
     /// boundary) falls back to the exact single-prefill MISS path.
-    pub fn prefill_optionally_cached<R: SnapshotRunner>(
+    ///
+    /// It is a closure because that cold MISS is the only place it is read,
+    /// and the Qwen tool path measures it by encoding the whole system+tools
+    /// head (20-60 ms at agentic sizes). Passed as a value, every warm turn
+    /// paid that encode for a number its HIT never looked at.
+    pub fn prefill_optionally_cached_with<R: SnapshotRunner>(
         &mut self,
         runner: &mut R,
         seq_id: u64,
         prompt_ids: &[u32],
         key: Option<&str>,
-        incremental_boundary: Option<usize>,
+        boundary: impl FnOnce() -> Option<usize>,
     ) -> Result<(u32, usize)> {
         let key = match key.filter(|_| self.enabled) {
             Some(k) => k,
@@ -434,8 +455,8 @@ impl PrefixCacheStore {
         // unchanged from a one-shot prefill — only an extra reusable snapshot is
         // created. With the feature off (or no/invalid boundary) this is the
         // exact original single-prefill path.
-        let do_incremental =
-            self.incremental && incremental_boundary.is_some_and(|b| b > 0 && b < prompt_ids.len());
+        let incremental_boundary = if self.incremental { boundary() } else { None };
+        let do_incremental = incremental_boundary.is_some_and(|b| b > 0 && b < prompt_ids.len());
         let (last, pos) = if do_incremental {
             let b = incremental_boundary.unwrap();
             let _ = runner.prefill(seq_id, &prompt_ids[..b])?;
@@ -742,10 +763,10 @@ impl PrefixCacheStore {
 /// - `LUMEN_MLX_PREFIX_CACHE_MAX=N`        — keep at most N entries, LRU-evict.
 /// - `LUMEN_MLX_PREFIX_CACHE_BRANCHES=N`   — keep at most N branches per key
 ///   (default 4). 1 restores strict single-entry-per-key behaviour.
-/// - `LUMEN_MLX_PREFIX_INCREMENTAL=1`      — Phase 0: on a cold MISS, also
-///   snapshot the shared system-prefix head as a pinned branch so a later
-///   prefix-sharing-but-divergent prompt forks the head instead of cold-
-///   prefilling. Default OFF (cold-MISS path stays byte-identical).
+/// - `LUMEN_MLX_PREFIX_INCREMENTAL=0`      — Phase 0 opt OUT: on a cold MISS,
+///   stop snapshotting the shared system-prefix head as a pinned branch (the
+///   head that lets a later prefix-sharing-but-divergent prompt fork instead
+///   of cold-prefilling). Default ON — see [`DEFAULT_INCREMENTAL`].
 ///
 /// Default is ON: the feature has been validated since 2026-05-18 and provides
 /// the 5-6× speedup users expect for repeated chat turns with a shared system
@@ -1370,6 +1391,50 @@ mod tests {
     }
 
     // ── Phase 0: incremental chunked-prefill boundary caching ──────────────
+
+    /// The boundary is computed only where it is read: a MISS with the
+    /// incremental policy on. The Qwen tool path's closure encodes the whole
+    /// system+tools head, so running it anywhere else is tens of milliseconds
+    /// of CPU per warm turn spent on a number nobody uses.
+    #[test]
+    fn boundary_is_computed_only_on_an_incremental_miss() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let boundary = || {
+            calls.set(calls.get() + 1);
+            Some(2)
+        };
+
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached_with(&mut m, 1, &[1, 2, 3, 4], Some("k"), boundary)
+            .unwrap();
+        assert_eq!(calls.get(), 1, "a cold MISS with incremental on reads it");
+        assert!(
+            m.log.iter().any(|l| l == "prefill(2)"),
+            "and uses it to split the head, got {:?}",
+            m.log
+        );
+        store
+            .prefill_optionally_cached_with(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"), boundary)
+            .unwrap();
+        assert_eq!(calls.get(), 1, "a HIT (extension) must not compute it");
+
+        let mut store = PrefixCacheStore::with_incremental(true, 4, false);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached_with(&mut m, 1, &[1, 2, 3, 4], Some("k"), boundary)
+            .unwrap();
+        assert_eq!(calls.get(), 1, "a MISS with incremental off must not");
+
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut m = MockRunner::default();
+        store
+            .prefill_optionally_cached_with(&mut m, 1, &[1, 2, 3, 4], None, boundary)
+            .unwrap();
+        assert_eq!(calls.get(), 1, "no cache key (cache bypassed) must not");
+    }
 
     #[test]
     fn incremental_off_is_byte_identical_miss() {

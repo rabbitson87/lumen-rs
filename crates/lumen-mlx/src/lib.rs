@@ -548,6 +548,21 @@ fn load_tokenizer_via_hub(model_id: &str) -> Result<TextTokenizer> {
     TextTokenizer::from_file(&path).map_err(|e| anyhow!("tokenizer from_file: {e}"))
 }
 
+/// The prefix cache's incremental boundary for a rendered `head`: its length in
+/// tokens, when that is a strict interior of a `prompt_len`-token prompt.
+/// Returned as a closure because the cache reads it on a cold MISS only, and
+/// computing it is an encode of the whole system+tools head.
+fn lazy_head_boundary<'a>(
+    tokenizer: Option<&'a TextTokenizer>,
+    head: Option<&'a str>,
+    prompt_len: usize,
+) -> impl FnOnce() -> Option<usize> + 'a {
+    move || {
+        let n = tokenizer?.encode(head?, true).ok()?.len();
+        (n > 0 && n < prompt_len).then_some(n)
+    }
+}
+
 /// Resolve the on-disk `tokenizer.json` path for `model_id`, mirroring
 /// [`load_tokenizer_via_hub`]'s lookup: a local directory's `tokenizer.json`
 /// first, else the HF-Hub-cached download. Used to build the llguidance parser
@@ -5607,12 +5622,10 @@ impl MlxQwen35Backend {
         } else {
             auto_prefix_key(messages, effort)
         };
-        let incremental_boundary = if has_images {
+        let boundary_head = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len(messages, tools, effort)
-                .ok()
-                .filter(|&b| b > 0 && b < prompt_ids.len())
+            Self::system_tools_head(messages, tools, effort)
         };
         self.chat_with_tools_impl(
             prompt_ids,
@@ -5623,7 +5636,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
-            incremental_boundary,
+            boundary_head,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -5698,12 +5711,10 @@ impl MlxQwen35Backend {
         } else {
             auto_prefix_key_from_turns(turns, effort)
         };
-        let incremental_boundary = if has_images {
+        let boundary_head = if has_images {
             None
         } else {
-            self.detect_system_tools_prefix_len_from_turns(turns, tools, effort)
-                .ok()
-                .filter(|&b| b > 0 && b < prompt_ids.len())
+            Self::system_tools_head_from_turns(turns, tools, effort)
         };
         self.chat_with_tools_impl(
             prompt_ids,
@@ -5714,7 +5725,7 @@ impl MlxQwen35Backend {
             max_new_tokens,
             seq_id,
             prefix_key.as_deref(),
-            incremental_boundary,
+            boundary_head,
             if force_required_params_enabled() {
                 force_required_params_map(tools)
             } else {
@@ -5761,12 +5772,13 @@ impl MlxQwen35Backend {
         // this request even when the feature is enabled — useful for ad-hoc
         // benchmarks that want clean cold-prefill timing.
         prefix_cache_key: Option<&str>,
-        // Phase 0 incremental-prefix boundary: token length of the shared
-        // system-prompt head, when known and a strict interior of the prompt.
-        // `Some(b)` lets the cold-MISS path snapshot `[..b]` as a reusable
-        // boundary (only acts when `LUMEN_MLX_PREFIX_INCREMENTAL=1`); `None`
-        // keeps the original single-prefill MISS.
-        incremental_boundary: Option<usize>,
+        // Phase 0 incremental-prefix boundary: the rendered shared head
+        // (`system_tools_head*`). Its token length, when a strict interior of
+        // the prompt, lets a cold MISS snapshot `[..len]` as a reusable
+        // boundary (unless `LUMEN_MLX_PREFIX_INCREMENTAL=0`). Passed as text
+        // because measuring it means encoding the whole head, and the cache
+        // asks for it on a cold MISS only. `None` keeps the single-prefill MISS.
+        boundary_head: Option<String>,
         // Tool name → required param keys. Empty unless
         // `LUMEN_QWEN35_FORCE_REQUIRED_PARAMS` is on; when non-empty the decode
         // loop injects a `<parameter=KEY>\n` opener before the model can close
@@ -5848,12 +5860,16 @@ impl MlxQwen35Backend {
 
         #[cfg(feature = "mlx-native")]
         let (mut last, mut pos) = if prepared_images.is_empty() {
-            self.prefix_store.prefill_optionally_cached(
+            self.prefix_store.prefill_optionally_cached_with(
                 &mut self.runner,
                 seq_id,
                 prefill_ids,
                 prefix_cache_key,
-                incremental_boundary,
+                lazy_head_boundary(
+                    self.tokenizer.as_ref(),
+                    boundary_head.as_deref(),
+                    prompt_ids.len(),
+                ),
             )?
         } else {
             self.prefill_with_images(seq_id, prefill_ids, &prepared_images)?
@@ -5865,12 +5881,16 @@ impl MlxQwen35Backend {
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            self.prefix_store.prefill_optionally_cached(
+            self.prefix_store.prefill_optionally_cached_with(
                 &mut self.runner,
                 seq_id,
                 prefill_ids,
                 prefix_cache_key,
-                incremental_boundary,
+                lazy_head_boundary(
+                    self.tokenizer.as_ref(),
+                    boundary_head.as_deref(),
+                    prompt_ids.len(),
+                ),
             )?
         };
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -6454,71 +6474,62 @@ impl MlxQwen35Backend {
         Ok(sys_ids.len())
     }
 
-    /// `detect_system_prefix_len` for the structured-history shape. Returns the
-    /// token length of the leading `System` turn's rendered block (0 if the
-    /// history doesn't start with a non-empty system turn). Used to supply the
-    /// Phase 0 incremental-prefix boundary for the tool-history entry points.
-    fn detect_system_prefix_len_from_turns(
-        &self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<usize> {
-        use crate::chat_io::ChatTurn;
-        let content = match turns.first() {
-            Some(ChatTurn::System(s)) if !s.is_empty() => *s,
-            _ => return Ok(0),
-        };
-        let block = format_system_prefix(&("system".to_string(), content.to_string()), effort);
-        let sys_ids = self.encode(&block)?;
-        Ok(sys_ids.len())
-    }
-
-    /// Tools-aware variant of [`Self::detect_system_prefix_len`]: returns the
-    /// token length of the **system + rendered-tools** head — the stable prefix
-    /// every same-system/same-tools request shares, which is what the agentic
-    /// chat path actually re-uses across turns and client compactions. The
-    /// plain system-only boundary leaves the ~25K-token tool-schema block out
-    /// of the snapshot, so it gets cold-prefilled every divergent turn; this
-    /// captures it. Mirrors exactly what `format_qwen3_chat_with_tools_*` emits
-    /// before the first body turn (`render_tools_system_block`), so
-    /// `prompt_ids[..len]` is a strict prefix. Falls back to the system-only
-    /// boundary when there are no tools.
-    fn detect_system_tools_prefix_len(
-        &self,
+    /// The **system + rendered-tools** head — the stable prefix every
+    /// same-system/same-tools request shares, which is what the agentic chat
+    /// path actually re-uses across turns and client compactions. The plain
+    /// system-only boundary leaves the ~25K-token tool-schema block out of the
+    /// snapshot, so it gets cold-prefilled every divergent turn; this captures
+    /// it. Mirrors exactly what `format_qwen3_chat_with_tools_*` emits before
+    /// the first body turn (`render_tools_system_block`), so its tokens are a
+    /// strict prefix of the prompt's. Falls back to the system-only block when
+    /// there are no tools, and to `None` when there is not even that.
+    ///
+    /// Rendered, not encoded: its token length is the prefix cache's
+    /// incremental boundary, which is read on a cold MISS only, so
+    /// `chat_with_tools_impl` measures it there and nowhere else.
+    fn system_tools_head(
         messages: &[(String, String)],
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<usize> {
-        if tools.is_empty() {
-            return self.detect_system_prefix_len(messages, effort);
-        }
+    ) -> Option<String> {
         let leading_system = match messages.first() {
             Some((role, text)) if role == "system" && !text.is_empty() => Some(text.as_str()),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
-        let ids = self.encode(&block)?;
-        Ok(ids.len())
+        Self::head_block(leading_system, tools, effort)
     }
 
-    /// `detect_system_tools_prefix_len` for the structured-history shape.
-    fn detect_system_tools_prefix_len_from_turns(
-        &self,
+    /// [`Self::system_tools_head`] for the structured-history shape.
+    fn system_tools_head_from_turns(
         turns: &[crate::chat_io::ChatTurn<'_>],
         tools: &[crate::chat_io::ToolDef<'_>],
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<usize> {
+    ) -> Option<String> {
         use crate::chat_io::ChatTurn;
-        if tools.is_empty() {
-            return self.detect_system_prefix_len_from_turns(turns, effort);
-        }
         let leading_system = match turns.first() {
             Some(ChatTurn::System(s)) if !s.is_empty() => Some(*s),
             _ => None,
         };
-        let block = crate::qwen3_5_tools::render_tools_system_block(tools, leading_system, effort);
-        let ids = self.encode(&block)?;
-        Ok(ids.len())
+        Self::head_block(leading_system, tools, effort)
+    }
+
+    fn head_block(
+        leading_system: Option<&str>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Option<String> {
+        if tools.is_empty() {
+            let system = leading_system?;
+            return Some(format_system_prefix(
+                &("system".to_string(), system.to_string()),
+                effort,
+            ));
+        }
+        Some(crate::qwen3_5_tools::render_tools_system_block(
+            tools,
+            leading_system,
+            effort,
+        ))
     }
 
     /// Drop a prefix-cache entry by key, releasing its master snapshot.
