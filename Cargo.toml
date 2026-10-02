@@ -32,7 +32,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# 1.87, not 1.85: lumen-mlx and lumen-diffusion use APIs stabilized in 1.87,
+# which went unnoticed while neither crate inherited this value. Clippy reads
+# it, so it also keeps lints from suggesting newer APIs (`as_chunks`, 1.88).
+rust-version = "1.87"
 license = "MIT"
 
 # `coverage` is set by `cargo llvm-cov`, and `lumen_core::always!()` /
