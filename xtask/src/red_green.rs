@@ -135,6 +135,15 @@ const fn srv_checkpoint(filter: &'static str) -> Guard {
     }
 }
 
+/// `lumen-server` integration test over a real checkpoint (it may start the
+/// server binary itself). Release, as `srv_checkpoint`.
+const fn srv_checkpoint_test(target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        ..srv_test(target, filter)
+    }
+}
+
 /// `lumen-mlx` lib guard that needs **no** feature — `grammar` is ungated
 /// (pure llguidance + serde_json), so this builds in seconds where an
 /// `mlx-native` lib guard takes minutes.
@@ -971,8 +980,11 @@ static DEFECTS: &[Defect] = &[
             find: "        std::thread::Builder::new()\n            .name(\"lumen-engine\".into())\n            .spawn(move || {\n                tokio::runtime::Builder::new_current_thread()\n                    .enable_all()\n                    .build()\n                    .expect(\"engine runtime\")\n                    .block_on(self.run(rx))\n            })?;",
             replace: "        tokio::spawn(async move { self.run(rx).await }); // defect: engine on a tokio worker",
         }],
-        guards: &[srv_checkpoint(
-            "engine::streaming_delivery::tokens_reach_the_client_while_the_engine_generates",
+        // An in-process engine test stayed green with the defect: the stall was
+        // the server runtime's scheduling, so the guard drives the real binary.
+        guards: &[srv_checkpoint_test(
+            "streaming_delivery",
+            "the_server_streams_tokens_while_it_generates",
         )],
         occurrences: 1,
         needs_checkpoint: true,
