@@ -18,6 +18,8 @@ const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
 const CORE: &str = "crates/lumen-core/src";
+/// fastokens, vendored with lumen-rs's fixes (vendor/fastokens/PATCHES.md).
+const FASTOKENS: &str = "vendor/fastokens/src/pre_tokenizers";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -1657,6 +1659,48 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: true,
         extra: &["--ignored"],
     },
+    Defect {
+        name: "fastokens-split-cache-reads-past-the-prefix",
+        symptom: "fastokens 0.3.2 as published gave the same string different ids \
+                  depending on what the thread encoded before: on every Qwen \
+                  tokenizer, 5000 bytes of text plus 700 spaces split the run as \
+                  59 + 2 tokens right after the same text with an `x` after the \
+                  spaces, where a fresh encode and HF give one. Its split cache \
+                  reused regex matches that bytes past the shared prefix decide \
+                  (`\\s+(?!\\S)` gives a space back when a non-space follows). \
+                  Task 016's parity run caught it before lumen encoded with it",
+        revert: &[Mutation {
+            path: FASTOKENS,
+            find: "                let limit = reuse_limit(bytes, common_len);\n                let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end <= limit);",
+            replace: "                // defect: upstream's reuse condition\n                let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end < common_len);",
+        }],
+        guards: &[core_mlx_lib(
+            "text_tokenizer::tests::fastokens_ids_do_not_depend_on_the_previous_call",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "fastokens-nfc-newer-unicode",
+        symptom: "with LUMEN_FASTOKENS on, text holding a combining mark newer \
+                  than Unicode 9 encoded to other ids than HF's: `a`, U+1DF6, \
+                  U+0301 became `á`, U+1DF6 under fastokens' ICU normalizer and \
+                  stayed as written under HF's Unicode 9 tables. Task 016's \
+                  code-point sweep showed four such marks; the tables differ on \
+                  193 characters, and text holding one goes to HF",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".filter(|_| fastokens_encode::get() && !normalization_differs(text));",
+            replace: ".filter(|_| fastokens_encode::get()); // defect: no normalization fallback",
+        }],
+        guards: &[core_mlx_lib(
+            "text_tokenizer::tests::text_the_normalizers_disagree_on_is_encoded_by_hf",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -1738,6 +1782,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         }
         (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
+        (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
+        (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

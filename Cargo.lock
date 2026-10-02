@@ -1441,8 +1441,6 @@ dependencies = [
 [[package]]
 name = "fastokens"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "102017e5eb15d2d2d5308f5bcb537390e38b0547174000f408d1f9d6aa62a369"
 dependencies = [
  "daachorse",
  "fancy-regex 0.17.0",
@@ -3076,6 +3074,7 @@ dependencies = [
  "anyhow",
  "fastokens",
  "hf-hub",
+ "icu_normalizer",
  "image",
  "llguidance",
  "lumen-core",
@@ -3094,6 +3093,7 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
+ "unicode-normalization-alignments",
 ]
 
 [[package]]

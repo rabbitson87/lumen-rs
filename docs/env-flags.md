@@ -9,6 +9,7 @@ unset → default, `"0"` → off, any other value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
+| `LUMEN_FASTOKENS` | off | Optimization | `lumen_mlx::text_tokenizer::fastokens_encode` |
 | `LUMEN_GEMMA4_FUSE_DENSE_MLP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_dense_mlp` |
 | `LUMEN_GEMMA4_FUSE_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_experts` |
 | `LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE` | off | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_layer_epilogue` |
@@ -37,6 +38,21 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
+
+### `LUMEN_FASTOKENS`
+
+*Optimization, default off.*
+
+Encode with the vendored fastokens (`vendor/fastokens`) instead of HF
+ `tokenizers`: BPE only, 10-16x faster on long prompts. Exact by
+ construction of the check, not by trust: the engine is built at load
+ only if it returns HF's ids for every probe string, with and without
+ special tokens, and text the two would normalize differently (193
+ characters newer than HF's Unicode 9 tables) or a per-call error goes
+ to HF. Decoding stays on HF. Off by default: with the memo on, a warm
+ turn encodes in ~1 ms, so what it saves is one cold encode — 15-20 ms
+ at 30K tokens, 60-95 ms at 107K — against a prefill of seconds, and
+ loading the tokenizer takes 0.3-0.9 s longer.
 
 ### `LUMEN_GEMMA4_FUSE_DENSE_MLP`
 

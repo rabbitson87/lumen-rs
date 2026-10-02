@@ -33,58 +33,59 @@
 //! `PCRE2_SYS_STATIC=1` so PCRE2 is the vendored build, not Homebrew's.
 //!
 //! ```text
-//! cargo run --release -p lumen-mlx --features tokenizer-parity --example tokenizer_parity
-//! cargo run --release -p lumen-mlx --features tokenizer-parity --example tokenizer_parity \
+//! cargo run --release -p lumen-mlx --example tokenizer_parity
+//! cargo run --release -p lumen-mlx --example tokenizer_parity \
 //!   -- a/tokenizer.json b/tokenizer.json
 //! # timing only, fastokens on one thread (algorithm vs parallelism):
 //! FASTOKENS_BPE_THREADS=1 RAYON_NUM_THREADS=1 cargo run --release -p lumen-mlx \
-//!   --features tokenizer-parity --example tokenizer_parity -- --bench-only
+//!   --example tokenizer_parity -- --bench-only
 //! ```
 //!
-//! The feature exists only for this example. fastokens is kept out of every
-//! default build graph because its pcre2-sys switches on `cc`'s `parallel`
-//! feature, which re-keys every C build script, mlx-sys included.
+//! fastokens is the vendored copy in `vendor/fastokens`, with lumen-rs's fix to
+//! its split cache (`vendor/fastokens/PATCHES.md`). This compares the engines
+//! directly: `TextTokenizer` additionally sends text the two normalize
+//! differently to HF, which the sweep below does not go through.
 //!
 //! Exits 1 if any id differs outside the code-point sweep. Sweep divergences
 //! are printed with their code points and decided on separately (plan T5).
 //!
-//! ## Result on record (fastokens 0.3.2 vs tokenizers 0.23.1, M3 Max, 14 cores)
+//! ## Result on record (vendored fastokens 0.3.2 vs tokenizers 0.23.1, M3 Max, 14 cores)
 //!
-//! **Gemma 4 is clean**: zero differing ids in every section, zero divergent
-//! code points.
+//! **PASS on all four pipelines**: zero differing ids in every section —
+//! agentic prompts, 8,000 seeded random cases, multilingual text, whitespace
+//! runs, every long-match placement across the parallel-chunk boundaries on
+//! both paths, and the shared-prefix sequence.
 //!
-//! **Every Qwen pipeline (3.5/3.8, 3.6, Qwen3-Embedding) has one real bug: ids
-//! depend on what the same thread encoded before.** The shared-prefix
-//! sequence fails, and the two-call repro pins it: 5000 B of text plus 700
-//! spaces encodes correctly on its own, and differently right after an input
-//! that had `x` where it continues its whitespace run (one more space, a
-//! newline, a tab). fastokens' thread-local regex-match cache reuses the
-//! previous input's matches that end before the first differing byte, but
-//! `\s+(?!\S)` places a whitespace match's end by looking one byte past it,
-//! so a divergence exactly there leaves a stale split (59 + 2 spaces where HF
-//! has one token). The cache only serves inputs with no added tokens of 4 KiB
-//! or more: lumen's chat prompts carry `<|im_start|>` and take the generic
-//! path, but raw `/v1/completions` prompts do not.
+//! Upstream 0.3.2 failed that last section on every Qwen pipeline (3.5/3.8,
+//! 3.6, Qwen3-Embedding): ids depended on what the same thread encoded before.
+//! 5000 B of text plus 700 spaces encoded correctly on its own and as 59 + 2
+//! space tokens, where HF has one, right after an input that had `x` where it
+//! continues its whitespace run. Its thread-local regex-match cache reused
+//! matches ending before the first differing byte, but `\s+(?!\S)` places a
+//! whitespace match's end by looking past it. The two-call repro the report
+//! prints now reads `same` in every row.
 //!
-//! Everything else is identical on all four: agentic prompts, 8,000 seeded
-//! random cases, multilingual text, whitespace runs, and every long-match
-//! placement across the parallel-chunk boundaries on both paths. The
-//! code-point sweep differs on four combining marks before U+0301 (U+1AEB,
-//! U+1DF6, U+1E4EC, U+1E4ED): fastokens' NFC (ICU, newer Unicode) reorders
-//! them by combining class and HF's tables predate them.
+//! The code-point sweep differs, on the Qwen pipelines, on four combining marks
+//! before U+0301 (U+1AEB, U+1DF6, U+1E4EC, U+1E4ED): fastokens' NFC (ICU4X)
+//! reorders them by combining class, and HF's Unicode 9 tables predate them.
+//! The sweep's three contexts only expose marks that sort after U+0301; the
+//! tables differ on 193 characters in all, every one encoded after Unicode 9,
+//! and `TextTokenizer` encodes text holding any of them with HF. Gemma 4
+//! normalizes without NFC: zero divergent code points.
 //!
-//! Speed, median ms per encode of an agentic prompt:
+//! Speed, median ms per encode of an agentic prompt. Ratios are against HF in
+//! the same run; HF itself moved between the two runs, so its column is a range.
 //!
-//! | tokenizer | tokens | HF | fastokens (14 threads) | fastokens (1 thread) |
+//! | tokenizer | tokens | HF | fastokens, 14 threads | fastokens, 1 thread |
 //! |---|---|---|---|---|
-//! | Qwen3.8 | 30,799 | 18.4 | 1.34 (13.7x) | 1.54 (10.9x) |
-//! | Qwen3.8 | 107,963 | 80.4 | 5.19 (15.5x) | 6.37 (10.5x) |
-//! | Gemma 4 | 31,471 | 12.8 | 0.90 (14.1x) | 1.07 (11.9x) |
-//! | Gemma 4 | 116,347 | 61.7 | 3.78 (16.3x) | 4.92 (12.3x) |
+//! | Qwen3.8 | 29,823 | 17.1-21.7 | 1.52 (14.3x) | 1.50 (11.4x) |
+//! | Qwen3.8 | 107,384 | 66.2-100.1 | 6.24 (16.0x) | 6.38 (10.4x) |
+//! | Gemma 4 | 30,574 | 12.9-13.5 | 0.84 (15.3x) | 1.02 (13.1x) |
+//! | Gemma 4 | 116,196 | 60.5-60.6 | 3.75 (16.2x) | 4.86 (12.5x) |
 //!
-//! Gemma's piecewise render (93 encodes, as lumen's renderer does it): 11.3 ms
-//! vs 1.16 ms. Loading is the one place fastokens is slower: 0.67-1.2 s vs
-//! 0.15-0.3 s for HF.
+//! Gemma's piecewise render (93 encodes, as lumen's renderer does it): 11.5 ms
+//! vs 0.9-1.2 ms. Loading is the one place fastokens is slower: 0.33-1.2 s vs
+//! 0.09-0.29 s for HF.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

@@ -11,7 +11,7 @@
 //!   tokenizer, and the engine prints the per-request delta.
 //! * **The engine is swappable.** Call sites see ids and strings, never an HF
 //!   `Encoding`, so a different encoder can sit behind this type without
-//!   touching them (task 016 evaluates one).
+//!   touching them: [`fastokens_encode`] puts the vendored fastokens there.
 //! * **Recurring pieces can be remembered.** An agent resends the same
 //!   system+tools head and history every turn; under [`tokenize_memo`] those
 //!   pieces come from a memo and a turn encodes only what is new.
@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use tokenizers::processors::PostProcessorWrapper;
@@ -44,6 +44,24 @@ lumen_flags::flag! {
     pub tokenize_memo {
         env: "LUMEN_TOKENIZE_MEMO",
         default: true,
+        kind: Optimization,
+    }
+}
+
+lumen_flags::flag! {
+    /// Encode with the vendored fastokens (`vendor/fastokens`) instead of HF
+    /// `tokenizers`: BPE only, 10-16x faster on long prompts. Exact by
+    /// construction of the check, not by trust: the engine is built at load
+    /// only if it returns HF's ids for every probe string, with and without
+    /// special tokens, and text the two would normalize differently (193
+    /// characters newer than HF's Unicode 9 tables) or a per-call error goes
+    /// to HF. Decoding stays on HF. Off by default: with the memo on, a warm
+    /// turn encodes in ~1 ms, so what it saves is one cold encode — 15-20 ms
+    /// at 30K tokens, 60-95 ms at 107K — against a prefill of seconds, and
+    /// loading the tokenizer takes 0.3-0.9 s longer.
+    pub fastokens_encode {
+        env: "LUMEN_FASTOKENS",
+        default: false,
         kind: Optimization,
     }
 }
@@ -127,6 +145,9 @@ fn elapsed_ns(started: Instant) -> u64 {
 /// A chat model's tokenizer: HF `tokenizers` underneath, ids and strings out.
 pub struct TextTokenizer {
     hf: tokenizers::Tokenizer,
+    /// The same tokenizer.json in fastokens, when [`fastokens_encode`] was on
+    /// at load and the probe found it exact (see [`fast_engine`]).
+    fast: Option<fastokens::Tokenizer>,
     stats: Arc<TokenizeStats>,
     memo: Mutex<Memo>,
     memo_cap: usize,
@@ -147,7 +168,19 @@ struct Memo {
 
 impl TextTokenizer {
     pub fn from_file(path: impl AsRef<Path>) -> tokenizers::Result<Self> {
-        Ok(Self::from_hf(tokenizers::Tokenizer::from_file(path)?))
+        let json = std::fs::read_to_string(path)?;
+        Self::from_json(&json)
+    }
+
+    /// From the text of a `tokenizer.json`; also builds the fastokens engine
+    /// when [`fastokens_encode`] is on.
+    pub fn from_json(json: &str) -> tokenizers::Result<Self> {
+        use std::str::FromStr;
+        let mut tok = Self::from_hf(tokenizers::Tokenizer::from_str(json)?);
+        if fastokens_encode::get() {
+            tok.fast = fast_engine(json, &tok.hf);
+        }
+        Ok(tok)
     }
 
     /// Wrap an already-built HF tokenizer (tests build theirs from a string).
@@ -159,6 +192,7 @@ impl TextTokenizer {
         let split_before = if plain_post { split_marker(&hf) } else { None };
         Self {
             hf,
+            fast: None,
             stats: Arc::default(),
             memo: Mutex::default(),
             memo_cap: MAX_MEMO_BYTES,
@@ -178,7 +212,7 @@ impl TextTokenizer {
         let ids = if memoizable {
             self.encode_memoized(text)?
         } else {
-            self.hf.encode(text, add_special_tokens)?.get_ids().to_vec()
+            self.encode_with_engine(text, add_special_tokens)?
         };
         self.stats.record_encode(ids.len(), started);
         Ok(ids)
@@ -197,14 +231,33 @@ impl TextTokenizer {
         Ok(ids)
     }
 
+    /// One encode by whichever engine is in use.
+    fn encode_with_engine(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> tokenizers::Result<Vec<u32>> {
+        let fast = self
+            .fast
+            .as_ref()
+            .filter(|_| fastokens_encode::get() && !normalization_differs(text));
+        if let Some(fast) = fast {
+            match fast.encode_with_special_tokens(text, add_special_tokens) {
+                Ok(ids) => return Ok(ids),
+                Err(e) => eprintln!("[tokenize] fastokens failed ({e}); this encode uses HF"),
+            }
+        }
+        Ok(self.hf.encode(text, add_special_tokens)?.get_ids().to_vec())
+    }
+
     fn piece(&self, piece: &str) -> tokenizers::Result<Arc<[u32]>> {
         if piece.len() < MIN_PIECE_BYTES {
-            return Ok(self.hf.encode(piece, false)?.get_ids().into());
+            return Ok(self.encode_with_engine(piece, false)?.into());
         }
         if let Some(ids) = self.memo().entries.get(piece) {
             return Ok(Arc::clone(ids));
         }
-        let ids: Arc<[u32]> = self.hf.encode(piece, false)?.get_ids().into();
+        let ids: Arc<[u32]> = self.encode_with_engine(piece, false)?.into();
         let cost = piece.len() + ids.len() * size_of::<u32>();
         let mut memo = self.memo();
         if memo.bytes + cost > self.memo_cap {
@@ -239,6 +292,172 @@ impl TextTokenizer {
     pub fn stats(&self) -> &Arc<TokenizeStats> {
         &self.stats
     }
+}
+
+/// fastokens over the same `tokenizer.json` — `None` unless it loads and
+/// returns exactly HF's ids for every probe string.
+///
+/// Built with `from_json`: its `from_file` also merges a sibling
+/// `tokenizer_config.json`, which HF does not. Probed with and without special
+/// tokens, since its plain `encode` hard-codes `false`.
+fn fast_engine(json: &str, hf: &tokenizers::Tokenizer) -> Option<fastokens::Tokenizer> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let fast = match fastokens::Tokenizer::from_json(value) {
+        Ok(fast) => fast,
+        Err(e) => {
+            eprintln!("[tokenize] fastokens cannot load this tokenizer ({e}); using HF");
+            return None;
+        }
+    };
+    for text in probe_texts(hf) {
+        for add_special in [false, true] {
+            let want = hf.encode(text.as_str(), add_special).ok()?;
+            let got = fast.encode_with_special_tokens(&text, add_special).ok();
+            if got.as_deref() != Some(want.get_ids()) {
+                eprintln!("[tokenize] fastokens disagrees with HF on a probe; using HF");
+                return None;
+            }
+        }
+    }
+    // Built now, so that no request pays for it.
+    nfc_divergent();
+    Some(fast)
+}
+
+/// What the load-time probe encodes: the shapes lumen sends and the ones
+/// fastokens has been wrong on — Korean, combining marks, an emoji ZWJ
+/// sequence, this tokenizer's own added tokens written literally, whitespace
+/// runs, and a string long enough (> 40 KB) for its parallel chunking. The
+/// last two share that long prefix, in order, so its split cache is exercised
+/// across calls too.
+fn probe_texts(hf: &tokenizers::Tokenizer) -> Vec<String> {
+    let mut added: Vec<String> = hf
+        .get_added_tokens_decoder()
+        .into_values()
+        .map(|t| t.content)
+        .collect();
+    added.sort();
+    added.truncate(6);
+    let mixed = format!(
+        "Hello, 세계! café cafe\u{301} 👩\u{200d}👩\u{200d}👧 {}  \n\n\t x",
+        added.join(" text ")
+    );
+    let long = format!(
+        "{}{}",
+        "fn main() {\n    println!(\"한글 text\");\n}\n".repeat(1200),
+        " ".repeat(700)
+    );
+    vec![
+        "A plain sentence.".to_string(),
+        mixed,
+        format!("{long}x and more"),
+        format!("{long} \n"),
+    ]
+}
+
+/// Whether HF and fastokens may normalize `text` differently, so that only
+/// HF's ids are right for it. HF's NFC uses Unicode 9 tables
+/// (`unicode-normalization-alignments`), fastokens' ICU4X's newer ones: a
+/// combining mark added since sorts differently (`a`, U+1DF6, U+0301 is `á`,
+/// U+1DF6 to ICU and unchanged to HF), and a few pairs of newer characters
+/// compose under ICU only.
+fn normalization_differs(text: &str) -> bool {
+    !text.is_ascii() && {
+        let divergent = nfc_divergent();
+        text.chars().any(|c| has_char(divergent, c))
+    }
+}
+
+/// The characters behind [`normalization_differs`], one bit per code point:
+/// each whose full canonical decomposition differs between the two tables,
+/// or, for one that does not decompose, its combining class; and the newer
+/// part of each composition only ICU makes. Built once, from a pass over
+/// every scalar value.
+fn nfc_divergent() -> &'static [u64] {
+    use icu_normalizer::properties::{
+        CanonicalCombiningClassMapBorrowed, CanonicalCompositionBorrowed,
+        CanonicalDecompositionBorrowed, Decomposed,
+    };
+    use unicode_normalization_alignments::char as hf;
+
+    /// `decompose` gives one level; a full decomposition recurses.
+    fn icu_decompose(d: &CanonicalDecompositionBorrowed<'_>, c: char, out: &mut Vec<char>) {
+        match d.decompose(c) {
+            Decomposed::Default => out.push(c),
+            Decomposed::Singleton(a) => icu_decompose(d, a, out),
+            Decomposed::Expansion(a, b) => {
+                icu_decompose(d, a, out);
+                icu_decompose(d, b, out);
+            }
+        }
+    }
+
+    static SET: OnceLock<Box<[u64]>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let ccc = CanonicalCombiningClassMapBorrowed::new();
+        let decomposition = CanonicalDecompositionBorrowed::new();
+        let composition = CanonicalCompositionBorrowed::new();
+        let words = char_bit(char::MAX).0 + 1;
+        let mut divergent = vec![0u64; words].into_boxed_slice();
+        // What HF's tables say something about: a combining class, or a place
+        // in some decomposition.
+        let mut known_to_hf = vec![0u64; words];
+        let mut icu_only_compositions = Vec::new();
+        let (mut theirs, mut ours) = (Vec::new(), Vec::new());
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            theirs.clear();
+            ours.clear();
+            hf::decompose_canonical(c, |d| theirs.push(d));
+            icu_decompose(&decomposition, c, &mut ours);
+            let hf_class = hf::canonical_combining_class(c);
+            if hf_class != 0 || theirs != [c] {
+                insert_char(&mut known_to_hf, c);
+                theirs
+                    .iter()
+                    .for_each(|&d| insert_char(&mut known_to_hf, d));
+            }
+            let class_differs = ours == [c] && hf_class != ccc.get_u8(c);
+            if theirs == ours && !class_differs {
+                continue;
+            }
+            insert_char(&mut divergent, c);
+            if let Decomposed::Expansion(a, b) = decomposition.decompose(c) {
+                if composition.compose(a, b) == Some(c) && hf::compose(a, b) != Some(c) {
+                    icu_only_compositions.push((a, b));
+                }
+            }
+        }
+        // Text holding both parts of a composition only ICU makes normalizes
+        // differently. Unicode never starts composing two parts that both
+        // predate the composite, so flagging the parts HF's tables say nothing
+        // about catches the newer one — and keeps U+0307, which two Todhri
+        // letters compose with, off the list. Both, should HF know both.
+        for (a, b) in icu_only_compositions {
+            let both_known = has_char(&known_to_hf, a) && has_char(&known_to_hf, b);
+            for part in [a, b] {
+                if both_known || !has_char(&known_to_hf, part) {
+                    insert_char(&mut divergent, part);
+                }
+            }
+        }
+        divergent
+    })
+}
+
+/// Word index and mask of `c` in a one-bit-per-code-point set.
+fn char_bit(c: char) -> (usize, u64) {
+    let c = u32::from(c);
+    ((c >> 6) as usize, 1 << (c & 63))
+}
+
+fn has_char(set: &[u64], c: char) -> bool {
+    let (word, bit) = char_bit(c);
+    set[word] & bit != 0
+}
+
+fn insert_char(set: &mut [u64], c: char) {
+    let (word, bit) = char_bit(c);
+    set[word] |= bit;
 }
 
 /// The chat-turn marker prompts can be cut at without changing their ids.
@@ -544,6 +763,203 @@ mod tests {
                 assert!(tok.memo().bytes <= 4096, "{} bytes", tok.memo().bytes);
             }
         });
+    }
+
+    /// Qwen3.5/3.8's split regex, as its tokenizer.json has it.
+    const QWEN_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// Qwen's pipeline — NFC, its split regex, ByteLevel, BPE — over a
+    /// vocabulary small enough to build here: the 256 byte symbols, and merges
+    /// that join runs of spaces.
+    fn qwen_pipeline_json() -> String {
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        let mut symbols: Vec<String> = ByteLevel::alphabet()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        symbols.sort();
+        symbols.extend(["ĠĠ".to_string(), "ĠĠĠĠ".to_string()]);
+        let vocab: serde_json::Map<String, serde_json::Value> = symbols
+            .into_iter()
+            .enumerate()
+            .map(|(id, symbol)| (symbol, id.into()))
+            .collect();
+        let added = |id: usize, content: &str| {
+            serde_json::json!({
+                "id": id, "content": content, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            })
+        };
+        let n = vocab.len();
+        serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [added(n, "<|im_start|>"), added(n + 1, "<|im_end|>")],
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": QWEN_SPLIT}, "behavior": "Isolated",
+                 "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true,
+                 "use_regex": false}
+            ]},
+            "post_processor": {"type": "ByteLevel", "add_prefix_space": false,
+                               "trim_offsets": false, "use_regex": false},
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+                        "use_regex": true},
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": "", "end_of_word_suffix": "", "fuse_unk": false,
+                "byte_fallback": false, "ignore_merges": false,
+                "vocab": vocab, "merges": [["Ġ", "Ġ"], ["ĠĠ", "ĠĠ"]]
+            }
+        })
+        .to_string()
+    }
+
+    /// fastokens gives HF's ids however the previous call on the thread ended.
+    /// Upstream's split cache reused regex matches that bytes past the shared
+    /// prefix decide — a run of spaces gives one back when a non-space follows
+    /// — so a string split its run differently right after one that diverged
+    /// just past it, and the load probe refused the engine.
+    #[test]
+    fn fastokens_ids_do_not_depend_on_the_previous_call() {
+        let json = qwen_pipeline_json();
+        let reference = tokenizers::Tokenizer::from_str(&json).expect("tokenizer");
+        fastokens_encode::with(true, || {
+            let tok = TextTokenizer::from_json(&json).expect("tokenizer");
+            assert!(tok.fast.is_some(), "the load probe refused fastokens");
+            // Past the cache's 4 KiB minimum shared prefix.
+            let head = format!("{}{}", "fn main() {}\n".repeat(400), " ".repeat(700));
+            for tail in ["x and more", " \n", "\n\n", "'ll do", "x"] {
+                let text = format!("{head}{tail}");
+                let want = reference.encode(text.as_str(), false).unwrap();
+                let got = tokenize_memo::with(false, || tok.encode(&text, false)).unwrap();
+                assert_eq!(got, want.get_ids(), "{tail:?}, after the previous tail");
+            }
+        });
+    }
+
+    /// Text the two normalize differently goes to HF. U+1DF6 is a combining
+    /// mark from Unicode 10: ICU sorts it after U+0301 and composes `á`, while
+    /// HF's Unicode 9 tables leave all three as they are.
+    #[test]
+    fn text_the_normalizers_disagree_on_is_encoded_by_hf() {
+        let json = qwen_pipeline_json();
+        let reference = tokenizers::Tokenizer::from_str(&json).expect("tokenizer");
+        fastokens_encode::with(true, || {
+            let tok = TextTokenizer::from_json(&json).expect("tokenizer");
+            assert!(tok.fast.is_some(), "the load probe refused fastokens");
+            for text in ["a\u{1DF6}\u{301} and more", "x\u{1E4EC}\u{301}"] {
+                let want = reference.encode(text, false).unwrap();
+                assert_eq!(tok.encode(text, false).unwrap(), want.get_ids(), "{text:?}");
+            }
+        });
+    }
+
+    /// The fallback covers what task 016's code-point sweep caught and a
+    /// letter that composes with U+0307 under ICU only (Todhri, Unicode 16) —
+    /// not U+0307 itself, nor anything else in everyday text: accents, Hangul,
+    /// kana, Indic and Thai marks, emoji sequences.
+    #[test]
+    fn the_normalization_fallback_is_narrow() {
+        for c in [
+            '\u{1AEB}',
+            '\u{1DF6}',
+            '\u{1E4EC}',
+            '\u{1E4ED}',
+            '\u{105D2}',
+        ] {
+            assert!(
+                normalization_differs(&c.to_string()),
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        let old = ('\0'..='\u{52F}').find(|&c| normalization_differs(&c.to_string()));
+        assert_eq!(
+            old, None,
+            "Latin, Greek, Cyrillic and their marks stay on fastokens"
+        );
+        for text in [
+            "plain ASCII",
+            "café cafe\u{301} ż z\u{307} Ελληνικά Привет Tiếng Việt",
+            "한국어 텍스트 \u{1100}\u{1161}\u{11A8}",
+            "日本語のテキスト、カタカナ",
+            "हिन्दी ไทย العربية עברית",
+            "👩\u{200d}👩\u{200d}👧 🇰🇷",
+        ] {
+            assert!(!normalization_differs(text), "{text:?}");
+        }
+    }
+
+    /// fastokens is BPE-only. A tokenizer it cannot load keeps encoding with
+    /// HF, flag or no flag.
+    #[test]
+    fn a_tokenizer_fastokens_cannot_load_stays_on_hf() {
+        fastokens_encode::with(true, || {
+            let tok = TextTokenizer::from_json(EOS_TEMPLATE_TOKENIZER).expect("tokenizer");
+            assert!(tok.fast.is_none(), "WordLevel has no fastokens engine");
+            for add_special in [false, true] {
+                let want = hf().encode("hello world", add_special).unwrap();
+                assert_eq!(
+                    tok.encode("hello world", add_special).unwrap(),
+                    want.get_ids()
+                );
+            }
+        });
+    }
+
+    /// The vendored fastokens, with the split-cache fix, returns HF's ids on
+    /// the real tokenizers: the load probe accepts them, and a growing
+    /// conversation encodes identically with the memo off and on.
+    #[test]
+    #[ignore = "requires real tokenizer.json files; set LUMEN_QWEN35_MODEL_DIR and LUMEN_GEMMA4_MODEL_DIR"]
+    fn fastokens_matches_hf_on_real_tokenizers() {
+        let dirs: Vec<String> = ["LUMEN_QWEN35_MODEL_DIR", "LUMEN_GEMMA4_MODEL_DIR"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .collect();
+        if dirs.is_empty() {
+            eprintln!("skip: set LUMEN_QWEN35_MODEL_DIR and/or LUMEN_GEMMA4_MODEL_DIR");
+            return;
+        }
+        let docs = include_str!("../../../docs/maintainer-workflow.md");
+        let file = include_str!("prefix_cache.rs");
+        for dir in dirs {
+            let path = Path::new(&dir).join("tokenizer.json");
+            let reference = tokenizers::Tokenizer::from_file(&path).expect("tokenizer.json");
+            let tok = fastokens_encode::with(true, || TextTokenizer::from_file(&path))
+                .expect("tokenizer.json");
+            assert!(tok.fast.is_some(), "{dir}: the probe refused fastokens");
+            let mut convo = format!("<|im_start|>system\n{docs}<|im_end|>\n");
+            let turns = [
+                format!("<|im_start|>user\n<tool_response>\n{file}\n</tool_response><|im_end|>\n"),
+                "<|im_start|>user\n이 파일에서 캐시 적중은 어떻게 결정되나요?   \t\n<|im_end|>\n"
+                    .to_string(),
+                format!(
+                    "<|im_start|>assistant\n{}{}<|im_end|>\n",
+                    " ".repeat(700),
+                    "x"
+                ),
+                format!("<|im_start|>user\n{}\n<|im_end|>\n", " ".repeat(701)),
+            ];
+            for (n, turn) in turns.iter().enumerate() {
+                convo.push_str(turn);
+                for memo in [false, true] {
+                    for add_special in [false, true] {
+                        let want = reference.encode(convo.as_str(), add_special).unwrap();
+                        let got = fastokens_encode::with(true, || {
+                            tokenize_memo::with(memo, || tok.encode(&convo, add_special))
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            got,
+                            want.get_ids(),
+                            "{dir} turn {n} memo={memo} add_special={add_special}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Exact on the tokenizer the cut exists for, over the prompt shapes lumen
