@@ -6455,6 +6455,57 @@ pub(crate) mod imp {
             self.forward_array_last_token(&ids, cache)
         }
 
+        /// The prefill chunk for a prompt whose keys reach `kv_upper`:
+        /// `LUMEN_GEMMA4_PREFILL_CHUNK` (default 2048), clamped so one chunk's
+        /// attention scores over `kv_upper` keys stay inside
+        /// `LUMEN_GEMMA4_PREFILL_SCORES_GB`. Every prefill shares this rule.
+        pub fn prefill_chunk_decision(
+            &self,
+            kv_upper: usize,
+        ) -> crate::prefill_budget::ChunkDecision {
+            let requested: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &usize| n > 0)
+                .unwrap_or(2048);
+            crate::prefill_budget::clamp_chunk(
+                requested,
+                crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB"),
+                self.config().text_config.num_attention_heads,
+                kv_upper,
+            )
+        }
+
+        /// [`Self::forward_last_token`] over a prompt of any length.
+        ///
+        /// Every chunk but the last is run and evaluated on its own, so no
+        /// single forward attends over the whole prompt at once. That matters
+        /// even with KV quantization off: the global layers (head_dim 512) take
+        /// MLX's materializing attention path, and one 35.8K-token pass asked
+        /// Metal for a 41 GB scores buffer. Returns the last chunk's logits,
+        /// still lazy.
+        pub fn forward_last_token_chunked(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativeGemma4PromptCache,
+        ) -> Result<Array> {
+            if input_ids.is_empty() {
+                return Err(anyhow!("forward_last_token_chunked: empty input_ids"));
+            }
+            let chunk = self
+                .prefill_chunk_decision(cache.offset() + input_ids.len())
+                .chunk;
+            let mut chunks = input_ids.chunks(chunk).peekable();
+            loop {
+                let ids = chunks.next().expect("non-empty input yields a chunk");
+                let logits = self.forward_last_token(ids, cache)?;
+                if chunks.peek().is_none() {
+                    return Ok(logits);
+                }
+                logits.eval().context("prefill chunk eval")?;
+            }
+        }
+
         /// Same as `forward()` but accepts the token-id input as an already-
         /// shaped `[1, L]` mlx Array. Used by the async-pipelined decode loop
         /// in `generate()` (Phase 1.5 P4) so the previous step's argmax can be
@@ -6816,7 +6867,7 @@ pub(crate) mod imp {
             // logits semantics for forward_probe / debug callers.
             let prefill_start = Instant::now();
             let logits = if images.is_empty() {
-                self.forward_last_token(prompt_ids, cache)
+                self.forward_last_token_chunked(prompt_ids, cache)
                     .context("generate: prefill forward_last_token")?
             } else {
                 // Image prefill still slices to the last token; the only

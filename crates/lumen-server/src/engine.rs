@@ -4626,6 +4626,87 @@ mod gemma_greedy_grammar {
     }
 }
 
+/// Gemma 4 prefilled the boundary snapshot, and every non-streaming prompt, in
+/// one forward. Its global layers materialize `[heads, L, L]` attention
+/// scores, so a 35.8K-token boundary asked Metal for 41 GB and failed. Checked
+/// here as peak memory at a size that is safe either way.
+#[cfg(test)]
+mod gemma_chunked_prefill {
+    use super::real_checkpoint::{ScopedEnv, gemma4};
+    use crate::types::ChatCompletionRequest;
+    use lumen_mlx::metal_memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+    use serde_json::{Value, json};
+
+    fn request(messages: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": messages,
+            "max_tokens": 1,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request")
+    }
+
+    /// Runs `f` and returns how far peak memory rose above where it started.
+    fn peak_growth<T>(f: impl FnOnce() -> T) -> (u64, T) {
+        let before = get_active_memory().expect("active memory") as u64;
+        reset_peak_memory();
+        let out = f();
+        let peak = get_peak_memory().expect("peak memory") as u64;
+        (peak.saturating_sub(before), out)
+    }
+
+    /// One unchunked pass over `tokens` holds at least a bf16 `[16, L, L]`
+    /// scores buffer for a global layer; a 512-token chunk holds a sliver.
+    fn assert_chunked(path: &str, growth: u64, tokens: u64) {
+        let whole = 16 * tokens * tokens * 2;
+        assert!(
+            growth < whole * 6 / 10,
+            "{path}: peak rose {:.2} GB over a {tokens}-token prefill — one \
+             unchunked pass's scores alone are {:.2} GB",
+            growth as f64 / 1e9,
+            whole as f64 / 1e9
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_long_prompt_is_prefilled_in_chunks() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // The first request materializes the weights; measure after it.
+        engine
+            .chat_completion(&request(json!([{"role": "user", "content": "Hi"}])))
+            .unwrap_or_else(|e| panic!("warm-up: {e:#}"));
+        let _chunk = ScopedEnv::set("LUMEN_GEMMA4_PREFILL_CHUNK", "512");
+        let filler = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
+
+        // No system message, so no prefix-cache key: `generate`'s own prefill.
+        let batch = request(json!([{"role": "user", "content": filler}]));
+        let (growth, resp) = peak_growth(|| engine.chat_completion(&batch));
+        let tokens = resp.unwrap_or_else(|e| panic!("{e:#}")).usage.prompt_tokens;
+        assert!(
+            tokens > 8_000,
+            "the filler should be ~10K tokens, got {tokens}"
+        );
+        assert_chunked("batch prefill", growth, u64::from(tokens));
+
+        // A system message keys the prefix cache; on a miss everything but the
+        // last message is prefilled as the boundary snapshot.
+        let history = request(json!([
+            {"role": "system", "content": "You are a terse assistant."},
+            {"role": "user", "content": filler},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Done?"},
+        ]));
+        let (growth, resp) = peak_growth(|| engine.chat_completion(&history));
+        let tokens = resp.unwrap_or_else(|e| panic!("{e:#}")).usage.prompt_tokens;
+        assert_chunked("boundary prefill", growth, u64::from(tokens));
+    }
+}
+
 /// Every streaming response arrived in one burst when generation finished:
 /// the engine ran as a tokio task that never yields, so the writer it woke
 /// waited on the engine's own worker until the request was done.

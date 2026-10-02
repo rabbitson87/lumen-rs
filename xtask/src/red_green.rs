@@ -903,6 +903,43 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "gemma-boundary-prefill-unchunked",
+        symptom: "a 35.8K-token Gemma 4 prompt failed: the prefix cache's \
+                  boundary snapshot was prefilled in one forward, and a global \
+                  layer's attention scores asked Metal for 41 GB; the snapshot \
+                  had been stored before anything was evaluated, so every later \
+                  request with that system prompt failed too, until restart",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                .forward_last_token_chunked(&prompt[..boundary], cache)",
+            replace: "                .forward_last_token(&prompt[..boundary], cache) // defect: one pass",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "gemma-batch-prefill-unchunked",
+        symptom: "every non-streaming Gemma 4 request prefilled its prompt in \
+                  one forward — only the streaming decode loop chunked — so a \
+                  long batch prompt materialized whole-prompt attention scores \
+                  and failed where the same prompt streamed fine",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                self.forward_last_token_chunked(prompt_ids, cache)",
+            replace: "                self.forward_last_token(prompt_ids, cache) // defect: one pass",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1622,6 +1659,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
             "gemma4_backend.rs"
         }
         (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
+        (_, "gemma-boundary-prefill-unchunked") => "gemma4_backend.rs",
+        (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",

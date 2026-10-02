@@ -83,6 +83,15 @@ pub mod metal_memory {
         clear_cache, get_active_memory, get_cache_memory, get_peak_memory, set_cache_limit,
         set_memory_limit, set_wired_limit,
     };
+
+    /// Starts a new peak window: the next [`get_peak_memory`] reports the
+    /// high-water mark since this call. mlx-rs wraps the getter but not this.
+    pub fn reset_peak_memory() {
+        // SAFETY: no arguments, and MLX guards the counter with its own lock.
+        unsafe {
+            mlx_sys::mlx_reset_peak_memory();
+        }
+    }
 }
 
 /// Public surface for the Gemma 4 26B-A4B MoE port (Phase 1 W4 (c) onwards).

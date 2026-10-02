@@ -2130,8 +2130,13 @@ pub(crate) mod imp {
             if boundary == 0 {
                 return Ok(());
             }
+            // Chunked like every other prefill, and evaluated before the
+            // snapshot is stored: a lazy snapshot only computes when the next
+            // request forks it, so a failure there used to leave an entry
+            // every later request with this system prompt reused.
             self.model
-                .forward_last_token(&prompt[..boundary], cache)
+                .forward_last_token_chunked(&prompt[..boundary], cache)
+                .and_then(|logits| Ok(logits.eval()?))
                 .context(ctx)?;
             self.save_prefix_snapshot(&Self::sys_key(key), cache, &prompt[..boundary]);
             Ok(())
@@ -3100,11 +3105,7 @@ pub(crate) mod imp {
                 // grown to ~10K KV. The attention QxK^T graph for a 4096-token
                 // chunk over a 10K KV is too large for one command buffer;
                 // halving the chunk keeps per-CB work bounded.
-                let requested_chunk: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n: &usize| n > 0)
-                    .unwrap_or(2048);
+
                 // ── Always-chunk invariant: single-pass OOM guard ──
                 // The quantized-KV / TurboQuant attention path materializes the
                 // full [heads, q_len, kv_len] scores array — fused flash-SDPA
@@ -3117,31 +3118,23 @@ pub(crate) mod imp {
                 // given the worst-case kv_len (== full prompt length). This makes
                 // chunking mandatory: an over-large env/config chunk is clamped
                 // DOWN, never up. Default 8 GB fits any box that can host a 26B
-                // model (Metal maxBufferLength ≥ ~16 GB there); kv-quant off uses
-                // flash-SDPA and is unaffected by the materialization, but the
-                // clamp also keeps the per-command-buffer intermediate graph
-                // bounded, so it is applied uniformly. Override the budget with
-                // `LUMEN_GEMMA4_PREFILL_SCORES_GB`.
-                // The arithmetic lives in `prefill_budget` so it can be swept at
-                // tier 0; the two backends had it duplicated. Behaviour here is
-                // unchanged by the hoist.
-                let scores_budget_bytes =
-                    crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB");
-                let decision = crate::prefill_budget::clamp_chunk(
-                    requested_chunk,
-                    scores_budget_bytes,
-                    self.model.config().text_config.num_attention_heads,
-                    prompt.len(),
-                );
+                // model (Metal maxBufferLength ≥ ~16 GB there). KV quantization
+                // off does not escape it: the global layers (head_dim 512) take
+                // MLX's materializing attention path too. Override the budget
+                // with `LUMEN_GEMMA4_PREFILL_SCORES_GB`. The rule itself is
+                // `NativeGemma4Model::prefill_chunk_decision`, shared with every
+                // other Gemma prefill; the arithmetic is in `prefill_budget`.
+                let decision = self.model.prefill_chunk_decision(prompt.len());
                 let chunk_size = decision.chunk;
                 if decision.clamped() {
                     eprintln!(
-                        "[prefill] chunk clamped {requested_chunk} → {chunk_size} \
+                        "[prefill] chunk clamped {} → {chunk_size} \
                          (heads={} kv_upper={} budget={:.1}GB) — \
                          keeps single-chunk scores under the Metal buffer cap",
+                        decision.requested,
                         decision.heads.max(1),
                         decision.kv_upper.max(1),
-                        scores_budget_bytes as f64 / 1e9
+                        decision.budget_bytes as f64 / 1e9
                     );
                 }
                 // Chunked prefill re-enabled (2026-05-14, take 2): the mask
