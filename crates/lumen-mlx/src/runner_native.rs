@@ -517,6 +517,8 @@ mod imp {
         Many(Vec<u32>),
     }
 
+    // Only `NativeModelConfig`'s derive reads it, and only tests load that.
+    #[allow(dead_code)]
     fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
     where
         D: serde::Deserializer<'de>,

@@ -240,15 +240,11 @@ fn match_balanced_braces(text: &str, open_at: usize) -> Option<usize> {
         if bytes[i..].starts_with(STR_DELIM_BYTES) {
             let after = i + STR_DELIM_BYTES.len();
             let rest = &bytes[after..];
-            if let Some(pos) = rest
+            let pos = rest
                 .windows(STR_DELIM_BYTES.len())
-                .position(|w| w == STR_DELIM_BYTES)
-            {
-                i = after + pos + STR_DELIM_BYTES.len();
-                continue;
-            } else {
-                return None;
-            }
+                .position(|w| w == STR_DELIM_BYTES)?;
+            i = after + pos + STR_DELIM_BYTES.len();
+            continue;
         }
         match bytes[i] {
             b'{' => depth += 1,

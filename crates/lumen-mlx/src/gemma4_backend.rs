@@ -2070,8 +2070,8 @@ pub(crate) mod imp {
                 (lcp == e.prefix_tokens.len() && lcp < prompt.len()).then_some(lcp)
             };
             let sys_k = Self::sys_key(key);
-            let full_lcp = self.prefix_caches.get(key).and_then(&strict);
-            let sys_lcp = self.prefix_caches.get(&sys_k).and_then(&strict);
+            let full_lcp = self.prefix_caches.get(key).and_then(strict);
+            let sys_lcp = self.prefix_caches.get(&sys_k).and_then(strict);
             let pick = match (full_lcp, sys_lcp) {
                 (Some(f), Some(s)) if s > f => Some((sys_k, s, "hit-sys")),
                 (Some(f), _) => Some((key.to_string(), f, "hit-full")),
