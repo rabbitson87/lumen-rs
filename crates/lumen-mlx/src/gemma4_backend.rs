@@ -2249,8 +2249,14 @@ pub(crate) mod imp {
         }
 
         /// Drop a prefix-cache entry by key. Returns true if it existed.
+        /// Drops both snapshots under `key`: the full-prompt one and its
+        /// system-boundary sibling. Leaving the sibling meant the route that
+        /// exists to evict a key could not evict a bad boundary snapshot —
+        /// the next request with that key forked it straight back.
         pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
-            self.prefix_caches.remove(key).is_some()
+            let full = self.prefix_caches.remove(key).is_some();
+            let boundary = self.prefix_caches.remove(&Self::sys_key(key)).is_some();
+            full || boundary
         }
 
         /// Clear all prefix-cache entries; returns the number released.

@@ -4707,6 +4707,53 @@ mod gemma_chunked_prefill {
     }
 }
 
+/// `DELETE /v1/prefix-cache/{key}` removed Gemma 4's full-prompt snapshot but
+/// not the system-boundary one stored beside it, so the next request with that
+/// key forked the boundary right back — the one entry worth evicting after a
+/// failed prefill.
+#[cfg(test)]
+mod gemma_prefix_cache_drop {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn dropping_a_key_drops_its_boundary_snapshot_too() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // Two turns of history: everything but the last message is the
+        // boundary, so a miss stores a boundary snapshot as well.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "session_id": "drop-me",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant."},
+                {"role": "user", "content": "Remember the number 7."},
+                {"role": "assistant", "content": "Noted."},
+                {"role": "user", "content": "Which number?"},
+            ],
+            "max_tokens": 1,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request");
+        engine
+            .chat_completion(&req)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(
+            engine.drop_prefix_cache("drop-me"),
+            "nothing stored under the key"
+        );
+        assert_eq!(
+            engine.clear_prefix_cache(),
+            0,
+            "a snapshot under the dropped key survived the drop"
+        );
+    }
+}
+
 /// Every streaming response arrived in one burst when generation finished:
 /// the engine ran as a tokio task that never yields, so the writer it woke
 /// waited on the engine's own worker until the request was done.

@@ -940,6 +940,24 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "gemma-drop-leaves-boundary-snapshot",
+        symptom: "DELETE /v1/prefix-cache/{key} on Gemma 4 removed the \
+                  full-prompt snapshot but not its system-boundary sibling, so \
+                  the next request with the key forked the boundary right back \
+                  — the route could not evict the entry a failed prefill left",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let boundary = self.prefix_caches.remove(&Self::sys_key(key)).is_some();",
+            replace: "            let boundary = false; // defect: the boundary snapshot survives",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_prefix_cache_drop::dropping_a_key_drops_its_boundary_snapshot_too",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1659,7 +1677,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
             "gemma4_backend.rs"
         }
         (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
-        (_, "gemma-boundary-prefill-unchunked") => "gemma4_backend.rs",
+        (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
+            "gemma4_backend.rs"
+        }
         (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
