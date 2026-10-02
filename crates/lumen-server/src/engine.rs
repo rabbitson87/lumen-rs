@@ -4541,20 +4541,22 @@ mod gemma_structured_stream {
             "model": "gemma-4",
             "messages": [
                 {"role": "system", "content": "You are a terse assistant."},
-                {"role": "user", "content": "What is 2 + 2?"},
+                {"role": "user", "content": "Summarize the plot of Romeo and Juliet in two sentences."},
             ],
-            "max_tokens": 48,
+            "max_tokens": 160,
             "temperature": 0,
             "stream": true,
             "chat_template_kwargs": {"enable_thinking": false},
+            // A free-form string: with the channel open, short values (an
+            // integer) still come out right, and free text degenerates.
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "sum",
+                    "name": "summary",
                     "schema": {
                         "type": "object",
-                        "properties": {"answer": {"type": "integer"}},
-                        "required": ["answer"],
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"],
                         "additionalProperties": false,
                     },
                 },
@@ -4566,16 +4568,23 @@ mod gemma_structured_stream {
         engine.chat_completion_streaming(&req, &tx);
         drop(tx);
         let mut text = String::new();
+        let mut finish = None;
         while let Ok(event) = rx.try_recv() {
             match event {
                 StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
                 StreamEvent::Error(e) => panic!("stream error: {e}"),
                 _ => {}
             }
         }
+        assert!(
+            matches!(finish, Some(super::FinishReason::Stop)),
+            "ran to max_tokens ({finish:?}): {text:?}"
+        );
         let value: serde_json::Value = serde_json::from_str(text.trim())
             .unwrap_or_else(|e| panic!("not the requested JSON ({e}): {text:?}"));
-        assert!(value["answer"].is_i64(), "{text}");
+        let summary = value["summary"].as_str().unwrap_or_default();
+        assert!(summary.split_whitespace().count() >= 8, "{text}");
     }
 }
 
