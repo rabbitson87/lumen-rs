@@ -2477,8 +2477,17 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
+            // A JSON grammar masks from token 0, so the prompt has to close the
+            // thought channel the model would otherwise open there — as every
+            // uncached route does (`gemma-thought-channel`).
+            let close_thought_channel = response_schema.is_some();
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
             }
@@ -2507,10 +2516,13 @@ pub(crate) mod imp {
             // those segments are PROMPT-TAIL-only and diverge in the next
             // turn the same way (mid-prompt model header tokens differ from
             // prompt-tail).
-            let trailing_header_len =
-                self.generation_tail_len(&prompt, &prefill_tokens, thinking, false, || {
-                    self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
-                });
+            let trailing_header_len = self.generation_tail_len(
+                &prompt,
+                &prefill_tokens,
+                thinking,
+                close_thought_channel,
+                || self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen),
+            );
             // Dual-snapshot: fork the longest strict-prefix snapshot (full or
             // system) with no rollback; on a miss prime the system-boundary
             // snapshot. `decode_streaming_with_prompt` separately records the
@@ -2579,12 +2591,14 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
+            // See `chat_streaming_with_prefix_cache`.
+            let close_thought_channel = response_schema.is_some();
             let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
                 turns,
                 thinking,
                 tools,
                 tool_choice,
-                false,
+                close_thought_channel,
             )?;
             if prompt.is_empty() {
                 return Err(anyhow!(
@@ -2600,14 +2614,19 @@ pub(crate) mod imp {
             // diff captures ONLY the generation prompt (+ optional tool_choice
             // prefill) — not tool definitions in the system block (those are
             // shared across turns and must NOT be excluded from the snapshot).
-            let trailing_header_len =
-                self.generation_tail_len(&prompt, &prefill_tokens, thinking, false, || {
+            let trailing_header_len = self.generation_tail_len(
+                &prompt,
+                &prefill_tokens,
+                thinking,
+                close_thought_channel,
+                || {
                     self.build_chat_input_from_history_no_gen(
                         turns,
                         thinking,
                         effective_tools_for_no_gen,
                     )
-                });
+                },
+            );
             let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
             if hit_kind == "miss" {
                 let boundary = self.batch_fanout_boundary_from_history(

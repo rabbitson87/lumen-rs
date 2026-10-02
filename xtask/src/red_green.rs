@@ -845,6 +845,26 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "gemma-cached-stream-thought-channel",
+        symptom: "a streaming response_format request that carried a system \
+                  message — so a prefix-cache key — degenerated on Gemma 4: \
+                  both cached streaming routes rendered the prompt with the \
+                  thought channel open while the JSON grammar masked from token \
+                  0. The gemma-thought-channel fix had reached the uncached \
+                  routes only, and the token counter assumed the channel closed",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let close_thought_channel = response_schema.is_some();",
+            replace: "            let close_thought_channel = false; // defect: channel left open",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_structured_stream::a_cached_stream_with_response_format_returns_the_schema",
+        )],
+        occurrences: 2, // the flat route and the history route
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1560,6 +1580,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "anthropic-output-drops-thinking-block") => "engine.rs",
         (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
+        (_, "gemma-cached-stream-thought-channel") => "gemma4_backend.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",

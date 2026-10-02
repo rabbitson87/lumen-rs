@@ -4518,6 +4518,67 @@ mod completion_admission {
     }
 }
 
+/// Gemma 4's cached streaming routes rendered a `response_format` request with
+/// the thought channel open. The JSON grammar masks from token 0, so the model
+/// was pushed off the `<|channel>` it opens every reply with and degenerated —
+/// the defect `gemma-thought-channel` fixed on the uncached routes only.
+#[cfg(test)]
+mod gemma_structured_stream {
+    use super::StreamEvent;
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_cached_stream_with_response_format_returns_the_schema() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // The system message gives the request a prefix-cache key, which is
+        // what sends it down the cached route.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant."},
+                {"role": "user", "content": "What is 2 + 2?"},
+            ],
+            "max_tokens": 48,
+            "temperature": 0,
+            "stream": true,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sum",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }))
+        .expect("a valid chat request");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        engine.chat_completion_streaming(&req, &tx);
+        drop(tx);
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Error(e) => panic!("stream error: {e}"),
+                _ => {}
+            }
+        }
+        let value: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("not the requested JSON ({e}): {text:?}"));
+        assert!(value["answer"].is_i64(), "{text}");
+    }
+}
+
 /// Every streaming response arrived in one burst when generation finished:
 /// the engine ran as a tokio task that never yields, so the writer it woke
 /// waited on the engine's own worker until the request was done.
