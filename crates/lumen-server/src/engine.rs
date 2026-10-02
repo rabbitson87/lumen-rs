@@ -1048,10 +1048,16 @@ impl InferenceEngine {
         // letting them reach the backend and crash the server via an uncaught
         // Metal OOM. Counted in each branch from what that branch decodes — a
         // tool-history request from its turns, which only exist once the
-        // branch has built them. (The Messages API has no `response_format`.)
+        // branch has built them — plus the placeholder runs its images expand
+        // into, which the rendered text does not carry. The figure admitted is
+        // the figure reported. (The Messages API has no `response_format`.)
+        let image_tokens = images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
         let anthropic_thinking =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let prompt_tokens_guard: u32;
+        let prompt_tokens: u32;
 
         let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
@@ -1241,15 +1247,15 @@ impl InferenceEngine {
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
-            prompt_tokens_guard = self.backend.count_history_prompt_tokens(
+            prompt_tokens = self.backend.count_history_prompt_tokens(
                 &turns,
                 anthropic_thinking,
                 &ov,
                 &tools_owned,
                 &tool_choice,
                 false,
-            );
-            guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
+            ) + image_tokens;
+            guard_prompt_fits(&self.backend, prompt_tokens)?;
             if turn_images.iter().any(|v| !v.is_empty()) {
                 self.backend.chat_from_history_with_images(
                     &turns,
@@ -1284,15 +1290,15 @@ impl InferenceEngine {
                 )?
             }
         } else {
-            prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
+            prompt_tokens = self.backend.count_chat_prompt_tokens(
                 &messages,
                 anthropic_thinking,
                 &ov,
                 &tools_owned,
                 &tool_choice,
                 false,
-            );
-            guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
+            ) + image_tokens;
+            guard_prompt_fits(&self.backend, prompt_tokens)?;
             if let Some(images) = images.as_deref() {
                 self.backend.chat_with_images(
                     &messages,
@@ -1329,14 +1335,6 @@ impl InferenceEngine {
             }
         };
 
-        // The guard's count — from the turns for a tool-history request — plus
-        // the placeholder runs images add on top of the rendered text, which
-        // the guard itself does not count yet.
-        let prompt_tokens = prompt_tokens_guard
-            + images
-                .as_deref()
-                .map(|i| self.backend.image_prompt_tokens(i))
-                .unwrap_or(0);
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match and
@@ -4236,5 +4234,174 @@ mod anthropic_thinking_blocks {
     fn an_empty_turn_is_unchanged() {
         let blocks = anthropic_content_blocks("", "", &[], true, ids());
         assert_eq!(kinds(&blocks), ["text"]);
+    }
+}
+
+/// Task 018: a batch `/v1/messages` request is admitted on the figure it
+/// reports — its rendered text plus the placeholder runs its images expand
+/// into — on both the flat and the tool-history branch.
+///
+/// The defect is which count the engine hands the guard, so the guard has to
+/// run the engine, and the engine has no test backend: this loads Gemma 4 with
+/// its vision tower. Every number is the checkpoint's own — the text count from
+/// a text-only twin of each request, the image's from the backend — so a budget
+/// or template change moves the cap with it instead of breaking the test.
+#[cfg(test)]
+mod anthropic_batch_image_admission {
+    use super::InferenceEngine;
+    use crate::types::AnthropicRequest;
+    use base64::Engine as _;
+    use serde_json::{Value, json};
+    use std::ffi::{OsStr, OsString};
+
+    const PROBE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lumen-mlx/tests/fixtures/gemma4_vision_probe.png"
+    );
+
+    /// Sets a variable until dropped, then puts the shell's value back — panic
+    /// included, so nothing leaks into a later test in the same process.
+    struct ScopedEnv {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: only ever called on the test thread while no request is
+            // in flight — before the load, or between two requests.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
+        let _cap = ScopedEnv::set("LUMEN_MAX_PROMPT_TOKENS", cap.to_string());
+        f()
+    }
+
+    fn request(messages: Value, tools: bool) -> AnthropicRequest {
+        let mut body = json!({
+            "model": "gemma-4",
+            "max_tokens": 1,
+            "temperature": 0,
+            "messages": messages,
+        });
+        if tools {
+            body["tools"] = json!([{
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }]);
+        }
+        serde_json::from_value(body).expect("a valid Messages request")
+    }
+
+    /// One user message — the flat branch.
+    fn flat(image: Option<&Value>) -> AnthropicRequest {
+        let mut content = vec![json!({"type": "text", "text": "What is in this picture?"})];
+        content.extend(image.cloned());
+        request(json!([{"role": "user", "content": content}]), false)
+    }
+
+    /// A tool call and its result ahead of the image — the tool-history branch.
+    fn tool_history(image: Option<&Value>) -> AnthropicRequest {
+        let mut last = vec![
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "notes.txt: the picture is attached below.",
+            }),
+            json!({"type": "text", "text": "What does the picture show?"}),
+        ];
+        last.extend(image.cloned());
+        request(
+            json!([
+                {"role": "user", "content": "Read notes.txt."},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "notes.txt"},
+                }]},
+                {"role": "user", "content": last},
+            ]),
+            true,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint with its vision tower; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn the_batch_guard_admits_on_the_count_it_reports() {
+        let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+            eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR to a Gemma 4 checkpoint");
+            return;
+        };
+        let _vision = ScopedEnv::set("LUMEN_VISION", "1");
+        let mut engine = InferenceEngine::load(&dir).expect("load Gemma 4");
+
+        let png = std::fs::read(PROBE).expect("read the probe image");
+        let image_tokens = engine.backend.image_prompt_tokens(&[vec![png.clone()]]);
+        assert!(
+            image_tokens > 0,
+            "no vision tower loaded: the image would cost nothing and prove nothing"
+        );
+        let image = json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(&png),
+            },
+        });
+
+        let shapes: [(&str, fn(Option<&Value>) -> AnthropicRequest); 2] =
+            [("flat", flat), ("tool history", tool_history)];
+        for (shape, build) in shapes {
+            // The same request without the image renders the same text.
+            let text = with_cap(1_000_000, || engine.anthropic_messages(&build(None)))
+                .unwrap_or_else(|e| panic!("{shape}: text-only twin: {e:#}"))
+                .usage
+                .input_tokens;
+            let total = text + image_tokens;
+
+            let rejected = with_cap(total - 1, || {
+                engine.anthropic_messages(&build(Some(&image)))
+            });
+            let err = match rejected {
+                Ok(_) => panic!(
+                    "{shape}: admitted under a cap of {} — the guard did not count the \
+                     image's {image_tokens} tokens on top of the text's {text}",
+                    total - 1
+                ),
+                Err(e) => e.to_string(),
+            };
+            let expected = format!("prompt too large: {total} tokens > limit {}", total - 1);
+            assert!(err.starts_with(&expected), "{shape}: {err}");
+
+            let admitted = with_cap(total, || engine.anthropic_messages(&build(Some(&image))))
+                .unwrap_or_else(|e| panic!("{shape}: rejected at a cap of exactly {total}: {e:#}"));
+            assert_eq!(
+                admitted.usage.input_tokens, total,
+                "{shape}: reported a different figure than it was admitted on"
+            );
+        }
     }
 }

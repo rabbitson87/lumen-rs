@@ -125,6 +125,16 @@ const fn srv(filter: &'static str) -> Guard {
     }
 }
 
+/// `lumen-server` lib guard that loads a real checkpoint. Release, because
+/// loading ~16 GB of weights in a debug build spends minutes before the test
+/// starts; pair it with `needs_checkpoint` so the run skips without one.
+const fn srv_checkpoint(filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        ..srv(filter)
+    }
+}
+
 /// `lumen-mlx` lib guard that needs **no** feature — `grammar` is ungated
 /// (pure llguidance + serde_json), so this builds in seconds where an
 /// `mlx-native` lib guard takes minutes.
@@ -730,6 +740,26 @@ static DEFECTS: &[Defect] = &[
         occurrences: 1,
         needs_checkpoint: false,
         extra: &[],
+    },
+    Defect {
+        name: "anthropic-batch-guard-omits-images",
+        symptom: "a non-streaming /v1/messages request was admitted on its \
+                  rendered text alone: every image's placeholder run (~280 \
+                  soft tokens each on Gemma 4) slipped past the prompt cap that \
+                  OpenAI and Anthropic streaming enforce, and was added only \
+                  afterwards, to `usage` — so the figure a request was admitted \
+                  on was not the figure it reported. Found in task 016",
+        revert: &[Mutation {
+            path: SRV,
+            find: ") + image_tokens;\n            guard_prompt_fits(&self.backend, prompt_tokens)?;",
+            replace: ") + image_tokens;\n            // defect: the guard sees the text alone\n            guard_prompt_fits(&self.backend, prompt_tokens - image_tokens)?;",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::anthropic_batch_image_admission::the_batch_guard_admits_on_the_count_it_reports",
+        )],
+        occurrences: 2, // the flat branch and the tool-history branch
+        needs_checkpoint: true,
+        extra: &["--ignored"],
     },
     Defect {
         name: "anthropic-stream-zero-input-tokens",
@@ -1432,6 +1462,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none")
         | (_, "anthropic-turn-images")
+        | (_, "anthropic-batch-guard-omits-images")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
         (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
