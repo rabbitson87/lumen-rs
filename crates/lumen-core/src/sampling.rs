@@ -296,6 +296,17 @@ fn categorical(probs: &[f32], rng: &mut Xorshift64) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// The first index of the largest logit.
+fn argmax_lowest(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 /// One-shot helper: run the full pipeline (penalty → temperature →
 /// softmax → top-p → sample) on a CPU logit buffer. Mutates `logits`
 /// in place (caller may discard or reuse). The caller owns
@@ -338,10 +349,17 @@ pub fn sample_from_logits(
     // argmax, so greedy output is unaffected.
     apply_min_p(logits, cfg.min_p);
 
-    // Temperature scaling before softmax. `<=0` would mean greedy but
-    // the caller is responsible for routing greedy elsewhere; clamp to
-    // a tiny epsilon as a safety net.
-    let t = cfg.temperature.max(1e-5);
+    // Temperature 0 is the most likely token — and the same one on every run.
+    // Scaling by 1/ε and drawing would still split an exact tie at the top by
+    // the RNG, which is seeded from the clock unless the request names a seed:
+    // two runs of one temperature-0 request then disagree. Ties go to the
+    // lowest id, as MLX's argmax breaks them.
+    if cfg.temperature <= 0.0 {
+        return argmax_lowest(logits);
+    }
+
+    // Temperature scaling before softmax.
+    let t = cfg.temperature;
     if (t - 1.0).abs() > 1e-6 {
         let inv = 1.0 / t;
         for v in logits.iter_mut() {
@@ -641,6 +659,42 @@ mod tests {
         let mut rng2 = Xorshift64::new(cfg.seed);
         let t2 = sample_from_logits(&mut probs, &[], &cfg, &mut rng2);
         assert_eq!(t1, t2);
+    }
+
+    /// Gemma 4 temperature-0 requests gave 2-3 distinct outputs across runs of
+    /// one binary: penalties keep them off the greedy path, so they came here
+    /// and an exact bf16 tie at the top was settled by a clock-seeded draw.
+    #[test]
+    fn temperature_zero_breaks_a_tie_the_same_way_on_every_seed() {
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            top_p: 0.95,
+            repeat_penalty: 1.1,
+            ..Default::default()
+        };
+        for seed in 0..200u64 {
+            let mut rng = Xorshift64::new(seed);
+            let mut logits = vec![0.5_f32, 3.0, 3.0, 1.0];
+            assert_eq!(
+                sample_from_logits(&mut logits, &[], &cfg, &mut rng),
+                1,
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn temperature_zero_still_applies_the_penalty_first() {
+        // Token 1 leads, but it was just emitted and a 1.1 penalty drops it
+        // below token 2.
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            repeat_penalty: 1.1,
+            ..Default::default()
+        };
+        let mut logits = vec![0.0_f32, 3.2, 3.0];
+        let mut rng = Xorshift64::new(1);
+        assert_eq!(sample_from_logits(&mut logits, &[1], &cfg, &mut rng), 2);
     }
 
     #[test]

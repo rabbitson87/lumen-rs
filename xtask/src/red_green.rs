@@ -865,6 +865,25 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "temperature-zero-is-a-coin-flip",
+        symptom: "the same temperature-0 request gave 2-3 different answers \
+                  across runs of one Gemma 4 binary: its default repeat \
+                  penalty keeps such requests off the greedy path, the sampler \
+                  scaled by 1/1e-5 and drew, and an exact bf16 tie at the top \
+                  was settled by an RNG seeded from the clock",
+        revert: &[Mutation {
+            path: CORE,
+            find: "    if cfg.temperature <= 0.0 {\n        return argmax_lowest(logits);\n    }\n\n    // Temperature scaling before softmax.\n    let t = cfg.temperature;",
+            replace: "    // defect: temperature 0 drawn from the RNG\n\n    // Temperature scaling before softmax.\n    let t = cfg.temperature.max(1e-5);",
+        }],
+        guards: &[core(
+            "sampling::tests::temperature_zero_breaks_a_tie_the_same_way_on_every_seed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1581,6 +1600,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
         (_, "gemma-cached-stream-thought-channel") => "gemma4_backend.rs",
+        (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
