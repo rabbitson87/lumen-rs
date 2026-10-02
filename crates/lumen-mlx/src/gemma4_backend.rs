@@ -1396,6 +1396,45 @@ pub(crate) mod imp {
             Ok(ids)
         }
 
+        /// Length of the prompt's generation tail — `<|turn>model\n`, the
+        /// optional empty thought channel, and the `tool_choice` prefill —
+        /// which the prefix cache stops short of because the next turn puts
+        /// the model's actual reply there.
+        ///
+        /// The hand-ported renderers append exactly
+        /// [`Gemma4ChatTemplate::generation_prompt_ids`] after the last turn,
+        /// so the tail is measured directly. It used to be a second render of
+        /// the whole conversation, every request, just to subtract two
+        /// lengths. A jinja template makes no such promise and keeps the
+        /// re-render (`no_gen`). `close_thought_channel` must be what the
+        /// prompt was built with.
+        fn generation_tail_len(
+            &self,
+            prompt: &[u32],
+            prefill: &[u32],
+            thinking: bool,
+            close_thought_channel: bool,
+            no_gen: impl FnOnce() -> Result<Vec<u32>>,
+        ) -> usize {
+            if self.jinja_chat.is_none() {
+                let opts = RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                    close_thought_channel,
+                };
+                if let Ok(gen_ids) = self.chat.generation_prompt_ids(&opts) {
+                    debug_assert!(
+                        prompt.ends_with(&[gen_ids.as_slice(), prefill].concat()),
+                        "prompt must end with the generation prompt + prefill"
+                    );
+                    return gen_ids.len() + prefill.len();
+                }
+            }
+            no_gen()
+                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
+                .unwrap_or(0)
+        }
+
         fn build_chat_input_from_history_no_gen(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -2447,10 +2486,10 @@ pub(crate) mod imp {
             // those segments are PROMPT-TAIL-only and diverge in the next
             // turn the same way (mid-prompt model header tokens differ from
             // prompt-tail).
-            let trailing_header_len = self
-                .build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
-                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
-                .unwrap_or(0);
+            let trailing_header_len =
+                self.generation_tail_len(&prompt, &prefill_tokens, thinking, false, || {
+                    self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
+                });
             // Dual-snapshot: fork the longest strict-prefix snapshot (full or
             // system) with no rollback; on a miss prime the system-boundary
             // snapshot. `decode_streaming_with_prompt` separately records the
@@ -2540,10 +2579,14 @@ pub(crate) mod imp {
             // diff captures ONLY the generation prompt (+ optional tool_choice
             // prefill) — not tool definitions in the system block (those are
             // shared across turns and must NOT be excluded from the snapshot).
-            let trailing_header_len = self
-                .build_chat_input_from_history_no_gen(turns, thinking, effective_tools_for_no_gen)
-                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
-                .unwrap_or(0);
+            let trailing_header_len =
+                self.generation_tail_len(&prompt, &prefill_tokens, thinking, false, || {
+                    self.build_chat_input_from_history_no_gen(
+                        turns,
+                        thinking,
+                        effective_tools_for_no_gen,
+                    )
+                });
             let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
             if hit_kind == "miss" {
                 let boundary = self.batch_fanout_boundary_from_history(

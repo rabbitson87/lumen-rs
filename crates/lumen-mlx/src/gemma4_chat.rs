@@ -396,6 +396,22 @@ pub(crate) mod imp {
             }
 
             // ── generation prompt ─────────────────────────────────────
+            out.extend(self.generation_prompt_ids(opts)?);
+
+            Ok(out)
+        }
+
+        /// The generation prompt both renderers end with: `<|turn>model\n`,
+        /// plus the empty thought channel when thinking is off and it is asked
+        /// for (`close_thought_channel`, or the operator's
+        /// [`empty_thought_on_nothink`]). Empty without `add_generation_prompt`.
+        ///
+        /// Neither renderer reads the generation options anywhere else, so a
+        /// render with them is exactly a render without them followed by this.
+        /// The prefix cache relies on that to measure the prompt's tail without
+        /// rendering the whole conversation a second time.
+        pub fn generation_prompt_ids(&self, opts: &RenderOptions) -> Result<Vec<u32>> {
+            let mut out = Vec::new();
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
@@ -414,7 +430,6 @@ pub(crate) mod imp {
                     out.push(TOK_CHANNEL_CLOSE);
                 }
             }
-
             Ok(out)
         }
 
@@ -637,22 +652,7 @@ pub(crate) mod imp {
             }
 
             // ── Generation prompt ─────────────────────────────────────
-            if opts.add_generation_prompt {
-                out.push(TOK_TURN_OPEN);
-                out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking
-                    && (opts.close_thought_channel || empty_thought_on_nothink())
-                {
-                    // Match Ollama's native gemma4 renderer: no empty thought
-                    // block on nothink (see `empty_thought_on_nothink`).
-                    out.push(TOK_CHANNEL_OPEN);
-                    out.extend(
-                        self.encode_plain("thought\n")
-                            .context("encode 'thought\\n'")?,
-                    );
-                    out.push(TOK_CHANNEL_CLOSE);
-                }
-            }
+            out.extend(self.generation_prompt_ids(opts)?);
 
             Ok(out)
         }
@@ -997,6 +997,91 @@ pub(crate) mod imp {
                 !ids.contains(&TOK_THINK),
                 "<|think|> must not appear when enable_thinking=false"
             );
+        }
+
+        /// The prefix cache measures the prompt's generation tail as
+        /// `generation_prompt_ids().len()` instead of re-rendering the whole
+        /// conversation without it. That is only exact if a render with the
+        /// generation prompt is a render without it plus those ids — for both
+        /// renderers, with and without tools, in every option combination.
+        #[test]
+        #[ignore = "requires a Gemma 4 tokenizer.json (~32 MB)"]
+        fn generation_prompt_is_the_whole_difference_between_renders() {
+            use crate::chat_io::{ChatTurn, ToolDef};
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
+            let msgs = [
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "You are terse.",
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Weather in Seoul?",
+                },
+            ];
+            let turns = [
+                ChatTurn::System("You are terse."),
+                ChatTurn::User("Hello"),
+                ChatTurn::Assistant {
+                    text: "Hi.",
+                    tool_calls: &[],
+                },
+                ChatTurn::User("Weather in Seoul?"),
+            ];
+            let params = serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            });
+            let tool = [ToolDef {
+                name: "get_weather",
+                description: Some("Current conditions for a city"),
+                parameters: Some(&params),
+                response: None,
+            }];
+            let no_tools: &[ToolDef<'_>] = &[];
+            for tools in [&tool[..], no_tools] {
+                for enable_thinking in [false, true] {
+                    for close_thought_channel in [false, true] {
+                        let with = RenderOptions {
+                            enable_thinking,
+                            add_generation_prompt: true,
+                            close_thought_channel,
+                        };
+                        let without = RenderOptions {
+                            add_generation_prompt: false,
+                            close_thought_channel: false,
+                            ..with
+                        };
+                        let gen_ids = tpl.generation_prompt_ids(&with).expect("gen");
+                        let case = format!(
+                            "tools={} thinking={enable_thinking} close={close_thought_channel}",
+                            tools.len()
+                        );
+                        let mut flat = tpl
+                            .render_to_ids_with_tools(&msgs, &without, tools)
+                            .expect("flat");
+                        flat.extend(&gen_ids);
+                        assert_eq!(
+                            tpl.render_to_ids_with_tools(&msgs, &with, tools)
+                                .expect("flat"),
+                            flat,
+                            "flat renderer, {case}"
+                        );
+                        let mut history = tpl
+                            .render_chat_history(&turns, &without, tools)
+                            .expect("hist");
+                        history.extend(&gen_ids);
+                        assert_eq!(
+                            tpl.render_chat_history(&turns, &with, tools).expect("hist"),
+                            history,
+                            "history renderer, {case}"
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
