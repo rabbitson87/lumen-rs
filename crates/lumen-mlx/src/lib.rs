@@ -4365,6 +4365,12 @@ impl MlxQwen35Backend {
     /// raw prefill string (which the caller must feed into the
     /// `Qwen35ResponseParser` before decoding so it starts in the
     /// correct state for Required/Tool(name) prefills).
+    ///
+    /// The ids are exactly [`Self::build_chat_input_with_tools_split`]'s:
+    /// both encode `prompt + prefill` in one piece. Only the split's
+    /// prefill-token suffix needs a second encode of the whole prompt, and no
+    /// caller of this one reads it. The prompt-token count calls this once per
+    /// request, so that second encode was pure cost at agentic sizes.
     pub fn build_chat_input_with_tools(
         &self,
         messages: &[(String, String)],
@@ -4373,9 +4379,11 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
-        let (ids, prefill, _prefill_tokens) =
-            self.build_chat_input_with_tools_split(messages, thinking, tools, tool_choice, effort)?;
-        Ok((ids, prefill))
+        use crate::qwen3_5_tools::{format_qwen3_chat_with_tools, qwen35_tool_choice_prefill_str};
+        let mut full = format_qwen3_chat_with_tools(messages, thinking, tools, effort);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        full.push_str(&prefill);
+        Ok((self.encode(&full)?, prefill))
     }
 
     /// Like [`build_chat_input_with_tools`] but also returns the exact trailing
@@ -8613,10 +8621,20 @@ mod tests {
             response: None,
         }];
 
-        // What the decode path renders, taken from the decode path itself.
-        let (decode_ids, _prefill) = backend
-            .build_chat_input_with_tools(&msgs, false, &tools, &ResolvedToolChoice::Auto, None)
-            .expect("tool render");
+        // What the decode path renders, taken from the decode path itself:
+        // `chat_with_tools_impl` builds through the split variant. The count
+        // builds through `build_chat_input_with_tools`, which skips the split's
+        // second encode — so pin that the shortcut lands on the same ids for
+        // every choice that appends a prefill, not just `Auto`.
+        let decode_ids = |choice: &ResolvedToolChoice<'_>| {
+            backend
+                .build_chat_input_with_tools_split(&msgs, false, &tools, choice, None)
+                .expect("tool render")
+                .0
+        };
+        let decode_auto = decode_ids(&ResolvedToolChoice::Auto);
+        let decode_required = decode_ids(&ResolvedToolChoice::Required);
+        let decode_named = decode_ids(&ResolvedToolChoice::Tool("get_weather"));
 
         let backend = MlxBackend::Qwen35Family(backend);
         let bare = backend.build_chat_input(&msgs, false, None).expect("bare");
@@ -8639,7 +8657,7 @@ mod tests {
             bare.len(),
         );
         assert_eq!(
-            counted, decode_ids,
+            counted, decode_auto,
             "the count must be the prefill, not an approximation of it",
         );
 
@@ -8661,6 +8679,18 @@ mod tests {
             required.len(),
             counted.len(),
         );
+        assert_eq!(required, decode_required, "Required: count != prefill");
+        let named = backend
+            .build_chat_input_prefilled(
+                &msgs,
+                false,
+                &tools,
+                &ResolvedToolChoice::Tool("get_weather"),
+                false,
+                None,
+            )
+            .expect("named");
+        assert_eq!(named, decode_named, "Tool(name): count != prefill");
 
         // `response_format` routes Qwen through `chat_response_format`, which
         // renders with no tool block at all. Counting the tools there would be
