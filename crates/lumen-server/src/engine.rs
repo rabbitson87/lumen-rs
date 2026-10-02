@@ -4237,37 +4237,26 @@ mod anthropic_thinking_blocks {
     }
 }
 
-/// Task 018: a batch `/v1/messages` request is admitted on the figure it
-/// reports — its rendered text plus the placeholder runs its images expand
-/// into — on both the flat and the tool-history branch.
+/// Engine tests over a real Gemma 4 checkpoint.
 ///
-/// The defect is which count the engine hands the guard, so the guard has to
-/// run the engine, and the engine has no test backend: this loads Gemma 4 with
-/// its vision tower. Every number is the checkpoint's own — the text count from
-/// a text-only twin of each request, the image's from the backend — so a budget
-/// or template change moves the cap with it instead of breaking the test.
+/// The engine has no test backend, so a defect in what it hands the prompt
+/// guard can only be caught by running it. `LUMEN_GEMMA4_MODEL_DIR` names the
+/// checkpoint; without it these tests print a skip line and pass, as the rest
+/// of the suite's checkpoint tests do.
 #[cfg(test)]
-mod anthropic_batch_image_admission {
+mod real_checkpoint {
     use super::InferenceEngine;
-    use crate::types::AnthropicRequest;
-    use base64::Engine as _;
-    use serde_json::{Value, json};
     use std::ffi::{OsStr, OsString};
-
-    const PROBE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../lumen-mlx/tests/fixtures/gemma4_vision_probe.png"
-    );
 
     /// Sets a variable until dropped, then puts the shell's value back — panic
     /// included, so nothing leaks into a later test in the same process.
-    struct ScopedEnv {
+    pub(super) struct ScopedEnv {
         key: &'static str,
         prev: Option<OsString>,
     }
 
     impl ScopedEnv {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        pub(super) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
             let prev = std::env::var_os(key);
             // SAFETY: only ever called on the test thread while no request is
             // in flight — before the load, or between two requests.
@@ -4288,10 +4277,42 @@ mod anthropic_batch_image_admission {
         }
     }
 
-    fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
+    /// Runs `f` with the prompt cap (`LUMEN_MAX_PROMPT_TOKENS`) at `cap`.
+    pub(super) fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
         let _cap = ScopedEnv::set("LUMEN_MAX_PROMPT_TOKENS", cap.to_string());
         f()
     }
+
+    /// The engine over `LUMEN_GEMMA4_MODEL_DIR`, with its vision tower when
+    /// asked (`LUMEN_VISION` is read at load only).
+    pub(super) fn gemma4(vision: bool) -> Option<InferenceEngine> {
+        let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+            eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR to a Gemma 4 checkpoint");
+            return None;
+        };
+        let _vision = vision.then(|| ScopedEnv::set("LUMEN_VISION", "1"));
+        Some(InferenceEngine::load(&dir).expect("load Gemma 4"))
+    }
+}
+
+/// Task 018: a batch `/v1/messages` request is admitted on the figure it
+/// reports — its rendered text plus the placeholder runs its images expand
+/// into — on both the flat and the tool-history branch.
+///
+/// Every number is the checkpoint's own — the text count from a text-only twin
+/// of each request, the image's from the backend — so a budget or template
+/// change moves the cap with it instead of breaking the test.
+#[cfg(test)]
+mod anthropic_batch_image_admission {
+    use super::real_checkpoint::{gemma4, with_cap};
+    use crate::types::AnthropicRequest;
+    use base64::Engine as _;
+    use serde_json::{Value, json};
+
+    const PROBE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lumen-mlx/tests/fixtures/gemma4_vision_probe.png"
+    );
 
     fn request(messages: Value, tools: bool) -> AnthropicRequest {
         let mut body = json!({
@@ -4350,12 +4371,9 @@ mod anthropic_batch_image_admission {
     #[test]
     #[ignore = "requires a Gemma 4 checkpoint with its vision tower; set LUMEN_GEMMA4_MODEL_DIR"]
     fn the_batch_guard_admits_on_the_count_it_reports() {
-        let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
-            eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR to a Gemma 4 checkpoint");
+        let Some(mut engine) = gemma4(true) else {
             return;
         };
-        let _vision = ScopedEnv::set("LUMEN_VISION", "1");
-        let mut engine = InferenceEngine::load(&dir).expect("load Gemma 4");
 
         let png = std::fs::read(PROBE).expect("read the probe image");
         let image_tokens = engine.backend.image_prompt_tokens(&[vec![png.clone()]]);
