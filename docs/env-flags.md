@@ -34,6 +34,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
 
@@ -306,3 +307,17 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  A/B hatch. The equivalence matrix must never flip this expecting
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
+
+### `LUMEN_TOKENIZE_MEMO`
+
+*Optimization, default on.*
+
+Remember the encodes of long prompt pieces that recur across requests —
+ the system+tools head and the history an agent resends every turn — so
+ a turn encodes only what is new. Qwen prompts are cut right before each
+ `<|im_start|>`, where HF splits them itself; other strings are
+ remembered whole. Exact: the cut is used only for a tokenizer where it
+ cannot change the ids, checked at load. Bounded at 64 MB. On by
+ default since task 016's Gate 2: warm agentic turns at ~35K tokens
+ reached their first token 38 ms sooner on Qwen3.5-9B (279 → 241 ms,
+ Welch t 16.3) and 45 ms sooner on Gemma 4 (272 → 227 ms, t 16.2).
