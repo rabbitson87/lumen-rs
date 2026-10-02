@@ -431,11 +431,13 @@ readable from one request: the reported figure must equal that number. Two
 things make a *correct* server look wrong here. An active grammar
 (`tool_choice: required`) holds the last prompt token back for a masked decode
 step, so the line also states `prompt=N` — compare against that, not the prefill
-length. And a structured-history request still counts the flattened
-`(role, content)` pairs while decoding from `ChatTurn`s, which is a known
-turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
-figure feeds `guard_prompt_fits` as well as the client's bill, so it
-under-reports and over-admits together.
+length. A request carrying tool history (prior `tool_calls`, `role:"tool"`,
+Anthropic `tool_use`/`tool_result`) is counted from the same `ChatTurn`s it
+decodes from, so it holds to the same invariant. It used to count the flattened
+`(role, content)` pairs, documented here as "a turn-framing gap of tens of
+tokens"; it was the whole tool history (red-green `tool-history-uncounted`).
+Any gap is a defect: the figure feeds `guard_prompt_fits` as well as the
+client's bill, so it under-reports and over-admits together.
 
 Check it through the **desktop app's** launch too, not just
 `MODEL_ID=… lumen-server`. The app resolves the model id against the local scan

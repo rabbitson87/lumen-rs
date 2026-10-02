@@ -1962,6 +1962,65 @@ impl MlxBackend {
         }
     }
 
+    /// [`Self::build_chat_input_prefilled`] for a request that carries tool
+    /// history — prior assistant `tool_calls`, `role:"tool"` results — which
+    /// the decode path renders from these turns, not from `(role, content)`
+    /// pairs.
+    ///
+    /// Counting the flattened pairs instead loses exactly what makes such a
+    /// request big: Qwen's flat renderer drops tool turns and every
+    /// `tool_calls` block, Anthropic's flattening drops `tool_use` and
+    /// `tool_result`, and Gemma's refuses role `tool` outright, leaving the
+    /// caller's chars/4 guess. Measured on Qwen3.5-9B, a 34.8K-token prefill
+    /// was reported as 32.7K — the whole tool result missing — and the same
+    /// figure is what the context guard admits on.
+    ///
+    /// Mirrors the history decode renderers branch for branch: Qwen renders
+    /// `response_format` through the tool-aware renderer with no tools (it is
+    /// the only one that can represent tool turns), Gemma keeps the tools and
+    /// closes the thought channel, as on the flat path.
+    pub fn build_chat_input_prefilled_from_history(
+        &self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        structured: bool,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<Vec<u32>> {
+        use crate::chat_io::ResolvedToolChoice;
+        match self {
+            Self::Qwen35Family(m) => {
+                let (tools, tool_choice) = if structured {
+                    // `chat_response_format_from_history` →
+                    // `build_response_format_input_from_history`.
+                    (&[][..], &ResolvedToolChoice::None)
+                } else {
+                    (tools, tool_choice)
+                };
+                m.build_chat_input_with_tools_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    effort,
+                )
+                .map(|(ids, _prefill)| ids)
+            }
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => {
+                let _ = effort;
+                m.build_chat_input_prefilled_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    structured,
+                )
+            }
+        }
+    }
+
     /// Prompt tokens the attached images will add on top of the rendered text.
     ///
     /// `build_chat_input` only sees `(role, content)` strings, so an image
@@ -4476,6 +4535,11 @@ impl MlxQwen35Backend {
 
     /// Structured-history variant — used when the request carries
     /// prior assistant tool_calls or role:"tool" turns.
+    ///
+    /// Same ids as [`Self::build_chat_input_with_tools_from_history_split`]
+    /// in one encode, for the same reason as
+    /// [`Self::build_chat_input_with_tools`]: the prompt-token count is the
+    /// caller, and it never reads the prefill split.
     pub fn build_chat_input_with_tools_from_history(
         &self,
         turns: &[crate::chat_io::ChatTurn<'_>],
@@ -4484,14 +4548,13 @@ impl MlxQwen35Backend {
         tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, String)> {
-        let (ids, prefill, _prefill_tokens) = self.build_chat_input_with_tools_from_history_split(
-            turns,
-            thinking,
-            tools,
-            tool_choice,
-            effort,
-        )?;
-        Ok((ids, prefill))
+        use crate::qwen3_5_tools::{
+            format_qwen3_chat_with_tools_from_history, qwen35_tool_choice_prefill_str,
+        };
+        let mut full = format_qwen3_chat_with_tools_from_history(turns, thinking, tools, effort);
+        let prefill = qwen35_tool_choice_prefill_str(tool_choice);
+        full.push_str(&prefill);
+        Ok((self.encode(&full)?, prefill))
     }
 
     /// `_split` variant of [`build_chat_input_with_tools_from_history`] —
@@ -8701,6 +8764,125 @@ mod tests {
         assert_eq!(
             structured, bare,
             "response_format drops the tool block on Qwen; the count has to drop it too",
+        );
+    }
+
+    /// A request carrying tool history decodes from its `ChatTurn`s — the
+    /// earlier call and its result included — so its count has to render
+    /// those turns as well.
+    ///
+    /// It used to count the flattened `(role, content)` pairs, and the flat
+    /// renderer drops `role:"tool"` turns and every `tool_calls` block. That
+    /// was documented as a turn-framing gap of "tens of tokens"; measured on
+    /// Qwen3.5-9B it was the whole tool result (a 34.8K-token prefill reported
+    /// as 32.7K), and the same figure is what the context guard admits on.
+    #[test]
+    fn the_history_count_renders_the_tool_turns_the_model_is_shown() {
+        use crate::chat_io::{AssistantToolCall, ChatTurn, ResolvedToolChoice, ToolDef};
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("tokenizer");
+        let backend = MlxQwen35Backend::with_token_script(vec![], 0, tokenizer, 11);
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        });
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Current conditions for a city"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let args = serde_json::json!({"city": "Seoul"});
+        let calls = [AssistantToolCall {
+            id: "call_1",
+            name: "get_weather",
+            arguments: &args,
+        }];
+        let result = "Seoul is 21 degrees and clear with a light westerly wind all afternoon";
+        let turns = [
+            ChatTurn::System("be brief"),
+            ChatTurn::User("weather in Seoul?"),
+            ChatTurn::Assistant {
+                text: "",
+                tool_calls: &calls,
+            },
+            ChatTurn::Tool {
+                tool_call_id: "call_1",
+                name: Some("get_weather"),
+                content: result,
+            },
+            ChatTurn::User("and tomorrow?"),
+        ];
+
+        // What each history decode route prefills, from the routes' own builders.
+        let decode = |tools: &[ToolDef<'_>], choice: &ResolvedToolChoice<'_>| {
+            backend
+                .build_chat_input_with_tools_from_history_split(&turns, false, tools, choice, None)
+                .expect("history render")
+                .0
+        };
+        let cases = [
+            ResolvedToolChoice::Auto,
+            ResolvedToolChoice::Required,
+            ResolvedToolChoice::Tool("get_weather"),
+        ];
+        let expected: Vec<Vec<u32>> = cases.iter().map(|c| decode(&tools, c)).collect();
+        let (response_format, _images) = backend
+            .build_response_format_input_from_history(&turns, &[], false, None)
+            .expect("response_format render");
+        // The flattened pairs the engine counted before.
+        let flat: Vec<(String, String)> = [
+            ("system", "be brief"),
+            ("user", "weather in Seoul?"),
+            ("assistant", ""),
+            ("tool", result),
+            ("user", "and tomorrow?"),
+        ]
+        .iter()
+        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .collect();
+
+        let backend = MlxBackend::Qwen35Family(backend);
+        for (choice, want) in cases.iter().zip(&expected) {
+            let counted = backend
+                .build_chat_input_prefilled_from_history(&turns, false, &tools, choice, false, None)
+                .expect("history count");
+            assert_eq!(&counted, want, "{choice:?}: the count must be the prefill");
+        }
+        let counted_rf = backend
+            .build_chat_input_prefilled_from_history(
+                &turns,
+                false,
+                &tools,
+                &ResolvedToolChoice::Auto,
+                true,
+                None,
+            )
+            .expect("response_format count");
+        assert_eq!(
+            counted_rf, response_format,
+            "response_format renders the history with no tools; the count has to as well",
+        );
+
+        // And the size of what the flat count left out: every word of the tool
+        // result is a token here, and it is all missing from the flat figure.
+        let flat_count = backend
+            .build_chat_input_prefilled(
+                &flat,
+                false,
+                &tools,
+                &ResolvedToolChoice::Auto,
+                false,
+                None,
+            )
+            .expect("flat count")
+            .len();
+        let words_in_result = result.split_whitespace().count();
+        assert!(
+            expected[0].len() >= flat_count + words_in_result,
+            "the tool result ({words_in_result} words) must be counted: history {} vs flat {flat_count}",
+            expected[0].len(),
         );
     }
 

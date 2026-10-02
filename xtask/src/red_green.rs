@@ -699,6 +699,39 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "tool-history-uncounted",
+        symptom: "a request carrying tool history — prior assistant \
+                  `tool_calls`, `role:\"tool\"` results, Anthropic \
+                  `tool_use`/`tool_result` — was counted from its flattened \
+                  `(role, content)` pairs while it decoded from `ChatTurn`s. \
+                  Qwen's flat renderer drops tool turns and calls, the \
+                  Anthropic flattening drops the blocks, and Gemma's rejects \
+                  role `tool` (chars/4 fallback). Documented as a turn-framing \
+                  gap of \"tens of tokens\"; measured on Qwen3.5-9B it was the \
+                  whole tool result — a 34.8K-token prefill reported as 32.7K — \
+                  in `usage.prompt_tokens` and in what `guard_prompt_fits` \
+                  admitted on. Found by the per-request `[tokenize]` line in \
+                  task 016",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                m.build_chat_input_with_tools_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    effort,
+                )
+                .map(|(ids, _prefill)| ids)"#,
+            replace: r#"                { let flat: Vec<(String, String)> = turns.iter().map(|t| match t { crate::chat_io::ChatTurn::System(s) => ("system".to_string(), s.to_string()), crate::chat_io::ChatTurn::User(s) => ("user".to_string(), s.to_string()), crate::chat_io::ChatTurn::Assistant { text, .. } => ("assistant".to_string(), text.to_string()), crate::chat_io::ChatTurn::Tool { content, .. } => ("tool".to_string(), content.to_string()) }).collect(); m.build_chat_input_with_tools(&flat, thinking, tools, tool_choice, effort).map(|(ids, _prefill)| ids) } // defect: tool history flattened"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_history_count_renders_the_tool_turns_the_model_is_shown",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "anthropic-stream-zero-input-tokens",
         symptom: "the Anthropic streaming route reported `input_tokens: 0` for \
                   every request. `message_start` is the one place the format \
@@ -1372,6 +1405,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parallel-tool-calls-not-consulted")
         | (_, "effort-ungated-in-token-count")
         | (_, "tool-schema-uncounted-in-usage")
+        | (_, "tool-history-uncounted")
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")

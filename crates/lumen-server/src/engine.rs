@@ -140,11 +140,12 @@ impl ModelBackend {
     /// schema-presence the `chat*` call on this path is about to take, and the
     /// count is the prefill.
     ///
-    /// One approximation survives on purpose: a structured-history request
-    /// (prior `tool_calls`, `role:"tool"`) decodes from `ChatTurn`s while this
-    /// still counts the flattened `(role, content)` pairs. That gap is turn
-    /// framing — tens of tokens — where the one just closed was the entire tool
-    /// schema.
+    /// A request that carries tool history (prior `tool_calls`, `role:"tool"`)
+    /// decodes from `ChatTurn`s and is counted by
+    /// [`Self::count_history_prompt_tokens`] instead. Counting its flattened
+    /// `(role, content)` pairs here was documented as a turn-framing gap of
+    /// "tens of tokens"; it was the whole tool history, because the flat
+    /// renderers drop tool turns and calls.
     fn count_chat_prompt_tokens(
         &self,
         messages: &[(String, String)],
@@ -168,6 +169,45 @@ impl ModelBackend {
             Ok(ids) => ids.len() as u32,
             Err(_) => {
                 let chars: usize = messages.iter().map(|(_, c)| c.len()).sum();
+                ((chars as u32) / 4).max(1)
+            }
+        }
+    }
+
+    /// [`Self::count_chat_prompt_tokens`] for a request carrying tool history,
+    /// rendered from the same `turns` the request decodes from — prior calls
+    /// and their results included.
+    ///
+    /// This used to count the flattened `(role, content)` pairs, and every
+    /// flat renderer drops exactly the part that makes such a request big:
+    /// Qwen's skips `role:"tool"` turns and `tool_calls` blocks, the Anthropic
+    /// flattening drops `tool_use`/`tool_result`, and Gemma's rejects role
+    /// `tool`, leaving the chars/4 fallback. Measured on Qwen3.5-9B, a
+    /// 34.8K-token prefill was reported as 32.7K: the tool result missing from
+    /// the client's bill and from the context guard alike.
+    fn count_history_prompt_tokens(
+        &self,
+        turns: &[ChatTurn<'_>],
+        thinking: bool,
+        ov: &lumen_mlx::SamplingOverrides,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        structured: bool,
+    ) -> u32 {
+        let res: Result<Vec<u32>> = match self {
+            Self::Mlx(m) => m.build_chat_input_prefilled_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                structured,
+                m.resolved_effort(ov),
+            ),
+        };
+        match res {
+            Ok(ids) => ids.len() as u32,
+            Err(_) => {
+                let chars: usize = turns.iter().map(turn_text_len).sum();
                 ((chars as u32) / 4).max(1)
             }
         }
@@ -662,56 +702,21 @@ impl InferenceEngine {
         let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
         let images = images_aligned_to_kept(&req.messages, &kept);
 
-        // Owning storage for `ChatTurn` borrows when routing structured.
+        // Owning storage for `ChatTurn` borrows when routing structured. Built
+        // before the guard: a tool-history request is counted from the turns
+        // it decodes from, not from the flattened pairs above.
         let arg_values: Vec<serde_json::Value> = if needs_structured {
-            req.messages
-                .iter()
-                .flat_map(|m| {
-                    m.tool_calls
-                        .iter()
-                        .flat_map(|calls| calls.iter())
-                        .map(|c| {
-                            // OpenAI ships arguments as a JSON-encoded
-                            // string. Parse to a Value so the renderer can
-                            // walk the structure; fall back to {} on
-                            // malformed input rather than failing the whole
-                            // request.
-                            serde_json::from_str(&c.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
+            openai_tool_call_args(&req.messages)
         } else {
             Vec::new()
         };
         let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = if needs_structured {
-            let mut next_arg = 0;
-            req.messages
-                .iter()
-                .map(|m| {
-                    m.tool_calls
-                        .as_ref()
-                        .map(|calls| {
-                            calls
-                                .iter()
-                                .map(|c| {
-                                    let av = &arg_values[next_arg];
-                                    next_arg += 1;
-                                    AssistantToolCall {
-                                        id: c.id.as_str(),
-                                        name: c.function.name.as_str(),
-                                        arguments: av,
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
+            openai_tool_calls(&req.messages, &arg_values)
         } else {
             Vec::new()
         };
+        let history: Option<Vec<ChatTurn<'_>>> =
+            needs_structured.then(|| openai_history_turns(&req.messages, &assistant_tc_buf));
 
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
@@ -735,46 +740,38 @@ impl InferenceEngine {
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
-            &messages,
-            thinking_on,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            req.response_json_schema().is_some(),
-        ) + image_tokens;
+        let structured_output = req.response_json_schema().is_some();
+        let prompt_tokens_guard = match &history {
+            Some(turns) => self.backend.count_history_prompt_tokens(
+                turns,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                structured_output,
+            ),
+            None => self.backend.count_chat_prompt_tokens(
+                &messages,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                structured_output,
+            ),
+        } + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
         // rate, but it is not threaded back here; this end-to-end rate is the
         // honest, cheap-to-measure figure for observability.
         let gen_started = Instant::now();
-        let mut parsed = if needs_structured {
-            let mut turns: Vec<ChatTurn<'_>> = req
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| match m.role.as_str() {
-                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
-                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
-                    "tool" => ChatTurn::Tool {
-                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
-                        name: m.name.as_deref(),
-                        content: m.content.as_str(),
-                    },
-                    _ => ChatTurn::Assistant {
-                        text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    },
-                })
-                .collect();
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+        let mut parsed = if let Some(turns) = history.as_deref() {
             // `turns` is 1:1 with `req.messages` and the turn strip applies the
             // same predicate as the flat one, so the surviving turns line up
             // with `images` — which is already indexed by the survivors.
             match images.as_deref() {
                 Some(imgs) => self.backend.chat_from_history_with_images(
-                    &turns,
+                    turns,
                     imgs,
                     req.max_tokens,
                     req.temperature,
@@ -787,7 +784,7 @@ impl InferenceEngine {
                     req.response_json_schema().as_ref(),
                 )?,
                 None => self.backend.chat_from_history(
-                    &turns,
+                    turns,
                     req.max_tokens,
                     req.temperature,
                     req.top_p,
@@ -1049,20 +1046,12 @@ impl InferenceEngine {
         // Prompt-size reject cap (Anthropic /v1/messages) — same OOM guard as
         // the OpenAI path: reject oversized prompts before prefill rather than
         // letting them reach the backend and crash the server via an uncaught
-        // Metal OOM. Uses the flat `messages` count (the same approximation
-        // already used for usage below).
+        // Metal OOM. Counted in each branch from what that branch decodes — a
+        // tool-history request from its turns, which only exist once the
+        // branch has built them. (The Messages API has no `response_format`.)
         let anthropic_thinking =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
-            &messages,
-            anthropic_thinking,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            // The Anthropic Messages API has no `response_format`.
-            false,
-        );
-        guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
+        let prompt_tokens_guard: u32;
 
         let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
@@ -1252,6 +1241,15 @@ impl InferenceEngine {
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
+            prompt_tokens_guard = self.backend.count_history_prompt_tokens(
+                &turns,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            );
+            guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
             if turn_images.iter().any(|v| !v.is_empty()) {
                 self.backend.chat_from_history_with_images(
                     &turns,
@@ -1285,40 +1283,55 @@ impl InferenceEngine {
                     None,
                 )?
             }
-        } else if let Some(images) = images.as_deref() {
-            self.backend.chat_with_images(
-                &messages,
-                images,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                None,
-            )?
         } else {
-            // Plain path — uses the flat messages built above. Matches
-            // the pre-Phase-1.4 behavior bit-for-bit.
-            self.backend.chat(
+            prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
                 &messages,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
+                anthropic_thinking,
                 &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                None,
-            )?
+                false,
+            );
+            guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
+            if let Some(images) = images.as_deref() {
+                self.backend.chat_with_images(
+                    &messages,
+                    images,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                )?
+            } else {
+                // Plain path — uses the flat messages built above. Matches
+                // the pre-Phase-1.4 behavior bit-for-bit.
+                self.backend.chat(
+                    &messages,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                )?
+            }
         };
 
-        // The guard's text count (same arguments, nothing in between changes
-        // them), plus the placeholder runs images add on top of the rendered
-        // text — which the guard itself does not count yet.
+        // The guard's count — from the turns for a tool-history request — plus
+        // the placeholder runs images add on top of the rendered text, which
+        // the guard itself does not count yet.
         let prompt_tokens = prompt_tokens_guard
             + images
                 .as_deref()
@@ -1432,21 +1445,47 @@ impl InferenceEngine {
         // (Gemma 4 only). `None` when absent / `text` → exact existing path.
         let response_schema = req.response_json_schema();
 
+        // A tool-history request decodes from structured turns, so it is
+        // counted from them: owning storage first, built ahead of the count.
+        let needs_structured = needs_structured_history(&req.messages);
+        let arg_values: Vec<serde_json::Value> = if needs_structured {
+            openai_tool_call_args(&req.messages)
+        } else {
+            Vec::new()
+        };
+        let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = if needs_structured {
+            openai_tool_calls(&req.messages, &arg_values)
+        } else {
+            Vec::new()
+        };
+        let history: Option<Vec<ChatTurn<'_>>> =
+            needs_structured.then(|| openai_history_turns(&req.messages, &assistant_tc_buf));
+
         // Includes the image soft-token runs; this figure feeds both the
         // context guard below and the `usage` block at the end of the stream.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            response_schema.is_some(),
-        ) + images
+        let thinking_on =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let prompt_tokens = match &history {
+            Some(turns) => self.backend.count_history_prompt_tokens(
+                turns,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                response_schema.is_some(),
+            ),
+            None => self.backend.count_chat_prompt_tokens(
+                &messages,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                response_schema.is_some(),
+            ),
+        } + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-
-        let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
         eprintln!(
             "[chat-stream] msgs={} prompt_bytes={} prompt_tokens={} max_tokens={} thinking={} structured={}",
@@ -1511,65 +1550,7 @@ impl InferenceEngine {
         // Wall-clock around the streaming generation for the `/v1/loads`
         // last tok/s gauge (recorded at the `Done` terminal below).
         let gen_started = Instant::now();
-        let result = if needs_structured {
-            let arg_values: Vec<serde_json::Value> = req
-                .messages
-                .iter()
-                .flat_map(|m| {
-                    m.tool_calls
-                        .iter()
-                        .flat_map(|calls| calls.iter())
-                        .map(|c| {
-                            serde_json::from_str(&c.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = {
-                let mut next_arg = 0;
-                req.messages
-                    .iter()
-                    .map(|m| {
-                        m.tool_calls
-                            .as_ref()
-                            .map(|calls| {
-                                calls
-                                    .iter()
-                                    .map(|c| {
-                                        let av = &arg_values[next_arg];
-                                        next_arg += 1;
-                                        AssistantToolCall {
-                                            id: c.id.as_str(),
-                                            name: c.function.name.as_str(),
-                                            arguments: av,
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            };
-            let mut turns: Vec<ChatTurn<'_>> = req
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| match m.role.as_str() {
-                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
-                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
-                    "tool" => ChatTurn::Tool {
-                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
-                        name: m.name.as_deref(),
-                        content: m.content.as_str(),
-                    },
-                    _ => ChatTurn::Assistant {
-                        text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    },
-                })
-                .collect();
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+        let result = if let Some(turns) = history.as_deref() {
             // See the non-streaming path: post-strip turns line up with
             // `images`, which is already indexed by the survivors.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
@@ -1627,7 +1608,7 @@ impl InferenceEngine {
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
             match images.as_deref() {
                 Some(imgs) => self.backend.chat_streaming_from_history_with_images(
-                    &turns,
+                    turns,
                     imgs,
                     req.max_tokens,
                     req.temperature,
@@ -1641,7 +1622,7 @@ impl InferenceEngine {
                     on_event,
                 ),
                 None => self.backend.chat_streaming_from_history(
-                    &turns,
+                    turns,
                     req.max_tokens,
                     req.temperature,
                     req.top_p,
@@ -1843,6 +1824,26 @@ impl InferenceEngine {
         }
     }
 
+    /// The context guard, then `message_start`. `message_start` carries
+    /// `input_tokens` and goes out before the first token, so the count has to
+    /// travel ahead of decode rather than with `Done` — and after the guard, so
+    /// a rejected request emits `error` and no `message_start` at all. `false`
+    /// means rejected (the error is already sent).
+    fn admit_anthropic_stream(
+        &self,
+        prompt_tokens: u32,
+        token_tx: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        // Prompt-size reject cap — guard the prefill from an uncaught Metal
+        // OOM that would crash the server process.
+        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            return false;
+        }
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        true
+    }
+
     /// Handle a streaming Anthropic messages request.
     fn anthropic_messages_streaming(
         &mut self,
@@ -1897,28 +1898,16 @@ impl InferenceEngine {
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
         let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            false,
-        ) + images
+        // Counted in each branch from what that branch decodes — a tool-history
+        // request from its turns, which only exist once the branch has built
+        // them — then guarded and announced (`admit_anthropic_stream`).
+        let image_tokens = images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        // Prompt-size reject cap (Anthropic streaming) — guard the prefill from
-        // an uncaught Metal OOM that would crash the server process.
-        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-            return;
-        }
-        // `message_start` carries `input_tokens` and goes out before the first
-        // token, so the count has to travel ahead of decode rather than with
-        // `Done`. Sent after the guard: a rejected request emits `error` and no
-        // `message_start` at all.
-        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let anthropic_thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let prompt_tokens: u32;
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -2090,6 +2079,17 @@ impl InferenceEngine {
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
+            prompt_tokens = self.backend.count_history_prompt_tokens(
+                &turns,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            ) + image_tokens;
+            if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
+                return;
+            }
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
                     BackendStreamEvent::Text(t) => {
@@ -2145,6 +2145,17 @@ impl InferenceEngine {
                 )
             }
         } else {
+            prompt_tokens = self.backend.count_chat_prompt_tokens(
+                &messages,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            ) + image_tokens;
+            if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
+                return;
+            }
             // Bound first so both dispatches below can take it — only one runs.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
@@ -2583,6 +2594,94 @@ fn needs_structured_history(messages: &[ChatMessage]) -> bool {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false)
     })
+}
+
+/// Every assistant tool call's arguments, parsed in message order — the owned
+/// storage [`openai_tool_calls`] borrows from. OpenAI ships them as a
+/// JSON-encoded string; malformed input becomes `{}` rather than failing the
+/// whole request.
+fn openai_tool_call_args(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flat_map(|calls| calls.iter()))
+        .map(|c| {
+            serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| serde_json::json!({}))
+        })
+        .collect()
+}
+
+/// Per-message assistant tool calls, taking their arguments from `args` in the
+/// order [`openai_tool_call_args`] produced them.
+fn openai_tool_calls<'a>(
+    messages: &'a [ChatMessage],
+    args: &'a [serde_json::Value],
+) -> Vec<Vec<AssistantToolCall<'a>>> {
+    let mut next_arg = 0;
+    messages
+        .iter()
+        .map(|m| {
+            m.tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| {
+                            let av = &args[next_arg];
+                            next_arg += 1;
+                            AssistantToolCall {
+                                id: c.id.as_str(),
+                                name: c.function.name.as_str(),
+                                arguments: av,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The turns a tool-history OpenAI request decodes from, client meta-wrappers
+/// already stripped. Both OpenAI paths decode from these and count them.
+fn openai_history_turns<'a>(
+    messages: &'a [ChatMessage],
+    tool_calls: &'a [Vec<AssistantToolCall<'a>>],
+) -> Vec<ChatTurn<'a>> {
+    let mut turns: Vec<ChatTurn<'a>> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| match m.role.as_str() {
+            "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
+            "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
+            "tool" => ChatTurn::Tool {
+                tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
+                name: m.name.as_deref(),
+                content: m.content.as_str(),
+            },
+            _ => ChatTurn::Assistant {
+                text: m.content.as_str(),
+                tool_calls: tool_calls.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            },
+        })
+        .collect();
+    lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+    turns
+}
+
+/// Text a turn carries, for the chars/4 fallback when the history count
+/// itself fails.
+fn turn_text_len(turn: &ChatTurn<'_>) -> usize {
+    match turn {
+        ChatTurn::System(s) | ChatTurn::User(s) => s.len(),
+        ChatTurn::Assistant { text, tool_calls } => {
+            text.len()
+                + tool_calls
+                    .iter()
+                    .map(|c| c.name.len() + c.arguments.to_string().len())
+                    .sum::<usize>()
+        }
+        ChatTurn::Tool { content, .. } => content.len(),
+    }
 }
 
 /// Per-message image attachments, re-indexed onto the post-strip message

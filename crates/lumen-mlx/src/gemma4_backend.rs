@@ -1531,6 +1531,27 @@ pub(crate) mod imp {
             .map(|(prompt, _prefill)| prompt)
         }
 
+        /// [`Self::build_chat_input_prefilled`] for a tool-history request —
+        /// the prompt every history decode route builds, which the flat pairs
+        /// cannot express: `parse_role_pairs` rejects role `tool` outright.
+        pub fn build_chat_input_prefilled_from_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<Vec<u32>> {
+            self.build_prompt_and_prefill_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
+            .map(|(prompt, _prefill)| prompt)
+        }
+
         /// Like `build_chat_input_with_tools` but without the trailing
         /// `<start_of_turn>model\n` generation prompt (and the empty thought
         /// channel that gets appended when `thinking=false`). Used by
