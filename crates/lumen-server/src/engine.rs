@@ -4763,6 +4763,80 @@ mod gemma_prefix_cache_drop {
     }
 }
 
+/// Gemma 4 sent every non-streaming request with tools — or `response_format` —
+/// down a route that never touched the prefix cache, so an agent, which sends
+/// tools on every turn, paid a cold prefill each time.
+#[cfg(test)]
+mod gemma_batch_grammar_prefix_cache {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::{Value, json};
+
+    fn request(messages: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": messages,
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }}],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request")
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_batch_tool_request_leaves_a_snapshot_for_the_next_turn() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        let system = json!({"role": "system", "content": "You are a weather assistant."});
+        let ask = json!({"role": "user", "content": "What is the weather in Paris?"});
+        let flat = request(json!([system.clone(), ask.clone()]));
+        let history = request(json!([
+            system,
+            ask,
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C."},
+            {"role": "user", "content": "And in Rome?"},
+        ]));
+        for (shape, req) in [("flat", flat), ("tool history", history)] {
+            let resp = engine
+                .chat_completion(&req)
+                .unwrap_or_else(|e| panic!("{shape}: {e:#}"));
+            let name = resp.choices[0]
+                .message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.function.name.clone());
+            assert_eq!(
+                name.as_deref(),
+                Some("get_weather"),
+                "{shape}: the forced tool call is gone"
+            );
+            assert!(
+                engine.clear_prefix_cache() > 0,
+                "{shape}: no prefix snapshot left for the next turn — the request took the \
+                 uncached route"
+            );
+        }
+    }
+}
+
 /// A refused prompt is the client's error (400), an inference failure the
 /// server's (500) — the status is what an SDK's retry policy keys on.
 #[cfg(test)]

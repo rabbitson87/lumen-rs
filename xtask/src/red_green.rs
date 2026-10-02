@@ -991,6 +991,25 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "gemma-batch-grammar-skips-prefix-cache",
+        symptom: "every non-streaming Gemma 4 request with tools or response_format \
+                  took a route that never touched the prefix cache, so an agent — \
+                  which sends tools on every turn — paid a cold prefill each time \
+                  (~19-20 s at 16K tokens) where the same request streamed from \
+                  the cache",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                    // The grammar masks generated tokens only, so the prompt\n                    // can still come from the prefix cache.\n                    let key = session_id",
+            replace: "                    // defect: grammar requests skip the prefix cache\n                    let key: Option<String> = None;\n                    let _ = session_id",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_batch_grammar_prefix_cache::a_batch_tool_request_leaves_a_snapshot_for_the_next_turn",
+        )],
+        occurrences: 2, // the flat route and the history route
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "anthropic-stream-zero-input-tokens",
         symptom: "the Anthropic streaming route reported `input_tokens: 0` for \
                   every request. `message_start` is the one place the format \
@@ -1669,7 +1688,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")
-        | (_, "session-reuse-needs-a-nonstandard-field") => "lib.rs",
+        | (_, "session-reuse-needs-a-nonstandard-field")
+        | (_, "gemma-batch-grammar-skips-prefix-cache") => "lib.rs",
         // One defect, two files: the wire had no field for the trace *and* the
         // renderer had nowhere to put one. Reverting either half is enough to
         // lose the KV, so both are mutated together.

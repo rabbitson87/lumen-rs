@@ -2193,9 +2193,10 @@ impl MlxBackend {
                 // The batched `generate()` path below applies no grammar at
                 // all, so any request that would have one runs through the
                 // streaming decode with a no-op sink and returns its
-                // ParsedResponse. It forgoes the prefix cache — a cold prefill
-                // in exchange for the constraint the caller asked for, rather
-                // than silently unconstrained output.
+                // ParsedResponse — the cached streaming route when a key
+                // resolves. It used to take the uncached one every time, and
+                // agent clients send tools on every request, so each turn paid
+                // a cold prefill (~19-20 s at 16K tokens).
                 //
                 // This covers `response_format` and tool calls alike. Leaving
                 // tools out is what let a non-streaming `tool_choice=required`
@@ -2203,6 +2204,26 @@ impl MlxBackend {
                 // name was whatever the model felt like, and only the response
                 // parser's fuzzy repair stood between that and the client.
                 if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                    // The grammar masks generated tokens only, so the prompt
+                    // can still come from the prefix cache.
+                    let key = session_id
+                        .map(String::from)
+                        .or_else(|| auto_prefix_key(messages, effort));
+                    if let Some(k) = key {
+                        return m.chat_streaming_with_prefix_cache(
+                            messages,
+                            max_new_tokens,
+                            temperature,
+                            top_p,
+                            ov,
+                            thinking,
+                            &k,
+                            tools,
+                            tool_choice,
+                            response_schema,
+                            |_| Ok(()),
+                        );
+                    }
                     return m.chat_streaming(
                         messages,
                         max_new_tokens,
@@ -2678,8 +2699,28 @@ impl MlxBackend {
                 // Mirror the flat `chat` path — a request that would get a
                 // grammar routes through the grammar-aware streaming decode
                 // with a no-op sink, because the cache/`generate` path applies
-                // none. Forgoes the prefix cache for those requests.
+                // none: the cached streaming route when a key resolves.
                 if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+                    // The grammar masks generated tokens only, so the prompt
+                    // can still come from the prefix cache.
+                    let key = session_id
+                        .map(String::from)
+                        .or_else(|| auto_prefix_key_from_turns(turns, effort));
+                    if let Some(k) = key {
+                        return m.chat_streaming_from_history_with_prefix_cache(
+                            turns,
+                            max_new_tokens,
+                            temperature,
+                            top_p,
+                            ov,
+                            thinking,
+                            &k,
+                            tools,
+                            tool_choice,
+                            response_schema,
+                            |_| Ok(()),
+                        );
+                    }
                     return m.chat_streaming_from_history(
                         turns,
                         max_new_tokens,
