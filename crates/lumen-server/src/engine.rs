@@ -828,17 +828,11 @@ impl InferenceEngine {
             )?
         };
 
-        // Same text count as the guard above, plus the image runs the model
-        // actually prefilled — reporting the text-only figure would under-count
-        // an image request by hundreds of tokens.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            thinking_on,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            req.response_json_schema().is_some(),
-        ) + image_tokens;
+        // The guard's count, image runs included. Counting again would render
+        // and encode the whole prompt a second time for the same number: the
+        // count reads only the request and load-time config, and nothing
+        // between here and the guard changes either.
+        let prompt_tokens = prompt_tokens_guard;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
@@ -1322,18 +1316,14 @@ impl InferenceEngine {
             )?
         };
 
-        // Images add their placeholder runs on top of the rendered text.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            false,
-        ) + images
-            .as_deref()
-            .map(|i| self.backend.image_prompt_tokens(i))
-            .unwrap_or(0);
+        // The guard's text count (same arguments, nothing in between changes
+        // them), plus the placeholder runs images add on top of the rendered
+        // text — which the guard itself does not count yet.
+        let prompt_tokens = prompt_tokens_guard
+            + images
+                .as_deref()
+                .map(|i| self.backend.image_prompt_tokens(i))
+                .unwrap_or(0);
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match and
