@@ -1,0 +1,101 @@
+# fastokens 0.3.2, vendored into lumen-rs with a fix to its split cache —
+# see PATCHES.md. Upstream: https://github.com/crusoecloud/fastokens
+# (Apache-2.0; LICENSE and NOTICES.txt are upstream's, unchanged).
+
+[package]
+edition = "2024"
+name = "fastokens"
+version = "0.3.2"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Fast Tokenizer"
+homepage = "https://github.com/Atero-ai/fastokens"
+documentation = "https://github.com/Atero-ai/fastokens/blob/main/README.md"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/Atero-ai/fastokens"
+
+[features]
+# lumen-rs: empty, so nothing pulls hf-hub and its HTTP stack (upstream: ["hf-hub"]).
+default = []
+hf-hub = [
+    "dep:hf-hub",
+    "dep:ureq",
+]
+
+[lib]
+name = "fastokens"
+path = "src/lib.rs"
+
+[dependencies.daachorse]
+version = "1.0.0"
+
+[dependencies.fancy-regex]
+version = "0.17.0"
+
+[dependencies.hf-hub]
+version = "0.4.3"
+features = [
+    "rustls-tls",
+    "ureq",
+]
+optional = true
+default-features = false
+
+[dependencies.icu_normalizer]
+version = "2"
+
+[dependencies.memchr]
+version = "2"
+
+[dependencies.pcre2]
+version = "0.2"
+
+[dependencies.rayon]
+version = "1.11.0"
+
+[dependencies.regex-syntax]
+version = "0.8"
+
+[dependencies.serde]
+version = "1.0.228"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1.0.149"
+
+[dependencies.strum]
+version = "0.27.2"
+features = ["derive"]
+
+[dependencies.thiserror]
+version = "2.0.18"
+
+[dependencies.ureq]
+version = "2"
+optional = true
+default-features = false
+
+[dev-dependencies.anyhow]
+version = "1"
+
+[dev-dependencies.clap]
+version = "4.5.58"
+features = ["derive"]
+
+[dev-dependencies.csv]
+version = "1.4.0"
+
+[dev-dependencies.indicatif]
+version = "0.18.4"
+
+[dev-dependencies.tokenizers]
+version = "0.22.2"
+features = ["http"]
+
+[target.'cfg(target_os = "macos")'.dependencies.libc]
+version = "0.2"

@@ -14,7 +14,11 @@ members = [
 # libfuzzer-sys into every workspace build graph. They are driven exclusively
 # through `cargo xtask fuzz`; the deterministic twin of each target runs in
 # tier 0 as `crates/lumen-mlx/tests/tool_surface_fuzz.rs`.
-exclude = ["fuzz"]
+#
+# `vendor/fastokens` is third-party code kept in-tree with lumen-rs changes
+# (see vendor/README.md): a path dependency, not a member, so the workspace's
+# lints and formatting do not apply to it.
+exclude = ["fuzz", "vendor/fastokens"]
 # lumen-app pulls in the Tauri + webview stack (~hundreds of crates). Excluding
 # it from `default-members` keeps `cargo build` / `cargo test` at the workspace
 # root fast — build the desktop app explicitly with `cargo build -p lumen-app`

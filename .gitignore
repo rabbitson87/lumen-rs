@@ -7,6 +7,10 @@
 # coverage map, regrown from the seeds on any machine.
 /fuzz/target/
 /fuzz/corpus/
+# A vendored crate's own tests (`cargo test --manifest-path vendor/<crate>/...`)
+# build outside the workspace, with their own target dir and lockfile.
+/vendor/*/target/
+/vendor/*/Cargo.lock
 
 # ── OS ──
 .DS_Store
@@ -25,6 +29,8 @@ __pycache__/
 
 # ── Large local artifacts ──
 models/
+# ...but a vendored crate's `src/models/` is source (fastokens' BPE).
+!/vendor/*/src/models/
 assets/*.bin
 
 # ── Test fixtures ──
