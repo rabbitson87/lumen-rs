@@ -1621,7 +1621,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "gemma4_chat::imp::tests::close_thought_channel_prefills_the_empty_block",
         )],
-        occurrences: 2, // the flat renderer and the history renderer
+        // One site since both renderers share `generation_prompt_ids` (task 016).
+        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
     },
