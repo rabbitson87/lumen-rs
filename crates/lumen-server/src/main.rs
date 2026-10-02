@@ -1,16 +1,18 @@
 // The modules moved to `lib.rs` so tests and fuzz targets can reach them; see
 // the module docs there. This binary is the same code it always was, one
 // crate boundary further out.
-use atomic_http::external::http::{Response, StatusCode};
+use atomic_http::external::http::{HeaderValue, Response, StatusCode};
 use atomic_http::*;
 
+use lumen_server::access::{self, Access, Cors};
 use lumen_server::diffusion_engine::{self, DiffusionHandle};
 use lumen_server::embedding::EmbeddingHandle;
 #[cfg(feature = "mlx-native")]
 use lumen_server::embedding::EmbeddingService;
 use lumen_server::engine::{EngineHandle, InferenceEngine};
-use lumen_server::types::ErrorResponse;
+use lumen_server::types::{AnthropicError, ErrorResponse};
 use lumen_server::{catalog, routes};
+use std::sync::Arc;
 
 /// Default image model id surfaced in `/v1/models` and image responses.
 const DEFAULT_IMAGE_MODEL: &str = "flux2-dev";
@@ -385,9 +387,23 @@ async fn main() -> Result<(), SendableError> {
         _ => None,
     };
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = access::listen_addr(
+        std::env::var("LUMEN_HOST").ok().as_deref(),
+        std::env::var("HOST").ok().as_deref(),
+        port,
+    );
+    let access = Arc::new(Access::from_env());
     let mut server = Server::new(&addr).await?;
-    eprintln!("TurboQuant serving on :{port}  (mode={serve_mode:?})");
+    eprintln!("TurboQuant serving on {addr}  (mode={serve_mode:?})");
+    eprintln!(
+        "[serve] api key {}, cors {:?} (LUMEN_API_KEY / LUMEN_CORS)",
+        if access.requires_key() {
+            "required"
+        } else {
+            "not required"
+        },
+        access.cors()
+    );
     let llm_note = if handle.is_some() {
         ""
     } else {
@@ -424,9 +440,10 @@ async fn main() -> Result<(), SendableError> {
         let handle = handle.clone();
         let embedding = embedding_handle.clone();
         let diffusion = diffusion_handle.clone();
+        let access = Arc::clone(&access);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(accept, handle, embedding, diffusion).await {
+            if let Err(e) = handle_connection(accept, handle, embedding, diffusion, &access).await {
                 eprintln!("connection error: {e}");
             }
         });
@@ -438,13 +455,39 @@ async fn handle_connection(
     handle: Option<EngineHandle>,
     embedding: Option<EmbeddingHandle>,
     diffusion: Option<DiffusionHandle>,
+    access: &Access,
 ) -> Result<(), SendableError> {
-    let (request, response) = accept.parse_request_arena_writer().await?;
+    let (request, mut response) = accept.parse_request_arena_writer().await?;
 
     let method = request.method().as_str();
     let path = request.uri().path();
 
     eprintln!("{method} {path}");
+
+    // Set before routing so every response carries it, the hand-written SSE
+    // heads included (`routes::sse_head`).
+    let origin = request
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok());
+    if let Some(allow) = access.cors().allow_origin(origin) {
+        let headers = response.headers_mut();
+        headers.insert(
+            "access-control-allow-origin",
+            HeaderValue::from_str(&allow)?,
+        );
+        headers.insert("vary", HeaderValue::from_static("Origin"));
+    }
+    if method == "OPTIONS" && access.cors() != Cors::Off {
+        let requested = request
+            .headers()
+            .get("access-control-request-headers")
+            .cloned();
+        return preflight(response, requested).await;
+    }
+    if !access.authorized(method, path, request.headers()) {
+        return unauthorized(response, path).await;
+    }
 
     // LLM routes require a loaded engine; in image-only mode they 503.
     // The macro binds the unwrapped `EngineHandle` to the caller-supplied
@@ -498,6 +541,51 @@ async fn llm_not_loaded(mut response: Response<ArenaWriter>) -> Result<(), Senda
     );
     response.body_mut().set_arena_json(&err)?;
     *response.status_mut() = StatusCode::from_u16(503)?;
+    response.responser_arena().await?;
+    Ok(())
+}
+
+/// CORS preflight: the methods the API serves and whatever headers the browser
+/// asked to send. The allow-origin header, if any, is already set.
+async fn preflight(
+    mut response: Response<ArenaWriter>,
+    requested_headers: Option<HeaderValue>,
+) -> Result<(), SendableError> {
+    let headers = response.headers_mut();
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        requested_headers.unwrap_or_else(|| {
+            HeaderValue::from_static("authorization, content-type, x-api-key, anthropic-version")
+        }),
+    );
+    headers.insert("access-control-max-age", HeaderValue::from_static("600"));
+    *response.status_mut() = StatusCode::from_u16(204)?;
+    response.responser_arena().await?;
+    Ok(())
+}
+
+/// 401 in the error shape the caller's SDK parses: Anthropic's on
+/// `/v1/messages`, OpenAI's everywhere else.
+async fn unauthorized(
+    mut response: Response<ArenaWriter>,
+    path: &str,
+) -> Result<(), SendableError> {
+    let message = "missing or invalid API key (LUMEN_API_KEY): send it as \
+                   `Authorization: Bearer <key>` or `x-api-key: <key>`";
+    if path == "/v1/messages" {
+        let mut err = AnthropicError::new(message);
+        err.error.r#type = "authentication_error".into();
+        response.body_mut().set_arena_json(&err)?;
+    } else {
+        response
+            .body_mut()
+            .set_arena_json(&ErrorResponse::new(message, 401))?;
+    }
+    *response.status_mut() = StatusCode::from_u16(401)?;
     response.responser_arena().await?;
     Ok(())
 }

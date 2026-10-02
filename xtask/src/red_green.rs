@@ -762,6 +762,54 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "server-binds-every-interface",
+        symptom: "lumen-app's host scope (\"localhost (127.0.0.1)\" by default) \
+                  reached the server as LUMEN_HOST and was never read: every \
+                  launch bound 0.0.0.0, putting an API with no auth on the \
+                  network, while the README promised a 127.0.0.1 default",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        .unwrap_or(\"127.0.0.1\");",
+            replace: "        .unwrap_or(\"0.0.0.0\"); // defect: every interface",
+        }],
+        guards: &[srv("access::tests::the_listener_defaults_to_loopback")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "api-key-not-enforced",
+        symptom: "lumen-app's API key reached the server as LUMEN_API_KEY and was \
+                  never read: a setup the app showed as key-protected answered \
+                  every request without one",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        if path == \"/health\" || method == \"OPTIONS\" {",
+            replace: "        if true {\n            // defect: the key is never checked",
+        }],
+        guards: &[srv(
+            "access::tests::a_configured_key_is_required_everywhere_but_health_and_preflight",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "cors-setting-ignored",
+        symptom: "lumen-app's CORS scope reached the server as LUMEN_CORS and was \
+                  never read: no response carried CORS headers, so a browser \
+                  client failed under every setting, \"all\" included",
+        revert: &[Mutation {
+            path: SRV,
+            find: "            Self::All => Some(\"*\".to_string()),",
+            replace: "            Self::All => None, // defect: CORS never applied",
+        }],
+        guards: &[srv("access::tests::all_and_off_ignore_the_origin")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1486,6 +1534,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "anthropic-batch-guard-omits-images")
         | (_, "streams-delivered-in-one-burst")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        (_, "server-binds-every-interface")
+        | (_, "api-key-not-enforced")
+        | (_, "cors-setting-ignored") => "access.rs",
         (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three

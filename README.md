@@ -256,8 +256,10 @@ MODEL_ID=~/models/gemma-4-26b-a4b-mlx-imatrix3plus-awq \
   cargo run --release --features mlx-native --bin lumen-server
 ```
 
-The server listens on `127.0.0.1:8080` by default. Override with `PORT` /
-`HOST` env vars if needed.
+The server listens on `127.0.0.1:41110` by default. Override with
+`LUMEN_HOST` / `PORT` (`HOST` is accepted too, as an IP address). Binding
+anything but loopback exposes the API to the network: set `LUMEN_API_KEY`
+first.
 
 ### Embedding-only mode
 
@@ -280,7 +282,7 @@ configured; `/v1/embeddings` will work.
 OpenAI-compatible. Single string or array of strings.
 
 ```bash
-curl -s localhost:8080/v1/embeddings \
+curl -s localhost:41110/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{
     "model": "qwen3-embedding-0.6b",
@@ -311,7 +313,7 @@ OpenAI-compatible. Non-streaming greedy decode (sampling lands in a
 follow-up).
 
 ```bash
-curl -s localhost:8080/v1/chat/completions \
+curl -s localhost:41110/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
     "model": "gemma-4-26b-a4b",
@@ -331,7 +333,7 @@ Gemma 4's native-resolution ViT and Qwen 3.6's Qwen3-VL ViT.
 
 ```bash
 B64=$(base64 -i photo.png)
-curl -s localhost:8080/v1/chat/completions \
+curl -s localhost:41110/v1/chat/completions \
   -H 'content-type: application/json' \
   -d "{
     \"model\": \"gemma-4-26b-a4b\",
@@ -454,7 +456,9 @@ unchanged to six decimal places — the speedup does not move the output.
 
 | Var | Purpose |
 |---|---|
-| `PORT`, `HOST` | HTTP listen address (defaults `127.0.0.1:8080`). |
+| `PORT`, `LUMEN_HOST` | HTTP listen address (defaults `127.0.0.1:41110`). `HOST` is honoured when it is an IP address. |
+| `LUMEN_API_KEY` | Require this key on every route but `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`. Unset = no auth. |
+| `LUMEN_CORS` | `off` (default) \| `localhost` \| `all` — which browser origins may read responses. |
 | `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native`. |
 | `LUMEN_EMBEDDING_BATCH_ROWS` | Rows per padded embedding forward pass (default 32; `1` disables batching). |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |

@@ -180,7 +180,11 @@ MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
   cargo run --release --features mlx-native --bin lumen-server
 ```
 
-Default listen address: `127.0.0.1:8080`. Override with `HOST` / `PORT`.
+Default listen address: `127.0.0.1:41110`. Override with `LUMEN_HOST` /
+`PORT` (`HOST` is accepted too, as an IP address). Before binding anything but
+loopback, set `LUMEN_API_KEY`: every route but `/health` then needs
+`Authorization: Bearer <key>` or `x-api-key: <key>`. `LUMEN_CORS`
+(`off` | `localhost` | `all`) controls which browser origins may read responses.
 
 ### Embedding only
 
@@ -203,13 +207,13 @@ MODEL_ID=~/models/gemma-4-26b-a4b-mlx-4bit \
 
 ```bash
 # Embeddings
-curl -s localhost:8080/v1/embeddings \
+curl -s localhost:41110/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{"model":"qwen3-embedding-0.6b","input":["hello","안녕"]}' \
   | jq '.data[0].embedding | length'   # → 1024
 
 # Chat
-curl -s localhost:8080/v1/chat/completions \
+curl -s localhost:41110/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
     "model": "gemma-4-26b-a4b",
@@ -249,7 +253,7 @@ Either way, the request looks the same:
 
 ```bash
 B64=$(base64 -i some-image.png)
-curl -s localhost:8080/v1/chat/completions \
+curl -s localhost:41110/v1/chat/completions \
   -H 'content-type: application/json' \
   -d "{
     \"model\": \"gemma-4-26b-a4b\",
@@ -282,7 +286,7 @@ automatically — the capability is read from the checkpoint's own
 needed to get 3.8 right:
 
 ```bash
-curl -s localhost:8080/v1/chat/completions \
+curl -s localhost:41110/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"q","messages":[{"role":"user","content":"..."}],
        "reasoning_effort":"low"}'

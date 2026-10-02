@@ -78,16 +78,10 @@ async fn handle_streaming(
     // ask for extended thinking?", which is the spec's condition for a
     // `thinking` block appearing in the response at all.
     let emit_thinking = req.enable_thinking();
+    let head = super::sse_head(response.headers());
     let mut tcp = response.into_body().stream;
 
-    tcp.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          \r\n",
-    )
-    .await?;
+    tcp.write_all(head.as_bytes()).await?;
 
     let mut token_rx = match handle.anthropic_messages_streaming(req).await {
         Ok(rx) => rx,
