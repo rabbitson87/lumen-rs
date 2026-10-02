@@ -810,6 +810,23 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "completions-unguarded",
+        symptom: "/v1/completions was the one surface with no prompt-size guard: \
+                  a raw prompt of any size went straight to prefill, where an \
+                  oversized prompt is a Metal out-of-memory instead of a refusal",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        guard_prompt_fits(&self.backend, prompt_tokens)?;\n\n        let ov = req.sampling_overrides();\n        let output_ids = self.backend.generate(",
+            replace: "        // defect: no guard\n\n        let ov = req.sampling_overrides();\n        let output_ids = self.backend.generate(",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::completion_admission::a_raw_prompt_over_the_cap_is_refused",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "streams-delivered-in-one-burst",
         symptom: "every streaming response, OpenAI and Anthropic, reached the \
                   client in one burst when generation finished — 80 Qwen 9B \
@@ -1532,6 +1549,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "tool-choice-none")
         | (_, "anthropic-turn-images")
         | (_, "anthropic-batch-guard-omits-images")
+        | (_, "completions-unguarded")
         | (_, "streams-delivered-in-one-burst")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
         (_, "server-binds-every-interface")

@@ -980,6 +980,9 @@ impl InferenceEngine {
         let _tokenize = TokenizeSpan::begin(&self.backend, "completion");
         let input_ids = self.backend.encode(&req.prompt)?;
         let prompt_tokens = input_ids.len() as u32;
+        // The same pre-prefill reject every chat surface makes. This one never
+        // had it, so a raw prompt of any size went straight to prefill.
+        guard_prompt_fits(&self.backend, prompt_tokens)?;
 
         let ov = req.sampling_overrides();
         let output_ids = self.backend.generate(
@@ -4447,6 +4450,44 @@ mod anthropic_batch_image_admission {
                 "{shape}: reported a different figure than it was admitted on"
             );
         }
+    }
+}
+
+/// `/v1/completions` was the one surface with no prompt-size guard: a raw
+/// prompt of any size went straight to prefill.
+#[cfg(test)]
+mod completion_admission {
+    use super::real_checkpoint::{gemma4, with_cap};
+    use crate::types::CompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_raw_prompt_over_the_cap_is_refused() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "prompt": "The quick brown fox jumps over the lazy dog.",
+            "max_tokens": 1,
+            "temperature": 0,
+        }))
+        .expect("a valid completions request");
+
+        let tokens = with_cap(1_000_000, || engine.completion(&req))
+            .unwrap_or_else(|e| panic!("refused under a cap of 1M: {e:#}"))
+            .usage
+            .prompt_tokens;
+        let refused = match with_cap(tokens - 1, || engine.completion(&req)) {
+            Ok(_) => panic!(
+                "a {tokens}-token prompt was admitted under a cap of {}",
+                tokens - 1
+            ),
+            Err(e) => e.to_string(),
+        };
+        let expected = format!("prompt too large: {tokens} tokens > limit {}", tokens - 1);
+        assert!(refused.starts_with(&expected), "{refused}");
     }
 }
 
