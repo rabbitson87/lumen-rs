@@ -1598,8 +1598,8 @@ static DEFECTS: &[Defect] = &[
         // before the content assertions, nothing compared what came back out.
         revert: &[Mutation {
             path: MLX,
-            find: r#"                    let cached = self.offset;"#,
-            replace: r#"                    let cached = self.offset.saturating_sub(1);"#,
+            find: "        let ordered = if idx == buf {\n            old.clone()",
+            replace: "        let ordered = if idx == buf {\n            slice_axis2(old, 0, idx.saturating_sub(1) as i32)? // defect: drops a token",
         }],
         guards: &[mlx(
             "native_cache::lifecycle_tests::rotating_cache_growth_within_max_size",
@@ -1657,6 +1657,28 @@ static DEFECTS: &[Defect] = &[
         // One site since both renderers share `generation_prompt_ids` (task 016).
         occurrences: 1,
         needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "rotating-cache-trims-against-offset",
+        symptom: "Gemma 4 prompts prefilled in chunks lost in-window context \
+                  from the third chunk on. The sliding layers' rotating cache \
+                  trimmed against `offset`, every token ever pushed, instead of \
+                  the keys it held, so once a chunk had been trimmed the slice \
+                  ran past the buffer; a ring wrapped by decode was never put \
+                  back in temporal order either, and the quantized variants kept \
+                  only `max_size - S` old keys. With 512-token chunks at 3,000 \
+                  tokens the last-token logits fell to cosine 0.89 against mlx-lm",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let trim = (held + 1).saturating_sub(max_size);",
+            replace: "        let trim = (offset + 1).saturating_sub(max_size); // defect: trims against offset",
+        }],
+        guards: &[mlx(
+            "native_cache::lifecycle_tests::rotating_cache_holds_what_mlx_lm_holds",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
         extra: &["--ignored"],
     },
     Defect {
@@ -1784,6 +1806,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "parallel-tool-calls-ignored") => "types.rs",
         (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
         (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
+        (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

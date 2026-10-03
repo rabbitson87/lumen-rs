@@ -68,6 +68,62 @@ mod imp {
             .context("NativeKvCache: slice axis=2")
     }
 
+    /// One buffer of a rotating cache's multi-token update — mlx-lm's
+    /// `RotatingKVCache._update_concat`: the cached entries in temporal
+    /// order, trimmed to the `keep` sinks plus the newest `max_size - 1`, then
+    /// `new` appended. Every new query still sees a full window, so the
+    /// result holds up to `max_size - 1 + S` entries.
+    ///
+    /// `idx` and `offset` are the cache's write index and total token count
+    /// before the update. The buffer can carry zero padding past `idx`
+    /// (step-prealloc growth before the ring fills) or be a ring that S=1
+    /// decode has wrapped, its oldest entry at `idx`.
+    ///
+    /// The trim is counted against the entries actually held, never against
+    /// `offset`: once a chunk has been trimmed `offset` runs ahead of the
+    /// buffer, and trimming by it dropped in-window keys from every chunk
+    /// after the second — Gemma 4 prompts prefilled in chunks lost context.
+    fn rotating_concat(
+        old: &Array,
+        new: &Array,
+        idx: usize,
+        offset: usize,
+        keep: usize,
+        max_size: usize,
+    ) -> Result<Array> {
+        let buf = old.shape()[2] as usize;
+        let ordered = if idx == buf {
+            old.clone()
+        } else if idx < offset {
+            mlx_rs::ops::concatenate_axis(
+                &[
+                    &slice_axis2(old, 0, keep as i32)?,
+                    &slice_axis2(old, idx as i32, buf as i32)?,
+                    &slice_axis2(old, keep as i32, idx as i32)?,
+                ],
+                2,
+            )
+            .context("rotating cache: temporal order")?
+        } else {
+            slice_axis2(old, 0, idx as i32)?
+        };
+        let held = ordered.shape()[2] as usize;
+        let trim = (held + 1).saturating_sub(max_size);
+        if trim == 0 {
+            return mlx_rs::ops::concatenate_axis(&[&ordered, new], 2)
+                .context("rotating cache: append");
+        }
+        mlx_rs::ops::concatenate_axis(
+            &[
+                &slice_axis2(&ordered, 0, keep as i32)?,
+                &slice_axis2(&ordered, (trim + keep) as i32, held as i32)?,
+                new,
+            ],
+            2,
+        )
+        .context("rotating cache: trim and append")
+    }
+
     /// Block-allocated full-attention KV cache (mlx_lm.KVCache step=256 semantics).
     #[derive(Clone)]
     pub struct NativeKvCache {
@@ -891,71 +947,21 @@ mod imp {
                 return self.update_in_place(keys, values);
             }
 
-            // Legacy concat path (prefill / S>1 decode / rotation / disabled).
-            //
-            // CRITICAL — trim `old_k` to `self.offset` BEFORE concat. With
-            // step-prealloc active, `old_k.shape[2]` can include zero-padded
-            // slots past the logical `offset` (e.g., after a prior S=1
-            // `update_in_place` grew the buffer to KV_CACHE_STEP=256). A
-            // naive `concat([old_k, new_keys])` would put the new K/V at
-            // physical positions `[old_k.shape[2]..]` while the SDPA mask
-            // expects them at logical positions `[offset..offset+s)` — the
-            // mask then reads ZEROS at logical `[offset..]` and the new
-            // K/V never get attended to. Slicing first restores the
-            // logical-length invariant the rest of the code assumes.
-            //
-            // Bug surfaced 2026-05-18 via MTP Phase 5b real-prompt smoke
-            // (mtp_step's Step C uses S=K+1>1 and hit this path after
-            // Step A's S=1 grew the buffer). Echo-pattern divergence (each
-            // mtp_step's verify_logits[0] read zero K/V for the just-
-            // written next_token slot) → committed_token never advanced.
+            // Multi-token path (prefill chunks, S>1 decode, step-prealloc
+            // off): mlx-lm's `_update_concat` via `rotating_concat`. It also
+            // drops the zero padding a prior S=1 `update_in_place` left past
+            // the write index — without that, the new K/V landed at physical
+            // positions the mask did not expect and were never attended to
+            // (MTP verify, 2026-05-18).
             let (new_keys, new_values) = match (&self.keys, &self.values) {
                 (None, None) => (keys.clone(), values.clone()),
                 (Some(old_k), Some(old_v)) => {
-                    let buf_size = old_k.shape()[2] as usize;
-                    let cached = self.offset;
-                    let trim_to_logical = cached < buf_size;
-                    let old_k_logical = if trim_to_logical {
-                        slice_axis2(old_k, 0, cached as i32)?
-                    } else {
-                        old_k.clone()
-                    };
-                    let old_v_logical = if trim_to_logical {
-                        slice_axis2(old_v, 0, cached as i32)?
-                    } else {
-                        old_v.clone()
-                    };
-                    // Compute trim against the size BEFORE concatenating new keys.
-                    let trim_size = (cached + 1).saturating_sub(self.max_size);
-                    if trim_size > 0 {
-                        let head_k = slice_axis2(&old_k_logical, 0, self.keep as i32)?;
-                        let tail_k = slice_axis2(
-                            &old_k_logical,
-                            (trim_size + self.keep) as i32,
-                            cached as i32,
-                        )?;
-                        let head_v = slice_axis2(&old_v_logical, 0, self.keep as i32)?;
-                        let tail_v = slice_axis2(
-                            &old_v_logical,
-                            (trim_size + self.keep) as i32,
-                            cached as i32,
-                        )?;
-                        let combined_keys =
-                            mlx_rs::ops::concatenate_axis(&[&head_k, &tail_k, keys], 2)
-                                .context("NativeRotatingKvCache: concat keys after trim")?;
-                        let combined_values =
-                            mlx_rs::ops::concatenate_axis(&[&head_v, &tail_v, values], 2)
-                                .context("NativeRotatingKvCache: concat values after trim")?;
-                        (combined_keys, combined_values)
-                    } else {
-                        let combined_keys =
-                            mlx_rs::ops::concatenate_axis(&[&old_k_logical, keys], 2)
-                                .context("NativeRotatingKvCache: concat keys (no trim)")?;
-                        let combined_values =
-                            mlx_rs::ops::concatenate_axis(&[&old_v_logical, values], 2)
-                                .context("NativeRotatingKvCache: concat values (no trim)")?;
-                        (combined_keys, combined_values)
-                    }
+                    let (idx, offset, keep, max) =
+                        (self.idx, self.offset, self.keep, self.max_size);
+                    (
+                        rotating_concat(old_k, keys, idx, offset, keep, max)?,
+                        rotating_concat(old_v, values, idx, offset, keep, max)?,
+                    )
                 }
                 _ => unreachable!("keys/values invariant: both Some or both None"),
             };
@@ -1353,64 +1359,28 @@ mod imp {
                 return self.update_in_place_q(k_p, k_s, k_b, v_p, v_s, v_b);
             }
 
-            // Legacy concat-with-trim path — covers S>1 prefill (single-pass
-            // or chunked) and the step-prealloc-disabled fallback. Trims the
-            // existing cached span by `(cached + s) - max_size` before concat
-            // so the post-concat length never exceeds `max_size`.
+            // Multi-token path (prefill chunks, S>1 decode, step-prealloc
+            // off): mlx-lm's `_update_concat`, buffer by buffer. This used to
+            // trim to `max_size - S` old entries so the result never passed
+            // `max_size`, which left a chunk longer than the window with no
+            // previous context at all.
             let (new_k, new_v) = match (self.keys.take(), self.values.take()) {
                 (None, None) => ((k_p, k_s, k_b), (v_p, v_s, v_b)),
                 (Some((kp, ks, kb)), Some((vp, vs, vb))) => {
-                    let cached = kp.shape()[2] as usize;
-                    let trim_size = (cached + s).saturating_sub(self.max_size);
-                    if trim_size > 0 {
-                        let keep_i = self.keep as i32;
-                        let trim_keep = (trim_size + self.keep) as i32;
-                        let cached_i = cached as i32;
-                        let head_kp = slice_axis2(&kp, 0, keep_i)?;
-                        let tail_kp = slice_axis2(&kp, trim_keep, cached_i)?;
-                        let head_ks = slice_axis2(&ks, 0, keep_i)?;
-                        let tail_ks = slice_axis2(&ks, trim_keep, cached_i)?;
-                        let head_kb = slice_axis2(&kb, 0, keep_i)?;
-                        let tail_kb = slice_axis2(&kb, trim_keep, cached_i)?;
-                        let head_vp = slice_axis2(&vp, 0, keep_i)?;
-                        let tail_vp = slice_axis2(&vp, trim_keep, cached_i)?;
-                        let head_vs = slice_axis2(&vs, 0, keep_i)?;
-                        let tail_vs = slice_axis2(&vs, trim_keep, cached_i)?;
-                        let head_vb = slice_axis2(&vb, 0, keep_i)?;
-                        let tail_vb = slice_axis2(&vb, trim_keep, cached_i)?;
-                        let new_kp = mlx_rs::ops::concatenate_axis(&[&head_kp, &tail_kp, &k_p], 2)
-                            .context("RotatingQuant: concat k_packed after trim")?;
-                        let new_ks = mlx_rs::ops::concatenate_axis(&[&head_ks, &tail_ks, &k_s], 2)
-                            .context("RotatingQuant: concat k_scales after trim")?;
-                        let new_kb = mlx_rs::ops::concatenate_axis(&[&head_kb, &tail_kb, &k_b], 2)
-                            .context("RotatingQuant: concat k_biases after trim")?;
-                        let new_vp = mlx_rs::ops::concatenate_axis(&[&head_vp, &tail_vp, &v_p], 2)
-                            .context("RotatingQuant: concat v_packed after trim")?;
-                        let new_vs = mlx_rs::ops::concatenate_axis(&[&head_vs, &tail_vs, &v_s], 2)
-                            .context("RotatingQuant: concat v_scales after trim")?;
-                        let new_vb = mlx_rs::ops::concatenate_axis(&[&head_vb, &tail_vb, &v_b], 2)
-                            .context("RotatingQuant: concat v_biases after trim")?;
-                        ((new_kp, new_ks, new_kb), (new_vp, new_vs, new_vb))
-                    } else {
-                        let new_kp = mlx_rs::ops::concatenate_axis(&[&kp, &k_p], 2)
-                            .context("RotatingQuant: concat k_packed (no trim)")?;
-                        let new_ks = mlx_rs::ops::concatenate_axis(&[&ks, &k_s], 2)
-                            .context("RotatingQuant: concat k_scales (no trim)")?;
-                        let new_kb = mlx_rs::ops::concatenate_axis(&[&kb, &k_b], 2)
-                            .context("RotatingQuant: concat k_biases (no trim)")?;
-                        let new_vp = mlx_rs::ops::concatenate_axis(&[&vp, &v_p], 2)
-                            .context("RotatingQuant: concat v_packed (no trim)")?;
-                        let new_vs = mlx_rs::ops::concatenate_axis(&[&vs, &v_s], 2)
-                            .context("RotatingQuant: concat v_scales (no trim)")?;
-                        let new_vb = mlx_rs::ops::concatenate_axis(&[&vb, &v_b], 2)
-                            .context("RotatingQuant: concat v_biases (no trim)")?;
-                        ((new_kp, new_ks, new_kb), (new_vp, new_vs, new_vb))
-                    }
+                    let (idx, offset, keep, max) =
+                        (self.idx, self.offset, self.keep, self.max_size);
+                    let cat = |old: &Array, new: &Array| {
+                        rotating_concat(old, new, idx, offset, keep, max)
+                    };
+                    (
+                        (cat(&kp, &k_p)?, cat(&ks, &k_s)?, cat(&kb, &k_b)?),
+                        (cat(&vp, &v_p)?, cat(&vs, &v_s)?, cat(&vb, &v_b)?),
+                    )
                 }
                 _ => unreachable!("keys/values invariant: both Some or both None"),
             };
             self.offset += s;
-            // After concat path, idx tracks the actual cached size (capped at max_size).
+            // After the concat path, idx is the number of entries held.
             self.idx = new_k.0.shape()[2] as usize;
             self.keys = Some((new_k.0.clone(), new_k.1.clone(), new_k.2.clone()));
             self.values = Some((new_v.0.clone(), new_v.1.clone(), new_v.2.clone()));
@@ -1908,7 +1878,8 @@ mod imp {
                 return self.update_in_place_tq(k_codes, k_sigma, v_codes, v_sigma);
             }
 
-            // Legacy concat-with-trim path (S>1 prefill or step-prealloc off).
+            // Multi-token path (S>1 prefill or step-prealloc off): mlx-lm's
+            // `_update_concat`, buffer by buffer (see `rotating_concat`).
             let (new_k_codes, new_k_sigma, new_v_codes, new_v_sigma) = match (
                 self.keys_codes.take(),
                 self.keys_sigma.take(),
@@ -1922,42 +1893,17 @@ mod imp {
                     v_sigma.clone(),
                 ),
                 (Some(kc), Some(ks), Some(vc), Some(vs)) => {
-                    let cached = kc.shape()[2] as usize;
-                    let trim_size = (cached + s).saturating_sub(self.max_size);
-                    let cached_i = cached as i32;
-                    let keep_i = self.keep as i32;
-                    let trim_keep = (trim_size + self.keep) as i32;
-                    if trim_size > 0 {
-                        let head_kc = slice_axis2(&kc, 0, keep_i)?;
-                        let tail_kc = slice_axis2(&kc, trim_keep, cached_i)?;
-                        let head_ks = slice_axis2(&ks, 0, keep_i)?;
-                        let tail_ks = slice_axis2(&ks, trim_keep, cached_i)?;
-                        let head_vc = slice_axis2(&vc, 0, keep_i)?;
-                        let tail_vc = slice_axis2(&vc, trim_keep, cached_i)?;
-                        let head_vs = slice_axis2(&vs, 0, keep_i)?;
-                        let tail_vs = slice_axis2(&vs, trim_keep, cached_i)?;
-                        (
-                            mlx_rs::ops::concatenate_axis(&[&head_kc, &tail_kc, k_codes], 2)
-                                .context("TurboQuant: concat k_codes after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_ks, &tail_ks, k_sigma], 2)
-                                .context("TurboQuant: concat k_sigma after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_vc, &tail_vc, v_codes], 2)
-                                .context("TurboQuant: concat v_codes after trim")?,
-                            mlx_rs::ops::concatenate_axis(&[&head_vs, &tail_vs, v_sigma], 2)
-                                .context("TurboQuant: concat v_sigma after trim")?,
-                        )
-                    } else {
-                        (
-                            mlx_rs::ops::concatenate_axis(&[&kc, k_codes], 2)
-                                .context("TurboQuant: concat k_codes (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&ks, k_sigma], 2)
-                                .context("TurboQuant: concat k_sigma (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&vc, v_codes], 2)
-                                .context("TurboQuant: concat v_codes (no trim)")?,
-                            mlx_rs::ops::concatenate_axis(&[&vs, v_sigma], 2)
-                                .context("TurboQuant: concat v_sigma (no trim)")?,
-                        )
-                    }
+                    let (idx, offset, keep, max) =
+                        (self.idx, self.offset, self.keep, self.max_size);
+                    let cat = |old: &Array, new: &Array| {
+                        rotating_concat(old, new, idx, offset, keep, max)
+                    };
+                    (
+                        cat(&kc, k_codes)?,
+                        cat(&ks, k_sigma)?,
+                        cat(&vc, v_codes)?,
+                        cat(&vs, v_sigma)?,
+                    )
                 }
                 _ => unreachable!("TurboQuant cache invariant: all four fields move in lockstep"),
             };
@@ -2181,8 +2127,8 @@ mod imp {
                     .update_in_place_tq_qjl(k_codes, k_sigma, k_signs, k_rnorm, v_codes, v_sigma);
             }
 
-            // Legacy concat-with-trim path mirroring update_and_fetch but
-            // operating on six buffers.
+            // Multi-token path: mlx-lm's `_update_concat` on all six buffers
+            // (see `rotating_concat`).
             let (new_k_codes, new_k_sigma, new_k_signs, new_k_rnorm, new_v_codes, new_v_sigma) =
                 match (
                     self.keys_codes.take(),
@@ -2201,54 +2147,19 @@ mod imp {
                         v_sigma.clone(),
                     ),
                     (Some(kc), Some(ks), Some(ksg), Some(krn), Some(vc), Some(vs)) => {
-                        let cached = kc.shape()[2] as usize;
-                        let trim_size = (cached + s).saturating_sub(self.max_size);
-                        let cached_i = cached as i32;
-                        let keep_i = self.keep as i32;
-                        let trim_keep = (trim_size + self.keep) as i32;
-                        if trim_size > 0 {
-                            let head_kc = slice_axis2(&kc, 0, keep_i)?;
-                            let tail_kc = slice_axis2(&kc, trim_keep, cached_i)?;
-                            let head_ks = slice_axis2(&ks, 0, keep_i)?;
-                            let tail_ks = slice_axis2(&ks, trim_keep, cached_i)?;
-                            let head_ksg = slice_axis2(&ksg, 0, keep_i)?;
-                            let tail_ksg = slice_axis2(&ksg, trim_keep, cached_i)?;
-                            let head_krn = slice_axis2(&krn, 0, keep_i)?;
-                            let tail_krn = slice_axis2(&krn, trim_keep, cached_i)?;
-                            let head_vc = slice_axis2(&vc, 0, keep_i)?;
-                            let tail_vc = slice_axis2(&vc, trim_keep, cached_i)?;
-                            let head_vs = slice_axis2(&vs, 0, keep_i)?;
-                            let tail_vs = slice_axis2(&vs, trim_keep, cached_i)?;
-                            (
-                                mlx_rs::ops::concatenate_axis(&[&head_kc, &tail_kc, k_codes], 2)
-                                    .context("TurboQuant(qjl): concat k_codes after trim")?,
-                                mlx_rs::ops::concatenate_axis(&[&head_ks, &tail_ks, k_sigma], 2)
-                                    .context("TurboQuant(qjl): concat k_sigma after trim")?,
-                                mlx_rs::ops::concatenate_axis(&[&head_ksg, &tail_ksg, k_signs], 2)
-                                    .context("TurboQuant(qjl): concat k_signs after trim")?,
-                                mlx_rs::ops::concatenate_axis(&[&head_krn, &tail_krn, k_rnorm], 2)
-                                    .context("TurboQuant(qjl): concat k_rnorm after trim")?,
-                                mlx_rs::ops::concatenate_axis(&[&head_vc, &tail_vc, v_codes], 2)
-                                    .context("TurboQuant(qjl): concat v_codes after trim")?,
-                                mlx_rs::ops::concatenate_axis(&[&head_vs, &tail_vs, v_sigma], 2)
-                                    .context("TurboQuant(qjl): concat v_sigma after trim")?,
-                            )
-                        } else {
-                            (
-                                mlx_rs::ops::concatenate_axis(&[&kc, k_codes], 2)
-                                    .context("TurboQuant(qjl): concat k_codes (no trim)")?,
-                                mlx_rs::ops::concatenate_axis(&[&ks, k_sigma], 2)
-                                    .context("TurboQuant(qjl): concat k_sigma (no trim)")?,
-                                mlx_rs::ops::concatenate_axis(&[&ksg, k_signs], 2)
-                                    .context("TurboQuant(qjl): concat k_signs (no trim)")?,
-                                mlx_rs::ops::concatenate_axis(&[&krn, k_rnorm], 2)
-                                    .context("TurboQuant(qjl): concat k_rnorm (no trim)")?,
-                                mlx_rs::ops::concatenate_axis(&[&vc, v_codes], 2)
-                                    .context("TurboQuant(qjl): concat v_codes (no trim)")?,
-                                mlx_rs::ops::concatenate_axis(&[&vs, v_sigma], 2)
-                                    .context("TurboQuant(qjl): concat v_sigma (no trim)")?,
-                            )
-                        }
+                        let (idx, offset, keep, max) =
+                            (self.idx, self.offset, self.keep, self.max_size);
+                        let cat = |old: &Array, new: &Array| {
+                            rotating_concat(old, new, idx, offset, keep, max)
+                        };
+                        (
+                            cat(&kc, k_codes)?,
+                            cat(&ks, k_sigma)?,
+                            cat(&ksg, k_signs)?,
+                            cat(&krn, k_rnorm)?,
+                            cat(&vc, v_codes)?,
+                            cat(&vs, v_sigma)?,
+                        )
                     }
                     _ => {
                         unreachable!("TurboQuant cache (qjl): all six fields must move in lockstep")
@@ -3057,6 +2968,89 @@ mod lifecycle_tests {
                 assert_eq!(c.cached_len(), 8, "prealloc={prealloc}: buffer full");
                 assert_eq!(kf.shape()[2], 8, "prealloc={prealloc}: full buffer");
             });
+        }
+    }
+
+    /// Keys labelled with their token position, `[1, 1, n, 1]`.
+    fn positions(from: usize, n: usize) -> Array {
+        let data: Vec<f32> = (from..from + n).map(|p| p as f32).collect();
+        Array::from_slice(&data, &[1, 1, n as i32, 1])
+    }
+
+    /// The positions mlx-lm's `RotatingKVCache` holds, oldest first.
+    struct MlxLmRing {
+        held: Vec<usize>,
+        max: usize,
+        keep: usize,
+    }
+
+    impl MlxLmRing {
+        fn update(&mut self, new: std::ops::Range<usize>) {
+            if new.len() == 1 {
+                // `_update_in_place`: a long prefill is trimmed to `max` once,
+                // then a full ring overwrites its oldest non-sink entry.
+                if self.held.len() > self.max {
+                    let trim = self.held.len() - self.max;
+                    self.held.drain(self.keep..self.keep + trim);
+                }
+                if self.held.len() == self.max {
+                    self.held.remove(self.keep);
+                }
+            } else {
+                // `_update_concat`: keep `max - 1` so each new query sees a
+                // full window.
+                let trim = (self.held.len() + 1).saturating_sub(self.max);
+                if trim > 0 {
+                    self.held.drain(self.keep..self.keep + trim);
+                }
+            }
+            self.held.extend(new);
+        }
+    }
+
+    /// Every update returns exactly the keys mlx-lm's cache holds — in
+    /// temporal order after a multi-token update, as a set after a
+    /// single-token one (decode writes a ring). It covers chunks shorter and
+    /// longer than the window, chunks after a trim (where `offset` runs
+    /// ahead of the keys held), chunks after the ring wrapped, and sinks,
+    /// on both append strategies. Trimming against `offset` dropped
+    /// in-window keys from the third chunk on; this caught it.
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn rotating_cache_holds_what_mlx_lm_holds() {
+        let plan = [
+            5usize, 1, 1, 1, 1, 1, 1, 3, 12, 4, 4, 1, 1, 1, 2, 20, 1, 6, 6,
+        ];
+        for keep in [0usize, 2] {
+            for prealloc in [false, true] {
+                super::imp::kv_step_prealloc::with(prealloc, || {
+                    let mut cache = NativeRotatingKvCache::new(8, keep);
+                    let mut ring = MlxLmRing {
+                        held: Vec::new(),
+                        max: 8,
+                        keep,
+                    };
+                    let mut at = 0;
+                    for (step, &s) in plan.iter().enumerate() {
+                        let keys = positions(at, s);
+                        let (got, _) = cache.update_and_fetch(&keys, &keys).unwrap();
+                        ring.update(at..at + s);
+                        at += s;
+                        got.eval().unwrap();
+                        let mut got: Vec<usize> =
+                            got.as_slice::<f32>().iter().map(|&p| p as usize).collect();
+                        let mut want = ring.held.clone();
+                        if s == 1 {
+                            got.sort_unstable();
+                            want.sort_unstable();
+                        }
+                        assert_eq!(
+                            got, want,
+                            "keep={keep} prealloc={prealloc} step {step} (S={s})"
+                        );
+                    }
+                });
+            }
         }
     }
 
