@@ -2612,49 +2612,63 @@ pub(crate) mod imp {
         })
     }
 
-    /// Whether `kernel` computes sliding-window attention: one call compared
-    /// with attention under an explicit window mask (mlx-lm's rule). The queries
-    /// sit far enough past the window that the kernel skips K blocks
-    /// (`kb_start` > 0), at an offset that is not block-aligned — the shape
-    /// both bugs of the pre-fix kernel showed on (max abs diff 0.1-0.8; the
-    /// fixed kernel is within one bf16 step, < 0.02).
+    /// Whether `kernel` computes sliding-window attention, against attention
+    /// under an explicit window mask (mlx-lm's rule), on three calls chosen so
+    /// that every defect the fork's kernel has had shows on both of its tile
+    /// layouts (32x16 steel, 64x32 NAX — NAX is picked per device, not per
+    /// shape, so on an M5 this runs the NAX kernel real requests would get):
+    ///
+    /// * 60 queries over 2,000 keys and over 2,048 keys: queries past the window
+    ///   at offsets (1,940 / 1,988) that are aligned to neither tile, so the
+    ///   kernel skips K blocks (`kb_start` > 0), the window edge falls mid-block,
+    ///   and the causal diagonal starts mid-block with the key count both
+    ///   unaligned (2,000 on 32-key tiles) and aligned (2,048);
+    /// * one pass over 1,100 tokens: the shape of a plain prefill just past
+    ///   the window.
+    ///
+    /// The pre-fix kernels missed by 0.03-0.8; the fixed one stays within one
+    /// bf16 step (< 0.02). Two query heads per KV head, as Gemma 4's 16/8.
     fn windowed_kernel_agrees(
         kernel: impl Fn(&Array, &Array, &Array, f32, i32) -> Result<Array>,
     ) -> Result<()> {
         const WINDOW: usize = 1024;
-        // Queries at 1940..2000: K blocks below 913 are skipped, and
-        // (1940 + 1) mod 16 = 5 puts the window edge mid-block.
-        let (q_len, k_len) = (60usize, 2000usize);
         let normal = |shape: &[i32], seed: u64| -> Result<Array> {
             let key = mlx_rs::random::key(seed)?;
             Ok(mlx_rs::random::normal::<f32>(shape, None, None, &key)?
                 .as_dtype(mlx_rs::Dtype::Bfloat16)?)
         };
-        let q = normal(&[1, 2, q_len as i32, 256], 0x5eed)?;
-        let k = normal(&[1, 1, k_len as i32, 256], 0x5eee)?;
-        let v = normal(&[1, 1, k_len as i32, 256], 0x5eef)?;
-        let scale = 1.0 / 16.0;
-        let got = kernel(&q, &k, &v, scale, WINDOW as i32)?;
-        let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(WINDOW))?
-            .ok_or_else(|| anyhow!("no mask for a multi-token query"))?;
-        let want = sdpa_with_mask(&q, &k, &v, scale, &mask)?;
         let flat = |a: &Array| -> Result<Array> {
             let a = a.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1])?;
             a.eval()?;
             Ok(a)
         };
-        let (got, want) = (flat(&got)?, flat(&want)?);
-        let worst = got
-            .as_slice::<f32>()
-            .iter()
-            .zip(want.as_slice::<f32>())
-            .map(|(a, b)| (a - b).abs())
-            // `f32::max` would skip a NaN; a kernel producing one must fail.
-            .fold(0f32, |m, d| if d.is_nan() || d > m { d } else { m });
-        if worst.is_nan() || worst > 0.05 {
-            return Err(anyhow!(
-                "differs from explicit-mask attention by up to {worst:.3}"
-            ));
+        for (i, (q_len, k_len)) in [(60usize, 2000usize), (60, 2048), (1100, 1100)]
+            .into_iter()
+            .enumerate()
+        {
+            let seed = 0x5eed + 3 * i as u64;
+            let q = normal(&[1, 2, q_len as i32, 256], seed)?;
+            let k = normal(&[1, 1, k_len as i32, 256], seed + 1)?;
+            let v = normal(&[1, 1, k_len as i32, 256], seed + 2)?;
+            let scale = 1.0 / 16.0;
+            let got = kernel(&q, &k, &v, scale, WINDOW as i32)?;
+            let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(WINDOW))?
+                .ok_or_else(|| anyhow!("no mask for a multi-token query"))?;
+            let want = sdpa_with_mask(&q, &k, &v, scale, &mask)?;
+            let (got, want) = (flat(&got)?, flat(&want)?);
+            let worst = got
+                .as_slice::<f32>()
+                .iter()
+                .zip(want.as_slice::<f32>())
+                .map(|(a, b)| (a - b).abs())
+                // `f32::max` would skip a NaN; a kernel producing one must fail.
+                .fold(0f32, |m, d| if d.is_nan() || d > m { d } else { m });
+            if worst.is_nan() || worst > 0.05 {
+                return Err(anyhow!(
+                    "{q_len} queries over {k_len} keys differ from explicit-mask \
+                     attention by up to {worst:.3}"
+                ));
+            }
         }
         Ok(())
     }

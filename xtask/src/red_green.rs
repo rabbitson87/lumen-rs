@@ -1705,8 +1705,8 @@ static DEFECTS: &[Defect] = &[
                   (it caught a second, causal-mask bug in the fork this way)",
         revert: &[Mutation {
             path: MLX,
-            find: "        if worst.is_nan() || worst > 0.05 {",
-            replace: "        if false && worst > 0.0 { // defect: kernel trusted unchecked",
+            find: "            if worst.is_nan() || worst > 0.05 {",
+            replace: "            if false && worst > 0.0 { // defect: kernel trusted unchecked",
         }],
         guards: &[mlx(
             "gemma4_moe::imp::tests::the_windowed_kernel_self_check_tells_right_from_wrong",
