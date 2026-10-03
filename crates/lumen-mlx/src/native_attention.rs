@@ -822,7 +822,7 @@ mod parity_tests {
 // window's left edge went unmasked one block early.
 #[cfg(all(test, feature = "mlx-native"))]
 mod windowed_kernel_tests {
-    use super::imp::{build_causal_mask_abs, sdpa_with_mask};
+    use super::imp::{build_causal_mask_abs, sdpa, sdpa_with_mask};
     use mlx_rs::{Array, Dtype, random};
 
     /// Cosine over every element, and the largest absolute difference.
@@ -873,6 +873,9 @@ mod windowed_kernel_tests {
             (25, 1048),
             (2048, 2648),
             (1000, 2500),
+            (60, 2000),
+            (64, 2004),
+            (60, 3000),
         ];
         let mut failures = Vec::new();
         for (i, &(q_len, k_len)) in shapes.iter().enumerate() {
@@ -901,6 +904,55 @@ mod windowed_kernel_tests {
         assert!(
             failures.is_empty(),
             "windowed kernel disagrees: {failures:#?}"
+        );
+    }
+
+    /// The same kernel family's plain causal path (no window), which every
+    /// prefill and prefix-cache continuation takes for full-attention layers,
+    /// against an explicit causal mask. The fork masked the diagonal over only
+    /// the last ceil(BQ/BK) K blocks, one short whenever the query offset was
+    /// not a multiple of 16, so some rows saw up to 15 future keys (ported
+    /// from upstream's fix, ml-explore/mlx #3271).
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn causal_kernel_matches_an_explicit_causal_mask() {
+        let shapes = [
+            (600, 600),
+            (2048, 2048),
+            (2048, 3071),
+            (25, 1048),
+            (60, 2000),
+            (64, 2004),
+            (1000, 2500),
+            (37, 1589),
+        ];
+        let mut failures = Vec::new();
+        for (i, &(q_len, k_len)) in shapes.iter().enumerate() {
+            let seed = 7000 + 1000 * i as u64;
+            // head_dim 128: without a window the steel kernel serves 64/80/128
+            // only (256 falls back to the unfused path, which is not under test).
+            let q = normal(&[1, 16, q_len as i32, 128], seed);
+            let k = normal(&[1, 8, k_len as i32, 128], seed + 1);
+            let v = normal(&[1, 8, k_len as i32, 128], seed + 2);
+            let scale = 1.0 / (128f32).sqrt();
+            let kernel = sdpa(&q, &k, &v, scale, true).expect("causal kernel");
+            let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, None)
+                .expect("mask")
+                .expect("a multi-token query needs a mask");
+            let reference = sdpa_with_mask(&q, &k, &v, scale, &mask).expect("explicit mask");
+            let (cos, worst) = agreement(&kernel, &reference);
+            eprintln!(
+                "[causal-kernel] q={q_len:5} k={k_len:5} cos={cos:.6} max_abs_diff={worst:.4}"
+            );
+            if cos < 0.9999 || worst > 0.05 {
+                failures.push(format!(
+                    "q={q_len} k={k_len}: cos {cos:.5}, max diff {worst:.3}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "causal kernel disagrees: {failures:#?}"
         );
     }
 }

@@ -2572,6 +2572,93 @@ pub(crate) mod imp {
         Ok(built)
     }
 
+    /// Whether sliding-layer prefill uses the MLX fork's windowed steel kernel
+    /// (`lumen_sdpa_windowed`), which skips K blocks outside the window: ~5%
+    /// off a cold 11.9K-token prefill. On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`,
+    /// and only after the kernel this build carries passes
+    /// `windowed_kernel_agrees`. Until rabbitson87/mlx 8a2587df the kernel read
+    /// the wrong K/V blocks once a forward held more than `sliding_window` keys
+    /// (long Gemma 4 prompts answered with garbage), and until 23b42543 its
+    /// causal mask let some rows see future keys at unaligned query offsets.
+    /// mlx-c fetches the fork by branch, so an MLX build cached from before
+    /// those commits still has the old kernel. The check turns it into a log line and the explicit-mask path,
+    /// which matches mlx-lm on every build. Decided once per process.
+    pub fn windowed_kernel_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED").as_deref() == Ok("0") {
+                eprintln!("[gemma4] windowed attention kernel: off (LUMEN_GEMMA4_SDPA_WINDOWED=0)");
+                return false;
+            }
+            let stream = mlx_rs::Stream::gpu();
+            let kernel = |q: &Array, k: &Array, v: &Array, scale: f32, window: i32| {
+                mlx_rs::metal::lumen_sdpa_windowed(q, k, v, scale, window, &stream)
+                    .map_err(|e| anyhow!("lumen_sdpa_windowed: {e}"))
+            };
+            match windowed_kernel_agrees(kernel) {
+                Ok(()) => {
+                    eprintln!("[gemma4] windowed attention kernel: on (self-check passed)");
+                    true
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gemma4] windowed attention kernel: off, self-check failed ({e:#}). \
+                         The MLX build likely predates rabbitson87/mlx 23b42543; \
+                         `cargo clean -p mlx-sys` refetches it. Prefill uses the explicit mask."
+                    );
+                    false
+                }
+            }
+        })
+    }
+
+    /// Whether `kernel` computes sliding-window attention: one call compared
+    /// with attention under an explicit window mask (mlx-lm's rule). The queries
+    /// sit far enough past the window that the kernel skips K blocks
+    /// (`kb_start` > 0), at an offset that is not block-aligned — the shape
+    /// both bugs of the pre-fix kernel showed on (max abs diff 0.1-0.8; the
+    /// fixed kernel is within one bf16 step, < 0.02).
+    fn windowed_kernel_agrees(
+        kernel: impl Fn(&Array, &Array, &Array, f32, i32) -> Result<Array>,
+    ) -> Result<()> {
+        const WINDOW: usize = 1024;
+        // Queries at 1940..2000: K blocks below 913 are skipped, and
+        // (1940 + 1) mod 16 = 5 puts the window edge mid-block.
+        let (q_len, k_len) = (60usize, 2000usize);
+        let normal = |shape: &[i32], seed: u64| -> Result<Array> {
+            let key = mlx_rs::random::key(seed)?;
+            Ok(mlx_rs::random::normal::<f32>(shape, None, None, &key)?
+                .as_dtype(mlx_rs::Dtype::Bfloat16)?)
+        };
+        let q = normal(&[1, 2, q_len as i32, 256], 0x5eed)?;
+        let k = normal(&[1, 1, k_len as i32, 256], 0x5eee)?;
+        let v = normal(&[1, 1, k_len as i32, 256], 0x5eef)?;
+        let scale = 1.0 / 16.0;
+        let got = kernel(&q, &k, &v, scale, WINDOW as i32)?;
+        let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(WINDOW))?
+            .ok_or_else(|| anyhow!("no mask for a multi-token query"))?;
+        let want = sdpa_with_mask(&q, &k, &v, scale, &mask)?;
+        let flat = |a: &Array| -> Result<Array> {
+            let a = a.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1])?;
+            a.eval()?;
+            Ok(a)
+        };
+        let (got, want) = (flat(&got)?, flat(&want)?);
+        let worst = got
+            .as_slice::<f32>()
+            .iter()
+            .zip(want.as_slice::<f32>())
+            .map(|(a, b)| (a - b).abs())
+            // `f32::max` would skip a NaN; a kernel producing one must fail.
+            .fold(0f32, |m, d| if d.is_nan() || d > m { d } else { m });
+        if worst.is_nan() || worst > 0.05 {
+            return Err(anyhow!(
+                "differs from explicit-mask attention by up to {worst:.3}"
+            ));
+        }
+        Ok(())
+    }
+
     // ───────────────────────── quant param resolver ─────────────────────────
 
     /// Resolve `(group_size, bits, mode)` for a tensor whose safetensors path
@@ -3512,6 +3599,9 @@ pub(crate) mod imp {
                 .find(|(_, k)| matches!(**k, NativeGemma4LayerType::SlidingAttention))
                 .map(|(i, _)| i);
 
+            // Decide the sliding-window kernel now (a one-off self-check), not
+            // inside the first request's forward.
+            windowed_kernel_enabled();
             Ok(Self {
                 config: cfg,
                 embed_tokens,
@@ -5142,22 +5232,9 @@ pub(crate) mod imp {
             //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
             //   - dtype bf16
             //
-            // OFF by default; `LUMEN_GEMMA4_SDPA_WINDOWED=1` opts in. Until
-            // rabbitson87/mlx 8a2587df the kernel read the wrong keys once a
-            // forward held more than `sliding_window` of them: its K/V loads
-            // started at block 0 while the loop and masks started at
-            // `kb_start`, and its left-edge mask stopped one block short for
-            // query offsets other than 0 or W-1 mod 16. Long Gemma 4 prompts
-            // answered with garbage (last-token cosine against mlx-lm 0.2-0.9
-            // past 1,024 tokens). Fixed, it matches the explicit-mask path
-            // (`native_attention::windowed_kernel_tests`) and saves ~5% of a
-            // cold 11.9K-token prefill. It stays opt-in because mlx-c fetches
-            // the fork by branch: an MLX build cached from before the fix
-            // keeps the broken kernel, and nothing would say so. The explicit
-            // mask path below matches mlx-lm on every build.
-            let sdpa_windowed_enabled = std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+            // On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`, and only once this
+            // build's kernel has passed its self-check (`windowed_kernel_enabled`).
+            let sdpa_windowed_enabled = windowed_kernel_enabled();
             // Chunked-prefill rotation support (2026-05-15 follow-up): the
             // steel kernel's window check `row_pos - col_pos >= W` is
             // computed in K-relative coordinates (both row_pos and col_pos
@@ -8220,6 +8297,31 @@ pub(crate) mod imp {
                 prompt.len(),
                 mean_ms,
                 tps
+            );
+        }
+
+        /// The kernel self-check accepts attention that honours the window and
+        /// rejects attention that does not — tested with stand-ins, so it holds
+        /// whichever kernel this build's MLX carries.
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn the_windowed_kernel_self_check_tells_right_from_wrong() {
+            let exact = |q: &Array, k: &Array, v: &Array, scale: f32, window: i32| {
+                let (q_len, k_len) = (q.shape()[2] as usize, k.shape()[2] as usize);
+                let mask =
+                    build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(window as usize))?
+                        .expect("a multi-token query needs a mask");
+                sdpa_with_mask(q, k, v, scale, &mask)
+            };
+            assert!(
+                windowed_kernel_agrees(exact).is_ok(),
+                "exact windowed attention"
+            );
+            let no_window =
+                |q: &Array, k: &Array, v: &Array, scale: f32, _: i32| sdpa(q, k, v, scale, true);
+            assert!(
+                windowed_kernel_agrees(no_window).is_err(),
+                "attention that ignores the window must fail the check"
             );
         }
 

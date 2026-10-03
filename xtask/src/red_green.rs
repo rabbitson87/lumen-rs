@@ -1695,6 +1695,27 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "windowed-kernel-used-unchecked",
+        symptom: "the windowed steel kernel is on by default, and mlx-c fetches \
+                  the MLX fork by branch: a build cached from before \
+                  rabbitson87/mlx 8a2587df / 23b42543 keeps a kernel that read \
+                  the wrong K/V blocks, and Gemma 4 long prompts came back as \
+                  garbage with nothing logged. The load-time self-check compares \
+                  the kernel with explicit-mask attention first and falls back \
+                  (it caught a second, causal-mask bug in the fork this way)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        if worst.is_nan() || worst > 0.05 {",
+            replace: "        if false && worst > 0.0 { // defect: kernel trusted unchecked",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::the_windowed_kernel_self_check_tells_right_from_wrong",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "fastokens-split-cache-reads-past-the-prefix",
         symptom: "fastokens 0.3.2 as published gave the same string different ids \
                   depending on what the thread encoded before: on every Qwen \
@@ -1820,6 +1841,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
         (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
+        (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
