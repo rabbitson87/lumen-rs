@@ -877,10 +877,14 @@ static DEFECTS: &[Defect] = &[
             find: "            let close_thought_channel = response_schema.is_some();",
             replace: "            let close_thought_channel = false; // defect: channel left open",
         }],
-        guards: &[srv_checkpoint(
-            "engine::gemma_structured_stream::a_cached_stream_with_response_format_returns_the_schema",
+        // The end-to-end test (`engine::gemma_structured_stream`) went green
+        // with the defect once sliding-layer attention changed numerics: an
+        // open channel under a JSON grammar degenerates or not depending on
+        // rounding. The guard checks the ids both cached routes render.
+        guards: &[mlx_checkpoint(
+            "gemma4_backend::imp::tests::a_cached_route_closes_the_thought_channel_for_a_schema",
         )],
-        occurrences: 2, // the flat route and the history route
+        occurrences: 1, // `cached_prompt_and_prefill`, shared by both cached routes
         needs_checkpoint: true,
         extra: &["--ignored"],
     },

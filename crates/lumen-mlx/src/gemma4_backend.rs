@@ -593,6 +593,13 @@ pub(crate) mod imp {
         position: usize,
     }
 
+    /// What a prefix-cached route renders its prompt from.
+    #[derive(Clone, Copy)]
+    enum CachedPrompt<'m, 't> {
+        Flat(&'m [(String, String)]),
+        History(&'m [crate::chat_io::ChatTurn<'t>]),
+    }
+
     pub struct Gemma4Backend {
         model: NativeGemma4Model,
         /// Phase 3: per-seq live decode caches keyed by seq_id, for the batched
@@ -1928,6 +1935,40 @@ pub(crate) mod imp {
         }
 
         /// History variant of `build_prompt_and_prefill`.
+        /// The prompt and prefill both prefix-cached routes send. A JSON
+        /// grammar masks from token 0, so with a schema the prompt has to close
+        /// the thought channel the model would otherwise open there — as every
+        /// uncached route does (`gemma-thought-channel`). One place decides it,
+        /// so a test can check what the routes actually run. Returns the
+        /// decision too: the generation tail's length depends on it.
+        fn cached_prompt_and_prefill(
+            &self,
+            input: CachedPrompt<'_, '_>,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+        ) -> Result<(Vec<u32>, Vec<u32>, bool)> {
+            let close_thought_channel = response_schema.is_some();
+            let (prompt, prefill) = match input {
+                CachedPrompt::Flat(messages) => self.build_prompt_and_prefill(
+                    messages,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    close_thought_channel,
+                ),
+                CachedPrompt::History(turns) => self.build_prompt_and_prefill_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    close_thought_channel,
+                ),
+            }?;
+            Ok((prompt, prefill, close_thought_channel))
+        }
+
         fn build_prompt_and_prefill_from_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -2488,16 +2529,12 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            // A JSON grammar masks from token 0, so the prompt has to close the
-            // thought channel the model would otherwise open there — as every
-            // uncached route does (`gemma-thought-channel`).
-            let close_thought_channel = response_schema.is_some();
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill(
-                messages,
+            let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
+                CachedPrompt::Flat(messages),
                 thinking,
                 tools,
                 tool_choice,
-                close_thought_channel,
+                response_schema,
             )?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
@@ -2602,14 +2639,12 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            // See `chat_streaming_with_prefix_cache`.
-            let close_thought_channel = response_schema.is_some();
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
-                turns,
+            let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
+                CachedPrompt::History(turns),
                 thinking,
                 tools,
                 tool_choice,
-                close_thought_channel,
+                response_schema,
             )?;
             if prompt.is_empty() {
                 return Err(anyhow!(
@@ -4227,6 +4262,65 @@ pub(crate) mod imp {
         use std::path::Path;
 
         const LMSTUDIO_DIR: &str = "/path/to/models/gemma-4-26b-a4b-mlx-4bit";
+
+        /// With a schema, the cached routes render exactly what the uncached
+        /// routes do: the thought channel closed. Checked on the token ids
+        /// rather than on the model's output — whether an open channel under
+        /// a JSON grammar degenerates depends on bf16 rounding, and the
+        /// output-based guard stopped seeing it when the attention path changed.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn a_cached_route_closes_the_thought_channel_for_a_schema() {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return;
+            };
+            let backend = Gemma4Backend::from_dir("gemma-4", &dir).expect("load backend");
+            let messages = vec![
+                (
+                    "system".to_string(),
+                    "You are a terse assistant.".to_string(),
+                ),
+                (
+                    "user".to_string(),
+                    "Summarize Romeo and Juliet.".to_string(),
+                ),
+            ];
+            let auto = crate::chat_io::ResolvedToolChoice::Auto;
+            let schema = serde_json::json!({"type": "object"});
+            let cached = |schema| {
+                let (prompt, prefill, _) = backend
+                    .cached_prompt_and_prefill(
+                        CachedPrompt::Flat(&messages),
+                        false,
+                        &[],
+                        &auto,
+                        schema,
+                    )
+                    .expect("cached prompt");
+                (prompt, prefill)
+            };
+            let uncached = |close| {
+                backend
+                    .build_prompt_and_prefill(&messages, false, &[], &auto, close)
+                    .expect("uncached prompt")
+            };
+            assert_eq!(
+                cached(Some(&schema)),
+                uncached(true),
+                "a schema closes the channel"
+            );
+            assert_eq!(
+                cached(None),
+                uncached(false),
+                "no schema leaves the prompt alone"
+            );
+            assert_ne!(
+                uncached(true),
+                uncached(false),
+                "closing the channel adds tokens"
+            );
+        }
 
         fn dir_present() -> bool {
             Path::new(LMSTUDIO_DIR).exists()
