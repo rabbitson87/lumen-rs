@@ -5141,10 +5141,22 @@ pub(crate) mod imp {
             //   - no rotation (kv_actual == kv_offset + l)
             //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
             //   - dtype bf16
-            // Env: LUMEN_GEMMA4_SDPA_WINDOWED=0 opts out.
+            //
+            // OFF by default; `LUMEN_GEMMA4_SDPA_WINDOWED=1` opts in. The
+            // kernel's left-edge window mask covers only the first
+            // ceil(BQ/BK) K-blocks after `kb_start`, but when a Q tile's
+            // lowest in-window key is not block-aligned the band spans one
+            // block more, and those keys stay unmasked. Any sliding layer
+            // that sees more than `sliding_window` keys in one forward got
+            // attention past its window: against mlx-lm, last-token logits
+            // fell from cos 0.995 to 0.2-0.9 beyond 1,024 tokens, and long
+            // Gemma 4 prompts answered with garbage. The explicit-mask path
+            // below matches mlx-lm. Re-enable once the fork's kernel is fixed
+            // and `chunked_and_continued_prefill_match_one_pass` passes with
+            // it on.
             let sdpa_windowed_enabled = std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+                .map(|v| v == "1")
+                .unwrap_or(false);
             // Chunked-prefill rotation support (2026-05-15 follow-up): the
             // steel kernel's window check `row_pos - col_pos >= W` is
             // computed in K-relative coordinates (both row_pos and col_pos
@@ -8207,6 +8219,169 @@ pub(crate) mod imp {
                 prompt.len(),
                 mean_ms,
                 tps
+            );
+        }
+
+        /// Last-token logits as f32.
+        fn logits_f32(logits: &Array) -> Vec<f32> {
+            let l = logits
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .expect("cast logits");
+            l.eval().expect("eval logits");
+            l.as_slice::<f32>().to_vec()
+        }
+
+        /// Cosine similarity of `b` to the reference `a`, and whether `b`'s
+        /// top token is also `a`'s — within 0.5 of `a`'s best logit, since
+        /// some positions are exact ties.
+        fn agreement(a: &[f32], b: &[f32]) -> (f64, bool) {
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (&x, &y) in a.iter().zip(b) {
+                dot += x as f64 * y as f64;
+                na += x as f64 * x as f64;
+                nb += y as f64 * y as f64;
+            }
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|x, y| x.1.total_cmp(y.1))
+                    .map_or(0, |(i, _)| i)
+            };
+            let same_top = a[argmax(b)] >= a[argmax(a)] - 0.5;
+            (dot / (na.sqrt() * nb.sqrt()), same_top)
+        }
+
+        /// Prefilling in chunks, or continuing a cache past its head, must
+        /// give the logits one pass gives. The sliding layers (window 1024)
+        /// are where it went wrong. The windowed steel kernel attended past
+        /// the window once a forward held more than 1,024 keys, and the
+        /// rotating cache trimmed against `offset` instead of the keys it
+        /// held, so every chunk after the second lost in-window context.
+        /// Against mlx-lm those gave last-token cosines of 0.2-0.89, and
+        /// long Gemma 4 prompts answered with garbage.
+        ///
+        /// Bars: cosine 0.98 and the same top token. Fixed, every path is at
+        /// 0.996 or better at these lengths. bf16 rounding alone dips to
+        /// ~0.9 at a few positions just past the window (1,100-1,300 move
+        /// either way when fusions are toggled), so those are not tested.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn chunked_and_continued_prefill_match_one_pass() {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return;
+            };
+            let dir = Path::new(&dir);
+            let model = NativeGemma4Model::load(dir).expect("load model");
+            let tok =
+                crate::TextTokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+            let ids = tok
+                .encode(include_str!("../../../docs/maintainer-workflow.md"), false)
+                .expect("encode");
+            let sizes: Vec<usize> = std::env::var("CHUNK_TEST_TOKENS")
+                .unwrap_or_else(|_| "1600,3000,5000".into())
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            for n in sizes {
+                let n = n.min(ids.len());
+                parity_at(&model, &ids[..n]);
+            }
+        }
+
+        fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {
+            let n = prompt.len();
+            let mut cache = model.make_cache();
+            let reference = logits_f32(
+                &model
+                    .forward_last_token(prompt, &mut cache)
+                    .expect("one pass"),
+            );
+
+            let mut results = Vec::new();
+            for chunk in [2048usize, 1024, 512] {
+                let mut cache = model.make_cache();
+                let mut last = None;
+                for ids in prompt.chunks(chunk) {
+                    let l = model.forward_last_token(ids, &mut cache).expect("chunk");
+                    l.eval().expect("eval chunk");
+                    last = Some(l);
+                }
+                results.push((format!("chunks of {chunk}"), logits_f32(&last.unwrap())));
+            }
+            let head = n - 25;
+            let mut cache = model.make_cache();
+            model
+                .forward_last_token(&prompt[..head], &mut cache)
+                .and_then(|l| Ok(l.eval()?))
+                .expect("head");
+            let mut fork = cache.clone();
+            results.push((
+                "head, then suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[head..], &mut cache)
+                        .expect("suffix"),
+                ),
+            ));
+            results.push((
+                "head, clone, then suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[head..], &mut fork)
+                        .expect("fork suffix"),
+                ),
+            ));
+            // Single-token steps wrap the sliding ring, so the multi-token
+            // update after them has to put it back in temporal order.
+            let head = n - 65;
+            let mut cache = model.make_cache();
+            model
+                .forward_last_token(&prompt[..head], &mut cache)
+                .and_then(|l| Ok(l.eval()?))
+                .expect("head");
+            for id in &prompt[head..n - 25] {
+                model
+                    .forward_last_token(std::slice::from_ref(id), &mut cache)
+                    .and_then(|l| Ok(l.eval()?))
+                    .expect("decode step");
+            }
+            results.push((
+                "head, 40 steps, suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[n - 25..], &mut cache)
+                        .expect("after steps"),
+                ),
+            ));
+            let mut failures = Vec::new();
+            for (name, logits) in &results {
+                let (cos, same) = agreement(&reference, logits);
+                eprintln!("[prefill-parity] n={n} {name:26} cos={cos:.6} same_argmax={same}");
+                if cos < 0.98 || !same {
+                    failures.push(format!("{name}: cos {cos:.4}, same argmax {same}"));
+                }
+            }
+            if let Ok(out) = std::env::var("PREFILL_PARITY_DUMP") {
+                let out = Path::new(&out).join(format!("n{n}"));
+                std::fs::create_dir_all(&out).expect("dump dir");
+                let write = |name: &str, v: &[f32]| {
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    std::fs::write(out.join(name), bytes).expect("dump");
+                };
+                let ids_bytes: Vec<u8> = prompt.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(out.join("ids.u32"), ids_bytes).expect("dump ids");
+                write("lumen_one_pass.f32", &reference);
+                for (name, logits) in &results {
+                    write(
+                        &format!("lumen_{}.f32", name.replace([' ', ','], "_")),
+                        logits,
+                    );
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "n={n}: these prefills disagree with one pass: {failures:#?}"
             );
         }
 
