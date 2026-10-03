@@ -5142,18 +5142,19 @@ pub(crate) mod imp {
             //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
             //   - dtype bf16
             //
-            // OFF by default; `LUMEN_GEMMA4_SDPA_WINDOWED=1` opts in. The
-            // kernel's left-edge window mask covers only the first
-            // ceil(BQ/BK) K-blocks after `kb_start`, but when a Q tile's
-            // lowest in-window key is not block-aligned the band spans one
-            // block more, and those keys stay unmasked. Any sliding layer
-            // that sees more than `sliding_window` keys in one forward got
-            // attention past its window: against mlx-lm, last-token logits
-            // fell from cos 0.995 to 0.2-0.9 beyond 1,024 tokens, and long
-            // Gemma 4 prompts answered with garbage. The explicit-mask path
-            // below matches mlx-lm. Re-enable once the fork's kernel is fixed
-            // and `chunked_and_continued_prefill_match_one_pass` passes with
-            // it on.
+            // OFF by default; `LUMEN_GEMMA4_SDPA_WINDOWED=1` opts in. Until
+            // rabbitson87/mlx 8a2587df the kernel read the wrong keys once a
+            // forward held more than `sliding_window` of them: its K/V loads
+            // started at block 0 while the loop and masks started at
+            // `kb_start`, and its left-edge mask stopped one block short for
+            // query offsets other than 0 or W-1 mod 16. Long Gemma 4 prompts
+            // answered with garbage (last-token cosine against mlx-lm 0.2-0.9
+            // past 1,024 tokens). Fixed, it matches the explicit-mask path
+            // (`native_attention::windowed_kernel_tests`) and saves ~5% of a
+            // cold 11.9K-token prefill. It stays opt-in because mlx-c fetches
+            // the fork by branch: an MLX build cached from before the fix
+            // keeps the broken kernel, and nothing would say so. The explicit
+            // mask path below matches mlx-lm on every build.
             let sdpa_windowed_enabled = std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
                 .map(|v| v == "1")
                 .unwrap_or(false);
@@ -8253,8 +8254,8 @@ pub(crate) mod imp {
 
         /// Prefilling in chunks, or continuing a cache past its head, must
         /// give the logits one pass gives. The sliding layers (window 1024)
-        /// are where it went wrong. The windowed steel kernel attended past
-        /// the window once a forward held more than 1,024 keys, and the
+        /// are where it went wrong. The windowed steel kernel read the wrong
+        /// keys once a forward held more than 1,024 of them, and the
         /// rotating cache trimmed against `offset` instead of the keys it
         /// held, so every chunk after the second lost in-window context.
         /// Against mlx-lm those gave last-token cosines of 0.2-0.89, and

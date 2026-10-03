@@ -1695,26 +1695,6 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
-        name: "gemma-windowed-kernel-attends-past-the-window",
-        symptom: "Gemma 4 answered long prompts with garbage (\"the it's the what \
-                  is the it's\"): the sliding-window steel kernel, on by default \
-                  for sliding-layer prefill, left keys past the window unmasked \
-                  once a forward held more than 1,024 keys. Against mlx-lm the \
-                  last-token logits fell from cosine 0.995 to 0.2-0.9 beyond \
-                  1,024 tokens, on every prefill path",
-        revert: &[Mutation {
-            path: MLX,
-            find: "            let sdpa_windowed_enabled = std::env::var(\"LUMEN_GEMMA4_SDPA_WINDOWED\")\n                .map(|v| v == \"1\")\n                .unwrap_or(false);",
-            replace: "            let sdpa_windowed_enabled = std::env::var(\"LUMEN_GEMMA4_SDPA_WINDOWED\")\n                .map(|v| v != \"0\")\n                .unwrap_or(true); // defect: windowed kernel on by default",
-        }],
-        guards: &[mlx_checkpoint(
-            "gemma4_moe::imp::tests::chunked_and_continued_prefill_match_one_pass",
-        )],
-        occurrences: 1,
-        needs_checkpoint: true,
-        extra: &["--ignored"],
-    },
-    Defect {
         name: "fastokens-split-cache-reads-past-the-prefix",
         symptom: "fastokens 0.3.2 as published gave the same string different ids \
                   depending on what the thread encoded before: on every Qwen \
@@ -1840,7 +1820,6 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
         (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
-        (_, "gemma-windowed-kernel-attends-past-the-window") => "gemma4_moe.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
