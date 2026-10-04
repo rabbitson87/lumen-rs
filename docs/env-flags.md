@@ -21,6 +21,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
+| `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session_rollback_enabled` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -175,6 +176,28 @@ Disable overlap scheduling on the sampled decode path, restoring the
  stays synchronous and in the original order. Only the parser advance,
  detokenisation and SSE send of the *previous* token are deferred, and
  the parser is consumed solely by `emit_token_event` / `finalize`.
+
+### `LUMEN_MLX_SESSION_ROLLBACK`
+
+*Optimization, default on.*
+
+Leave a rollback point at each chat turn's conversation boundary, so
+ the next turn can resume a session it does not exactly extend.
+
+ Without it, plain multi-turn chat on Qwen 3.5 / 3.6 never reuses a
+ session: the generation header a turn ends with is not in the next
+ prompt (the template drops the `<think>` block from replayed turns), so
+ every turn prefilled the whole conversation again — measured on
+ Qwen3.5-9B with an 11.5K-token system prompt, about 25 s a turn. The
+ same holds on 3.8 for any client that does not return the trace.
+
+ **`Optimization`: the output does not change, by construction.** The
+ point is placed by cutting the prefill, and `session_feed::plan_feed`
+ only cuts where every row still goes through the kernels one bulk pass
+ uses, keeping that pass's chunk grid. A resumed turn re-feeds what
+ follows the point through the same bulk path, which is what a cold
+ prefill of the longer prompt does — `extend` reproduces a bulk prefill
+ bit-identically (`session_reuse_reproduces_a_cold_prefill`).
 
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 

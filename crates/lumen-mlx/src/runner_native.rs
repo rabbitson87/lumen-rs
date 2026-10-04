@@ -113,7 +113,7 @@ mod imp {
     use crate::kv_disk::{DiskKvStore, KvManifest};
     use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
-    use crate::native_snapshot::PromptCacheSnapshot;
+    use crate::native_snapshot::{PromptCacheSnapshot, RollbackPoint};
     use crate::qwen3_5_moe::{MtpStepOutput, NativeQwen3_5MoeModel};
     use crate::qwen3_5_mtp::Qwen35MtpBlock;
     use std::collections::HashMap;
@@ -143,6 +143,9 @@ mod imp {
         /// `cache.offset()` so the fused rope keeps counting from the right
         /// place. `0` on every text-only seq, which is the byte-identical path.
         mrope_delta: i32,
+        /// Where [`NativeMlxRunner::rollback`] returns this seq to; set by
+        /// [`NativeMlxRunner::mark_rollback`]. Dies with the seq.
+        rollback: Option<RollbackPoint>,
     }
 
     /// process-wide background worker that runs
@@ -1028,6 +1031,25 @@ mod imp {
             .unwrap_or(2048)
     }
 
+    /// The chunk size [`forward_chunked`] runs a call of `n` tokens in.
+    ///
+    /// The arithmetic lives in `prefill_budget` so it can be swept at tier 0
+    /// (it is this crate's `malloc`-fail-at-N analogue: MLX allocation cannot
+    /// fail into an `Err`, so the guard is to not allocate). Exposed through
+    /// [`NativeMlxRunner::prefill_grid`] so a caller that feeds a prompt in
+    /// pieces can keep the grid a single call would have used.
+    fn prefill_chunk_decision(
+        model: &NativeQwen3_5MoeModel,
+        n: usize,
+    ) -> crate::prefill_budget::ChunkDecision {
+        crate::prefill_budget::clamp_chunk(
+            qwen35_prefill_chunk(),
+            crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB"),
+            model.config().text_config.num_attention_heads,
+            n,
+        )
+    }
+
     /// Run `tokens` through the trunk in query-windowed chunks, accumulating
     /// KV / linear-attn recurrent state in `cache`, and return the FINAL
     /// chunk's logits (`[1, 1, vocab]` when `last_only`).
@@ -1091,7 +1113,6 @@ mod imp {
         label: &str,
         vision: Option<(&[[i32; 3]], &[(usize, usize)], &[Array])>,
     ) -> Result<Array> {
-        let requested_chunk = qwen35_prefill_chunk();
         let n = tokens.len();
         // ── Always-chunk invariant: bound full-attn scores per chunk ──
         // Qwen3.x is hybrid: linear-attn layers are O(seq) (cheap), but the
@@ -1108,27 +1129,17 @@ mod imp {
         // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
         // chunk override.
         let chunk = {
-            // The arithmetic lives in `prefill_budget` so it can be swept at
-            // tier 0 (it is this crate's `malloc`-fail-at-N analogue: MLX
-            // allocation cannot fail into an `Err`, so the guard is to not
-            // allocate). Behaviour here is unchanged by the hoist.
-            let budget =
-                crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB");
-            let d = crate::prefill_budget::clamp_chunk(
-                requested_chunk,
-                budget,
-                model.config().text_config.num_attention_heads,
-                n,
-            );
+            let d = prefill_chunk_decision(model, n);
             if d.clamped() {
                 eprintln!(
-                    "[prefill] qwen chunk clamped {requested_chunk} → {} \
+                    "[prefill] qwen chunk clamped {} → {} \
                      (heads={} kv_upper={} budget={:.1}GB) — \
                      keeps single-chunk full-attn scores under the Metal buffer cap",
+                    d.requested,
                     d.chunk,
                     d.heads.max(1),
                     d.kv_upper.max(1),
-                    budget as f64 / 1e9
+                    d.budget_bytes as f64 / 1e9
                 );
             }
             d.chunk
@@ -1478,6 +1489,7 @@ mod imp {
                     mtp_carried: None,
                     prompt: tokens.to_vec(),
                     mrope_delta,
+                    rollback: None,
                 },
             );
             Ok((next_tok, position))
@@ -1556,6 +1568,7 @@ mod imp {
                     mtp_carried: None,
                     prompt: tokens.to_vec(),
                     mrope_delta: 0,
+                    rollback: None,
                 },
             );
             Ok((next_tok, position, captured))
@@ -2333,6 +2346,51 @@ mod imp {
             Ok(())
         }
 
+        /// The shape of a bulk prefill of `n` tokens: its chunk size, and
+        /// whether — and from how many rows — a piece cut inside a chunk is
+        /// still computed the same way. A mixture-of-experts model allows no
+        /// such cut (see [`crate::session_feed::PrefillGrid::min_piece`]).
+        /// `None` before a model is loaded.
+        pub(crate) fn prefill_grid(&self, n: usize) -> Option<crate::session_feed::PrefillGrid> {
+            let model = self.model.as_ref()?;
+            let min_piece = match model.config().text_config.mlp_kind() {
+                crate::qwen35_config::MlpKind::Moe => None,
+                crate::qwen35_config::MlpKind::Dense => Some(crate::session_feed::MIN_BULK_PIECE),
+            };
+            Some(crate::session_feed::PrefillGrid {
+                chunk: prefill_chunk_decision(model, n).chunk,
+                min_piece,
+            })
+        }
+
+        /// Remember `seq_id`'s current state as the point [`Self::rollback`]
+        /// returns to, replacing any earlier one. See [`RollbackPoint`] for why
+        /// this costs no copy of the KV.
+        pub(crate) fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+            let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: mark_rollback — unknown seq_id {seq_id}")
+            })?;
+            seq.rollback = Some(RollbackPoint::capture(&seq.cache, seq.position)?);
+            Ok(())
+        }
+
+        /// Put `seq_id` back to its rollback point and return that position.
+        /// The point stays, so the same position can be returned to again.
+        pub(crate) fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+            let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
+                anyhow!("native mlx-rs runner: rollback — unknown seq_id {seq_id}")
+            })?;
+            let point = seq.rollback.as_ref().ok_or_else(|| {
+                anyhow!("native mlx-rs runner: seq {seq_id} has no rollback point")
+            })?;
+            point.restore_into(&mut seq.cache)?;
+            seq.position = point.position();
+            // The MTP carry is the trunk hidden at the position just left; a
+            // fresh bootstrap is the only correct seed from here.
+            seq.mtp_carried = None;
+            Ok(seq.position)
+        }
+
         /// L2 disk tier: serialize the deep snapshot `snapshot_id` to disk under
         /// `key` so a future process can fork it instead of cold-prefilling.
         /// No-op when the disk tier is off. Dense `Full` + `Linear` layers only
@@ -2477,6 +2535,7 @@ mod imp {
                     // Snapshots are only taken on text prefixes (image requests
                     // bypass the prefix cache), so there is no shift to carry.
                     mrope_delta: 0,
+                    rollback: None,
                 },
             );
             Ok(position)
@@ -3090,6 +3149,22 @@ mod imp {
         }
 
         pub(crate) fn release_snapshot(&mut self, _snapshot_id: u64) -> Result<()> {
+            Err(anyhow!(
+                "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
+            ))
+        }
+
+        pub(crate) fn prefill_grid(&self, _n: usize) -> Option<crate::session_feed::PrefillGrid> {
+            None
+        }
+
+        pub(crate) fn mark_rollback(&mut self, _seq_id: u64) -> Result<()> {
+            Err(anyhow!(
+                "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
+            ))
+        }
+
+        pub(crate) fn rollback(&mut self, _seq_id: u64) -> Result<usize> {
             Err(anyhow!(
                 "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
             ))

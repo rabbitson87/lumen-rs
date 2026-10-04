@@ -213,6 +213,7 @@ mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
 mod runner_pyo3;
 mod runner_subprocess;
+mod session_feed;
 mod spec_decode;
 #[cfg(feature = "mlx-native")]
 mod turboquant;
@@ -356,6 +357,23 @@ trait Runner {
     /// snapshot. Snapshot is *not* consumed — multi-fork supported. Returns
     /// the position of the new seq.
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
+    /// The shape of a bulk prefill of `n` tokens, so a caller that feeds a
+    /// prompt in pieces can keep it. `None` when this runner cannot say — and
+    /// then no caller cuts a prefill to place a rollback point, because it
+    /// could not tell whether the cut is exact.
+    fn prefill_grid(&self, _n: usize) -> Option<session_feed::PrefillGrid> {
+        None
+    }
+    /// Remember `seq_id`'s current state as the point [`Runner::rollback`]
+    /// returns to, replacing any earlier one.
+    fn mark_rollback(&mut self, _seq_id: u64) -> Result<()> {
+        Err(anyhow!("{} runner has no rollback points", self.name()))
+    }
+    /// Put `seq_id` back to its rollback point and return that position. The
+    /// point stays, so the same position can be returned to again.
+    fn rollback(&mut self, _seq_id: u64) -> Result<usize> {
+        Err(anyhow!("{} runner has no rollback points", self.name()))
+    }
 }
 
 impl Runner for SubprocessRunner {
@@ -533,6 +551,18 @@ impl Runner for NativeMlxRunner {
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
         NativeMlxRunner::fork_from_snapshot(self, snapshot_id, dst_seq_id)
     }
+
+    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
+        NativeMlxRunner::prefill_grid(self, n)
+    }
+
+    fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+        NativeMlxRunner::mark_rollback(self, seq_id)
+    }
+
+    fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+        NativeMlxRunner::rollback(self, seq_id)
+    }
 }
 
 /// Loads the HF tokenizer that mirrors what mlx_lm uses internally. We keep a
@@ -630,6 +660,29 @@ pub(crate) struct TokenScriptRunner {
     /// Returned once the script runs dry, so a loop that fails to stop on its
     /// own terminates rather than hanging the test.
     eos: u32,
+    /// When set, `prefill` and `extend` answer with this token instead of
+    /// taking one from the script — for tests whose prompt goes in over
+    /// several calls, where only the last call's answer is the model's.
+    feed_token: Option<u32>,
+    /// What `prefill_grid` reports. `None`, the default, is a runner that
+    /// cannot say, so every prompt goes in one call and no rollback point is
+    /// ever placed.
+    grid: Option<session_feed::PrefillGrid>,
+    /// Every prefill, extend, mark and rollback, in order.
+    feeds: Vec<ScriptFeed>,
+    positions: std::collections::HashMap<u64, usize>,
+    marks: std::collections::HashMap<u64, usize>,
+}
+
+/// One prompt-side call a [`TokenScriptRunner`] saw, with the token count fed
+/// or the position marked / returned to.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptFeed {
+    Prefill(usize),
+    Extend(usize),
+    Mark(usize),
+    Rollback(usize),
 }
 
 #[cfg(test)]
@@ -639,6 +692,18 @@ impl TokenScriptRunner {
             script,
             next: 0,
             eos,
+            feed_token: None,
+            grid: None,
+            feeds: Vec::new(),
+            positions: std::collections::HashMap::new(),
+            marks: std::collections::HashMap::new(),
+        }
+    }
+
+    fn fed(&mut self) -> u32 {
+        match self.feed_token {
+            Some(t) => t,
+            None => self.pop(),
         }
     }
 
@@ -659,22 +724,49 @@ impl Runner for TokenScriptRunner {
     fn name(&self) -> &'static str {
         "token-script"
     }
-    fn prefill(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        Ok((self.pop(), tokens.len()))
+    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.feeds.push(ScriptFeed::Prefill(tokens.len()));
+        self.positions.insert(seq_id, tokens.len());
+        Ok((self.fed(), tokens.len()))
     }
     fn decode_step(
         &mut self,
-        _seq_id: u64,
+        seq_id: u64,
         _last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)> {
+        self.positions.insert(seq_id, position + 1);
         Ok((self.pop(), position + 1))
     }
-    fn remove_seq(&mut self, _seq_id: u64) -> Result<()> {
+    fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
+        self.positions.remove(&seq_id);
+        self.marks.remove(&seq_id);
         Ok(())
     }
-    fn extend(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        Ok((self.pop(), tokens.len()))
+    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.feeds.push(ScriptFeed::Extend(tokens.len()));
+        let pos = self.positions.entry(seq_id).or_insert(0);
+        *pos += tokens.len();
+        let pos = *pos;
+        Ok((self.fed(), pos))
+    }
+    fn prefill_grid(&self, _n: usize) -> Option<session_feed::PrefillGrid> {
+        self.grid
+    }
+    fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+        let pos = self.positions.get(&seq_id).copied().unwrap_or(0);
+        self.feeds.push(ScriptFeed::Mark(pos));
+        self.marks.insert(seq_id, pos);
+        Ok(())
+    }
+    fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+        let pos = *self
+            .marks
+            .get(&seq_id)
+            .ok_or_else(|| anyhow!("token-script: seq {seq_id} has no rollback point"))?;
+        self.feeds.push(ScriptFeed::Rollback(pos));
+        self.positions.insert(seq_id, pos);
+        Ok(pos)
     }
     fn forward_probe(&mut self, _seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
         Ok(ProbeRows {
@@ -827,6 +919,18 @@ impl RunnerImpl {
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
         self.as_runner_mut()
             .fork_from_snapshot(snapshot_id, dst_seq_id)
+    }
+
+    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
+        self.as_runner().prefill_grid(n)
+    }
+
+    fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+        self.as_runner_mut().mark_rollback(seq_id)
+    }
+
+    fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+        self.as_runner_mut().rollback(seq_id)
     }
 
     /// L2 disk tier — persist a snapshot durably. Native-only; other backends
@@ -1172,6 +1276,10 @@ fn selected_runner_kind() -> Result<RunnerKind> {
 struct SessionState {
     seq_id: u64,
     tokens: Vec<u32>,
+    /// How many of `tokens` the runner can wind this sequence back to: the
+    /// rollback point left at the conversation boundary, before the generation
+    /// header. `None` when no point was placed.
+    rollback_len: Option<usize>,
     last_access: Instant,
 }
 
@@ -1189,6 +1297,58 @@ impl SessionState {
             && prompt_ids.len() > self.tokens.len()
             && prompt_ids.starts_with(&self.tokens)
     }
+
+    /// Where this prompt can pick the session up from its rollback point,
+    /// when it does not extend the whole session.
+    ///
+    /// That is the usual case for a chat turn, not an edge: the generation
+    /// header a turn ends with never comes back in the next prompt. Qwen 3.5
+    /// and 3.6 templates drop the `<think>` block from replayed assistant
+    /// turns, and on any checkpoint a client that does not return the trace
+    /// drops it too. So `extends` misses on every turn of a plain chat, while
+    /// everything before the header — the point kept here — is reproduced.
+    /// Same guard as `extends`: the prompt must actually continue those
+    /// tokens, so a wrong guess costs a prefill, never an answer.
+    fn resumes_at(&self, prompt_ids: &[u32]) -> Option<usize> {
+        let kept = self.rollback_len?;
+        (kept > 0
+            && kept <= self.tokens.len()
+            && prompt_ids.len() > kept
+            && prompt_ids.starts_with(&self.tokens[..kept]))
+        .then_some(kept)
+    }
+
+    /// How many of this prompt's tokens the session already holds, by
+    /// whichever route reaches more of them.
+    fn reusable_len(&self, prompt_ids: &[u32]) -> Option<usize> {
+        if self.extends(prompt_ids) {
+            Some(self.tokens.len())
+        } else {
+            self.resumes_at(prompt_ids)
+        }
+    }
+}
+
+/// How a session turn's sequence got to where its prompt starts feeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionReuse {
+    /// The prompt continues the whole session; its end is the start.
+    Extend,
+    /// The prompt continues the session only up to its rollback point, and
+    /// the sequence was wound back there.
+    Resume,
+    /// Nothing reusable; a new, empty sequence.
+    Fresh,
+}
+
+/// A session turn's sequence, positioned for its prompt to be fed.
+struct SessionStart {
+    seq_id: u64,
+    /// Prompt tokens the sequence already holds.
+    from: usize,
+    how: SessionReuse,
+    /// The rollback point the sequence still holds, in tokens.
+    point: Option<usize>,
 }
 
 /// Key prefix for sessions the server invented rather than the client naming.
@@ -1233,6 +1393,31 @@ lumen_flags::flag! {
         env: "LUMEN_MLX_AUTO_SESSION",
         default: true,
         kind: Behavior,
+    }
+}
+
+lumen_flags::flag! {
+    /// Leave a rollback point at each chat turn's conversation boundary, so
+    /// the next turn can resume a session it does not exactly extend.
+    ///
+    /// Without it, plain multi-turn chat on Qwen 3.5 / 3.6 never reuses a
+    /// session: the generation header a turn ends with is not in the next
+    /// prompt (the template drops the `<think>` block from replayed turns), so
+    /// every turn prefilled the whole conversation again — measured on
+    /// Qwen3.5-9B with an 11.5K-token system prompt, about 25 s a turn. The
+    /// same holds on 3.8 for any client that does not return the trace.
+    ///
+    /// **`Optimization`: the output does not change, by construction.** The
+    /// point is placed by cutting the prefill, and `session_feed::plan_feed`
+    /// only cuts where every row still goes through the kernels one bulk pass
+    /// uses, keeping that pass's chunk grid. A resumed turn re-feeds what
+    /// follows the point through the same bulk path, which is what a cold
+    /// prefill of the longer prompt does — `extend` reproduces a bulk prefill
+    /// bit-identically (`session_reuse_reproduces_a_cold_prefill`).
+    pub(crate) session_rollback_enabled {
+        env: "LUMEN_MLX_SESSION_ROLLBACK",
+        default: true,
+        kind: Optimization,
     }
 }
 
@@ -3382,6 +3567,14 @@ impl MlxQwen35Backend {
     pub(crate) fn scripted_tokens_consumed(&self) -> usize {
         match &self.runner {
             RunnerImpl::Scripted(r) => r.consumed(),
+            _ => unreachable!("only built by with_token_script"),
+        }
+    }
+
+    /// The scripted runner itself, to configure it or read what it was fed.
+    pub(crate) fn script_runner(&mut self) -> &mut TokenScriptRunner {
+        match &mut self.runner {
+            RunnerImpl::Scripted(r) => r,
             _ => unreachable!("only built by with_token_script"),
         }
     }
@@ -7074,12 +7267,14 @@ impl MlxQwen35Backend {
     ///
     /// Behavior:
     /// 1. Tokenize the full chat-templated prompt for this turn.
-    /// 2. Look up `session_id`. If found and the cached prefix is a strict
-    ///    prefix of the new prompt, only feed the suffix (`extend`) — the cache
-    ///    state from prior turns is reused. If divergent, drop the session
-    ///    (hybrid SSM/linear-attn caches cannot roll back).
-    /// 3. Decode greedily until EOS or `max_new_tokens`.
-    /// 4. Persist `prompt + generated` as the session's new token sequence.
+    /// 2. Position the session's sequence (see [`Self::position_session`]):
+    ///    its end when the prompt extends the whole session, its rollback
+    ///    point when the prompt only continues the conversation up to there,
+    ///    else a fresh sequence.
+    /// 3. Feed the rest, leaving a new rollback point at this turn's
+    ///    conversation boundary for the next one.
+    /// 4. Decode greedily until EOS or `max_new_tokens`.
+    /// 5. Persist `prompt + generated` as the session's new token sequence.
     pub fn chat_streaming_session<F>(
         &mut self,
         messages: &[(String, String)],
@@ -7099,45 +7294,11 @@ impl MlxQwen35Backend {
 
         self.evict_stale_sessions();
         let session_id = &self.resolve_session_key(session_id, &prompt_ids);
-
-        // Decide: reuse existing session, or start fresh.
-        let (seq_id, mut last, mut pos, fresh) = match self.sessions.get(session_id.as_str()) {
-            Some(state) if state.extends(&prompt_ids) => {
-                let suffix = prompt_ids[state.tokens.len()..].to_vec();
-                let seq_id = state.seq_id;
-                let cached_len = state.tokens.len();
-                let t = std::time::Instant::now();
-                let (last, pos) = self.runner.extend(seq_id, &suffix)?;
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[mlx] seq {seq_id} session={session_id:?} reuse: cached={cached_len} \
-                     suffix={} in {ms:.0}ms",
-                    suffix.len()
-                );
-                (seq_id, last, pos, false)
-            }
-            _ => {
-                // No usable session → drop any old one, alloc new.
-                if let Some(old) = self.sessions.remove(session_id) {
-                    let _ = self.runner.remove_seq(old.seq_id);
-                    eprintln!(
-                        "[mlx] session={session_id:?} divergent prompt; dropping old seq {} ({} tokens)",
-                        old.seq_id,
-                        old.tokens.len()
-                    );
-                }
-                let seq_id = self.alloc_seq_id();
-                let t = std::time::Instant::now();
-                let (last, pos) = self.prefill(seq_id, &prompt_ids)?;
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[mlx] seq {seq_id} session={session_id:?} fresh prefill: {} tokens in {ms:.0}ms",
-                    prompt_ids.len()
-                );
-                (seq_id, last, pos, true)
-            }
-        };
-        let _ = fresh;
+        let boundary = self.conversation_boundary(&prompt_ids, thinking);
+        let start = self.position_session(session_id, &prompt_ids, "")?;
+        let seq_id = start.seq_id;
+        let (mut last, mut pos, point) =
+            self.feed_session_prompt(session_id, &start, &prompt_ids, boundary, "")?;
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
@@ -7179,12 +7340,150 @@ impl MlxQwen35Backend {
             SessionState {
                 seq_id,
                 tokens: new_tokens,
+                rollback_len: point,
                 last_access: Instant::now(),
             },
         );
         self.evict_excess_auto_sessions();
 
         Ok(out)
+    }
+
+    /// Where this chat prompt's conversation ends and its generation header
+    /// begins — the part the next turn's history renders again.
+    ///
+    /// `None` when rollback points are off, or the header does not tokenize to
+    /// a clean suffix of the prompt (then there is no boundary to trust).
+    fn conversation_boundary(&self, prompt_ids: &[u32], thinking: bool) -> Option<usize> {
+        if !session_rollback_enabled::get() {
+            return None;
+        }
+        let header = self
+            .encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
+            .ok()?;
+        (!header.is_empty() && prompt_ids.len() > header.len() && prompt_ids.ends_with(&header))
+            .then(|| prompt_ids.len() - header.len())
+    }
+
+    /// Put the sequence for session `key` where `prompt_ids` can continue it.
+    ///
+    /// The session's end when the prompt extends all of it; its rollback point
+    /// when the prompt continues only that far, winding the sequence back
+    /// there; otherwise a new, empty sequence, dropping the old one. A rollback
+    /// that fails is logged and treated as no match — the turn still gets a
+    /// correct answer, only without the reuse.
+    fn position_session(
+        &mut self,
+        key: &str,
+        prompt_ids: &[u32],
+        label: &str,
+    ) -> Result<SessionStart> {
+        let found = self.sessions.get(key).map(|s| {
+            (
+                s.seq_id,
+                s.extends(prompt_ids).then_some(s.tokens.len()),
+                s.resumes_at(prompt_ids),
+                s.rollback_len,
+                s.tokens.len(),
+            )
+        });
+        match found {
+            Some((seq_id, Some(len), _, point, _)) => {
+                return Ok(SessionStart {
+                    seq_id,
+                    from: len,
+                    how: SessionReuse::Extend,
+                    point,
+                });
+            }
+            Some((seq_id, None, Some(kept), _, _)) => match self.runner.rollback(seq_id) {
+                Ok(pos) if pos == kept => {
+                    return Ok(SessionStart {
+                        seq_id,
+                        from: kept,
+                        how: SessionReuse::Resume,
+                        point: Some(kept),
+                    });
+                }
+                other => eprintln!(
+                    "[mlx] session={key:?}{label} rollback to {kept} failed ({:?}); prefilling fresh",
+                    other.map_err(|e| format!("{e:#}"))
+                ),
+            },
+            _ => {}
+        }
+        // No usable session → drop any old one, alloc new.
+        if let Some(old) = self.sessions.remove(key) {
+            let _ = self.runner.remove_seq(old.seq_id);
+            eprintln!(
+                "[mlx] session={key:?}{label} divergent prompt; dropping old seq {} ({} tokens)",
+                old.seq_id,
+                old.tokens.len()
+            );
+        }
+        Ok(SessionStart {
+            seq_id: self.alloc_seq_id(),
+            from: 0,
+            how: SessionReuse::Fresh,
+            point: None,
+        })
+    }
+
+    /// Feed `prompt[start.from..]` to the positioned sequence — a prefill
+    /// from position 0, an extend otherwise — leaving a rollback point at
+    /// `boundary` when [`session_feed::plan_feed`] finds an exact place for
+    /// one. Returns the next token, the position, and the rollback point the
+    /// sequence now holds (the new one, or the one it already had).
+    fn feed_session_prompt(
+        &mut self,
+        key: &str,
+        start: &SessionStart,
+        prompt: &[u32],
+        boundary: Option<usize>,
+        label: &str,
+    ) -> Result<(u32, usize, Option<usize>)> {
+        let (seq_id, from, end) = (start.seq_id, start.from, prompt.len());
+        let plan = match (boundary, self.runner.prefill_grid(end)) {
+            (Some(b), Some(grid)) => session_feed::plan_feed(from, end, grid, b),
+            _ => session_feed::FeedPlan {
+                cuts: vec![end],
+                mark: None,
+            },
+        };
+        let t = std::time::Instant::now();
+        let (mut last, mut pos, mut at) = (0, 0, from);
+        for &to in &plan.cuts {
+            (last, pos) = if at == 0 {
+                self.runner.prefill(seq_id, &prompt[at..to])?
+            } else {
+                self.runner.extend(seq_id, &prompt[at..to])?
+            };
+            if plan.mark == Some(to) {
+                self.runner.mark_rollback(seq_id)?;
+            }
+            at = to;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let marked = plan
+            .mark
+            .map(|m| format!(", rollback point at {m}"))
+            .unwrap_or_default();
+        let fed = end - from;
+        match start.how {
+            SessionReuse::Extend => eprintln!(
+                "[mlx] seq {seq_id} session={key:?}{label} reuse: cached={from} \
+                 suffix={fed} in {ms:.0}ms{marked}"
+            ),
+            SessionReuse::Resume => eprintln!(
+                "[mlx] seq {seq_id} session={key:?}{label} resume: rolled back to {from} \
+                 suffix={fed} in {ms:.0}ms{marked}"
+            ),
+            SessionReuse::Fresh => eprintln!(
+                "[mlx] seq {seq_id} session={key:?}{label} fresh prefill: {fed} tokens \
+                 in {ms:.0}ms{marked}"
+            ),
+        }
+        Ok((last, pos, plan.mark.or(start.point)))
     }
 
     /// Which session key this request should use.
@@ -7227,7 +7526,7 @@ impl MlxQwen35Backend {
     }
 
     /// Non-streaming completion (raw text path used by `/v1/completions`) with
-    /// prompt-cache reuse keyed by `session_id`. Same strict-prefix policy as
+    /// prompt-cache reuse keyed by `session_id`. Same prefix policy as
     /// `chat_streaming_session` — divergent prompts drop the session and
     /// re-prefill. Returns the generated token IDs (caller decodes).
     pub fn completion_session(
@@ -7247,42 +7546,12 @@ impl MlxQwen35Backend {
         // conversation id either, and a client extending a raw prompt with what
         // the model just wrote is the same prefix relationship a chat turn is.
         let session_id = &self.resolve_session_key(session_id, &prompt_ids);
-
-        let (seq_id, mut last, mut pos) = match self.sessions.get(session_id.as_str()) {
-            Some(state) if state.extends(&prompt_ids) => {
-                let suffix = prompt_ids[state.tokens.len()..].to_vec();
-                let seq_id = state.seq_id;
-                let cached_len = state.tokens.len();
-                let t = std::time::Instant::now();
-                let (last, pos) = self.runner.extend(seq_id, &suffix)?;
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[mlx] seq {seq_id} session={session_id:?} (completion) reuse: cached={cached_len} \
-                     suffix={} in {ms:.0}ms",
-                    suffix.len()
-                );
-                (seq_id, last, pos)
-            }
-            _ => {
-                if let Some(old) = self.sessions.remove(session_id) {
-                    let _ = self.runner.remove_seq(old.seq_id);
-                    eprintln!(
-                        "[mlx] session={session_id:?} (completion) divergent prompt; dropping old seq {} ({} tokens)",
-                        old.seq_id,
-                        old.tokens.len()
-                    );
-                }
-                let seq_id = self.alloc_seq_id();
-                let t = std::time::Instant::now();
-                let (last, pos) = self.prefill(seq_id, &prompt_ids)?;
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[mlx] seq {seq_id} session={session_id:?} (completion) fresh prefill: {} tokens in {ms:.0}ms",
-                    prompt_ids.len()
-                );
-                (seq_id, last, pos)
-            }
-        };
+        // A raw prompt has no generation header, so no boundary to mark — but
+        // it can still resume a chat session from that session's point.
+        let start = self.position_session(session_id, &prompt_ids, " (completion)")?;
+        let seq_id = start.seq_id;
+        let (mut last, mut pos, point) =
+            self.feed_session_prompt(session_id, &start, &prompt_ids, None, " (completion)")?;
 
         let mut generated: Vec<u32> = vec![last];
         if !self.eos_tokens.contains(&last) {
@@ -7304,6 +7573,7 @@ impl MlxQwen35Backend {
             SessionState {
                 seq_id,
                 tokens: new_tokens,
+                rollback_len: point,
                 last_access: Instant::now(),
             },
         );
@@ -7353,7 +7623,9 @@ impl MlxQwen35Backend {
 /// tokens instead is what makes reuse reachable from a spec-conformant request.
 ///
 /// The longest match wins, so a conversation that has grown extends its own
-/// newest state rather than an older snapshot of itself.
+/// newest state rather than an older snapshot of itself. A session also
+/// matches up to its rollback point (see [`SessionState::resumes_at`]), which
+/// is how a plain chat turn finds the previous one at all.
 ///
 /// Explicit sessions are candidates too: a client that named a session on turn
 /// one and omitted it on turn two still continues the same conversation.
@@ -7363,8 +7635,8 @@ fn longest_prefix_session(
 ) -> Option<String> {
     sessions
         .iter()
-        .filter(|(_, s)| s.extends(prompt_ids))
-        .max_by_key(|(_, s)| s.tokens.len())
+        .filter_map(|(k, s)| s.reusable_len(prompt_ids).map(|n| (k, n)))
+        .max_by_key(|&(_, n)| n)
         .map(|(k, _)| k.clone())
 }
 
@@ -7925,6 +8197,7 @@ mod tests {
         SessionState {
             seq_id,
             tokens: vec![1, 2, 3],
+            rollback_len: None,
             last_access,
         }
     }
@@ -7933,6 +8206,7 @@ mod tests {
         SessionState {
             seq_id: 0,
             tokens,
+            rollback_len: None,
             last_access,
         }
     }
@@ -7990,6 +8264,189 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("auto/1".to_string(), s);
         assert!(longest_prefix_session(&map, &[7, 8, 9]).is_none());
+    }
+
+    /// A chat session matches the next turn up to its rollback point even when
+    /// the turn does not extend it — and only if the turn really continues
+    /// those tokens.
+    #[test]
+    fn a_session_is_found_again_through_its_rollback_point() {
+        let now = Instant::now();
+        // Turn one: 4 conversation tokens, a 2-token generation header (8, 9),
+        // a 1-token reply. The point sits before the header.
+        let mut s = session_with(vec![1, 2, 3, 4, 8, 9, 50], now);
+        s.rollback_len = Some(4);
+
+        // Turn two re-renders the reply without the header: no extension…
+        let next = [1, 2, 3, 4, 50, 60, 8, 9];
+        assert!(!s.extends(&next));
+        // …but everything up to the point is there.
+        assert_eq!(s.resumes_at(&next), Some(4));
+        assert_eq!(s.reusable_len(&next), Some(4));
+        // A prompt that diverges before the point does not match.
+        assert_eq!(s.resumes_at(&[1, 2, 7, 4, 50]), None);
+        // Nothing past the point: nothing to feed.
+        assert_eq!(s.resumes_at(&[1, 2, 3, 4]), None);
+        // Exact extension still wins when the prompt has it.
+        let extended = [1, 2, 3, 4, 8, 9, 50, 70];
+        assert_eq!(s.reusable_len(&extended), Some(7));
+        // A session without a point has only the exact route.
+        assert_eq!(
+            session_with(vec![1, 2, 3, 4, 8, 9], now).resumes_at(&next),
+            None
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("auto/1".to_string(), s);
+        map.insert("auto/2".to_string(), session_with(vec![1, 2], now));
+        assert_eq!(
+            longest_prefix_session(&map, &next).as_deref(),
+            Some("auto/1"),
+            "the resumable session reuses more than the shorter exact one"
+        );
+    }
+
+    /// Chat-template pieces as whole words, so a scripted conversation renders
+    /// and tokenizes the way a real Qwen prompt does — specials split out,
+    /// whitespace dropped. Only the shape of the token stream matters here.
+    const CHAT_TOKENIZER: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [
+            {"id": 1, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 3, "content": "<think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false},
+            {"id": 4, "content": "</think>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": false}
+        ],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": {"type": "Fuse"},
+        "model": {
+            "type": "WordLevel",
+            "unk_token": "<unk>",
+            "vocab": {
+                "<unk>": 0, "<|im_start|>": 1, "<|im_end|>": 2, "<think>": 3, "</think>": 4,
+                "system": 5, "user": 6, "assistant": 7, "S": 8, "U1": 9, "U2": 10, "Blue": 11
+            }
+        }
+    }"#;
+
+    const CHAT_IM_END: u32 = 2;
+    const CHAT_BLUE: u32 = 11;
+
+    /// A scripted backend whose every reply is `Blue`, fed through a runner
+    /// that reports a dense model's 2048-token prefill grid — the shape the
+    /// native runner has.
+    fn chat_backend(preserves_thinking: bool) -> MlxQwen35Backend {
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+        let mut b = auto_session_enabled::with(true, || {
+            MlxQwen35Backend::with_token_script(vec![CHAT_IM_END; 8], CHAT_IM_END, tokenizer, 12)
+        });
+        b.preserves_thinking_on_replay = preserves_thinking;
+        let r = b.script_runner();
+        r.feed_token = Some(CHAT_BLUE);
+        r.grid = Some(session_feed::PrefillGrid {
+            chunk: 2048,
+            min_piece: Some(session_feed::MIN_BULK_PIECE),
+        });
+        b
+    }
+
+    fn chat_turn(b: &mut MlxQwen35Backend, messages: &[(&str, &str)]) -> Vec<ScriptFeed> {
+        let messages: Vec<(String, String)> = messages
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect();
+        let reply = b
+            .chat_streaming_session(&messages, 8, false, None, |_| {}, None)
+            .expect("chat turn");
+        assert_eq!(reply, "Blue");
+        std::mem::take(&mut b.script_runner().feeds)
+    }
+
+    /// A plain chat's second turn must not prefill the conversation again.
+    ///
+    /// The generation header a turn ends with never comes back: Qwen 3.5/3.6
+    /// templates drop the `<think>` block from replayed assistant turns (and
+    /// any client that does not return the trace drops it on 3.8), so a
+    /// session's tokens are never a prefix of the next prompt. Measured on
+    /// Qwen3.5-9B with an 11.5K-token system prompt: every turn missed the
+    /// session and re-prefilled everything, ~25 s a turn, on `main` too.
+    #[test]
+    fn the_next_chat_turn_resumes_instead_of_prefilling_again() {
+        session_rollback_enabled::with(true, || {
+            let mut b = chat_backend(false);
+            let system = "S ".repeat(80);
+            let turn1 = [("system", system.as_str()), ("user", "U1")];
+            // 91 prompt tokens, a 4-token header from 87. The point goes 32
+            // rows before the end, so both pieces stay bulk-sized.
+            assert_eq!(
+                chat_turn(&mut b, &turn1),
+                vec![
+                    ScriptFeed::Prefill(59),
+                    ScriptFeed::Mark(59),
+                    ScriptFeed::Extend(32)
+                ]
+            );
+
+            let turn2 = [
+                ("system", system.as_str()),
+                ("user", "U1"),
+                ("assistant", "Blue"),
+                ("user", "U2"),
+            ];
+            assert_eq!(
+                chat_turn(&mut b, &turn2),
+                vec![ScriptFeed::Rollback(59), ScriptFeed::Extend(40)],
+                "turn two must wind back to the point and feed only what follows it"
+            );
+            assert_eq!(b.session_count(), 1, "the turn continues its own session");
+        });
+    }
+
+    /// Where the replay does reproduce the header (3.8 with thinking off
+    /// renders the empty block), the whole session is still extended — the
+    /// point is only the fallback.
+    #[test]
+    fn a_turn_that_extends_the_whole_session_still_extends_it() {
+        session_rollback_enabled::with(true, || {
+            let mut b = chat_backend(true);
+            let system = "S ".repeat(80);
+            chat_turn(&mut b, &[("system", system.as_str()), ("user", "U1")]);
+            let turn2 = [
+                ("system", system.as_str()),
+                ("user", "U1"),
+                ("assistant", "Blue"),
+                ("user", "U2"),
+            ];
+            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Extend(8)]);
+        });
+    }
+
+    /// Off, the turn is fed exactly as before the flag existed: one prefill,
+    /// no point — and so the next turn cannot resume.
+    #[test]
+    fn without_rollback_points_a_turn_is_fed_in_one_call() {
+        session_rollback_enabled::with(false, || {
+            let mut b = chat_backend(false);
+            let system = "S ".repeat(80);
+            let turn1 = [("system", system.as_str()), ("user", "U1")];
+            assert_eq!(chat_turn(&mut b, &turn1), vec![ScriptFeed::Prefill(91)]);
+            let turn2 = [
+                ("system", system.as_str()),
+                ("user", "U1"),
+                ("assistant", "Blue"),
+                ("user", "U2"),
+            ];
+            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Prefill(99)]);
+        });
     }
 
     /// Auto sessions are capped where explicit ones are not: naming a session
@@ -8564,6 +9021,119 @@ mod tests {
             "the first token after reuse must match a cold prefill; \
              diverging immediately means the reused KV is wrong, not imprecise"
         );
+    }
+
+    /// A rollback point must not change a single token — neither in the turn
+    /// that places it nor in the turn that resumes from it.
+    ///
+    /// The point is placed by cutting the prefill, and `session_feed` only cuts
+    /// where every row still runs through the kernels a bulk pass uses. That
+    /// is an argument about MLX's kernel selection; this is the measurement.
+    /// Turn one with points on must equal turn one with them off, and a resumed
+    /// turn two must equal a cold prefill of the same prompt. The lengths put
+    /// the prefill's last chunk at 4, 20 and 50 rows (short, inside the
+    /// small-row kernel range, and bulk), at a full grid of two chunks, and at
+    /// one short prompt, so each branch of the planner is taken. Run it on a
+    /// dense and a mixture-of-experts checkpoint: they cut differently.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_rollback_point_changes_no_token() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let n_gen = 48;
+        let user = "Summarize the text above in two sentences.";
+        let sentence = "The printing press changed how ideas spread across Europe.";
+
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("rollback points only concern the Qwen path");
+        };
+        let as_owned = |msgs: &[(&str, &str)]| -> Vec<(String, String)> {
+            msgs.iter()
+                .map(|(r, c)| (r.to_string(), c.to_string()))
+                .collect()
+        };
+        let run = |m: &mut MlxQwen35Backend, on: bool, msgs: &[(String, String)], sid: &str| {
+            session_rollback_enabled::with(on, || {
+                m.chat_streaming_session(msgs, n_gen, false, Some(sid), |_| {}, None)
+                    .expect("chat turn")
+            })
+        };
+
+        let grid = m
+            .runner
+            .prefill_grid(4096)
+            .expect("native runner reports its grid");
+        let chunk = grid.chunk;
+        eprintln!("chunk={chunk} min_piece={:?}", grid.min_piece);
+        for target in [
+            600,
+            2 * chunk + 4,
+            2 * chunk + 20,
+            2 * chunk + 50,
+            2 * chunk,
+        ] {
+            // Grow the system prompt to the target length, a sentence at a time
+            // while far off and a word at a time close by.
+            let mut system = sentence.to_string();
+            let n = loop {
+                let msgs = as_owned(&[("system", &system), ("user", user)]);
+                let n = m
+                    .build_chat_input(&msgs, false, None)
+                    .expect("prompt")
+                    .len();
+                if n >= target {
+                    break n;
+                }
+                system.push_str(if target - n > 40 {
+                    " The press spread ideas."
+                } else {
+                    " ok"
+                });
+            };
+            let turn1 = as_owned(&[("system", &system), ("user", user)]);
+
+            let off1 = run(m, false, &turn1, "off");
+            let on1 = run(m, true, &turn1, "on");
+            let point = m.sessions.get("on").and_then(|s| s.rollback_len);
+            eprintln!("prompt={n} last-chunk={} point={point:?}", n % chunk);
+            assert_eq!(
+                on1, off1,
+                "turn one changed with a rollback point (prompt {n})"
+            );
+
+            let mut turn2 = turn1.clone();
+            turn2.push(("assistant".into(), on1.clone()));
+            turn2.push(("user".into(), "Now say it in one sentence.".into()));
+            let p2 = m.build_chat_input(&turn2, false, None).expect("prompt 2");
+            let session = m.sessions.get("on").expect("session kept");
+            if point.is_none() {
+                // Only a model without cuts inside a chunk may lack one, and
+                // only below a chunk's length.
+                assert!(
+                    grid.min_piece.is_none() && n < chunk,
+                    "no rollback point placed (prompt {n})"
+                );
+                eprintln!("  no chunk boundary before the header; nothing to resume");
+            } else if session.extends(&p2) {
+                eprintln!("  turn two extends the whole session; not a resume");
+            } else {
+                assert!(
+                    session.resumes_at(&p2).is_some(),
+                    "turn two must be able to resume (prompt {n}, point {point:?})"
+                );
+                let cold2 = run(m, false, &turn2, "cold");
+                let resumed2 = run(m, true, &turn2, "on");
+                assert_eq!(
+                    resumed2, cold2,
+                    "a resumed turn must equal a cold prefill (prompt {n}, point {point:?})"
+                );
+            }
+            for sid in ["off", "on", "cold"] {
+                m.drop_session(sid);
+            }
+        }
     }
 
     /// The same property, for a turn that was generated with thinking ON.

@@ -581,6 +581,28 @@ without inventing a threshold.
 equivalence matrix must never flip it. The session path has always had the drift;
 the flag only changes who reaches it.
 
+**A chat turn's own tail never comes back, so exact extension misses every plain
+chat turn.** The generation header a turn ends with
+(`<|im_start|>assistant\n<think>…`) is not in the next prompt: Qwen 3.5/3.6 templates drop the `<think>`
+block from replayed assistant turns, and on 3.8 so does any client that does not
+return the trace. So `extends` fails on every turn and the whole conversation is
+prefilled again — ~25 s a turn on Qwen3.5-9B with an 11.5K-token system prompt.
+`LUMEN_MLX_SESSION_ROLLBACK` leaves a rollback point before the header (full
+attention truncates, only the linear-attention state is kept) and the next turn
+winds back to it: 26.0 s → 0.4 s, replies byte-identical.
+
+Placing the point means cutting the prefill, and a cut is exact only if every row
+is still computed as the bulk pass computes it. `session_feed::plan_feed` keeps
+the bulk pass's chunk grid and cuts inside a chunk only on dense models, with 32+
+rows on each side — below that MLX routes quantized projections to its vector
+kernel. Mixture-of-experts models mark on chunk boundaries only: `GatherQMM`
+tiles across the rows routed to each expert, so a row depends on which rows share
+its call, and no floor fixes that (a 128-row-floored cut on Qwen3.6-35B-A3B still
+differed from a cold prefill). `a_rollback_point_changes_no_token` measures both
+claims — turn one with and without a point, a resumed turn against a cold
+prefill — and must be run on a dense and a MoE checkpoint. The flag is
+`Optimization`.
+
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to
 carry its trace; it did not make one carry it, because the route emitted no

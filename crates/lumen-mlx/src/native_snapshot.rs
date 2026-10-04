@@ -509,11 +509,119 @@ mod imp {
             )),
         }
     }
+
+    /// A position a sequence can be wound back to without a copy of its KV.
+    ///
+    /// Full-attention layers only ever append, so going back is a truncation
+    /// and nothing has to be kept for them. Linear-attention layers are the
+    /// opposite: a forward pass *replaces* their conv/SSM state, and the state
+    /// at an earlier position cannot be recomputed from a later one, so those
+    /// slots are what this holds, by reference. MLX arrays are values — holding
+    /// one keeps the next step from donating its buffer — so the captured state
+    /// stays exactly what it was, and costs one layer-state's worth of memory.
+    ///
+    /// Restoring leaves the point in place: the same position can be returned
+    /// to again until a new point replaces it.
+    pub struct RollbackPoint {
+        position: usize,
+        layers: Vec<RollbackLayer>,
+    }
+
+    enum RollbackLayer {
+        /// Full attention, plain or TurboQuant-compressed: truncate back to
+        /// this offset.
+        Truncate(usize),
+        Recurrent {
+            slots: Vec<Option<Array>>,
+            offset: usize,
+            lengths: Option<Array>,
+            left_padding: Option<Array>,
+        },
+    }
+
+    impl RollbackPoint {
+        pub fn capture(cache: &NativePromptCache, position: usize) -> Result<Self> {
+            let layers = cache
+                .layers()
+                .iter()
+                .map(|l| -> Result<RollbackLayer> {
+                    Ok(match l {
+                        NativeLayerCache::Full(c) => RollbackLayer::Truncate(c.offset()),
+                        NativeLayerCache::FullTurboquant(c) => RollbackLayer::Truncate(c.offset()),
+                        NativeLayerCache::Linear(c) => {
+                            // Materialize now: the state is needed by the next
+                            // piece anyway, and an evaluated array holds no
+                            // graph behind it.
+                            for slot in c.slots().iter().flatten() {
+                                slot.eval().context("RollbackPoint: eval linear state")?;
+                            }
+                            RollbackLayer::Recurrent {
+                                slots: c.slots().to_vec(),
+                                offset: c.offset(),
+                                lengths: c.lengths().cloned(),
+                                left_padding: c.left_padding().cloned(),
+                            }
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self { position, layers })
+        }
+
+        pub fn position(&self) -> usize {
+            self.position
+        }
+
+        pub fn restore_into(&self, cache: &mut NativePromptCache) -> Result<()> {
+            if cache.len() != self.layers.len() {
+                bail!(
+                    "RollbackPoint::restore_into: layer count mismatch (cache={}, point={})",
+                    cache.len(),
+                    self.layers.len()
+                );
+            }
+            for (i, (layer, point)) in cache.layers_mut().iter_mut().zip(&self.layers).enumerate() {
+                match (layer, point) {
+                    (NativeLayerCache::Full(c), RollbackLayer::Truncate(offset)) => c
+                        .truncate_to(*offset)
+                        .with_context(|| format!("RollbackPoint: truncate layer {i}"))?,
+                    (NativeLayerCache::FullTurboquant(c), RollbackLayer::Truncate(offset)) => c
+                        .truncate_to(*offset)
+                        .with_context(|| format!("RollbackPoint: truncate layer {i}"))?,
+                    (
+                        NativeLayerCache::Linear(c),
+                        RollbackLayer::Recurrent {
+                            slots,
+                            offset,
+                            lengths,
+                            left_padding,
+                        },
+                    ) => {
+                        if c.len() != slots.len() {
+                            bail!(
+                                "RollbackPoint: linear layer {i} slot count mismatch (cache={}, point={})",
+                                c.len(),
+                                slots.len()
+                            );
+                        }
+                        for (idx, s) in slots.iter().enumerate() {
+                            c.set_slot(idx, s.clone())?;
+                        }
+                        c.set_offset(*offset);
+                        c.set_lengths(lengths.clone());
+                        c.set_left_padding(left_padding.clone());
+                    }
+                    _ => bail!("RollbackPoint: layer kind mismatch at {i}"),
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)]
-pub(crate) use imp::{LayerSnapshot, PromptCacheSnapshot};
+pub(crate) use imp::{LayerSnapshot, PromptCacheSnapshot, RollbackPoint};
 
 #[cfg(all(test, feature = "mlx-native"))]
 mod lifecycle_tests {

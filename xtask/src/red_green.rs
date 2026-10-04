@@ -535,10 +535,8 @@ static DEFECTS: &[Defect] = &[
                   `session_id` anywhere: turn 1 4.55 s, then 0.41 s and 0.40 s",
         revert: &[Mutation {
             path: MLX,
-            find: "        .filter(|(_, s)| s.extends(prompt_ids))\n        \
-                   .max_by_key(|(_, s)| s.tokens.len())",
-            replace: "        .filter(|(_, s)| { let _ = (s, prompt_ids); false })\n        \
-                      .max_by_key(|(_, s)| s.tokens.len())",
+            find: "        .filter_map(|(k, s)| s.reusable_len(prompt_ids).map(|n| (k, n)))",
+            replace: "        .filter_map(|(k, s)| { let _ = (k, s, prompt_ids); None::<(&String, usize)> })",
         }],
         guards: &[mlx(
             "tests::a_prompt_finds_its_own_conversation_without_being_told_which",
@@ -1757,6 +1755,75 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "chat-turn-header-defeats-session-reuse",
+        symptom: "plain multi-turn chat on Qwen 3.5 / 3.6 never reused its \
+                  session: a turn ends in a generation header \
+                  (`<|im_start|>assistant\\n<think>…`) that the next prompt does \
+                  not reproduce — the template drops the `<think>` block from \
+                  replayed assistant turns, and on 3.8 so does any client that \
+                  does not return the trace — so the session's tokens were never \
+                  a prefix of the next prompt and every turn prefilled the whole \
+                  conversation again. Measured on Qwen3.5-9B with an 11.5K-token \
+                  system prompt: ~25 s a turn, on main too. Fixed by leaving a \
+                  rollback point at the conversation boundary and resuming from \
+                  it: turn two 26.0 s -> 0.4 s, replies byte-identical",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let kept = self.rollback_len?;",
+            replace: "        let kept = self.rollback_len.filter(|_| false)?; // defect: no resume",
+        }],
+        guards: &[
+            core_mlx_lib("tests::the_next_chat_turn_resumes_instead_of_prefilling_again"),
+            core_mlx_lib("tests::a_session_is_found_again_through_its_rollback_point"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "rollback-cut-inside-a-moe-chunk",
+        symptom: "on a mixture-of-experts model a rollback point cut inside a \
+                  prefill chunk changes the answer: MLX's GatherQMM sorts the \
+                  routed rows by expert and tiles across them, so a row's result \
+                  depends on which rows share its call. Measured on \
+                  Qwen3.6-35B-A3B: a 32-row piece changed a greedy reply after \
+                  ~30 words, and a turn resumed from a 128-row-floored cut still \
+                  differed from a cold prefill. Such models mark only on chunk \
+                  boundaries, where the pieces are the bulk pass's own chunks",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let inside = grid.min_piece.map(|floor| {",
+            replace: "            let inside = grid.min_piece.or(Some(MIN_BULK_PIECE)).map(|floor| { // defect",
+        }],
+        guards: &[core_mlx_lib(
+            "session_feed::tests::a_mixture_of_experts_marks_only_on_chunk_boundaries",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "rollback-cut-leaves-a-short-piece",
+        symptom: "cutting the prefill right at the conversation boundary leaves \
+                  the generation header — ten rows on Qwen — as a piece of its \
+                  own, and below ~32 rows MLX computes quantized projections with \
+                  its vector kernel (`get_qmv_batch_limit`), which sums in a \
+                  different order from the bulk chunk those rows sat in: the turn \
+                  that places the point is no longer the turn without it. The \
+                  planner keeps every piece cut inside a chunk at 32+ rows",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                let at = boundary.min(cell_end.saturating_sub(floor));",
+            replace: "                let at = boundary; // defect: cuts at the header",
+        }],
+        guards: &[core_mlx_lib(
+            "session_feed::tests::a_cut_never_changes_which_kernels_a_row_goes_through",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -1842,6 +1909,10 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
         (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
+        (_, "chat-turn-header-defeats-session-reuse") => "lib.rs",
+        (_, "rollback-cut-inside-a-moe-chunk") | (_, "rollback-cut-leaves-a-short-piece") => {
+            "session_feed.rs"
+        }
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
