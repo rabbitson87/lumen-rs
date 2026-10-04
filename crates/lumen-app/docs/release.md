@@ -149,56 +149,27 @@ Existing v0.1.0 users will see the new version next time they hit **Update →
 Check for updates** in the app (or on next launch once you flip the policy to
 auto-check).
 
-## Automated flow (GitHub Actions sketch)
+## Automated flow (GitHub Actions)
 
-Drop the following at `.github/workflows/release.yml`:
+[`.github/workflows/release.yml`](../../../.github/workflows/release.yml) runs
+the manual flow above on a `v*` tag (or a manual dispatch, which uploads to a
+draft `vTEST-<sha>` release). `tauri-action` signs the `.app.tar.gz`, uploads
+the bundle and its signature to a draft GitHub Release, and writes `latest.json`.
+Publish the draft to expose it at `releases/latest/download/latest.json`, the
+URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
+toolchain choices (macOS 26 for the NAX availability guard, the separately
+downloaded Metal toolchain, the `mlx-sys` pre-build).
 
-```yaml
-name: Release
-on:
-  push:
-    tags: ['v*']
-jobs:
-  build:
-    strategy:
-      matrix:
-        # Apple Silicon only — MLX upstream CMakeLists.txt errors out
-        # on x86_64. An Intel matrix entry can't succeed with mlx-native.
-        target: [aarch64-apple-darwin]
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - name: Build server
-        run: |
-          cargo build -p lumen-server --release --target ${{ matrix.target }}
-          mkdir -p crates/lumen-app/binaries
-          cp target/${{ matrix.target }}/release/lumen-server \
-             crates/lumen-app/binaries/lumen-server-${{ matrix.target }}
-      - name: Install frontend deps
-        run: cd crates/lumen-app/frontend && npm ci
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: crates/lumen-app
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Lumen ${{ github.ref_name }}'
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }} --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
-```
+### When the release job fails at notarization
 
-`tauri-action` handles signing the `.app.tar.gz`, uploading both bundle + sig to
-the GitHub Release, and writing the `latest.json` manifest in the format the
-updater expects. After the job completes, publish the draft release —
-that flips the visibility for `releases/latest/download/latest.json`, which is
-the URL baked into `tauri.conf.json`.
+`failed to notarize app: Error: HTTP status code: 401. Invalid credentials`
+(what stopped the v0.12.0 run) comes after a successful build and code
+signature: Apple rejected `APPLE_ID` / `APPLE_PASSWORD`. `APPLE_PASSWORD` is an
+**app-specific password**, which stops working when it is revoked or the Apple
+ID password changes. Generate a new one at appleid.apple.com → Sign-In and
+Security → App-Specific Passwords, update the secret, and re-run the tag's job
+(or push a new tag). `APPLE_TEAM_ID` must be the team that owns
+`APPLE_SIGNING_IDENTITY`.
 
 ## Config schema migrations
 

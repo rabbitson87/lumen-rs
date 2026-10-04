@@ -2,3 +2,6 @@
 /frontend/dist
 /frontend/.vite
 gen/
+# Release staging: the lumen-server sidecar (and its metallib) copied here
+# for `cargo tauri build`. Built artifacts, never sources.
+/binaries

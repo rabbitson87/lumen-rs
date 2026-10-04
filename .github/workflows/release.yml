@@ -65,7 +65,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "26.2"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Tauri's sidecar bundling references the on-disk `lumen-server`
           # binary path; the workflow places it relative to the workspace
@@ -115,9 +115,11 @@ jobs:
             . -> target
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          # 22 LTS: Node 20 is end-of-life, and the v4 actions that ran on it
+          # were being forced onto Node 24 with a deprecation warning.
+          node-version: 22
           cache: npm
           cache-dependency-path: crates/lumen-app/frontend/package-lock.json
 
