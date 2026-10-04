@@ -23,5 +23,6 @@ pub mod diffusion_engine;
 pub mod embedding;
 pub mod engine;
 pub mod load_stats;
+pub mod metallib;
 pub mod routes;
 pub mod types;

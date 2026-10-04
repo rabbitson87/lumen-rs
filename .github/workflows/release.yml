@@ -51,6 +51,19 @@ jobs:
         target:
           - aarch64-apple-darwin
 
+    # The oldest macOS the release runs on, applied to every compiler in the
+    # job: rustc, the C/C++ builds, and — through CMake — the `metal` compiler
+    # that builds MLX's kernel library. Without it MLX passes no deployment
+    # target, `metal` defaults to the runner's SDK, and the metallib comes out
+    # bound to that exact version (macOS 26.5 on the last build) while the app
+    # claimed 11.0, so on an older macOS it installed and then could not load its
+    # kernels. 26.2 is the lowest target that still compiles Metal 4.0, which the
+    # M5 Neural Accelerator (NAX) kernels need. Keep it equal to
+    # `bundle.macOS.minimumSystemVersion` in crates/lumen-app/tauri.conf.json
+    # (a test in crates/lumen-server/tests/packaging.rs checks).
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.2"
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,6 +147,14 @@ jobs:
           mkdir -p crates/lumen-app/binaries
           cp target/${{ matrix.target }}/release/lumen-server \
              crates/lumen-app/binaries/lumen-server-${{ matrix.target }}
+          # MLX's kernel library ships in the bundle's Contents/Resources, written
+          # out by the server itself so it is byte-for-byte the copy it embeds.
+          # Without it the server unpacks the library next to itself, inside the
+          # signed Contents/MacOS — which fails when the app runs from its
+          # read-only DMG or a Gatekeeper-translocated copy, and MLX then aborts
+          # with "Failed to load the default metallib".
+          crates/lumen-app/binaries/lumen-server-${{ matrix.target }} \
+            --write-metallib crates/lumen-app/binaries/mlx.metallib
 
       # ── Frontend install ──────────────────────────────────────────
       - name: Install frontend deps
@@ -166,8 +187,8 @@ jobs:
           releaseName: ${{ github.event_name == 'push' && format('Lumen {0}', github.ref_name) || format('Lumen vTEST-{0} (dry-run)', github.sha) }}
           releaseDraft: true
           prerelease: false
-          # `--config` injects the sidecar binding so the default
-          # tauri.conf.json stays clean for `cargo tauri dev`.
+          # `--config` injects the sidecar binding and its kernel library so the
+          # default tauri.conf.json stays clean for `cargo tauri dev`.
           args: >-
             --target ${{ matrix.target }}
-            --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
+            --config '{"bundle":{"externalBin":["binaries/lumen-server"],"resources":{"binaries/mlx.metallib":"mlx.metallib"}}}'

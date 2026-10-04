@@ -68,6 +68,14 @@ cd crates/lumen-app
 # Apple Silicon only — MLX (mlx-sys) refuses to build on x86_64, so there
 # is no Intel Mac target.
 TARGET=aarch64-apple-darwin
+# The oldest macOS the release supports, for every compiler including the
+# `metal` one that builds MLX's kernel library: without it the metallib is
+# bound to this machine's SDK version. Must equal
+# `bundle.macOS.minimumSystemVersion` in tauri.conf.json (26.2: the lowest
+# target that still compiles the M5 NAX kernels). Clean mlx-sys so MLX is
+# reconfigured with it.
+export MACOSX_DEPLOYMENT_TARGET=26.2
+cargo clean -p mlx-sys --release --target "$TARGET"
 cargo build -p lumen-server --release --target "$TARGET"
 
 # Tauri's sidecar feature requires the binary at a specific name.
@@ -75,10 +83,28 @@ mkdir -p binaries
 cp ../../target/$TARGET/release/lumen-server \
    binaries/lumen-server-$TARGET
 
-# Build the .app bundle. The --config flag injects the sidecar binding so the
-# default tauri.conf.json stays clean for `cargo tauri dev`.
-cargo tauri build --target "$TARGET" --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
+# MLX's kernel library goes in the bundle's Contents/Resources, written out by
+# the server so it is exactly the copy it embeds. Skip this and the server
+# unpacks it next to itself inside the signed Contents/MacOS, which fails when
+# the app runs from its read-only DMG or a translocated copy ("Failed to load
+# the default metallib").
+binaries/lumen-server-$TARGET --write-metallib binaries/mlx.metallib
+
+# Build the .app bundle. The --config flag injects the sidecar binding and its
+# kernel library so the default tauri.conf.json stays clean for `cargo tauri dev`.
+cargo tauri build --target "$TARGET" --config '{"bundle":{"externalBin":["binaries/lumen-server"],"resources":{"binaries/mlx.metallib":"mlx.metallib"}}}'
 ```
+
+The bundle needs an MLX build that looks in `Contents/Resources`
+(rabbitson87/mlx `lumen-rs-patches` from 97685a09). mlx-c fetches that branch
+when `mlx-sys` builds from scratch, as the release workflow does
+(`cargo clean -p mlx-sys` first); a cached older MLX build would still load the
+library from the build machine's own path and hide the problem until the app
+runs elsewhere.
+
+`TAURI_SIGNING_PRIVATE_KEY` (and its password, if set) must be in the
+environment: `createUpdaterArtifacts` is on, and without the key the build stops
+after bundling with "A public key has been found, but no private key".
 
 Outputs:
 - `target/$TARGET/release/bundle/macos/Lumen.app` — signable artifact

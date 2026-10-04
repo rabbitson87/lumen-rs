@@ -69,13 +69,15 @@ const DEFAULT_PORT: u16 = 41110;
 #[cfg(feature = "mlx-native")]
 static EMBEDDED_MLX_METALLIB: &[u8] = include_bytes!(env!("LUMEN_MLX_METALLIB_PATH"));
 
-/// Drop the embedded metallib next to the running binary so mlx's
-/// `load_colocated_library("mlx")` finds it on startup. Idempotent —
-/// skips if a matching-size file already exists. Errors surface as
-/// stderr warnings; mlx will then fail with its native error message,
-/// which is more actionable than a panic here.
+/// Make sure MLX finds this binary's kernel library on startup: the copy an
+/// app bundle ships in `Contents/Resources`, one already beside the binary, or
+/// else the embedded bytes unpacked beside it. See [`lumen_server::metallib`]
+/// for why the bundle must not be written to. Errors surface as stderr
+/// warnings; mlx then fails with its native error message, which is more
+/// actionable than a panic here.
 #[cfg(feature = "mlx-native")]
 fn ensure_metallib_colocated() {
+    use lumen_server::metallib;
     if EMBEDDED_MLX_METALLIB.is_empty() {
         return; // Built without an actual metallib — nothing to unpack.
     }
@@ -89,13 +91,20 @@ fn ensure_metallib_colocated() {
     let Some(dir) = exe.parent() else {
         return;
     };
-    let target = dir.join("mlx.metallib");
-    // Skip if already present with the same size (cheap idempotency check —
-    // avoids rewriting on every restart).
-    if let Ok(meta) = std::fs::metadata(&target) {
-        if meta.len() as usize == EMBEDDED_MLX_METALLIB.len() {
+    let target = metallib::colocated_path(dir);
+    let bundled = metallib::bundled_path(dir);
+    let len = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.len());
+    match metallib::plan(
+        len(&target),
+        len(&bundled),
+        EMBEDDED_MLX_METALLIB.len() as u64,
+    ) {
+        metallib::Plan::AlreadyColocated => return,
+        metallib::Plan::UseBundled => {
+            eprintln!("[metallib] using the app bundle's {}", bundled.display());
             return;
         }
+        metallib::Plan::Unpack => {}
     }
     match std::fs::write(&target, EMBEDDED_MLX_METALLIB) {
         Ok(_) => eprintln!(
@@ -129,6 +138,32 @@ async fn main() -> Result<(), SendableError> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("lumen-server {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    // `--write-metallib <path>`: write the embedded kernel library out, so the
+    // release build can ship this binary's exact copy in the app bundle's
+    // `Contents/Resources` (see `lumen_server::metallib`).
+    if let Some(i) = args.iter().position(|a| a == "--write-metallib") {
+        let path = args
+            .get(i + 1)
+            .ok_or_else(|| SendableError::from("--write-metallib needs a path"))?;
+        #[cfg(feature = "mlx-native")]
+        {
+            if EMBEDDED_MLX_METALLIB.is_empty() {
+                return Err(SendableError::from(
+                    "this build embeds no metallib (MLX built without Metal)",
+                ));
+            }
+            std::fs::write(path, EMBEDDED_MLX_METALLIB)
+                .map_err(|e| SendableError::from(format!("write {path}: {e}")))?;
+            println!("{path}");
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            return Err(SendableError::from(format!(
+                "--write-metallib {path}: built without mlx-native"
+            )));
+        }
     }
 
     // Auto-load .env from CWD or binary-adjacent directory so deployments

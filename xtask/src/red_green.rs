@@ -20,6 +20,8 @@ const SRV: &str = "crates/lumen-server/src";
 const CORE: &str = "crates/lumen-core/src";
 /// fastokens, vendored with lumen-rs's fixes (vendor/fastokens/PATCHES.md).
 const FASTOKENS: &str = "vendor/fastokens/src/pre_tokenizers";
+const WORKFLOWS: &str = ".github/workflows";
+const APP: &str = "crates/lumen-app";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -1824,6 +1826,73 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "bundled-server-writes-its-metallib-into-the-app",
+        symptom: "the release app's server could not start on a user's Mac: it \
+                  unpacked mlx.metallib next to itself, inside the signed \
+                  Lumen.app/Contents/MacOS, and when the app ran from its \
+                  read-only DMG (or a Gatekeeper-translocated copy) the write \
+                  failed and MLX aborted with \"Failed to load the default \
+                  metallib\" (exit 255) — on the build machine MLX's compiled-in \
+                  path to the build tree hid it. The bundle now ships the library \
+                  in Contents/Resources, the MLX fork looks there (97685a09), and \
+                  the server leaves the bundle alone when that copy is its own",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        (None, Some(b)) if b == embedded => Plan::UseBundled,",
+            replace: "        (None, Some(b)) if b == embedded && false => Plan::UseBundled, // defect",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "a_bundled_library_is_used_without_writing_into_the_bundle",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "release-bundle-ships-no-metallib",
+        symptom: "the release workflow bundled the lumen-server sidecar without \
+                  MLX's kernel library, so the server had to write it into the \
+                  signed app at run time — and could not on a read-only volume. \
+                  The workflow stages the server's own copy \
+                  (`--write-metallib`) and maps it into Contents/Resources",
+        revert: &[Mutation {
+            path: WORKFLOWS,
+            find: r#","resources":{"binaries/mlx.metallib":"mlx.metallib"}"#,
+            replace: r#","resources":{}"#,
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_release_workflow_ships_the_library_where_mlx_looks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "bundle-claims-an-older-macos-than-its-kernels",
+        symptom: "the release app declared macOS 11.0 while its MLX kernel \
+                  library was compiled for the CI runner's SDK \
+                  (air64-apple-macosx26.5 on the last build): MLX passes no \
+                  deployment target, so `metal` defaulted to the SDK, and a Metal \
+                  library does not load on an older macOS than it was built for. \
+                  The release job now pins MACOSX_DEPLOYMENT_TARGET=26.2 (the \
+                  lowest that still compiles the M5 NAX kernels) and the bundle \
+                  declares the same floor",
+        revert: &[Mutation {
+            path: APP,
+            find: "\"minimumSystemVersion\": \"26.2\",",
+            replace: "\"minimumSystemVersion\": \"11.0\",",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_bundle_declares_the_macos_its_kernels_were_built_for",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -1913,6 +1982,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "rollback-cut-inside-a-moe-chunk") | (_, "rollback-cut-leaves-a-short-piece") => {
             "session_feed.rs"
         }
+        (_, "bundled-server-writes-its-metallib-into-the-app") => "metallib.rs",
+        (_, "release-bundle-ships-no-metallib") => "release.yml",
+        (_, "bundle-claims-an-older-macos-than-its-kernels") => "tauri.conf.json",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)
