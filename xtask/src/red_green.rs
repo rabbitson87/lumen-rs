@@ -1917,6 +1917,47 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "release-requires-notarization",
+        symptom: "the release job handed the notary credentials to the build on \
+                  every run, so with the Apple Developer Program membership \
+                  lapsed it failed at notarization (401) after building and \
+                  signing — no release at all. Notarization is now opt-in \
+                  (repository variable MACOS_NOTARIZE)",
+        revert: &[Mutation {
+            path: WORKFLOWS,
+            find: "          # The Apple signing / notarization variables come from the step above.",
+            replace: "          APPLE_ID: ${{ secrets.APPLE_ID }} # defect: always notarize",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_release_builds_without_notarization_unless_asked",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "unsigned-bundle-reads-as-damaged",
+        symptom: "built without a Developer ID certificate, the app carried only \
+                  the linker's ad-hoc signature on its executables, which claims a \
+                  bundle seal that was never written (`codesign --verify --strict`: \
+                  'code has no resources but signature indicates they must be \
+                  present'); macOS reports such a download as damaged, with no \
+                  Open Anyway. The bundle is now signed ad-hoc by default",
+        revert: &[Mutation {
+            path: APP,
+            find: "\"signingIdentity\": \"-\"",
+            replace: "\"signingIdentity\": null",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "a_build_without_a_certificate_is_still_validly_signed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2010,6 +2051,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "release-bundle-ships-no-metallib") => "release.yml",
         (_, "bundle-claims-an-older-macos-than-its-kernels") => "tauri.conf.json",
         (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
+        (_, "release-requires-notarization") => "release.yml",
+        (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

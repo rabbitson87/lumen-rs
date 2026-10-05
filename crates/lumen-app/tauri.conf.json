@@ -39,7 +39,7 @@
       "minimumSystemVersion": "14.0",
       "entitlements": null,
       "exceptionDomain": "localhost",
-      "signingIdentity": null
+      "signingIdentity": "-"
     },
     "externalBin": []
   },

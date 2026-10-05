@@ -160,16 +160,29 @@ URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
 toolchain choices (macOS 26 for an SDK that knows MLX's availability guards, the separately
 downloaded Metal toolchain, why `mlx-sys` is cleaned first).
 
-### When the release job fails at notarization
+### Code signing and notarization
 
-`failed to notarize app: Error: HTTP status code: 401. Invalid credentials`
-(what stopped the v0.12.0 run) comes after a successful build and code
-signature: Apple rejected `APPLE_ID` / `APPLE_PASSWORD`. `APPLE_PASSWORD` is an
-**app-specific password**, which stops working when it is revoked or the Apple
-ID password changes. Generate a new one at appleid.apple.com → Sign-In and
-Security → App-Specific Passwords, update the secret, and re-run the tag's job
-(or push a new tag). `APPLE_TEAM_ID` must be the team that owns
-`APPLE_SIGNING_IDENTITY`.
+The `Configure macOS signing` step decides both, from what the repository
+holds:
+
+| | Configured by | Without it |
+|---|---|---|
+| Developer ID signature | secrets `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | ad-hoc signature (`signingIdentity: "-"`) |
+| Notarization | repository variable `MACOS_NOTARIZE=true` plus secrets `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | not notarized |
+
+Notarization needs an **active** Apple Developer Program membership. A lapsed
+one is what stopped the v0.12.0 run — `failed to notarize app: Error: HTTP
+status code: 401. Invalid credentials` after a successful build and code
+signature — even though the Developer ID certificate was still valid; a revoked
+or rotated app-specific password (`APPLE_PASSWORD`) fails the same way. Leave
+`MACOS_NOTARIZE` unset while the membership is inactive: the release still
+builds and ships, and users allow it once (README → Install from a release).
+
+A Developer ID certificate outlives a lapsed membership but not its own expiry
+date. Once it expires, signing fails; delete the three certificate secrets and
+releases fall back to ad-hoc signing. Either signature is valid — what matters
+is that the bundle is sealed: an unsealed one is reported as **damaged**, with
+no Open Anyway.
 
 ## Config schema migrations
 

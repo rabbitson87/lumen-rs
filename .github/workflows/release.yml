@@ -155,6 +155,51 @@ jobs:
         run: npm ci
 
       # ── Tauri build + sign + upload ───────────────────────────────
+      # ── macOS code signing and notarization ───────────────────────
+      # Only what is configured reaches Tauri: an unset secret would arrive as
+      # an empty string, which is not the same as no identity.
+      #
+      # * Signing: the Developer ID certificate when its secrets are set, else
+      #   ad-hoc (`signingIdentity: "-"` in tauri.conf.json). Either way the
+      #   bundle's signature is valid; an unsigned one makes macOS report the
+      #   download as "damaged", with no way to open it from the Finder.
+      # * Notarization is opt-in with the repository variable
+      #   MACOS_NOTARIZE=true. It needs an *active* Apple Developer Program
+      #   membership — a lapsed one is what failed the v0.12.0 job (401) even
+      #   though the certificate was still valid. Without it users open the app
+      #   once via System Settings → Privacy & Security → Open Anyway.
+      - name: Configure macOS signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_NOTARIZE: ${{ vars.MACOS_NOTARIZE }}
+        run: |
+          put() {
+            if [ -n "$2" ]; then
+              { echo "$1<<__LUMEN_EOF__"; echo "$2"; echo "__LUMEN_EOF__"; } >> "$GITHUB_ENV"
+            fi
+          }
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            put APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
+            put APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+            put APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+            echo "signing: Developer ID"
+          else
+            echo "signing: ad-hoc (no Developer ID certificate secrets)"
+          fi
+          if [ "$MACOS_NOTARIZE" = "true" ]; then
+            put APPLE_ID "$APPLE_ID"
+            put APPLE_PASSWORD "$APPLE_PASSWORD"
+            put APPLE_TEAM_ID "$APPLE_TEAM_ID"
+            echo "notarization: on"
+          else
+            echo "notarization: off (repository variable MACOS_NOTARIZE is not true)"
+          fi
+
       - name: Build, sign + upload (.app, .dmg, latest.json)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -163,15 +208,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple notary credentials (optional; only set on real releases —
-          # without these the app is signed by the Tauri key but not notarized,
-          # so users see a Gatekeeper warning on first launch).
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The Apple signing / notarization variables come from the step above.
         with:
           projectPath: crates/lumen-app
           # Tag push → use the pushed tag (e.g. v0.2.0). Manual dispatch →

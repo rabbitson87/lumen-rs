@@ -100,8 +100,16 @@ reads, and self-updates from GitHub Releases.
    is no Intel Mac bundle. The release's Metal kernels are compiled for
    macOS 14, which leaves out the M5 Neural Accelerator prefill kernels; a
    source build on macOS 26.2+ includes them.
-3. Drag `Lumen.app` to `/Applications` and launch it. The first run
-   prompts macOS to verify the developer signature — accept it once.
+3. Drag `Lumen.app` to `/Applications` and launch it. Releases are not
+   notarized by Apple, so macOS blocks the first launch ("Apple could not
+   verify “Lumen” is free of malware…") — allow it once:
+   - **macOS 15 and later:** click **Done**, open **System Settings →
+     Privacy & Security**, scroll to *“Lumen” was blocked*, click **Open
+     Anyway** and confirm with your password.
+   - **macOS 14:** Control-click `Lumen.app` → **Open** → **Open**.
+
+   After that it opens normally, and in-app updates install without asking
+   again.
 4. On the **Models & Server** tab, pick a recommended model from the
    dropdown and hit **Download**. Wait for completion, then **Use** →
    **Start**.

@@ -130,3 +130,45 @@ fn the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev() {
         "lumen-server and lumen-mlx must pin the same mlx-sys"
     );
 }
+
+/// v0.12.0 never shipped: the job always notarized, and with the Apple
+/// Developer Program membership lapsed Apple answered 401 — after the build and
+/// the code signature had succeeded. Notarization needs an active membership, so
+/// it is opt-in (`vars.MACOS_NOTARIZE`); the build step must not be handed the
+/// notary credentials unconditionally.
+#[test]
+fn the_release_builds_without_notarization_unless_asked() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/release.yml"),
+    )
+    .expect("read release.yml");
+    let action = workflow
+        .split("uses: tauri-apps/tauri-action")
+        .nth(1)
+        .and_then(|rest| rest.split("        with:").next())
+        .expect("the tauri-action step");
+    assert!(
+        !action.contains("APPLE_ID"),
+        "the build step must not receive notary credentials directly"
+    );
+    assert!(
+        workflow.contains("if [ \"$MACOS_NOTARIZE\" = \"true\" ]; then"),
+        "notarization must be gated on the MACOS_NOTARIZE variable"
+    );
+}
+
+/// Without a Developer ID certificate Tauri left only the linker's signature on
+/// the executables, which promises a bundle seal that is not there: macOS calls
+/// such a download "damaged" and offers only Move to Trash. An ad-hoc identity
+/// seals the bundle, so an unnotarized build can still be opened (Open Anyway).
+#[test]
+fn a_build_without_a_certificate_is_still_validly_signed() {
+    let conf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../lumen-app/tauri.conf.json"),
+        )
+        .expect("read tauri.conf.json"),
+    )
+    .expect("parse tauri.conf.json");
+    assert_eq!(conf["bundle"]["macOS"]["signingIdentity"], "-");
+}
