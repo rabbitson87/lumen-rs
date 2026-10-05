@@ -31,15 +31,11 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    # macos-26 (not macos-14): the MLX Neural-Accelerator (NAX) GEMM path —
-    # the M5 Pro/Max prefill speedup — is gated at runtime by
-    # `is_nax_available()`, which expands to `__builtin_available(macOS 26.2)`.
-    # Compiling that guard needs an SDK that *knows* macOS 26.2, i.e. Xcode 26.x.
-    # macos-14/macos-15 default to Xcode 16.x and don't reliably carry Xcode 26
-    # (disk-space constrained), so they fail with "macOS 26.2 is not a valid
-    # availability version". macos-26 (GA, arm64-native) ships Xcode 26.x by
-    # default. The kernels are baked into the metallib host-independently, so an
-    # arm64 runner builds a binary that activates the M5 path at runtime on M5.
+    # macos-26: the newest SDK, which builds for older macOS through
+    # MACOSX_DEPLOYMENT_TARGET below. MLX's availability guards (e.g.
+    # `__builtin_available(macOS 26.2)` in `is_nax_available()`) only compile
+    # against an SDK that knows those versions; macos-14/15 default to Xcode 16.x
+    # and fail with "macOS 26.2 is not a valid availability version".
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -57,12 +53,15 @@ jobs:
     # target, `metal` defaults to the runner's SDK, and the metallib comes out
     # bound to that exact version (macOS 26.5 on the last build) while the app
     # claimed 11.0, so on an older macOS it installed and then could not load its
-    # kernels. 26.2 is the lowest target that still compiles Metal 4.0, which the
-    # M5 Neural Accelerator (NAX) kernels need. Keep it equal to
+    # kernels. 14.0 is MLX's own minimum. It compiles the kernels as Metal 3.1,
+    # so the release carries no M5 Neural Accelerator (NAX) kernels — those need
+    # Metal 4.0, i.e. a 26.2 target — and MLX compiles its NAX path out
+    # (MLX_METAL_NO_NAX). Wider install base chosen over the M5 prefill speedup;
+    # a source build on macOS 26.2+ still gets it. Keep it equal to
     # `bundle.macOS.minimumSystemVersion` in crates/lumen-app/tauri.conf.json
     # (a test in crates/lumen-server/tests/packaging.rs checks).
     env:
-      MACOSX_DEPLOYMENT_TARGET: "26.2"
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
 
     steps:
       - uses: actions/checkout@v5
@@ -72,12 +71,11 @@ jobs:
           # root, so the checkout depth must be full (not shallow).
           fetch-depth: 0
 
-      # ── Pin newest stable Xcode (macOS 26.2 SDK for the NAX availability guard) ──
+      # ── Pin newest stable Xcode (an SDK that knows MLX's availability guards) ──
       # macos-26 already defaults to Xcode 26.x, but GitHub rotates that default
       # (26.0.1 → 26.2 → 26.3 …) and trims old point releases for disk space.
       # `latest-stable` deterministically selects the newest installed 26.x so
-      # MLX's `__builtin_available(macOS 26.2, *)` guard always finds a ≥26.2 SDK
-      # and libmlx/metallib build with the NAX kernels.
+      # MLX's `__builtin_available(macOS 26.2, *)` guards always compile.
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:

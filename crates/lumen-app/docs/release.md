@@ -71,10 +71,10 @@ TARGET=aarch64-apple-darwin
 # The oldest macOS the release supports, for every compiler including the
 # `metal` one that builds MLX's kernel library: without it the metallib is
 # bound to this machine's SDK version. Must equal
-# `bundle.macOS.minimumSystemVersion` in tauri.conf.json (26.2: the lowest
-# target that still compiles the M5 NAX kernels). Clean mlx-sys so MLX is
-# reconfigured with it.
-export MACOSX_DEPLOYMENT_TARGET=26.2
+# `bundle.macOS.minimumSystemVersion` in tauri.conf.json (14.0: MLX's own
+# minimum; the kernels compile as Metal 3.1, without the M5 NAX kernels, which
+# need a 26.2 target). Clean mlx-sys so MLX is reconfigured with it.
+export MACOSX_DEPLOYMENT_TARGET=14.0
 cargo clean -p mlx-sys --release --target "$TARGET"
 cargo build -p lumen-server --release --target "$TARGET"
 
@@ -157,7 +157,7 @@ draft `vTEST-<sha>` release). `tauri-action` signs the `.app.tar.gz`, uploads
 the bundle and its signature to a draft GitHub Release, and writes `latest.json`.
 Publish the draft to expose it at `releases/latest/download/latest.json`, the
 URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
-toolchain choices (macOS 26 for the NAX availability guard, the separately
+toolchain choices (macOS 26 for an SDK that knows MLX's availability guards, the separately
 downloaded Metal toolchain, the `mlx-sys` pre-build).
 
 ### When the release job fails at notarization

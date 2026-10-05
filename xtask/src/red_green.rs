@@ -1877,12 +1877,11 @@ static DEFECTS: &[Defect] = &[
                   (air64-apple-macosx26.5 on the last build): MLX passes no \
                   deployment target, so `metal` defaulted to the SDK, and a Metal \
                   library does not load on an older macOS than it was built for. \
-                  The release job now pins MACOSX_DEPLOYMENT_TARGET=26.2 (the \
-                  lowest that still compiles the M5 NAX kernels) and the bundle \
-                  declares the same floor",
+                  The release job now pins MACOSX_DEPLOYMENT_TARGET=14.0 (MLX's \
+                  own minimum) and the bundle declares the same floor",
         revert: &[Mutation {
             path: APP,
-            find: "\"minimumSystemVersion\": \"26.2\",",
+            find: "\"minimumSystemVersion\": \"14.0\",",
             replace: "\"minimumSystemVersion\": \"11.0\",",
         }],
         guards: &[srv_test(

@@ -8,8 +8,8 @@ live metrics — no chat UI in v1 (chat lives in third-party clients via `/v1/*`
 
 - Rust 1.87+ (workspace toolchain)
 - Node.js 22+ and npm
-- macOS 14+ on Apple Silicon to build and run from source; the release bundle
-  needs macOS 26.2+ (its Metal kernels are compiled for it — see
+- macOS 14+ on Apple Silicon, for source builds and the release bundle alike
+  (the bundle's Metal kernels are compiled for macOS 14 — see
   `docs/release.md`). Linux/Windows untested.
 - `cargo install tauri-cli --version "^2"` (the `cargo tauri` subcommand)
 

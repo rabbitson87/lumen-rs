@@ -95,11 +95,11 @@ reads, and self-updates from GitHub Releases.
 ### Install from a release
 
 1. Open the [latest GitHub Release](https://github.com/rabbitson87/lumen-rs/releases/latest).
-2. Download the `aarch64` `.dmg`. **Apple Silicon only, macOS 26.2 or
+2. Download the `aarch64` `.dmg`. **Apple Silicon only, macOS 14 or
    later** — MLX is ARM64-native and refuses to build on x86_64, so there
-   is no Intel Mac bundle, and the release's Metal kernels are compiled for
-   macOS 26.2 so they can include the M5 Neural Accelerator paths. On an
-   older macOS, build from source (macOS 14+, see Requirements).
+   is no Intel Mac bundle. The release's Metal kernels are compiled for
+   macOS 14, which leaves out the M5 Neural Accelerator prefill kernels; a
+   source build on macOS 26.2+ includes them.
 3. Drag `Lumen.app` to `/Applications` and launch it. The first run
    prompts macOS to verify the developer signature — accept it once.
 4. On the **Models & Server** tab, pick a recommended model from the
