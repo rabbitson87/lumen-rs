@@ -96,3 +96,37 @@ fn the_bundle_declares_the_macos_its_kernels_were_built_for() {
         "tauri.conf.json minimumSystemVersion must equal the release job's MACOSX_DEPLOYMENT_TARGET"
     );
 }
+
+/// The pinned `rev` of the mlx-rs fork in a crate's manifest line for `dep`.
+fn pinned_rev(manifest: &str, dep: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with(&format!("{dep} = {{")))
+        .and_then(|l| l.split("rev = \"").nth(1))
+        .and_then(|r| r.split('"').next())
+        .map(str::to_string)
+}
+
+/// A fresh `cargo build -p lumen-server` used to fail: build.rs looked for the
+/// metallib while MLX was still compiling, because nothing ordered it after
+/// mlx-sys's build script. mlx-sys declares `links = "mlx"`, which orders the
+/// build scripts of its *direct* dependents and hands them DEP_MLX_METALLIB —
+/// so the server must depend on mlx-sys itself, at the same rev lumen-mlx uses
+/// (another rev would be a second MLX build, and a different library).
+#[test]
+fn the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let server = std::fs::read_to_string(root.join("Cargo.toml")).expect("read server manifest");
+    let mlx = std::fs::read_to_string(root.join("../lumen-mlx/Cargo.toml"))
+        .expect("read lumen-mlx manifest");
+    assert!(
+        server.contains("\"dep:mlx-sys\""),
+        "the mlx-native feature must enable the direct mlx-sys dependency"
+    );
+    let server_rev = pinned_rev(&server, "mlx-sys").expect("server pins mlx-sys");
+    assert_eq!(
+        Some(server_rev),
+        pinned_rev(&mlx, "mlx-sys"),
+        "lumen-server and lumen-mlx must pin the same mlx-sys"
+    );
+}

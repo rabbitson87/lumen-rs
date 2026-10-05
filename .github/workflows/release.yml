@@ -121,22 +121,15 @@ jobs:
           cache: npm
           cache-dependency-path: crates/lumen-app/frontend/package-lock.json
 
-      # ── mlx-sys: force-build first so the metallib lands on disk before
-      #    lumen-server's build.rs runs. Without this, a `Swatinem/rust-cache`
-      #    hit can restore mlx-sys's metadata but skip the `out/` directory,
-      #    leaving lumen-server with no metallib to embed.
-      - name: Pre-build mlx-sys (writes mlx.metallib)
-        run: |
-          # mlx-sys's own default features (accelerate + metal) drive the
-          # CMake build that produces mlx.metallib. No `mlx-native` feature
-          # exists at the mlx-sys layer — that knob lives one crate up.
-          cargo clean -p mlx-sys || true
-          cargo build -p mlx-sys --release --target ${{ matrix.target }}
-          # Surface the metallib path so the next step (or a failure log) can
-          # cross-check what build.rs will discover.
-          echo "--- mlx.metallib search ---"
-          find target/${{ matrix.target }}/release/build -name mlx.metallib -print 2>/dev/null || true
-          find target/release/build -name mlx.metallib -print 2>/dev/null || true
+      # ── mlx-sys: start from a clean MLX build ─────────────────────
+      # mlx-c fetches the MLX fork by branch name, so a cached mlx-sys build
+      # (`Swatinem/rust-cache`) would keep whatever MLX it fetched last time.
+      # The metallib no longer needs a separate pre-build: mlx-sys declares
+      # `links = "mlx"`, so lumen-server's build script runs after it and gets
+      # the library's path as DEP_MLX_METALLIB. (The old `cargo build -p
+      # mlx-sys` here built a differently-featured unit — MLX compiled twice.)
+      - name: Clean mlx-sys
+        run: cargo clean -p mlx-sys --release --target ${{ matrix.target }} || true
 
       # ── Sidecar: build lumen-server, drop it into the bundle path ──
       - name: Build lumen-server (sidecar)

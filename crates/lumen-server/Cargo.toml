@@ -29,6 +29,10 @@ anyhow = { workspace = true }
 # .env auto-load. Read at server startup so callers can drop a `.env`
 # file next to the binary (or in CWD) instead of exporting every var.
 dotenvy = "0.15.7"
+# Not used from Rust: a direct dependency so build.rs runs after mlx-sys's
+# (it declares `links = "mlx"`) and gets the exact kernel library it embeds as
+# DEP_MLX_METALLIB. Same source and rev as lumen-mlx's, so it is the one unit.
+mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "cee2f18ae60c23e1314301c3f07347d048725a6d", optional = true }
 
 [features]
 # MLX is the only backend. `mlx-native` also pulls in the native FLUX.2-dev
@@ -43,4 +47,5 @@ mlx-native = [
     "lumen-mlx/mlx-native",
     "dep:lumen-diffusion",
     "lumen-diffusion/mlx-native-metal",
+    "dep:mlx-sys",
 ]

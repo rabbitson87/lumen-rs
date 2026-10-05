@@ -22,6 +22,7 @@ const CORE: &str = "crates/lumen-core/src";
 const FASTOKENS: &str = "vendor/fastokens/src/pre_tokenizers";
 const WORKFLOWS: &str = ".github/workflows";
 const APP: &str = "crates/lumen-app";
+const SRV_CRATE: &str = "crates/lumen-server";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -1892,6 +1893,30 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "server-build-races-mlx-for-the-metallib",
+        symptom: "a fresh `cargo build -p lumen-server` failed: its build.rs \
+                  searched the target directory for mlx.metallib while mlx-sys \
+                  was still running CMake, found nothing, and panicked — Cargo \
+                  orders a build script after a dependency's only when that \
+                  dependency declares `links` and is a direct dependency. CI \
+                  pre-built mlx-sys to get around it, as a differently-featured \
+                  unit, so MLX compiled twice. mlx-sys now declares \
+                  `links = \"mlx\"` (rabbitson87/mlx-rs cee2f18a) and the server \
+                  depends on it directly, receiving DEP_MLX_METALLIB",
+        revert: &[Mutation {
+            path: SRV_CRATE,
+            find: "    \"dep:mlx-sys\",",
+            replace: "    # defect: mlx-sys not a direct dependency",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -1984,6 +2009,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "bundled-server-writes-its-metallib-into-the-app") => "metallib.rs",
         (_, "release-bundle-ships-no-metallib") => "release.yml",
         (_, "bundle-claims-an-older-macos-than-its-kernels") => "tauri.conf.json",
+        (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

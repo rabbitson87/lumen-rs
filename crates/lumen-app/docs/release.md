@@ -158,7 +158,7 @@ the bundle and its signature to a draft GitHub Release, and writes `latest.json`
 Publish the draft to expose it at `releases/latest/download/latest.json`, the
 URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
 toolchain choices (macOS 26 for an SDK that knows MLX's availability guards, the separately
-downloaded Metal toolchain, the `mlx-sys` pre-build).
+downloaded Metal toolchain, why `mlx-sys` is cleaned first).
 
 ### When the release job fails at notarization
 
