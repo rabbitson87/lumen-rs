@@ -31,15 +31,11 @@ permissions:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    # macos-26 (not macos-14): the MLX Neural-Accelerator (NAX) GEMM path —
-    # the M5 Pro/Max prefill speedup — is gated at runtime by
-    # `is_nax_available()`, which expands to `__builtin_available(macOS 26.2)`.
-    # Compiling that guard needs an SDK that *knows* macOS 26.2, i.e. Xcode 26.x.
-    # macos-14/macos-15 default to Xcode 16.x and don't reliably carry Xcode 26
-    # (disk-space constrained), so they fail with "macOS 26.2 is not a valid
-    # availability version". macos-26 (GA, arm64-native) ships Xcode 26.x by
-    # default. The kernels are baked into the metallib host-independently, so an
-    # arm64 runner builds a binary that activates the M5 path at runtime on M5.
+    # macos-26: the newest SDK, which builds for older macOS through
+    # MACOSX_DEPLOYMENT_TARGET below. MLX's availability guards (e.g.
+    # `__builtin_available(macOS 26.2)` in `is_nax_available()`) only compile
+    # against an SDK that knows those versions; macos-14/15 default to Xcode 16.x
+    # and fail with "macOS 26.2 is not a valid availability version".
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -51,20 +47,35 @@ jobs:
         target:
           - aarch64-apple-darwin
 
+    # The oldest macOS the release runs on, applied to every compiler in the
+    # job: rustc, the C/C++ builds, and — through CMake — the `metal` compiler
+    # that builds MLX's kernel library. Without it MLX passes no deployment
+    # target, `metal` defaults to the runner's SDK, and the metallib comes out
+    # bound to that exact version (macOS 26.5 on the last build) while the app
+    # claimed 11.0, so on an older macOS it installed and then could not load its
+    # kernels. 14.0 is MLX's own minimum. It compiles the kernels as Metal 3.1,
+    # so the release carries no M5 Neural Accelerator (NAX) kernels — those need
+    # Metal 4.0, i.e. a 26.2 target — and MLX compiles its NAX path out
+    # (MLX_METAL_NO_NAX). Wider install base chosen over the M5 prefill speedup;
+    # a source build on macOS 26.2+ still gets it. Keep it equal to
+    # `bundle.macOS.minimumSystemVersion` in crates/lumen-app/tauri.conf.json
+    # (a test in crates/lumen-server/tests/packaging.rs checks).
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Tauri's sidecar bundling references the on-disk `lumen-server`
           # binary path; the workflow places it relative to the workspace
           # root, so the checkout depth must be full (not shallow).
           fetch-depth: 0
 
-      # ── Pin newest stable Xcode (macOS 26.2 SDK for the NAX availability guard) ──
+      # ── Pin newest stable Xcode (an SDK that knows MLX's availability guards) ──
       # macos-26 already defaults to Xcode 26.x, but GitHub rotates that default
       # (26.0.1 → 26.2 → 26.3 …) and trims old point releases for disk space.
       # `latest-stable` deterministically selects the newest installed 26.x so
-      # MLX's `__builtin_available(macOS 26.2, *)` guard always finds a ≥26.2 SDK
-      # and libmlx/metallib build with the NAX kernels.
+      # MLX's `__builtin_available(macOS 26.2, *)` guards always compile.
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -102,28 +113,23 @@ jobs:
             . -> target
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          # 22 LTS: Node 20 is end-of-life, and the v4 actions that ran on it
+          # were being forced onto Node 24 with a deprecation warning.
+          node-version: 22
           cache: npm
           cache-dependency-path: crates/lumen-app/frontend/package-lock.json
 
-      # ── mlx-sys: force-build first so the metallib lands on disk before
-      #    lumen-server's build.rs runs. Without this, a `Swatinem/rust-cache`
-      #    hit can restore mlx-sys's metadata but skip the `out/` directory,
-      #    leaving lumen-server with no metallib to embed.
-      - name: Pre-build mlx-sys (writes mlx.metallib)
-        run: |
-          # mlx-sys's own default features (accelerate + metal) drive the
-          # CMake build that produces mlx.metallib. No `mlx-native` feature
-          # exists at the mlx-sys layer — that knob lives one crate up.
-          cargo clean -p mlx-sys || true
-          cargo build -p mlx-sys --release --target ${{ matrix.target }}
-          # Surface the metallib path so the next step (or a failure log) can
-          # cross-check what build.rs will discover.
-          echo "--- mlx.metallib search ---"
-          find target/${{ matrix.target }}/release/build -name mlx.metallib -print 2>/dev/null || true
-          find target/release/build -name mlx.metallib -print 2>/dev/null || true
+      # ── mlx-sys: start from a clean MLX build ─────────────────────
+      # mlx-c fetches the MLX fork by branch name, so a cached mlx-sys build
+      # (`Swatinem/rust-cache`) would keep whatever MLX it fetched last time.
+      # The metallib no longer needs a separate pre-build: mlx-sys declares
+      # `links = "mlx"`, so lumen-server's build script runs after it and gets
+      # the library's path as DEP_MLX_METALLIB. (The old `cargo build -p
+      # mlx-sys` here built a differently-featured unit — MLX compiled twice.)
+      - name: Clean mlx-sys
+        run: cargo clean -p mlx-sys --release --target ${{ matrix.target }} || true
 
       # ── Sidecar: build lumen-server, drop it into the bundle path ──
       - name: Build lumen-server (sidecar)
@@ -134,6 +140,14 @@ jobs:
           mkdir -p crates/lumen-app/binaries
           cp target/${{ matrix.target }}/release/lumen-server \
              crates/lumen-app/binaries/lumen-server-${{ matrix.target }}
+          # MLX's kernel library ships in the bundle's Contents/Resources, written
+          # out by the server itself so it is byte-for-byte the copy it embeds.
+          # Without it the server unpacks the library next to itself, inside the
+          # signed Contents/MacOS — which fails when the app runs from its
+          # read-only DMG or a Gatekeeper-translocated copy, and MLX then aborts
+          # with "Failed to load the default metallib".
+          crates/lumen-app/binaries/lumen-server-${{ matrix.target }} \
+            --write-metallib crates/lumen-app/binaries/mlx.metallib
 
       # ── Frontend install ──────────────────────────────────────────
       - name: Install frontend deps
@@ -141,6 +155,51 @@ jobs:
         run: npm ci
 
       # ── Tauri build + sign + upload ───────────────────────────────
+      # ── macOS code signing and notarization ───────────────────────
+      # Only what is configured reaches Tauri: an unset secret would arrive as
+      # an empty string, which is not the same as no identity.
+      #
+      # * Signing: the Developer ID certificate when its secrets are set, else
+      #   ad-hoc (`signingIdentity: "-"` in tauri.conf.json). Either way the
+      #   bundle's signature is valid; an unsigned one makes macOS report the
+      #   download as "damaged", with no way to open it from the Finder.
+      # * Notarization is opt-in with the repository variable
+      #   MACOS_NOTARIZE=true. It needs an *active* Apple Developer Program
+      #   membership — a lapsed one is what failed the v0.12.0 job (401) even
+      #   though the certificate was still valid. Without it users open the app
+      #   once via System Settings → Privacy & Security → Open Anyway.
+      - name: Configure macOS signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_NOTARIZE: ${{ vars.MACOS_NOTARIZE }}
+        run: |
+          put() {
+            if [ -n "$2" ]; then
+              { echo "$1<<__LUMEN_EOF__"; echo "$2"; echo "__LUMEN_EOF__"; } >> "$GITHUB_ENV"
+            fi
+          }
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            put APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
+            put APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+            put APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+            echo "signing: Developer ID"
+          else
+            echo "signing: ad-hoc (no Developer ID certificate secrets)"
+          fi
+          if [ "$MACOS_NOTARIZE" = "true" ]; then
+            put APPLE_ID "$APPLE_ID"
+            put APPLE_PASSWORD "$APPLE_PASSWORD"
+            put APPLE_TEAM_ID "$APPLE_TEAM_ID"
+            echo "notarization: on"
+          else
+            echo "notarization: off (repository variable MACOS_NOTARIZE is not true)"
+          fi
+
       - name: Build, sign + upload (.app, .dmg, latest.json)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -149,15 +208,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple notary credentials (optional; only set on real releases —
-          # without these the app is signed by the Tauri key but not notarized,
-          # so users see a Gatekeeper warning on first launch).
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The Apple signing / notarization variables come from the step above.
         with:
           projectPath: crates/lumen-app
           # Tag push → use the pushed tag (e.g. v0.2.0). Manual dispatch →
@@ -166,8 +217,8 @@ jobs:
           releaseName: ${{ github.event_name == 'push' && format('Lumen {0}', github.ref_name) || format('Lumen vTEST-{0} (dry-run)', github.sha) }}
           releaseDraft: true
           prerelease: false
-          # `--config` injects the sidecar binding so the default
-          # tauri.conf.json stays clean for `cargo tauri dev`.
+          # `--config` injects the sidecar binding and its kernel library so the
+          # default tauri.conf.json stays clean for `cargo tauri dev`.
           args: >-
             --target ${{ matrix.target }}
-            --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
+            --config '{"bundle":{"externalBin":["binaries/lumen-server"],"resources":{"binaries/mlx.metallib":"mlx.metallib"}}}'

@@ -17,10 +17,12 @@
 //! same code — and makes the request types reachable from
 //! `tests/` and from `fuzz/`.
 
+pub mod access;
 pub mod catalog;
 pub mod diffusion_engine;
 pub mod embedding;
 pub mod engine;
 pub mod load_stats;
+pub mod metallib;
 pub mod routes;
 pub mod types;

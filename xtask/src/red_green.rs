@@ -18,6 +18,11 @@ const MLX: &str = "crates/lumen-mlx/src";
 const DIF: &str = "crates/lumen-diffusion/src";
 const SRV: &str = "crates/lumen-server/src";
 const CORE: &str = "crates/lumen-core/src";
+/// fastokens, vendored with lumen-rs's fixes (vendor/fastokens/PATCHES.md).
+const FASTOKENS: &str = "vendor/fastokens/src/pre_tokenizers";
+const WORKFLOWS: &str = ".github/workflows";
+const APP: &str = "crates/lumen-app";
+const SRV_CRATE: &str = "crates/lumen-server";
 
 /// A single in-place edit. Both sides must be non-empty: the reverse direction
 /// searches for `replace`, and searching for an empty string matches
@@ -122,6 +127,34 @@ const fn srv(filter: &'static str) -> Guard {
         lib_only: true,
         test_target: "",
         release: false,
+    }
+}
+
+/// `lumen-server` lib guard that loads a real checkpoint. Release, because
+/// loading ~16 GB of weights in a debug build spends minutes before the test
+/// starts; pair it with `needs_checkpoint` so the run skips without one.
+const fn srv_checkpoint(filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        ..srv(filter)
+    }
+}
+
+/// `lumen-server` integration test over a real checkpoint (it may start the
+/// server binary itself). Release, as `srv_checkpoint`.
+const fn srv_checkpoint_test(target: &'static str, filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        ..srv_test(target, filter)
+    }
+}
+
+/// `lumen-mlx` lib guard over a real checkpoint: release, since a debug forward
+/// over thousands of tokens takes minutes. Pair with `needs_checkpoint`.
+const fn mlx_checkpoint(filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        ..mlx(filter)
     }
 }
 
@@ -505,10 +538,8 @@ static DEFECTS: &[Defect] = &[
                   `session_id` anywhere: turn 1 4.55 s, then 0.41 s and 0.40 s",
         revert: &[Mutation {
             path: MLX,
-            find: "        .filter(|(_, s)| s.extends(prompt_ids))\n        \
-                   .max_by_key(|(_, s)| s.tokens.len())",
-            replace: "        .filter(|(_, s)| { let _ = (s, prompt_ids); false })\n        \
-                      .max_by_key(|(_, s)| s.tokens.len())",
+            find: "        .filter_map(|(k, s)| s.reusable_len(prompt_ids).map(|n| (k, n)))",
+            replace: "        .filter_map(|(k, s)| { let _ = (k, s, prompt_ids); None::<(&String, usize)> })",
         }],
         guards: &[mlx(
             "tests::a_prompt_finds_its_own_conversation_without_being_told_which",
@@ -697,6 +728,302 @@ static DEFECTS: &[Defect] = &[
         occurrences: 1,
         needs_checkpoint: false,
         extra: &[],
+    },
+    Defect {
+        name: "tool-history-uncounted",
+        symptom: "a request carrying tool history — prior assistant \
+                  `tool_calls`, `role:\"tool\"` results, Anthropic \
+                  `tool_use`/`tool_result` — was counted from its flattened \
+                  `(role, content)` pairs while it decoded from `ChatTurn`s. \
+                  Qwen's flat renderer drops tool turns and calls, the \
+                  Anthropic flattening drops the blocks, and Gemma's rejects \
+                  role `tool` (chars/4 fallback). Documented as a turn-framing \
+                  gap of \"tens of tokens\"; measured on Qwen3.5-9B it was the \
+                  whole tool result — a 34.8K-token prefill reported as 32.7K — \
+                  in `usage.prompt_tokens` and in what `guard_prompt_fits` \
+                  admitted on. Found by the per-request `[tokenize]` line in \
+                  task 016",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                m.build_chat_input_with_tools_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    effort,
+                )
+                .map(|(ids, _prefill)| ids)"#,
+            replace: r#"                { let flat: Vec<(String, String)> = turns.iter().map(|t| match t { crate::chat_io::ChatTurn::System(s) => ("system".to_string(), s.to_string()), crate::chat_io::ChatTurn::User(s) => ("user".to_string(), s.to_string()), crate::chat_io::ChatTurn::Assistant { text, .. } => ("assistant".to_string(), text.to_string()), crate::chat_io::ChatTurn::Tool { content, .. } => ("tool".to_string(), content.to_string()) }).collect(); m.build_chat_input_with_tools(&flat, thinking, tools, tool_choice, effort).map(|(ids, _prefill)| ids) } // defect: tool history flattened"#,
+        }],
+        guards: &[core_mlx_lib(
+            "tests::the_history_count_renders_the_tool_turns_the_model_is_shown",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "anthropic-batch-guard-omits-images",
+        symptom: "a non-streaming /v1/messages request was admitted on its \
+                  rendered text alone: every image's placeholder run (~280 \
+                  soft tokens each on Gemma 4) slipped past the prompt cap that \
+                  OpenAI and Anthropic streaming enforce, and was added only \
+                  afterwards, to `usage` — so the figure a request was admitted \
+                  on was not the figure it reported. Found in task 016",
+        revert: &[Mutation {
+            path: SRV,
+            find: ") + image_tokens;\n            guard_prompt_fits(&self.backend, prompt_tokens)?;",
+            replace: ") + image_tokens;\n            // defect: the guard sees the text alone\n            guard_prompt_fits(&self.backend, prompt_tokens - image_tokens)?;",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::anthropic_batch_image_admission::the_batch_guard_admits_on_the_count_it_reports",
+        )],
+        occurrences: 2, // the flat branch and the tool-history branch
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "server-binds-every-interface",
+        symptom: "lumen-app's host scope (\"localhost (127.0.0.1)\" by default) \
+                  reached the server as LUMEN_HOST and was never read: every \
+                  launch bound 0.0.0.0, putting an API with no auth on the \
+                  network, while the README promised a 127.0.0.1 default",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        .unwrap_or(\"127.0.0.1\");",
+            replace: "        .unwrap_or(\"0.0.0.0\"); // defect: every interface",
+        }],
+        guards: &[srv("access::tests::the_listener_defaults_to_loopback")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "api-key-not-enforced",
+        symptom: "lumen-app's API key reached the server as LUMEN_API_KEY and was \
+                  never read: a setup the app showed as key-protected answered \
+                  every request without one",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        if path == \"/health\" || method == \"OPTIONS\" {",
+            replace: "        if true {\n            // defect: the key is never checked",
+        }],
+        guards: &[srv(
+            "access::tests::a_configured_key_is_required_everywhere_but_health_and_preflight",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "cors-setting-ignored",
+        symptom: "lumen-app's CORS scope reached the server as LUMEN_CORS and was \
+                  never read: no response carried CORS headers, so a browser \
+                  client failed under every setting, \"all\" included",
+        revert: &[Mutation {
+            path: SRV,
+            find: "            Self::All => Some(\"*\".to_string()),",
+            replace: "            Self::All => None, // defect: CORS never applied",
+        }],
+        guards: &[srv("access::tests::all_and_off_ignore_the_origin")],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "completions-unguarded",
+        symptom: "/v1/completions was the one surface with no prompt-size guard: \
+                  a raw prompt of any size went straight to prefill, where an \
+                  oversized prompt is a Metal out-of-memory instead of a refusal",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        guard_prompt_fits(&self.backend, prompt_tokens)?;\n\n        let ov = req.sampling_overrides();\n        let output_ids = self.backend.generate(",
+            replace: "        // defect: no guard\n\n        let ov = req.sampling_overrides();\n        let output_ids = self.backend.generate(",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::completion_admission::a_raw_prompt_over_the_cap_is_refused",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "prompt-refusal-reported-as-server-error",
+        symptom: "a prompt the size guard refused went out as HTTP 500 on every \
+                  batch route — a server error, which the OpenAI and Anthropic \
+                  SDKs retry, resending a prompt that can only be refused again; \
+                  the Anthropic body even said invalid_request_error",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        400\n    } else {\n        500\n    }",
+            replace: "        500 // defect: refusals reported as server errors\n    } else {\n        500\n    }",
+        }],
+        guards: &[srv(
+            "engine::prompt_refusal_status::a_refused_prompt_goes_out_as_a_client_error",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "gemma-cached-stream-thought-channel",
+        symptom: "a streaming response_format request that carried a system \
+                  message — so a prefix-cache key — degenerated on Gemma 4: \
+                  both cached streaming routes rendered the prompt with the \
+                  thought channel open while the JSON grammar masked from token \
+                  0. The gemma-thought-channel fix had reached the uncached \
+                  routes only, and the token counter assumed the channel closed",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let close_thought_channel = response_schema.is_some();",
+            replace: "            let close_thought_channel = false; // defect: channel left open",
+        }],
+        // The end-to-end test (`engine::gemma_structured_stream`) went green
+        // with the defect once sliding-layer attention changed numerics: an
+        // open channel under a JSON grammar degenerates or not depending on
+        // rounding. The guard checks the ids both cached routes render.
+        guards: &[mlx_checkpoint(
+            "gemma4_backend::imp::tests::a_cached_route_closes_the_thought_channel_for_a_schema",
+        )],
+        occurrences: 1, // `cached_prompt_and_prefill`, shared by both cached routes
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "temperature-zero-is-a-coin-flip",
+        symptom: "the same temperature-0 request gave 2-3 different answers \
+                  across runs of one Gemma 4 binary: its default repeat \
+                  penalty keeps such requests off the greedy path, the sampler \
+                  scaled by 1/1e-5 and drew, and an exact bf16 tie at the top \
+                  was settled by an RNG seeded from the clock",
+        revert: &[Mutation {
+            path: CORE,
+            find: "    if cfg.temperature <= 0.0 {\n        return argmax_lowest(logits);\n    }\n\n    // Temperature scaling before softmax.\n    let t = cfg.temperature;",
+            replace: "    // defect: temperature 0 drawn from the RNG\n\n    // Temperature scaling before softmax.\n    let t = cfg.temperature.max(1e-5);",
+        }],
+        guards: &[core(
+            "sampling::tests::temperature_zero_breaks_a_tie_the_same_way_on_every_seed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "greedy-decode-drops-the-grammar",
+        symptom: "on Gemma 4 a grammar was applied only by the sampled decode \
+                  branch, so a greedy request (temperature 0, penalties off — \
+                  `repeat_penalty: 1.0` from the client is enough) decoded with \
+                  no mask: response_format and forced tool calls came back as \
+                  free text",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                    .or_else(|| grammar.is_some().then(SamplingConfig::default));",
+            replace: "                    ; // defect: greedy decode ignores the grammar",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_greedy_grammar::a_greedy_request_still_gets_its_schema",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "gemma-boundary-prefill-unchunked",
+        symptom: "a 35.8K-token Gemma 4 prompt failed: the prefix cache's \
+                  boundary snapshot was prefilled in one forward, and a global \
+                  layer's attention scores asked Metal for 41 GB; the snapshot \
+                  had been stored before anything was evaluated, so every later \
+                  request with that system prompt failed too, until restart",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                .forward_last_token_chunked(&prompt[..boundary], cache)",
+            replace: "                .forward_last_token(&prompt[..boundary], cache) // defect: one pass",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "gemma-batch-prefill-unchunked",
+        symptom: "every non-streaming Gemma 4 request prefilled its prompt in \
+                  one forward — only the streaming decode loop chunked — so a \
+                  long batch prompt materialized whole-prompt attention scores \
+                  and failed where the same prompt streamed fine",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                self.forward_last_token_chunked(prompt_ids, cache)",
+            replace: "                self.forward_last_token(prompt_ids, cache) // defect: one pass",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "gemma-drop-leaves-boundary-snapshot",
+        symptom: "DELETE /v1/prefix-cache/{key} on Gemma 4 removed the \
+                  full-prompt snapshot but not its system-boundary sibling, so \
+                  the next request with the key forked the boundary right back \
+                  — the route could not evict the entry a failed prefill left",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let boundary = self.prefix_caches.remove(&Self::sys_key(key)).is_some();",
+            replace: "            let boundary = false; // defect: the boundary snapshot survives",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_prefix_cache_drop::dropping_a_key_drops_its_boundary_snapshot_too",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "streams-delivered-in-one-burst",
+        symptom: "every streaming response, OpenAI and Anthropic, reached the \
+                  client in one burst when generation finished — 80 Qwen 9B \
+                  deltas all at 2,894 ms of a 2,894 ms stream, Anthropic's \
+                  message_start included — so time to first token was the \
+                  whole generation. The engine ran as a tokio task that never \
+                  yields, and the SSE writer it woke waited on the engine's own \
+                  worker until the request was done",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        std::thread::Builder::new()\n            .name(\"lumen-engine\".into())\n            .spawn(move || {\n                tokio::runtime::Builder::new_current_thread()\n                    .enable_all()\n                    .build()\n                    .expect(\"engine runtime\")\n                    .block_on(self.run(rx))\n            })?;",
+            replace: "        tokio::spawn(async move { self.run(rx).await }); // defect: engine on a tokio worker",
+        }],
+        // An in-process engine test stayed green with the defect: the stall was
+        // the server runtime's scheduling, so the guard drives the real binary.
+        guards: &[srv_checkpoint_test(
+            "streaming_delivery",
+            "the_server_streams_tokens_while_it_generates",
+        )],
+        occurrences: 1,
+        needs_checkpoint: true,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "gemma-batch-grammar-skips-prefix-cache",
+        symptom: "every non-streaming Gemma 4 request with tools or response_format \
+                  took a route that never touched the prefix cache, so an agent — \
+                  which sends tools on every turn — paid a cold prefill each time \
+                  (~19-20 s at 16K tokens) where the same request streamed from \
+                  the cache",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                    // The grammar masks generated tokens only, so the prompt\n                    // can still come from the prefix cache.\n                    let key = session_id",
+            replace: "                    // defect: grammar requests skip the prefix cache\n                    let key: Option<String> = None;\n                    let _ = session_id",
+        }],
+        guards: &[srv_checkpoint(
+            "engine::gemma_batch_grammar_prefix_cache::a_batch_tool_request_leaves_a_snapshot_for_the_next_turn",
+        )],
+        occurrences: 2, // the flat route and the history route
+        needs_checkpoint: true,
+        extra: &["--ignored"],
     },
     Defect {
         name: "anthropic-stream-zero-input-tokens",
@@ -1285,8 +1612,8 @@ static DEFECTS: &[Defect] = &[
         // before the content assertions, nothing compared what came back out.
         revert: &[Mutation {
             path: MLX,
-            find: r#"                    let cached = self.offset;"#,
-            replace: r#"                    let cached = self.offset.saturating_sub(1);"#,
+            find: "        let ordered = if idx == buf {\n            old.clone()",
+            replace: "        let ordered = if idx == buf {\n            slice_axis2(old, 0, idx.saturating_sub(1) as i32)? // defect: drops a token",
         }],
         guards: &[mlx(
             "native_cache::lifecycle_tests::rotating_cache_growth_within_max_size",
@@ -1341,9 +1668,295 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "gemma4_chat::imp::tests::close_thought_channel_prefills_the_empty_block",
         )],
-        occurrences: 2, // the flat renderer and the history renderer
+        // One site since both renderers share `generation_prompt_ids` (task 016).
+        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+    },
+    Defect {
+        name: "rotating-cache-trims-against-offset",
+        symptom: "Gemma 4 prompts prefilled in chunks lost in-window context \
+                  from the third chunk on. The sliding layers' rotating cache \
+                  trimmed against `offset`, every token ever pushed, instead of \
+                  the keys it held, so once a chunk had been trimmed the slice \
+                  ran past the buffer; a ring wrapped by decode was never put \
+                  back in temporal order either, and the quantized variants kept \
+                  only `max_size - S` old keys. With 512-token chunks at 3,000 \
+                  tokens the last-token logits fell to cosine 0.89 against mlx-lm",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let trim = (held + 1).saturating_sub(max_size);",
+            replace: "        let trim = (offset + 1).saturating_sub(max_size); // defect: trims against offset",
+        }],
+        guards: &[mlx(
+            "native_cache::lifecycle_tests::rotating_cache_holds_what_mlx_lm_holds",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "windowed-kernel-used-unchecked",
+        symptom: "the windowed steel kernel is on by default, and mlx-c fetches \
+                  the MLX fork by branch: a build cached from before \
+                  rabbitson87/mlx 8a2587df / 23b42543 keeps a kernel that read \
+                  the wrong K/V blocks, and Gemma 4 long prompts came back as \
+                  garbage with nothing logged. The load-time self-check compares \
+                  the kernel with explicit-mask attention first and falls back \
+                  (it caught a second, causal-mask bug in the fork this way)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            if worst.is_nan() || worst > 0.05 {",
+            replace: "            if false && worst > 0.0 { // defect: kernel trusted unchecked",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::the_windowed_kernel_self_check_tells_right_from_wrong",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "fastokens-split-cache-reads-past-the-prefix",
+        symptom: "fastokens 0.3.2 as published gave the same string different ids \
+                  depending on what the thread encoded before: on every Qwen \
+                  tokenizer, 5000 bytes of text plus 700 spaces split the run as \
+                  59 + 2 tokens right after the same text with an `x` after the \
+                  spaces, where a fresh encode and HF give one. Its split cache \
+                  reused regex matches that bytes past the shared prefix decide \
+                  (`\\s+(?!\\S)` gives a space back when a non-space follows). \
+                  Task 016's parity run caught it before lumen encoded with it",
+        revert: &[Mutation {
+            path: FASTOKENS,
+            find: "                let limit = reuse_limit(bytes, common_len);\n                let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end <= limit);",
+            replace: "                // defect: upstream's reuse condition\n                let reuse_count = cache.prev_matches.partition_point(|&(_, end)| end < common_len);",
+        }],
+        guards: &[core_mlx_lib(
+            "text_tokenizer::tests::fastokens_ids_do_not_depend_on_the_previous_call",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "fastokens-nfc-newer-unicode",
+        symptom: "with LUMEN_FASTOKENS on, text holding a combining mark newer \
+                  than Unicode 9 encoded to other ids than HF's: `a`, U+1DF6, \
+                  U+0301 became `á`, U+1DF6 under fastokens' ICU normalizer and \
+                  stayed as written under HF's Unicode 9 tables. Task 016's \
+                  code-point sweep showed four such marks; the tables differ on \
+                  193 characters, and text holding one goes to HF",
+        revert: &[Mutation {
+            path: MLX,
+            find: ".filter(|_| fastokens_encode::get() && !normalization_differs(text));",
+            replace: ".filter(|_| fastokens_encode::get()); // defect: no normalization fallback",
+        }],
+        guards: &[core_mlx_lib(
+            "text_tokenizer::tests::text_the_normalizers_disagree_on_is_encoded_by_hf",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "chat-turn-header-defeats-session-reuse",
+        symptom: "plain multi-turn chat on Qwen 3.5 / 3.6 never reused its \
+                  session: a turn ends in a generation header \
+                  (`<|im_start|>assistant\\n<think>…`) that the next prompt does \
+                  not reproduce — the template drops the `<think>` block from \
+                  replayed assistant turns, and on 3.8 so does any client that \
+                  does not return the trace — so the session's tokens were never \
+                  a prefix of the next prompt and every turn prefilled the whole \
+                  conversation again. Measured on Qwen3.5-9B with an 11.5K-token \
+                  system prompt: ~25 s a turn, on main too. Fixed by leaving a \
+                  rollback point at the conversation boundary and resuming from \
+                  it: turn two 26.0 s -> 0.4 s, replies byte-identical",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let kept = self.rollback_len?;",
+            replace: "        let kept = self.rollback_len.filter(|_| false)?; // defect: no resume",
+        }],
+        guards: &[
+            core_mlx_lib("tests::the_next_chat_turn_resumes_instead_of_prefilling_again"),
+            core_mlx_lib("tests::a_session_is_found_again_through_its_rollback_point"),
+        ],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "rollback-cut-inside-a-moe-chunk",
+        symptom: "on a mixture-of-experts model a rollback point cut inside a \
+                  prefill chunk changes the answer: MLX's GatherQMM sorts the \
+                  routed rows by expert and tiles across them, so a row's result \
+                  depends on which rows share its call. Measured on \
+                  Qwen3.6-35B-A3B: a 32-row piece changed a greedy reply after \
+                  ~30 words, and a turn resumed from a 128-row-floored cut still \
+                  differed from a cold prefill. Such models mark only on chunk \
+                  boundaries, where the pieces are the bulk pass's own chunks",
+        revert: &[Mutation {
+            path: MLX,
+            find: "            let inside = grid.min_piece.map(|floor| {",
+            replace: "            let inside = grid.min_piece.or(Some(MIN_BULK_PIECE)).map(|floor| { // defect",
+        }],
+        guards: &[core_mlx_lib(
+            "session_feed::tests::a_mixture_of_experts_marks_only_on_chunk_boundaries",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "rollback-cut-leaves-a-short-piece",
+        symptom: "cutting the prefill right at the conversation boundary leaves \
+                  the generation header — ten rows on Qwen — as a piece of its \
+                  own, and below ~32 rows MLX computes quantized projections with \
+                  its vector kernel (`get_qmv_batch_limit`), which sums in a \
+                  different order from the bulk chunk those rows sat in: the turn \
+                  that places the point is no longer the turn without it. The \
+                  planner keeps every piece cut inside a chunk at 32+ rows",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                let at = boundary.min(cell_end.saturating_sub(floor));",
+            replace: "                let at = boundary; // defect: cuts at the header",
+        }],
+        guards: &[core_mlx_lib(
+            "session_feed::tests::a_cut_never_changes_which_kernels_a_row_goes_through",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "bundled-server-writes-its-metallib-into-the-app",
+        symptom: "the release app's server could not start on a user's Mac: it \
+                  unpacked mlx.metallib next to itself, inside the signed \
+                  Lumen.app/Contents/MacOS, and when the app ran from its \
+                  read-only DMG (or a Gatekeeper-translocated copy) the write \
+                  failed and MLX aborted with \"Failed to load the default \
+                  metallib\" (exit 255) — on the build machine MLX's compiled-in \
+                  path to the build tree hid it. The bundle now ships the library \
+                  in Contents/Resources, the MLX fork looks there (97685a09), and \
+                  the server leaves the bundle alone when that copy is its own",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        (None, Some(b)) if b == embedded => Plan::UseBundled,",
+            replace: "        (None, Some(b)) if b == embedded && false => Plan::UseBundled, // defect",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "a_bundled_library_is_used_without_writing_into_the_bundle",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "release-bundle-ships-no-metallib",
+        symptom: "the release workflow bundled the lumen-server sidecar without \
+                  MLX's kernel library, so the server had to write it into the \
+                  signed app at run time — and could not on a read-only volume. \
+                  The workflow stages the server's own copy \
+                  (`--write-metallib`) and maps it into Contents/Resources",
+        revert: &[Mutation {
+            path: WORKFLOWS,
+            find: r#","resources":{"binaries/mlx.metallib":"mlx.metallib"}"#,
+            replace: r#","resources":{}"#,
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_release_workflow_ships_the_library_where_mlx_looks",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "bundle-claims-an-older-macos-than-its-kernels",
+        symptom: "the release app declared macOS 11.0 while its MLX kernel \
+                  library was compiled for the CI runner's SDK \
+                  (air64-apple-macosx26.5 on the last build): MLX passes no \
+                  deployment target, so `metal` defaulted to the SDK, and a Metal \
+                  library does not load on an older macOS than it was built for. \
+                  The release job now pins MACOSX_DEPLOYMENT_TARGET=14.0 (MLX's \
+                  own minimum) and the bundle declares the same floor",
+        revert: &[Mutation {
+            path: APP,
+            find: "\"minimumSystemVersion\": \"14.0\",",
+            replace: "\"minimumSystemVersion\": \"11.0\",",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_bundle_declares_the_macos_its_kernels_were_built_for",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "server-build-races-mlx-for-the-metallib",
+        symptom: "a fresh `cargo build -p lumen-server` failed: its build.rs \
+                  searched the target directory for mlx.metallib while mlx-sys \
+                  was still running CMake, found nothing, and panicked — Cargo \
+                  orders a build script after a dependency's only when that \
+                  dependency declares `links` and is a direct dependency. CI \
+                  pre-built mlx-sys to get around it, as a differently-featured \
+                  unit, so MLX compiled twice. mlx-sys now declares \
+                  `links = \"mlx\"` (rabbitson87/mlx-rs cee2f18a) and the server \
+                  depends on it directly, receiving DEP_MLX_METALLIB",
+        revert: &[Mutation {
+            path: SRV_CRATE,
+            find: "    \"dep:mlx-sys\",",
+            replace: "    # defect: mlx-sys not a direct dependency",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "release-requires-notarization",
+        symptom: "the release job handed the notary credentials to the build on \
+                  every run, so with the Apple Developer Program membership \
+                  lapsed it failed at notarization (401) after building and \
+                  signing — no release at all. Notarization is now opt-in \
+                  (repository variable MACOS_NOTARIZE)",
+        revert: &[Mutation {
+            path: WORKFLOWS,
+            find: "          # The Apple signing / notarization variables come from the step above.",
+            replace: "          APPLE_ID: ${{ secrets.APPLE_ID }} # defect: always notarize",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "the_release_builds_without_notarization_unless_asked",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "unsigned-bundle-reads-as-damaged",
+        symptom: "built without a Developer ID certificate, the app carried only \
+                  the linker's ad-hoc signature on its executables, which claims a \
+                  bundle seal that was never written (`codesign --verify --strict`: \
+                  'code has no resources but signature indicates they must be \
+                  present'); macOS reports such a download as damaged, with no \
+                  Open Anyway. The bundle is now signed ad-hoc by default",
+        revert: &[Mutation {
+            path: APP,
+            find: "\"signingIdentity\": \"-\"",
+            replace: "\"signingIdentity\": null",
+        }],
+        guards: &[srv_test(
+            "packaging",
+            "a_build_without_a_certificate_is_still_validly_signed",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
     },
 ];
 
@@ -1372,10 +1985,12 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-parallel-tool-calls-not-consulted")
         | (_, "effort-ungated-in-token-count")
         | (_, "tool-schema-uncounted-in-usage")
+        | (_, "tool-history-uncounted")
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")
-        | (_, "session-reuse-needs-a-nonstandard-field") => "lib.rs",
+        | (_, "session-reuse-needs-a-nonstandard-field")
+        | (_, "gemma-batch-grammar-skips-prefix-cache") => "lib.rs",
         // One defect, two files: the wire had no field for the trace *and* the
         // renderer had nowhere to put one. Reverting either half is enough to
         // lose the KV, so both are mutated together.
@@ -1392,13 +2007,28 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "anthropic-output-drops-thinking-block") => "engine.rs",
         (_, "anthropic-stream-block-indices-pinned") => "routes/messages.rs",
         (_, "gemma-thought-channel") => "gemma4_chat.rs",
+        (_, "gemma-cached-stream-thought-channel") | (_, "greedy-decode-drops-the-grammar") => {
+            "gemma4_backend.rs"
+        }
+        (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
+        (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
+            "gemma4_backend.rs"
+        }
+        (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
         (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none")
         | (_, "anthropic-turn-images")
+        | (_, "anthropic-batch-guard-omits-images")
+        | (_, "completions-unguarded")
+        | (_, "streams-delivered-in-one-burst")
         | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        (_, "server-binds-every-interface")
+        | (_, "api-key-not-enforced")
+        | (_, "cors-setting-ignored") => "access.rs",
+        (_, "prompt-refusal-reported-as-server-error") => "types.rs",
         (_, "anthropic-stream-zero-input-tokens") => "routes/messages.rs",
         // `TempPath` lives in `lumen-core`'s lib.rs rather than in a module of
         // its own: it is three lines of test scaffolding shared by three
@@ -1409,6 +2039,20 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         }
         (_, "no-overlap-keyed-on-presence") => "gemma4_backend.rs",
         (_, "parallel-tool-calls-ignored") => "types.rs",
+        (_, "fastokens-split-cache-reads-past-the-prefix") => "split.rs",
+        (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
+        (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
+        (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
+        (_, "chat-turn-header-defeats-session-reuse") => "lib.rs",
+        (_, "rollback-cut-inside-a-moe-chunk") | (_, "rollback-cut-leaves-a-short-piece") => {
+            "session_feed.rs"
+        }
+        (_, "bundled-server-writes-its-metallib-into-the-app") => "metallib.rs",
+        (_, "release-bundle-ships-no-metallib") => "release.yml",
+        (_, "bundle-claims-an-older-macos-than-its-kernels") => "tauri.conf.json",
+        (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
+        (_, "release-requires-notarization") => "release.yml",
+        (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

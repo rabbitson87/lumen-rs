@@ -28,6 +28,25 @@ fn main() {
         return;
     }
 
+    // mlx-sys reports the library it built (`links = "mlx"` → DEP_MLX_METALLIB),
+    // and declaring `links` is also what makes Cargo run this script after
+    // mlx-sys's. Without that ordering a fresh build ran this script while MLX
+    // was still compiling, found nothing, and failed — CI pre-built mlx-sys to
+    // get around it, compiling MLX twice. The search below is the fallback for
+    // an mlx-sys without the metadata.
+    println!("cargo:rerun-if-env-changed=DEP_MLX_METALLIB");
+    if let Some(reported) = std::env::var_os("DEP_MLX_METALLIB")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        println!("cargo:rerun-if-changed={}", reported.display());
+        println!(
+            "cargo:rustc-env=LUMEN_MLX_METALLIB_PATH={}",
+            reported.display()
+        );
+        return;
+    }
+
     // Search both `<workspace>/target/` (root) AND `<workspace>/target/<triple>/`
     // (cross-compile dir) because mlx-sys's CMake can land the artifact under
     // either depending on host vs target match and the CMake version.

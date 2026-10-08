@@ -53,11 +53,3 @@ directories = "6.0.0"
 
 # Locate the lumen-server binary on PATH (dev fallback)
 which = "8.0.2"
-
-[features]
-# `bundled-server` includes the lumen-server binary as a Tauri sidecar in the
-# .app bundle. Off by default — during dev the app finds the binary via PATH or
-# the `binary_path` config field. Production builds (`cargo tauri build`) flip
-# this on.
-default = []
-bundled-server = []

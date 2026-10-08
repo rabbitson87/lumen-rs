@@ -159,9 +159,10 @@ pub async fn handle(
             *response.status_mut() = StatusCode::from_u16(200)?;
         }
         Err(e) => {
-            let err = ErrorResponse::new(crate::types::inference_error_message(&e), 500);
+            let status = crate::types::inference_error_status(&e);
+            let err = ErrorResponse::new(crate::types::inference_error_message(&e), status);
             response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(500)?;
+            *response.status_mut() = StatusCode::from_u16(status)?;
         }
     }
 
@@ -180,17 +181,11 @@ async fn handle_streaming(
         .as_ref()
         .map(|o| o.include_usage)
         .unwrap_or(false);
+    let head = super::sse_head(response.headers());
     let mut tcp = response.into_body().stream;
 
     // Write HTTP headers for SSE
-    tcp.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          \r\n",
-    )
-    .await?;
+    tcp.write_all(head.as_bytes()).await?;
 
     let mut token_rx = match handle.chat_completion_streaming(req).await {
         Ok(rx) => rx,

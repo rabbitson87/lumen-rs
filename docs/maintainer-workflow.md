@@ -431,11 +431,13 @@ readable from one request: the reported figure must equal that number. Two
 things make a *correct* server look wrong here. An active grammar
 (`tool_choice: required`) holds the last prompt token back for a masked decode
 step, so the line also states `prompt=N` — compare against that, not the prefill
-length. And a structured-history request still counts the flattened
-`(role, content)` pairs while decoding from `ChatTurn`s, which is a known
-turn-framing gap of tens of tokens. Anything bigger than that is a defect: the
-figure feeds `guard_prompt_fits` as well as the client's bill, so it
-under-reports and over-admits together.
+length. A request carrying tool history (prior `tool_calls`, `role:"tool"`,
+Anthropic `tool_use`/`tool_result`) is counted from the same `ChatTurn`s it
+decodes from, so it holds to the same invariant. It used to count the flattened
+`(role, content)` pairs, documented here as "a turn-framing gap of tens of
+tokens"; it was the whole tool history (red-green `tool-history-uncounted`).
+Any gap is a defect: the figure feeds `guard_prompt_fits` as well as the
+client's bill, so it under-reports and over-admits together.
 
 Check it through the **desktop app's** launch too, not just
 `MODEL_ID=… lumen-server`. The app resolves the model id against the local scan
@@ -578,6 +580,28 @@ without inventing a threshold.
 `LUMEN_MLX_AUTO_SESSION` is registered `Behavior` for this reason and the
 equivalence matrix must never flip it. The session path has always had the drift;
 the flag only changes who reaches it.
+
+**A chat turn's own tail never comes back, so exact extension misses every plain
+chat turn.** The generation header a turn ends with
+(`<|im_start|>assistant\n<think>…`) is not in the next prompt: Qwen 3.5/3.6 templates drop the `<think>`
+block from replayed assistant turns, and on 3.8 so does any client that does not
+return the trace. So `extends` fails on every turn and the whole conversation is
+prefilled again — ~25 s a turn on Qwen3.5-9B with an 11.5K-token system prompt.
+`LUMEN_MLX_SESSION_ROLLBACK` leaves a rollback point before the header (full
+attention truncates, only the linear-attention state is kept) and the next turn
+winds back to it: 26.0 s → 0.4 s, replies byte-identical.
+
+Placing the point means cutting the prefill, and a cut is exact only if every row
+is still computed as the bulk pass computes it. `session_feed::plan_feed` keeps
+the bulk pass's chunk grid and cuts inside a chunk only on dense models, with 32+
+rows on each side — below that MLX routes quantized projections to its vector
+kernel. Mixture-of-experts models mark on chunk boundaries only: `GatherQMM`
+tiles across the rows routed to each expert, so a row depends on which rows share
+its call, and no floor fixes that (a 128-row-floored cut on Qwen3.6-35B-A3B still
+differed from a cold prefill). `a_rollback_point_changes_no_token` measures both
+claims — turn one with and without a point, a resumed turn against a cold
+prefill — and must be run on a dense and a MoE checkpoint. The flag is
+`Optimization`.
 
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to

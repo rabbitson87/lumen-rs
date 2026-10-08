@@ -369,7 +369,7 @@ pub async fn check_model_updates(
 #[tauri::command]
 pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ServerStatus> {
     let g = state.config.lock().await;
-    let mut cfg = g.clone();
+    let cfg = g.clone();
     // Two independent slots: a chat/LLM model and an image/diffusion model.
     // Either or both may be set → chat, image, or hybrid serve.
     let chat_id = g.active_model.clone();
@@ -409,18 +409,12 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     let (model_arg, active_bytes) = if let Some(ref cid) = chat_id {
         let entries = models::scan_local(&models_dir, &cat).map_err(err)?;
         match entries.iter().find(|m| m.id == *cid) {
-            Some(entry) => {
-                // Mirror into local_model_dir too — engine.rs reads
-                // LUMEN_GEMMA4_DIR / LUMEN_QWEN35_SHARDS for the non-MLX
-                // (Candle) Gemma4Native / Qwen35Moe paths.
-                if cfg.server.local_model_dir.is_none() {
-                    cfg.server.local_model_dir = Some(entry.path.clone());
-                }
-                (
-                    entry.path.to_string_lossy().into_owned(),
-                    Some(entry.size_bytes),
-                )
-            }
+            // MODEL_ID is the local path; every loader takes the weights
+            // from it.
+            Some(entry) => (
+                entry.path.to_string_lossy().into_owned(),
+                Some(entry.size_bytes),
+            ),
             None => {
                 // Not on disk — resolve to the canonical HF id so the server
                 // can fetch.

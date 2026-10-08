@@ -160,10 +160,8 @@ export const en: Record<string, string> = {
   "debug.memoryBypass.label": "Bypass all caps",
   "debug.memoryBypass.hint": "skip wired+cache+memory; let MLX/macOS manage",
   "debug.loader": "Loader overrides",
-  "debug.tokenizer": "Tokenizer",
-  "debug.tokenizer.placeholder": "HF repo id (override)",
-  "debug.weightsDir": "Weights dir",
-  "debug.weightsDir.placeholder": "auto-set from active model",
+  "debug.weightsDir": "Gemma 4 weights dir",
+  "debug.weightsDir.placeholder": "only for a Gemma 4 model not downloaded here",
   "debug.skipWarmup": "Skip warmup",
   "debug.skipWarmup.hint": "faster start, first request slower",
 

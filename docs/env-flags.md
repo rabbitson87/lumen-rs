@@ -9,6 +9,7 @@ unset → default, `"0"` → off, any other value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
+| `LUMEN_FASTOKENS` | off | Optimization | `lumen_mlx::text_tokenizer::fastokens_encode` |
 | `LUMEN_GEMMA4_FUSE_DENSE_MLP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_dense_mlp` |
 | `LUMEN_GEMMA4_FUSE_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_experts` |
 | `LUMEN_GEMMA4_FUSE_LAYER_EPILOGUE` | off | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_layer_epilogue` |
@@ -20,6 +21,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
+| `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session_rollback_enabled` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -34,8 +36,24 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
+
+### `LUMEN_FASTOKENS`
+
+*Optimization, default off.*
+
+Encode with the vendored fastokens (`vendor/fastokens`) instead of HF
+ `tokenizers`: BPE only, 10-16x faster on long prompts. Exact by
+ construction of the check, not by trust: the engine is built at load
+ only if it returns HF's ids for every probe string, with and without
+ special tokens, and text the two would normalize differently (193
+ characters newer than HF's Unicode 9 tables) or a per-call error goes
+ to HF. Decoding stays on HF. Off by default: with the memo on, a warm
+ turn encodes in ~1 ms, so what it saves is one cold encode — 15-20 ms
+ at 30K tokens, 60-95 ms at 107K — against a prefill of seconds, and
+ loading the tokenizer takes 0.3-0.9 s longer.
 
 ### `LUMEN_GEMMA4_FUSE_DENSE_MLP`
 
@@ -158,6 +176,28 @@ Disable overlap scheduling on the sampled decode path, restoring the
  stays synchronous and in the original order. Only the parser advance,
  detokenisation and SSE send of the *previous* token are deferred, and
  the parser is consumed solely by `emit_token_event` / `finalize`.
+
+### `LUMEN_MLX_SESSION_ROLLBACK`
+
+*Optimization, default on.*
+
+Leave a rollback point at each chat turn's conversation boundary, so
+ the next turn can resume a session it does not exactly extend.
+
+ Without it, plain multi-turn chat on Qwen 3.5 / 3.6 never reuses a
+ session: the generation header a turn ends with is not in the next
+ prompt (the template drops the `<think>` block from replayed turns), so
+ every turn prefilled the whole conversation again — measured on
+ Qwen3.5-9B with an 11.5K-token system prompt, about 25 s a turn. The
+ same holds on 3.8 for any client that does not return the trace.
+
+ **`Optimization`: the output does not change, by construction.** The
+ point is placed by cutting the prefill, and `session_feed::plan_feed`
+ only cuts where every row still goes through the kernels one bulk pass
+ uses, keeping that pass's chunk grid. A resumed turn re-feeds what
+ follows the point through the same bulk path, which is what a cold
+ prefill of the longer prompt does — `extend` reproduces a bulk prefill
+ bit-identically (`session_reuse_reproduces_a_cold_prefill`).
 
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 
@@ -306,3 +346,17 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  A/B hatch. The equivalence matrix must never flip this expecting
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
+
+### `LUMEN_TOKENIZE_MEMO`
+
+*Optimization, default on.*
+
+Remember the encodes of long prompt pieces that recur across requests —
+ the system+tools head and the history an agent resends every turn — so
+ a turn encodes only what is new. Qwen prompts are cut right before each
+ `<|im_start|>`, where HF splits them itself; other strings are
+ remembered whole. Exact: the cut is used only for a tokenizer where it
+ cannot change the ids, checked at load. Bounded at 64 MB. On by
+ default since task 016's Gate 2: warm agentic turns at ~35K tokens
+ reached their first token 38 ms sooner on Qwen3.5-9B (279 → 241 ms,
+ Welch t 16.3) and 45 ms sooner on Gemma 4 (272 → 227 ms, t 16.2).

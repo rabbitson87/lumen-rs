@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 // carried a `v7 -> v8` step, and migration only runs when `schema_version <
 // CURRENT`, so a config sitting at exactly 7 never received that step. Bumping
 // the constant is not optional bookkeeping; it is what makes the step run.
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -82,9 +82,9 @@ pub struct ServerConfig {
     // ── Loading / warmup ────────────────────────────────────────────
     /// → `EMBEDDING_MODEL_ID` — optional embedding model spawned alongside.
     pub embedding_model_id: Option<String>,
-    /// → `TOKENIZER_ID` — override tokenizer repo (rarely needed).
-    pub tokenizer_id: Option<String>,
-    /// → `LUMEN_GEMMA4_DIR` / `LUMEN_QWEN35_SHARDS` — local weights path.
+    /// → `LUMEN_GEMMA4_DIR` — where Gemma 4 weights live when `MODEL_ID` is
+    /// a Hub id the app has not downloaded. Every other model loads from
+    /// `MODEL_ID` alone, which the app already sets to the local path.
     pub local_model_dir: Option<PathBuf>,
     /// → `SKIP_WARMUP=1`
     #[serde(default)]
@@ -129,9 +129,7 @@ pub enum CorsMode {
 pub struct QuantConfig {
     /// KV-cache quantization bits (3 / 4 / 6 / 8). Default 4 (gives 4×
     /// compression). 8-bit gives 2× compression with closer-to-bf16
-    /// quality. Emitted as `LUMEN_GEMMA4_QUANT_KV_BITS` (also kept as
-    /// `TQ_BITS` for legacy Candle backends still on the
-    /// turboquant-cache crate path).
+    /// quality. Emitted as `LUMEN_GEMMA4_QUANT_KV_BITS`.
     pub bits: u8,
 
     /// Three-way KV quantization mode.
@@ -291,7 +289,6 @@ impl Default for PersistentConfig {
                 memory_limit_gb: Some(mem.memory_limit_gb),
                 disable_wired_limit: false,
                 embedding_model_id: None,
-                tokenizer_id: None,
                 local_model_dir: None,
                 skip_warmup: false,
                 kv_disk_enabled: false,
@@ -496,6 +493,13 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
         }
         cfg.schema_version = 9;
     }
+    // v9 -> v10: dropped `server.tokenizer_id`. It became `TOKENIZER_ID`,
+    // which nothing in the server has read since the Candle backend went (the
+    // MLX loaders take the tokenizer from the model directory). serde drops a
+    // stored value on parse; this step stamps the version.
+    if cfg.schema_version < 10 {
+        cfg.schema_version = 10;
+    }
     // Future migrations append here.
 }
 
@@ -586,7 +590,7 @@ max_batch = 6
     fn v9_migration_carries_max_batch_into_mlx_batch_max() {
         let cfg = migrated_v8();
         assert_eq!(cfg.advanced.mlx_batch_max, Some(6));
-        assert_eq!(cfg.schema_version, 9);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
     }
 
     /// The six retired fields drove env vars nothing reads. They must be
@@ -611,7 +615,7 @@ max_batch = 6
         let once = cfg.advanced.mlx_batch_max;
         migrate_in_place(&mut cfg);
         assert_eq!(cfg.advanced.mlx_batch_max, once);
-        assert_eq!(cfg.schema_version, 9);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
     }
 
     /// A config already on v9 has no legacy table; the step must not clobber a
@@ -626,6 +630,34 @@ max_batch = 6
         cfg.advanced.paged_attention = Some(LegacyPagedConfig { max_batch: Some(6) });
         migrate_in_place(&mut cfg);
         assert_eq!(cfg.advanced.mlx_batch_max, Some(2));
+    }
+
+    /// `tokenizer_id` went in v10: `TOKENIZER_ID` had no reader. A config that
+    /// still carries it must load, land on the current version, and stop
+    /// writing the field back out.
+    #[test]
+    fn v10_migration_drops_the_tokenizer_override() {
+        let stored = toml::to_string_pretty(&PersistentConfig::default())
+            .expect("serialize")
+            .replacen(
+                "[server]\n",
+                "[server]\ntokenizer_id = \"Qwen/Qwen3-8B\"\n",
+                1,
+            )
+            .replace(
+                &format!("schema_version = {CURRENT_SCHEMA_VERSION}"),
+                "schema_version = 9",
+            );
+        assert!(
+            stored.contains("tokenizer_id"),
+            "the fixture must carry the old field"
+        );
+        let mut cfg: PersistentConfig =
+            toml::from_str(&stored).expect("a v9 config must still deserialize");
+        migrate_in_place(&mut cfg);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        let out = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(!out.contains("tokenizer_id"), "written back out:\n{out}");
     }
 
     /// Guards the 7 -> 8 class of bug: a migration step that exists but is

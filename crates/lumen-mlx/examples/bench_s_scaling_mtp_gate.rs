@@ -17,7 +17,6 @@
 //!
 //! Usage:
 //!   MODEL_ID=mlx-community/Qwen3.6-27B-4bit \
-//!   LUMEN_QWEN35_SHARDS=/path/to/snapshot \
 //!     cargo run --release -p lumen-mlx --example bench_s_scaling_mtp_gate \
 //!       --features mlx-native -- --runs 7
 

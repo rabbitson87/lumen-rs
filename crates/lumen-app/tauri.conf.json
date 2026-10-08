@@ -36,10 +36,10 @@
     "shortDescription": "Local LLM control plane",
     "longDescription": "Lumen is a desktop control plane for the lumen-server inference engine — model management, quantization settings, and server lifecycle in one dashboard.",
     "macOS": {
-      "minimumSystemVersion": "11.0",
+      "minimumSystemVersion": "14.0",
       "entitlements": null,
       "exceptionDomain": "localhost",
-      "signingIdentity": null
+      "signingIdentity": "-"
     },
     "externalBin": []
   },

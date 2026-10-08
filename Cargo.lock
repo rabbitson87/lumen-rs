@@ -1428,6 +1428,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fastokens"
+version = "0.3.2"
+dependencies = [
+ "daachorse",
+ "fancy-regex 0.17.0",
+ "icu_normalizer",
+ "libc",
+ "memchr",
+ "pcre2",
+ "rayon",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2406,6 +2435,9 @@ dependencies = [
  "icu_properties",
  "icu_provider",
  "smallvec",
+ "utf16_iter",
+ "utf8_iter",
+ "write16",
  "zerovec",
 ]
 
@@ -2775,7 +2807,7 @@ dependencies = [
  "base64 0.22.1",
  "bytecount",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.14.0",
  "fraction",
  "idna",
  "itoa",
@@ -3040,7 +3072,9 @@ name = "lumen-mlx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fastokens",
  "hf-hub",
+ "icu_normalizer",
  "image",
  "llguidance",
  "lumen-core",
@@ -3059,6 +3093,7 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
+ "unicode-normalization-alignments",
 ]
 
 [[package]]
@@ -3072,6 +3107,7 @@ dependencies = [
  "lumen-core",
  "lumen-diffusion",
  "lumen-mlx",
+ "mlx-sys",
  "serde",
  "serde_json",
  "tokio",
@@ -3241,7 +3277,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=cee2f18ae60c23e1314301c3f07347d048725a6d#cee2f18ae60c23e1314301c3f07347d048725a6d"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -3253,7 +3289,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=cee2f18ae60c23e1314301c3f07347d048725a6d#cee2f18ae60c23e1314301c3f07347d048725a6d"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3264,7 +3300,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=cee2f18ae60c23e1314301c3f07347d048725a6d#cee2f18ae60c23e1314301c3f07347d048725a6d"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -3289,7 +3325,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/rabbitson87/mlx-rs?rev=f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c#f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c"
+source = "git+https://github.com/rabbitson87/mlx-rs?rev=cee2f18ae60c23e1314301c3f07347d048725a6d#cee2f18ae60c23e1314301c3f07347d048725a6d"
 dependencies = [
  "bindgen",
  "cc",
@@ -4046,6 +4082,28 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "pcre2"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
+dependencies = [
+ "libc",
+ "log",
+ "pcre2-sys",
+]
+
+[[package]]
+name = "pcre2-sys"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18b9073c1a2549bd409bf4a32c94d903bb1a09bf845bc306ae148897fa0760a4"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "pem-rfc7468"
@@ -6780,6 +6838,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
+name = "utf16_iter"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8232dd3cdaed5356e0f716d285e4b40b932ac434100fe9b7e0e8e935b9e6246"
+
+[[package]]
 name = "utf8-zero"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7742,6 +7806,12 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
+
+[[package]]
+name = "write16"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1890f4022759daae28ed4fe62859b1236caebfc61ede2f63ed4e695f3f6d936"
 
 [[package]]
 name = "writeable"

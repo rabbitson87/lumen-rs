@@ -392,7 +392,11 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// 201 -> 193 when the eight Gemma 4 fusion flags moved into the registry,
 /// 193 -> 192 with `LUMEN_MLX_NO_OVERLAP`, 192 -> 190 with
 /// `LUMEN_NATIVE_FUSE_GATE_UP` and `LUMEN_NATIVE_CACHED_STREAM`.
-const UNMANAGED_BASELINE: usize = 190;
+/// 190 -> 193, deliberately, with `LUMEN_HOST`, `LUMEN_API_KEY` and
+/// `LUMEN_CORS` (task 019): lumen-app's access settings, which the server
+/// finally reads. A bind address, a key and a three-way mode — none of them a
+/// boolean, so `flag!` cannot hold them, and none gates an optimization.
+const UNMANAGED_BASELINE: usize = 193;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

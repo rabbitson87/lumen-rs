@@ -41,6 +41,15 @@ A `[patch]` for mlx-c / mlx is handled by mlx-c's CMakeLists.txt env
 override: set `MLX_LOCAL_SOURCE_DIR=<your-mlx-checkout>` to redirect
 the FetchContent call to a local mlx source tree.
 
+## Vendored crates (in-tree)
+
+`vendor/` holds third-party crates lumen-rs changes, each with its upstream
+license and notices and a `PATCHES.md` listing the changes (see
+`vendor/README.md`). Today that is `fastokens` 0.3.2 (Apache-2.0), the encoder
+behind `LUMEN_FASTOKENS`. It links PCRE2 (BSD-3) through `pcre2-sys`, built
+from the bundled source and statically linked: `.cargo/config.toml` sets
+`PCRE2_SYS_STATIC=1`, so a system `libpcre2` is never picked up.
+
 ## Model checkpoints (required at runtime)
 
 Examples and the server expect environment variables pointing at local
@@ -49,7 +58,8 @@ safetensors shards). None of the model weights are committed to this
 repo. Useful env vars:
 
 - `EMBEDDING_MODEL_ID` — Qwen3-Embedding-0.6B (MLX 8-bit quant)
-- `MODEL_ID` / `LUMEN_GEMMA4_DIR` — Gemma 4 26B-A4B (MLX 3- or 4-bit)
-- `LUMEN_QWEN35_SHARDS` — Qwen3.6-27B / Qwen3.5-30B-A3B (mxfp4)
+- `MODEL_ID` — the chat model, as a Hub id or a local checkpoint directory:
+  Gemma 4 26B-A4B (MLX 3- or 4-bit), Qwen3.5/3.6 (mxfp4)
+- `LUMEN_GEMMA4_DIR` — where Gemma 4 weights live when `MODEL_ID` is a Hub id
 
 See each example's module docs for the exact format expected.

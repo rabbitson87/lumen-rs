@@ -32,9 +32,15 @@ pub async fn handle(
             *response.status_mut() = StatusCode::from_u16(200)?;
         }
         Err(e) => {
-            let err = AnthropicError::new(crate::types::inference_error_message(&e));
+            let status = crate::types::inference_error_status(&e);
+            let mut err = AnthropicError::new(crate::types::inference_error_message(&e));
+            // Anthropic's own type for a server-side failure; the default
+            // `invalid_request_error` stays for the 400.
+            if status == 500 {
+                err.error.r#type = "api_error".into();
+            }
             response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(500)?;
+            *response.status_mut() = StatusCode::from_u16(status)?;
         }
     }
 
@@ -78,16 +84,10 @@ async fn handle_streaming(
     // ask for extended thinking?", which is the spec's condition for a
     // `thinking` block appearing in the response at all.
     let emit_thinking = req.enable_thinking();
+    let head = super::sse_head(response.headers());
     let mut tcp = response.into_body().stream;
 
-    tcp.write_all(
-        b"HTTP/1.1 200 OK\r\n\
-          Content-Type: text/event-stream\r\n\
-          Cache-Control: no-cache\r\n\
-          Connection: keep-alive\r\n\
-          \r\n",
-    )
-    .await?;
+    tcp.write_all(head.as_bytes()).await?;
 
     let mut token_rx = match handle.anthropic_messages_streaming(req).await {
         Ok(rx) => rx,

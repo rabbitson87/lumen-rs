@@ -2,6 +2,7 @@
 name = "lumen-diffusion"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,10 +42,10 @@ tokenizers = { workspace = true }
 # Pinned to the SAME rev as lumen-mlx so cargo reuses the already-compiled
 # dependency rather than building a second copy. Provides conv2d / conv_transpose2d
 # / group-norm / quantized_matmul used across the VAE, DiT, and text encoder.
-mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true, default-features = false, features = [
+mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "cee2f18ae60c23e1314301c3f07347d048725a6d", optional = true, default-features = false, features = [
     "accelerate",
 ] }
-mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "f8cfdd8830d675ae7bbe5fbfb78ea6ea4478278c", optional = true }
+mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "cee2f18ae60c23e1314301c3f07347d048725a6d", optional = true }
 
 [dev-dependencies]
 lumen-testkit = { workspace = true }

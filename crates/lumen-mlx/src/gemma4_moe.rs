@@ -2572,6 +2572,107 @@ pub(crate) mod imp {
         Ok(built)
     }
 
+    /// Whether sliding-layer prefill uses the MLX fork's windowed steel kernel
+    /// (`lumen_sdpa_windowed`), which skips K blocks outside the window: ~5%
+    /// off a cold 11.9K-token prefill. On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`,
+    /// and only after the kernel this build carries passes
+    /// `windowed_kernel_agrees`. Until rabbitson87/mlx 8a2587df the kernel read
+    /// the wrong K/V blocks once a forward held more than `sliding_window` keys
+    /// (long Gemma 4 prompts answered with garbage), and until 23b42543 its
+    /// causal mask let some rows see future keys at unaligned query offsets.
+    /// mlx-c fetches the fork by branch, so an MLX build cached from before
+    /// those commits still has the old kernel. The check turns it into a log line and the explicit-mask path,
+    /// which matches mlx-lm on every build. Decided once per process.
+    pub fn windowed_kernel_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED").as_deref() == Ok("0") {
+                eprintln!("[gemma4] windowed attention kernel: off (LUMEN_GEMMA4_SDPA_WINDOWED=0)");
+                return false;
+            }
+            let stream = mlx_rs::Stream::gpu();
+            let kernel = |q: &Array, k: &Array, v: &Array, scale: f32, window: i32| {
+                mlx_rs::metal::lumen_sdpa_windowed(q, k, v, scale, window, &stream)
+                    .map_err(|e| anyhow!("lumen_sdpa_windowed: {e}"))
+            };
+            match windowed_kernel_agrees(kernel) {
+                Ok(()) => {
+                    eprintln!("[gemma4] windowed attention kernel: on (self-check passed)");
+                    true
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gemma4] windowed attention kernel: off, self-check failed ({e:#}). \
+                         The MLX build likely predates rabbitson87/mlx 23b42543; \
+                         `cargo clean -p mlx-sys` refetches it. Prefill uses the explicit mask."
+                    );
+                    false
+                }
+            }
+        })
+    }
+
+    /// Whether `kernel` computes sliding-window attention, against attention
+    /// under an explicit window mask (mlx-lm's rule), on three calls chosen so
+    /// that every defect the fork's kernel has had shows on both of its tile
+    /// layouts (32x16 steel, 64x32 NAX — NAX is picked per device, not per
+    /// shape, so on an M5 this runs the NAX kernel real requests would get):
+    ///
+    /// * 60 queries over 2,000 keys and over 2,048 keys: queries past the window
+    ///   at offsets (1,940 / 1,988) that are aligned to neither tile, so the
+    ///   kernel skips K blocks (`kb_start` > 0), the window edge falls mid-block,
+    ///   and the causal diagonal starts mid-block with the key count both
+    ///   unaligned (2,000 on 32-key tiles) and aligned (2,048);
+    /// * one pass over 1,100 tokens: the shape of a plain prefill just past
+    ///   the window.
+    ///
+    /// The pre-fix kernels missed by 0.03-0.8; the fixed one stays within one
+    /// bf16 step (< 0.02). Two query heads per KV head, as Gemma 4's 16/8.
+    fn windowed_kernel_agrees(
+        kernel: impl Fn(&Array, &Array, &Array, f32, i32) -> Result<Array>,
+    ) -> Result<()> {
+        const WINDOW: usize = 1024;
+        let normal = |shape: &[i32], seed: u64| -> Result<Array> {
+            let key = mlx_rs::random::key(seed)?;
+            Ok(mlx_rs::random::normal::<f32>(shape, None, None, &key)?
+                .as_dtype(mlx_rs::Dtype::Bfloat16)?)
+        };
+        let flat = |a: &Array| -> Result<Array> {
+            let a = a.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1])?;
+            a.eval()?;
+            Ok(a)
+        };
+        for (i, (q_len, k_len)) in [(60usize, 2000usize), (60, 2048), (1100, 1100)]
+            .into_iter()
+            .enumerate()
+        {
+            let seed = 0x5eed + 3 * i as u64;
+            let q = normal(&[1, 2, q_len as i32, 256], seed)?;
+            let k = normal(&[1, 1, k_len as i32, 256], seed + 1)?;
+            let v = normal(&[1, 1, k_len as i32, 256], seed + 2)?;
+            let scale = 1.0 / 16.0;
+            let got = kernel(&q, &k, &v, scale, WINDOW as i32)?;
+            let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(WINDOW))?
+                .ok_or_else(|| anyhow!("no mask for a multi-token query"))?;
+            let want = sdpa_with_mask(&q, &k, &v, scale, &mask)?;
+            let (got, want) = (flat(&got)?, flat(&want)?);
+            let worst = got
+                .as_slice::<f32>()
+                .iter()
+                .zip(want.as_slice::<f32>())
+                .map(|(a, b)| (a - b).abs())
+                // `f32::max` would skip a NaN; a kernel producing one must fail.
+                .fold(0f32, |m, d| if d.is_nan() || d > m { d } else { m });
+            if worst.is_nan() || worst > 0.05 {
+                return Err(anyhow!(
+                    "{q_len} queries over {k_len} keys differ from explicit-mask \
+                     attention by up to {worst:.3}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     // ───────────────────────── quant param resolver ─────────────────────────
 
     /// Resolve `(group_size, bits, mode)` for a tensor whose safetensors path
@@ -3512,6 +3613,9 @@ pub(crate) mod imp {
                 .find(|(_, k)| matches!(**k, NativeGemma4LayerType::SlidingAttention))
                 .map(|(i, _)| i);
 
+            // Decide the sliding-window kernel now (a one-off self-check), not
+            // inside the first request's forward.
+            windowed_kernel_enabled();
             Ok(Self {
                 config: cfg,
                 embed_tokens,
@@ -5141,10 +5245,10 @@ pub(crate) mod imp {
             //   - no rotation (kv_actual == kv_offset + l)
             //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
             //   - dtype bf16
-            // Env: LUMEN_GEMMA4_SDPA_WINDOWED=0 opts out.
-            let sdpa_windowed_enabled = std::env::var("LUMEN_GEMMA4_SDPA_WINDOWED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            //
+            // On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`, and only once this
+            // build's kernel has passed its self-check (`windowed_kernel_enabled`).
+            let sdpa_windowed_enabled = windowed_kernel_enabled();
             // Chunked-prefill rotation support (2026-05-15 follow-up): the
             // steel kernel's window check `row_pos - col_pos >= W` is
             // computed in K-relative coordinates (both row_pos and col_pos
@@ -6455,6 +6559,57 @@ pub(crate) mod imp {
             self.forward_array_last_token(&ids, cache)
         }
 
+        /// The prefill chunk for a prompt whose keys reach `kv_upper`:
+        /// `LUMEN_GEMMA4_PREFILL_CHUNK` (default 2048), clamped so one chunk's
+        /// attention scores over `kv_upper` keys stay inside
+        /// `LUMEN_GEMMA4_PREFILL_SCORES_GB`. Every prefill shares this rule.
+        pub fn prefill_chunk_decision(
+            &self,
+            kv_upper: usize,
+        ) -> crate::prefill_budget::ChunkDecision {
+            let requested: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &usize| n > 0)
+                .unwrap_or(2048);
+            crate::prefill_budget::clamp_chunk(
+                requested,
+                crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB"),
+                self.config().text_config.num_attention_heads,
+                kv_upper,
+            )
+        }
+
+        /// [`Self::forward_last_token`] over a prompt of any length.
+        ///
+        /// Every chunk but the last is run and evaluated on its own, so no
+        /// single forward attends over the whole prompt at once. That matters
+        /// even with KV quantization off: the global layers (head_dim 512) take
+        /// MLX's materializing attention path, and one 35.8K-token pass asked
+        /// Metal for a 41 GB scores buffer. Returns the last chunk's logits,
+        /// still lazy.
+        pub fn forward_last_token_chunked(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativeGemma4PromptCache,
+        ) -> Result<Array> {
+            if input_ids.is_empty() {
+                return Err(anyhow!("forward_last_token_chunked: empty input_ids"));
+            }
+            let chunk = self
+                .prefill_chunk_decision(cache.offset() + input_ids.len())
+                .chunk;
+            let mut chunks = input_ids.chunks(chunk).peekable();
+            loop {
+                let ids = chunks.next().expect("non-empty input yields a chunk");
+                let logits = self.forward_last_token(ids, cache)?;
+                if chunks.peek().is_none() {
+                    return Ok(logits);
+                }
+                logits.eval().context("prefill chunk eval")?;
+            }
+        }
+
         /// Same as `forward()` but accepts the token-id input as an already-
         /// shaped `[1, L]` mlx Array. Used by the async-pipelined decode loop
         /// in `generate()` (Phase 1.5 P4) so the previous step's argmax can be
@@ -6816,7 +6971,7 @@ pub(crate) mod imp {
             // logits semantics for forward_probe / debug callers.
             let prefill_start = Instant::now();
             let logits = if images.is_empty() {
-                self.forward_last_token(prompt_ids, cache)
+                self.forward_last_token_chunked(prompt_ids, cache)
                     .context("generate: prefill forward_last_token")?
             } else {
                 // Image prefill still slices to the last token; the only
@@ -8156,6 +8311,194 @@ pub(crate) mod imp {
                 prompt.len(),
                 mean_ms,
                 tps
+            );
+        }
+
+        /// The kernel self-check accepts attention that honours the window and
+        /// rejects attention that does not — tested with stand-ins, so it holds
+        /// whichever kernel this build's MLX carries.
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn the_windowed_kernel_self_check_tells_right_from_wrong() {
+            let exact = |q: &Array, k: &Array, v: &Array, scale: f32, window: i32| {
+                let (q_len, k_len) = (q.shape()[2] as usize, k.shape()[2] as usize);
+                let mask =
+                    build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, Some(window as usize))?
+                        .expect("a multi-token query needs a mask");
+                sdpa_with_mask(q, k, v, scale, &mask)
+            };
+            assert!(
+                windowed_kernel_agrees(exact).is_ok(),
+                "exact windowed attention"
+            );
+            let no_window =
+                |q: &Array, k: &Array, v: &Array, scale: f32, _: i32| sdpa(q, k, v, scale, true);
+            assert!(
+                windowed_kernel_agrees(no_window).is_err(),
+                "attention that ignores the window must fail the check"
+            );
+        }
+
+        /// Last-token logits as f32.
+        fn logits_f32(logits: &Array) -> Vec<f32> {
+            let l = logits
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .expect("cast logits");
+            l.eval().expect("eval logits");
+            l.as_slice::<f32>().to_vec()
+        }
+
+        /// Cosine similarity of `b` to the reference `a`, and whether `b`'s
+        /// top token is also `a`'s — within 0.5 of `a`'s best logit, since
+        /// some positions are exact ties.
+        fn agreement(a: &[f32], b: &[f32]) -> (f64, bool) {
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (&x, &y) in a.iter().zip(b) {
+                dot += x as f64 * y as f64;
+                na += x as f64 * x as f64;
+                nb += y as f64 * y as f64;
+            }
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|x, y| x.1.total_cmp(y.1))
+                    .map_or(0, |(i, _)| i)
+            };
+            let same_top = a[argmax(b)] >= a[argmax(a)] - 0.5;
+            (dot / (na.sqrt() * nb.sqrt()), same_top)
+        }
+
+        /// Prefilling in chunks, or continuing a cache past its head, must
+        /// give the logits one pass gives. The sliding layers (window 1024)
+        /// are where it went wrong. The windowed steel kernel read the wrong
+        /// keys once a forward held more than 1,024 of them, and the
+        /// rotating cache trimmed against `offset` instead of the keys it
+        /// held, so every chunk after the second lost in-window context.
+        /// Against mlx-lm those gave last-token cosines of 0.2-0.89, and
+        /// long Gemma 4 prompts answered with garbage.
+        ///
+        /// Bars: cosine 0.98 and the same top token. Fixed, every path is at
+        /// 0.996 or better at these lengths. bf16 rounding alone dips to
+        /// ~0.9 at a few positions just past the window (1,100-1,300 move
+        /// either way when fusions are toggled), so those are not tested.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn chunked_and_continued_prefill_match_one_pass() {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return;
+            };
+            let dir = Path::new(&dir);
+            let model = NativeGemma4Model::load(dir).expect("load model");
+            let tok =
+                crate::TextTokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+            let ids = tok
+                .encode(include_str!("../../../docs/maintainer-workflow.md"), false)
+                .expect("encode");
+            let sizes: Vec<usize> = std::env::var("CHUNK_TEST_TOKENS")
+                .unwrap_or_else(|_| "1600,3000,5000".into())
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            for n in sizes {
+                let n = n.min(ids.len());
+                parity_at(&model, &ids[..n]);
+            }
+        }
+
+        fn parity_at(model: &NativeGemma4Model, prompt: &[u32]) {
+            let n = prompt.len();
+            let mut cache = model.make_cache();
+            let reference = logits_f32(
+                &model
+                    .forward_last_token(prompt, &mut cache)
+                    .expect("one pass"),
+            );
+
+            let mut results = Vec::new();
+            for chunk in [2048usize, 1024, 512] {
+                let mut cache = model.make_cache();
+                let mut last = None;
+                for ids in prompt.chunks(chunk) {
+                    let l = model.forward_last_token(ids, &mut cache).expect("chunk");
+                    l.eval().expect("eval chunk");
+                    last = Some(l);
+                }
+                results.push((format!("chunks of {chunk}"), logits_f32(&last.unwrap())));
+            }
+            let head = n - 25;
+            let mut cache = model.make_cache();
+            model
+                .forward_last_token(&prompt[..head], &mut cache)
+                .and_then(|l| Ok(l.eval()?))
+                .expect("head");
+            let mut fork = cache.clone();
+            results.push((
+                "head, then suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[head..], &mut cache)
+                        .expect("suffix"),
+                ),
+            ));
+            results.push((
+                "head, clone, then suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[head..], &mut fork)
+                        .expect("fork suffix"),
+                ),
+            ));
+            // Single-token steps wrap the sliding ring, so the multi-token
+            // update after them has to put it back in temporal order.
+            let head = n - 65;
+            let mut cache = model.make_cache();
+            model
+                .forward_last_token(&prompt[..head], &mut cache)
+                .and_then(|l| Ok(l.eval()?))
+                .expect("head");
+            for id in &prompt[head..n - 25] {
+                model
+                    .forward_last_token(std::slice::from_ref(id), &mut cache)
+                    .and_then(|l| Ok(l.eval()?))
+                    .expect("decode step");
+            }
+            results.push((
+                "head, 40 steps, suffix".into(),
+                logits_f32(
+                    &model
+                        .forward_last_token(&prompt[n - 25..], &mut cache)
+                        .expect("after steps"),
+                ),
+            ));
+            let mut failures = Vec::new();
+            for (name, logits) in &results {
+                let (cos, same) = agreement(&reference, logits);
+                eprintln!("[prefill-parity] n={n} {name:26} cos={cos:.6} same_argmax={same}");
+                if cos < 0.98 || !same {
+                    failures.push(format!("{name}: cos {cos:.4}, same argmax {same}"));
+                }
+            }
+            if let Ok(out) = std::env::var("PREFILL_PARITY_DUMP") {
+                let out = Path::new(&out).join(format!("n{n}"));
+                std::fs::create_dir_all(&out).expect("dump dir");
+                let write = |name: &str, v: &[f32]| {
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    std::fs::write(out.join(name), bytes).expect("dump");
+                };
+                let ids_bytes: Vec<u8> = prompt.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(out.join("ids.u32"), ids_bytes).expect("dump ids");
+                write("lumen_one_pass.f32", &reference);
+                for (name, logits) in &results {
+                    write(
+                        &format!("lumen_{}.f32", name.replace([' ', ','], "_")),
+                        logits,
+                    );
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "n={n}: these prefills disagree with one pass: {failures:#?}"
             );
         }
 

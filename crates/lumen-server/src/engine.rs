@@ -10,6 +10,50 @@ use lumen_mlx::chat_io::{
     ResolvedToolChoice, ToolDef,
 };
 
+/// Prints the tokenizer work one request did when it goes out of scope, so a
+/// guard rejection or an early `?` return is still reported.
+///
+/// Nothing else times tokenization: the prefill timers start after the prompt
+/// is built, so a request that encoded its system+tools head three times read
+/// exactly like one that encoded it once.
+///
+/// It reads deltas of the backend's cumulative [`lumen_mlx::TokenizeStats`].
+/// Every request it wraps is served to completion before the next one starts —
+/// the sequential loop, and the batched loop's inline fallback, which pauses
+/// the batch — so the delta is that request's own work.
+struct TokenizeSpan {
+    req: &'static str,
+    stats: Option<Arc<lumen_mlx::TokenizeStats>>,
+    start: lumen_mlx::TokenizeSnapshot,
+}
+
+impl TokenizeSpan {
+    fn begin(backend: &ModelBackend, req: &'static str) -> Self {
+        let stats = backend.tokenize_stats();
+        let start = stats.as_ref().map(|s| s.snapshot()).unwrap_or_default();
+        Self { req, stats, start }
+    }
+}
+
+impl Drop for TokenizeSpan {
+    fn drop(&mut self) {
+        let Some(stats) = &self.stats else { return };
+        let d = stats.snapshot().since(&self.start);
+        if d.encode_calls == 0 && d.decode_calls == 0 {
+            return;
+        }
+        eprintln!(
+            "[tokenize] req={} encodes={} enc_tokens={} encode_ms={:.1} decodes={} decode_ms={:.1}",
+            self.req,
+            d.encode_calls,
+            d.encode_tokens,
+            d.encode_ns as f64 / 1e6,
+            d.decode_calls,
+            d.decode_ns as f64 / 1e6,
+        );
+    }
+}
+
 /// Model backend — supports multiple architectures.
 /// The engine's model backend.
 ///
@@ -54,6 +98,12 @@ impl ModelBackend {
         })
     }
 
+    fn tokenize_stats(&self) -> Option<Arc<lumen_mlx::TokenizeStats>> {
+        match self {
+            Self::Mlx(m) => m.tokenize_stats(),
+        }
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Mlx(m) => m.encode(text),
@@ -90,11 +140,12 @@ impl ModelBackend {
     /// schema-presence the `chat*` call on this path is about to take, and the
     /// count is the prefill.
     ///
-    /// One approximation survives on purpose: a structured-history request
-    /// (prior `tool_calls`, `role:"tool"`) decodes from `ChatTurn`s while this
-    /// still counts the flattened `(role, content)` pairs. That gap is turn
-    /// framing — tens of tokens — where the one just closed was the entire tool
-    /// schema.
+    /// A request that carries tool history (prior `tool_calls`, `role:"tool"`)
+    /// decodes from `ChatTurn`s and is counted by
+    /// [`Self::count_history_prompt_tokens`] instead. Counting its flattened
+    /// `(role, content)` pairs here was documented as a turn-framing gap of
+    /// "tens of tokens"; it was the whole tool history, because the flat
+    /// renderers drop tool turns and calls.
     fn count_chat_prompt_tokens(
         &self,
         messages: &[(String, String)],
@@ -118,6 +169,45 @@ impl ModelBackend {
             Ok(ids) => ids.len() as u32,
             Err(_) => {
                 let chars: usize = messages.iter().map(|(_, c)| c.len()).sum();
+                ((chars as u32) / 4).max(1)
+            }
+        }
+    }
+
+    /// [`Self::count_chat_prompt_tokens`] for a request carrying tool history,
+    /// rendered from the same `turns` the request decodes from — prior calls
+    /// and their results included.
+    ///
+    /// This used to count the flattened `(role, content)` pairs, and every
+    /// flat renderer drops exactly the part that makes such a request big:
+    /// Qwen's skips `role:"tool"` turns and `tool_calls` blocks, the Anthropic
+    /// flattening drops `tool_use`/`tool_result`, and Gemma's rejects role
+    /// `tool`, leaving the chars/4 fallback. Measured on Qwen3.5-9B, a
+    /// 34.8K-token prefill was reported as 32.7K: the tool result missing from
+    /// the client's bill and from the context guard alike.
+    fn count_history_prompt_tokens(
+        &self,
+        turns: &[ChatTurn<'_>],
+        thinking: bool,
+        ov: &lumen_mlx::SamplingOverrides,
+        tools: &[ToolDef<'_>],
+        tool_choice: &ResolvedToolChoice<'_>,
+        structured: bool,
+    ) -> u32 {
+        let res: Result<Vec<u32>> = match self {
+            Self::Mlx(m) => m.build_chat_input_prefilled_from_history(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                structured,
+                m.resolved_effort(ov),
+            ),
+        };
+        match res {
+            Ok(ids) => ids.len() as u32,
+            Err(_) => {
+                let chars: usize = turns.iter().map(turn_text_len).sum();
                 ((chars as u32) / 4).max(1)
             }
         }
@@ -516,6 +606,32 @@ impl InferenceEngine {
         Arc::clone(&self.load_stats)
     }
 
+    /// Runs the engine on a thread of its own; requests reach it through the
+    /// returned handle.
+    ///
+    /// A request runs start to finish without an `.await`: prefill and every
+    /// decode step block the thread. As a tokio task that stalled every stream.
+    /// The engine's first `try_send` woke the SSE writer onto the engine's own
+    /// worker (its LIFO slot, which other workers do not steal from), so the
+    /// writer ran only after the request finished and the client got every
+    /// token in one burst at the end — measured on Qwen 9B, all 80 deltas at
+    /// 2,894 ms of a 2,894 ms stream. Woken from a thread outside the runtime,
+    /// writers go through the shared queue and write while the engine works.
+    pub fn start(self) -> std::io::Result<EngineHandle> {
+        let load_stats = self.load_stats();
+        let (tx, rx) = mpsc::channel(32);
+        std::thread::Builder::new()
+            .name("lumen-engine".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("engine runtime")
+                    .block_on(self.run(rx))
+            })?;
+        Ok(EngineHandle::new(tx, load_stats))
+    }
+
     /// Run warmup forward passes to compile all Metal shaders and stabilize GPU power state.
     pub fn warmup(&mut self) -> Result<()> {
         let skip = std::env::var("SKIP_WARMUP").is_ok();
@@ -573,6 +689,7 @@ impl InferenceEngine {
         &mut self,
         req: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "chat");
         // Detect turn-2+ shape: any message carries tool_calls (assistant
         // replay) or role=="tool" (tool result). When present we route
         // through the structured `chat_from_history` path which can stitch
@@ -611,56 +728,21 @@ impl InferenceEngine {
         let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
         let images = images_aligned_to_kept(&req.messages, &kept);
 
-        // Owning storage for `ChatTurn` borrows when routing structured.
+        // Owning storage for `ChatTurn` borrows when routing structured. Built
+        // before the guard: a tool-history request is counted from the turns
+        // it decodes from, not from the flattened pairs above.
         let arg_values: Vec<serde_json::Value> = if needs_structured {
-            req.messages
-                .iter()
-                .flat_map(|m| {
-                    m.tool_calls
-                        .iter()
-                        .flat_map(|calls| calls.iter())
-                        .map(|c| {
-                            // OpenAI ships arguments as a JSON-encoded
-                            // string. Parse to a Value so the renderer can
-                            // walk the structure; fall back to {} on
-                            // malformed input rather than failing the whole
-                            // request.
-                            serde_json::from_str(&c.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
+            openai_tool_call_args(&req.messages)
         } else {
             Vec::new()
         };
         let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = if needs_structured {
-            let mut next_arg = 0;
-            req.messages
-                .iter()
-                .map(|m| {
-                    m.tool_calls
-                        .as_ref()
-                        .map(|calls| {
-                            calls
-                                .iter()
-                                .map(|c| {
-                                    let av = &arg_values[next_arg];
-                                    next_arg += 1;
-                                    AssistantToolCall {
-                                        id: c.id.as_str(),
-                                        name: c.function.name.as_str(),
-                                        arguments: av,
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
+            openai_tool_calls(&req.messages, &arg_values)
         } else {
             Vec::new()
         };
+        let history: Option<Vec<ChatTurn<'_>>> =
+            needs_structured.then(|| openai_history_turns(&req.messages, &assistant_tc_buf));
 
         let tool_choice =
             resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
@@ -684,46 +766,38 @@ impl InferenceEngine {
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
-            &messages,
-            thinking_on,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            req.response_json_schema().is_some(),
-        ) + image_tokens;
+        let structured_output = req.response_json_schema().is_some();
+        let prompt_tokens_guard = match &history {
+            Some(turns) => self.backend.count_history_prompt_tokens(
+                turns,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                structured_output,
+            ),
+            None => self.backend.count_chat_prompt_tokens(
+                &messages,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                structured_output,
+            ),
+        } + image_tokens;
         guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
         // Wall-clock around the full generation for the `/v1/loads` last
         // tok/s gauge. Backend `GenerateStats` carries a finer decode-only
         // rate, but it is not threaded back here; this end-to-end rate is the
         // honest, cheap-to-measure figure for observability.
         let gen_started = Instant::now();
-        let mut parsed = if needs_structured {
-            let mut turns: Vec<ChatTurn<'_>> = req
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| match m.role.as_str() {
-                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
-                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
-                    "tool" => ChatTurn::Tool {
-                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
-                        name: m.name.as_deref(),
-                        content: m.content.as_str(),
-                    },
-                    _ => ChatTurn::Assistant {
-                        text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    },
-                })
-                .collect();
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+        let mut parsed = if let Some(turns) = history.as_deref() {
             // `turns` is 1:1 with `req.messages` and the turn strip applies the
             // same predicate as the flat one, so the surviving turns line up
             // with `images` — which is already indexed by the survivors.
             match images.as_deref() {
                 Some(imgs) => self.backend.chat_from_history_with_images(
-                    &turns,
+                    turns,
                     imgs,
                     req.max_tokens,
                     req.temperature,
@@ -736,7 +810,7 @@ impl InferenceEngine {
                     req.response_json_schema().as_ref(),
                 )?,
                 None => self.backend.chat_from_history(
-                    &turns,
+                    turns,
                     req.max_tokens,
                     req.temperature,
                     req.top_p,
@@ -777,17 +851,11 @@ impl InferenceEngine {
             )?
         };
 
-        // Same text count as the guard above, plus the image runs the model
-        // actually prefilled — reporting the text-only figure would under-count
-        // an image request by hundreds of tokens.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            thinking_on,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            req.response_json_schema().is_some(),
-        ) + image_tokens;
+        // The guard's count, image runs included. Counting again would render
+        // and encode the whole prompt a second time for the same number: the
+        // count reads only the request and load-time config, and nothing
+        // between here and the guard changes either.
+        let prompt_tokens = prompt_tokens_guard;
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
@@ -909,8 +977,12 @@ impl InferenceEngine {
 
     /// Handle a completion request.
     pub fn completion(&mut self, req: &CompletionRequest) -> Result<CompletionResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "completion");
         let input_ids = self.backend.encode(&req.prompt)?;
         let prompt_tokens = input_ids.len() as u32;
+        // The same pre-prefill reject every chat surface makes. This one never
+        // had it, so a raw prompt of any size went straight to prefill.
+        guard_prompt_fits(&self.backend, prompt_tokens)?;
 
         let ov = req.sampling_overrides();
         let output_ids = self.backend.generate(
@@ -957,6 +1029,7 @@ impl InferenceEngine {
 
     /// Handle an Anthropic Messages API request.
     pub fn anthropic_messages(&mut self, req: &AnthropicRequest) -> Result<AnthropicResponse> {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "messages");
         let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
@@ -1002,20 +1075,18 @@ impl InferenceEngine {
         // Prompt-size reject cap (Anthropic /v1/messages) — same OOM guard as
         // the OpenAI path: reject oversized prompts before prefill rather than
         // letting them reach the backend and crash the server via an uncaught
-        // Metal OOM. Uses the flat `messages` count (the same approximation
-        // already used for usage below).
+        // Metal OOM. Counted in each branch from what that branch decodes — a
+        // tool-history request from its turns, which only exist once the
+        // branch has built them — plus the placeholder runs its images expand
+        // into, which the rendered text does not carry. The figure admitted is
+        // the figure reported. (The Messages API has no `response_format`.)
+        let image_tokens = images
+            .as_deref()
+            .map(|i| self.backend.image_prompt_tokens(i))
+            .unwrap_or(0);
         let anthropic_thinking =
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-        let prompt_tokens_guard = self.backend.count_chat_prompt_tokens(
-            &messages,
-            anthropic_thinking,
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            // The Anthropic Messages API has no `response_format`.
-            false,
-        );
-        guard_prompt_fits(&self.backend, prompt_tokens_guard)?;
+        let prompt_tokens: u32;
 
         let mut parsed = if needs_structured {
             // Owning storage for ChatTurn::Assistant.tool_calls borrows.
@@ -1205,6 +1276,15 @@ impl InferenceEngine {
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
+            prompt_tokens = self.backend.count_history_prompt_tokens(
+                &turns,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            ) + image_tokens;
+            guard_prompt_fits(&self.backend, prompt_tokens)?;
             if turn_images.iter().any(|v| !v.is_empty()) {
                 self.backend.chat_from_history_with_images(
                     &turns,
@@ -1238,49 +1318,52 @@ impl InferenceEngine {
                     None,
                 )?
             }
-        } else if let Some(images) = images.as_deref() {
-            self.backend.chat_with_images(
-                &messages,
-                images,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
-                &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
-                &tools_owned,
-                &tool_choice,
-                None,
-            )?
         } else {
-            // Plain path — uses the flat messages built above. Matches
-            // the pre-Phase-1.4 behavior bit-for-bit.
-            self.backend.chat(
+            prompt_tokens = self.backend.count_chat_prompt_tokens(
                 &messages,
-                req.max_tokens,
-                req.temperature,
-                req.top_p,
+                anthropic_thinking,
                 &ov,
-                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-                req.session_id.as_deref(),
                 &tools_owned,
                 &tool_choice,
-                None,
-            )?
+                false,
+            ) + image_tokens;
+            guard_prompt_fits(&self.backend, prompt_tokens)?;
+            if let Some(images) = images.as_deref() {
+                self.backend.chat_with_images(
+                    &messages,
+                    images,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                )?
+            } else {
+                // Plain path — uses the flat messages built above. Matches
+                // the pre-Phase-1.4 behavior bit-for-bit.
+                self.backend.chat(
+                    &messages,
+                    req.max_tokens,
+                    req.temperature,
+                    req.top_p,
+                    &ov,
+                    req.enable_thinking_with_backend_default(
+                        self.backend.is_reasoning_first_family(),
+                    ),
+                    req.session_id.as_deref(),
+                    &tools_owned,
+                    &tool_choice,
+                    None,
+                )?
+            }
         };
 
-        // Images add their placeholder runs on top of the rendered text.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            false,
-        ) + images
-            .as_deref()
-            .map(|i| self.backend.image_prompt_tokens(i))
-            .unwrap_or(0);
         // Bug A: resolve abbreviated tool names by unique suffix match.
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match and
@@ -1344,6 +1427,7 @@ impl InferenceEngine {
         req: &ChatCompletionRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "chat-stream");
         let ov = req.sampling_overrides();
         let mut messages: Vec<(String, String)> = req
             .messages
@@ -1388,21 +1472,47 @@ impl InferenceEngine {
         // (Gemma 4 only). `None` when absent / `text` → exact existing path.
         let response_schema = req.response_json_schema();
 
+        // A tool-history request decodes from structured turns, so it is
+        // counted from them: owning storage first, built ahead of the count.
+        let needs_structured = needs_structured_history(&req.messages);
+        let arg_values: Vec<serde_json::Value> = if needs_structured {
+            openai_tool_call_args(&req.messages)
+        } else {
+            Vec::new()
+        };
+        let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = if needs_structured {
+            openai_tool_calls(&req.messages, &arg_values)
+        } else {
+            Vec::new()
+        };
+        let history: Option<Vec<ChatTurn<'_>>> =
+            needs_structured.then(|| openai_history_turns(&req.messages, &assistant_tc_buf));
+
         // Includes the image soft-token runs; this figure feeds both the
         // context guard below and the `usage` block at the end of the stream.
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            response_schema.is_some(),
-        ) + images
+        let thinking_on =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let prompt_tokens = match &history {
+            Some(turns) => self.backend.count_history_prompt_tokens(
+                turns,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                response_schema.is_some(),
+            ),
+            None => self.backend.count_chat_prompt_tokens(
+                &messages,
+                thinking_on,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                response_schema.is_some(),
+            ),
+        } + images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-
-        let needs_structured = needs_structured_history(&req.messages);
         let prompt_bytes: usize = messages.iter().map(|(_, c)| c.len()).sum();
         eprintln!(
             "[chat-stream] msgs={} prompt_bytes={} prompt_tokens={} max_tokens={} thinking={} structured={}",
@@ -1467,65 +1577,7 @@ impl InferenceEngine {
         // Wall-clock around the streaming generation for the `/v1/loads`
         // last tok/s gauge (recorded at the `Done` terminal below).
         let gen_started = Instant::now();
-        let result = if needs_structured {
-            let arg_values: Vec<serde_json::Value> = req
-                .messages
-                .iter()
-                .flat_map(|m| {
-                    m.tool_calls
-                        .iter()
-                        .flat_map(|calls| calls.iter())
-                        .map(|c| {
-                            serde_json::from_str(&c.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = {
-                let mut next_arg = 0;
-                req.messages
-                    .iter()
-                    .map(|m| {
-                        m.tool_calls
-                            .as_ref()
-                            .map(|calls| {
-                                calls
-                                    .iter()
-                                    .map(|c| {
-                                        let av = &arg_values[next_arg];
-                                        next_arg += 1;
-                                        AssistantToolCall {
-                                            id: c.id.as_str(),
-                                            name: c.function.name.as_str(),
-                                            arguments: av,
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            };
-            let mut turns: Vec<ChatTurn<'_>> = req
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| match m.role.as_str() {
-                    "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
-                    "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
-                    "tool" => ChatTurn::Tool {
-                        tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
-                        name: m.name.as_deref(),
-                        content: m.content.as_str(),
-                    },
-                    _ => ChatTurn::Assistant {
-                        text: m.content.as_str(),
-                        tool_calls: assistant_tc_buf.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    },
-                })
-                .collect();
-            lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+        let result = if let Some(turns) = history.as_deref() {
             // See the non-streaming path: post-strip turns line up with
             // `images`, which is already indexed by the survivors.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
@@ -1583,7 +1635,7 @@ impl InferenceEngine {
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
             match images.as_deref() {
                 Some(imgs) => self.backend.chat_streaming_from_history_with_images(
-                    &turns,
+                    turns,
                     imgs,
                     req.max_tokens,
                     req.temperature,
@@ -1597,7 +1649,7 @@ impl InferenceEngine {
                     on_event,
                 ),
                 None => self.backend.chat_streaming_from_history(
-                    &turns,
+                    turns,
                     req.max_tokens,
                     req.temperature,
                     req.top_p,
@@ -1799,12 +1851,33 @@ impl InferenceEngine {
         }
     }
 
+    /// The context guard, then `message_start`. `message_start` carries
+    /// `input_tokens` and goes out before the first token, so the count has to
+    /// travel ahead of decode rather than with `Done` — and after the guard, so
+    /// a rejected request emits `error` and no `message_start` at all. `false`
+    /// means rejected (the error is already sent).
+    fn admit_anthropic_stream(
+        &self,
+        prompt_tokens: u32,
+        token_tx: &mpsc::Sender<StreamEvent>,
+    ) -> bool {
+        // Prompt-size reject cap — guard the prefill from an uncaught Metal
+        // OOM that would crash the server process.
+        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
+            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
+            return false;
+        }
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        true
+    }
+
     /// Handle a streaming Anthropic messages request.
     fn anthropic_messages_streaming(
         &mut self,
         req: &AnthropicRequest,
         token_tx: &mpsc::Sender<StreamEvent>,
     ) {
+        let _tokenize = TokenizeSpan::begin(&self.backend, "messages-stream");
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
 
@@ -1852,28 +1925,16 @@ impl InferenceEngine {
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
         let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
-        let prompt_tokens = self.backend.count_chat_prompt_tokens(
-            &messages,
-            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
-            &req.sampling_overrides(),
-            &tools_owned,
-            &tool_choice,
-            false,
-        ) + images
+        // Counted in each branch from what that branch decodes — a tool-history
+        // request from its turns, which only exist once the branch has built
+        // them — then guarded and announced (`admit_anthropic_stream`).
+        let image_tokens = images
             .as_deref()
             .map(|i| self.backend.image_prompt_tokens(i))
             .unwrap_or(0);
-        // Prompt-size reject cap (Anthropic streaming) — guard the prefill from
-        // an uncaught Metal OOM that would crash the server process.
-        if let Err(e) = guard_prompt_fits(&self.backend, prompt_tokens) {
-            let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
-            return;
-        }
-        // `message_start` carries `input_tokens` and goes out before the first
-        // token, so the count has to travel ahead of decode rather than with
-        // `Done`. Sent after the guard: a rejected request emits `error` and no
-        // `message_start` at all.
-        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let anthropic_thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let prompt_tokens: u32;
 
         // Phase 1.5: structured-history dispatch for Anthropic streaming.
         // Mirrors `anthropic_messages` non-stream: build owning buffers
@@ -2045,6 +2106,17 @@ impl InferenceEngine {
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
+            prompt_tokens = self.backend.count_history_prompt_tokens(
+                &turns,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            ) + image_tokens;
+            if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
+                return;
+            }
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
                     BackendStreamEvent::Text(t) => {
@@ -2100,6 +2172,17 @@ impl InferenceEngine {
                 )
             }
         } else {
+            prompt_tokens = self.backend.count_chat_prompt_tokens(
+                &messages,
+                anthropic_thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                false,
+            ) + image_tokens;
+            if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
+                return;
+            }
             // Bound first so both dispatches below can take it — only one runs.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
@@ -2372,6 +2455,16 @@ fn effective_prompt_cap_for(backend: &ModelBackend) -> (u32, u32, Option<u32>) {
 /// an `Err` whose message explains the cause + the fix.
 fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
     let (effective, operator_cap, max_ctx) = effective_prompt_cap_for(backend);
+    refuse_oversized_prompt(prompt_tokens, effective, operator_cap, max_ctx)
+}
+
+/// The decision [`guard_prompt_fits`] makes once the limits are known.
+fn refuse_oversized_prompt(
+    prompt_tokens: u32,
+    effective: u32,
+    operator_cap: u32,
+    max_ctx: Option<u32>,
+) -> Result<()> {
     if prompt_tokens <= effective {
         return Ok(());
     }
@@ -2400,10 +2493,27 @@ fn guard_prompt_fits(backend: &ModelBackend, prompt_tokens: u32) -> Result<()> {
              longer prefill."
         ),
     };
-    Err(anyhow::anyhow!(
+    Err(PromptTooLarge(format!(
         "prompt too large: {prompt_tokens} tokens > limit {effective}.{hint}"
     ))
+    .into())
 }
+
+/// A prompt [`guard_prompt_fits`] refused.
+///
+/// Typed so the routes can tell it from an inference failure: it is the
+/// client's to fix, so it goes out as 400 rather than 500 — and SDKs retry a
+/// 5xx, which for an oversized prompt only repeats the refusal.
+#[derive(Debug)]
+pub struct PromptTooLarge(String);
+
+impl std::fmt::Display for PromptTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PromptTooLarge {}
 
 /// Streaming analogue of [`first_json_value_end`]: a stateful tracker fed the
 /// decoded text chunks of a `response_format` stream. It emits text up to and
@@ -2538,6 +2648,94 @@ fn needs_structured_history(messages: &[ChatMessage]) -> bool {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false)
     })
+}
+
+/// Every assistant tool call's arguments, parsed in message order — the owned
+/// storage [`openai_tool_calls`] borrows from. OpenAI ships them as a
+/// JSON-encoded string; malformed input becomes `{}` rather than failing the
+/// whole request.
+fn openai_tool_call_args(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flat_map(|calls| calls.iter()))
+        .map(|c| {
+            serde_json::from_str(&c.function.arguments).unwrap_or_else(|_| serde_json::json!({}))
+        })
+        .collect()
+}
+
+/// Per-message assistant tool calls, taking their arguments from `args` in the
+/// order [`openai_tool_call_args`] produced them.
+fn openai_tool_calls<'a>(
+    messages: &'a [ChatMessage],
+    args: &'a [serde_json::Value],
+) -> Vec<Vec<AssistantToolCall<'a>>> {
+    let mut next_arg = 0;
+    messages
+        .iter()
+        .map(|m| {
+            m.tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| {
+                            let av = &args[next_arg];
+                            next_arg += 1;
+                            AssistantToolCall {
+                                id: c.id.as_str(),
+                                name: c.function.name.as_str(),
+                                arguments: av,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The turns a tool-history OpenAI request decodes from, client meta-wrappers
+/// already stripped. Both OpenAI paths decode from these and count them.
+fn openai_history_turns<'a>(
+    messages: &'a [ChatMessage],
+    tool_calls: &'a [Vec<AssistantToolCall<'a>>],
+) -> Vec<ChatTurn<'a>> {
+    let mut turns: Vec<ChatTurn<'a>> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| match m.role.as_str() {
+            "system" | "System" | "SYSTEM" => ChatTurn::System(m.content.as_str()),
+            "user" | "User" | "USER" => ChatTurn::User(m.content.as_str()),
+            "tool" => ChatTurn::Tool {
+                tool_call_id: m.tool_call_id.as_deref().unwrap_or(""),
+                name: m.name.as_deref(),
+                content: m.content.as_str(),
+            },
+            _ => ChatTurn::Assistant {
+                text: m.content.as_str(),
+                tool_calls: tool_calls.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            },
+        })
+        .collect();
+    lumen_mlx::chat_io::strip_client_meta_wrappers(&mut turns);
+    turns
+}
+
+/// Text a turn carries, for the chars/4 fallback when the history count
+/// itself fails.
+fn turn_text_len(turn: &ChatTurn<'_>) -> usize {
+    match turn {
+        ChatTurn::System(s) | ChatTurn::User(s) => s.len(),
+        ChatTurn::Assistant { text, tool_calls } => {
+            text.len()
+                + tool_calls
+                    .iter()
+                    .map(|c| c.name.len() + c.arguments.to_string().len())
+                    .sum::<usize>()
+        }
+        ChatTurn::Tool { content, .. } => content.len(),
+    }
 }
 
 /// Per-message image attachments, re-indexed onto the post-strip message
@@ -4092,5 +4290,577 @@ mod anthropic_thinking_blocks {
     fn an_empty_turn_is_unchanged() {
         let blocks = anthropic_content_blocks("", "", &[], true, ids());
         assert_eq!(kinds(&blocks), ["text"]);
+    }
+}
+
+/// Engine tests over a real Gemma 4 checkpoint.
+///
+/// The engine has no test backend, so a defect in what it hands the prompt
+/// guard can only be caught by running it. `LUMEN_GEMMA4_MODEL_DIR` names the
+/// checkpoint; without it these tests print a skip line and pass, as the rest
+/// of the suite's checkpoint tests do.
+#[cfg(test)]
+mod real_checkpoint {
+    use super::InferenceEngine;
+    use std::ffi::{OsStr, OsString};
+
+    /// Sets a variable until dropped, then puts the shell's value back — panic
+    /// included, so nothing leaks into a later test in the same process.
+    pub(super) struct ScopedEnv {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        pub(super) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: only ever called on the test thread while no request is
+            // in flight — before the load, or between two requests.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Runs `f` with the prompt cap (`LUMEN_MAX_PROMPT_TOKENS`) at `cap`.
+    pub(super) fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
+        let _cap = ScopedEnv::set("LUMEN_MAX_PROMPT_TOKENS", cap.to_string());
+        f()
+    }
+
+    /// The engine over `LUMEN_GEMMA4_MODEL_DIR`, with its vision tower when
+    /// asked (`LUMEN_VISION` is read at load only).
+    pub(super) fn gemma4(vision: bool) -> Option<InferenceEngine> {
+        let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+            eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR to a Gemma 4 checkpoint");
+            return None;
+        };
+        let _vision = vision.then(|| ScopedEnv::set("LUMEN_VISION", "1"));
+        Some(InferenceEngine::load(&dir).expect("load Gemma 4"))
+    }
+}
+
+/// Task 018: a batch `/v1/messages` request is admitted on the figure it
+/// reports — its rendered text plus the placeholder runs its images expand
+/// into — on both the flat and the tool-history branch.
+///
+/// Every number is the checkpoint's own — the text count from a text-only twin
+/// of each request, the image's from the backend — so a budget or template
+/// change moves the cap with it instead of breaking the test.
+#[cfg(test)]
+mod anthropic_batch_image_admission {
+    use super::real_checkpoint::{gemma4, with_cap};
+    use crate::types::AnthropicRequest;
+    use base64::Engine as _;
+    use serde_json::{Value, json};
+
+    const PROBE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lumen-mlx/tests/fixtures/gemma4_vision_probe.png"
+    );
+
+    fn request(messages: Value, tools: bool) -> AnthropicRequest {
+        let mut body = json!({
+            "model": "gemma-4",
+            "max_tokens": 1,
+            "temperature": 0,
+            "messages": messages,
+        });
+        if tools {
+            body["tools"] = json!([{
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }]);
+        }
+        serde_json::from_value(body).expect("a valid Messages request")
+    }
+
+    /// One user message — the flat branch.
+    fn flat(image: Option<&Value>) -> AnthropicRequest {
+        let mut content = vec![json!({"type": "text", "text": "What is in this picture?"})];
+        content.extend(image.cloned());
+        request(json!([{"role": "user", "content": content}]), false)
+    }
+
+    /// A tool call and its result ahead of the image — the tool-history branch.
+    fn tool_history(image: Option<&Value>) -> AnthropicRequest {
+        let mut last = vec![
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "notes.txt: the picture is attached below.",
+            }),
+            json!({"type": "text", "text": "What does the picture show?"}),
+        ];
+        last.extend(image.cloned());
+        request(
+            json!([
+                {"role": "user", "content": "Read notes.txt."},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "notes.txt"},
+                }]},
+                {"role": "user", "content": last},
+            ]),
+            true,
+        )
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint with its vision tower; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn the_batch_guard_admits_on_the_count_it_reports() {
+        let Some(mut engine) = gemma4(true) else {
+            return;
+        };
+
+        let png = std::fs::read(PROBE).expect("read the probe image");
+        let image_tokens = engine.backend.image_prompt_tokens(&[vec![png.clone()]]);
+        assert!(
+            image_tokens > 0,
+            "no vision tower loaded: the image would cost nothing and prove nothing"
+        );
+        let image = json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64::engine::general_purpose::STANDARD.encode(&png),
+            },
+        });
+
+        let shapes: [(&str, fn(Option<&Value>) -> AnthropicRequest); 2] =
+            [("flat", flat), ("tool history", tool_history)];
+        for (shape, build) in shapes {
+            // The same request without the image renders the same text.
+            let text = with_cap(1_000_000, || engine.anthropic_messages(&build(None)))
+                .unwrap_or_else(|e| panic!("{shape}: text-only twin: {e:#}"))
+                .usage
+                .input_tokens;
+            let total = text + image_tokens;
+
+            let rejected = with_cap(total - 1, || {
+                engine.anthropic_messages(&build(Some(&image)))
+            });
+            let err = match rejected {
+                Ok(_) => panic!(
+                    "{shape}: admitted under a cap of {} — the guard did not count the \
+                     image's {image_tokens} tokens on top of the text's {text}",
+                    total - 1
+                ),
+                Err(e) => e.to_string(),
+            };
+            let expected = format!("prompt too large: {total} tokens > limit {}", total - 1);
+            assert!(err.starts_with(&expected), "{shape}: {err}");
+
+            let admitted = with_cap(total, || engine.anthropic_messages(&build(Some(&image))))
+                .unwrap_or_else(|e| panic!("{shape}: rejected at a cap of exactly {total}: {e:#}"));
+            assert_eq!(
+                admitted.usage.input_tokens, total,
+                "{shape}: reported a different figure than it was admitted on"
+            );
+        }
+    }
+}
+
+/// `/v1/completions` was the one surface with no prompt-size guard: a raw
+/// prompt of any size went straight to prefill.
+#[cfg(test)]
+mod completion_admission {
+    use super::real_checkpoint::{gemma4, with_cap};
+    use crate::types::CompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_raw_prompt_over_the_cap_is_refused() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "prompt": "The quick brown fox jumps over the lazy dog.",
+            "max_tokens": 1,
+            "temperature": 0,
+        }))
+        .expect("a valid completions request");
+
+        let tokens = with_cap(1_000_000, || engine.completion(&req))
+            .unwrap_or_else(|e| panic!("refused under a cap of 1M: {e:#}"))
+            .usage
+            .prompt_tokens;
+        let refused = match with_cap(tokens - 1, || engine.completion(&req)) {
+            Ok(_) => panic!(
+                "a {tokens}-token prompt was admitted under a cap of {}",
+                tokens - 1
+            ),
+            Err(e) => e.to_string(),
+        };
+        let expected = format!("prompt too large: {tokens} tokens > limit {}", tokens - 1);
+        assert!(refused.starts_with(&expected), "{refused}");
+    }
+}
+
+/// Gemma 4's cached streaming routes rendered a `response_format` request with
+/// the thought channel open. The JSON grammar masks from token 0, so the model
+/// was pushed off the `<|channel>` it opens every reply with and degenerated —
+/// the defect `gemma-thought-channel` fixed on the uncached routes only.
+#[cfg(test)]
+mod gemma_structured_stream {
+    use super::StreamEvent;
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_cached_stream_with_response_format_returns_the_schema() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // The system message gives the request a prefix-cache key, which is
+        // what sends it down the cached route.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant."},
+                {"role": "user", "content": "Summarize the plot of Romeo and Juliet in two sentences."},
+            ],
+            "max_tokens": 160,
+            "temperature": 0,
+            "stream": true,
+            "chat_template_kwargs": {"enable_thinking": false},
+            // A free-form string: with the channel open, short values (an
+            // integer) still come out right, and free text degenerates.
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "summary",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }))
+        .expect("a valid chat request");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        engine.chat_completion_streaming(&req, &tx);
+        drop(tx);
+        let mut text = String::new();
+        let mut finish = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                StreamEvent::Error(e) => panic!("stream error: {e}"),
+                _ => {}
+            }
+        }
+        assert!(
+            matches!(finish, Some(super::FinishReason::Stop)),
+            "ran to max_tokens ({finish:?}): {text:?}"
+        );
+        let value: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("not the requested JSON ({e}): {text:?}"));
+        let summary = value["summary"].as_str().unwrap_or_default();
+        assert!(summary.split_whitespace().count() >= 8, "{text}");
+    }
+}
+
+/// A grammar was applied only on the sampled decode branch, so a greedy
+/// request — temperature 0 with every penalty off — decoded unconstrained:
+/// `response_format` became a suggestion.
+#[cfg(test)]
+mod gemma_greedy_grammar {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_greedy_request_still_gets_its_schema() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // Nothing in the prompt asks for JSON: only the grammar can produce it.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+            "max_tokens": 48,
+            "temperature": 0,
+            "repeat_penalty": 1.0,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sum",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }))
+        .expect("a valid chat request");
+        let resp = engine
+            .chat_completion(&req)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        let text = resp.choices[0].message.content.clone().unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("not the requested JSON ({e}): {text:?}"));
+        assert!(value["answer"].is_i64(), "{text}");
+    }
+}
+
+/// Gemma 4 prefilled the boundary snapshot, and every non-streaming prompt, in
+/// one forward. Its global layers materialize `[heads, L, L]` attention
+/// scores, so a 35.8K-token boundary asked Metal for 41 GB and failed. Checked
+/// here as peak memory at a size that is safe either way.
+#[cfg(test)]
+mod gemma_chunked_prefill {
+    use super::real_checkpoint::{ScopedEnv, gemma4};
+    use crate::types::ChatCompletionRequest;
+    use lumen_mlx::metal_memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+    use serde_json::{Value, json};
+
+    fn request(messages: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": messages,
+            "max_tokens": 1,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request")
+    }
+
+    /// Runs `f` and returns how far peak memory rose above where it started.
+    fn peak_growth<T>(f: impl FnOnce() -> T) -> (u64, T) {
+        let before = get_active_memory().expect("active memory") as u64;
+        reset_peak_memory();
+        let out = f();
+        let peak = get_peak_memory().expect("peak memory") as u64;
+        (peak.saturating_sub(before), out)
+    }
+
+    /// One unchunked pass over `tokens` holds at least a bf16 `[16, L, L]`
+    /// scores buffer for a global layer; a 512-token chunk holds a sliver.
+    fn assert_chunked(path: &str, growth: u64, tokens: u64) {
+        let whole = 16 * tokens * tokens * 2;
+        assert!(
+            growth < whole * 6 / 10,
+            "{path}: peak rose {:.2} GB over a {tokens}-token prefill — one \
+             unchunked pass's scores alone are {:.2} GB",
+            growth as f64 / 1e9,
+            whole as f64 / 1e9
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_long_prompt_is_prefilled_in_chunks() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // The first request materializes the weights; measure after it.
+        engine
+            .chat_completion(&request(json!([{"role": "user", "content": "Hi"}])))
+            .unwrap_or_else(|e| panic!("warm-up: {e:#}"));
+        let _chunk = ScopedEnv::set("LUMEN_GEMMA4_PREFILL_CHUNK", "512");
+        let filler = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
+
+        // No system message, so no prefix-cache key: `generate`'s own prefill.
+        let batch = request(json!([{"role": "user", "content": filler}]));
+        let (growth, resp) = peak_growth(|| engine.chat_completion(&batch));
+        let tokens = resp.unwrap_or_else(|e| panic!("{e:#}")).usage.prompt_tokens;
+        assert!(
+            tokens > 8_000,
+            "the filler should be ~10K tokens, got {tokens}"
+        );
+        assert_chunked("batch prefill", growth, u64::from(tokens));
+
+        // A system message keys the prefix cache; on a miss everything but the
+        // last message is prefilled as the boundary snapshot.
+        let history = request(json!([
+            {"role": "system", "content": "You are a terse assistant."},
+            {"role": "user", "content": filler},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Done?"},
+        ]));
+        let (growth, resp) = peak_growth(|| engine.chat_completion(&history));
+        let tokens = resp.unwrap_or_else(|e| panic!("{e:#}")).usage.prompt_tokens;
+        assert_chunked("boundary prefill", growth, u64::from(tokens));
+    }
+}
+
+/// `DELETE /v1/prefix-cache/{key}` removed Gemma 4's full-prompt snapshot but
+/// not the system-boundary one stored beside it, so the next request with that
+/// key forked the boundary right back — the one entry worth evicting after a
+/// failed prefill.
+#[cfg(test)]
+mod gemma_prefix_cache_drop {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn dropping_a_key_drops_its_boundary_snapshot_too() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        // Two turns of history: everything but the last message is the
+        // boundary, so a miss stores a boundary snapshot as well.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gemma-4",
+            "session_id": "drop-me",
+            "messages": [
+                {"role": "system", "content": "You are a terse assistant."},
+                {"role": "user", "content": "Remember the number 7."},
+                {"role": "assistant", "content": "Noted."},
+                {"role": "user", "content": "Which number?"},
+            ],
+            "max_tokens": 1,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request");
+        engine
+            .chat_completion(&req)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(
+            engine.drop_prefix_cache("drop-me"),
+            "nothing stored under the key"
+        );
+        assert_eq!(
+            engine.clear_prefix_cache(),
+            0,
+            "a snapshot under the dropped key survived the drop"
+        );
+    }
+}
+
+/// Gemma 4 sent every non-streaming request with tools — or `response_format` —
+/// down a route that never touched the prefix cache, so an agent, which sends
+/// tools on every turn, paid a cold prefill each time.
+#[cfg(test)]
+mod gemma_batch_grammar_prefix_cache {
+    use super::real_checkpoint::gemma4;
+    use crate::types::ChatCompletionRequest;
+    use serde_json::{Value, json};
+
+    fn request(messages: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "gemma-4",
+            "messages": messages,
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }}],
+            "tool_choice": "required",
+            "max_tokens": 48,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("a valid chat request")
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_batch_tool_request_leaves_a_snapshot_for_the_next_turn() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        let system = json!({"role": "system", "content": "You are a weather assistant."});
+        let ask = json!({"role": "user", "content": "What is the weather in Paris?"});
+        let flat = request(json!([system.clone(), ask.clone()]));
+        let history = request(json!([
+            system,
+            ask,
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 21 C."},
+            {"role": "user", "content": "And in Rome?"},
+        ]));
+        for (shape, req) in [("flat", flat), ("tool history", history)] {
+            let resp = engine
+                .chat_completion(&req)
+                .unwrap_or_else(|e| panic!("{shape}: {e:#}"));
+            let name = resp.choices[0]
+                .message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.function.name.clone());
+            assert_eq!(
+                name.as_deref(),
+                Some("get_weather"),
+                "{shape}: the forced tool call is gone"
+            );
+            assert!(
+                engine.clear_prefix_cache() > 0,
+                "{shape}: no prefix snapshot left for the next turn — the request took the \
+                 uncached route"
+            );
+        }
+    }
+}
+
+/// A refused prompt is the client's error (400), an inference failure the
+/// server's (500) — the status is what an SDK's retry policy keys on.
+#[cfg(test)]
+mod prompt_refusal_status {
+    use super::refuse_oversized_prompt;
+    use crate::types::inference_error_status;
+
+    #[test]
+    fn a_refused_prompt_goes_out_as_a_client_error() {
+        let refused = refuse_oversized_prompt(9, 8, 8, None).expect_err("over the cap");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("prompt too large: 9 tokens > limit 8.")
+        );
+        assert_eq!(inference_error_status(&refused), 400);
+        // A route that adds context keeps the classification.
+        assert_eq!(inference_error_status(&refused.context("chat")), 400);
+    }
+
+    #[test]
+    fn everything_else_stays_a_server_error() {
+        refuse_oversized_prompt(8, 8, 8, None).expect("at the cap is admitted");
+        let failed = anyhow::anyhow!("prefill forward (seq_id=3)");
+        assert_eq!(inference_error_status(&failed), 500);
     }
 }

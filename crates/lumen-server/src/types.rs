@@ -805,6 +805,19 @@ pub fn inference_error_message(e: &anyhow::Error) -> String {
     format!("inference error: {e:#}")
 }
 
+/// The status an inference failure goes out with: 400 for a prompt the size
+/// guard refused — the client's to fix, and one an SDK must not retry the way
+/// it retries a 5xx — and 500 for everything else.
+pub fn inference_error_status(e: &anyhow::Error) -> u16 {
+    if e.chain()
+        .any(|cause| cause.is::<crate::engine::PromptTooLarge>())
+    {
+        400
+    } else {
+        500
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,

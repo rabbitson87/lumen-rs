@@ -593,6 +593,13 @@ pub(crate) mod imp {
         position: usize,
     }
 
+    /// What a prefix-cached route renders its prompt from.
+    #[derive(Clone, Copy)]
+    enum CachedPrompt<'m, 't> {
+        Flat(&'m [(String, String)]),
+        History(&'m [crate::chat_io::ChatTurn<'t>]),
+    }
+
     pub struct Gemma4Backend {
         model: NativeGemma4Model,
         /// Phase 3: per-seq live decode caches keyed by seq_id, for the batched
@@ -701,7 +708,7 @@ pub(crate) mod imp {
             let chat = Gemma4ChatTemplate::from_dir(dir)
                 .with_context(|| format!("Gemma4Backend::from_dir({dir:?}): tokenizer load"))?;
             let jinja_chat = if env_jinja_renderer_on() {
-                match JinjaChatTemplate::from_dir(dir) {
+                match JinjaChatTemplate::from_dir_with_tokenizer(dir, chat.tokenizer().clone()) {
                     Ok(j) => {
                         eprintln!(
                             "[gemma4] minijinja renderer ACTIVE (LUMEN_USE_JINJA_RENDERER=1)"
@@ -1273,6 +1280,12 @@ pub(crate) mod imp {
             &self.chat
         }
 
+        /// Cumulative tokenizer work. The jinja renderer shares this
+        /// tokenizer, so its encodes are counted here too.
+        pub fn tokenize_stats(&self) -> Arc<crate::text_tokenizer::TokenizeStats> {
+            self.chat.tokenizer().stats().clone()
+        }
+
         // ── Trait-shape API used by `lumen-server` ─────────────────
 
         /// Tokenize raw text without applying the chat template. Used by
@@ -1390,6 +1403,45 @@ pub(crate) mod imp {
             Ok(ids)
         }
 
+        /// Length of the prompt's generation tail — `<|turn>model\n`, the
+        /// optional empty thought channel, and the `tool_choice` prefill —
+        /// which the prefix cache stops short of because the next turn puts
+        /// the model's actual reply there.
+        ///
+        /// The hand-ported renderers append exactly
+        /// [`Gemma4ChatTemplate::generation_prompt_ids`] after the last turn,
+        /// so the tail is measured directly. It used to be a second render of
+        /// the whole conversation, every request, just to subtract two
+        /// lengths. A jinja template makes no such promise and keeps the
+        /// re-render (`no_gen`). `close_thought_channel` must be what the
+        /// prompt was built with.
+        fn generation_tail_len(
+            &self,
+            prompt: &[u32],
+            prefill: &[u32],
+            thinking: bool,
+            close_thought_channel: bool,
+            no_gen: impl FnOnce() -> Result<Vec<u32>>,
+        ) -> usize {
+            if self.jinja_chat.is_none() {
+                let opts = RenderOptions {
+                    enable_thinking: thinking,
+                    add_generation_prompt: true,
+                    close_thought_channel,
+                };
+                if let Ok(gen_ids) = self.chat.generation_prompt_ids(&opts) {
+                    debug_assert!(
+                        prompt.ends_with(&[gen_ids.as_slice(), prefill].concat()),
+                        "prompt must end with the generation prompt + prefill"
+                    );
+                    return gen_ids.len() + prefill.len();
+                }
+            }
+            no_gen()
+                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
+                .unwrap_or(0)
+        }
+
         fn build_chat_input_from_history_no_gen(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1478,6 +1530,27 @@ pub(crate) mod imp {
         ) -> Result<Vec<u32>> {
             self.build_prompt_and_prefill(
                 messages,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )
+            .map(|(prompt, _prefill)| prompt)
+        }
+
+        /// [`Self::build_chat_input_prefilled`] for a tool-history request —
+        /// the prompt every history decode route builds, which the flat pairs
+        /// cannot express: `parse_role_pairs` rejects role `tool` outright.
+        pub fn build_chat_input_prefilled_from_history(
+            &self,
+            turns: &[crate::chat_io::ChatTurn<'_>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<Vec<u32>> {
+            self.build_prompt_and_prefill_from_history(
+                turns,
                 thinking,
                 tools,
                 tool_choice,
@@ -1862,6 +1935,40 @@ pub(crate) mod imp {
         }
 
         /// History variant of `build_prompt_and_prefill`.
+        /// The prompt and prefill both prefix-cached routes send. A JSON
+        /// grammar masks from token 0, so with a schema the prompt has to close
+        /// the thought channel the model would otherwise open there — as every
+        /// uncached route does (`gemma-thought-channel`). One place decides it,
+        /// so a test can check what the routes actually run. Returns the
+        /// decision too: the generation tail's length depends on it.
+        fn cached_prompt_and_prefill(
+            &self,
+            input: CachedPrompt<'_, '_>,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            response_schema: Option<&serde_json::Value>,
+        ) -> Result<(Vec<u32>, Vec<u32>, bool)> {
+            let close_thought_channel = response_schema.is_some();
+            let (prompt, prefill) = match input {
+                CachedPrompt::Flat(messages) => self.build_prompt_and_prefill(
+                    messages,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    close_thought_channel,
+                ),
+                CachedPrompt::History(turns) => self.build_prompt_and_prefill_from_history(
+                    turns,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    close_thought_channel,
+                ),
+            }?;
+            Ok((prompt, prefill, close_thought_channel))
+        }
+
         fn build_prompt_and_prefill_from_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -2004,8 +2111,8 @@ pub(crate) mod imp {
                 (lcp == e.prefix_tokens.len() && lcp < prompt.len()).then_some(lcp)
             };
             let sys_k = Self::sys_key(key);
-            let full_lcp = self.prefix_caches.get(key).and_then(&strict);
-            let sys_lcp = self.prefix_caches.get(&sys_k).and_then(&strict);
+            let full_lcp = self.prefix_caches.get(key).and_then(strict);
+            let sys_lcp = self.prefix_caches.get(&sys_k).and_then(strict);
             let pick = match (full_lcp, sys_lcp) {
                 (Some(f), Some(s)) if s > f => Some((sys_k, s, "hit-sys")),
                 (Some(f), _) => Some((key.to_string(), f, "hit-full")),
@@ -2064,8 +2171,13 @@ pub(crate) mod imp {
             if boundary == 0 {
                 return Ok(());
             }
+            // Chunked like every other prefill, and evaluated before the
+            // snapshot is stored: a lazy snapshot only computes when the next
+            // request forks it, so a failure there used to leave an entry
+            // every later request with this system prompt reused.
             self.model
-                .forward_last_token(&prompt[..boundary], cache)
+                .forward_last_token_chunked(&prompt[..boundary], cache)
+                .and_then(|logits| Ok(logits.eval()?))
                 .context(ctx)?;
             self.save_prefix_snapshot(&Self::sys_key(key), cache, &prompt[..boundary]);
             Ok(())
@@ -2178,8 +2290,14 @@ pub(crate) mod imp {
         }
 
         /// Drop a prefix-cache entry by key. Returns true if it existed.
+        /// Drops both snapshots under `key`: the full-prompt one and its
+        /// system-boundary sibling. Leaving the sibling meant the route that
+        /// exists to evict a key could not evict a bad boundary snapshot —
+        /// the next request with that key forked it straight back.
         pub fn drop_prefix_cache(&mut self, key: &str) -> bool {
-            self.prefix_caches.remove(key).is_some()
+            let full = self.prefix_caches.remove(key).is_some();
+            let boundary = self.prefix_caches.remove(&Self::sys_key(key)).is_some();
+            full || boundary
         }
 
         /// Clear all prefix-cache entries; returns the number released.
@@ -2411,8 +2529,13 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
+            let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
+                CachedPrompt::Flat(messages),
+                thinking,
+                tools,
+                tool_choice,
+                response_schema,
+            )?;
             if prompt.is_empty() {
                 return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
             }
@@ -2441,10 +2564,13 @@ pub(crate) mod imp {
             // those segments are PROMPT-TAIL-only and diverge in the next
             // turn the same way (mid-prompt model header tokens differ from
             // prompt-tail).
-            let trailing_header_len = self
-                .build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
-                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
-                .unwrap_or(0);
+            let trailing_header_len = self.generation_tail_len(
+                &prompt,
+                &prefill_tokens,
+                thinking,
+                close_thought_channel,
+                || self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen),
+            );
             // Dual-snapshot: fork the longest strict-prefix snapshot (full or
             // system) with no rollback; on a miss prime the system-boundary
             // snapshot. `decode_streaming_with_prompt` separately records the
@@ -2513,12 +2639,12 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
-                turns,
+            let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
+                CachedPrompt::History(turns),
                 thinking,
                 tools,
                 tool_choice,
-                false,
+                response_schema,
             )?;
             if prompt.is_empty() {
                 return Err(anyhow!(
@@ -2534,10 +2660,19 @@ pub(crate) mod imp {
             // diff captures ONLY the generation prompt (+ optional tool_choice
             // prefill) — not tool definitions in the system block (those are
             // shared across turns and must NOT be excluded from the snapshot).
-            let trailing_header_len = self
-                .build_chat_input_from_history_no_gen(turns, thinking, effective_tools_for_no_gen)
-                .map(|no_gen| prompt.len().saturating_sub(no_gen.len()))
-                .unwrap_or(0);
+            let trailing_header_len = self.generation_tail_len(
+                &prompt,
+                &prefill_tokens,
+                thinking,
+                close_thought_channel,
+                || {
+                    self.build_chat_input_from_history_no_gen(
+                        turns,
+                        thinking,
+                        effective_tools_for_no_gen,
+                    )
+                },
+            );
             let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
             if hit_kind == "miss" {
                 let boundary = self.batch_fanout_boundary_from_history(
@@ -3011,11 +3146,7 @@ pub(crate) mod imp {
                 // grown to ~10K KV. The attention QxK^T graph for a 4096-token
                 // chunk over a 10K KV is too large for one command buffer;
                 // halving the chunk keeps per-CB work bounded.
-                let requested_chunk: usize = std::env::var("LUMEN_GEMMA4_PREFILL_CHUNK")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n: &usize| n > 0)
-                    .unwrap_or(2048);
+
                 // ── Always-chunk invariant: single-pass OOM guard ──
                 // The quantized-KV / TurboQuant attention path materializes the
                 // full [heads, q_len, kv_len] scores array — fused flash-SDPA
@@ -3028,31 +3159,23 @@ pub(crate) mod imp {
                 // given the worst-case kv_len (== full prompt length). This makes
                 // chunking mandatory: an over-large env/config chunk is clamped
                 // DOWN, never up. Default 8 GB fits any box that can host a 26B
-                // model (Metal maxBufferLength ≥ ~16 GB there); kv-quant off uses
-                // flash-SDPA and is unaffected by the materialization, but the
-                // clamp also keeps the per-command-buffer intermediate graph
-                // bounded, so it is applied uniformly. Override the budget with
-                // `LUMEN_GEMMA4_PREFILL_SCORES_GB`.
-                // The arithmetic lives in `prefill_budget` so it can be swept at
-                // tier 0; the two backends had it duplicated. Behaviour here is
-                // unchanged by the hoist.
-                let scores_budget_bytes =
-                    crate::prefill_budget::scores_budget_from_env("LUMEN_GEMMA4_PREFILL_SCORES_GB");
-                let decision = crate::prefill_budget::clamp_chunk(
-                    requested_chunk,
-                    scores_budget_bytes,
-                    self.model.config().text_config.num_attention_heads,
-                    prompt.len(),
-                );
+                // model (Metal maxBufferLength ≥ ~16 GB there). KV quantization
+                // off does not escape it: the global layers (head_dim 512) take
+                // MLX's materializing attention path too. Override the budget
+                // with `LUMEN_GEMMA4_PREFILL_SCORES_GB`. The rule itself is
+                // `NativeGemma4Model::prefill_chunk_decision`, shared with every
+                // other Gemma prefill; the arithmetic is in `prefill_budget`.
+                let decision = self.model.prefill_chunk_decision(prompt.len());
                 let chunk_size = decision.chunk;
                 if decision.clamped() {
                     eprintln!(
-                        "[prefill] chunk clamped {requested_chunk} → {chunk_size} \
+                        "[prefill] chunk clamped {} → {chunk_size} \
                          (heads={} kv_upper={} budget={:.1}GB) — \
                          keeps single-chunk scores under the Metal buffer cap",
+                        decision.requested,
                         decision.heads.max(1),
                         decision.kv_upper.max(1),
-                        scores_budget_bytes as f64 / 1e9
+                        decision.budget_bytes as f64 / 1e9
                     );
                 }
                 // Chunked prefill re-enabled (2026-05-14, take 2): the mask
@@ -3285,7 +3408,14 @@ pub(crate) mod imp {
                 }
                 let eos = self.model.eos_tokens().to_vec();
 
-                let sampling_cfg = build_sampling_config(temperature, top_p, ov);
+                // Only the sampled branch below applies a grammar; the greedy
+                // and MTP branches never read it. So a greedy request that
+                // carries one — temperature 0 with every penalty off, which a
+                // client's `repeat_penalty: 1.0` is enough for — decoded
+                // unconstrained. Send it through the sampled branch at
+                // temperature 0: the same argmax, with the mask applied.
+                let sampling_cfg = build_sampling_config(temperature, top_p, ov)
+                    .or_else(|| grammar.is_some().then(SamplingConfig::default));
 
                 // ── MTP decode branch (DEFAULT OFF — opt-in only) ──
                 //
@@ -4132,6 +4262,65 @@ pub(crate) mod imp {
         use std::path::Path;
 
         const LMSTUDIO_DIR: &str = "/path/to/models/gemma-4-26b-a4b-mlx-4bit";
+
+        /// With a schema, the cached routes render exactly what the uncached
+        /// routes do: the thought channel closed. Checked on the token ids
+        /// rather than on the model's output — whether an open channel under
+        /// a JSON grammar degenerates depends on bf16 rounding, and the
+        /// output-based guard stopped seeing it when the attention path changed.
+        #[test]
+        #[ignore = "requires the Gemma 4 checkpoint and a Metal device; set LUMEN_GEMMA4_MODEL_DIR"]
+        fn a_cached_route_closes_the_thought_channel_for_a_schema() {
+            let Ok(dir) = std::env::var("LUMEN_GEMMA4_MODEL_DIR") else {
+                eprintln!("skip: set LUMEN_GEMMA4_MODEL_DIR");
+                return;
+            };
+            let backend = Gemma4Backend::from_dir("gemma-4", &dir).expect("load backend");
+            let messages = vec![
+                (
+                    "system".to_string(),
+                    "You are a terse assistant.".to_string(),
+                ),
+                (
+                    "user".to_string(),
+                    "Summarize Romeo and Juliet.".to_string(),
+                ),
+            ];
+            let auto = crate::chat_io::ResolvedToolChoice::Auto;
+            let schema = serde_json::json!({"type": "object"});
+            let cached = |schema| {
+                let (prompt, prefill, _) = backend
+                    .cached_prompt_and_prefill(
+                        CachedPrompt::Flat(&messages),
+                        false,
+                        &[],
+                        &auto,
+                        schema,
+                    )
+                    .expect("cached prompt");
+                (prompt, prefill)
+            };
+            let uncached = |close| {
+                backend
+                    .build_prompt_and_prefill(&messages, false, &[], &auto, close)
+                    .expect("uncached prompt")
+            };
+            assert_eq!(
+                cached(Some(&schema)),
+                uncached(true),
+                "a schema closes the channel"
+            );
+            assert_eq!(
+                cached(None),
+                uncached(false),
+                "no schema leaves the prompt alone"
+            );
+            assert_ne!(
+                uncached(true),
+                uncached(false),
+                "closing the channel adds tokens"
+            );
+        }
 
         fn dir_present() -> bool {
             Path::new(LMSTUDIO_DIR).exists()

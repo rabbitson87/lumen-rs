@@ -1,16 +1,18 @@
 // The modules moved to `lib.rs` so tests and fuzz targets can reach them; see
 // the module docs there. This binary is the same code it always was, one
 // crate boundary further out.
-use atomic_http::external::http::{Response, StatusCode};
+use atomic_http::external::http::{HeaderValue, Response, StatusCode};
 use atomic_http::*;
 
+use lumen_server::access::{self, Access, Cors};
 use lumen_server::diffusion_engine::{self, DiffusionHandle};
 use lumen_server::embedding::EmbeddingHandle;
 #[cfg(feature = "mlx-native")]
 use lumen_server::embedding::EmbeddingService;
 use lumen_server::engine::{EngineHandle, InferenceEngine};
-use lumen_server::types::ErrorResponse;
+use lumen_server::types::{AnthropicError, ErrorResponse};
 use lumen_server::{catalog, routes};
+use std::sync::Arc;
 
 /// Default image model id surfaced in `/v1/models` and image responses.
 const DEFAULT_IMAGE_MODEL: &str = "flux2-dev";
@@ -67,13 +69,15 @@ const DEFAULT_PORT: u16 = 41110;
 #[cfg(feature = "mlx-native")]
 static EMBEDDED_MLX_METALLIB: &[u8] = include_bytes!(env!("LUMEN_MLX_METALLIB_PATH"));
 
-/// Drop the embedded metallib next to the running binary so mlx's
-/// `load_colocated_library("mlx")` finds it on startup. Idempotent —
-/// skips if a matching-size file already exists. Errors surface as
-/// stderr warnings; mlx will then fail with its native error message,
-/// which is more actionable than a panic here.
+/// Make sure MLX finds this binary's kernel library on startup: the copy an
+/// app bundle ships in `Contents/Resources`, one already beside the binary, or
+/// else the embedded bytes unpacked beside it. See [`lumen_server::metallib`]
+/// for why the bundle must not be written to. Errors surface as stderr
+/// warnings; mlx then fails with its native error message, which is more
+/// actionable than a panic here.
 #[cfg(feature = "mlx-native")]
 fn ensure_metallib_colocated() {
+    use lumen_server::metallib;
     if EMBEDDED_MLX_METALLIB.is_empty() {
         return; // Built without an actual metallib — nothing to unpack.
     }
@@ -87,13 +91,20 @@ fn ensure_metallib_colocated() {
     let Some(dir) = exe.parent() else {
         return;
     };
-    let target = dir.join("mlx.metallib");
-    // Skip if already present with the same size (cheap idempotency check —
-    // avoids rewriting on every restart).
-    if let Ok(meta) = std::fs::metadata(&target) {
-        if meta.len() as usize == EMBEDDED_MLX_METALLIB.len() {
+    let target = metallib::colocated_path(dir);
+    let bundled = metallib::bundled_path(dir);
+    let len = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.len());
+    match metallib::plan(
+        len(&target),
+        len(&bundled),
+        EMBEDDED_MLX_METALLIB.len() as u64,
+    ) {
+        metallib::Plan::AlreadyColocated => return,
+        metallib::Plan::UseBundled => {
+            eprintln!("[metallib] using the app bundle's {}", bundled.display());
             return;
         }
+        metallib::Plan::Unpack => {}
     }
     match std::fs::write(&target, EMBEDDED_MLX_METALLIB) {
         Ok(_) => eprintln!(
@@ -127,6 +138,32 @@ async fn main() -> Result<(), SendableError> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("lumen-server {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    // `--write-metallib <path>`: write the embedded kernel library out, so the
+    // release build can ship this binary's exact copy in the app bundle's
+    // `Contents/Resources` (see `lumen_server::metallib`).
+    if let Some(i) = args.iter().position(|a| a == "--write-metallib") {
+        let path = args
+            .get(i + 1)
+            .ok_or_else(|| SendableError::from("--write-metallib needs a path"))?;
+        #[cfg(feature = "mlx-native")]
+        {
+            if EMBEDDED_MLX_METALLIB.is_empty() {
+                return Err(SendableError::from(
+                    "this build embeds no metallib (MLX built without Metal)",
+                ));
+            }
+            std::fs::write(path, EMBEDDED_MLX_METALLIB)
+                .map_err(|e| SendableError::from(format!("write {path}: {e}")))?;
+            println!("{path}");
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            return Err(SendableError::from(format!(
+                "--write-metallib {path}: built without mlx-native"
+            )));
+        }
     }
 
     // Auto-load .env from CWD or binary-adjacent directory so deployments
@@ -295,14 +332,12 @@ async fn main() -> Result<(), SendableError> {
             .warmup()
             .map_err(|e| SendableError::from(format!("warmup failed: {e}")))?;
 
-        // Channel-based engine: no Mutex, requests queue through channel.
-        // Hand the shared lifetime-stats accumulator to the handle BEFORE moving
-        // the engine into its task, so `GET /v1/loads` reads the same atomics the
-        // engine bumps at each chat completion.
-        let load_stats = engine.load_stats();
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let handle = EngineHandle::new(tx, load_stats);
-        tokio::spawn(async move { engine.run(rx).await });
+        // Channel-based engine: no Mutex, requests queue through a channel to
+        // the engine's own thread (see `InferenceEngine::start` for why it is
+        // not a tokio task).
+        let handle = engine
+            .start()
+            .map_err(|e| SendableError::from(format!("engine thread: {e}")))?;
         Some(handle)
     } else {
         None
@@ -387,9 +422,23 @@ async fn main() -> Result<(), SendableError> {
         _ => None,
     };
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = access::listen_addr(
+        std::env::var("LUMEN_HOST").ok().as_deref(),
+        std::env::var("HOST").ok().as_deref(),
+        port,
+    );
+    let access = Arc::new(Access::from_env());
     let mut server = Server::new(&addr).await?;
-    eprintln!("TurboQuant serving on :{port}  (mode={serve_mode:?})");
+    eprintln!("TurboQuant serving on {addr}  (mode={serve_mode:?})");
+    eprintln!(
+        "[serve] api key {}, cors {:?} (LUMEN_API_KEY / LUMEN_CORS)",
+        if access.requires_key() {
+            "required"
+        } else {
+            "not required"
+        },
+        access.cors()
+    );
     let llm_note = if handle.is_some() {
         ""
     } else {
@@ -426,9 +475,10 @@ async fn main() -> Result<(), SendableError> {
         let handle = handle.clone();
         let embedding = embedding_handle.clone();
         let diffusion = diffusion_handle.clone();
+        let access = Arc::clone(&access);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(accept, handle, embedding, diffusion).await {
+            if let Err(e) = handle_connection(accept, handle, embedding, diffusion, &access).await {
                 eprintln!("connection error: {e}");
             }
         });
@@ -440,13 +490,39 @@ async fn handle_connection(
     handle: Option<EngineHandle>,
     embedding: Option<EmbeddingHandle>,
     diffusion: Option<DiffusionHandle>,
+    access: &Access,
 ) -> Result<(), SendableError> {
-    let (request, response) = accept.parse_request_arena_writer().await?;
+    let (request, mut response) = accept.parse_request_arena_writer().await?;
 
     let method = request.method().as_str();
     let path = request.uri().path();
 
     eprintln!("{method} {path}");
+
+    // Set before routing so every response carries it, the hand-written SSE
+    // heads included (`routes::sse_head`).
+    let origin = request
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok());
+    if let Some(allow) = access.cors().allow_origin(origin) {
+        let headers = response.headers_mut();
+        headers.insert(
+            "access-control-allow-origin",
+            HeaderValue::from_str(&allow)?,
+        );
+        headers.insert("vary", HeaderValue::from_static("Origin"));
+    }
+    if method == "OPTIONS" && access.cors() != Cors::Off {
+        let requested = request
+            .headers()
+            .get("access-control-request-headers")
+            .cloned();
+        return preflight(response, requested).await;
+    }
+    if !access.authorized(method, path, request.headers()) {
+        return unauthorized(response, path).await;
+    }
 
     // LLM routes require a loaded engine; in image-only mode they 503.
     // The macro binds the unwrapped `EngineHandle` to the caller-supplied
@@ -500,6 +576,51 @@ async fn llm_not_loaded(mut response: Response<ArenaWriter>) -> Result<(), Senda
     );
     response.body_mut().set_arena_json(&err)?;
     *response.status_mut() = StatusCode::from_u16(503)?;
+    response.responser_arena().await?;
+    Ok(())
+}
+
+/// CORS preflight: the methods the API serves and whatever headers the browser
+/// asked to send. The allow-origin header, if any, is already set.
+async fn preflight(
+    mut response: Response<ArenaWriter>,
+    requested_headers: Option<HeaderValue>,
+) -> Result<(), SendableError> {
+    let headers = response.headers_mut();
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        requested_headers.unwrap_or_else(|| {
+            HeaderValue::from_static("authorization, content-type, x-api-key, anthropic-version")
+        }),
+    );
+    headers.insert("access-control-max-age", HeaderValue::from_static("600"));
+    *response.status_mut() = StatusCode::from_u16(204)?;
+    response.responser_arena().await?;
+    Ok(())
+}
+
+/// 401 in the error shape the caller's SDK parses: Anthropic's on
+/// `/v1/messages`, OpenAI's everywhere else.
+async fn unauthorized(
+    mut response: Response<ArenaWriter>,
+    path: &str,
+) -> Result<(), SendableError> {
+    let message = "missing or invalid API key (LUMEN_API_KEY): send it as \
+                   `Authorization: Bearer <key>` or `x-api-key: <key>`";
+    if path == "/v1/messages" {
+        let mut err = AnthropicError::new(message);
+        err.error.r#type = "authentication_error".into();
+        response.body_mut().set_arena_json(&err)?;
+    } else {
+        response
+            .body_mut()
+            .set_arena_json(&ErrorResponse::new(message, 401))?;
+    }
+    *response.status_mut() = StatusCode::from_u16(401)?;
     response.responser_arena().await?;
     Ok(())
 }

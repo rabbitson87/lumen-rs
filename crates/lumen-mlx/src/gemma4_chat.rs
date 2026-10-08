@@ -1,6 +1,6 @@
 //! Gemma 4 tokenizer + chat template.
 //!
-//! Wraps a HuggingFace `tokenizers::Tokenizer` (loaded from `tokenizer.json`)
+//! Wraps the model's [`TextTokenizer`](crate::text_tokenizer::TextTokenizer) (loaded from `tokenizer.json`)
 //! and exposes the minimal subset of Gemma 4's chat template needed for the
 //! initial OpenAI-compatible HTTP shim:
 //!   • BOS / EOS / special-turn / channel / think tokens
@@ -20,7 +20,9 @@
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use std::path::Path;
-    use tokenizers::Tokenizer;
+    use std::sync::Arc;
+
+    use crate::text_tokenizer::TextTokenizer;
 
     // ────────── Hard-coded special-token IDs ─────────────────────────────
     // Sourced from `tokenizer.json` of `gemma-4-26b-a4b-mlx-4bit`. They are
@@ -178,10 +180,11 @@ pub(crate) mod imp {
         }
     }
 
-    /// Loaded tokenizer + chat-template state. Cheap to clone (it carries a
-    /// single `Tokenizer` which is itself `Arc`-internally).
+    /// Loaded tokenizer + chat-template state. The tokenizer sits behind an
+    /// `Arc` so the opt-in jinja renderer shares it rather than loading a
+    /// second copy (~240 MB resident for Gemma 4's 262K vocab).
     pub struct Gemma4ChatTemplate {
-        tokenizer: Tokenizer,
+        tokenizer: Arc<TextTokenizer>,
     }
 
     impl Gemma4ChatTemplate {
@@ -195,7 +198,7 @@ pub(crate) mod imp {
         pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
             let p = path.as_ref();
             let tokenizer =
-                Tokenizer::from_file(p).map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
+                TextTokenizer::from_file(p).map_err(|e| anyhow!("tokenizer load {p:?}: {e}"))?;
             // Sanity: confirm a couple of the constants resolve to the
             // strings we think they do. Catches a swapped tokenizer file.
             let bos = tokenizer
@@ -218,10 +221,12 @@ pub(crate) mod imp {
                     turn_open
                 ));
             }
-            Ok(Self { tokenizer })
+            Ok(Self {
+                tokenizer: Arc::new(tokenizer),
+            })
         }
 
-        pub fn tokenizer(&self) -> &Tokenizer {
+        pub fn tokenizer(&self) -> &Arc<TextTokenizer> {
             &self.tokenizer
         }
 
@@ -229,11 +234,9 @@ pub(crate) mod imp {
         /// BOS/EOS. Used internally by `render_to_ids` for the textual
         /// segments between special tokens.
         pub fn encode_plain(&self, text: &str) -> Result<Vec<u32>> {
-            let enc = self
-                .tokenizer
+            self.tokenizer
                 .encode(text, /* add_special_tokens */ false)
-                .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
-            Ok(enc.get_ids().to_vec())
+                .map_err(|e| anyhow!("tokenizer encode: {e}"))
         }
 
         /// Decode token ids back to a string. Skips special tokens by
@@ -393,6 +396,22 @@ pub(crate) mod imp {
             }
 
             // ── generation prompt ─────────────────────────────────────
+            out.extend(self.generation_prompt_ids(opts)?);
+
+            Ok(out)
+        }
+
+        /// The generation prompt both renderers end with: `<|turn>model\n`,
+        /// plus the empty thought channel when thinking is off and it is asked
+        /// for (`close_thought_channel`, or the operator's
+        /// [`empty_thought_on_nothink`]). Empty without `add_generation_prompt`.
+        ///
+        /// Neither renderer reads the generation options anywhere else, so a
+        /// render with them is exactly a render without them followed by this.
+        /// The prefix cache relies on that to measure the prompt's tail without
+        /// rendering the whole conversation a second time.
+        pub fn generation_prompt_ids(&self, opts: &RenderOptions) -> Result<Vec<u32>> {
+            let mut out = Vec::new();
             if opts.add_generation_prompt {
                 out.push(TOK_TURN_OPEN);
                 out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
@@ -411,7 +430,6 @@ pub(crate) mod imp {
                     out.push(TOK_CHANNEL_CLOSE);
                 }
             }
-
             Ok(out)
         }
 
@@ -634,22 +652,7 @@ pub(crate) mod imp {
             }
 
             // ── Generation prompt ─────────────────────────────────────
-            if opts.add_generation_prompt {
-                out.push(TOK_TURN_OPEN);
-                out.extend(self.encode_plain("model\n").context("encode 'model\\n'")?);
-                if !opts.enable_thinking
-                    && (opts.close_thought_channel || empty_thought_on_nothink())
-                {
-                    // Match Ollama's native gemma4 renderer: no empty thought
-                    // block on nothink (see `empty_thought_on_nothink`).
-                    out.push(TOK_CHANNEL_OPEN);
-                    out.extend(
-                        self.encode_plain("thought\n")
-                            .context("encode 'thought\\n'")?,
-                    );
-                    out.push(TOK_CHANNEL_CLOSE);
-                }
-            }
+            out.extend(self.generation_prompt_ids(opts)?);
 
             Ok(out)
         }
@@ -994,6 +997,91 @@ pub(crate) mod imp {
                 !ids.contains(&TOK_THINK),
                 "<|think|> must not appear when enable_thinking=false"
             );
+        }
+
+        /// The prefix cache measures the prompt's generation tail as
+        /// `generation_prompt_ids().len()` instead of re-rendering the whole
+        /// conversation without it. That is only exact if a render with the
+        /// generation prompt is a render without it plus those ids — for both
+        /// renderers, with and without tools, in every option combination.
+        #[test]
+        #[ignore = "requires a Gemma 4 tokenizer.json (~32 MB)"]
+        fn generation_prompt_is_the_whole_difference_between_renders() {
+            use crate::chat_io::{ChatTurn, ToolDef};
+            let Some(tpl) = load_template_if_present() else {
+                return;
+            };
+            let msgs = [
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "You are terse.",
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Weather in Seoul?",
+                },
+            ];
+            let turns = [
+                ChatTurn::System("You are terse."),
+                ChatTurn::User("Hello"),
+                ChatTurn::Assistant {
+                    text: "Hi.",
+                    tool_calls: &[],
+                },
+                ChatTurn::User("Weather in Seoul?"),
+            ];
+            let params = serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            });
+            let tool = [ToolDef {
+                name: "get_weather",
+                description: Some("Current conditions for a city"),
+                parameters: Some(&params),
+                response: None,
+            }];
+            let no_tools: &[ToolDef<'_>] = &[];
+            for tools in [&tool[..], no_tools] {
+                for enable_thinking in [false, true] {
+                    for close_thought_channel in [false, true] {
+                        let with = RenderOptions {
+                            enable_thinking,
+                            add_generation_prompt: true,
+                            close_thought_channel,
+                        };
+                        let without = RenderOptions {
+                            add_generation_prompt: false,
+                            close_thought_channel: false,
+                            ..with
+                        };
+                        let gen_ids = tpl.generation_prompt_ids(&with).expect("gen");
+                        let case = format!(
+                            "tools={} thinking={enable_thinking} close={close_thought_channel}",
+                            tools.len()
+                        );
+                        let mut flat = tpl
+                            .render_to_ids_with_tools(&msgs, &without, tools)
+                            .expect("flat");
+                        flat.extend(&gen_ids);
+                        assert_eq!(
+                            tpl.render_to_ids_with_tools(&msgs, &with, tools)
+                                .expect("flat"),
+                            flat,
+                            "flat renderer, {case}"
+                        );
+                        let mut history = tpl
+                            .render_chat_history(&turns, &without, tools)
+                            .expect("hist");
+                        history.extend(&gen_ids);
+                        assert_eq!(
+                            tpl.render_chat_history(&turns, &with, tools).expect("hist"),
+                            history,
+                            "history renderer, {case}"
+                        );
+                    }
+                }
+            }
         }
 
         #[test]

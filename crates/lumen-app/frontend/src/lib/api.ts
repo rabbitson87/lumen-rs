@@ -15,7 +15,6 @@ export interface ServerConfig {
   memory_limit_gb: number | null;
   disable_wired_limit: boolean;
   embedding_model_id: string | null;
-  tokenizer_id: string | null;
   local_model_dir: string | null;
   skip_warmup: boolean;
   /** → LUMEN_KV_DISK — persist prefix-cache KV to disk across restarts. */
@@ -27,8 +26,8 @@ export interface ServerConfig {
 }
 
 export interface QuantConfig {
-  /** KV-cache quantization bits (3 / 4 / 6 / 8). Drives both legacy `TQ_BITS`
-   *  and Gemma 4 native `LUMEN_GEMMA4_QUANT_KV_BITS`. */
+  /** KV-cache quantization bits (3 / 4 / 6 / 8). Drives
+   *  `LUMEN_GEMMA4_QUANT_KV_BITS`. */
   bits: number;
   /** Three-way KV-cache quantization control (v8+).
    *   - `off`  — never quantize; KV stays in bf16 (fastest, most memory).

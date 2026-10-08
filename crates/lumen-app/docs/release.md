@@ -68,6 +68,14 @@ cd crates/lumen-app
 # Apple Silicon only — MLX (mlx-sys) refuses to build on x86_64, so there
 # is no Intel Mac target.
 TARGET=aarch64-apple-darwin
+# The oldest macOS the release supports, for every compiler including the
+# `metal` one that builds MLX's kernel library: without it the metallib is
+# bound to this machine's SDK version. Must equal
+# `bundle.macOS.minimumSystemVersion` in tauri.conf.json (14.0: MLX's own
+# minimum; the kernels compile as Metal 3.1, without the M5 NAX kernels, which
+# need a 26.2 target). Clean mlx-sys so MLX is reconfigured with it.
+export MACOSX_DEPLOYMENT_TARGET=14.0
+cargo clean -p mlx-sys --release --target "$TARGET"
 cargo build -p lumen-server --release --target "$TARGET"
 
 # Tauri's sidecar feature requires the binary at a specific name.
@@ -75,10 +83,28 @@ mkdir -p binaries
 cp ../../target/$TARGET/release/lumen-server \
    binaries/lumen-server-$TARGET
 
-# Build the .app bundle. The --config flag injects the sidecar binding so the
-# default tauri.conf.json stays clean for `cargo tauri dev`.
-cargo tauri build --target "$TARGET" --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
+# MLX's kernel library goes in the bundle's Contents/Resources, written out by
+# the server so it is exactly the copy it embeds. Skip this and the server
+# unpacks it next to itself inside the signed Contents/MacOS, which fails when
+# the app runs from its read-only DMG or a translocated copy ("Failed to load
+# the default metallib").
+binaries/lumen-server-$TARGET --write-metallib binaries/mlx.metallib
+
+# Build the .app bundle. The --config flag injects the sidecar binding and its
+# kernel library so the default tauri.conf.json stays clean for `cargo tauri dev`.
+cargo tauri build --target "$TARGET" --config '{"bundle":{"externalBin":["binaries/lumen-server"],"resources":{"binaries/mlx.metallib":"mlx.metallib"}}}'
 ```
+
+The bundle needs an MLX build that looks in `Contents/Resources`
+(rabbitson87/mlx `lumen-rs-patches` from 97685a09). mlx-c fetches that branch
+when `mlx-sys` builds from scratch, as the release workflow does
+(`cargo clean -p mlx-sys` first); a cached older MLX build would still load the
+library from the build machine's own path and hide the problem until the app
+runs elsewhere.
+
+`TAURI_SIGNING_PRIVATE_KEY` (and its password, if set) must be in the
+environment: `createUpdaterArtifacts` is on, and without the key the build stops
+after bundling with "A public key has been found, but no private key".
 
 Outputs:
 - `target/$TARGET/release/bundle/macos/Lumen.app` — signable artifact
@@ -123,56 +149,40 @@ Existing v0.1.0 users will see the new version next time they hit **Update →
 Check for updates** in the app (or on next launch once you flip the policy to
 auto-check).
 
-## Automated flow (GitHub Actions sketch)
+## Automated flow (GitHub Actions)
 
-Drop the following at `.github/workflows/release.yml`:
+[`.github/workflows/release.yml`](../../../.github/workflows/release.yml) runs
+the manual flow above on a `v*` tag (or a manual dispatch, which uploads to a
+draft `vTEST-<sha>` release). `tauri-action` signs the `.app.tar.gz`, uploads
+the bundle and its signature to a draft GitHub Release, and writes `latest.json`.
+Publish the draft to expose it at `releases/latest/download/latest.json`, the
+URL baked into `tauri.conf.json`. The workflow's comments explain its runner and
+toolchain choices (macOS 26 for an SDK that knows MLX's availability guards, the separately
+downloaded Metal toolchain, why `mlx-sys` is cleaned first).
 
-```yaml
-name: Release
-on:
-  push:
-    tags: ['v*']
-jobs:
-  build:
-    strategy:
-      matrix:
-        # Apple Silicon only — MLX upstream CMakeLists.txt errors out
-        # on x86_64. An Intel matrix entry can't succeed with mlx-native.
-        target: [aarch64-apple-darwin]
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - name: Build server
-        run: |
-          cargo build -p lumen-server --release --target ${{ matrix.target }}
-          mkdir -p crates/lumen-app/binaries
-          cp target/${{ matrix.target }}/release/lumen-server \
-             crates/lumen-app/binaries/lumen-server-${{ matrix.target }}
-      - name: Install frontend deps
-        run: cd crates/lumen-app/frontend && npm ci
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: crates/lumen-app
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Lumen ${{ github.ref_name }}'
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }} --config '{"bundle":{"externalBin":["binaries/lumen-server"]}}'
-```
+### Code signing and notarization
 
-`tauri-action` handles signing the `.app.tar.gz`, uploading both bundle + sig to
-the GitHub Release, and writing the `latest.json` manifest in the format the
-updater expects. After the job completes, publish the draft release —
-that flips the visibility for `releases/latest/download/latest.json`, which is
-the URL baked into `tauri.conf.json`.
+The `Configure macOS signing` step decides both, from what the repository
+holds:
+
+| | Configured by | Without it |
+|---|---|---|
+| Developer ID signature | secrets `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | ad-hoc signature (`signingIdentity: "-"`) |
+| Notarization | repository variable `MACOS_NOTARIZE=true` plus secrets `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | not notarized |
+
+Notarization needs an **active** Apple Developer Program membership. A lapsed
+one is what stopped the v0.12.0 run — `failed to notarize app: Error: HTTP
+status code: 401. Invalid credentials` after a successful build and code
+signature — even though the Developer ID certificate was still valid; a revoked
+or rotated app-specific password (`APPLE_PASSWORD`) fails the same way. Leave
+`MACOS_NOTARIZE` unset while the membership is inactive: the release still
+builds and ships, and users allow it once (README → Install from a release).
+
+A Developer ID certificate outlives a lapsed membership but not its own expiry
+date. Once it expires, signing fails; delete the three certificate secrets and
+releases fall back to ad-hoc signing. Either signature is valid — what matters
+is that the bundle is sealed: an unsealed one is reported as **damaged**, with
+no Open Anyway.
 
 ## Config schema migrations
 

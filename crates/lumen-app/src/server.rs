@@ -451,10 +451,14 @@ impl ServerSupervisor {
         // is up. Times out after 60 s (cold weight load takes 10-40 s).
         let host = cfg.server.host.clone();
         let port = cfg.server.port;
+        // `/v1/models` needs the key once one is configured; without it the
+        // probe would read a healthy server as crashed.
+        let api_key = cfg.server.api_key.clone().filter(|k| !k.trim().is_empty());
         let app_probe = app.clone();
         let sup = Arc::clone(self);
         tokio::spawn(async move {
-            let healthy = probe_until_ready(&host, port, Duration::from_secs(60)).await;
+            let healthy =
+                probe_until_ready(&host, port, api_key.as_deref(), Duration::from_secs(60)).await;
             let mut g = sup.inner.lock().await;
             if healthy {
                 g.state = LifecycleState::Running;
@@ -681,7 +685,12 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-async fn probe_until_ready(host: &str, port: u16, timeout: Duration) -> bool {
+async fn probe_until_ready(
+    host: &str,
+    port: u16,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> bool {
     let url = format!("http://{}:{}/v1/models", host, port);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(800))
@@ -689,7 +698,11 @@ async fn probe_until_ready(host: &str, port: u16, timeout: Duration) -> bool {
         .expect("reqwest client");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(r) = client.get(&url).send().await {
+        let mut probe = client.get(&url);
+        if let Some(key) = api_key {
+            probe = probe.bearer_auth(key.trim());
+        }
+        if let Ok(r) = probe.send().await {
             if r.status().is_success() {
                 return true;
             }
@@ -797,18 +810,10 @@ fn apply_env(
             cmd.env("EMBEDDING_MODEL_ID", eid);
         }
     }
-    if let Some(tid) = &cfg.server.tokenizer_id {
-        if !tid.is_empty() {
-            cmd.env("TOKENIZER_ID", tid);
-        }
-    }
     if let Some(p) = &cfg.server.local_model_dir {
-        // The server reads either LUMEN_GEMMA4_DIR or LUMEN_QWEN35_SHARDS
-        // depending on the detected architecture. Set both — the unused one
-        // is harmless.
-        let s = p.to_string_lossy();
-        cmd.env("LUMEN_GEMMA4_DIR", s.as_ref());
-        cmd.env("LUMEN_QWEN35_SHARDS", s.as_ref());
+        // Only the Gemma 4 loader reads a weights directory apart from
+        // MODEL_ID; every other model loads from MODEL_ID alone.
+        cmd.env("LUMEN_GEMMA4_DIR", p.to_string_lossy().as_ref());
     }
     if cfg.server.skip_warmup {
         cmd.env("SKIP_WARMUP", "1");
@@ -836,11 +841,6 @@ fn apply_env(
             cfg.quant.kv_auto_threshold_tokens.to_string(),
         );
     }
-    // Legacy `TQ_BITS` for the older turboquant-cache crate path used by
-    // Candle backends / smaller MoE models. Mirror the same bit width so
-    // a future re-enablement uses the same compression level the user
-    // picked here. (No-op when those backends aren't loaded.)
-    cmd.env("TQ_BITS", cfg.quant.bits.to_string());
 
     // ── Context ────────────────────────────────────────────────────
     // Three knobs from the CONTEXT card; each maps to a single env var the
@@ -1058,15 +1058,10 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_CACHE_LIMIT_GB",
     "LUMEN_MEMORY_LIMIT_GB",
     "EMBEDDING_MODEL_ID",
-    "TOKENIZER_ID",
     "LUMEN_GEMMA4_DIR",
-    "LUMEN_QWEN35_SHARDS",
     "SKIP_WARMUP",
     "CANDLE_METAL_COMPUTE_PER_BUFFER",
     "REPEAT_PENALTY",
-    "TQ_BITS",
-    "TQ_QJL_M",
-    "TQ_SEED",
     // The KV-quant card's two base controls. They were emitted but never
     // declared, so `env_overrides` could shadow them with no warning — and
     // overrides are applied last, so the card would silently stop working
