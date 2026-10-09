@@ -60,10 +60,13 @@ mod imp {
         reset_layer_sub_timings, store_fine_timings,
     };
 
-    use crate::native_attention::{sdpa, sdpa_split};
+    use crate::native_attention::{
+        SPARSE_DECODE_MIN_KEYS, quantized_kv_attention, sdpa, sdpa_page_sparse, sdpa_split,
+        sparse_decode, sparse_keep_pages,
+    };
     use crate::native_cache::{
-        NativeArraysCache, NativeKvCache, NativeLayerCache, NativePromptCache,
-        NativeRotatingKvCacheTurboQuant, SharedPrefixKv,
+        NativeArraysCache, NativeKvCache, NativeKvCacheQuantized, NativeLayerCache,
+        NativePromptCache, NativeRotatingKvCacheTurboQuant, SharedPrefixKv,
     };
     use crate::native_conv1d::conv1d;
     use crate::native_embedding::quantized_embedding_lookup_with_mode;
@@ -120,6 +123,27 @@ mod imp {
             kind: Behavior,
         }
     }
+
+    lumen_flags::flag! {
+        /// Store the full-attention KV cache affine-quantized (8-bit, group
+        /// 64): half the bytes of bf16. Decode reads it through the fused
+        /// kernel in `native_quant_attention`; prefill dequantizes each chunk
+        /// and takes the bf16 SDPA path. On an M3 Max at 64K keys (task 021)
+        /// decode attention is ~7% faster than bf16 at GQA 4 (9B) and 15-20%
+        /// slower at GQA 6-8 (27B, 35B-A3B), so this is a memory lever. Disk
+        /// persistence of these caches is not supported yet. Default off.
+        pub(crate) quant_kv {
+            env: "LUMEN_QWEN35_QUANT_KV",
+            default: false,
+            kind: Behavior,
+        }
+    }
+
+    /// Bits and group size of `LUMEN_QWEN35_QUANT_KV`. Eight bits: at four,
+    /// attention output drifts to cos ≈ 0.991 against bf16 on random data,
+    /// against 0.99994 at eight.
+    const QUANT_KV_BITS: i32 = 8;
+    const QUANT_KV_GROUP_SIZE: i32 = 64;
 
     lumen_flags::flag! {
         /// Fuse `gate_proj` + `up_proj` into one QMV when their quant params
@@ -1481,6 +1505,14 @@ mod imp {
             let tq_enabled = std::env::var("LUMEN_QWEN35_TQ_KV")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
                 .unwrap_or(false);
+            if !tq_enabled && quant_kv::get() {
+                return NativePromptCache::new_with_quant(
+                    &self.is_linear_per_layer,
+                    /* ssm_slots */ 2,
+                    QUANT_KV_GROUP_SIZE,
+                    QUANT_KV_BITS,
+                );
+            }
             if !tq_enabled {
                 return NativePromptCache::new(&self.is_linear_per_layer, /* ssm_slots */ 2);
             }
@@ -1628,10 +1660,68 @@ mod imp {
             let (k_full, v_full) = cache.update_and_fetch(&k_store, &v_store)?;
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
             let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward: q")?;
-            let attn_out = sdpa(&q, &k_full, &v_full, p.scale, causal)?;
+            let kv_len = k_full.shape()[2] as usize;
+            let attn_out = if !causal
+                && p.l == 1
+                && kv_len >= SPARSE_DECODE_MIN_KEYS
+                && sparse_decode::get()
+                && let Some(digest) = cache.page_digest()?
+            {
+                // LUMEN_SPARSE_DECODE: attend to the best-bounded pages only.
+                let keep = sparse_keep_pages(digest.pages);
+                sdpa_page_sparse(&q, &k_full, &v_full, p.scale, &digest, keep)?
+            } else {
+                sdpa(&q, &k_full, &v_full, p.scale, causal)?
+            };
             // Back to f32 before the gate: `full_attn_finish` multiplies by an
             // f32 gate through a fused kernel that expects matching dtypes.
             let attn_out = Self::to_f32(attn_out, "layer_full_attn_forward: attn_out")?;
+            self.full_attn_finish(
+                &attn_out,
+                &p.gate,
+                p.b,
+                p.l,
+                p.num_heads,
+                p.head_dim,
+                layer_idx,
+            )
+        }
+
+        /// Affine-quantized variant of [`Self::layer_full_attn_forward`]
+        /// (`LUMEN_QWEN35_QUANT_KV`). Projections and RoPE are shared; K/V go
+        /// into the cache quantized. A multi-token query dequantizes the cache
+        /// and takes causal SDPA; a single-token one reads the packed cache
+        /// through the fused kernel, or the three-op path for a layout the
+        /// kernel does not read.
+        pub(crate) fn layer_full_attn_forward_quant(
+            &self,
+            x: &Array,
+            layer_idx: usize,
+            causal: bool,
+            cache: &mut NativeKvCacheQuantized,
+            positions: RopePlan<'_>,
+        ) -> Result<Array> {
+            let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
+            let k_store = Self::to_kv_dtype(&p.k_rope, "layer_full_attn_forward_quant: k")?;
+            let v_store = Self::to_kv_dtype(&p.v_t, "layer_full_attn_forward_quant: v")?;
+            let (kt, vt) = cache.update_and_fetch(&k_store, &v_store)?;
+            let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward_quant: q")?;
+            let (gs, bits) = (cache.group_size(), cache.bits());
+            let attn_out = if causal {
+                let dequantize = |t: &(Array, Array, Array)| {
+                    mlx_rs::ops::dequantize(&t.0, &t.1, &t.2, gs, bits)
+                        .context("layer_full_attn_forward_quant: dequantize")
+                };
+                sdpa(&q, &dequantize(&kt)?, &dequantize(&vt)?, p.scale, true)?
+            } else {
+                let scale = Array::from_f32(p.scale).as_dtype(q.dtype())?;
+                let q = mlx_rs::ops::multiply(&q, &scale)?;
+                match crate::native_quant_attention::quantized_sdpa_decode(&q, &kt, &vt, gs, bits) {
+                    Ok(out) => out,
+                    Err(_) => quantized_kv_attention(&q, &kt, &vt, None, gs, bits)?,
+                }
+            };
+            let attn_out = Self::to_f32(attn_out, "layer_full_attn_forward_quant: attn_out")?;
             self.full_attn_finish(
                 &attn_out,
                 &p.gate,
@@ -3052,6 +3142,9 @@ mod imp {
                 } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
                     let tq = layer_cache.as_full_turboquant_mut()?;
                     self.layer_full_attn_forward_tq(&normed, layer_idx, causal, tq, positions)?
+                } else if matches!(layer_cache, NativeLayerCache::FullQuantized(_)) {
+                    let qc = layer_cache.as_full_quantized_mut()?;
+                    self.layer_full_attn_forward_quant(&normed, layer_idx, causal, qc, positions)?
                 } else {
                     let kv = layer_cache.as_full_mut()?;
                     self.layer_full_attn_forward(&normed, layer_idx, causal, kv, positions)?
@@ -3327,28 +3420,39 @@ mod imp {
                     out
                 } else {
                     // Full-attn. Plain (bf16) caches batch the q/k/v/o projections
-                    // (Stage 1); TurboQuant caches fall back to per-seq whole-layer.
-                    let is_tq = matches!(
+                    // (Stage 1); compressed caches (TurboQuant, affine-quantized)
+                    // fall back to per-seq whole-layer.
+                    let is_compressed = matches!(
                         caches[0].layer_mut(layer_idx).ok_or_else(|| anyhow!(
                             "forward_decode_batch: layer {layer_idx} missing"
                         ))?,
-                        NativeLayerCache::FullTurboquant(_)
+                        NativeLayerCache::FullTurboquant(_) | NativeLayerCache::FullQuantized(_)
                     );
-                    if is_tq {
+                    if is_compressed {
                         let mut parts: Vec<Array> = Vec::with_capacity(n);
                         for (i, c) in caches.iter_mut().enumerate() {
                             let idx_i = Array::from_slice(&[i as i32], &[1]);
                             let normed_i = normed.take_axis(&idx_i, 0).context(
-                                "forward_decode_batch: slice seq for TQ full-attn failed",
+                                "forward_decode_batch: slice seq for compressed full-attn failed",
                             )?;
-                            let tq = c.layer_mut(layer_idx).unwrap().as_full_turboquant_mut()?;
-                            parts.push(self.layer_full_attn_forward_tq(
-                                &normed_i,
-                                layer_idx,
-                                false,
-                                tq,
-                                RopePlan::Sequential,
-                            )?);
+                            let layer = c.layer_mut(layer_idx).unwrap();
+                            parts.push(if let NativeLayerCache::FullQuantized(qc) = layer {
+                                self.layer_full_attn_forward_quant(
+                                    &normed_i,
+                                    layer_idx,
+                                    false,
+                                    qc,
+                                    RopePlan::Sequential,
+                                )?
+                            } else {
+                                self.layer_full_attn_forward_tq(
+                                    &normed_i,
+                                    layer_idx,
+                                    false,
+                                    layer.as_full_turboquant_mut()?,
+                                    RopePlan::Sequential,
+                                )?
+                            });
                         }
                         let refs: Vec<&Array> = parts.iter().collect();
                         mlx_rs::ops::concatenate_axis(&refs, 0)
@@ -3533,6 +3637,11 @@ mod imp {
                         return Err(anyhow!(
                             "commit_captured: FullTurboquant layer {layer_idx} unsupported (use replay path / dense KV)"
                         ));
+                    }
+                    NativeLayerCache::FullQuantized(qc) => {
+                        qc.truncate_to(target_offset).with_context(|| {
+                            format!("commit_captured: truncate quantized layer {layer_idx}")
+                        })?;
                     }
                     NativeLayerCache::Linear(arr) => {
                         let (spp, cin) = cap.get(&layer_idx).ok_or_else(|| {

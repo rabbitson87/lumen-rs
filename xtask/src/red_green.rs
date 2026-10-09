@@ -1639,6 +1639,24 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "compressed-cache-reports-offset-zero",
+        symptom: "NativePromptCache::full_attn_offset read only plain Full layers, \
+                  so a cache whose full-attention layers were TurboQuant or \
+                  quantized reported 0 tokens — the prefill scores clamp then \
+                  sized chunks as if nothing were cached",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                .find(|l| !matches!(l, NativeLayerCache::Linear(_)))\n                .map_or(0, NativeLayerCache::offset)",
+            replace: "                .find_map(|l| l.as_full().map(|c| c.offset())) // defect: plain Full only\n                .unwrap_or(0)",
+        }],
+        guards: &[mlx(
+            "native_cache::digest_tests::quantized_prompt_cache_reports_its_offset",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "qwen-extend-clamp-ignores-cached-prefix",
         symptom: "Qwen's prefill scores clamp sized each chunk for the call's own \
                   tokens only, so an extend or prefix-cache continuation over a \
@@ -2075,7 +2093,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "causal-mask-coverage")
         | (_, "causal-mask-builders-agree")
         | (_, "quantized-kv-prefill-unmasked") => "native_attention.rs",
-        (_, "rotating-cache-both-paths") => "native_cache.rs",
+        (_, "rotating-cache-both-paths") | (_, "compressed-cache-reports-offset-zero") => {
+            "native_cache.rs"
+        }
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none")

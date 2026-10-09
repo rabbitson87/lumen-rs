@@ -27,7 +27,8 @@ mod imp {
         ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
     };
     use crate::native_cache::{
-        NativeLayerCache, NativePromptCache, NativeRotatingKvCacheTurboQuant,
+        NativeKvCacheQuantized, NativeLayerCache, NativePromptCache,
+        NativeRotatingKvCacheTurboQuant,
     };
 
     /// Per-layer captured state. Both Full and Linear variants hold the
@@ -49,6 +50,9 @@ mod imp {
         /// TurboQuant-compressed full-attn layer — the whole compressed cache
         /// is captured (shallow = refcount clone, deep = `deep_clone`).
         FullTurboquant(NativeRotatingKvCacheTurboQuant),
+        /// Affine-quantized full-attn layer (`LUMEN_QWEN35_QUANT_KV`), captured
+        /// whole the same way.
+        FullQuantized(NativeKvCacheQuantized),
     }
 
     /// Captured prompt-cache state. Construct via `capture_shallow` or
@@ -96,6 +100,27 @@ mod imp {
         a.map(deep_clone_array).transpose()
     }
 
+    /// Independent buffers for every array of a quantized cache.
+    fn deep_clone_quantized(c: &NativeKvCacheQuantized) -> Result<NativeKvCacheQuantized> {
+        let triple = |t: Option<&(Array, Array, Array)>| -> Result<Option<(Array, Array, Array)>> {
+            t.map(|(w, s, b)| {
+                Ok((
+                    deep_clone_array(w)?,
+                    deep_clone_array(s)?,
+                    deep_clone_array(b)?,
+                ))
+            })
+            .transpose()
+        };
+        Ok(NativeKvCacheQuantized::from_parts(
+            triple(c.keys())?,
+            triple(c.values())?,
+            c.offset(),
+            c.group_size(),
+            c.bits(),
+        ))
+    }
+
     impl PromptCacheSnapshot {
         pub fn position(&self) -> usize {
             self.position
@@ -137,6 +162,9 @@ mod imp {
                         NativeLayerCache::FullTurboquant(c) => {
                             Ok(LayerSnapshot::FullTurboquant(c.clone()))
                         }
+                        NativeLayerCache::FullQuantized(c) => {
+                            Ok(LayerSnapshot::FullQuantized(c.clone()))
+                        }
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -174,6 +202,9 @@ mod imp {
                         }
                         NativeLayerCache::FullTurboquant(c) => {
                             Ok(LayerSnapshot::FullTurboquant(c.deep_clone()?))
+                        }
+                        NativeLayerCache::FullQuantized(c) => {
+                            Ok(LayerSnapshot::FullQuantized(deep_clone_quantized(c)?))
                         }
                     }
                 })
@@ -305,6 +336,10 @@ mod imp {
                         m.qjl_m = tq.qjl_m();
                         metas.push(m);
                     }
+                    LayerSnapshot::FullQuantized(_) => bail!(
+                        "to_records: affine-quantized full-attention KV \
+                         (LUMEN_QWEN35_QUANT_KV) cannot be persisted to disk yet"
+                    ),
                 }
             }
 
@@ -504,6 +539,14 @@ mod imp {
                 };
                 Ok(())
             }
+            (NativeLayerCache::FullQuantized(dst), LayerSnapshot::FullQuantized(snap)) => {
+                *dst = if fork {
+                    deep_clone_quantized(snap)?
+                } else {
+                    snap.clone()
+                };
+                Ok(())
+            }
             _ => Err(anyhow!(
                 "PromptCacheSnapshot apply_layer: layer kind mismatch at {layer_idx}"
             )),
@@ -548,6 +591,7 @@ mod imp {
                     Ok(match l {
                         NativeLayerCache::Full(c) => RollbackLayer::Truncate(c.offset()),
                         NativeLayerCache::FullTurboquant(c) => RollbackLayer::Truncate(c.offset()),
+                        NativeLayerCache::FullQuantized(c) => RollbackLayer::Truncate(c.offset()),
                         NativeLayerCache::Linear(c) => {
                             // Materialize now: the state is needed by the next
                             // piece anyway, and an evaluated array holds no
@@ -586,6 +630,9 @@ mod imp {
                         .truncate_to(*offset)
                         .with_context(|| format!("RollbackPoint: truncate layer {i}"))?,
                     (NativeLayerCache::FullTurboquant(c), RollbackLayer::Truncate(offset)) => c
+                        .truncate_to(*offset)
+                        .with_context(|| format!("RollbackPoint: truncate layer {i}"))?,
+                    (NativeLayerCache::FullQuantized(c), RollbackLayer::Truncate(offset)) => c
                         .truncate_to(*offset)
                         .with_context(|| format!("RollbackPoint: truncate layer {i}"))?,
                     (
