@@ -1366,3 +1366,51 @@ mod page_sparse_tests {
         );
     }
 }
+
+// Gemma 4's global-layer decode (head_dim 512) through whichever kernel the
+// MLX build routes it to — the fallback below `MLX_SDPA_D512_MIN_KL` keys, the
+// vector kernel from there on — against attention computed in f32.
+#[cfg(all(test, feature = "mlx-native"))]
+mod d512_decode_tests {
+    use super::imp::sdpa;
+    use super::windowed_kernel_tests::agreement;
+    use mlx_rs::{Array, Dtype, random};
+
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn d512_decode_matches_an_f32_reference() {
+        let (h, h_kv, d) = (16, 2, 512);
+        for (i, n) in [600, 9000].into_iter().enumerate() {
+            let key = random::key(0xd512 + i as u64).unwrap();
+            let normal = |shape: &[i32]| {
+                random::normal::<f32>(shape, None, None, &key)
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let q = normal(&[1, h, 1, d]);
+            let k = normal(&[1, h_kv, n, d]);
+            let v = normal(&[1, h_kv, n, d]);
+            let scale = 1.0 / (d as f32).sqrt();
+            let got = sdpa(&q, &k, &v, scale, false).unwrap();
+            // f32 reference with the KV heads expanded to the query heads.
+            let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+            let expand = |a: &Array| {
+                let a = mlx_rs::ops::reshape(f(a), &[1, h_kv, 1, n, d]).unwrap();
+                let a = mlx_rs::ops::broadcast_to(&a, &[1, h_kv, h / h_kv, n, d]).unwrap();
+                mlx_rs::ops::reshape(&a, &[1, h, n, d]).unwrap()
+            };
+            let (kf, vf) = (expand(&k), expand(&v));
+            let scores = mlx_rs::ops::matmul(
+                &mlx_rs::ops::multiply(f(&q), Array::from_f32(scale)).unwrap(),
+                &mlx_rs::ops::transpose_axes(&kf, &[0, 1, 3, 2]).unwrap(),
+            )
+            .unwrap();
+            let probs = mlx_rs::ops::softmax_axis(&scores, -1, Some(true)).unwrap();
+            let want = mlx_rs::ops::matmul(&probs, &vf).unwrap();
+            let (cos, worst) = agreement(&got, &want);
+            eprintln!("[d512-decode] keys={n} cos={cos:.6} max_abs_diff={worst:.4}");
+            assert!(cos > 0.9999, "{n} keys: cos {cos}");
+        }
+    }
+}

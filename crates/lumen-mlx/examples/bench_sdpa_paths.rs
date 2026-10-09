@@ -33,9 +33,13 @@
 //!   ARMS    comma list of fa2, fa2-qview, q8-3op, q4-3op, q8-fused, q4-fused
 //!           to run besides sdpa (default all)
 //!
-//! Process latches (read once by the MLX fork; set them for a separate run):
+//! MLX fork switches (set them for a separate run):
 //!   LUMEN_GEMMA4_PREFILL_FAST_BD256=1  `sdpa` takes steel attention at D=256
-//!   LUMEN_SDPA_VECTOR_D512=1           `sdpa` takes sdpa_vector at D=512 decode
+//!   LUMEN_SDPA_VECTOR_D512=1 / =0      D=512 decode on sdpa_vector at every
+//!                                      length / never; unset, from
+//!                                      MLX_SDPA_D512_MIN_KL keys (8192)
+//!   MLX_SDPA_BLOCKS=N                  block count of the two-pass vector
+//!                                      kernel (read per call)
 //!
 //! Run:
 //!   cargo run --release -p lumen-mlx --features mlx-native \
