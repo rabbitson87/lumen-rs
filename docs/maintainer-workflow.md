@@ -289,14 +289,18 @@ The A/B partner column exists to explain that row, so it was the obvious next
 step. Two things came out of it; only one is a measurement.
 
 **Established, from code and config rather than a stopwatch.** The custom
-flash-attn kernel can apply to at most **5 of 30 layers**. `layer_types` on
-gemma-4-26b-a4b is 25 `sliding_attention` to 5 `full_attention`, and
-`use_custom_flash` requires `!use_sdpa_windowed` (plus `S == 1`, `head_dim ==
-256`, all-bf16, no explicit mask — see `gemma4_moe.rs`). Whatever the kernel is
-worth, it is worth it on a sixth of the attention work, and attention is itself
-a small share of a decode step that is dominated by weight reads. That alone
-predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
-**448 ms vs 449 ms over 31 steps — nothing.**
+flash-attn kernel runs on the **25 sliding layers** at decode and on none of
+the 5 full layers. `layer_types` on gemma-4-26b-a4b is 25 `sliding_attention`
+to 5 `full_attention`, and `use_custom_flash` requires `S == 1`, `head_dim ==
+256`, all-bf16 and no explicit mask (see `gemma4_moe.rs`): the sliding layers
+are head_dim 256, the full layers 512. (An earlier version of this section said
+"at most 5 of 30", reading the `!use_sdpa_windowed` guard as excluding the
+sliding layers; that guard only fires for multi-token queries.) Sliding-layer
+attention is capped at the 1,024-key window, so the kernel works on the part of
+attention that does not grow with the context, and attention is itself a small
+share of a decode step dominated by weight reads. That predicts a small A/B
+delta, and at `PROMPT_LEN=512` the measured delta is **448 ms vs 449 ms over 31
+steps — nothing.**
 
 **Settled, once the measurement stopped being process-per-run.** At
 `PROMPT_LEN=8192`, 10 interleaved in-process pairs:
@@ -308,7 +312,7 @@ predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
 
 **min-vs-min −0.3%**, median −2.0%, against a 7.0% noise floor. The recorded
 5.5% gap (18.8 vs 19.9) does not reproduce: the two paths are indistinguishable
-here, which is what the 5-of-30-layers bound predicts.
+here, which is what a kernel confined to window-capped layers predicts.
 
 So the custom kernel is **not** the explanation for the Gemma row's 27% drift.
 
