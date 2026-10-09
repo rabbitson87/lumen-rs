@@ -1195,6 +1195,20 @@ pub(crate) mod imp {
         fuse_layer_epilogue::get()
     }
 
+    lumen_flags::flag! {
+        /// Log each chunked-prefill chunk's wall time and MLX memory (active,
+        /// peak) to stderr, as `LUMEN_QWEN35_PREFILL_CHUNK_LOG` does for Qwen.
+        /// Chunk time against cache offset is how much of prefill attention
+        /// costs as the context grows. The last chunk is evaluated too, so the
+        /// returned logits are no longer lazy; every chunk already ends in an
+        /// eval, so no barrier is added inside a forward.
+        pub(crate) prefill_chunk_log {
+            env: "LUMEN_GEMMA4_PREFILL_CHUNK_LOG",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
+
     fn gemma4_layer_epilogue_fused(
         h1: &Array,
         h2: &Array,
@@ -6476,7 +6490,7 @@ pub(crate) mod imp {
         /// even with KV quantization off: the global layers (head_dim 512) take
         /// MLX's materializing attention path, and one 35.8K-token pass asked
         /// Metal for a 41 GB scores buffer. Returns the last chunk's logits,
-        /// still lazy.
+        /// still lazy unless `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` is on.
         pub fn forward_last_token_chunked(
             &self,
             input_ids: &[u32],
@@ -6488,14 +6502,33 @@ pub(crate) mod imp {
             let chunk = self
                 .prefill_chunk_decision(cache.offset() + input_ids.len())
                 .chunk;
-            let mut chunks = input_ids.chunks(chunk).peekable();
+            let report = prefill_chunk_log::get();
+            let n_chunks = input_ids.len().div_ceil(chunk);
+            let mut chunks = input_ids.chunks(chunk).enumerate().peekable();
             loop {
-                let ids = chunks.next().expect("non-empty input yields a chunk");
+                let (idx, ids) = chunks.next().expect("non-empty input yields a chunk");
+                let t0 = report.then(Instant::now);
                 let logits = self.forward_last_token(ids, cache)?;
-                if chunks.peek().is_none() {
+                let is_last = chunks.peek().is_none();
+                if !is_last || report {
+                    logits.eval().context("prefill chunk eval")?;
+                }
+                if let Some(t0) = t0 {
+                    let active = crate::metal_memory::get_active_memory().unwrap_or(0);
+                    let peak = crate::metal_memory::get_peak_memory().unwrap_or(0);
+                    eprintln!(
+                        "[gemma4-prefill] chunk {}/{} ({} tok) {:.0}ms  mlx-mem active={:.1}GB peak={:.1}GB",
+                        idx + 1,
+                        n_chunks,
+                        ids.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                        active as f64 / 1e9,
+                        peak as f64 / 1e9,
+                    );
+                }
+                if is_last {
                     return Ok(logits);
                 }
-                logits.eval().context("prefill chunk eval")?;
             }
         }
 

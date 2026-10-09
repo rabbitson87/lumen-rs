@@ -18,6 +18,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
@@ -108,6 +109,17 @@ Fuse routing into the expert dispatch, replacing the two-slot
 *Optimization, default on.*
 
 Fuse the attention logit softcap. Output-identical.
+
+### `LUMEN_GEMMA4_PREFILL_CHUNK_LOG`
+
+*Diagnostic, default off.*
+
+Log each chunked-prefill chunk's wall time and MLX memory (active,
+ peak) to stderr, as `LUMEN_QWEN35_PREFILL_CHUNK_LOG` does for Qwen.
+ Chunk time against cache offset is how much of prefill attention
+ costs as the context grows. The last chunk is evaluated too, so the
+ returned logits are no longer lazy; every chunk already ends in an
+ eval, so no barrier is added inside a forward.
 
 ### `LUMEN_MLX_AUTO_SESSION`
 
