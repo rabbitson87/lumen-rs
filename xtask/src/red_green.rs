@@ -1620,6 +1620,25 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "short-sliding-query-loses-window",
+        symptom: "Gemma 4 sent every multi-token sliding-layer query to the \
+                  windowed kernel, but MLX routes 2-8 rows to sdpa_vector, which \
+                  drops the window; with the rotating cache's window-1+L keys, \
+                  query i saw i keys from before its window (final prefill \
+                  chunks of 2-8 tokens, MTP verify, short extends)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        query_len > 8 && matches!(head_dim, 64 | 80 | 128 | 256)",
+            replace: "        query_len > 1 && matches!(head_dim, 64 | 80 | 128 | 256) // defect: no 8-row floor",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::windowed_kernel_never_takes_vector_routed_queries",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
         name: "rotating-cache-both-paths",
         symptom: "the rotating-cache growth test asserted cached_len == fetch, \
                   false for the default path since step-prealloc landed; and the \
@@ -2032,7 +2051,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
             "gemma4_backend.rs"
         }
-        (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
+        (_, "gemma-batch-prefill-unchunked") | (_, "short-sliding-query-loses-window") => {
+            "gemma4_moe.rs"
+        }
         (_, "causal-mask-coverage")
         | (_, "causal-mask-builders-agree")
         | (_, "quantized-kv-prefill-unmasked") => "native_attention.rs",

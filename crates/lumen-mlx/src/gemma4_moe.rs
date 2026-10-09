@@ -2614,6 +2614,18 @@ pub(crate) mod imp {
         })
     }
 
+    /// Whether a sliding-layer query of `query_len` rows can be handed to
+    /// `lumen_sdpa_windowed` at all. Only MLX's steel kernel reads the window,
+    /// and it serves only these head dims. MLX routes a query of at most 8 rows
+    /// to `sdpa_vector` instead, which applies the causal mask but drops
+    /// `window_size`, while the rotating cache returns `window - 1 + L` keys:
+    /// query `i` would see `i` keys from before its window. Those queries (a
+    /// final prefill chunk of 2-8 tokens, MTP verify, a short extend) take
+    /// the explicit-mask path, which `sdpa_vector` does honour.
+    pub(crate) fn windowed_kernel_fits(query_len: usize, head_dim: i32) -> bool {
+        query_len > 8 && matches!(head_dim, 64 | 80 | 128 | 256)
+    }
+
     /// Whether `kernel` computes sliding-window attention, against attention
     /// under an explicit window mask (mlx-lm's rule), on three calls chosen so
     /// that every defect the fork's kernel has had shows on both of its tile
@@ -5122,8 +5134,9 @@ pub(crate) mod imp {
             //
             // Guards:
             //   - sliding layer (full-attn uses causal sentinel path)
-            //   - no rotation (kv_actual == kv_offset + l)
-            //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
+            //   - more than 8 queries and head_dim ∈ {64, 80, 128, 256}
+            //     (`windowed_kernel_fits`: shorter queries reach MLX's
+            //     vector kernel, which ignores the window)
             //   - dtype bf16
             //
             // On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`, and only once this
@@ -5145,13 +5158,9 @@ pub(crate) mod imp {
             // kernel path.
             let use_sdpa_windowed = sdpa_windowed_enabled
                 && !prefill_kernel_eligible
-                && (l as usize) > 1
                 && dtype_bf16
                 && matches!(kind, NativeGemma4LayerType::SlidingAttention)
-                && (head_dim_now == 64
-                    || head_dim_now == 80
-                    || head_dim_now == 128
-                    || head_dim_now == 256);
+                && windowed_kernel_fits(l as usize, head_dim_now);
             // Skip the mask Array build entirely when an in-kernel mask
             // path will fire (prefill_kernel or sdpa_windowed both encode
             // causal+window themselves).
@@ -8217,6 +8226,114 @@ pub(crate) mod imp {
                 windowed_kernel_agrees(no_window).is_err(),
                 "attention that ignores the window must fail the check"
             );
+        }
+
+        /// MLX sends a query of at most 8 rows to its vector kernel, which
+        /// ignores the window, so those never go to the windowed kernel.
+        #[test]
+        fn windowed_kernel_never_takes_vector_routed_queries() {
+            for l in 0..=8 {
+                assert!(
+                    !windowed_kernel_fits(l, 256),
+                    "{l} queries reach sdpa_vector"
+                );
+            }
+            assert!(windowed_kernel_fits(9, 256));
+            assert!(windowed_kernel_fits(2048, 128));
+            assert!(
+                !windowed_kernel_fits(2048, 512),
+                "no steel instantiation at 512"
+            );
+        }
+
+        /// Why `windowed_kernel_fits` has an 8-row floor, on the rotating
+        /// cache's shape (`window - 1 + L` keys for `L` new tokens): the
+        /// explicit-mask path matches each query attending only to its own
+        /// window, and the windowed kernel does not. If the second assertion
+        /// starts failing, the fork honours the window for short queries and
+        /// the floor can go.
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn short_sliding_queries_need_the_explicit_mask() {
+            use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+            const WINDOW: usize = 1024;
+            let stream = mlx_rs::Stream::gpu();
+            let normal = |shape: &[i32], seed: u64| {
+                let key = mlx_rs::random::key(seed).unwrap();
+                mlx_rs::random::normal::<f32>(shape, None, None, &key)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let max_diff = |a: &Array, b: &Array| {
+                let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap())
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .max(None)
+                    .unwrap();
+                d.eval().unwrap();
+                d.item::<f32>()
+            };
+            for q_len in [2usize, 4, 8] {
+                let k_len = WINDOW - 1 + q_len;
+                let seed = 0x51de + q_len as u64;
+                let q = normal(&[1, 16, q_len as i32, 256], seed);
+                let k = normal(&[1, 8, k_len as i32, 256], seed + 1);
+                // The first keys are the ones a later query must not see.
+                // Their values are large, so one leaked key out of ~1,024
+                // moves the output by ~0.05, well clear of bf16 kernel noise.
+                let v = mlx_rs::ops::concatenate_axis(
+                    &[
+                        mlx_rs::ops::full::<f32>(&[1, 8, 8, 256], &Array::from_f32(50.0))
+                            .unwrap()
+                            .as_dtype(mlx_rs::Dtype::Bfloat16)
+                            .unwrap(),
+                        normal(&[1, 8, k_len as i32 - 8, 256], seed + 2),
+                    ],
+                    2,
+                )
+                .unwrap();
+                let scale = 1.0 / 16.0;
+                // Query i sits at key index WINDOW - 1 + i and may see keys
+                // i..=WINDOW - 1 + i.
+                let per_query: Vec<Array> = (0..q_len as i32)
+                    .map(|i| {
+                        let lo = i;
+                        let hi = WINDOW as i32 + i;
+                        sdpa(
+                            &q.index((Ellipsis, i..i + 1, ..)),
+                            &k.index((Ellipsis, lo..hi, ..)),
+                            &v.index((Ellipsis, lo..hi, ..)),
+                            scale,
+                            false,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let reference = mlx_rs::ops::concatenate_axis(&per_query, 2).unwrap();
+                let mask = build_causal_mask_abs(WINDOW - 1, q_len, 0, k_len, Some(WINDOW))
+                    .unwrap()
+                    .expect("a multi-token query needs a mask");
+                let masked = sdpa_with_mask(&q, &k, &v, scale, &mask).unwrap();
+                let kernel =
+                    mlx_rs::metal::lumen_sdpa_windowed(&q, &k, &v, scale, WINDOW as i32, &stream)
+                        .unwrap();
+                let (masked_diff, kernel_diff) =
+                    (max_diff(&masked, &reference), max_diff(&kernel, &reference));
+                eprintln!(
+                    "[short-sliding] q={q_len} k={k_len} explicit-mask diff={masked_diff:.4} \
+                     windowed-kernel diff={kernel_diff:.4}"
+                );
+                assert!(
+                    masked_diff < 0.02,
+                    "explicit mask at {q_len} queries: {masked_diff}"
+                );
+                assert!(
+                    kernel_diff > 0.03,
+                    "windowed kernel at {q_len} queries now honours the window ({kernel_diff})"
+                );
+            }
         }
 
         /// Last-token logits as f32.
