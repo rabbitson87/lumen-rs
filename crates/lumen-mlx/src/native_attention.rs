@@ -227,6 +227,109 @@ mod imp {
         .context("mlx-rs fast::scaled_dot_product_attention (explicit mask) FFI call failed")
     }
 
+    /// Apply a mask from [`build_causal_mask_abs`] to explicit `Q·Kᵀ` scores,
+    /// for the paths that run softmax themselves instead of calling SDPA.
+    ///
+    /// The builder returns either representation: by default a bool array
+    /// (`true` = may attend), or the legacy bf16 `0.0`/`-inf` one under
+    /// `LUMEN_LEGACY_MASK_BUILDER=1`. SDPA accepts both, but a bare `add`
+    /// only works for the second: adding a bool promotes it to `1.0`/`0.0`,
+    /// which masks nothing. The quantized-KV paths did exactly that, so every
+    /// multi-token query attended to every key in the cache, future
+    /// positions included.
+    ///
+    /// The `-inf` fill is cast to the scores' dtype first, so a bf16 scores
+    /// tensor stays bf16 (an f32 scalar would promote the whole result).
+    pub fn apply_attention_mask(scores: &Array, mask: &Array) -> Result<Array> {
+        if mask.dtype() == mlx_rs::Dtype::Bool {
+            let neg_inf = Array::from_f32(f32::NEG_INFINITY)
+                .as_dtype(scores.dtype())
+                .context("apply_attention_mask: cast -inf to the scores dtype")?;
+            mlx_rs::ops::r#where(mask, scores, &neg_inf)
+                .context("apply_attention_mask: where(mask, scores, -inf)")
+        } else {
+            mlx_rs::ops::add(scores, mask).context("apply_attention_mask: scores + additive mask")
+        }
+    }
+
+    /// One affine-quantized tensor as `mlx::quantize` returns it and the
+    /// quantized KV caches hold it: `(packed, scales, biases)`.
+    pub type QuantizedTriple = (Array, Array, Array);
+
+    /// `softmax(Q·Kᵀ + mask)·V` over an affine-quantized K/V cache. Both
+    /// products run through `quantized_matmul`, so K and V are never
+    /// dequantized.
+    ///
+    /// * `queries` is `[B, H, L, D]` and must already carry the softmax scale
+    ///   (Gemma 4 uses 1.0, so nothing is applied here).
+    /// * `keys` / `values` hold `H_kv` heads. GQA folds the query heads into
+    ///   `[B, H_kv, H/H_kv, L, D]` and broadcasts each triple over the group
+    ///   axis.
+    /// * `mask` is whatever [`build_causal_mask_abs`] returned, bool or
+    ///   additive, applied through [`apply_attention_mask`]. Pass `None`
+    ///   for single-token decode.
+    ///
+    /// The full `[B, H, L, S]` scores tensor is materialized, which is why
+    /// the prefill callers bound `L` with the scores budget.
+    pub fn quantized_kv_attention(
+        queries: &Array,
+        keys: &QuantizedTriple,
+        values: &QuantizedTriple,
+        mask: Option<&Array>,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Array> {
+        let qs = queries.shape();
+        let (b, h, l, d) = (qs[0], qs[1], qs[2], qs[3]);
+        let n_repeats = h / keys.0.shape()[1];
+        let (q, k, v) = if n_repeats > 1 {
+            let q = mlx_rs::ops::reshape(queries, &[b, h / n_repeats, n_repeats, l, d])
+                .context("quantized_kv_attention: reshape Q for GQA")?;
+            let exp = |a: &Array| -> Result<Array> {
+                mlx_rs::ops::expand_dims(a, -3)
+                    .context("quantized_kv_attention: expand_dims(K/V, -3)")
+            };
+            let k = (exp(&keys.0)?, exp(&keys.1)?, exp(&keys.2)?);
+            let v = (exp(&values.0)?, exp(&values.1)?, exp(&values.2)?);
+            (q, k, v)
+        } else {
+            (queries.clone(), keys.clone(), values.clone())
+        };
+        let scores = mlx_rs::ops::quantized_matmul(
+            &q,
+            &k.0,
+            &k.1,
+            Some(&k.2),
+            /* transpose */ true,
+            group_size,
+            bits,
+        )
+        .context("quantized_kv_attention: quantized_matmul(Q, K)")?;
+        let scores = match mask {
+            Some(m) => apply_attention_mask(&scores, m)?,
+            None => scores,
+        };
+        let last_axis = scores.ndim() as i32 - 1;
+        let probs = mlx_rs::ops::softmax_axis(&scores, last_axis, /* precise */ Some(true))
+            .context("quantized_kv_attention: softmax")?;
+        let out = mlx_rs::ops::quantized_matmul(
+            &probs,
+            &v.0,
+            &v.1,
+            Some(&v.2),
+            /* transpose */ false,
+            group_size,
+            bits,
+        )
+        .context("quantized_kv_attention: quantized_matmul(scores, V)")?;
+        if n_repeats > 1 {
+            mlx_rs::ops::reshape(&out, &[b, h, l, d])
+                .context("quantized_kv_attention: reshape output back to [B, H, L, D]")
+        } else {
+            Ok(out)
+        }
+    }
+
     /// Build an additive attention mask of shape `[query_len, kv_offset + query_len]`
     /// in `Float32`. Allowed positions are `0.0`; masked positions are `-inf`.
     ///
@@ -403,7 +506,8 @@ pub use imp::lumen_sdpa_timing;
 #[allow(unused_imports)]
 // Consumed by Phase 3b model assembly in runner_native.rs and Gemma 4 sliding attention.
 pub(crate) use imp::{
-    attn_lse, build_causal_mask, build_causal_mask_abs, sdpa, sdpa_split, sdpa_with_mask,
+    attn_lse, build_causal_mask, build_causal_mask_abs, quantized_kv_attention, sdpa, sdpa_split,
+    sdpa_with_mask,
 };
 
 // SDPA bit-identical vs MLX reference.
@@ -828,7 +932,7 @@ mod windowed_kernel_tests {
     /// Cosine over every element, and the largest absolute difference.
     /// Flattened first: an attention output can be a strided view, and
     /// `as_slice` reads memory order.
-    fn agreement(a: &Array, b: &Array) -> (f64, f32) {
+    pub(super) fn agreement(a: &Array, b: &Array) -> (f64, f32) {
         let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
         let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
         a.eval().unwrap();
@@ -953,6 +1057,106 @@ mod windowed_kernel_tests {
         assert!(
             failures.is_empty(),
             "causal kernel disagrees: {failures:#?}"
+        );
+    }
+}
+
+// Attention over affine-quantized K/V against SDPA on the same K/V
+// dequantized. That path runs its own softmax, so it applies the mask itself,
+// and it used to `add` it: the default mask is bool, `true` became +1.0, and
+// every prefill query attended to the whole cache, future positions included.
+#[cfg(all(test, feature = "mlx-native"))]
+mod quantized_kv_attention_tests {
+    use super::imp::{
+        QuantizedTriple, build_causal_mask_abs, build_causal_mask_legacy_bf16,
+        quantized_kv_attention, sdpa, sdpa_with_mask,
+    };
+    use super::windowed_kernel_tests::agreement;
+    use mlx_rs::{Array, Dtype, random};
+
+    const GROUP_SIZE: i32 = 64;
+    const BITS: i32 = 8;
+
+    fn normal(shape: &[i32], std_dev: f32, seed: u64) -> Array {
+        let key = random::key(seed).unwrap();
+        random::normal::<f32>(shape, None, Some(std_dev), &key)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+    }
+
+    fn quantize(x: &Array) -> QuantizedTriple {
+        mlx_rs::ops::quantize(x, GROUP_SIZE, BITS).expect("quantize")
+    }
+
+    fn dequantize(t: &QuantizedTriple) -> Array {
+        mlx_rs::ops::dequantize(&t.0, &t.1, &t.2, GROUP_SIZE, BITS).expect("dequantize")
+    }
+
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn quantized_kv_attention_matches_sdpa_on_dequantized_kv() {
+        // (heads, kv_heads, head_dim, queries, keys, window): Gemma 4's full
+        // layer over a fresh prompt, its sliding layer with the queries at the
+        // end of a cache longer than the window, and full-layer decode.
+        let cases = [
+            (16, 2, 512, 64, 64, None),
+            (16, 8, 256, 64, 1100, Some(1024)),
+            (16, 2, 512, 1, 300, None),
+        ];
+        let mut failures = Vec::new();
+        for (i, &(h, h_kv, d, q_len, k_len, window)) in cases.iter().enumerate() {
+            let seed = 9000 + 1000 * i as u64;
+            // Gemma 4's softmax scale is 1.0, so the queries arrive scaled.
+            let q = normal(&[1, h, q_len, d], 1.0 / (d as f32).sqrt(), seed);
+            let k = quantize(&normal(&[1, h_kv, k_len, d], 1.0, seed + 1));
+            let v = quantize(&normal(&[1, h_kv, k_len, d], 1.0, seed + 2));
+            let (k_ref, v_ref) = (dequantize(&k), dequantize(&v));
+            let masks = if q_len > 1 {
+                let (q_len, k_len) = (q_len as usize, k_len as usize);
+                let bool_mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, window)
+                    .expect("mask")
+                    .expect("a multi-token query needs a mask");
+                assert_eq!(
+                    bool_mask.dtype(),
+                    Dtype::Bool,
+                    "the default builder is bool"
+                );
+                let additive =
+                    build_causal_mask_legacy_bf16(k_len - q_len, q_len, 0, k_len, window)
+                        .expect("legacy mask")
+                        .expect("a multi-token query needs a mask");
+                vec![Some(bool_mask), Some(additive)]
+            } else {
+                vec![None]
+            };
+            for mask in &masks {
+                let got = quantized_kv_attention(&q, &k, &v, mask.as_ref(), GROUP_SIZE, BITS)
+                    .expect("quantized attention");
+                let want = match mask {
+                    Some(m) => sdpa_with_mask(&q, &k_ref, &v_ref, 1.0, m),
+                    None => sdpa(&q, &k_ref, &v_ref, 1.0, false),
+                }
+                .expect("reference sdpa");
+                assert_eq!(got.shape(), want.shape());
+                let (cos, worst) = agreement(&got, &want);
+                let kind = mask
+                    .as_ref()
+                    .map_or("none".to_string(), |m| format!("{:?}", m.dtype()));
+                eprintln!(
+                    "[quantized-kv-attn] h={h} kv={h_kv} d={d} q={q_len} k={k_len} \
+                     window={window:?} mask={kind} cos={cos:.6} max_abs_diff={worst:.4}"
+                );
+                if cos < 0.999 {
+                    failures.push(format!(
+                        "d={d} q={q_len} k={k_len} mask={kind}: cos {cos:.5}, max diff {worst:.3}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "quantized-KV attention disagrees with SDPA: {failures:#?}"
         );
     }
 }

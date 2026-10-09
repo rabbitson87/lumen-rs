@@ -21,7 +21,9 @@ pub(crate) mod imp {
     use crate::kv_disk::{
         ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
     };
-    use crate::native_attention::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
+    use crate::native_attention::{
+        build_causal_mask, build_causal_mask_abs, quantized_kv_attention, sdpa, sdpa_with_mask,
+    };
     use crate::native_cache::{
         NativeKvCache, NativeKvCacheQuantized, NativeRotatingKvCache,
         NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
@@ -4345,88 +4347,26 @@ pub(crate) mod imp {
                 if let Some(t0) = cache_start {
                     bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                // Scale Q by 1.0 (Gemma 4 SDPA scale convention — already
-                // baked into the post-RoPE Q via the kernel scale arg=1.0).
-                // GQA reshape: n_repeats = n_heads / n_kv. Q: [B, n_heads, L, D] →
-                // [B, n_kv, n_repeats, L, D]. K/V tuples: each Array gets
-                // expand_dims at axis -3 → [B, n_kv, 1, S, ...] for broadcast.
-                let b_i = b;
-                let l_i = l;
-                let n_heads_i = n_heads;
-                let n_kv_i = n_kv;
-                let head_dim_i = head_dim;
-                let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
-                {
-                    let q_reshaped =
-                        mlx_rs::ops::reshape(&q_rope, &[b_i, n_kv_i, n_repeats, l_i, head_dim_i])
-                            .context("qkv_quant: reshape Q for GQA")?;
-                    let exp = |a: &Array| -> Result<Array> {
-                        mlx_rs::ops::expand_dims(a, -3).context("qkv_quant: expand_dims(K/V, -3)")
-                    };
-                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                    (q_reshaped, kt2, vt2, true)
-                } else {
-                    (q_rope.clone(), kt, vt, false)
-                };
+                // Gemma 4's SDPA scale is 1.0, so the post-RoPE Q is already
+                // scaled. Decode (L == 1) needs no mask.
                 let sdpa_start = if time_substages {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                // scores = Q @ K^T  (Q is bf16, K is quantized)
-                let scores = mlx_rs::ops::quantized_matmul(
-                    &q_for_qmm,
-                    &k_tuple_for_qmm.0,
-                    &k_tuple_for_qmm.1,
-                    Some(&k_tuple_for_qmm.2),
-                    /* transpose */ true,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant: quantized_matmul(Q, K)")?;
-                // Apply causal mask if multi-token (prefill); decode L=1 needs no mask.
-                let scores_masked = if (l_i as usize) > 1 {
-                    let mask = make_attention_mask_for_layer_chunked(
+                let mask = if (l as usize) > 1 {
+                    make_attention_mask_for_layer_chunked(
                         kind,
                         cfg,
-                        l_i as usize,
+                        l as usize,
                         kv_offset as usize,
                         kv_actual_q,
-                    )?;
-                    match mask {
-                        Some(m) => mlx_rs::ops::add(&scores, &m).context("qkv_quant: add mask")?,
-                        None => scores,
-                    }
+                    )?
                 } else {
-                    scores
+                    None
                 };
-                // Precise softmax along last axis.
-                let last_axis = (scores_masked.ndim() as i32) - 1;
-                let scores_sm = mlx_rs::ops::softmax_axis(
-                    &scores_masked,
-                    last_axis,
-                    /* precise */ Some(true),
-                )
-                .context("qkv_quant: softmax")?;
-                // out = scores @ V
-                let out = mlx_rs::ops::quantized_matmul(
-                    &scores_sm,
-                    &v_tuple_for_qmm.0,
-                    &v_tuple_for_qmm.1,
-                    Some(&v_tuple_for_qmm.2),
-                    /* transpose */ false,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant: quantized_matmul(scores, V)")?;
-                let attn_out_q = if needs_reshape {
-                    mlx_rs::ops::reshape(&out, &[b_i, n_heads_i, l_i, head_dim_i])
-                        .context("qkv_quant: reshape output back to [B, n_heads, L, D]")?
-                } else {
-                    out
-                };
+                let attn_out_q = quantized_kv_attention(&q_rope, &kt, &vt, mask.as_ref(), gs, bits)
+                    .context("qkv_quant")?;
                 if let Some(t0) = sdpa_start {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -4439,7 +4379,7 @@ pub(crate) mod imp {
                 };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant: transpose output")?;
-                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
@@ -4482,89 +4422,29 @@ pub(crate) mod imp {
                 if let Some(t0) = cache_start {
                     bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let b_i = b;
-                let l_i = l;
-                let n_heads_i = n_heads;
-                let n_kv_i = n_kv;
-                let head_dim_i = head_dim;
-                let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
-                {
-                    let q_reshaped = mlx_rs::ops::reshape(
-                        &q_for_rotation,
-                        &[b_i, n_kv_i, n_repeats, l_i, head_dim_i],
-                    )
-                    .context("qkv_quant_sliding: reshape Q for GQA")?;
-                    let exp = |a: &Array| -> Result<Array> {
-                        mlx_rs::ops::expand_dims(a, -3)
-                            .context("qkv_quant_sliding: expand_dims(K/V, -3)")
-                    };
-                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                    (q_reshaped, kt2, vt2, true)
-                } else {
-                    (q_for_rotation, kt, vt, false)
-                };
                 let sdpa_start = if time_substages {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                // scores = Q @ K^T  (Q is bf16, K is quantized)
-                let scores = mlx_rs::ops::quantized_matmul(
-                    &q_for_qmm,
-                    &k_tuple_for_qmm.0,
-                    &k_tuple_for_qmm.1,
-                    Some(&k_tuple_for_qmm.2),
-                    /* transpose */ true,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant_sliding: quantized_matmul(Q, K)")?;
                 // Causal + sliding mask only at prefill (L > 1). Decode L==1
                 // sees only the in-window tokens that the cache holds, and
                 // SDPA over a permutation-invariant K set produces the same
                 // output regardless of ring order — no mask needed.
-                let scores_masked = if (l_i as usize) > 1 {
-                    let mask = make_attention_mask_for_layer_chunked(
+                let mask = if (l as usize) > 1 {
+                    make_attention_mask_for_layer_chunked(
                         kind,
                         cfg,
-                        l_i as usize,
+                        l as usize,
                         kv_offset as usize,
                         kv_actual_q,
-                    )?;
-                    match mask {
-                        Some(m) => {
-                            mlx_rs::ops::add(&scores, &m).context("qkv_quant_sliding: add mask")?
-                        }
-                        None => scores,
-                    }
+                    )?
                 } else {
-                    scores
+                    None
                 };
-                let last_axis = (scores_masked.ndim() as i32) - 1;
-                let scores_sm = mlx_rs::ops::softmax_axis(
-                    &scores_masked,
-                    last_axis,
-                    /* precise */ Some(true),
-                )
-                .context("qkv_quant_sliding: softmax")?;
-                let out = mlx_rs::ops::quantized_matmul(
-                    &scores_sm,
-                    &v_tuple_for_qmm.0,
-                    &v_tuple_for_qmm.1,
-                    Some(&v_tuple_for_qmm.2),
-                    /* transpose */ false,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant_sliding: quantized_matmul(scores, V)")?;
-                let attn_out_q = if needs_reshape {
-                    mlx_rs::ops::reshape(&out, &[b_i, n_heads_i, l_i, head_dim_i])
-                        .context("qkv_quant_sliding: reshape output back")?
-                } else {
-                    out
-                };
+                let attn_out_q =
+                    quantized_kv_attention(&q_for_rotation, &kt, &vt, mask.as_ref(), gs, bits)
+                        .context("qkv_quant_sliding")?;
                 if let Some(t0) = sdpa_start {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -4575,7 +4455,7 @@ pub(crate) mod imp {
                 };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant_sliding: transpose output")?;
-                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant_sliding: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {

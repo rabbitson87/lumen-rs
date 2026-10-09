@@ -1602,6 +1602,24 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "quantized-kv-prefill-unmasked",
+        symptom: "Gemma 4's quantized-KV attention added the default bool mask to \
+                  its scores, so `true` became +1.0 and nothing was masked: with \
+                  LUMEN_GEMMA4_QUANT_KV_MODE on (or auto past the threshold) every \
+                  prefill query attended to the whole cache, future tokens included",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        if mask.dtype() == mlx_rs::Dtype::Bool {",
+            replace: "        if false { // defect: a bool mask is added as 1.0 / 0.0",
+        }],
+        guards: &[mlx(
+            "native_attention::quantized_kv_attention_tests::quantized_kv_attention_matches_sdpa_on_dequantized_kv",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "rotating-cache-both-paths",
         symptom: "the rotating-cache growth test asserted cached_len == fetch, \
                   false for the default path since step-prealloc landed; and the \
@@ -2015,7 +2033,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
             "gemma4_backend.rs"
         }
         (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
-        (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
+        (_, "causal-mask-coverage")
+        | (_, "causal-mask-builders-agree")
+        | (_, "quantized-kv-prefill-unmasked") => "native_attention.rs",
         (_, "rotating-cache-both-paths") => "native_cache.rs",
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
