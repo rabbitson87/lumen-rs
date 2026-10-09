@@ -1639,6 +1639,24 @@ static DEFECTS: &[Defect] = &[
         extra: &[],
     },
     Defect {
+        name: "qwen-extend-clamp-ignores-cached-prefix",
+        symptom: "Qwen's prefill scores clamp sized each chunk for the call's own \
+                  tokens only, so an extend or prefix-cache continuation over a \
+                  long cached prefix built full-attention scores over prefix + \
+                  chunk keys without ever being clamped",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        cache.full_attn_offset() + n\n",
+            replace: "        n // defect: the cached prefix is not counted\n",
+        }],
+        guards: &[mlx(
+            "runner_native::imp::tests::the_chunk_clamp_counts_the_cached_prefix",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "rotating-cache-both-paths",
         symptom: "the rotating-cache growth test asserted cached_len == fetch, \
                   false for the default path since step-prealloc landed; and the \
@@ -2094,6 +2112,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
         (_, "release-requires-notarization") => "release.yml",
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
+        (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

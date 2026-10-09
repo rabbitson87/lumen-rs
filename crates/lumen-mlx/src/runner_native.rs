@@ -1031,23 +1031,32 @@ mod imp {
             .unwrap_or(2048)
     }
 
-    /// The chunk size [`forward_chunked`] runs a call of `n` tokens in.
+    /// The chunk size [`forward_chunked`] runs a call in.
     ///
     /// The arithmetic lives in `prefill_budget` so it can be swept at tier 0
     /// (it is this crate's `malloc`-fail-at-N analogue: MLX allocation cannot
     /// fail into an `Err`, so the guard is to not allocate). Exposed through
     /// [`NativeMlxRunner::prefill_grid`] so a caller that feeds a prompt in
     /// pieces can keep the grid a single call would have used.
+    ///
+    /// `kv_upper` is the most keys any chunk attends to: the tokens already in
+    /// the cache plus the ones this call adds.
     fn prefill_chunk_decision(
         model: &NativeQwen3_5MoeModel,
-        n: usize,
+        kv_upper: usize,
     ) -> crate::prefill_budget::ChunkDecision {
         crate::prefill_budget::clamp_chunk(
             qwen35_prefill_chunk(),
             crate::prefill_budget::scores_budget_from_env("LUMEN_QWEN35_PREFILL_SCORES_GB"),
             model.config().text_config.num_attention_heads,
-            n,
+            kv_upper,
         )
+    }
+
+    /// The most keys a [`forward_chunked`] call's chunks attend to: what
+    /// `cache` already holds plus the call's own `n` tokens.
+    fn chunked_call_kv_upper(cache: &NativePromptCache, n: usize) -> usize {
+        cache.full_attn_offset() + n
     }
 
     /// Run `tokens` through the trunk in query-windowed chunks, accumulating
@@ -1122,14 +1131,17 @@ mod imp {
         // length, and that buffer can exceed Metal's per-buffer cap (observed:
         // a ~130 GB allocation attempt for a 21k-token single pass). Clamp the
         // chunk DOWN so one chunk's full-attn scores stay under a byte budget
-        // given the worst-case kv_len (= prompt length). Short prompts are
+        // given the worst-case kv_len: what the cache already holds plus this
+        // call's tokens. Counting only the call's own tokens let an extend or
+        // a prefix-cache continuation over a long cached prefix through
+        // unclamped (Gemma's loop already counted the cache). Short prompts are
         // unaffected (the cap is large); an over-large
         // `LUMEN_QWEN35_PREFILL_CHUNK` is clamped, never honored — chunking is
         // mandatory. The legacy single-pass A/B path now also requires raising
         // `LUMEN_QWEN35_PREFILL_SCORES_GB` (e.g. a huge value) alongside the
         // chunk override.
         let chunk = {
-            let d = prefill_chunk_decision(model, n);
+            let d = prefill_chunk_decision(model, chunked_call_kv_upper(cache, n));
             if d.clamped() {
                 eprintln!(
                     "[prefill] qwen chunk clamped {} → {} \
@@ -2546,6 +2558,24 @@ mod imp {
     mod tests {
         use super::*;
         use std::process::{Command, Output};
+
+        /// An extend over a cached prefix attends to the prefix too, so the
+        /// scores clamp has to count it.
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn the_chunk_clamp_counts_the_cached_prefix() {
+            let mut cache = NativePromptCache::new(&[true, false], 2);
+            assert_eq!(chunked_call_kv_upper(&cache, 10), 10);
+            let block = Array::zeros::<f32>(&[1, 2, 40, 8]).unwrap();
+            cache
+                .layer_mut(1)
+                .unwrap()
+                .as_full_mut()
+                .unwrap()
+                .update_and_fetch(&block, &block)
+                .unwrap();
+            assert_eq!(chunked_call_kv_upper(&cache, 10), 50);
+        }
 
         #[test]
         fn native_model_assets_discovers_local_directory() -> Result<()> {
