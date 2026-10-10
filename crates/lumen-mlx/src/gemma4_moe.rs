@@ -5925,8 +5925,20 @@ pub(crate) mod imp {
             //      Pre/post norms stay outside.
             //   3. Legacy: router_forward (routing_fused_tail slot) +
             //      experts_forward (experts_fused slot) chain.
+            // The fused slots run gather_qmm on unsorted indices: the decode
+            // branch of `experts_forward` (B·L·top_k < 64). A prefill chunk
+            // takes the legacy path, which sorts by expert first — at 2,048
+            // tokens unsorted gather_qmm is ~6.5x slower (M3 Max, 4-bit
+            // experts). Before MLX 0.32 the slots could not trace GatherQMM
+            // shapelessly, so every call already ended up on the legacy path.
+            let tokens: usize = h.shape()[..h.ndim() - 1]
+                .iter()
+                .map(|&d| d as usize)
+                .product();
+            let unsorted_experts = tokens * self.config.text_config.top_k_experts < 64;
             let needs_post_norm_outside;
-            let h2 = if gemma4_pre_post_norm_routing_experts_fuse_enabled()
+            let h2 = if unsorted_experts
+                && gemma4_pre_post_norm_routing_experts_fuse_enabled()
                 && lw.experts.gate_proj.bits == 4
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
@@ -5985,7 +5997,8 @@ pub(crate) mod imp {
                 }
                 needs_post_norm_outside = false;
                 h2
-            } else if gemma4_routing_experts_fuse_enabled()
+            } else if unsorted_experts
+                && gemma4_routing_experts_fuse_enabled()
                 && lw.experts.gate_proj.bits == 4
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
