@@ -114,7 +114,7 @@ pub mod gemma4 {
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
         NativeGemma4Model, NativeGemma4PromptCache, quant_params_for, set_forward_step,
-        take_gemma4_breakdown,
+        set_quant_kv_fused_attn, set_quant_kv_prefill_dequant, take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
@@ -143,6 +143,7 @@ mod golden;
 pub mod metal_kernel;
 pub mod native_attention;
 mod native_cache;
+pub mod native_quant_attention;
 /// Block granularity the per-sequence full-attention KV cache grows in
 /// (`mlx_lm.cache.KVCache(step=256)` semantics). Exposed for harnesses that
 /// reason about allocation rounding — see `examples/kv_concurrency_ab.rs`.
@@ -183,6 +184,8 @@ pub use qwen3_5_tools::render_tools_system_block;
 // Qwen3.6-35B-A3B-mxfp4 shapes. Internal API used by
 // `examples/bench_qwen35_mtp_step_b.rs` to validate the K=2 vs K=3 cycle
 // math before investing in the HF-native loader + runner wiring.
+#[cfg(feature = "mlx-native")]
+pub use native_attention::set_sparse_decode;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]

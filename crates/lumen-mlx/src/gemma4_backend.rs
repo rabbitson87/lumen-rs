@@ -3427,7 +3427,7 @@ pub(crate) mod imp {
                 // full measurement + root-cause analysis.
                 //
                 // ⚠️  GREEDY NON-IDENTICAL by design: OFF path uses the
-                // custom-FA-2 attention kernel on full-attn layers (5-10%
+                // custom-FA-2 attention kernel on the sliding layers (5-10%
                 // faster) while mtp_step internally forces mlx::fast::sdpa
                 // (so Step A's S=1 and Step C's S=K+1 stay on the same
                 // kernel for accept-rate sanity). The ~1-ULP kernel drift

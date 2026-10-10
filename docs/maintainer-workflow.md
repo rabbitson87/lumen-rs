@@ -84,19 +84,29 @@ is at the end of `docs/release-checklist.md`.
 
 `lumen-rs` consumes three upstream forks pinned to specific commit SHAs.
 Each fork lives under `github.com/rabbitson87/<fork>` with a branch
-named `lumen-rs-patches`.
+named `lumen-rs-patches-v0.32` (MLX v0.32.3 baseline); the MLX 0.30 line
+stays on `lumen-rs-patches`.
 
 The `candle-*` fork was dropped when the Candle backend was removed — a
 clean clone no longer needs a sibling `../candle` checkout to build.
 
 | Cargo dep | Fork branch | URL |
 |---|---|---|
-| `mlx-rs`, `mlx-sys` | `rabbitson87/mlx-rs/lumen-rs-patches` | https://github.com/rabbitson87/mlx-rs |
-| mlx-c submodule | `rabbitson87/mlx-c/lumen-rs-patches` | https://github.com/rabbitson87/mlx-c |
-| mlx core (FetchContent in mlx-c) | `rabbitson87/mlx/lumen-rs-patches` | https://github.com/rabbitson87/mlx |
+| `mlx-rs`, `mlx-sys` | `rabbitson87/mlx-rs/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx-rs |
+| mlx-c submodule | `rabbitson87/mlx-c/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx-c |
+| mlx core (FetchContent in mlx-c) | `rabbitson87/mlx/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx |
 
 Each branch is a **single squashed commit on top of an upstream
 baseline** so rebases stay atomic.
+
+**Rebasing onto a new MLX release gets new branches; never force-push the
+MLX branch.** mlx-c fetches MLX by branch *name* (`GIT_TAG` in its
+CMakeLists), so rewriting that branch changes what every older lumen-rs
+commit and release tag builds — and their mlx-c cannot compile against a
+newer MLX. Push the rebase as `lumen-rs-patches-v<x.y>` in mlx and mlx-c,
+point mlx-c's `GIT_TAG` at it, bump the submodule on a matching mlx-rs
+branch, then bump the `rev` here. The force-push flow below is only for
+mlx-rs and mlx-c, which are pinned by SHA.
 
 ### Bumping a fork SHA (when upstream has new commits to integrate)
 
@@ -289,14 +299,18 @@ The A/B partner column exists to explain that row, so it was the obvious next
 step. Two things came out of it; only one is a measurement.
 
 **Established, from code and config rather than a stopwatch.** The custom
-flash-attn kernel can apply to at most **5 of 30 layers**. `layer_types` on
-gemma-4-26b-a4b is 25 `sliding_attention` to 5 `full_attention`, and
-`use_custom_flash` requires `!use_sdpa_windowed` (plus `S == 1`, `head_dim ==
-256`, all-bf16, no explicit mask — see `gemma4_moe.rs`). Whatever the kernel is
-worth, it is worth it on a sixth of the attention work, and attention is itself
-a small share of a decode step that is dominated by weight reads. That alone
-predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
-**448 ms vs 449 ms over 31 steps — nothing.**
+flash-attn kernel runs on the **25 sliding layers** at decode and on none of
+the 5 full layers. `layer_types` on gemma-4-26b-a4b is 25 `sliding_attention`
+to 5 `full_attention`, and `use_custom_flash` requires `S == 1`, `head_dim ==
+256`, all-bf16 and no explicit mask (see `gemma4_moe.rs`): the sliding layers
+are head_dim 256, the full layers 512. (An earlier version of this section said
+"at most 5 of 30", reading the `!use_sdpa_windowed` guard as excluding the
+sliding layers; that guard only fires for multi-token queries.) Sliding-layer
+attention is capped at the 1,024-key window, so the kernel works on the part of
+attention that does not grow with the context, and attention is itself a small
+share of a decode step dominated by weight reads. That predicts a small A/B
+delta, and at `PROMPT_LEN=512` the measured delta is **448 ms vs 449 ms over 31
+steps — nothing.**
 
 **Settled, once the measurement stopped being process-per-run.** At
 `PROMPT_LEN=8192`, 10 interleaved in-process pairs:
@@ -308,7 +322,7 @@ predicts a small A/B delta, and at `PROMPT_LEN=512` the measured delta is
 
 **min-vs-min −0.3%**, median −2.0%, against a 7.0% noise floor. The recorded
 5.5% gap (18.8 vs 19.9) does not reproduce: the two paths are indistinguishable
-here, which is what the 5-of-30-layers bound predicts.
+here, which is what a kernel confined to window-capped layers predicts.
 
 So the custom kernel is **not** the explanation for the Gemma row's 27% drift.
 

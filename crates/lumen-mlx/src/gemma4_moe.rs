@@ -21,7 +21,11 @@ pub(crate) mod imp {
     use crate::kv_disk::{
         ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
     };
-    use crate::native_attention::{build_causal_mask, build_causal_mask_abs, sdpa, sdpa_with_mask};
+    use crate::native_attention::{
+        QuantizedTriple, SPARSE_DECODE_MIN_KEYS, build_causal_mask, build_causal_mask_abs,
+        quantized_kv_attention, sdpa, sdpa_page_sparse, sdpa_with_mask, sparse_decode,
+        sparse_keep_pages,
+    };
     use crate::native_cache::{
         NativeKvCache, NativeKvCacheQuantized, NativeRotatingKvCache,
         NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
@@ -1191,6 +1195,20 @@ pub(crate) mod imp {
 
     fn gemma4_layer_epilogue_fuse_enabled() -> bool {
         fuse_layer_epilogue::get()
+    }
+
+    lumen_flags::flag! {
+        /// Log each chunked-prefill chunk's wall time and MLX memory (active,
+        /// peak) to stderr, as `LUMEN_QWEN35_PREFILL_CHUNK_LOG` does for Qwen.
+        /// Chunk time against cache offset is how much of prefill attention
+        /// costs as the context grows. The last chunk is evaluated too, so the
+        /// returned logits are no longer lazy; every chunk already ends in an
+        /// eval, so no barrier is added inside a forward.
+        pub(crate) prefill_chunk_log {
+            env: "LUMEN_GEMMA4_PREFILL_CHUNK_LOG",
+            default: false,
+            kind: Diagnostic,
+        }
     }
 
     fn gemma4_layer_epilogue_fused(
@@ -2610,6 +2628,129 @@ pub(crate) mod imp {
                 }
             }
         })
+    }
+
+    /// Whether a sliding-layer query of `query_len` rows can be handed to
+    /// `lumen_sdpa_windowed` at all. Only MLX's steel kernel reads the window,
+    /// and it serves only these head dims. MLX routes a query of at most 8 rows
+    /// to `sdpa_vector` instead, which applies the causal mask but drops
+    /// `window_size`, while the rotating cache returns `window - 1 + L` keys:
+    /// query `i` would see `i` keys from before its window. Those queries (a
+    /// final prefill chunk of 2-8 tokens, MTP verify, a short extend) take
+    /// the explicit-mask path, which `sdpa_vector` does honour.
+    pub(crate) fn windowed_kernel_fits(query_len: usize, head_dim: i32) -> bool {
+        query_len > 8 && matches!(head_dim, 64 | 80 | 128 | 256)
+    }
+
+    lumen_flags::flag! {
+        /// Run quantized-KV prefill (queries of more than one token) through
+        /// the bf16 attention kernels: dequantize the cached K/V, then dispatch
+        /// as the bf16 caches do (the windowed kernel on sliding layers, causal
+        /// SDPA on full ones). The quantized path builds `Q·Kᵀ` explicitly with
+        /// `quantized_matmul`; this one lets the sliding layers skip K blocks
+        /// outside the window and drop their scores tensor. Different kernels,
+        /// so not bit-identical.
+        ///
+        /// Default on (task 021): prefill −10.0% at 16K, −12.7% at 32K (paired
+        /// per-chunk t −28 / −5.9). Teacher-forced over 8,192 tokens against
+        /// bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
+        /// at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
+        /// `=0` restores the quantized matmuls.
+        pub(crate) quant_kv_prefill_dequant {
+            env: "LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT",
+            default: true,
+            kind: Behavior,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Decode over a quantized KV cache (single-token steps) through the
+        /// fused kernel in `native_quant_attention`, which dequantizes inside
+        /// its loop, instead of `quantized_matmul` · softmax ·
+        /// `quantized_matmul`. Falls back to the three-op path for layouts the
+        /// kernel does not read.
+        ///
+        /// Default on (task 021): 2.3× faster at 8 bits on a global layer at
+        /// 64K keys, even at 4 bits; end-to-end decode −7.7% at 32K.
+        /// Teacher-forced decode against bf16 KV it agrees as well or better
+        /// than the three-op path: 96.68% vs 95.12% at 4 bits, 97.07% vs 96.88%
+        /// at 8. `=0` restores the three-op path.
+        pub(crate) quant_kv_fused_attn {
+            env: "LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN",
+            default: true,
+            kind: Behavior,
+        }
+    }
+
+    /// Pin `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` process-wide for an
+    /// in-process A/B (`examples/gemma4_kv_quality.rs`).
+    pub fn set_quant_kv_prefill_dequant(on: bool) {
+        quant_kv_prefill_dequant::set(on);
+    }
+
+    /// Pin `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` process-wide for an in-process
+    /// A/B (`examples/gemma4_kv_quality.rs`).
+    pub fn set_quant_kv_fused_attn(on: bool) {
+        quant_kv_fused_attn::set(on);
+    }
+
+    /// Single-token attention over a quantized KV cache: the fused kernel when
+    /// `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` is on and it reads this layout, the
+    /// three-op path otherwise.
+    fn quantized_decode_attention(
+        queries: &Array,
+        keys: &QuantizedTriple,
+        values: &QuantizedTriple,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Array> {
+        if quant_kv_fused_attn::get()
+            && let Ok(out) = crate::native_quant_attention::quantized_sdpa_decode(
+                queries, keys, values, group_size, bits,
+            )
+        {
+            return Ok(out);
+        }
+        quantized_kv_attention(queries, keys, values, None, group_size, bits)
+    }
+
+    /// Attention for a multi-token query over a quantized KV cache through the
+    /// bf16 kernels (`LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT`), at Gemma 4's
+    /// softmax scale of 1.0. `queries` must be bf16, as the dequantized K/V
+    /// are. `window` is the sliding window, `None` on full layers;
+    /// `causal_aligned` says the keys end where the queries do (`kv_actual ==
+    /// kv_offset + L`), which the causal sentinel assumes. `mask` builds the
+    /// explicit mask and is called only when no in-kernel mask applies.
+    #[allow(clippy::too_many_arguments)]
+    fn dequantized_prefill_attention(
+        queries: &Array,
+        keys: &QuantizedTriple,
+        values: &QuantizedTriple,
+        group_size: i32,
+        bits: i32,
+        window: Option<usize>,
+        causal_aligned: bool,
+        mask: impl FnOnce() -> Result<Option<Array>>,
+    ) -> Result<Array> {
+        let dequantize = |t: &QuantizedTriple| {
+            mlx_rs::ops::dequantize(&t.0, &t.1, &t.2, group_size, bits)
+                .context("dequantized_prefill_attention: dequantize")
+        };
+        let (k, v) = (dequantize(keys)?, dequantize(values)?);
+        let q_len = queries.shape()[2] as usize;
+        let head_dim = queries.shape()[3];
+        match window {
+            Some(w) if windowed_kernel_enabled() && windowed_kernel_fits(q_len, head_dim) => {
+                let stream = mlx_rs::Stream::gpu();
+                mlx_rs::metal::lumen_sdpa_windowed(queries, &k, &v, 1.0, w as i32, &stream)
+                    .map_err(|e| anyhow!("lumen_sdpa_windowed: {e}"))
+            }
+            None if causal_aligned => sdpa(queries, &k, &v, 1.0, true),
+            _ => {
+                let mask = mask()?.ok_or_else(|| anyhow!("a multi-token query needs a mask"))?;
+                sdpa_with_mask(queries, &k, &v, 1.0, &mask)
+            }
+        }
     }
 
     /// Whether `kernel` computes sliding-window attention, against attention
@@ -4345,87 +4486,44 @@ pub(crate) mod imp {
                 if let Some(t0) = cache_start {
                     bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                // Scale Q by 1.0 (Gemma 4 SDPA scale convention — already
-                // baked into the post-RoPE Q via the kernel scale arg=1.0).
-                // GQA reshape: n_repeats = n_heads / n_kv. Q: [B, n_heads, L, D] →
-                // [B, n_kv, n_repeats, L, D]. K/V tuples: each Array gets
-                // expand_dims at axis -3 → [B, n_kv, 1, S, ...] for broadcast.
-                let b_i = b;
-                let l_i = l;
-                let n_heads_i = n_heads;
-                let n_kv_i = n_kv;
-                let head_dim_i = head_dim;
-                let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
-                {
-                    let q_reshaped =
-                        mlx_rs::ops::reshape(&q_rope, &[b_i, n_kv_i, n_repeats, l_i, head_dim_i])
-                            .context("qkv_quant: reshape Q for GQA")?;
-                    let exp = |a: &Array| -> Result<Array> {
-                        mlx_rs::ops::expand_dims(a, -3).context("qkv_quant: expand_dims(K/V, -3)")
-                    };
-                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                    (q_reshaped, kt2, vt2, true)
-                } else {
-                    (q_rope.clone(), kt, vt, false)
-                };
+                // Gemma 4's SDPA scale is 1.0, so the post-RoPE Q is already
+                // scaled. Decode (L == 1) needs no mask.
                 let sdpa_start = if time_substages {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                // scores = Q @ K^T  (Q is bf16, K is quantized)
-                let scores = mlx_rs::ops::quantized_matmul(
-                    &q_for_qmm,
-                    &k_tuple_for_qmm.0,
-                    &k_tuple_for_qmm.1,
-                    Some(&k_tuple_for_qmm.2),
-                    /* transpose */ true,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant: quantized_matmul(Q, K)")?;
-                // Apply causal mask if multi-token (prefill); decode L=1 needs no mask.
-                let scores_masked = if (l_i as usize) > 1 {
-                    let mask = make_attention_mask_for_layer_chunked(
+                let prefill = (l as usize) > 1;
+                let mask = || {
+                    make_attention_mask_for_layer_chunked(
                         kind,
                         cfg,
-                        l_i as usize,
+                        l as usize,
                         kv_offset as usize,
                         kv_actual_q,
-                    )?;
-                    match mask {
-                        Some(m) => mlx_rs::ops::add(&scores, &m).context("qkv_quant: add mask")?,
-                        None => scores,
-                    }
-                } else {
-                    scores
+                    )
                 };
-                // Precise softmax along last axis.
-                let last_axis = (scores_masked.ndim() as i32) - 1;
-                let scores_sm = mlx_rs::ops::softmax_axis(
-                    &scores_masked,
-                    last_axis,
-                    /* precise */ Some(true),
-                )
-                .context("qkv_quant: softmax")?;
-                // out = scores @ V
-                let out = mlx_rs::ops::quantized_matmul(
-                    &scores_sm,
-                    &v_tuple_for_qmm.0,
-                    &v_tuple_for_qmm.1,
-                    Some(&v_tuple_for_qmm.2),
-                    /* transpose */ false,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant: quantized_matmul(scores, V)")?;
-                let attn_out_q = if needs_reshape {
-                    mlx_rs::ops::reshape(&out, &[b_i, n_heads_i, l_i, head_dim_i])
-                        .context("qkv_quant: reshape output back to [B, n_heads, L, D]")?
+                let attn_out_q = if prefill
+                    && quant_kv_prefill_dequant::get()
+                    && q_rope.dtype() == mlx_rs::Dtype::Bfloat16
+                {
+                    dequantized_prefill_attention(
+                        &q_rope,
+                        &kt,
+                        &vt,
+                        gs,
+                        bits,
+                        None,
+                        kv_actual_q == kv_offset as usize + l as usize,
+                        mask,
+                    )
+                    .context("qkv_quant: dequantized prefill")?
+                } else if prefill {
+                    quantized_kv_attention(&q_rope, &kt, &vt, mask()?.as_ref(), gs, bits)
+                        .context("qkv_quant")?
                 } else {
-                    out
+                    quantized_decode_attention(&q_rope, &kt, &vt, gs, bits)
+                        .context("qkv_quant: decode")?
                 };
                 if let Some(t0) = sdpa_start {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4439,7 +4537,7 @@ pub(crate) mod imp {
                 };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant: transpose output")?;
-                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
@@ -4482,88 +4580,49 @@ pub(crate) mod imp {
                 if let Some(t0) = cache_start {
                     bump_gemma4_attn_cache_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                let b_i = b;
-                let l_i = l;
-                let n_heads_i = n_heads;
-                let n_kv_i = n_kv;
-                let head_dim_i = head_dim;
-                let n_repeats = n_heads_i / n_kv_i;
-                let (q_for_qmm, k_tuple_for_qmm, v_tuple_for_qmm, needs_reshape) = if n_repeats > 1
-                {
-                    let q_reshaped = mlx_rs::ops::reshape(
-                        &q_for_rotation,
-                        &[b_i, n_kv_i, n_repeats, l_i, head_dim_i],
-                    )
-                    .context("qkv_quant_sliding: reshape Q for GQA")?;
-                    let exp = |a: &Array| -> Result<Array> {
-                        mlx_rs::ops::expand_dims(a, -3)
-                            .context("qkv_quant_sliding: expand_dims(K/V, -3)")
-                    };
-                    let kt2 = (exp(&kt.0)?, exp(&kt.1)?, exp(&kt.2)?);
-                    let vt2 = (exp(&vt.0)?, exp(&vt.1)?, exp(&vt.2)?);
-                    (q_reshaped, kt2, vt2, true)
-                } else {
-                    (q_for_rotation, kt, vt, false)
-                };
                 let sdpa_start = if time_substages {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                // scores = Q @ K^T  (Q is bf16, K is quantized)
-                let scores = mlx_rs::ops::quantized_matmul(
-                    &q_for_qmm,
-                    &k_tuple_for_qmm.0,
-                    &k_tuple_for_qmm.1,
-                    Some(&k_tuple_for_qmm.2),
-                    /* transpose */ true,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant_sliding: quantized_matmul(Q, K)")?;
                 // Causal + sliding mask only at prefill (L > 1). Decode L==1
                 // sees only the in-window tokens that the cache holds, and
                 // SDPA over a permutation-invariant K set produces the same
                 // output regardless of ring order — no mask needed.
-                let scores_masked = if (l_i as usize) > 1 {
-                    let mask = make_attention_mask_for_layer_chunked(
+                let prefill = (l as usize) > 1;
+                let mask = || {
+                    make_attention_mask_for_layer_chunked(
                         kind,
                         cfg,
-                        l_i as usize,
+                        l as usize,
                         kv_offset as usize,
                         kv_actual_q,
-                    )?;
-                    match mask {
-                        Some(m) => {
-                            mlx_rs::ops::add(&scores, &m).context("qkv_quant_sliding: add mask")?
-                        }
-                        None => scores,
-                    }
-                } else {
-                    scores
+                    )
                 };
-                let last_axis = (scores_masked.ndim() as i32) - 1;
-                let scores_sm = mlx_rs::ops::softmax_axis(
-                    &scores_masked,
-                    last_axis,
-                    /* precise */ Some(true),
-                )
-                .context("qkv_quant_sliding: softmax")?;
-                let out = mlx_rs::ops::quantized_matmul(
-                    &scores_sm,
-                    &v_tuple_for_qmm.0,
-                    &v_tuple_for_qmm.1,
-                    Some(&v_tuple_for_qmm.2),
-                    /* transpose */ false,
-                    /* group_size */ gs,
-                    /* bits */ bits,
-                )
-                .context("qkv_quant_sliding: quantized_matmul(scores, V)")?;
-                let attn_out_q = if needs_reshape {
-                    mlx_rs::ops::reshape(&out, &[b_i, n_heads_i, l_i, head_dim_i])
-                        .context("qkv_quant_sliding: reshape output back")?
+                // With the Haar rotation on, the cache holds rotated K and Q is
+                // rotated the same way (both bf16), so the dot products, and the
+                // dequantized path, are unchanged by it.
+                let attn_out_q = if prefill
+                    && quant_kv_prefill_dequant::get()
+                    && q_for_rotation.dtype() == mlx_rs::Dtype::Bfloat16
+                {
+                    dequantized_prefill_attention(
+                        &q_for_rotation,
+                        &kt,
+                        &vt,
+                        gs,
+                        bits,
+                        Some(cfg.sliding_window),
+                        false,
+                        mask,
+                    )
+                    .context("qkv_quant_sliding: dequantized prefill")?
+                } else if prefill {
+                    quantized_kv_attention(&q_for_rotation, &kt, &vt, mask()?.as_ref(), gs, bits)
+                        .context("qkv_quant_sliding")?
                 } else {
-                    out
+                    quantized_decode_attention(&q_for_rotation, &kt, &vt, gs, bits)
+                        .context("qkv_quant_sliding: decode")?
                 };
                 if let Some(t0) = sdpa_start {
                     bump_gemma4_attn_sdpa_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -4575,7 +4634,7 @@ pub(crate) mod imp {
                 };
                 let attn_t = mlx_rs::ops::transpose_axes(&attn_out_q, &[0, 2, 1, 3])
                     .context("qkv_quant_sliding: transpose output")?;
-                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b_i, l_i, n_heads_i * head_dim_i])
+                let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant_sliding: reshape output flat")?;
                 let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
                 if let Some(t0) = oproj_start {
@@ -5242,8 +5301,9 @@ pub(crate) mod imp {
             //
             // Guards:
             //   - sliding layer (full-attn uses causal sentinel path)
-            //   - no rotation (kv_actual == kv_offset + l)
-            //   - head_dim ∈ {64, 80, 128, 256} (steel kernel instantiation set)
+            //   - more than 8 queries and head_dim ∈ {64, 80, 128, 256}
+            //     (`windowed_kernel_fits`: shorter queries reach MLX's
+            //     vector kernel, which ignores the window)
             //   - dtype bf16
             //
             // On unless `LUMEN_GEMMA4_SDPA_WINDOWED=0`, and only once this
@@ -5265,13 +5325,9 @@ pub(crate) mod imp {
             // kernel path.
             let use_sdpa_windowed = sdpa_windowed_enabled
                 && !prefill_kernel_eligible
-                && (l as usize) > 1
                 && dtype_bf16
                 && matches!(kind, NativeGemma4LayerType::SlidingAttention)
-                && (head_dim_now == 64
-                    || head_dim_now == 80
-                    || head_dim_now == 128
-                    || head_dim_now == 256);
+                && windowed_kernel_fits(l as usize, head_dim_now);
             // Skip the mask Array build entirely when an in-kernel mask
             // path will fire (prefill_kernel or sdpa_windowed both encode
             // causal+window themselves).
@@ -5398,11 +5454,21 @@ pub(crate) mod imp {
                 .map_err(|e| anyhow!("attn: custom flash_attn_bf16: {e}"))?
             } else if use_causal_sentinel {
                 sdpa(&q_rope, &k_full, &v_full, 1.0, true)?
+            } else if let Some(m) = mask {
+                sdpa_with_mask(&q_rope, &k_full, &v_full, 1.0, &m)?
+            } else if l == 1
+                && !mtp_active_now
+                && k_full.shape()[2] as usize >= SPARSE_DECODE_MIN_KEYS
+                && sparse_decode::get()
+                && let NativeGemma4LayerCache::Full(c) = cache
+                && let Some(digest) = c.page_digest()?
+            {
+                // LUMEN_SPARSE_DECODE on a global layer. Skipped inside an MTP
+                // step, whose draft and verify passes must share one kernel.
+                let keep = sparse_keep_pages(digest.pages);
+                sdpa_page_sparse(&q_rope, &k_full, &v_full, 1.0, &digest, keep)?
             } else {
-                match mask {
-                    Some(m) => sdpa_with_mask(&q_rope, &k_full, &v_full, 1.0, &m)?,
-                    None => sdpa(&q_rope, &k_full, &v_full, 1.0, false)?,
-                }
+                sdpa(&q_rope, &k_full, &v_full, 1.0, false)?
             };
             if let Some(t0) = tight_start {
                 bump_gemma4_attn_sdpa_tight_ms(t0.elapsed().as_secs_f64() * 1e3);
@@ -5859,8 +5925,20 @@ pub(crate) mod imp {
             //      Pre/post norms stay outside.
             //   3. Legacy: router_forward (routing_fused_tail slot) +
             //      experts_forward (experts_fused slot) chain.
+            // The fused slots run gather_qmm on unsorted indices: the decode
+            // branch of `experts_forward` (B·L·top_k < 64). A prefill chunk
+            // takes the legacy path, which sorts by expert first — at 2,048
+            // tokens unsorted gather_qmm is ~6.5x slower (M3 Max, 4-bit
+            // experts). Before MLX 0.32 the slots could not trace GatherQMM
+            // shapelessly, so every call already ended up on the legacy path.
+            let tokens: usize = h.shape()[..h.ndim() - 1]
+                .iter()
+                .map(|&d| d as usize)
+                .product();
+            let unsorted_experts = tokens * self.config.text_config.top_k_experts < 64;
             let needs_post_norm_outside;
-            let h2 = if gemma4_pre_post_norm_routing_experts_fuse_enabled()
+            let h2 = if unsorted_experts
+                && gemma4_pre_post_norm_routing_experts_fuse_enabled()
                 && lw.experts.gate_proj.bits == 4
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
@@ -5919,7 +5997,8 @@ pub(crate) mod imp {
                 }
                 needs_post_norm_outside = false;
                 h2
-            } else if gemma4_routing_experts_fuse_enabled()
+            } else if unsorted_experts
+                && gemma4_routing_experts_fuse_enabled()
                 && lw.experts.gate_proj.bits == 4
                 && lw.experts.gate_proj.group_size == 64
                 && lw.experts.gate_proj.mode == MODE_AFFINE
@@ -6587,7 +6666,7 @@ pub(crate) mod imp {
         /// even with KV quantization off: the global layers (head_dim 512) take
         /// MLX's materializing attention path, and one 35.8K-token pass asked
         /// Metal for a 41 GB scores buffer. Returns the last chunk's logits,
-        /// still lazy.
+        /// still lazy unless `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` is on.
         pub fn forward_last_token_chunked(
             &self,
             input_ids: &[u32],
@@ -6599,14 +6678,33 @@ pub(crate) mod imp {
             let chunk = self
                 .prefill_chunk_decision(cache.offset() + input_ids.len())
                 .chunk;
-            let mut chunks = input_ids.chunks(chunk).peekable();
+            let report = prefill_chunk_log::get();
+            let n_chunks = input_ids.len().div_ceil(chunk);
+            let mut chunks = input_ids.chunks(chunk).enumerate().peekable();
             loop {
-                let ids = chunks.next().expect("non-empty input yields a chunk");
+                let (idx, ids) = chunks.next().expect("non-empty input yields a chunk");
+                let t0 = report.then(Instant::now);
                 let logits = self.forward_last_token(ids, cache)?;
-                if chunks.peek().is_none() {
+                let is_last = chunks.peek().is_none();
+                if !is_last || report {
+                    logits.eval().context("prefill chunk eval")?;
+                }
+                if let Some(t0) = t0 {
+                    let active = crate::metal_memory::get_active_memory().unwrap_or(0);
+                    let peak = crate::metal_memory::get_peak_memory().unwrap_or(0);
+                    eprintln!(
+                        "[gemma4-prefill] chunk {}/{} ({} tok) {:.0}ms  mlx-mem active={:.1}GB peak={:.1}GB",
+                        idx + 1,
+                        n_chunks,
+                        ids.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                        active as f64 / 1e9,
+                        peak as f64 / 1e9,
+                    );
+                }
+                if is_last {
                     return Ok(logits);
                 }
-                logits.eval().context("prefill chunk eval")?;
             }
         }
 
@@ -8337,6 +8435,188 @@ pub(crate) mod imp {
                 windowed_kernel_agrees(no_window).is_err(),
                 "attention that ignores the window must fail the check"
             );
+        }
+
+        /// MLX sends a query of at most 8 rows to its vector kernel, which
+        /// ignores the window, so those never go to the windowed kernel.
+        #[test]
+        fn windowed_kernel_never_takes_vector_routed_queries() {
+            for l in 0..=8 {
+                assert!(
+                    !windowed_kernel_fits(l, 256),
+                    "{l} queries reach sdpa_vector"
+                );
+            }
+            assert!(windowed_kernel_fits(9, 256));
+            assert!(windowed_kernel_fits(2048, 128));
+            assert!(
+                !windowed_kernel_fits(2048, 512),
+                "no steel instantiation at 512"
+            );
+        }
+
+        /// `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` computes what the quantized
+        /// matmuls do, on each dispatch it can take: the windowed kernel (a
+        /// sliding layer, more than 8 queries), the explicit mask (a short
+        /// sliding query), and the causal sentinel (a full layer, queries at
+        /// the end of the keys).
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn dequantized_prefill_matches_the_quantized_path() {
+            const GROUP_SIZE: i32 = 64;
+            const BITS: i32 = 8;
+            let normal = |shape: &[i32], std_dev: f32, seed: u64| {
+                let key = mlx_rs::random::key(seed).unwrap();
+                mlx_rs::random::normal::<f32>(shape, None, Some(std_dev), &key)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let cosine = |a: &Array, b: &Array| {
+                let flat = |x: &Array| {
+                    let x = x
+                        .as_dtype(mlx_rs::Dtype::Float32)
+                        .unwrap()
+                        .reshape(&[-1])
+                        .unwrap();
+                    x.eval().unwrap();
+                    x.as_slice::<f32>().to_vec()
+                };
+                let (a, b) = (flat(a), flat(b));
+                let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                for (&x, &y) in a.iter().zip(&b) {
+                    dot += x as f64 * y as f64;
+                    na += x as f64 * x as f64;
+                    nb += y as f64 * y as f64;
+                }
+                dot / (na.sqrt() * nb.sqrt())
+            };
+            // (heads, kv_heads, head_dim, queries, keys, window)
+            let cases = [
+                (16, 8, 256, 64, 1100, Some(1024usize)),
+                (16, 8, 256, 4, 1027, Some(1024)),
+                (16, 2, 512, 64, 64, None),
+                (16, 2, 512, 64, 300, None),
+            ];
+            for (i, &(h, h_kv, d, q_len, k_len, window)) in cases.iter().enumerate() {
+                let seed = 0xde9 + 10 * i as u64;
+                // Gemma 4's softmax scale is 1.0: the queries arrive scaled.
+                let q = normal(&[1, h, q_len, d], 1.0 / (d as f32).sqrt(), seed);
+                let quantize = |x: Array| mlx_rs::ops::quantize(&x, GROUP_SIZE, BITS).unwrap();
+                let k = quantize(normal(&[1, h_kv, k_len, d], 1.0, seed + 1));
+                let v = quantize(normal(&[1, h_kv, k_len, d], 1.0, seed + 2));
+                let (ql, kl) = (q_len as usize, k_len as usize);
+                let mask = || build_causal_mask_abs(kl - ql, ql, 0, kl, window);
+                let got = dequantized_prefill_attention(
+                    &q,
+                    &k,
+                    &v,
+                    GROUP_SIZE,
+                    BITS,
+                    window,
+                    window.is_none(),
+                    mask,
+                )
+                .expect("dequantized prefill");
+                let want =
+                    quantized_kv_attention(&q, &k, &v, mask().unwrap().as_ref(), GROUP_SIZE, BITS)
+                        .expect("quantized attention");
+                let cos = cosine(&got, &want);
+                eprintln!(
+                    "[dequant-prefill] d={d} q={q_len} k={k_len} window={window:?} cos={cos:.6}"
+                );
+                assert!(cos >= 0.999, "d={d} q={q_len} k={k_len}: cos {cos}");
+            }
+        }
+
+        /// Why `windowed_kernel_fits` has an 8-row floor, on the rotating
+        /// cache's shape (`window - 1 + L` keys for `L` new tokens): the
+        /// explicit-mask path matches each query attending only to its own
+        /// window, and the windowed kernel does not. If the second assertion
+        /// starts failing, the fork honours the window for short queries and
+        /// the floor can go.
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn short_sliding_queries_need_the_explicit_mask() {
+            use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+            const WINDOW: usize = 1024;
+            let stream = mlx_rs::Stream::gpu();
+            let normal = |shape: &[i32], seed: u64| {
+                let key = mlx_rs::random::key(seed).unwrap();
+                mlx_rs::random::normal::<f32>(shape, None, None, &key)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let max_diff = |a: &Array, b: &Array| {
+                let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap())
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .max(None)
+                    .unwrap();
+                d.eval().unwrap();
+                d.item::<f32>()
+            };
+            for q_len in [2usize, 4, 8] {
+                let k_len = WINDOW - 1 + q_len;
+                let seed = 0x51de + q_len as u64;
+                let q = normal(&[1, 16, q_len as i32, 256], seed);
+                let k = normal(&[1, 8, k_len as i32, 256], seed + 1);
+                // The first keys are the ones a later query must not see.
+                // Their values are large, so one leaked key out of ~1,024
+                // moves the output by ~0.05, well clear of bf16 kernel noise.
+                let v = mlx_rs::ops::concatenate_axis(
+                    &[
+                        mlx_rs::ops::full::<f32>(&[1, 8, 8, 256], &Array::from_f32(50.0))
+                            .unwrap()
+                            .as_dtype(mlx_rs::Dtype::Bfloat16)
+                            .unwrap(),
+                        normal(&[1, 8, k_len as i32 - 8, 256], seed + 2),
+                    ],
+                    2,
+                )
+                .unwrap();
+                let scale = 1.0 / 16.0;
+                // Query i sits at key index WINDOW - 1 + i and may see keys
+                // i..=WINDOW - 1 + i.
+                let per_query: Vec<Array> = (0..q_len as i32)
+                    .map(|i| {
+                        let lo = i;
+                        let hi = WINDOW as i32 + i;
+                        sdpa(
+                            &q.index((Ellipsis, i..i + 1, ..)),
+                            &k.index((Ellipsis, lo..hi, ..)),
+                            &v.index((Ellipsis, lo..hi, ..)),
+                            scale,
+                            false,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let reference = mlx_rs::ops::concatenate_axis(&per_query, 2).unwrap();
+                let mask = build_causal_mask_abs(WINDOW - 1, q_len, 0, k_len, Some(WINDOW))
+                    .unwrap()
+                    .expect("a multi-token query needs a mask");
+                let masked = sdpa_with_mask(&q, &k, &v, scale, &mask).unwrap();
+                let kernel =
+                    mlx_rs::metal::lumen_sdpa_windowed(&q, &k, &v, scale, WINDOW as i32, &stream)
+                        .unwrap();
+                let (masked_diff, kernel_diff) =
+                    (max_diff(&masked, &reference), max_diff(&kernel, &reference));
+                eprintln!(
+                    "[short-sliding] q={q_len} k={k_len} explicit-mask diff={masked_diff:.4} \
+                     windowed-kernel diff={kernel_diff:.4}"
+                );
+                assert!(
+                    masked_diff < 0.02,
+                    "explicit mask at {q_len} queries: {masked_diff}"
+                );
+                assert!(
+                    kernel_diff > 0.03,
+                    "windowed kernel at {q_len} queries now honours the window ({kernel_diff})"
+                );
+            }
         }
 
         /// Last-token logits as f32.

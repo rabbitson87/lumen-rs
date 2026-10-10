@@ -124,6 +124,23 @@ mod imp {
         .context("rotating cache: trim and append")
     }
 
+    /// Tokens per page of a [`PageDigest`]. Divides the cache's 256-token
+    /// growth step, so a page never straddles a buffer reallocation.
+    pub const DIGEST_PAGE: usize = 64;
+
+    /// Per-page key bounds for page-sparse decode (`LUMEN_SPARSE_DECODE`): the
+    /// elementwise min and max of the keys in each full [`DIGEST_PAGE`]-token
+    /// page, `[B, n_kv_heads, pages, D]`. A query's dot product with any key in
+    /// a page is at most `Σ_d max(q_d·max_d, q_d·min_d)`, which is how decode
+    /// ranks pages without reading them (Quest, arXiv 2406.10774).
+    #[derive(Clone)]
+    pub struct PageDigest {
+        pub key_min: Array,
+        pub key_max: Array,
+        /// Full pages covered, counted from the start of the buffer.
+        pub pages: usize,
+    }
+
     /// Block-allocated full-attention KV cache (mlx_lm.KVCache step=256 semantics).
     #[derive(Clone)]
     pub struct NativeKvCache {
@@ -142,6 +159,10 @@ mod imp {
         /// positioning use `offset()` = `base_offset + offset`, while the
         /// physical buffer still starts at index 0.
         base_offset: usize,
+        /// Page digest of the keys, built on demand by [`Self::page_digest`].
+        /// Appends leave it valid; anything that rewrites or rewinds the
+        /// buffer trims or drops it.
+        digest: Option<PageDigest>,
     }
 
     impl NativeKvCache {
@@ -151,7 +172,53 @@ mod imp {
                 values: None,
                 offset: 0,
                 base_offset: 0,
+                digest: None,
             }
+        }
+
+        /// The page digest, brought up to date with every page that is full
+        /// now. Pages digested earlier are kept, so a decode step reads only
+        /// the keys of a page that has just filled. `None` for an empty cache
+        /// and for a suffix-only buffer under shared-prefix dedup, whose first
+        /// pages live in the shared buffer.
+        pub fn page_digest(&mut self) -> Result<Option<PageDigest>> {
+            let Some(keys) = self.keys.as_ref() else {
+                return Ok(None);
+            };
+            if self.base_offset != 0 {
+                return Ok(None);
+            }
+            let full = self.offset / DIGEST_PAGE;
+            let done = self.digest.as_ref().map_or(0, |d| d.pages);
+            if full > done {
+                let s = keys.shape();
+                let (b, h, d) = (s[0], s[1], s[3]);
+                let span = slice_axis2(
+                    keys,
+                    (done * DIGEST_PAGE) as i32,
+                    (full * DIGEST_PAGE) as i32,
+                )?;
+                let pages = mlx_rs::ops::reshape(
+                    &span,
+                    &[b, h, (full - done) as i32, DIGEST_PAGE as i32, d],
+                )
+                .context("NativeKvCache::page_digest: split pages")?;
+                let new_min = pages.min_axis(3, false)?;
+                let new_max = pages.max_axis(3, false)?;
+                let (key_min, key_max) = match self.digest.take() {
+                    Some(old) => (
+                        mlx_rs::ops::concatenate_axis(&[&old.key_min, &new_min], 2)?,
+                        mlx_rs::ops::concatenate_axis(&[&old.key_max, &new_max], 2)?,
+                    ),
+                    None => (new_min, new_max),
+                };
+                self.digest = Some(PageDigest {
+                    key_min,
+                    key_max,
+                    pages: full,
+                });
+            }
+            Ok(self.digest.clone())
         }
 
         /// Absolute logical position = shared-prefix length + suffix length.
@@ -205,6 +272,7 @@ mod imp {
             }
             self.offset = new_len;
             self.base_offset = prefix_len;
+            self.digest = None;
             Ok(())
         }
 
@@ -436,6 +504,7 @@ mod imp {
             self.values = None;
             self.offset = 0;
             self.base_offset = 0;
+            self.digest = None;
         }
 
         /// Replace keys / values / offset wholesale. Used by snapshot restore
@@ -446,6 +515,7 @@ mod imp {
             self.keys = keys;
             self.values = values;
             self.offset = offset;
+            self.digest = None;
         }
 
         /// MTP rollback hook — truncate logical offset to `target` and
@@ -484,6 +554,22 @@ mod imp {
                     .context("NativeKvCache::truncate_to: eval values")?;
             }
             self.offset = target;
+            // The slots past `target` will be overwritten: keep only the pages
+            // that lie wholly below it.
+            let keep = target / DIGEST_PAGE;
+            if let Some(d) = self.digest.take()
+                && keep > 0
+            {
+                self.digest = Some(if keep < d.pages {
+                    PageDigest {
+                        key_min: slice_axis2(&d.key_min, 0, keep as i32)?,
+                        key_max: slice_axis2(&d.key_max, 0, keep as i32)?,
+                        pages: keep,
+                    }
+                } else {
+                    d
+                });
+            }
             Ok(())
         }
     }
@@ -2517,6 +2603,11 @@ mod imp {
         /// Opt-in via `LUMEN_QWEN35_TQ_KV` — cuts the growing full-attn KV
         /// footprint ~2-4× at the cost of dequant-on-read.
         FullTurboquant(NativeRotatingKvCacheTurboQuant),
+        /// Full-attention layer whose KV is affine-quantized (`mlx::quantize`,
+        /// 4 or 8 bits). Opt-in via `LUMEN_QWEN35_QUANT_KV`. Decode reads it
+        /// through the fused kernel in `native_quant_attention`; prefill
+        /// dequantizes and takes the bf16 path.
+        FullQuantized(NativeKvCacheQuantized),
     }
 
     impl NativeLayerCache {
@@ -2528,6 +2619,17 @@ mod imp {
                 NativeLayerCache::Full(c) => c.offset(),
                 NativeLayerCache::Linear(c) => c.offset(),
                 NativeLayerCache::FullTurboquant(c) => c.offset(),
+                NativeLayerCache::FullQuantized(c) => c.offset(),
+            }
+        }
+
+        /// Mutable access to the affine-quantized full-attn cache.
+        pub fn as_full_quantized_mut(&mut self) -> Result<&mut NativeKvCacheQuantized> {
+            match self {
+                NativeLayerCache::FullQuantized(c) => Ok(c),
+                _ => Err(anyhow!(
+                    "NativeLayerCache::as_full_quantized_mut called on a non-FullQuantized layer"
+                )),
             }
         }
 
@@ -2578,6 +2680,7 @@ mod imp {
                 NativeLayerCache::Full(c) => c.clear(),
                 NativeLayerCache::Linear(c) => c.clear(),
                 NativeLayerCache::FullTurboquant(c) => c.clear(),
+                NativeLayerCache::FullQuantized(c) => c.clear(),
             }
         }
     }
@@ -2645,6 +2748,29 @@ mod imp {
                     } else {
                         NativeLayerCache::FullTurboquant(NativeRotatingKvCacheTurboQuant::new(
                             max_ctx, 0, tq_bits,
+                        ))
+                    }
+                })
+                .collect();
+            Self { layers }
+        }
+
+        /// Like [`NativePromptCache::new`] but full-attention layers hold
+        /// affine-quantized K/V (`LUMEN_QWEN35_QUANT_KV`).
+        pub fn new_with_quant(
+            is_linear_per_layer: &[bool],
+            ssm_slots: usize,
+            group_size: i32,
+            bits: i32,
+        ) -> Self {
+            let layers = is_linear_per_layer
+                .iter()
+                .map(|&is_linear| {
+                    if is_linear {
+                        NativeLayerCache::Linear(NativeArraysCache::new(ssm_slots))
+                    } else {
+                        NativeLayerCache::FullQuantized(NativeKvCacheQuantized::new(
+                            group_size, bits,
                         ))
                     }
                 })
@@ -2726,12 +2852,14 @@ mod imp {
 
         /// Token offset of the first full-attn layer — convenient for the
         /// decode loop's RoPE offset (all full-attn layers share the same
-        /// offset because they're updated in lockstep).
+        /// offset because they're updated in lockstep). Any full-attention
+        /// variant counts: reading only plain `Full` layers made a TurboQuant
+        /// or quantized cache report 0.
         pub fn full_attn_offset(&self) -> usize {
             self.layers
                 .iter()
-                .find_map(|l| l.as_full().map(|c| c.offset()))
-                .unwrap_or(0)
+                .find(|l| !matches!(l, NativeLayerCache::Linear(_)))
+                .map_or(0, NativeLayerCache::offset)
         }
 
         pub fn clear(&mut self) {
@@ -2756,6 +2884,9 @@ mod imp {
                     NativeLayerCache::FullTurboquant(c) => {
                         NativeLayerCache::FullTurboquant(c.structure_clone())
                     }
+                    NativeLayerCache::FullQuantized(c) => NativeLayerCache::FullQuantized(
+                        NativeKvCacheQuantized::new(c.group_size(), c.bits()),
+                    ),
                 })
                 .collect();
             Self { layers }
@@ -2772,9 +2903,9 @@ pub use imp::KV_CACHE_STEP;
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d decode loop in runner_native.rs.
 pub(crate) use imp::{
-    NativeArraysCache, NativeKvCache, NativeKvCacheQuantized, NativeLayerCache, NativePromptCache,
-    NativeRotatingKvCache, NativeRotatingKvCacheQuantized, NativeRotatingKvCacheTurboQuant,
-    SharedPrefixKv,
+    DIGEST_PAGE, NativeArraysCache, NativeKvCache, NativeKvCacheQuantized, NativeLayerCache,
+    NativePromptCache, NativeRotatingKvCache, NativeRotatingKvCacheQuantized,
+    NativeRotatingKvCacheTurboQuant, PageDigest, SharedPrefixKv,
 };
 
 // exercise concat / set-get / advance / construction
@@ -3282,5 +3413,96 @@ mod lifecycle_tests {
         let mut full = NativeLayerCache::Full(NativeKvCache::new());
         assert!(full.as_linear_mut().is_err());
         assert!(full.as_full_mut().is_ok());
+    }
+}
+
+// The page digest a cache keeps for page-sparse decode must equal the bounds
+// computed from scratch over its keys, through appends and rewinds.
+#[cfg(all(test, feature = "mlx-native"))]
+mod digest_tests {
+    use super::imp::{DIGEST_PAGE, NativeKvCache, NativePromptCache};
+    use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+    use mlx_rs::{Array, random};
+
+    fn normal(shape: &[i32], seed: u64) -> Array {
+        let key = random::key(seed).unwrap();
+        random::normal::<f32>(shape, None, None, &key).unwrap()
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap())
+            .unwrap()
+            .max(None)
+            .unwrap();
+        d.eval().unwrap();
+        d.item::<f32>()
+    }
+
+    /// Check `cache`'s digest against min/max over its first full pages.
+    fn check(cache: &mut NativeKvCache, all_keys: &Array) {
+        let digest = cache.page_digest().unwrap().expect("a digest");
+        let pages = cache.offset() / DIGEST_PAGE;
+        assert_eq!(digest.pages, pages);
+        let span = all_keys.index((Ellipsis, 0..(pages * DIGEST_PAGE) as i32, ..));
+        let paged =
+            mlx_rs::ops::reshape(&span, &[1, 2, pages as i32, DIGEST_PAGE as i32, 8]).unwrap();
+        assert_eq!(
+            max_abs_diff(&digest.key_min, &paged.min_axis(3, false).unwrap()),
+            0.0
+        );
+        assert_eq!(
+            max_abs_diff(&digest.key_max, &paged.max_axis(3, false).unwrap()),
+            0.0
+        );
+    }
+
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn digest_tracks_appends_and_rewinds() {
+        let keys = normal(&[1, 2, 1000, 8], 1);
+        let mut cache = NativeKvCache::new();
+        let feed = |cache: &mut NativeKvCache, from: i32, to: i32| {
+            let k = keys.index((Ellipsis, from..to, ..));
+            cache.update_and_fetch(&k, &k).unwrap();
+        };
+        // A prefill, then decode steps across page boundaries.
+        feed(&mut cache, 0, 300);
+        check(&mut cache, &keys);
+        for t in 300..400 {
+            feed(&mut cache, t, t + 1);
+        }
+        check(&mut cache, &keys);
+        // A rewind into the middle of a page drops that page and every later
+        // one; refilling must digest the new keys, not the stale ones.
+        cache.truncate_to(200).unwrap();
+        let replaced = normal(&[1, 2, 200, 8], 2);
+        let mut expect =
+            mlx_rs::ops::concatenate_axis(&[&keys.index((Ellipsis, 0..200, ..)), &replaced], 2)
+                .unwrap();
+        let k = replaced.index((Ellipsis, 0..200, ..));
+        cache.update_and_fetch(&k, &k).unwrap();
+        check(&mut cache, &expect);
+        // set_state (snapshot restore) drops the digest entirely.
+        let view = cache.keys_view().unwrap();
+        cache.set_state(view.clone(), view, 400);
+        expect = expect.index((Ellipsis, 0..400, ..));
+        check(&mut cache, &expect);
+    }
+
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn quantized_prompt_cache_reports_its_offset() {
+        let mut pc = NativePromptCache::new_with_quant(&[true, false, true, false], 2, 64, 8);
+        assert_eq!(pc.full_attn_offset(), 0);
+        let k = normal(&[1, 2, 70, 64], 3)
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        pc.layer_mut(1)
+            .unwrap()
+            .as_full_quantized_mut()
+            .unwrap()
+            .update_and_fetch(&k, &k)
+            .unwrap();
+        assert_eq!(pc.full_attn_offset(), 70);
     }
 }

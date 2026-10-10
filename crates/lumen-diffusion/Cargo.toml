@@ -38,14 +38,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # is an unconditional dep — no MLX/Metal needed to turn a prompt into token ids.
 tokenizers = { workspace = true }
 
-# Patched mlx-rs / mlx-sys fork (rabbitson87/mlx-rs, lumen-rs-patches branch).
+# Patched mlx-rs / mlx-sys fork (rabbitson87/mlx-rs, lumen-rs-patches-v0.32 branch).
 # Pinned to the SAME rev as lumen-mlx so cargo reuses the already-compiled
 # dependency rather than building a second copy. Provides conv2d / conv_transpose2d
 # / group-norm / quantized_matmul used across the VAE, DiT, and text encoder.
-mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "cee2f18ae60c23e1314301c3f07347d048725a6d", optional = true, default-features = false, features = [
+mlx-rs = { git = "https://github.com/rabbitson87/mlx-rs", rev = "e7244a229c555436e08637fe00540844962dc1b5", optional = true, default-features = false, features = [
     "accelerate",
 ] }
-mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "cee2f18ae60c23e1314301c3f07347d048725a6d", optional = true }
+mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "e7244a229c555436e08637fe00540844962dc1b5", optional = true }
 
 [dev-dependencies]
 lumen-testkit = { workspace = true }

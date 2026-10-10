@@ -1602,6 +1602,79 @@ static DEFECTS: &[Defect] = &[
         extra: &["--ignored"],
     },
     Defect {
+        name: "quantized-kv-prefill-unmasked",
+        symptom: "Gemma 4's quantized-KV attention added the default bool mask to \
+                  its scores, so `true` became +1.0 and nothing was masked: with \
+                  LUMEN_GEMMA4_QUANT_KV_MODE on (or auto past the threshold) every \
+                  prefill query attended to the whole cache, future tokens included",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        if mask.dtype() == mlx_rs::Dtype::Bool {",
+            replace: "        if false { // defect: a bool mask is added as 1.0 / 0.0",
+        }],
+        guards: &[mlx(
+            "native_attention::quantized_kv_attention_tests::quantized_kv_attention_matches_sdpa_on_dequantized_kv",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "short-sliding-query-loses-window",
+        symptom: "Gemma 4 sent every multi-token sliding-layer query to the \
+                  windowed kernel, but MLX routes 2-8 rows to sdpa_vector, which \
+                  drops the window; with the rotating cache's window-1+L keys, \
+                  query i saw i keys from before its window (final prefill \
+                  chunks of 2-8 tokens, MTP verify, short extends)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        query_len > 8 && matches!(head_dim, 64 | 80 | 128 | 256)",
+            replace: "        query_len > 1 && matches!(head_dim, 64 | 80 | 128 | 256) // defect: no 8-row floor",
+        }],
+        guards: &[mlx(
+            "gemma4_moe::imp::tests::windowed_kernel_never_takes_vector_routed_queries",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
+    Defect {
+        name: "compressed-cache-reports-offset-zero",
+        symptom: "NativePromptCache::full_attn_offset read only plain Full layers, \
+                  so a cache whose full-attention layers were TurboQuant or \
+                  quantized reported 0 tokens — the prefill scores clamp then \
+                  sized chunks as if nothing were cached",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                .find(|l| !matches!(l, NativeLayerCache::Linear(_)))\n                .map_or(0, NativeLayerCache::offset)",
+            replace: "                .find_map(|l| l.as_full().map(|c| c.offset())) // defect: plain Full only\n                .unwrap_or(0)",
+        }],
+        guards: &[mlx(
+            "native_cache::digest_tests::quantized_prompt_cache_reports_its_offset",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
+        name: "qwen-extend-clamp-ignores-cached-prefix",
+        symptom: "Qwen's prefill scores clamp sized each chunk for the call's own \
+                  tokens only, so an extend or prefix-cache continuation over a \
+                  long cached prefix built full-attention scores over prefix + \
+                  chunk keys without ever being clamped",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        cache.full_attn_offset() + n\n",
+            replace: "        n // defect: the cached prefix is not counted\n",
+        }],
+        guards: &[mlx(
+            "runner_native::imp::tests::the_chunk_clamp_counts_the_cached_prefix",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &["--ignored"],
+    },
+    Defect {
         name: "rotating-cache-both-paths",
         symptom: "the rotating-cache growth test asserted cached_len == fetch, \
                   false for the default path since step-prealloc landed; and the \
@@ -2014,9 +2087,15 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
             "gemma4_backend.rs"
         }
-        (_, "gemma-batch-prefill-unchunked") => "gemma4_moe.rs",
-        (_, "causal-mask-coverage") | (_, "causal-mask-builders-agree") => "native_attention.rs",
-        (_, "rotating-cache-both-paths") => "native_cache.rs",
+        (_, "gemma-batch-prefill-unchunked") | (_, "short-sliding-query-loses-window") => {
+            "gemma4_moe.rs"
+        }
+        (_, "causal-mask-coverage")
+        | (_, "causal-mask-builders-agree")
+        | (_, "quantized-kv-prefill-unmasked") => "native_attention.rs",
+        (_, "rotating-cache-both-paths") | (_, "compressed-cache-reports-offset-zero") => {
+            "native_cache.rs"
+        }
         (_, "flux-scheduler-invariants") => "scheduler.rs",
         (_, "flux-left-padding") => "tokenizer.rs",
         (_, "tool-choice-none")
@@ -2053,6 +2132,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
         (_, "release-requires-notarization") => "release.yml",
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
+        (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
     root().join(m.path).join(leaf)

@@ -18,6 +18,9 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTER` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_router` |
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
+| `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
+| `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
+| `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
@@ -35,7 +38,9 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
@@ -108,6 +113,51 @@ Fuse routing into the expert dispatch, replacing the two-slot
 *Optimization, default on.*
 
 Fuse the attention logit softcap. Output-identical.
+
+### `LUMEN_GEMMA4_PREFILL_CHUNK_LOG`
+
+*Diagnostic, default off.*
+
+Log each chunked-prefill chunk's wall time and MLX memory (active,
+ peak) to stderr, as `LUMEN_QWEN35_PREFILL_CHUNK_LOG` does for Qwen.
+ Chunk time against cache offset is how much of prefill attention
+ costs as the context grows. The last chunk is evaluated too, so the
+ returned logits are no longer lazy; every chunk already ends in an
+ eval, so no barrier is added inside a forward.
+
+### `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN`
+
+*Behavior, default on.*
+
+Decode over a quantized KV cache (single-token steps) through the
+ fused kernel in `native_quant_attention`, which dequantizes inside
+ its loop, instead of `quantized_matmul` · softmax ·
+ `quantized_matmul`. Falls back to the three-op path for layouts the
+ kernel does not read.
+
+ Default on (task 021): 2.3× faster at 8 bits on a global layer at
+ 64K keys, even at 4 bits; end-to-end decode −7.7% at 32K.
+ Teacher-forced decode against bf16 KV it agrees as well or better
+ than the three-op path: 96.68% vs 95.12% at 4 bits, 97.07% vs 96.88%
+ at 8. `=0` restores the three-op path.
+
+### `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT`
+
+*Behavior, default on.*
+
+Run quantized-KV prefill (queries of more than one token) through
+ the bf16 attention kernels: dequantize the cached K/V, then dispatch
+ as the bf16 caches do (the windowed kernel on sliding layers, causal
+ SDPA on full ones). The quantized path builds `Q·Kᵀ` explicitly with
+ `quantized_matmul`; this one lets the sliding layers skip K blocks
+ outside the window and drop their scores tensor. Different kernels,
+ so not bit-identical.
+
+ Default on (task 021): prefill −10.0% at 16K, −12.7% at 32K (paired
+ per-chunk t −28 / −5.9). Teacher-forced over 8,192 tokens against
+ bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
+ at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
+ `=0` restores the quantized matmuls.
 
 ### `LUMEN_MLX_AUTO_SESSION`
 
@@ -333,6 +383,18 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
 
+### `LUMEN_QWEN35_QUANT_KV`
+
+*Behavior, default off.*
+
+Store the full-attention KV cache affine-quantized (8-bit, group
+ 64): half the bytes of bf16. Decode reads it through the fused
+ kernel in `native_quant_attention`; prefill dequantizes each chunk
+ and takes the bf16 SDPA path. On an M3 Max at 64K keys (task 021)
+ decode attention is ~7% faster than bf16 at GQA 4 (9B) and 15-20%
+ slower at GQA 6-8 (27B, 35B-A3B), so this is a memory lever. Disk
+ persistence of these caches is not supported yet. Default off.
+
 ### `LUMEN_QWEN35_REASONING_EFFORT`
 
 *Behavior, default on.*
@@ -346,6 +408,18 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  A/B hatch. The equivalence matrix must never flip this expecting
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
+
+### `LUMEN_SPARSE_DECODE`
+
+*Behavior, default off.*
+
+Page-sparse decode on the full-attention layers (Qwen 3.5/3.6,
+ Gemma 4): once a cache holds `SPARSE_DECODE_MIN_KEYS` keys, a
+ single-token step attends to the pages whose key bounds score
+ highest for its query, plus the first and most recent pages,
+ instead of every key (`sdpa_page_sparse`). Prefill, MTP verify and
+ batched decode stay dense. Changes which keys are attended, so
+ `Behavior`. Default off.
 
 ### `LUMEN_TOKENIZE_MEMO`
 
