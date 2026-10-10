@@ -8,7 +8,8 @@ versions of some libraries.
 
 `lumen-rs` consumes three upstream-fork dependencies pinned to specific
 commit SHAs on `github.com/rabbitson87/<fork>` branches named
-`lumen-rs-patches`. A clean `cargo build` fetches them automatically —
+`lumen-rs-patches-v0.32` (MLX v0.32.3; the MLX 0.30 line stays on
+`lumen-rs-patches`). A clean `cargo build` fetches them automatically —
 **no sibling clones required**.
 The `mlx-native` feature triggers a longer first build (cmake +
 fetched mlx C++ source) but works end-to-end without manual setup.

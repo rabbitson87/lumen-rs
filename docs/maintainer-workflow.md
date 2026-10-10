@@ -84,19 +84,29 @@ is at the end of `docs/release-checklist.md`.
 
 `lumen-rs` consumes three upstream forks pinned to specific commit SHAs.
 Each fork lives under `github.com/rabbitson87/<fork>` with a branch
-named `lumen-rs-patches`.
+named `lumen-rs-patches-v0.32` (MLX v0.32.3 baseline); the MLX 0.30 line
+stays on `lumen-rs-patches`.
 
 The `candle-*` fork was dropped when the Candle backend was removed — a
 clean clone no longer needs a sibling `../candle` checkout to build.
 
 | Cargo dep | Fork branch | URL |
 |---|---|---|
-| `mlx-rs`, `mlx-sys` | `rabbitson87/mlx-rs/lumen-rs-patches` | https://github.com/rabbitson87/mlx-rs |
-| mlx-c submodule | `rabbitson87/mlx-c/lumen-rs-patches` | https://github.com/rabbitson87/mlx-c |
-| mlx core (FetchContent in mlx-c) | `rabbitson87/mlx/lumen-rs-patches` | https://github.com/rabbitson87/mlx |
+| `mlx-rs`, `mlx-sys` | `rabbitson87/mlx-rs/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx-rs |
+| mlx-c submodule | `rabbitson87/mlx-c/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx-c |
+| mlx core (FetchContent in mlx-c) | `rabbitson87/mlx/lumen-rs-patches-v0.32` | https://github.com/rabbitson87/mlx |
 
 Each branch is a **single squashed commit on top of an upstream
 baseline** so rebases stay atomic.
+
+**Rebasing onto a new MLX release gets new branches; never force-push the
+MLX branch.** mlx-c fetches MLX by branch *name* (`GIT_TAG` in its
+CMakeLists), so rewriting that branch changes what every older lumen-rs
+commit and release tag builds — and their mlx-c cannot compile against a
+newer MLX. Push the rebase as `lumen-rs-patches-v<x.y>` in mlx and mlx-c,
+point mlx-c's `GIT_TAG` at it, bump the submodule on a matching mlx-rs
+branch, then bump the `rev` here. The force-push flow below is only for
+mlx-rs and mlx-c, which are pinned by SHA.
 
 ### Bumping a fork SHA (when upstream has new commits to integrate)
 
