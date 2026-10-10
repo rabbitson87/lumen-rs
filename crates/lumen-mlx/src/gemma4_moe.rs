@@ -2648,11 +2648,17 @@ pub(crate) mod imp {
         /// as the bf16 caches do (the windowed kernel on sliding layers, causal
         /// SDPA on full ones). The quantized path builds `Q·Kᵀ` explicitly with
         /// `quantized_matmul`; this one lets the sliding layers skip K blocks
-        /// outside the window and drop their scores tensor. Decode keeps the
-        /// quantized matmuls. Different kernels, so not bit-identical.
+        /// outside the window and drop their scores tensor. Different kernels,
+        /// so not bit-identical.
+        ///
+        /// Default on (task 021): prefill −10.0% at 16K, −12.7% at 32K (paired
+        /// per-chunk t −28 / −5.9). Teacher-forced over 8,192 tokens against
+        /// bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
+        /// at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
+        /// `=0` restores the quantized matmuls.
         pub(crate) quant_kv_prefill_dequant {
             env: "LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT",
-            default: false,
+            default: true,
             kind: Behavior,
         }
     }
@@ -2661,14 +2667,31 @@ pub(crate) mod imp {
         /// Decode over a quantized KV cache (single-token steps) through the
         /// fused kernel in `native_quant_attention`, which dequantizes inside
         /// its loop, instead of `quantized_matmul` · softmax ·
-        /// `quantized_matmul`. On an M3 Max at 64K keys (task 021) it is 2.3×
-        /// faster at 8 bits on a global layer and even at 4 bits. Falls back to
-        /// the three-op path for layouts the kernel does not read. Default off.
+        /// `quantized_matmul`. Falls back to the three-op path for layouts the
+        /// kernel does not read.
+        ///
+        /// Default on (task 021): 2.3× faster at 8 bits on a global layer at
+        /// 64K keys, even at 4 bits; end-to-end decode −7.7% at 32K.
+        /// Teacher-forced decode against bf16 KV it agrees as well or better
+        /// than the three-op path: 96.68% vs 95.12% at 4 bits, 97.07% vs 96.88%
+        /// at 8. `=0` restores the three-op path.
         pub(crate) quant_kv_fused_attn {
             env: "LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN",
-            default: false,
+            default: true,
             kind: Behavior,
         }
+    }
+
+    /// Pin `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` process-wide for an
+    /// in-process A/B (`examples/gemma4_kv_quality.rs`).
+    pub fn set_quant_kv_prefill_dequant(on: bool) {
+        quant_kv_prefill_dequant::set(on);
+    }
+
+    /// Pin `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` process-wide for an in-process
+    /// A/B (`examples/gemma4_kv_quality.rs`).
+    pub fn set_quant_kv_fused_attn(on: bool) {
+        quant_kv_fused_attn::set(on);
     }
 
     /// Single-token attention over a quantized KV cache: the fused kernel when

@@ -19,8 +19,8 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_FUSE_ROUTING_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_routing_experts` |
 | `LUMEN_GEMMA4_FUSE_SOFTCAP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_softcap` |
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
-| `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | off | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
-| `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | off | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
+| `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
@@ -127,26 +127,37 @@ Log each chunked-prefill chunk's wall time and MLX memory (active,
 
 ### `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Decode over a quantized KV cache (single-token steps) through the
  fused kernel in `native_quant_attention`, which dequantizes inside
  its loop, instead of `quantized_matmul` · softmax ·
- `quantized_matmul`. On an M3 Max at 64K keys (task 021) it is 2.3×
- faster at 8 bits on a global layer and even at 4 bits. Falls back to
- the three-op path for layouts the kernel does not read. Default off.
+ `quantized_matmul`. Falls back to the three-op path for layouts the
+ kernel does not read.
+
+ Default on (task 021): 2.3× faster at 8 bits on a global layer at
+ 64K keys, even at 4 bits; end-to-end decode −7.7% at 32K.
+ Teacher-forced decode against bf16 KV it agrees as well or better
+ than the three-op path: 96.68% vs 95.12% at 4 bits, 97.07% vs 96.88%
+ at 8. `=0` restores the three-op path.
 
 ### `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Run quantized-KV prefill (queries of more than one token) through
  the bf16 attention kernels: dequantize the cached K/V, then dispatch
  as the bf16 caches do (the windowed kernel on sliding layers, causal
  SDPA on full ones). The quantized path builds `Q·Kᵀ` explicitly with
  `quantized_matmul`; this one lets the sliding layers skip K blocks
- outside the window and drop their scores tensor. Decode keeps the
- quantized matmuls. Different kernels, so not bit-identical.
+ outside the window and drop their scores tensor. Different kernels,
+ so not bit-identical.
+
+ Default on (task 021): prefill −10.0% at 16K, −12.7% at 32K (paired
+ per-chunk t −28 / −5.9). Teacher-forced over 8,192 tokens against
+ bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
+ at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
+ `=0` restores the quantized matmuls.
 
 ### `LUMEN_MLX_AUTO_SESSION`
 

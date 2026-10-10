@@ -114,7 +114,7 @@ pub mod gemma4 {
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
         NativeGemma4Model, NativeGemma4PromptCache, quant_params_for, set_forward_step,
-        take_gemma4_breakdown,
+        set_quant_kv_fused_attn, set_quant_kv_prefill_dequant, take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
