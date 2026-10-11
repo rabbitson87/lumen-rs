@@ -1402,8 +1402,8 @@ mod d512_decode_tests {
             };
             let (kf, vf) = (expand(&k), expand(&v));
             let scores = mlx_rs::ops::matmul(
-                &mlx_rs::ops::multiply(f(&q), Array::from_f32(scale)).unwrap(),
-                &mlx_rs::ops::transpose_axes(&kf, &[0, 1, 3, 2]).unwrap(),
+                mlx_rs::ops::multiply(f(&q), Array::from_f32(scale)).unwrap(),
+                mlx_rs::ops::transpose_axes(&kf, &[0, 1, 3, 2]).unwrap(),
             )
             .unwrap();
             let probs = mlx_rs::ops::softmax_axis(&scores, -1, Some(true)).unwrap();

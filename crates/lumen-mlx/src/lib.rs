@@ -29,7 +29,6 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use hf_hub::api::sync::ApiBuilder;
@@ -216,6 +215,7 @@ mod runner_native;
 #[cfg(feature = "mlx-pyo3")]
 mod runner_pyo3;
 mod runner_subprocess;
+mod session;
 mod session_feed;
 mod spec_decode;
 #[cfg(feature = "mlx-native")]
@@ -924,18 +924,6 @@ impl RunnerImpl {
             .fork_from_snapshot(snapshot_id, dst_seq_id)
     }
 
-    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
-        self.as_runner().prefill_grid(n)
-    }
-
-    fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
-        self.as_runner_mut().mark_rollback(seq_id)
-    }
-
-    fn rollback(&mut self, seq_id: u64) -> Result<usize> {
-        self.as_runner_mut().rollback(seq_id)
-    }
-
     /// L2 disk tier — persist a snapshot durably. Native-only; other backends
     /// are no-ops (their snapshot state is not serializable here).
     fn persist_snapshot_disk(
@@ -1172,6 +1160,29 @@ impl RunnerImpl {
     }
 }
 
+/// The Qwen runners, as the session machinery sees them — each method is the
+/// active variant's `Runner` method.
+impl session::SessionRunner for RunnerImpl {
+    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.as_runner_mut().prefill(seq_id, tokens)
+    }
+    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.as_runner_mut().extend(seq_id, tokens)
+    }
+    fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
+        self.as_runner_mut().remove_seq(seq_id)
+    }
+    fn prefill_grid(&self, n: usize) -> Option<session_feed::PrefillGrid> {
+        self.as_runner().prefill_grid(n)
+    }
+    fn mark_rollback(&mut self, seq_id: u64) -> Result<()> {
+        self.as_runner_mut().mark_rollback(seq_id)
+    }
+    fn rollback(&mut self, seq_id: u64) -> Result<usize> {
+        self.as_runner_mut().rollback(seq_id)
+    }
+}
+
 /// `RunnerImpl` exposes the narrow `SnapshotRunner` surface the prefix cache
 /// needs, delegating to the active variant's `Runner` impl. Keeps `prefix_cache`
 /// decoupled from the runner enum — the store works against these five methods.
@@ -1270,176 +1281,6 @@ fn selected_runner_kind() -> Result<RunnerKind> {
     let backend = std::env::var("LUMEN_MLX_BACKEND").ok();
     let legacy_subprocess = std::env::var("LUMEN_MLX_SUBPROCESS").ok();
     runner_kind_from_env(backend.as_deref(), legacy_subprocess.as_deref())
-}
-
-/// Per-session prompt-cache state. Holds the running token sequence (prompt +
-/// generated) so that the next request on the same session can skip prefilling
-/// the longest common prefix. `last_access` is bumped on every prefill / extend
-/// touch so TTL + LRU eviction can run from a single timestamp.
-struct SessionState {
-    seq_id: u64,
-    tokens: Vec<u32>,
-    /// How many of `tokens` the runner can wind this sequence back to: the
-    /// rollback point left at the conversation boundary, before the generation
-    /// header. `None` when no point was placed.
-    rollback_len: Option<usize>,
-    last_access: Instant,
-}
-
-impl SessionState {
-    /// Is this session exactly `prompt_ids`, one turn earlier?
-    ///
-    /// `tokens` is what the model was fed plus what it generated, so a strict
-    /// prefix match means the KV behind this sequence is a prefix of the KV this
-    /// prompt needs — the suffix can be appended instead of re-prefilling the
-    /// whole conversation. It is also the *only* thing that makes reuse safe, so
-    /// key selection can be a guess: a wrong guess costs a prefill, never an
-    /// answer.
-    fn extends(&self, prompt_ids: &[u32]) -> bool {
-        !self.tokens.is_empty()
-            && prompt_ids.len() > self.tokens.len()
-            && prompt_ids.starts_with(&self.tokens)
-    }
-
-    /// Where this prompt can pick the session up from its rollback point,
-    /// when it does not extend the whole session.
-    ///
-    /// That is the usual case for a chat turn, not an edge: the generation
-    /// header a turn ends with never comes back in the next prompt. Qwen 3.5
-    /// and 3.6 templates drop the `<think>` block from replayed assistant
-    /// turns, and on any checkpoint a client that does not return the trace
-    /// drops it too. So `extends` misses on every turn of a plain chat, while
-    /// everything before the header — the point kept here — is reproduced.
-    /// Same guard as `extends`: the prompt must actually continue those
-    /// tokens, so a wrong guess costs a prefill, never an answer.
-    fn resumes_at(&self, prompt_ids: &[u32]) -> Option<usize> {
-        let kept = self.rollback_len?;
-        (kept > 0
-            && kept <= self.tokens.len()
-            && prompt_ids.len() > kept
-            && prompt_ids.starts_with(&self.tokens[..kept]))
-        .then_some(kept)
-    }
-
-    /// How many of this prompt's tokens the session already holds, by
-    /// whichever route reaches more of them.
-    fn reusable_len(&self, prompt_ids: &[u32]) -> Option<usize> {
-        if self.extends(prompt_ids) {
-            Some(self.tokens.len())
-        } else {
-            self.resumes_at(prompt_ids)
-        }
-    }
-}
-
-/// How a session turn's sequence got to where its prompt starts feeding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionReuse {
-    /// The prompt continues the whole session; its end is the start.
-    Extend,
-    /// The prompt continues the session only up to its rollback point, and
-    /// the sequence was wound back there.
-    Resume,
-    /// Nothing reusable; a new, empty sequence.
-    Fresh,
-}
-
-/// A session turn's sequence, positioned for its prompt to be fed.
-struct SessionStart {
-    seq_id: u64,
-    /// Prompt tokens the sequence already holds.
-    from: usize,
-    how: SessionReuse,
-    /// The rollback point the sequence still holds, in tokens.
-    point: Option<usize>,
-}
-
-/// Key prefix for sessions the server invented rather than the client naming.
-const AUTO_SESSION_PREFIX: &str = "auto/";
-
-/// How many server-invented sessions to keep alive.
-///
-/// Bounded where an explicit session is not, and deliberately: a client that
-/// names a session has said it will come back, while an auto session is our
-/// guess, and each one holds a whole conversation's KV until it is evicted. Two
-/// covers the case this exists for — a conversation growing turn by turn — plus
-/// one alternate interleaved with it. `LUMEN_MLX_SESSION_MAX` still caps the
-/// pool as a whole for an operator who wants a harder bound.
-const AUTO_SESSION_MAX: usize = 2;
-
-lumen_flags::flag! {
-    /// Reuse a conversation's KV without the client naming a session.
-    ///
-    /// Neither the OpenAI nor the Anthropic request has a conversation id, and
-    /// `session_id` is a Lumen extension no stock client sends — so without
-    /// this, every spec-conformant client re-prefilled its whole conversation
-    /// on every turn. ON matches the prompt against live sessions by token
-    /// prefix instead, which needs no cooperation and cannot be wrong: the same
-    /// `starts_with` gate guards the reuse itself.
-    ///
-    /// **`Behavior`, not `Optimization`, and the mechanism is measured rather
-    /// than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
-    /// arms over the same tokens and localizes it: `extend` reproduces a bulk
-    /// prefill **bit-identically**, so the cache handoff is exact. What is not
-    /// exact is the decode path in between — the tokens between two prompts
-    /// advanced the cache one at a time, and a single-token forward is a
-    /// different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
-    /// reduction order differs. Measured on Qwen3.8-27B: identical for 43
-    /// tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
-    /// cover this — 256 vs 2048 are both GEMM.)
-    ///
-    /// Each path is deterministic and stable across runs; they just are not
-    /// each other, so the equivalence matrix must never flip this. Not a new
-    /// property — the explicit-`session_id` path has always had it, and this
-    /// output is byte-identical to that path's.
-    pub(crate) auto_session_enabled {
-        env: "LUMEN_MLX_AUTO_SESSION",
-        default: true,
-        kind: Behavior,
-    }
-}
-
-lumen_flags::flag! {
-    /// Leave a rollback point at each chat turn's conversation boundary, so
-    /// the next turn can resume a session it does not exactly extend.
-    ///
-    /// Without it, plain multi-turn chat on Qwen 3.5 / 3.6 never reuses a
-    /// session: the generation header a turn ends with is not in the next
-    /// prompt (the template drops the `<think>` block from replayed turns), so
-    /// every turn prefilled the whole conversation again — measured on
-    /// Qwen3.5-9B with an 11.5K-token system prompt, about 25 s a turn. The
-    /// same holds on 3.8 for any client that does not return the trace.
-    ///
-    /// **`Optimization`: the output does not change, by construction.** The
-    /// point is placed by cutting the prefill, and `session_feed::plan_feed`
-    /// only cuts where every row still goes through the kernels one bulk pass
-    /// uses, keeping that pass's chunk grid. A resumed turn re-feeds what
-    /// follows the point through the same bulk path, which is what a cold
-    /// prefill of the longer prompt does — `extend` reproduces a bulk prefill
-    /// bit-identically (`session_reuse_reproduces_a_cold_prefill`).
-    pub(crate) session_rollback_enabled {
-        env: "LUMEN_MLX_SESSION_ROLLBACK",
-        default: true,
-        kind: Optimization,
-    }
-}
-
-/// Read session-eviction limits from env. Both default to "no limit".
-///
-/// - `LUMEN_MLX_SESSION_TTL_SECS=N` — drop sessions idle > N seconds.
-/// - `LUMEN_MLX_SESSION_MAX=N`      — keep at most N sessions, evicting
-///   least-recently-used first.
-fn read_session_limits() -> (Option<Duration>, Option<usize>) {
-    let ttl = std::env::var("LUMEN_MLX_SESSION_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(Duration::from_secs);
-    let max = std::env::var("LUMEN_MLX_SESSION_MAX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0);
-    (ttl, max)
 }
 
 /// Compute a process-stable cache key for a chat request based on the system
@@ -2335,7 +2176,7 @@ impl MlxBackend {
                 }
                 let _ = tool_choice;
                 // Always the session path. Without an explicit id the prompt
-                // identifies its own conversation (see `resolve_session_key`),
+                // identifies its own conversation (see `session::Sessions::resolve_key`),
                 // which is the only way reuse is reachable from a stock OpenAI
                 // or Anthropic request — neither carries a conversation id, and
                 // `session_id` is a Lumen extension no such client sends. Before
@@ -3444,14 +3285,9 @@ pub struct MlxQwen35Backend {
     pub vocab_size: usize,
     tokenizer: Option<TextTokenizer>,
     next_seq_id: AtomicU64,
-    sessions: std::collections::HashMap<String, SessionState>,
-    /// Monotonic counter for `auto/N` session keys.
-    auto_session_seq: u64,
-    /// Cap on server-invented sessions; `0` disables them. See
-    /// [`read_auto_session_max`].
-    auto_session_max: usize,
-    session_ttl: Option<Duration>,
-    session_max: Option<usize>,
+    /// Conversation sessions — keying, rollback points, eviction. Shared with
+    /// any family; see [`session`].
+    sessions: session::Sessions,
     prefix_store: prefix_cache::PrefixCacheStore,
     /// Lazily-built llguidance parser factory for the Qwen 3.6 tool-call
     /// grammar (WS-C #2), backed by this model's `tokenizer.json`. `None`
@@ -3545,15 +3381,7 @@ impl MlxQwen35Backend {
             vocab_size,
             tokenizer: Some(TextTokenizer::from_hf(tokenizer)),
             next_seq_id: AtomicU64::new(1),
-            sessions: std::collections::HashMap::new(),
-            auto_session_seq: 0,
-            auto_session_max: if auto_session_enabled::get() {
-                AUTO_SESSION_MAX
-            } else {
-                0
-            },
-            session_ttl: None,
-            session_max: None,
+            sessions: session::Sessions::new(),
             prefix_store: prefix_cache::PrefixCacheStore::from_env(),
             grammar_factory: OnceLock::new(),
             wants_reasoning_effort: false,
@@ -3642,13 +3470,7 @@ impl MlxQwen35Backend {
             runner.name(),
         );
 
-        let (session_ttl, session_max) = read_session_limits();
-        if let Some(ttl) = session_ttl {
-            eprintln!("[mlx] session TTL = {}s", ttl.as_secs());
-        }
-        if let Some(max) = session_max {
-            eprintln!("[mlx] session LRU cap = {max}");
-        }
+        let sessions = session::Sessions::from_env();
 
         let prefix_store = prefix_cache::PrefixCacheStore::from_env();
         if prefix_store.enabled() {
@@ -3682,15 +3504,7 @@ impl MlxQwen35Backend {
             vocab_size,
             tokenizer,
             next_seq_id: AtomicU64::new(1),
-            sessions: std::collections::HashMap::new(),
-            auto_session_seq: 0,
-            auto_session_max: if auto_session_enabled::get() {
-                AUTO_SESSION_MAX
-            } else {
-                0
-            },
-            session_ttl,
-            session_max,
+            sessions,
             prefix_store,
             grammar_factory: OnceLock::new(),
             wants_reasoning_effort,
@@ -7270,7 +7084,7 @@ impl MlxQwen35Backend {
     ///
     /// Behavior:
     /// 1. Tokenize the full chat-templated prompt for this turn.
-    /// 2. Position the session's sequence (see [`Self::position_session`]):
+    /// 2. Position the session's sequence (see [`session::Sessions::position`]):
     ///    its end when the prompt extends the whole session, its rollback
     ///    point when the prompt only continues the conversation up to there,
     ///    else a fresh sequence.
@@ -7295,13 +7109,28 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt after tokenization"));
         }
 
-        self.evict_stale_sessions();
-        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
-        let boundary = self.conversation_boundary(&prompt_ids, thinking);
-        let start = self.position_session(session_id, &prompt_ids, "")?;
+        self.sessions.evict_stale(&mut self.runner);
+        let session_id = &self.sessions.resolve_key(session_id, &prompt_ids);
+        // Qwen's generation header — the one family-specific input.
+        let boundary = session::conversation_boundary(&prompt_ids, || {
+            self.encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
+                .ok()
+        });
+        let next_seq_id = &self.next_seq_id;
+        let start =
+            self.sessions
+                .position(&mut self.runner, session_id, &prompt_ids, "", || {
+                    next_seq_id.fetch_add(1, Ordering::Relaxed)
+                })?;
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) =
-            self.feed_session_prompt(session_id, &start, &prompt_ids, boundary, "")?;
+        let (mut last, mut pos, point) = session::feed(
+            &mut self.runner,
+            session_id,
+            &start,
+            &prompt_ids,
+            boundary,
+            "",
+        )?;
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
@@ -7338,194 +7167,10 @@ impl MlxQwen35Backend {
         // the cache state is needed for the next turn.
         let mut new_tokens = prompt_ids;
         new_tokens.extend_from_slice(&generated);
-        self.sessions.insert(
-            session_id.to_string(),
-            SessionState {
-                seq_id,
-                tokens: new_tokens,
-                rollback_len: point,
-                last_access: Instant::now(),
-            },
-        );
-        self.evict_excess_auto_sessions();
+        self.sessions
+            .store(&mut self.runner, session_id, seq_id, new_tokens, point);
 
         Ok(out)
-    }
-
-    /// Where this chat prompt's conversation ends and its generation header
-    /// begins — the part the next turn's history renders again.
-    ///
-    /// `None` when rollback points are off, or the header does not tokenize to
-    /// a clean suffix of the prompt (then there is no boundary to trust).
-    fn conversation_boundary(&self, prompt_ids: &[u32], thinking: bool) -> Option<usize> {
-        if !session_rollback_enabled::get() {
-            return None;
-        }
-        let header = self
-            .encode(crate::qwen3_5_tools::qwen3_generation_header(thinking))
-            .ok()?;
-        (!header.is_empty() && prompt_ids.len() > header.len() && prompt_ids.ends_with(&header))
-            .then(|| prompt_ids.len() - header.len())
-    }
-
-    /// Put the sequence for session `key` where `prompt_ids` can continue it.
-    ///
-    /// The session's end when the prompt extends all of it; its rollback point
-    /// when the prompt continues only that far, winding the sequence back
-    /// there; otherwise a new, empty sequence, dropping the old one. A rollback
-    /// that fails is logged and treated as no match — the turn still gets a
-    /// correct answer, only without the reuse.
-    fn position_session(
-        &mut self,
-        key: &str,
-        prompt_ids: &[u32],
-        label: &str,
-    ) -> Result<SessionStart> {
-        let found = self.sessions.get(key).map(|s| {
-            (
-                s.seq_id,
-                s.extends(prompt_ids).then_some(s.tokens.len()),
-                s.resumes_at(prompt_ids),
-                s.rollback_len,
-                s.tokens.len(),
-            )
-        });
-        match found {
-            Some((seq_id, Some(len), _, point, _)) => {
-                return Ok(SessionStart {
-                    seq_id,
-                    from: len,
-                    how: SessionReuse::Extend,
-                    point,
-                });
-            }
-            Some((seq_id, None, Some(kept), _, _)) => match self.runner.rollback(seq_id) {
-                Ok(pos) if pos == kept => {
-                    return Ok(SessionStart {
-                        seq_id,
-                        from: kept,
-                        how: SessionReuse::Resume,
-                        point: Some(kept),
-                    });
-                }
-                other => eprintln!(
-                    "[mlx] session={key:?}{label} rollback to {kept} failed ({:?}); prefilling fresh",
-                    other.map_err(|e| format!("{e:#}"))
-                ),
-            },
-            _ => {}
-        }
-        // No usable session → drop any old one, alloc new.
-        if let Some(old) = self.sessions.remove(key) {
-            let _ = self.runner.remove_seq(old.seq_id);
-            eprintln!(
-                "[mlx] session={key:?}{label} divergent prompt; dropping old seq {} ({} tokens)",
-                old.seq_id,
-                old.tokens.len()
-            );
-        }
-        Ok(SessionStart {
-            seq_id: self.alloc_seq_id(),
-            from: 0,
-            how: SessionReuse::Fresh,
-            point: None,
-        })
-    }
-
-    /// Feed `prompt[start.from..]` to the positioned sequence — a prefill
-    /// from position 0, an extend otherwise — leaving a rollback point at
-    /// `boundary` when [`session_feed::plan_feed`] finds an exact place for
-    /// one. Returns the next token, the position, and the rollback point the
-    /// sequence now holds (the new one, or the one it already had).
-    fn feed_session_prompt(
-        &mut self,
-        key: &str,
-        start: &SessionStart,
-        prompt: &[u32],
-        boundary: Option<usize>,
-        label: &str,
-    ) -> Result<(u32, usize, Option<usize>)> {
-        let (seq_id, from, end) = (start.seq_id, start.from, prompt.len());
-        let plan = match (boundary, self.runner.prefill_grid(end)) {
-            (Some(b), Some(grid)) => session_feed::plan_feed(from, end, grid, b),
-            _ => session_feed::FeedPlan {
-                cuts: vec![end],
-                mark: None,
-            },
-        };
-        let t = std::time::Instant::now();
-        let (mut last, mut pos, mut at) = (0, 0, from);
-        for &to in &plan.cuts {
-            (last, pos) = if at == 0 {
-                self.runner.prefill(seq_id, &prompt[at..to])?
-            } else {
-                self.runner.extend(seq_id, &prompt[at..to])?
-            };
-            if plan.mark == Some(to) {
-                self.runner.mark_rollback(seq_id)?;
-            }
-            at = to;
-        }
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        let marked = plan
-            .mark
-            .map(|m| format!(", rollback point at {m}"))
-            .unwrap_or_default();
-        let fed = end - from;
-        match start.how {
-            SessionReuse::Extend => eprintln!(
-                "[mlx] seq {seq_id} session={key:?}{label} reuse: cached={from} \
-                 suffix={fed} in {ms:.0}ms{marked}"
-            ),
-            SessionReuse::Resume => eprintln!(
-                "[mlx] seq {seq_id} session={key:?}{label} resume: rolled back to {from} \
-                 suffix={fed} in {ms:.0}ms{marked}"
-            ),
-            SessionReuse::Fresh => eprintln!(
-                "[mlx] seq {seq_id} session={key:?}{label} fresh prefill: {fed} tokens \
-                 in {ms:.0}ms{marked}"
-            ),
-        }
-        Ok((last, pos, plan.mark.or(start.point)))
-    }
-
-    /// Which session key this request should use.
-    ///
-    /// An explicit id is taken as given — the client is managing the session and
-    /// gets exactly the behaviour it always had. Without one, the prompt itself
-    /// identifies the conversation: see [`longest_prefix_session`]. Only when
-    /// nothing matches is a new `auto/N` key minted, and only if auto sessions
-    /// are enabled at all.
-    ///
-    /// Returning a fresh key when auto sessions are off is what keeps the old
-    /// behaviour intact: nothing will ever match it, so the turn cold-prefills
-    /// and `evict_excess_auto_sessions` drops it again immediately.
-    fn resolve_session_key(&mut self, session_id: Option<&str>, prompt_ids: &[u32]) -> String {
-        if let Some(id) = session_id {
-            return id.to_string();
-        }
-        if self.auto_session_max > 0
-            && let Some(k) = longest_prefix_session(&self.sessions, prompt_ids)
-        {
-            return k;
-        }
-        self.auto_session_seq += 1;
-        format!("{AUTO_SESSION_PREFIX}{}", self.auto_session_seq)
-    }
-
-    /// Drop auto sessions past the cap, oldest first, releasing their KV.
-    fn evict_excess_auto_sessions(&mut self) {
-        for key in pick_auto_session_victims(&self.sessions, self.auto_session_max) {
-            if let Some(state) = self.sessions.remove(&key) {
-                let _ = self.runner.remove_seq(state.seq_id);
-                eprintln!(
-                    "[mlx] session={key:?} evicted (auto-session cap {}); freed seq {} ({} tokens)",
-                    self.auto_session_max,
-                    state.seq_id,
-                    state.tokens.len()
-                );
-            }
-        }
     }
 
     /// Non-streaming completion (raw text path used by `/v1/completions`) with
@@ -7542,19 +7187,32 @@ impl MlxQwen35Backend {
             return Err(anyhow!("empty prompt"));
         }
 
-        self.evict_stale_sessions();
+        self.sessions.evict_stale(&mut self.runner);
 
         let prompt_ids: Vec<u32> = input_ids.to_vec();
         // Same resolution as the chat path: `/v1/completions` has no
         // conversation id either, and a client extending a raw prompt with what
         // the model just wrote is the same prefix relationship a chat turn is.
-        let session_id = &self.resolve_session_key(session_id, &prompt_ids);
+        let session_id = &self.sessions.resolve_key(session_id, &prompt_ids);
         // A raw prompt has no generation header, so no boundary to mark — but
         // it can still resume a chat session from that session's point.
-        let start = self.position_session(session_id, &prompt_ids, " (completion)")?;
+        let next_seq_id = &self.next_seq_id;
+        let start = self.sessions.position(
+            &mut self.runner,
+            session_id,
+            &prompt_ids,
+            " (completion)",
+            || next_seq_id.fetch_add(1, Ordering::Relaxed),
+        )?;
         let seq_id = start.seq_id;
-        let (mut last, mut pos, point) =
-            self.feed_session_prompt(session_id, &start, &prompt_ids, None, " (completion)")?;
+        let (mut last, mut pos, point) = session::feed(
+            &mut self.runner,
+            session_id,
+            &start,
+            &prompt_ids,
+            None,
+            " (completion)",
+        )?;
 
         let mut generated: Vec<u32> = vec![last];
         if !self.eos_tokens.contains(&last) {
@@ -7571,149 +7229,21 @@ impl MlxQwen35Backend {
 
         let mut new_tokens = prompt_ids;
         new_tokens.extend_from_slice(&generated);
-        self.sessions.insert(
-            session_id.to_string(),
-            SessionState {
-                seq_id,
-                tokens: new_tokens,
-                rollback_len: point,
-                last_access: Instant::now(),
-            },
-        );
-        self.evict_excess_auto_sessions();
+        self.sessions
+            .store(&mut self.runner, session_id, seq_id, new_tokens, point);
 
         Ok(generated)
     }
 
     /// Drop a session's prompt cache. Returns true if the session existed.
     pub fn drop_session(&mut self, session_id: &str) -> bool {
-        if let Some(state) = self.sessions.remove(session_id) {
-            let _ = self.runner.remove_seq(state.seq_id);
-            true
-        } else {
-            false
-        }
+        self.sessions.remove(&mut self.runner, session_id)
     }
 
     /// Number of live sessions. Used by tests + diagnostics.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
-
-    /// Drop sessions idle past TTL, then enforce LRU cap if set. No-op when
-    /// neither limit is configured. Called at the entry of every session-aware
-    /// generation request.
-    fn evict_stale_sessions(&mut self) {
-        let now = Instant::now();
-        let evicted =
-            pick_eviction_victims(&self.sessions, now, self.session_ttl, self.session_max);
-        for (key, reason) in evicted {
-            if let Some(state) = self.sessions.remove(&key) {
-                let _ = self.runner.remove_seq(state.seq_id);
-                eprintln!("[mlx] session={key:?} evicted ({reason})");
-            }
-        }
-    }
-}
-
-/// Which live session a prompt should extend, when the client named none.
-///
-/// A session's `tokens` are what the model was fed plus what it generated, so a
-/// session whose tokens are a strict prefix of this prompt **is** this
-/// conversation one turn earlier — no id required, and none available: neither
-/// the OpenAI nor the Anthropic request has a conversation identifier, and
-/// `session_id` is a Lumen extension no stock client sends. Matching on the
-/// tokens instead is what makes reuse reachable from a spec-conformant request.
-///
-/// The longest match wins, so a conversation that has grown extends its own
-/// newest state rather than an older snapshot of itself. A session also
-/// matches up to its rollback point (see [`SessionState::resumes_at`]), which
-/// is how a plain chat turn finds the previous one at all.
-///
-/// Explicit sessions are candidates too: a client that named a session on turn
-/// one and omitted it on turn two still continues the same conversation.
-fn longest_prefix_session(
-    sessions: &std::collections::HashMap<String, SessionState>,
-    prompt_ids: &[u32],
-) -> Option<String> {
-    sessions
-        .iter()
-        .filter_map(|(k, s)| s.reusable_len(prompt_ids).map(|n| (k, n)))
-        .max_by_key(|&(_, n)| n)
-        .map(|(k, _)| k.clone())
-}
-
-/// LRU victims among the **auto** sessions only, once they exceed `max`.
-///
-/// Explicit sessions are exempt: naming one is the client saying it will come
-/// back, while an auto session is our guess, and each holds a whole
-/// conversation's KV until dropped. `max == 0` means auto sessions are off, in
-/// which case every one of them is a victim.
-fn pick_auto_session_victims(
-    sessions: &std::collections::HashMap<String, SessionState>,
-    max: usize,
-) -> Vec<String> {
-    let mut autos: Vec<(&String, Instant)> = sessions
-        .iter()
-        .filter(|(k, _)| k.starts_with(AUTO_SESSION_PREFIX))
-        .map(|(k, s)| (k, s.last_access))
-        .collect();
-    if autos.len() <= max {
-        return Vec::new();
-    }
-    // Oldest first, drop until the cap is met.
-    autos.sort_by_key(|&(_, t)| t);
-    autos[..autos.len() - max]
-        .iter()
-        .map(|(k, _)| (*k).clone())
-        .collect()
-}
-
-/// Pure helper for `evict_stale_sessions`: picks (key, human_reason) pairs
-/// for every session that should be dropped at this moment. TTL victims first,
-/// then LRU until `session_max` is satisfied. Pulled out so the policy is unit-
-/// testable without spinning up a real runner.
-fn pick_eviction_victims(
-    sessions: &std::collections::HashMap<String, SessionState>,
-    now: Instant,
-    session_ttl: Option<Duration>,
-    session_max: Option<usize>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut alive: std::collections::HashMap<String, Instant> = sessions
-        .iter()
-        .map(|(k, s)| (k.clone(), s.last_access))
-        .collect();
-
-    if let Some(ttl) = session_ttl {
-        let stale: Vec<String> = alive
-            .iter()
-            .filter(|&(_, t)| now.duration_since(*t) > ttl)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in stale {
-            alive.remove(&k);
-            out.push((k, format!("TTL > {}s", ttl.as_secs())));
-        }
-    }
-
-    if let Some(max) = session_max {
-        while alive.len() > max {
-            let victim = alive
-                .iter()
-                .min_by_key(|&(_, t)| *t)
-                .map(|(k, _)| k.clone());
-            match victim {
-                Some(k) => {
-                    alive.remove(&k);
-                    out.push((k, format!("LRU cap {max}")));
-                }
-                None => break,
-            }
-        }
-    }
-
-    out
 }
 
 /// Phase 2: bridges Qwen35ResponseParser events to the generic
@@ -7934,6 +7464,7 @@ mod tests {
         DecodeRecord, PrefillRecord, RunnerTranscript, capture_runner_transcript,
         compare_runner_to_golden_transcript, load_runner_transcript,
     };
+    use crate::session::{SessionRunner, auto_session_enabled, session_rollback_enabled};
 
     #[cfg(feature = "mlx-native")]
     const DEFAULT_RUNNER: RunnerKind = RunnerKind::Native;
@@ -8196,119 +7727,6 @@ mod tests {
         }
     }
 
-    fn fake_session(seq_id: u64, last_access: Instant) -> SessionState {
-        SessionState {
-            seq_id,
-            tokens: vec![1, 2, 3],
-            rollback_len: None,
-            last_access,
-        }
-    }
-
-    fn session_with(tokens: Vec<u32>, last_access: Instant) -> SessionState {
-        SessionState {
-            seq_id: 0,
-            tokens,
-            rollback_len: None,
-            last_access,
-        }
-    }
-
-    /// A stock OpenAI or Anthropic request carries no conversation id, and
-    /// `session_id` is a Lumen extension no such client sends — so before this,
-    /// every one of them re-prefilled the whole conversation, every turn.
-    ///
-    /// The prompt identifies its own conversation instead: a session's tokens
-    /// are what the model was fed plus what it generated, so a strict prefix
-    /// match is that conversation, one turn earlier.
-    #[test]
-    fn a_prompt_finds_its_own_conversation_without_being_told_which() {
-        let now = Instant::now();
-        let mut map = std::collections::HashMap::new();
-        map.insert("auto/1".to_string(), session_with(vec![1, 2, 3], now));
-        // A longer state of the SAME conversation must win, so a growing chat
-        // extends its newest turn rather than an older snapshot of itself.
-        map.insert("auto/2".to_string(), session_with(vec![1, 2, 3, 4, 5], now));
-        // …and an unrelated conversation must not match at all.
-        map.insert("auto/3".to_string(), session_with(vec![9, 9], now));
-
-        assert_eq!(
-            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6]).as_deref(),
-            Some("auto/2")
-        );
-        // An explicit session is a candidate too — a client may name one on
-        // turn 1 and omit it afterwards.
-        map.insert(
-            "mine".to_string(),
-            session_with(vec![1, 2, 3, 4, 5, 6], now),
-        );
-        assert_eq!(
-            longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6, 7]).as_deref(),
-            Some("mine")
-        );
-    }
-
-    /// The guard that makes guessing a key safe at all.
-    #[test]
-    fn a_session_only_extends_a_prompt_that_actually_continues_it() {
-        let now = Instant::now();
-        let s = session_with(vec![1, 2, 3], now);
-        assert!(s.extends(&[1, 2, 3, 4]));
-        // Identical, not longer: there is nothing to append, and re-running it
-        // as an extension would decode from the wrong position.
-        assert!(!s.extends(&[1, 2, 3]));
-        assert!(!s.extends(&[1, 2]));
-        // Divergent at the last token — the case a system-hash key would get
-        // wrong and this cannot.
-        assert!(!s.extends(&[1, 2, 4, 5]));
-        // An empty session has no KV to reuse.
-        assert!(!session_with(Vec::new(), now).extends(&[1, 2, 3]));
-
-        let mut map = std::collections::HashMap::new();
-        map.insert("auto/1".to_string(), s);
-        assert!(longest_prefix_session(&map, &[7, 8, 9]).is_none());
-    }
-
-    /// A chat session matches the next turn up to its rollback point even when
-    /// the turn does not extend it — and only if the turn really continues
-    /// those tokens.
-    #[test]
-    fn a_session_is_found_again_through_its_rollback_point() {
-        let now = Instant::now();
-        // Turn one: 4 conversation tokens, a 2-token generation header (8, 9),
-        // a 1-token reply. The point sits before the header.
-        let mut s = session_with(vec![1, 2, 3, 4, 8, 9, 50], now);
-        s.rollback_len = Some(4);
-
-        // Turn two re-renders the reply without the header: no extension…
-        let next = [1, 2, 3, 4, 50, 60, 8, 9];
-        assert!(!s.extends(&next));
-        // …but everything up to the point is there.
-        assert_eq!(s.resumes_at(&next), Some(4));
-        assert_eq!(s.reusable_len(&next), Some(4));
-        // A prompt that diverges before the point does not match.
-        assert_eq!(s.resumes_at(&[1, 2, 7, 4, 50]), None);
-        // Nothing past the point: nothing to feed.
-        assert_eq!(s.resumes_at(&[1, 2, 3, 4]), None);
-        // Exact extension still wins when the prompt has it.
-        let extended = [1, 2, 3, 4, 8, 9, 50, 70];
-        assert_eq!(s.reusable_len(&extended), Some(7));
-        // A session without a point has only the exact route.
-        assert_eq!(
-            session_with(vec![1, 2, 3, 4, 8, 9], now).resumes_at(&next),
-            None
-        );
-
-        let mut map = std::collections::HashMap::new();
-        map.insert("auto/1".to_string(), s);
-        map.insert("auto/2".to_string(), session_with(vec![1, 2], now));
-        assert_eq!(
-            longest_prefix_session(&map, &next).as_deref(),
-            Some("auto/1"),
-            "the resumable session reuses more than the shorter exact one"
-        );
-    }
-
     /// Chat-template pieces as whole words, so a scripted conversation renders
     /// and tokenizes the way a real Qwen prompt does — specials split out,
     /// whitespace dropped. Only the shape of the token stream matters here.
@@ -8450,120 +7868,6 @@ mod tests {
             ];
             assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Prefill(99)]);
         });
-    }
-
-    /// Auto sessions are capped where explicit ones are not: naming a session
-    /// is the client saying it will come back, while an auto one is our guess,
-    /// and each holds a whole conversation's KV until dropped.
-    #[test]
-    fn only_the_sessions_the_server_invented_are_capped() {
-        let now = Instant::now();
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            "auto/1".to_string(),
-            session_with(vec![1], now - Duration::from_secs(30)),
-        );
-        map.insert(
-            "auto/2".to_string(),
-            session_with(vec![2], now - Duration::from_secs(20)),
-        );
-        map.insert(
-            "auto/3".to_string(),
-            session_with(vec![3], now - Duration::from_secs(10)),
-        );
-        map.insert(
-            "named".to_string(),
-            session_with(vec![4], now - Duration::from_secs(99)),
-        );
-
-        // Oldest auto first; the named one is exempt however stale it is.
-        assert_eq!(
-            pick_auto_session_victims(&map, 2),
-            vec!["auto/1".to_string()]
-        );
-        assert_eq!(
-            pick_auto_session_victims(&map, 1),
-            vec!["auto/1".to_string(), "auto/2".to_string()]
-        );
-        // `0` disables auto sessions — every one of them goes, the named one stays.
-        assert_eq!(
-            pick_auto_session_victims(&map, 0),
-            vec![
-                "auto/1".to_string(),
-                "auto/2".to_string(),
-                "auto/3".to_string()
-            ]
-        );
-        assert!(pick_auto_session_victims(&map, 8).is_empty());
-    }
-
-    #[test]
-    fn pick_eviction_victims_no_limits_keeps_all() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert("a".to_string(), fake_session(1, now));
-        map.insert("b".to_string(), fake_session(2, now));
-        let victims = pick_eviction_victims(&map, now, None, None);
-        assert!(victims.is_empty());
-    }
-
-    #[test]
-    fn pick_eviction_victims_ttl_drops_stale_only() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        let stale = now - Duration::from_secs(60);
-        map.insert("fresh".to_string(), fake_session(1, now));
-        map.insert("stale".to_string(), fake_session(2, stale));
-
-        let victims = pick_eviction_victims(&map, now, Some(Duration::from_secs(10)), None);
-        let keys: Vec<&str> = victims.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["stale"]);
-        assert!(victims[0].1.contains("TTL"));
-    }
-
-    #[test]
-    fn pick_eviction_victims_lru_drops_oldest_until_cap() {
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert(
-            "oldest".to_string(),
-            fake_session(1, now - Duration::from_secs(30)),
-        );
-        map.insert(
-            "middle".to_string(),
-            fake_session(2, now - Duration::from_secs(10)),
-        );
-        map.insert("newest".to_string(), fake_session(3, now));
-
-        let victims = pick_eviction_victims(&map, now, None, Some(1));
-        // Expect 2 victims (3 - 1 cap), oldest first.
-        assert_eq!(victims.len(), 2);
-        assert_eq!(victims[0].0, "oldest");
-        assert_eq!(victims[1].0, "middle");
-        assert!(victims[0].1.contains("LRU"));
-    }
-
-    #[test]
-    fn pick_eviction_victims_ttl_then_lru() {
-        // TTL drops one, LRU drops another from the survivors.
-        let mut map = std::collections::HashMap::new();
-        let now = Instant::now();
-        map.insert(
-            "expired".to_string(),
-            fake_session(1, now - Duration::from_secs(120)),
-        );
-        map.insert(
-            "oldish".to_string(),
-            fake_session(2, now - Duration::from_secs(20)),
-        );
-        map.insert("fresh".to_string(), fake_session(3, now));
-
-        let victims = pick_eviction_victims(&map, now, Some(Duration::from_secs(60)), Some(1));
-        // expired: TTL. oldish: LRU (fresh survives since cap=1).
-        assert_eq!(victims.len(), 2);
-        let reasons: Vec<&str> = victims.iter().map(|(_, r)| r.as_str()).collect();
-        assert!(reasons.iter().any(|r| r.contains("TTL")));
-        assert!(reasons.iter().any(|r| r.contains("LRU")));
     }
 
     #[test]

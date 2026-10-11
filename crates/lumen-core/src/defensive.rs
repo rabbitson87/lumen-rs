@@ -210,8 +210,9 @@ mod tests {
     /// on, in whichever configuration the suite runs.
     #[test]
     fn the_macros_evaluate_to_their_condition() {
-        assert!(always!(1 + 1 == 2));
-        assert!(!never!(1 + 1 == 3));
+        let two = std::hint::black_box(2);
+        assert!(always!(1 + 1 == two));
+        assert!(!never!(1 + 1 == two + 1));
     }
 
     /// They must be usable as expressions, not just statements — the whole

@@ -617,6 +617,52 @@ claims — turn one with and without a point, a resumed turn against a cold
 prefill — and must be run on a dense and a MoE checkpoint. The flag is
 `Optimization`.
 
+**Giving a new model family session reuse.** All of it lives in
+`crates/lumen-mlx/src/session.rs`, and none of it knows the model. A family
+supplies two things and makes six calls around its own decode loop (the
+module doc shows the sequence; `MlxQwen35Backend::chat_streaming_session` is the
+worked example):
+
+- its runner implements `session::SessionRunner`. `prefill` / `extend` /
+  `remove_seq` alone give exact-extension reuse. `prefill_grid` (chunk size, and
+  `min_piece: None` for mixture-of-experts) plus `mark_rollback` / `rollback`
+  (`RollbackPoint::capture` / `restore_into` on a `NativePromptCache`) add
+  resuming from the conversation boundary. Implement the three together: the
+  defaults refuse, so a family that skips all three is correct, just slower on
+  plain chat — but a grid alone makes `session::feed` place a point the runner
+  then refuses, and that fails the turn.
+- its generation header's token ids, returned from a closure passed to
+  `session::conversation_boundary` (it runs only when rollback points are on).
+  If the header is not a clean suffix of the prompt, the turn gets no rollback
+  point — never a wrong one.
+
+Then run `a_rollback_point_changes_no_token` on a checkpoint of the family before
+turning it on: the planner's "dense cuts are exact" rule is a measurement about
+MLX's kernels, and a family with different layers has to be measured, not
+assumed. Sliding-window (rotating) caches cannot roll back past a wrap and have
+no `RollbackPoint` arm — Gemma 4 reuses through its own prefix cache instead.
+
+**Run-time kernels are compiled on the user's Mac, for the user's macOS.** MLX
+compiles every `MetalKernel` at run time, as the Metal version that macOS
+supports: 3.1 on macOS 14 — the release's floor — but 4.1 on this machine. A
+kernel that needs anything newer passes every local test and fails only for
+users. So an unfiltered `cargo xtask test` ends with a second pass: every test
+in every file that calls `MetalKernel::new` (tier-1 ignored tests included,
+weight-dependent ones not) runs again with `MLX_METAL_LANGUAGE_VERSION=3.1`, an
+override in the rabbitson87/mlx fork. It is this machine's compiler targeting
+3.1, not a macOS 14 machine, and it covers `MetalKernel`s only — not the kernels
+MLX itself generates when it fuses a compiled graph.
+`metal_kernel::smoke_tests::kernels_compile_with_the_requested_metal_version`
+checks the override took effect (an MLX build from before it would otherwise
+pass vacuously). The pass counts what ran, not tests: every name given to
+`MetalKernel::new` must be applied during it — and its output evaluated, since
+MLX compiles at evaluation — so a kernel whose only test returns early for
+missing fixtures fails the pass by name. MLX compiles each instantiation
+separately, so a kernel generic over its float type (a dtype template argument)
+must also run as bfloat16, what the models use. A new kernel needs nothing extra
+— only a test that runs it without fixtures, in f32 and bf16, with its name as a
+string literal.
+
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to
 carry its trace; it did not make one carry it, because the route emitted no

@@ -1380,7 +1380,7 @@ mod parity_tests {
 #[cfg(all(test, feature = "mlx-native"))]
 mod capture_kernel_tests {
     use super::imp::{gated_delta_step_kernel, gated_delta_step_kernel_capture};
-    use mlx_rs::Array;
+    use mlx_rs::{Array, Dtype};
 
     fn mk(n: usize, seed: f32) -> Vec<f32> {
         (0..n)
@@ -1389,19 +1389,35 @@ mod capture_kernel_tests {
     }
     fn max_abs_diff(a: &Array, b: &Array) -> f32 {
         let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-        let m = d.max(None).unwrap();
+        let m = d.max(None).unwrap().as_dtype(Dtype::Float32).unwrap();
         m.eval().unwrap();
         m.as_slice::<f32>()[0]
     }
 
     #[test]
     fn capture_matches_base_and_per_position() {
+        capture_matches_base_and_per_position_as(Dtype::Float32);
+    }
+
+    /// What the models run: bf16 activations over an f32 state — a separate
+    /// instantiation of both kernels.
+    #[test]
+    fn capture_matches_base_and_per_position_in_bf16() {
+        capture_matches_base_and_per_position_as(Dtype::Bfloat16);
+    }
+
+    fn capture_matches_base_and_per_position_as(dt: Dtype) {
         let (b, t, hk, hv, dk, dv) = (1i32, 4i32, 1i32, 2i32, 32i32, 4i32);
-        let q = Array::from_slice(&mk((b * t * hk * dk) as usize, 0.11), &[b, t, hk, dk]);
-        let k = Array::from_slice(&mk((b * t * hk * dk) as usize, 0.13), &[b, t, hk, dk]);
-        let v = Array::from_slice(&mk((b * t * hv * dv) as usize, 0.17), &[b, t, hv, dv]);
-        let g = Array::from_slice(&mk((b * t * hv) as usize, 0.23), &[b, t, hv]);
-        let beta = Array::from_slice(&mk((b * t * hv) as usize, 0.19), &[b, t, hv]);
+        let act = |n: i32, seed: f32, shape: &[i32]| {
+            Array::from_slice(&mk(n as usize, seed), shape)
+                .as_dtype(dt)
+                .unwrap()
+        };
+        let q = act(b * t * hk * dk, 0.11, &[b, t, hk, dk]);
+        let k = act(b * t * hk * dk, 0.13, &[b, t, hk, dk]);
+        let v = act(b * t * hv * dv, 0.17, &[b, t, hv, dv]);
+        let g = act(b * t * hv, 0.23, &[b, t, hv]);
+        let beta = act(b * t * hv, 0.19, &[b, t, hv]);
         let state = Array::from_slice(&mk((b * hv * dv * dk) as usize, 0.05), &[b, hv, dv, dk]);
 
         let (y_b, s_b) = gated_delta_step_kernel(&q, &k, &v, &g, &beta, &state).unwrap();
@@ -1441,5 +1457,145 @@ mod capture_kernel_tests {
             "per-pos[0] vs T=1 final state"
         );
         eprintln!("capture kernel OK: y/state bit-identical, per-pos[0] and [T-1] verified");
+    }
+}
+
+// Every run-time kernel in this file has to run in a test with no fixture, in
+// f32 and in the bf16 the models use: the parity tests above need dumps from
+// the deleted lumen-metal crate and skip without them, and `cargo xtask test`'s
+// macOS 14 pass (Metal 3.1) only checks instantiations a test actually runs.
+#[cfg(all(test, feature = "mlx-native"))]
+mod fused_kernel_tests {
+    use super::imp::{inproj_tail_fused, rms_norm_gated_fused, rms_norm_gated_legacy};
+    use mlx_rs::{Array, Dtype};
+
+    fn mk(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 + 1.0) * seed).sin() * 0.5)
+            .collect()
+    }
+
+    fn values(a: &Array) -> Vec<f32> {
+        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
+        a.eval().unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    fn array(xs: &[f32], shape: &[i32], dt: Dtype) -> Array {
+        Array::from_slice(xs, shape).as_dtype(dt).unwrap()
+    }
+
+    /// bf16 keeps ~3 significant digits; the outputs here stay below ~2.
+    fn tolerance(dt: Dtype) -> f32 {
+        if dt == Dtype::Float32 { 1e-4 } else { 3e-2 }
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// The fused kernel against the composed ops it replaces.
+    #[test]
+    fn rms_norm_gated_fused_matches_the_composed_path() {
+        rms_norm_gated_fused_matches_the_composed_path_as(Dtype::Float32);
+    }
+
+    #[test]
+    fn rms_norm_gated_fused_matches_the_composed_path_in_bf16() {
+        rms_norm_gated_fused_matches_the_composed_path_as(Dtype::Bfloat16);
+    }
+
+    fn rms_norm_gated_fused_matches_the_composed_path_as(dt: Dtype) {
+        let (rows, d) = (6i32, 64i32);
+        let x = array(&mk((rows * d) as usize, 0.13), &[rows, d], dt);
+        let gate = array(&mk((rows * d) as usize, 0.07), &[rows, d], dt);
+        let w: Vec<f32> = mk(d as usize, 0.31).iter().map(|v| 1.0 + v).collect();
+        let w = array(&w, &[d], dt);
+        let fused = values(&rms_norm_gated_fused(&x, &gate, &w, 1e-6).unwrap());
+        let legacy = values(&rms_norm_gated_legacy(&x, &gate, &w, 1e-6).unwrap());
+        let diff = max_abs_diff(&fused, &legacy);
+        assert!(
+            diff < tolerance(dt),
+            "{dt:?} fused vs composed: max |diff| {diff}"
+        );
+    }
+
+    /// The fused conv + SiLU + split + q/k RMSNorm against the same math on the
+    /// CPU, as `INPROJ_TAIL_SOURCE` documents it.
+    #[test]
+    fn inproj_tail_fused_matches_its_math() {
+        inproj_tail_fused_matches_its_math_as(Dtype::Float32);
+    }
+
+    #[test]
+    fn inproj_tail_fused_matches_its_math_in_bf16() {
+        inproj_tail_fused_matches_its_math_as(Dtype::Bfloat16);
+    }
+
+    fn inproj_tail_fused_matches_its_math_as(dt: Dtype) {
+        let (nk, nv, dn, dv, taps) = (2usize, 3usize, 32usize, 32usize, 4usize);
+        let key_dim = nk * dn;
+        let conv_dim = 2 * key_dim + nv * dv;
+        let eps = 1e-6f32;
+        let conv_input = array(
+            &mk(taps * conv_dim, 0.17),
+            &[taps as i32, conv_dim as i32],
+            dt,
+        );
+        let conv_w = array(
+            &mk(conv_dim * taps, 0.05),
+            &[conv_dim as i32, taps as i32],
+            dt,
+        );
+        let wq: Vec<f32> = mk(dn, 0.23).iter().map(|v| 1.0 + v).collect();
+        let wk: Vec<f32> = mk(dn, 0.29).iter().map(|v| 1.0 + v).collect();
+        let (wq, wk) = (array(&wq, &[dn as i32], dt), array(&wk, &[dn as i32], dt));
+        let (q, k, v) = inproj_tail_fused(
+            &conv_input,
+            &conv_w,
+            &wq,
+            &wk,
+            eps,
+            nk as i32,
+            nv as i32,
+            dn as i32,
+            dv as i32,
+            taps as i32,
+        )
+        .unwrap();
+
+        // The reference reads the inputs as the kernel saw them (bf16-rounded).
+        let (conv_input, conv_w) = (values(&conv_input), values(&conv_w));
+        let (wq, wk) = (values(&wq), values(&wk));
+
+        let silu = |c: usize| {
+            let acc: f32 = (0..taps)
+                .map(|k| conv_input[k * conv_dim + c] * conv_w[c * taps + k])
+                .sum();
+            acc / (1.0 + (-acc).exp())
+        };
+        let normed = |base: usize, w: &[f32]| -> Vec<f32> {
+            let s: Vec<f32> = (0..dn).map(|d| silu(base + d)).collect();
+            let inv = 1.0 / (s.iter().map(|v| v * v).sum::<f32>() / dn as f32 + eps).sqrt();
+            s.iter().zip(w).map(|(v, w)| v * inv * w).collect()
+        };
+        let want_q: Vec<f32> = (0..nk).flat_map(|h| normed(h * dn, &wq)).collect();
+        let want_k: Vec<f32> = (0..nk)
+            .flat_map(|h| normed(key_dim + h * dn, &wk))
+            .collect();
+        let want_v: Vec<f32> = (0..nv * dv).map(|i| silu(2 * key_dim + i)).collect();
+
+        for (name, got, want) in [
+            ("q", values(&q), want_q),
+            ("k", values(&k), want_k),
+            ("v", values(&v), want_v),
+        ] {
+            let diff = max_abs_diff(&got, &want);
+            assert!(diff < tolerance(dt), "{dt:?} {name}: max |diff| {diff}");
+        }
     }
 }
