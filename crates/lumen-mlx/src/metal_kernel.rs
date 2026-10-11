@@ -21,6 +21,10 @@ mod imp {
     /// `mlx_fast_metal_kernel_config_free`.
     pub struct MetalKernelConfig {
         inner: mlx_sys::mlx_fast_metal_kernel_config,
+        /// `name=dtype` per dtype template argument, as test builds report a
+        /// kernel's instantiation (see [`note_kernel_ran`]).
+        #[cfg(test)]
+        dtype_args: std::cell::RefCell<Vec<String>>,
     }
 
     impl Default for MetalKernelConfig {
@@ -33,6 +37,8 @@ mod imp {
         pub fn new() -> Self {
             Self {
                 inner: unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() },
+                #[cfg(test)]
+                dtype_args: Default::default(),
             }
         }
 
@@ -95,6 +101,10 @@ mod imp {
                     "mlx_fast_metal_kernel_config_add_template_arg_dtype({name}) returned {status}"
                 ));
             }
+            #[cfg(test)]
+            self.dtype_args
+                .borrow_mut()
+                .push(format!("{name}={dtype:?}"));
             Ok(())
         }
 
@@ -148,6 +158,36 @@ mod imp {
     /// `mlx_fast_metal_kernel_free`.
     pub struct MetalKernel {
         inner: mlx_sys::mlx_fast_metal_kernel,
+        /// The kernel's name, as test builds report it (see [`note_kernel_ran`]).
+        #[cfg(test)]
+        name: String,
+    }
+
+    /// Test builds only: report each instantiation of a run-time kernel the
+    /// first time it is applied — its name, then its dtype template arguments
+    /// (`gated_delta_step InT=Bfloat16 StT=Float32`), since MLX compiles each
+    /// instantiation separately.
+    ///
+    /// `cargo xtask test`'s macOS 14 pass reads these lines (it runs with
+    /// `--nocapture`) and fails if a kernel declared in source never ran, or
+    /// one generic over its float type never ran as bfloat16: a test that
+    /// returns early — a missing fixture, say — would otherwise count as a
+    /// kernel checked at Metal 3.1 when it was never compiled. MLX compiles at
+    /// evaluation, so a kernel test has to evaluate what the kernel returns.
+    #[cfg(test)]
+    fn note_kernel_ran(name: &str, dtype_args: &[String]) {
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+        let line = std::iter::once(name)
+            .chain(dtype_args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Ok(mut seen) = SEEN.lock()
+            && seen.insert(line.clone())
+        {
+            eprintln!("[metal-kernel-ran] {line}");
+        }
     }
 
     impl MetalKernel {
@@ -227,7 +267,11 @@ mod imp {
                 return Err(anyhow!("mlx_fast_metal_kernel_new returned null handle"));
             }
 
-            Ok(Self { inner })
+            Ok(Self {
+                inner,
+                #[cfg(test)]
+                name: name.to_string(),
+            })
         }
 
         /// Apply the kernel with the given inputs and config. Returns the
@@ -240,6 +284,8 @@ mod imp {
             config: &MetalKernelConfig,
             num_outputs: usize,
         ) -> Result<Vec<Array>> {
+            #[cfg(test)]
+            note_kernel_ran(&self.name, &config.dtype_args.borrow());
             // Build mlx_vector_array of inputs, free on drop.
             struct VecArrayGuard(mlx_sys::mlx_vector_array);
             impl Drop for VecArrayGuard {
@@ -336,12 +382,78 @@ mod smoke_tests {
     use super::imp::{MetalKernel, MetalKernelConfig};
     use mlx_rs::{Array, Dtype};
 
+    /// The Metal language version MLX compiles run-time kernels with — the
+    /// one the user's macOS supports, not the build machine's.
+    ///
+    /// `cargo xtask test` runs every kernel's tests a second time with
+    /// `MLX_METAL_LANGUAGE_VERSION=3.1`, what macOS 14 compiles with, so a
+    /// kernel that needs a newer Metal fails here instead of on a user's Mac.
+    /// That pass is only as good as the override, and an MLX build from before
+    /// it (rabbitson87/mlx `lumen-rs-patches-v0.32`) silently ignores the
+    /// variable — so this kernel reports the version it was compiled with, and
+    /// the test holds it to the one requested.
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn kernels_compile_with_the_requested_metal_version() {
+        let kernel = MetalKernel::new(
+            "lumen_metal_version_probe",
+            &["inp"],
+            &["out"],
+            "out[0] = __METAL_VERSION__ + int(inp[0]);",
+            /* ensure_row_contiguous */ true,
+            /* atomic_outputs */ false,
+        )
+        .expect("probe kernel");
+        let input = Array::from_slice(&[0i32], &[1]);
+        let config = MetalKernelConfig::new();
+        config.set_grid(1, 1, 1).expect("grid");
+        config.set_thread_group(1, 1, 1).expect("thread group");
+        config.add_output_arg(&[1], Dtype::Int32).expect("output");
+        let out = kernel.apply(&[&input], &config, 1).expect("probe apply");
+        out[0].eval().expect("probe eval");
+        let compiled_with = out[0].as_slice::<i32>()[0];
+        eprintln!("run-time kernels compile as __METAL_VERSION__ {compiled_with}");
+
+        match std::env::var("MLX_METAL_LANGUAGE_VERSION").ok().as_deref() {
+            Some(requested) => {
+                let expected = match requested {
+                    "3.1" => 310,
+                    "3.2" => 320,
+                    "4.0" => 400,
+                    other => {
+                        panic!("MLX_METAL_LANGUAGE_VERSION={other}: not a version MLX accepts")
+                    }
+                };
+                assert_eq!(
+                    compiled_with, expected,
+                    "MLX_METAL_LANGUAGE_VERSION={requested} was ignored — this MLX build predates \
+                     the override; rebuild it (`cargo clean -p mlx-sys --release`)"
+                );
+            }
+            None => assert!(
+                compiled_with >= 310,
+                "macOS 14 is the floor: {compiled_with}"
+            ),
+        }
+    }
+
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn myexp_smoke_kernel_works() {
+        myexp_smoke_kernel_works_as(Dtype::Float32, 1e-5);
+    }
+
+    /// The bf16 instantiation is a separate compile (see `note_kernel_ran`).
+    #[test]
+    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+    fn myexp_smoke_kernel_works_in_bf16() {
+        myexp_smoke_kernel_works_as(Dtype::Bfloat16, 1e-2);
+    }
+
+    fn myexp_smoke_kernel_works_as(dt: Dtype, max_rel: f32) {
         let source = "uint elem = thread_position_in_grid.x;\n\
-                      T tmp = inp[elem];\n\
-                      out[elem] = metal::exp(tmp);";
+                      float tmp = static_cast<float>(inp[elem]);\n\
+                      out[elem] = static_cast<T>(metal::exp(tmp));";
         let kernel = MetalKernel::new(
             "myexp",
             &["inp"],
@@ -353,11 +465,11 @@ mod smoke_tests {
         .expect("MetalKernel::new must succeed");
 
         let input_data: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
-        let input = Array::from_slice(&input_data, &[4]);
+        let input = Array::from_slice(&input_data, &[4]).as_dtype(dt).unwrap();
 
         let config = MetalKernelConfig::new();
         config
-            .add_template_arg_dtype("T", Dtype::Float32)
+            .add_template_arg_dtype("T", dt)
             .expect("add_template_arg_dtype must succeed");
         config
             .set_grid(input_data.len() as i32, 1, 1)
@@ -366,7 +478,7 @@ mod smoke_tests {
             .set_thread_group(input_data.len() as i32, 1, 1)
             .expect("set_thread_group must succeed");
         config
-            .add_output_arg(&[input_data.len() as i32], Dtype::Float32)
+            .add_output_arg(&[input_data.len() as i32], dt)
             .expect("add_output_arg must succeed");
 
         let outputs = kernel
@@ -375,6 +487,7 @@ mod smoke_tests {
         assert_eq!(outputs.len(), 1);
         let out = &outputs[0];
         assert_eq!(out.shape(), &[4]);
+        let out = out.as_dtype(Dtype::Float32).unwrap();
         out.eval().expect("eval must succeed");
 
         let observed: &[f32] = out.as_slice();
@@ -386,8 +499,8 @@ mod smoke_tests {
             let abs_diff = (got - exp).abs();
             let rel = abs_diff / exp.abs().max(1e-6);
             assert!(
-                rel < 1e-5,
-                "myexp[{i}]: got={got} expected={exp} rel_err={rel}"
+                rel < max_rel,
+                "{dt:?} myexp[{i}]: got={got} expected={exp} rel_err={rel}"
             );
         }
     }

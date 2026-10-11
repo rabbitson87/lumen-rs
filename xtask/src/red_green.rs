@@ -47,6 +47,8 @@ struct Guard {
     test_target: &'static str,
     /// The Metal guards take minutes in a debug build and seconds in release.
     release: bool,
+    /// Environment for the guard's test run.
+    env: &'static [(&'static str, &'static str)],
 }
 
 struct Defect {
@@ -70,6 +72,7 @@ const fn mlx(filter: &'static str) -> Guard {
         lib_only: true,
         test_target: "",
         release: false,
+        env: &[],
     }
 }
 const fn dif(filter: &'static str) -> Guard {
@@ -80,6 +83,7 @@ const fn dif(filter: &'static str) -> Guard {
         lib_only: false,
         test_target: "",
         release: false,
+        env: &[],
     }
 }
 /// Guard on an integration-test target over the ungated tool-calling surface.
@@ -97,6 +101,7 @@ const fn mlx_ungated_test(target: &'static str, filter: &'static str) -> Guard {
         lib_only: false,
         test_target: target,
         release: false,
+        env: &[],
     }
 }
 
@@ -114,6 +119,7 @@ const fn mlx_native_test(target: &'static str, filter: &'static str) -> Guard {
         lib_only: false,
         test_target: target,
         release: false,
+        env: &[],
     }
 }
 
@@ -127,6 +133,7 @@ const fn srv(filter: &'static str) -> Guard {
         lib_only: true,
         test_target: "",
         release: false,
+        env: &[],
     }
 }
 
@@ -158,6 +165,16 @@ const fn mlx_checkpoint(filter: &'static str) -> Guard {
     }
 }
 
+/// `lumen-mlx` lib guard run the way `cargo xtask test`'s kernel pass runs it:
+/// MLX compiling run-time kernels as Metal 3.1, what macOS 14 compiles with.
+const fn mlx_oldest_metal(filter: &'static str) -> Guard {
+    Guard {
+        release: true,
+        env: &[("MLX_METAL_LANGUAGE_VERSION", "3.1")],
+        ..mlx(filter)
+    }
+}
+
 /// `lumen-mlx` lib guard that needs **no** feature — `grammar` is ungated
 /// (pure llguidance + serde_json), so this builds in seconds where an
 /// `mlx-native` lib guard takes minutes.
@@ -169,6 +186,7 @@ const fn core_mlx_lib(filter: &'static str) -> Guard {
         lib_only: true,
         test_target: "",
         release: false,
+        env: &[],
     }
 }
 
@@ -182,6 +200,7 @@ const fn srv_test(target: &'static str, filter: &'static str) -> Guard {
         lib_only: false,
         test_target: target,
         release: false,
+        env: &[],
     }
 }
 
@@ -195,6 +214,7 @@ const fn core(filter: &'static str) -> Guard {
         lib_only: true,
         test_target: "",
         release: false,
+        env: &[],
     }
 }
 
@@ -2031,6 +2051,27 @@ static DEFECTS: &[Defect] = &[
         needs_checkpoint: false,
         extra: &[],
     },
+    Defect {
+        name: "runtime-kernel-needs-newer-metal",
+        symptom: "MLX compiles run-time kernels (`MetalKernel`) on the user's Mac, \
+                  as the Metal version that macOS supports — 3.1 on macOS 14, the \
+                  release's floor — while every local test compiled them as this \
+                  machine's (4.1 on macOS 27). A kernel needing anything newer \
+                  passed every test and failed only for users. `cargo xtask test` \
+                  now re-runs every kernel file's tests with \
+                  MLX_METAL_LANGUAGE_VERSION=3.1 (rabbitson87/mlx override)",
+        revert: &[Mutation {
+            path: MLX,
+            find: "    pub const GATED_DELTA_KERNEL_SOURCE: &str = r#\"\n        auto n = thread_position_in_grid.z;",
+            replace: "    pub const GATED_DELTA_KERNEL_SOURCE: &str = r#\"\n        #if __METAL_VERSION__ < 320 // defect: needs Metal 3.2\n        #error needs Metal 3.2\n        #endif\n        auto n = thread_position_in_grid.z;",
+        }],
+        guards: &[mlx_oldest_metal(
+            "native_ssm::capture_kernel_tests::capture_matches_base_and_per_position",
+        )],
+        occurrences: 1,
+        needs_checkpoint: false,
+        extra: &[],
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2132,6 +2173,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "server-build-races-mlx-for-the-metallib") => "Cargo.toml",
         (_, "release-requires-notarization") => "release.yml",
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
+        (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
@@ -2255,6 +2297,7 @@ fn failing_guards(defect: &Defect) -> Result<Vec<&'static str>, String> {
         if !g.test_target.is_empty() {
             cmd.args(["--test", g.test_target]);
         }
+        cmd.envs(g.env.iter().copied());
         cmd.args([g.filter, "--", "--test-threads=1", "--exact"])
             .args(defect.extra);
         let out = cmd.output().map_err(|e| format!("spawn cargo: {e}"))?;

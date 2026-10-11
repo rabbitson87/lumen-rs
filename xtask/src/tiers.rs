@@ -246,7 +246,7 @@ const EXTERNAL_RULE_DEFINITIONS: &[&str] = &["xtask/src/tiers.rs"];
 ///
 /// Reporting zero because you stopped looking is the failure this command
 /// exists to prevent, so the fix belongs in the scanner and not in the reasons.
-fn logical_lines(src: &str) -> Vec<(usize, String)> {
+pub(crate) fn logical_lines(src: &str) -> Vec<(usize, String)> {
     let raw: Vec<&str> = src.lines().collect();
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -480,6 +480,12 @@ fn collect() -> std::io::Result<Vec<Entry>> {
         }
     }
     Ok(entries)
+}
+
+/// The tier an `#[ignore]` reason puts a test in, by number: `1` needs only a
+/// Metal device; `2` and up need something more (weights, a fixture, Python).
+pub(crate) fn tier_id(reason: &str) -> Option<u8> {
+    classify(reason).map(|t| t.id)
 }
 
 fn classify(reason: &str) -> Option<&'static Tier> {
