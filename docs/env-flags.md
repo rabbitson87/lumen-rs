@@ -21,10 +21,10 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
-| `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::auto_session_enabled` |
+| `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::session::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
-| `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session_rollback_enabled` |
+| `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session::session_rollback_enabled` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |

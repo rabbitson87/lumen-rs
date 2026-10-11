@@ -541,8 +541,8 @@ static DEFECTS: &[Defect] = &[
             find: "        .filter_map(|(k, s)| s.reusable_len(prompt_ids).map(|n| (k, n)))",
             replace: "        .filter_map(|(k, s)| { let _ = (k, s, prompt_ids); None::<(&String, usize)> })",
         }],
-        guards: &[mlx(
-            "tests::a_prompt_finds_its_own_conversation_without_being_told_which",
+        guards: &[core_mlx_lib(
+            "session::tests::a_prompt_finds_its_own_conversation_without_being_told_which",
         )],
         occurrences: 1,
         needs_checkpoint: false,
@@ -1851,7 +1851,7 @@ static DEFECTS: &[Defect] = &[
         }],
         guards: &[
             core_mlx_lib("tests::the_next_chat_turn_resumes_instead_of_prefilling_again"),
-            core_mlx_lib("tests::a_session_is_found_again_through_its_rollback_point"),
+            core_mlx_lib("session::tests::a_session_is_found_again_through_its_rollback_point"),
         ],
         occurrences: 1,
         needs_checkpoint: false,
@@ -2062,7 +2062,6 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "qwen-sampling-discarded")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")
-        | (_, "session-reuse-needs-a-nonstandard-field")
         | (_, "gemma-batch-grammar-skips-prefix-cache") => "lib.rs",
         // One defect, two files: the wire had no field for the trace *and* the
         // renderer had nowhere to put one. Reverting either half is enough to
@@ -2122,7 +2121,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "fastokens-nfc-newer-unicode") => "text_tokenizer.rs",
         (_, "rotating-cache-trims-against-offset") => "native_cache.rs",
         (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
-        (_, "chat-turn-header-defeats-session-reuse") => "lib.rs",
+        (_, "chat-turn-header-defeats-session-reuse")
+        | (_, "session-reuse-needs-a-nonstandard-field") => "session.rs",
         (_, "rollback-cut-inside-a-moe-chunk") | (_, "rollback-cut-leaves-a-short-piece") => {
             "session_feed.rs"
         }

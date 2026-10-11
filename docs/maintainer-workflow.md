@@ -617,6 +617,31 @@ claims — turn one with and without a point, a resumed turn against a cold
 prefill — and must be run on a dense and a MoE checkpoint. The flag is
 `Optimization`.
 
+**Giving a new model family session reuse.** All of it lives in
+`crates/lumen-mlx/src/session.rs`, and none of it knows the model. A family
+supplies two things and makes six calls around its own decode loop (the
+module doc shows the sequence; `MlxQwen35Backend::chat_streaming_session` is the
+worked example):
+
+- its runner implements `session::SessionRunner`. `prefill` / `extend` /
+  `remove_seq` alone give exact-extension reuse. `prefill_grid` (chunk size, and
+  `min_piece: None` for mixture-of-experts) plus `mark_rollback` / `rollback`
+  (`RollbackPoint::capture` / `restore_into` on a `NativePromptCache`) add
+  resuming from the conversation boundary. Implement the three together: the
+  defaults refuse, so a family that skips all three is correct, just slower on
+  plain chat — but a grid alone makes `session::feed` place a point the runner
+  then refuses, and that fails the turn.
+- its generation header's token ids, returned from a closure passed to
+  `session::conversation_boundary` (it runs only when rollback points are on).
+  If the header is not a clean suffix of the prompt, the turn gets no rollback
+  point — never a wrong one.
+
+Then run `a_rollback_point_changes_no_token` on a checkpoint of the family before
+turning it on: the planner's "dense cuts are exact" rule is a measurement about
+MLX's kernels, and a family with different layers has to be measured, not
+assumed. Sliding-window (rotating) caches cannot roll back past a wrap and have
+no `RollbackPoint` arm — Gemma 4 reuses through its own prefix cache instead.
+
 **A round trip has two halves, and the second one is easy to declare done.**
 Accepting a `thinking` block on input made an Anthropic conversation *able* to
 carry its trace; it did not make one carry it, because the route emitted no
