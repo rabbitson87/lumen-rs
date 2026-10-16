@@ -41,30 +41,26 @@ Run in order; the cheap and the automatic first.
       plausible numbers rather than crashing. Slow by roughly an order of
       magnitude; that is why it is here and not in the gate.
 - [ ] Miri over `lumen-core`, the FFI-free crate and so the only one Miri can
-      reason about. The command is not the obvious one, and both differences
-      were found by running it rather than by reading about it:
+      reason about. The command is not the obvious one, and the difference was
+      found by running it rather than by reading about it:
 
       ```
       MIRIFLAGS="-Zmiri-disable-isolation" \
-        cargo +nightly miri test -p lumen-core --lib -- --skip mtp_procrustes
+        cargo +nightly miri test -p lumen-core --lib
       ```
 
       * `-Zmiri-disable-isolation` — three round-trip tests write a scratch file,
         and Miri blocks filesystem access by default. Without the flag the run
         stops at the first `File::create` and reports a failure that has nothing
         to do with memory.
-      * `--skip mtp_procrustes` — those tests call `faer`'s SVD, which uses the
-        AArch64 NEON intrinsic `llvm.aarch64.neon.fmaxnmv.f64.v2f64`. Miri does
-        not emulate it and reports **`unsupported operation`**, which is a Miri
-        limitation and not a finding. Skipping is the honest response; treating
-        the abort as a failure would be as wrong as treating it as a pass.
 
-      So Miri covers `lumen-core` **minus the faer-backed linear algebra**. That
-      exclusion is the same kind as the `.metal` shaders in Phase 4.1: named,
-      with the reason, rather than quietly absent.
+      The run used to need `--skip mtp_procrustes`: those tests called `faer`'s
+      SVD, which uses a NEON intrinsic Miri does not emulate. That module and
+      `faer` are gone, so Miri now covers every `lumen-core` lib test.
 
-      **Start it the night before.** Measured: 75 passed, 0 failed, 3 filtered —
-      in **41,892 s (11 h 38 m)**. Miri interprets rather than executes, and
+      **Start it the night before.** Measured while the MTP corrector modules
+      still existed: 75 passed, 0 failed, 3 filtered — in **41,892 s
+      (11 h 38 m)**. Miri interprets rather than executes, and
       `lloyd_max::compute` runs 1,000 EM iterations over the full codebook, so
       the cost is in the numerics rather than in anything pathological. Treat
       this as an overnight job; a release plan that plans for minutes here will

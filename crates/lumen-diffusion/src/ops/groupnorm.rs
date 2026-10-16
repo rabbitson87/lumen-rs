@@ -103,12 +103,12 @@ mod imp {
 }
 
 #[cfg(feature = "mlx-native")]
-#[allow(unused_imports)] // Consumed by the VAE decoder (Phase 0).
 pub use imp::group_norm;
 
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::group_norm;
+    use crate::test_util::assert_all_close;
     use mlx_rs::Array;
 
     /// num_groups = 1 over 4 channels at a single spatial location reduces to a
@@ -124,14 +124,8 @@ mod parity_tests {
         assert_eq!(out.shape(), &[1, 1, 1, 4]);
         out.eval().expect("mlx eval must succeed");
 
-        let observed: &[f32] = out.as_slice();
         let expected = [-1.341641f32, -0.447214, 0.447214, 1.341641];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-3,
-                "group_norm[{i}]: got {got}, expected {exp}"
-            );
-        }
+        assert_all_close("group_norm", out.as_slice(), &expected, 1e-3);
     }
 
     /// Same input with affine weight=2, bias=1 → out = 2*normalized + 1.
@@ -146,15 +140,9 @@ mod parity_tests {
             group_norm(&x, 1, Some(&w), Some(&b), 1e-5, true).expect("group_norm must succeed");
         out.eval().expect("mlx eval must succeed");
 
-        let observed: &[f32] = out.as_slice();
         // 2 * [-1.341641,-0.447214,0.447214,1.341641] + 1
         let expected = [-1.683282f32, 0.105572, 1.894428, 3.683282];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-3,
-                "group_norm_affine[{i}]: got {got}, expected {exp}"
-            );
-        }
+        assert_all_close("group_norm_affine", out.as_slice(), &expected, 1e-3);
     }
 
     /// Two groups over 4 channels: groups {0,1} and {2,3} normalize independently.
@@ -169,13 +157,7 @@ mod parity_tests {
         let out = group_norm(&x, 2, None, None, 1e-8, true).expect("group_norm must succeed");
         out.eval().expect("mlx eval must succeed");
 
-        let observed: &[f32] = out.as_slice();
         let expected = [-1.0f32, 1.0, -1.0, 1.0];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-3,
-                "group_norm_2groups[{i}]: got {got}, expected {exp}"
-            );
-        }
+        assert_all_close("group_norm_2groups", out.as_slice(), &expected, 1e-3);
     }
 }

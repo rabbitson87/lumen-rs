@@ -10,6 +10,7 @@
 //! Each entry also records the symptom the defect produced in production, so
 //! `--list` doubles as the evidence for "this was already broken".
 
+use crate::repo_root;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -64,27 +65,31 @@ struct Defect {
     extra: &'static [&'static str],
 }
 
-const fn mlx(filter: &'static str) -> Guard {
+/// A non-release guard with no extra environment; the constructors below
+/// differ only in these.
+const fn guard(
+    package: &'static str,
+    features: &'static str,
+    lib_only: bool,
+    test_target: &'static str,
+    filter: &'static str,
+) -> Guard {
     Guard {
-        package: "lumen-mlx",
+        package,
         filter,
-        features: "mlx-native",
-        lib_only: true,
-        test_target: "",
+        features,
+        lib_only,
+        test_target,
         release: false,
         env: &[],
     }
 }
+
+const fn mlx(filter: &'static str) -> Guard {
+    guard("lumen-mlx", "mlx-native", true, "", filter)
+}
 const fn dif(filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-diffusion",
-        filter,
-        features: "mlx-native",
-        lib_only: false,
-        test_target: "",
-        release: false,
-        env: &[],
-    }
+    guard("lumen-diffusion", "mlx-native", false, "", filter)
 }
 /// Guard on an integration-test target over the ungated tool-calling surface.
 ///
@@ -94,15 +99,7 @@ const fn dif(filter: &'static str) -> Guard {
 /// one takes minutes. Also used by the fault sweeps, which are pure
 /// bytes-in/`Result`-out and equally GPU-free.
 const fn mlx_ungated_test(target: &'static str, filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-mlx",
-        filter,
-        features: "",
-        lib_only: false,
-        test_target: target,
-        release: false,
-        env: &[],
-    }
+    guard("lumen-mlx", "", false, target, filter)
 }
 
 /// Integration-test guard that DOES need `mlx-native`.
@@ -112,29 +109,13 @@ const fn mlx_ungated_test(target: &'static str, filter: &'static str) -> Guard {
 /// here genuinely needs the feature — `NativeWeights` holds `Array`, so the
 /// safetensors sweep cannot be built without MLX.
 const fn mlx_native_test(target: &'static str, filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-mlx",
-        filter,
-        features: "mlx-native",
-        lib_only: false,
-        test_target: target,
-        release: false,
-        env: &[],
-    }
+    guard("lumen-mlx", "mlx-native", false, target, filter)
 }
 
 /// `lumen-server` grew a lib target so its request types could be reached from
 /// tests and fuzzing; these guards live in `engine.rs`, which moved with it.
 const fn srv(filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-server",
-        filter,
-        features: "mlx-native",
-        lib_only: true,
-        test_target: "",
-        release: false,
-        env: &[],
-    }
+    guard("lumen-server", "mlx-native", true, "", filter)
 }
 
 /// `lumen-server` lib guard that loads a real checkpoint. Release, because
@@ -179,44 +160,31 @@ const fn mlx_oldest_metal(filter: &'static str) -> Guard {
 /// (pure llguidance + serde_json), so this builds in seconds where an
 /// `mlx-native` lib guard takes minutes.
 const fn core_mlx_lib(filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-mlx",
-        filter,
-        features: "",
-        lib_only: true,
-        test_target: "",
-        release: false,
-        env: &[],
-    }
+    guard("lumen-mlx", "", true, "", filter)
 }
 
 /// `lumen-server` integration-test guard. Its lib target carries the request
 /// types, so no feature is needed for the pure request-policy checks.
 const fn srv_test(target: &'static str, filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-server",
-        filter,
-        features: "",
-        lib_only: false,
-        test_target: target,
-        release: false,
-        env: &[],
-    }
+    guard("lumen-server", "", false, target, filter)
 }
 
 /// `lumen-core` is the FFI-free crate: no feature, no GPU, and the fastest
 /// guards in the catalogue.
 const fn core(filter: &'static str) -> Guard {
-    Guard {
-        package: "lumen-core",
-        filter,
-        features: "",
-        lib_only: true,
-        test_target: "",
-        release: false,
-        env: &[],
-    }
+    guard("lumen-core", "", true, "", filter)
 }
+
+/// The common case: one site, no checkpoint, no extra `libtest` arguments.
+const PLAIN: Defect = Defect {
+    name: "",
+    symptom: "",
+    revert: &[],
+    guards: &[],
+    occurrences: 1,
+    needs_checkpoint: false,
+    extra: &[],
+};
 
 static DEFECTS: &[Defect] = &[
     Defect {
@@ -235,9 +203,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "gemma4_backend::imp::tests::zero_does_not_disable_overlap",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "parallel-tool-calls-not-enforced",
@@ -258,9 +224,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "grammar::tests::the_one_call_stop_fires_on_the_closer_and_needs_no_grammar",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "mtp-norm-double-fold",
@@ -287,9 +251,7 @@ static DEFECTS: &[Defect] = &[
             ),
             mlx("qwen3_5_mtp::norm_convention_tests::the_boundary_is_pinned"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "effort-ungated-in-token-count",
@@ -311,9 +273,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "tests::effort_is_gated_on_the_checkpoint_declaring_it",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "replay-drops-think-block",
@@ -339,9 +299,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "tests::a_replayed_assistant_turn_matches_what_the_model_was_fed",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "reasoning-trace-has-no-wire-field",
@@ -378,9 +336,7 @@ static DEFECTS: &[Defect] = &[
             srv("types::reasoning_round_trip::the_field_lumen_emits_is_a_field_lumen_reads"),
             mlx("tests::a_replayed_thinking_turn_matches_what_the_model_was_fed"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "anthropic-thinking-block-rejected",
@@ -405,9 +361,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "types::reasoning_round_trip::an_anthropic_thinking_block_is_accepted_and_kept",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-thinking-trace-served-as-the-answer",
@@ -434,9 +388,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "qwen3_5_tools::tests::a_prompt_opened_think_block_is_reasoning_not_visible_text",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-plain-path-never-split-reasoning",
@@ -472,9 +424,7 @@ static DEFECTS: &[Defect] = &[
             mlx("qwen3_5_tools::tests::the_plain_path_splits_a_prompt_opened_trace"),
             mlx("qwen3_5_tools::tests::the_streaming_splitter_holds_a_tag_split_across_chunks"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "stray-think-close-reaches-the-answer",
@@ -507,9 +457,7 @@ static DEFECTS: &[Defect] = &[
             mlx("qwen3_5_tools::tests::a_stray_close_tag_never_reaches_the_answer"),
             mlx("qwen3_5_tools::tests::the_streaming_splitter_drops_a_stray_close_the_same_way"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "inference-error-drops-its-cause",
@@ -534,9 +482,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "types::inference_error_carries_its_cause::the_root_cause_survives_into_the_message",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "session-reuse-needs-a-nonstandard-field",
@@ -564,9 +510,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "session::tests::a_prompt_finds_its_own_conversation_without_being_told_which",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "anthropic-output-drops-thinking-block",
@@ -592,9 +536,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "engine::anthropic_thinking_blocks::the_trace_comes_first_then_text_then_tools",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "anthropic-stream-block-indices-pinned",
@@ -622,9 +564,7 @@ static DEFECTS: &[Defect] = &[
                 "routes::messages::tests::without_a_trace_text_is_still_index_zero_and_tools_start_at_one",
             ),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-tool-stream-drops-the-trace",
@@ -646,9 +586,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "qwen3_5_tools::tests::the_tool_parser_streams_the_trace_instead_of_only_keeping_it",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "tools-replay-doubles-think-block",
@@ -669,9 +607,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "qwen3_5_tools::tests::a_replayed_tool_turn_carries_the_trace_it_was_given",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "mtp-drops-sampling-knobs",
@@ -693,9 +629,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "tests::speculative_decode_refuses_sampling_it_cannot_reproduce",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-sampling-discarded",
@@ -719,9 +653,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "tests::a_request_asking_for_randomness_gets_a_sampler",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "tool-schema-uncounted-in-usage",
@@ -745,9 +677,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "tests::the_prompt_count_renders_the_tool_block_the_model_is_shown",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "tool-history-uncounted",
@@ -778,9 +708,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "tests::the_history_count_renders_the_tool_turns_the_model_is_shown",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "anthropic-batch-guard-omits-images",
@@ -814,9 +742,7 @@ static DEFECTS: &[Defect] = &[
             replace: "        .unwrap_or(\"0.0.0.0\"); // defect: every interface",
         }],
         guards: &[srv("access::tests::the_listener_defaults_to_loopback")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "api-key-not-enforced",
@@ -831,9 +757,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "access::tests::a_configured_key_is_required_everywhere_but_health_and_preflight",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "cors-setting-ignored",
@@ -846,9 +770,7 @@ static DEFECTS: &[Defect] = &[
             replace: "            Self::All => None, // defect: CORS never applied",
         }],
         guards: &[srv("access::tests::all_and_off_ignore_the_origin")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "completions-unguarded",
@@ -863,9 +785,9 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv_checkpoint(
             "engine::completion_admission::a_raw_prompt_over_the_cap_is_refused",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "prompt-refusal-reported-as-server-error",
@@ -881,9 +803,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "engine::prompt_refusal_status::a_refused_prompt_goes_out_as_a_client_error",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "gemma-cached-stream-thought-channel",
@@ -924,9 +844,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core(
             "sampling::tests::temperature_zero_breaks_a_tie_the_same_way_on_every_seed",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "greedy-decode-drops-the-grammar",
@@ -943,9 +861,9 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv_checkpoint(
             "engine::gemma_greedy_grammar::a_greedy_request_still_gets_its_schema",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "gemma-boundary-prefill-unchunked",
@@ -962,9 +880,9 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv_checkpoint(
             "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "gemma-batch-prefill-unchunked",
@@ -980,9 +898,9 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv_checkpoint(
             "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "gemma-drop-leaves-boundary-snapshot",
@@ -998,9 +916,9 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv_checkpoint(
             "engine::gemma_prefix_cache_drop::dropping_a_key_drops_its_boundary_snapshot_too",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "streams-delivered-in-one-burst",
@@ -1022,9 +940,9 @@ static DEFECTS: &[Defect] = &[
             "streaming_delivery",
             "the_server_streams_tokens_while_it_generates",
         )],
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "gemma-batch-grammar-skips-prefix-cache",
@@ -1035,13 +953,13 @@ static DEFECTS: &[Defect] = &[
                   the cache",
         revert: &[Mutation {
             path: MLX,
-            find: "                    // The grammar masks generated tokens only, so the prompt\n                    // can still come from the prefix cache.\n                    let key = session_id",
-            replace: "                    // defect: grammar requests skip the prefix cache\n                    let key: Option<String> = None;\n                    let _ = session_id",
+            find: "        // The grammar masks generated tokens only, so the prompt\n        // can still come from the prefix cache.\n        let key = session_id",
+            replace: "        // defect: grammar requests skip the prefix cache\n        let key: Option<String> = None;\n        let _ = session_id",
         }],
         guards: &[srv_checkpoint(
             "engine::gemma_batch_grammar_prefix_cache::a_batch_tool_request_leaves_a_snapshot_for_the_next_turn",
         )],
-        occurrences: 2, // the flat route and the history route
+        occurrences: 1, // `gemma4_chat`, shared by the flat route and the history route
         needs_checkpoint: true,
         extra: &["--ignored"],
     },
@@ -1065,9 +983,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "routes::messages::tests::message_start_reports_the_prompt_size_the_engine_measured",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "undeclared-tool-name-forwarded",
@@ -1090,9 +1006,7 @@ static DEFECTS: &[Defect] = &[
             srv("engine::tool_name_resolve_tests::an_unresolvable_name_is_dropped_not_forwarded"),
             srv("engine::tool_name_resolve_tests::requires_separator_boundary"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-parallel-tool-calls-not-consulted",
@@ -1113,9 +1027,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "tests::the_tool_decode_loop_consults_parallel_tool_calls",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-parallel-tool-calls-inert",
@@ -1143,9 +1055,7 @@ static DEFECTS: &[Defect] = &[
                 "qwen3_5_tools::tests::exactly_one_cuts_the_turn_where_one_or_more_keeps_decoding",
             ),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "parallel-tool-calls-ignored",
@@ -1162,9 +1072,7 @@ static DEFECTS: &[Defect] = &[
             "request_policy",
             "an_explicit_parallel_tool_calls_reaches_the_backend",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "scratch-path-collision",
@@ -1185,9 +1093,7 @@ static DEFECTS: &[Defect] = &[
             Self(std::env::temp_dir().join(format!("lumen-core-{stem}.bin")))"#,
         }],
         guards: &[core("testpath::two_temp_paths_never_collide")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "lark-opener",
@@ -1205,9 +1111,7 @@ static DEFECTS: &[Defect] = &[
             mlx("grammar::tests::lazy_activation_leaves_the_matcher_at_the_start_of_the_body"),
             mlx("grammar::tests::eager_prefill_replay_skips_the_opener_and_parses_the_rest"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "json-whitespace",
@@ -1220,9 +1124,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "grammar::tests::response_format_grammar_forbids_whitespace_runs",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "json-separator-space",
@@ -1238,9 +1140,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "grammar::tests::response_format_grammar_keeps_the_separator_space",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "grammar-rule-names",
@@ -1254,9 +1154,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "grammar::tests::lark_grammar_escapes_a_non_identifier_tool_name",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "grammar-control-chars",
@@ -1282,9 +1180,7 @@ static DEFECTS: &[Defect] = &[
             mlx("grammar::tests::lark_grammar_escapes_control_chars_in_a_tool_name"),
             mlx_ungated_test("fuzz_corpus_replay", "replay_grammar_literals"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "grammar-literal-escaping",
@@ -1306,9 +1202,7 @@ static DEFECTS: &[Defect] = &[
             // leaving that as a claim.
             mlx_ungated_test("fuzz_corpus_replay", "replay_grammar_literals"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "tool-name-scanner",
@@ -1340,9 +1234,7 @@ static DEFECTS: &[Defect] = &[
                 "parser_survives_generated_tool_call_streams",
             ),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "safetensors-silent-truncation",
@@ -1360,9 +1252,25 @@ static DEFECTS: &[Defect] = &[
             "weights_faults",
             "data_section_truncation_is_rejected_not_silently_wrong",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
+    },
+    Defect {
+        name: "gemma4-safetensors-silent-truncation",
+        symptom: "Gemma 4's loader never ran the completeness check Qwen's had: a \
+                  shard truncated inside its DATA section loaded with no error and \
+                  wrong weights, so an interrupted download of a Gemma checkpoint \
+                  served plausible, wrong output",
+        revert: &[Mutation {
+            path: MLX,
+            find: r#"                validate_safetensors_complete(&shard)?;
+"#,
+            replace: "                // xtask red-green: completeness guard removed\n",
+        }],
+        guards: &[mlx_native_test(
+            "weights_faults",
+            "gemma4_rejects_a_data_section_truncation_too",
+        )],
+        ..PLAIN
     },
     Defect {
         name: "config-null-moe-fields",
@@ -1380,9 +1288,7 @@ static DEFECTS: &[Defect] = &[
             "config_faults",
             "explicit_null_moe_fields_on_a_dense_config",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-nested-eos-token-id",
@@ -1414,9 +1320,7 @@ static DEFECTS: &[Defect] = &[
             "qwen35_config_validate",
             "eos_token_id_is_read_from_either_level",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "gemma4-config-null-moe-fields",
@@ -1436,9 +1340,7 @@ static DEFECTS: &[Defect] = &[
             "gemma4_config_faults",
             "explicit_null_moe_fields_on_a_dense_config",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "prefill-budget-rounds-to-zero",
@@ -1459,9 +1361,7 @@ static DEFECTS: &[Defect] = &[
             "prefill_budget_faults",
             "hostile_budget_env_values_never_hang_or_disable_the_guard",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "kv-disk-alloc-bomb",
@@ -1484,9 +1384,7 @@ static DEFECTS: &[Defect] = &[
             "kv_disk_faults",
             "implausible_record_length_is_rejected_not_allocated",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "args-unicode-keys",
@@ -1502,9 +1400,7 @@ static DEFECTS: &[Defect] = &[
                 "gemma4_tool_syntax::tests::args_to_json_handles_non_ascii_in_nested_and_array_positions",
             ),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "gemma-nonstreaming-grammar",
@@ -1520,9 +1416,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "grammar_routing_regressions::tools_alone_must_route_through_the_grammar_aware_decode",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "qwen-first-token-mask",
@@ -1536,9 +1430,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "grammar_routing_regressions::an_active_grammar_holds_the_last_prompt_token_back",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "tool-choice-none",
@@ -1557,9 +1449,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[srv(
             "engine::tool_choice_none_withholds_tools::none_hides_them",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "anthropic-turn-images",
@@ -1581,9 +1471,7 @@ static DEFECTS: &[Defect] = &[
                 "engine::anthropic_turn_image_alignment::a_textless_imageless_message_emits_no_turn",
             ),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "causal-mask-coverage",
@@ -1601,9 +1489,8 @@ static DEFECTS: &[Defect] = &[
             mlx("native_attention::parity_tests::causal_mask_prefill_window_truncates_past_window"),
             mlx("native_attention::parity_tests::causal_mask_decode_with_offset_and_window"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "causal-mask-builders-agree",
@@ -1617,9 +1504,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "native_attention::parity_tests::causal_mask_prefill_window_truncates_past_window",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "quantized-kv-prefill-unmasked",
@@ -1635,9 +1521,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "native_attention::quantized_kv_attention_tests::quantized_kv_attention_matches_sdpa_on_dequantized_kv",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "short-sliding-query-loses-window",
@@ -1654,9 +1539,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "gemma4_moe::imp::tests::windowed_kernel_never_takes_vector_routed_queries",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "compressed-cache-reports-offset-zero",
@@ -1672,9 +1555,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "native_cache::digest_tests::quantized_prompt_cache_reports_its_offset",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "qwen-extend-clamp-ignores-cached-prefix",
@@ -1690,9 +1572,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "runner_native::imp::tests::the_chunk_clamp_counts_the_cached_prefix",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "rotating-cache-both-paths",
@@ -1711,9 +1592,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "native_cache::lifecycle_tests::rotating_cache_growth_within_max_size",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "flux-scheduler-invariants",
@@ -1726,9 +1606,7 @@ static DEFECTS: &[Defect] = &[
             replace: r#"        let s = exp_mu / (exp_mu + (1.0 / t + 1.0));"#,
         }],
         guards: &[dif("scheduler::tests::shift_multiplies_the_odds_by_exp_mu")],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "flux-left-padding",
@@ -1745,9 +1623,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[dif(
             "tokenizer::tests::padding_is_on_the_left_and_preserves_order",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "gemma-thought-channel",
@@ -1762,9 +1638,9 @@ static DEFECTS: &[Defect] = &[
             "gemma4_chat::imp::tests::close_thought_channel_prefills_the_empty_block",
         )],
         // One site since both renderers share `generation_prompt_ids` (task 016).
-        occurrences: 1,
         needs_checkpoint: true,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "rotating-cache-trims-against-offset",
@@ -1784,9 +1660,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "native_cache::lifecycle_tests::rotating_cache_holds_what_mlx_lm_holds",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "windowed-kernel-used-unchecked",
@@ -1805,9 +1680,8 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx(
             "gemma4_moe::imp::tests::the_windowed_kernel_self_check_tells_right_from_wrong",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
         extra: &["--ignored"],
+        ..PLAIN
     },
     Defect {
         name: "fastokens-split-cache-reads-past-the-prefix",
@@ -1827,9 +1701,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "text_tokenizer::tests::fastokens_ids_do_not_depend_on_the_previous_call",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "fastokens-nfc-newer-unicode",
@@ -1847,9 +1719,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[core_mlx_lib(
             "text_tokenizer::tests::text_the_normalizers_disagree_on_is_encoded_by_hf",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "chat-turn-header-defeats-session-reuse",
@@ -1873,52 +1743,34 @@ static DEFECTS: &[Defect] = &[
             core_mlx_lib("tests::the_next_chat_turn_resumes_instead_of_prefilling_again"),
             core_mlx_lib("session::tests::a_session_is_found_again_through_its_rollback_point"),
         ],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
-        name: "rollback-cut-inside-a-moe-chunk",
-        symptom: "on a mixture-of-experts model a rollback point cut inside a \
-                  prefill chunk changes the answer: MLX's GatherQMM sorts the \
-                  routed rows by expert and tiles across them, so a row's result \
-                  depends on which rows share its call. Measured on \
-                  Qwen3.6-35B-A3B: a 32-row piece changed a greedy reply after \
-                  ~30 words, and a turn resumed from a 128-row-floored cut still \
-                  differed from a cold prefill. Such models mark only on chunk \
-                  boundaries, where the pieces are the bulk pass's own chunks",
+        name: "rollback-cut-inside-a-chunk",
+        symptom: "a rollback point cut inside a prefill chunk changes the answer \
+                  of the turn that places it: MLX picks kernels, and how they \
+                  split their sums, by how many rows share a call. On MLX 0.32 \
+                  split-K splits Qwen3.5-9B's 32-output linear-attention gate \
+                  projections 8 ways for a 2048-row chunk and 64 for 32 rows, \
+                  so a dense turn cut 32 rows before its header changed its \
+                  reply (it was exact on MLX 0.30); on a mixture-of-experts \
+                  model GatherQMM tiles across the routed rows, and a 32-row \
+                  piece changed a Qwen3.6-35B-A3B reply after ~30 words. Points \
+                  go on the bulk pass's chunk boundaries only",
         revert: &[Mutation {
             path: MLX,
-            find: "            let inside = grid.min_piece.map(|floor| {",
-            replace: "            let inside = grid.min_piece.or(Some(MIN_BULK_PIECE)).map(|floor| { // defect",
+            find: "    let cuts: Vec<usize> = (start / chunk + 1..)\n        .map(|k| k * chunk)\n        .take_while(|&c| c < end)\n        .chain([end])\n        .collect();",
+            replace: "    let mark = boundary.saturating_sub(32).max(mark); // defect: cuts inside the chunk\n    let mut cuts: Vec<usize> = (start / chunk + 1..)\n        .map(|k| k * chunk)\n        .take_while(|&c| c < end)\n        .chain([mark, end])\n        .collect();\n    cuts.sort_unstable();\n    cuts.dedup();",
         }],
-        guards: &[core_mlx_lib(
-            "session_feed::tests::a_mixture_of_experts_marks_only_on_chunk_boundaries",
-        )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
-    },
-    Defect {
-        name: "rollback-cut-leaves-a-short-piece",
-        symptom: "cutting the prefill right at the conversation boundary leaves \
-                  the generation header — ten rows on Qwen — as a piece of its \
-                  own, and below ~32 rows MLX computes quantized projections with \
-                  its vector kernel (`get_qmv_batch_limit`), which sums in a \
-                  different order from the bulk chunk those rows sat in: the turn \
-                  that places the point is no longer the turn without it. The \
-                  planner keeps every piece cut inside a chunk at 32+ rows",
-        revert: &[Mutation {
-            path: MLX,
-            find: "                let at = boundary.min(cell_end.saturating_sub(floor));",
-            replace: "                let at = boundary; // defect: cuts at the header",
-        }],
-        guards: &[core_mlx_lib(
-            "session_feed::tests::a_cut_never_changes_which_kernels_a_row_goes_through",
-        )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        guards: &[
+            core_mlx_lib(
+                "session_feed::tests::a_cut_never_changes_which_kernels_a_row_goes_through",
+            ),
+            core_mlx_lib(
+                "session_feed::tests::the_point_goes_to_the_last_chunk_boundary_before_the_header",
+            ),
+        ],
+        ..PLAIN
     },
     Defect {
         name: "bundled-server-writes-its-metallib-into-the-app",
@@ -1940,9 +1792,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "a_bundled_library_is_used_without_writing_into_the_bundle",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "release-bundle-ships-no-metallib",
@@ -1960,9 +1810,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "the_release_workflow_ships_the_library_where_mlx_looks",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "bundle-claims-an-older-macos-than-its-kernels",
@@ -1982,9 +1830,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "the_bundle_declares_the_macos_its_kernels_were_built_for",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "server-build-races-mlx-for-the-metallib",
@@ -2006,9 +1852,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "the_server_depends_on_mlx_sys_directly_at_lumen_mlx_s_rev",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "release-requires-notarization",
@@ -2026,9 +1870,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "the_release_builds_without_notarization_unless_asked",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "unsigned-bundle-reads-as-damaged",
@@ -2047,9 +1889,7 @@ static DEFECTS: &[Defect] = &[
             "packaging",
             "a_build_without_a_certificate_is_still_validly_signed",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
     Defect {
         name: "runtime-kernel-needs-newer-metal",
@@ -2068,9 +1908,7 @@ static DEFECTS: &[Defect] = &[
         guards: &[mlx_oldest_metal(
             "native_ssm::capture_kernel_tests::capture_matches_base_and_per_position",
         )],
-        occurrences: 1,
-        needs_checkpoint: false,
-        extra: &[],
+        ..PLAIN
     },
 ];
 
@@ -2091,6 +1929,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "kv-disk-alloc-bomb") => "kv_disk.rs",
         (_, "config-null-moe-fields") | (_, "qwen-nested-eos-token-id") => "qwen35_config.rs",
         (_, "safetensors-silent-truncation") => "qwen3_5_moe.rs",
+        (_, "gemma4-safetensors-silent-truncation") => "gemma4_moe.rs",
         (_, "mtp-norm-double-fold") => "qwen3_5_mtp.rs",
         (_, "prefill-budget-rounds-to-zero") => "prefill_budget.rs",
         (_, "gemma4-config-null-moe-fields") => "gemma4_config.rs",
@@ -2164,9 +2003,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "windowed-kernel-used-unchecked") => "gemma4_moe.rs",
         (_, "chat-turn-header-defeats-session-reuse")
         | (_, "session-reuse-needs-a-nonstandard-field") => "session.rs",
-        (_, "rollback-cut-inside-a-moe-chunk") | (_, "rollback-cut-leaves-a-short-piece") => {
-            "session_feed.rs"
-        }
+        (_, "rollback-cut-inside-a-chunk") => "session_feed.rs",
         (_, "bundled-server-writes-its-metallib-into-the-app") => "metallib.rs",
         (_, "release-bundle-ships-no-metallib") => "release.yml",
         (_, "bundle-claims-an-older-macos-than-its-kernels") => "tauri.conf.json",
@@ -2177,15 +2014,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
     };
-    root().join(m.path).join(leaf)
-}
-
-fn root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is `<workspace>/xtask`.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives one level below the workspace root")
-        .to_path_buf()
+    repo_root().join(m.path).join(leaf)
 }
 
 /// Where pristine copies live while a mutation is applied.
@@ -2196,14 +2025,14 @@ fn root() -> PathBuf {
 /// impatient Ctrl-C sends. The journal survives those: the next run finds it and
 /// puts the sources back before doing anything else.
 fn journal_dir() -> PathBuf {
-    root().join("target/xtask-red-green-journal")
+    repo_root().join("target/xtask-red-green-journal")
 }
 
 /// Journal entries are named after the file they back up, with separators
 /// escaped, so the directory listing is its own index — no format to parse and
 /// nothing that can be half-written.
 fn journal_entry(path: &Path) -> PathBuf {
-    let rel = path.strip_prefix(root()).unwrap_or(path);
+    let rel = path.strip_prefix(repo_root()).unwrap_or(path);
     journal_dir().join(rel.to_string_lossy().replace(['/', '\\'], "%"))
 }
 
@@ -2218,7 +2047,7 @@ fn repair_interrupted_run() -> std::io::Result<usize> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let rel = entry.file_name().to_string_lossy().replace('%', "/");
-        let target = root().join(&rel);
+        let target = repo_root().join(&rel);
         let pristine = std::fs::read_to_string(entry.path())?;
         if std::fs::read_to_string(&target).ok().as_deref() != Some(pristine.as_str()) {
             std::fs::write(&target, &pristine)?;
@@ -2283,7 +2112,7 @@ fn failing_guards(defect: &Defect) -> Result<Vec<&'static str>, String> {
     let mut failing = Vec::new();
     for g in defect.guards {
         let mut cmd = Command::new("cargo");
-        cmd.current_dir(root()).args(["test", "-p", g.package]);
+        cmd.current_dir(repo_root()).args(["test", "-p", g.package]);
         if !g.features.is_empty() {
             cmd.args(["--features", g.features]);
         }

@@ -1,6 +1,7 @@
-//! Library entry — re-exports the modules used by `src/main.rs` so they're
-//! also reachable from `examples/*` (which can only reference the crate's
-//! public surface, not bin-private modules).
+//! Library entry — the modules `src/main.rs` builds the app from, public so
+//! they're also reachable from `examples/*` (which can only reference the
+//! crate's public surface, not bin-private modules). The bin imports them
+//! rather than declaring them again, so each is compiled, and tested, once.
 
 pub mod catalog;
 pub mod config;

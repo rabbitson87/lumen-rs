@@ -117,7 +117,7 @@ fn main() -> Result<()> {
     println!("--- native forward state-equivalence verifier ---");
     println!(
         "backend     = {}",
-        std::env::var("LUMEN_MLX_BACKEND").unwrap_or_else(|_| "(default = pyo3)".into())
+        std::env::var("LUMEN_MLX_BACKEND").unwrap_or_else(|_| "(default = native)".into())
     );
     println!("model       = {model_id}");
     println!("n_list      = {n_list:?}");

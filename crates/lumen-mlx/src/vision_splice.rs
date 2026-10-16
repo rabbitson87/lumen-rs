@@ -10,7 +10,8 @@
 //! fall outside the window entirely, or straddle either edge and contribute
 //! only some of its rows. That arithmetic is where the off-by-ones live, so it
 //! sits here as pure functions with no MLX dependency, unit-testable on any
-//! machine.
+//! machine. The few MLX-side helpers both towers also share are in the
+//! `mlx-native`-gated [`tower`] submodule.
 
 /// Contiguous `(start, len)` runs of `image_token` in a prompt — one per image,
 /// in prompt order.
@@ -85,6 +86,66 @@ pub(crate) fn clip_runs_to_window(
         cursor = local_end;
     }
     Ok(out)
+}
+
+/// What the two image towers share besides the splice arithmetic: weight
+/// lookup and the two env knobs their forwards read.
+#[cfg(feature = "mlx-native")]
+pub(crate) mod tower {
+    use anyhow::{Context, Result, anyhow};
+    use mlx_rs::{Array, Dtype};
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    /// Run a tower in float32 instead of the checkpoint's bf16. Used by the
+    /// golden-tensor parity tests, which compare against float32 PyTorch
+    /// references; production leaves this off.
+    pub(crate) fn vision_f32_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION_F32")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Drain the lazy graph every N encoder layers. `0` disables draining
+    /// (fastest, highest peak memory). Without it every layer's activations
+    /// stay live until the first eval and peak memory climbs by GBs on a long
+    /// patch grid; the default 4 keeps the live set to a few layers', which
+    /// matters on 36 GB machines where the text weights already take ~15 GB.
+    pub(crate) fn vision_eval_every() -> usize {
+        static EVERY: OnceLock<usize> = OnceLock::new();
+        *EVERY.get_or_init(|| {
+            std::env::var("LUMEN_VISION_EVAL_EVERY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+        })
+    }
+
+    /// Look up a weight and cast it to the working dtype.
+    pub(crate) fn take(
+        weights: &HashMap<String, Array>,
+        name: &str,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        weights
+            .get(name)
+            .ok_or_else(|| anyhow!("vision weight `{name}` not found"))?
+            .as_dtype(dtype)
+            .with_context(|| format!("cast `{name}` to {dtype:?}"))
+    }
+
+    /// Look up an `[out, in]` projection and return it transposed to `[in, out]`.
+    pub(crate) fn take_t(
+        weights: &HashMap<String, Array>,
+        name: &str,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        let w = take(weights, name, dtype)?;
+        mlx_rs::ops::transpose(&w).with_context(|| format!("transpose(`{name}`)"))
+    }
 }
 
 #[cfg(test)]

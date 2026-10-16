@@ -7,7 +7,6 @@
 //! `mlx_lm/models/gemma4_text.py`.
 
 #[cfg(feature = "mlx-native")]
-#[allow(dead_code)] // Phase 1 W1 (a): config-only landing; consumers come in W1 (b)+.
 pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
@@ -19,7 +18,8 @@ pub(crate) mod imp {
     use std::ffi::CStr;
 
     use crate::kv_disk::{
-        ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
+        ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record, turboquant_from_meta,
+        turboquant_meta,
     };
     use crate::native_attention::{
         QuantizedTriple, SPARSE_DECODE_MIN_KEYS, build_causal_mask, build_causal_mask_abs,
@@ -38,6 +38,7 @@ pub(crate) mod imp {
         gather_qmm_with_mode, quantize_with_mode, quantized_matmul_with_mode,
     };
     use crate::native_rope::{rope, rope_with_freqs};
+    use crate::qwen3_5_moe::{ResolvedLinear, argmax_rows, validate_safetensors_complete};
     use crate::vision_splice::{clip_runs_to_window, image_token_runs};
     use mlx_rs::error::Exception;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
@@ -363,16 +364,7 @@ pub(crate) mod imp {
         // args[0] = scores  (post-projection logits, [B, L, num_experts])
         // args[1] = indices ([B, L, top_k] — sliced from argpartition outside)
         // args[2] = per_expert_scale ([num_experts])
-        let scores = &args[0];
-        let indices = &args[1];
-        let per_expert_scale = &args[2];
-        let last_axis = (scores.ndim() as i32) - 1;
-
-        let top_logits = scores.take_along_axis(indices, last_axis)?;
-        let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
-        let weights = weights.multiply(&per_expert)?;
-        Ok(vec![weights])
+        Ok(vec![routing_weights(&args[0], &args[1], &args[2])?])
     }
 
     static GEMMA4_ROUTING_SLOT: OnceLock<
@@ -390,6 +382,151 @@ pub(crate) mod imp {
 
     fn gemma4_router_fuse_enabled() -> bool {
         fuse_router::get()
+    }
+
+    // ─────────────── Pieces traced into the compile slots ───────────────
+    //
+    // The slots below are built from these. A slot replays the graph its inner
+    // fn traced, so every slot calls them in the order it always ran its ops.
+    // Slots do not nest, which is why the GeGLU is written out here rather
+    // than going through `native_moe::gelu_mul_fused`.
+
+    /// Routing tail: `take_along_axis(scores, indices)` → softmax (precise) →
+    /// × `per_expert_scale[indices]`.
+    fn routing_weights(
+        scores: &Array,
+        indices: &Array,
+        per_expert_scale: &Array,
+    ) -> std::result::Result<Array, Exception> {
+        let last_axis = (scores.ndim() as i32) - 1;
+        let top_logits = scores.take_along_axis(indices, last_axis)?;
+        let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
+        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
+        weights.multiply(&per_expert)
+    }
+
+    /// GeGLU, `gelu_approx(gate) * up` (`gelu_pytorch_tanh`), op by op. The
+    /// constants take `gate.dtype()` so the bf16 model does not get an
+    /// implicit AsType on every multiply.
+    fn geglu_tanh(gate: &Array, up: &Array) -> std::result::Result<Array, Exception> {
+        use mlx_rs::ops::tanh;
+        let dt = gate.dtype();
+        let half = Array::from_f32(0.5).as_dtype(dt)?;
+        let one = Array::from_f32(1.0).as_dtype(dt)?;
+        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
+        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
+        let x_squared = gate.multiply(gate)?;
+        let x_cubed = x_squared.multiply(gate)?;
+        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
+        let scaled = coeff.multiply(&inner_add)?;
+        let t = tanh(&scaled)?;
+        let one_plus_tanh = one.add(&t)?;
+        half.multiply(gate)?.multiply(&one_plus_tanh)?.multiply(up)
+    }
+
+    /// `down(geglu_tanh(gate(x), up(x)))` over the nine arrays [`glu_args`]
+    /// lays out, with `mm` the slot's quantized matmul.
+    fn glu_body(
+        x: &Array,
+        w: &[Array],
+        mm: impl Fn(&Array, &Array, &Array, &Array) -> std::result::Result<Array, Exception>,
+    ) -> std::result::Result<Array, Exception> {
+        let gate = mm(x, &w[0], &w[1], &w[2])?;
+        let up = mm(x, &w[3], &w[4], &w[5])?;
+        let activated = geglu_tanh(&gate, &up)?;
+        mm(&activated, &w[6], &w[7], &w[8])
+    }
+
+    /// The dense MLP's matmul: mlx-rs's public `quantized_matmul`, whose
+    /// default mode is affine, at the dense MLP's 8 bits / group 64. The
+    /// stream is restamped at trace time, so the default-device variant is
+    /// the one to trace.
+    fn dense_qmm(
+        x: &Array,
+        w: &Array,
+        s: &Array,
+        b: &Array,
+    ) -> std::result::Result<Array, Exception> {
+        mlx_rs::ops::quantized_matmul(
+            x, w, s, b, /* transpose */ true, /* group_size */ 64, /* bits */ 8,
+        )
+    }
+
+    /// The expert GLU on the no-sort branch: `gather_qmm` (affine by default,
+    /// as Gemma 4's experts are) at 4 bits / group 64 over unsorted `indices`.
+    fn experts_body(
+        x: &Array,
+        indices: &Array,
+        w: &[Array],
+    ) -> std::result::Result<Array, Exception> {
+        glu_body(x, w, |xi, w, s, b| {
+            mlx_rs::ops::gather_qmm(
+                xi,
+                w,
+                s,
+                b,
+                /* lhs_indices */ None,
+                /* rhs_indices */ Some(indices),
+                /* transpose */ true,
+                /* group_size */ 64,
+                /* bits */ 4,
+                /* sorted_indices */ false,
+            )
+        })
+    }
+
+    /// Recombine the K expert outputs: squeeze(-2) → × `weights[..., None]` →
+    /// sum over the expert axis.
+    fn recombine(down: &Array, weights: &Array) -> std::result::Result<Array, Exception> {
+        let per_expert_out = mlx_rs::ops::squeeze_axes(down, &[-2])?;
+        let w_expanded = mlx_rs::ops::expand_dims_axes(weights, &[-1])?;
+        let weighted = mlx_rs::ops::multiply(&per_expert_out, &w_expanded)?;
+        mlx_rs::ops::sum_axis(&weighted, -2, /* keep_dims */ false)
+    }
+
+    /// The nine GLU arrays a slot takes: `[gate_w, gate_s, gate_b, up_w, up_s,
+    /// up_b, down_w, down_s, down_b]`. The slots need every bias (Gemma 4's
+    /// affine quant always ships them); a missing one is an error, and the
+    /// caller falls back to the unfused path.
+    fn glu_args<'a>(
+        gate: &'a ResolvedLinear,
+        up: &'a ResolvedLinear,
+        down: &'a ResolvedLinear,
+        what: &str,
+    ) -> Result<[&'a Array; 9]> {
+        let bias = |lin: &'a ResolvedLinear, name: &str| {
+            lin.biases
+                .as_ref()
+                .ok_or_else(|| anyhow!("{what}: {name}.biases is None"))
+        };
+        Ok([
+            &gate.weight,
+            &gate.scales,
+            bias(gate, "gate_proj")?,
+            &up.weight,
+            &up.scales,
+            bias(up, "up_proj")?,
+            &down.weight,
+            &down.scales,
+            bias(down, "down_proj")?,
+        ])
+    }
+
+    /// Dispatch a shapeless, single-output compile slot.
+    fn invoke_fused<F>(
+        slot: &'static OnceLock<std::sync::Mutex<crate::native_compile_cache::CompiledMultiRefs>>,
+        inner: F,
+        args: &[&Array],
+        what: &str,
+    ) -> Result<Array>
+    where
+        F: FnMut(&[Array]) -> std::result::Result<Vec<Array>, Exception> + 'static + Send,
+    {
+        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+            slot, inner, /* shapeless */ true, args,
+        )
+        .with_context(|| format!("{what}: mlx compile dispatch failed"))?;
+        out.pop().with_context(|| format!("{what}: missing output"))
     }
 
     // ───────────────────────── Dense MLP compile (Phase 1.5 P9) ────────
@@ -414,57 +551,7 @@ pub(crate) mod imp {
     fn gemma4_dense_mlp_compiled_inner(
         args: &[Array],
     ) -> std::result::Result<Vec<Array>, Exception> {
-        use mlx_rs::ops::tanh;
-        let x = &args[0];
-        let gate_w = &args[1];
-        let gate_s = &args[2];
-        let gate_b = &args[3];
-        let up_w = &args[4];
-        let up_s = &args[5];
-        let up_b = &args[6];
-        let down_w = &args[7];
-        let down_s = &args[8];
-        let down_b = &args[9];
-
-        // Use mlx-rs public `quantized_matmul` (mode = "affine" by default,
-        // matching Gemma 4 dense MLP's 8-bit affine quant). The lazy compile
-        // path traces ops during first invocation; the stream is restamped at
-        // trace time so we use the default-device variant here.
-        let qmm = |xi: &Array,
-                   w: &Array,
-                   s: &Array,
-                   b: &Array|
-         -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::quantized_matmul(
-                xi, w, s, b, /* transpose */ true, /* group_size */ 64, /* bits */ 8,
-            )
-        };
-
-        let gate = qmm(x, gate_w, gate_s, gate_b)?;
-        let up = qmm(x, up_w, up_s, up_b)?;
-
-        // GeGLU: gelu_approx(gate) * up — inlined formula to avoid nested
-        // compile (gelu_mul_fused is itself a compile slot, can't nest).
-        // match `gate.dtype()` so the bf16 model
-        // doesn't trigger implicit AsType primitives on every multiply.
-        let dt = gate.dtype();
-        let half = Array::from_f32(0.5).as_dtype(dt)?;
-        let one = Array::from_f32(1.0).as_dtype(dt)?;
-        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
-        let x_squared = gate.multiply(&gate)?;
-        let x_cubed = x_squared.multiply(&gate)?;
-        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
-        let scaled = coeff.multiply(&inner_add)?;
-        let t = tanh(&scaled)?;
-        let one_plus_tanh = one.add(&t)?;
-        let activated = half
-            .multiply(&gate)?
-            .multiply(&one_plus_tanh)?
-            .multiply(&up)?;
-
-        let down = qmm(&activated, down_w, down_s, down_b)?;
-        Ok(vec![down])
+        Ok(vec![glu_body(&args[0], &args[1..10], dense_qmm)?])
     }
 
     static GEMMA4_DENSE_MLP_SLOT: OnceLock<
@@ -500,52 +587,9 @@ pub(crate) mod imp {
     fn gemma4_pre_post_norm_dense_mlp_compiled_inner(
         args: &[Array],
     ) -> std::result::Result<Vec<Array>, Exception> {
-        use mlx_rs::ops::tanh;
-        let x = &args[0];
-        let pre_norm_w = &args[1];
-        let post_norm_w = &args[2];
-        let gate_w = &args[3];
-        let gate_s = &args[4];
-        let gate_b = &args[5];
-        let up_w = &args[6];
-        let up_s = &args[7];
-        let up_b = &args[8];
-        let down_w = &args[9];
-        let down_s = &args[10];
-        let down_b = &args[11];
-
+        let (x, pre_norm_w, post_norm_w) = (&args[0], &args[1], &args[2]);
         let normed = mlx_rs::fast::rms_norm(x, pre_norm_w, 1e-6_f32)?;
-
-        let qmm = |xi: &Array,
-                   w: &Array,
-                   s: &Array,
-                   b: &Array|
-         -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::quantized_matmul(
-                xi, w, s, b, /* transpose */ true, /* group_size */ 64, /* bits */ 8,
-            )
-        };
-
-        let gate = qmm(&normed, gate_w, gate_s, gate_b)?;
-        let up = qmm(&normed, up_w, up_s, up_b)?;
-
-        let dt = gate.dtype();
-        let half = Array::from_f32(0.5).as_dtype(dt)?;
-        let one = Array::from_f32(1.0).as_dtype(dt)?;
-        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
-        let x_squared = gate.multiply(&gate)?;
-        let x_cubed = x_squared.multiply(&gate)?;
-        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
-        let scaled = coeff.multiply(&inner_add)?;
-        let t = tanh(&scaled)?;
-        let one_plus_tanh = one.add(&t)?;
-        let activated = half
-            .multiply(&gate)?
-            .multiply(&one_plus_tanh)?
-            .multiply(&up)?;
-
-        let down = qmm(&activated, down_w, down_s, down_b)?;
+        let down = glu_body(&normed, &args[3..12], dense_qmm)?;
         let result = mlx_rs::fast::rms_norm(&down, post_norm_w, 1e-6_f32)?;
         Ok(vec![result])
     }
@@ -574,79 +618,40 @@ pub(crate) mod imp {
         post_norm_w: &Array,
         w: &ResolvedGemma4DenseMlpWeights,
     ) -> Result<Array> {
-        let gate_b = w.gate_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_dense_mlp_fused: gate_proj.biases is None")
-        })?;
-        let up_b = w.up_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_dense_mlp_fused: up_proj.biases is None")
-        })?;
-        let down_b = w.down_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_dense_mlp_fused: down_proj.biases is None")
-        })?;
-        let args = [
-            x,
-            pre_norm_w,
-            post_norm_w,
-            &w.gate_proj.weight,
-            &w.gate_proj.scales,
-            gate_b,
-            &w.up_proj.weight,
-            &w.up_proj.scales,
-            up_b,
-            &w.down_proj.weight,
-            &w.down_proj.scales,
-            down_b,
-        ];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        const WHAT: &str = "gemma4_pre_post_norm_dense_mlp_fused";
+        let [gw, gs, gb, uw, us, ub, dw, ds, db] =
+            glu_args(&w.gate_proj, &w.up_proj, &w.down_proj, WHAT)?;
+        invoke_fused(
             &GEMMA4_PRE_POST_NORM_DENSE_MLP_SLOT,
             gemma4_pre_post_norm_dense_mlp_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[
+                x,
+                pre_norm_w,
+                post_norm_w,
+                gw,
+                gs,
+                gb,
+                uw,
+                us,
+                ub,
+                dw,
+                ds,
+                db,
+            ],
+            WHAT,
         )
-        .context("gemma4_pre_post_norm_dense_mlp_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("gemma4_pre_post_norm_dense_mlp_fused: missing output")
     }
 
     fn gemma4_dense_mlp_fused(x: &Array, w: &ResolvedGemma4DenseMlpWeights) -> Result<Array> {
-        // Dense MLP biases must be present for the compile path (10 args
-        // assumed). Fall back to legacy if any bias is None.
-        let gate_b = match w.gate_proj.biases.as_ref() {
-            Some(b) => b,
-            None => {
-                return Err(anyhow!(
-                    "gemma4_dense_mlp_fused: gate_proj.biases is None — falling back required"
-                ));
-            }
-        };
-        let up_b = match w.up_proj.biases.as_ref() {
-            Some(b) => b,
-            None => return Err(anyhow!("gemma4_dense_mlp_fused: up_proj.biases is None")),
-        };
-        let down_b = match w.down_proj.biases.as_ref() {
-            Some(b) => b,
-            None => return Err(anyhow!("gemma4_dense_mlp_fused: down_proj.biases is None")),
-        };
-        let args = [
-            x,
-            &w.gate_proj.weight,
-            &w.gate_proj.scales,
-            gate_b,
-            &w.up_proj.weight,
-            &w.up_proj.scales,
-            up_b,
-            &w.down_proj.weight,
-            &w.down_proj.scales,
-            down_b,
-        ];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        const WHAT: &str = "gemma4_dense_mlp_fused";
+        let [gw, gs, gb, uw, us, ub, dw, ds, db] =
+            glu_args(&w.gate_proj, &w.up_proj, &w.down_proj, WHAT)?;
+        invoke_fused(
             &GEMMA4_DENSE_MLP_SLOT,
             gemma4_dense_mlp_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[x, gw, gs, gb, uw, us, ub, dw, ds, db],
+            WHAT,
         )
-        .context("gemma4_dense_mlp_fused: mlx compile dispatch failed")?;
-        out.pop().context("gemma4_dense_mlp_fused: missing output")
     }
 
     /// Run the fused tail. `indices` must already be sliced to shape
@@ -657,16 +662,12 @@ pub(crate) mod imp {
         indices: &Array,
         per_expert_scale: &Array,
     ) -> Result<Array> {
-        let args = [scores, indices, per_expert_scale];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        invoke_fused(
             &GEMMA4_ROUTING_SLOT,
             gemma4_routing_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[scores, indices, per_expert_scale],
+            "gemma4_routing_fused",
         )
-        .context("gemma4_routing_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("gemma4_routing_fused: missing weights output")
     }
 
     // ───────────────────────── Experts compile (Phase 1.5 P10) ────────
@@ -696,65 +697,7 @@ pub(crate) mod imp {
     // GeGLU formula inlined (gelu_approx(gate) * up) — can't nest the existing
     // gelu_mul compile slot inside another compile.
     fn gemma4_experts_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
-        use mlx_rs::ops::tanh;
-        let x = &args[0];
-        let idx = &args[1];
-        let gate_w = &args[2];
-        let gate_s = &args[3];
-        let gate_b = &args[4];
-        let up_w = &args[5];
-        let up_s = &args[6];
-        let up_b = &args[7];
-        let down_w = &args[8];
-        let down_s = &args[9];
-        let down_b = &args[10];
-
-        // mlx-rs's macro-generated `gather_qmm` uses DEFAULT_MODE="affine",
-        // matching Gemma 4 experts (4-bit affine). The stream is restamped at
-        // trace time so we use the default-device variant.
-        let gqmm = |xi: &Array,
-                    w: &Array,
-                    s: &Array,
-                    b: &Array|
-         -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::gather_qmm(
-                xi,
-                w,
-                s,
-                b,
-                /* lhs_indices */ None,
-                /* rhs_indices */ Some(idx),
-                /* transpose */ true,
-                /* group_size */ 64,
-                /* bits */ 4,
-                /* sorted_indices */ false,
-            )
-        };
-
-        let gate = gqmm(x, gate_w, gate_s, gate_b)?;
-        let up = gqmm(x, up_w, up_s, up_b)?;
-
-        // GeGLU: gelu_approx(gate) * up — inlined formula (same constants as
-        // P9's gemma4_dense_mlp_compiled_inner; can't nest compile slots).
-        // match gate.dtype() to avoid implicit AsType.
-        let dt = gate.dtype();
-        let half = Array::from_f32(0.5).as_dtype(dt)?;
-        let one = Array::from_f32(1.0).as_dtype(dt)?;
-        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
-        let x_squared = gate.multiply(&gate)?;
-        let x_cubed = x_squared.multiply(&gate)?;
-        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
-        let scaled = coeff.multiply(&inner_add)?;
-        let t = tanh(&scaled)?;
-        let one_plus_tanh = one.add(&t)?;
-        let activated = half
-            .multiply(&gate)?
-            .multiply(&one_plus_tanh)?
-            .multiply(&up)?;
-
-        let down = gqmm(&activated, down_w, down_s, down_b)?;
-        Ok(vec![down])
+        Ok(vec![experts_body(&args[0], &args[1], &args[2..11])?])
     }
 
     static GEMMA4_EXPERTS_SLOT: OnceLock<
@@ -797,80 +740,12 @@ pub(crate) mod imp {
     fn gemma4_routing_experts_compiled_inner(
         args: &[Array],
     ) -> std::result::Result<Vec<Array>, Exception> {
-        use mlx_rs::ops::tanh;
-
-        let scores = &args[0];
-        let indices = &args[1];
-        let per_expert_scale = &args[2];
-        let x = &args[3];
-        let gate_w = &args[4];
-        let gate_s = &args[5];
-        let gate_b = &args[6];
-        let up_w = &args[7];
-        let up_s = &args[8];
-        let up_b = &args[9];
-        let down_w = &args[10];
-        let down_s = &args[11];
-        let down_b = &args[12];
-
-        // 1. Routing tail: take_along + softmax + per_expert_scale gather + multiply.
-        let last_axis = (scores.ndim() as i32) - 1;
-        let top_logits = scores.take_along_axis(indices, last_axis)?;
-        let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
-        let weights = weights.multiply(&per_expert)?;
-
-        // 2. expand_dims(x, [-2, -3]) → [B, L, 1, 1, hidden] for gather_qmm.
+        let (scores, indices, per_expert_scale, x) = (&args[0], &args[1], &args[2], &args[3]);
+        let weights = routing_weights(scores, indices, per_expert_scale)?;
+        // expand_dims(x, [-2, -3]) → [B, L, 1, 1, hidden] for gather_qmm.
         let x_5d = mlx_rs::ops::expand_dims_axes(x, &[-2, -3])?;
-
-        // 3. Experts: gate / up / GeGLU / down (mirrors gemma4_experts_compiled_inner).
-        let gqmm = |xi: &Array,
-                    w: &Array,
-                    s: &Array,
-                    b: &Array|
-         -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::gather_qmm(
-                xi,
-                w,
-                s,
-                b,
-                /* lhs_indices */ None,
-                /* rhs_indices */ Some(indices),
-                /* transpose */ true,
-                /* group_size */ 64,
-                /* bits */ 4,
-                /* sorted_indices */ false,
-            )
-        };
-
-        let gate = gqmm(&x_5d, gate_w, gate_s, gate_b)?;
-        let up = gqmm(&x_5d, up_w, up_s, up_b)?;
-
-        let dt = gate.dtype();
-        let half = Array::from_f32(0.5).as_dtype(dt)?;
-        let one = Array::from_f32(1.0).as_dtype(dt)?;
-        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
-        let x_squared = gate.multiply(&gate)?;
-        let x_cubed = x_squared.multiply(&gate)?;
-        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
-        let scaled = coeff.multiply(&inner_add)?;
-        let t = tanh(&scaled)?;
-        let one_plus_tanh = one.add(&t)?;
-        let activated = half
-            .multiply(&gate)?
-            .multiply(&one_plus_tanh)?
-            .multiply(&up)?;
-
-        let down = gqmm(&activated, down_w, down_s, down_b)?;
-
-        // 4. Recombine: squeeze(-2) → multiply by weights[..., None] → sum(axis=-2).
-        let per_expert_out = mlx_rs::ops::squeeze_axes(&down, &[-2])?;
-        let w_expanded = mlx_rs::ops::expand_dims_axes(&weights, &[-1])?;
-        let weighted = mlx_rs::ops::multiply(&per_expert_out, &w_expanded)?;
-        let summed = mlx_rs::ops::sum_axis(&weighted, -2, /* keep_dims */ false)?;
-
-        Ok(vec![summed])
+        let down = experts_body(&x_5d, indices, &args[4..13])?;
+        Ok(vec![recombine(&down, &weights)?])
     }
 
     static GEMMA4_ROUTING_EXPERTS_SLOT: OnceLock<
@@ -912,76 +787,14 @@ pub(crate) mod imp {
     fn gemma4_pre_post_norm_routing_experts_compiled_inner(
         args: &[Array],
     ) -> std::result::Result<Vec<Array>, Exception> {
-        use mlx_rs::ops::tanh;
-
-        let scores = &args[0];
-        let indices = &args[1];
-        let per_expert_scale = &args[2];
-        let h_raw = &args[3];
-        let pre_norm_w = &args[4];
-        let post_norm_w = &args[5];
-        let gate_w = &args[6];
-        let gate_s = &args[7];
-        let gate_b = &args[8];
-        let up_w = &args[9];
-        let up_s = &args[10];
-        let up_b = &args[11];
-        let down_w = &args[12];
-        let down_s = &args[13];
-        let down_b = &args[14];
-
-        // 0. Pre-norm.
+        let (scores, indices, per_expert_scale) = (&args[0], &args[1], &args[2]);
+        let (h_raw, pre_norm_w, post_norm_w) = (&args[3], &args[4], &args[5]);
         let h = mlx_rs::fast::rms_norm(h_raw, pre_norm_w, 1e-6_f32)?;
-
-        // 1. Routing tail.
-        let last_axis = (scores.ndim() as i32) - 1;
-        let top_logits = scores.take_along_axis(indices, last_axis)?;
-        let weights = mlx_rs::ops::softmax_axis(&top_logits, last_axis, Some(true))?;
-        let per_expert = mlx_rs::ops::indexing::take_axis(per_expert_scale, indices, 0)?;
-        let weights = weights.multiply(&per_expert)?;
-
-        // 2. expand_dims for gather_qmm.
+        let weights = routing_weights(scores, indices, per_expert_scale)?;
         let x_5d = mlx_rs::ops::expand_dims_axes(&h, &[-2, -3])?;
-
-        // 3. Experts.
-        let gqmm = |xi: &Array,
-                    w: &Array,
-                    s: &Array,
-                    b: &Array|
-         -> std::result::Result<Array, Exception> {
-            mlx_rs::ops::gather_qmm(xi, w, s, b, None, Some(indices), true, 64, 4, false)
-        };
-
-        let gate = gqmm(&x_5d, gate_w, gate_s, gate_b)?;
-        let up = gqmm(&x_5d, up_w, up_s, up_b)?;
-
-        let dt = gate.dtype();
-        let half = Array::from_f32(0.5).as_dtype(dt)?;
-        let one = Array::from_f32(1.0).as_dtype(dt)?;
-        let c3 = Array::from_f32(0.044715).as_dtype(dt)?;
-        let coeff = Array::from_f32(0.797_884_6_f32).as_dtype(dt)?;
-        let x_squared = gate.multiply(&gate)?;
-        let x_cubed = x_squared.multiply(&gate)?;
-        let inner_add = gate.add(&x_cubed.multiply(&c3)?)?;
-        let scaled = coeff.multiply(&inner_add)?;
-        let t = tanh(&scaled)?;
-        let one_plus_tanh = one.add(&t)?;
-        let activated = half
-            .multiply(&gate)?
-            .multiply(&one_plus_tanh)?
-            .multiply(&up)?;
-
-        let down = gqmm(&activated, down_w, down_s, down_b)?;
-
-        // 4. Recombine.
-        let per_expert_out = mlx_rs::ops::squeeze_axes(&down, &[-2])?;
-        let w_expanded = mlx_rs::ops::expand_dims_axes(&weights, &[-1])?;
-        let weighted = mlx_rs::ops::multiply(&per_expert_out, &w_expanded)?;
-        let summed = mlx_rs::ops::sum_axis(&weighted, -2, false)?;
-
-        // 5. Post-norm.
+        let down = experts_body(&x_5d, indices, &args[6..15])?;
+        let summed = recombine(&down, &weights)?;
         let out = mlx_rs::fast::rms_norm(&summed, post_norm_w, 1e-6_f32)?;
-
         Ok(vec![out])
     }
 
@@ -1012,41 +825,31 @@ pub(crate) mod imp {
         post_norm_w: &Array,
         w: &ResolvedGemma4ExpertsWeights,
     ) -> Result<Array> {
-        let gate_b = w.gate_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_routing_experts_fused: gate_proj.biases is None")
-        })?;
-        let up_b = w.up_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_routing_experts_fused: up_proj.biases is None")
-        })?;
-        let down_b = w.down_proj.biases.as_ref().ok_or_else(|| {
-            anyhow!("gemma4_pre_post_norm_routing_experts_fused: down_proj.biases is None")
-        })?;
-        let args = [
-            scores,
-            indices,
-            per_expert_scale,
-            h_raw,
-            pre_norm_w,
-            post_norm_w,
-            &w.gate_proj.weight,
-            &w.gate_proj.scales,
-            gate_b,
-            &w.up_proj.weight,
-            &w.up_proj.scales,
-            up_b,
-            &w.down_proj.weight,
-            &w.down_proj.scales,
-            down_b,
-        ];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        const WHAT: &str = "gemma4_pre_post_norm_routing_experts_fused";
+        let [gw, gs, gb, uw, us, ub, dw, ds, db] =
+            glu_args(&w.gate_proj, &w.up_proj, &w.down_proj, WHAT)?;
+        invoke_fused(
             &GEMMA4_PRE_POST_NORM_ROUTING_EXPERTS_SLOT,
             gemma4_pre_post_norm_routing_experts_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[
+                scores,
+                indices,
+                per_expert_scale,
+                h_raw,
+                pre_norm_w,
+                post_norm_w,
+                gw,
+                gs,
+                gb,
+                uw,
+                us,
+                ub,
+                dw,
+                ds,
+                db,
+            ],
+            WHAT,
         )
-        .context("gemma4_pre_post_norm_routing_experts_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("gemma4_pre_post_norm_routing_experts_fused: missing output")
     }
 
     fn gemma4_routing_experts_fused(
@@ -1056,45 +859,29 @@ pub(crate) mod imp {
         x: &Array,
         w: &ResolvedGemma4ExpertsWeights,
     ) -> Result<Array> {
-        let gate_b = w
-            .gate_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_routing_experts_fused: gate_proj.biases is None"))?;
-        let up_b = w
-            .up_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_routing_experts_fused: up_proj.biases is None"))?;
-        let down_b = w
-            .down_proj
-            .biases
-            .as_ref()
-            .ok_or_else(|| anyhow!("gemma4_routing_experts_fused: down_proj.biases is None"))?;
-        let args = [
-            scores,
-            indices,
-            per_expert_scale,
-            x,
-            &w.gate_proj.weight,
-            &w.gate_proj.scales,
-            gate_b,
-            &w.up_proj.weight,
-            &w.up_proj.scales,
-            up_b,
-            &w.down_proj.weight,
-            &w.down_proj.scales,
-            down_b,
-        ];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        const WHAT: &str = "gemma4_routing_experts_fused";
+        let [gw, gs, gb, uw, us, ub, dw, ds, db] =
+            glu_args(&w.gate_proj, &w.up_proj, &w.down_proj, WHAT)?;
+        invoke_fused(
             &GEMMA4_ROUTING_EXPERTS_SLOT,
             gemma4_routing_experts_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[
+                scores,
+                indices,
+                per_expert_scale,
+                x,
+                gw,
+                gs,
+                gb,
+                uw,
+                us,
+                ub,
+                dw,
+                ds,
+                db,
+            ],
+            WHAT,
         )
-        .context("gemma4_routing_experts_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("gemma4_routing_experts_fused: missing output")
     }
 
     // ───────────────────────── Softcap compile (Tier 3) ────────────────
@@ -1136,15 +923,12 @@ pub(crate) mod imp {
     }
 
     fn gemma4_softcap_fused(logits: &Array, softcap_inv: &Array, softcap: &Array) -> Result<Array> {
-        let args = [logits, softcap_inv, softcap];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        invoke_fused(
             &GEMMA4_SOFTCAP_SLOT,
             gemma4_softcap_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[logits, softcap_inv, softcap],
+            "gemma4_softcap_fused",
         )
-        .context("gemma4_softcap_fused: mlx compile dispatch failed")?;
-        out.pop().context("gemma4_softcap_fused: missing output")
     }
 
     // ───────── Layer epilogue fuse (orthogonal-axes exploration 2026-05-17) ─────
@@ -1218,16 +1002,12 @@ pub(crate) mod imp {
         post_ff_w: &Array,
         layer_scalar: &Array,
     ) -> Result<Array> {
-        let args = [h1, h2, residual, post_ff_w, layer_scalar];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        invoke_fused(
             &GEMMA4_LAYER_EPILOGUE_SLOT,
             gemma4_layer_epilogue_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[h1, h2, residual, post_ff_w, layer_scalar],
+            "gemma4_layer_epilogue_fused",
         )
-        .context("gemma4_layer_epilogue_fused: mlx compile dispatch failed")?;
-        out.pop()
-            .context("gemma4_layer_epilogue_fused: missing output")
     }
 
     fn gemma4_experts_fused(
@@ -1235,39 +1015,15 @@ pub(crate) mod imp {
         idx: &Array,
         w: &ResolvedGemma4ExpertsWeights,
     ) -> Result<Array> {
-        let gate_b = match w.gate_proj.biases.as_ref() {
-            Some(b) => b,
-            None => return Err(anyhow!("gemma4_experts_fused: gate_proj.biases is None")),
-        };
-        let up_b = match w.up_proj.biases.as_ref() {
-            Some(b) => b,
-            None => return Err(anyhow!("gemma4_experts_fused: up_proj.biases is None")),
-        };
-        let down_b = match w.down_proj.biases.as_ref() {
-            Some(b) => b,
-            None => return Err(anyhow!("gemma4_experts_fused: down_proj.biases is None")),
-        };
-        let args = [
-            x,
-            idx,
-            &w.gate_proj.weight,
-            &w.gate_proj.scales,
-            gate_b,
-            &w.up_proj.weight,
-            &w.up_proj.scales,
-            up_b,
-            &w.down_proj.weight,
-            &w.down_proj.scales,
-            down_b,
-        ];
-        let mut out = crate::native_compile_cache::invoke_compiled_multi_refs(
+        const WHAT: &str = "gemma4_experts_fused";
+        let [gw, gs, gb, uw, us, ub, dw, ds, db] =
+            glu_args(&w.gate_proj, &w.up_proj, &w.down_proj, WHAT)?;
+        invoke_fused(
             &GEMMA4_EXPERTS_SLOT,
             gemma4_experts_compiled_inner,
-            /* shapeless */ true,
-            &args,
+            &[x, idx, gw, gs, gb, uw, us, ub, dw, ds, db],
+            WHAT,
         )
-        .context("gemma4_experts_fused: mlx compile dispatch failed")?;
-        out.pop().context("gemma4_experts_fused: missing output")
     }
 
     // config.json parsing lives in the ungated `gemma4_config` module so a
@@ -1293,6 +1049,10 @@ pub(crate) mod imp {
         /// Walk all `*.safetensors` files in `dir`, load each via mlx-rs, and
         /// merge into a single keyed map. Mirrors mlx_lm's
         /// `_get_weights(model_path)`.
+        ///
+        /// Each shard is checked for truncation before it is read, as Qwen's
+        /// loader does: mlx-rs loads a shard cut inside its data section
+        /// without error and returns wrong weights.
         pub fn load_dir(dir: &Path) -> Result<Self> {
             let mut shard_paths = std::fs::read_dir(dir)
                 .with_context(|| format!("read_dir({}) failed", dir.display()))?
@@ -1305,6 +1065,7 @@ pub(crate) mod imp {
             }
             let mut tensors: HashMap<String, Array> = HashMap::new();
             for shard in shard_paths {
+                validate_safetensors_complete(&shard)?;
                 let map = Array::load_safetensors(&shard).map_err(|err| {
                     anyhow!("load_safetensors({}) failed: {err}", shard.display())
                 })?;
@@ -1532,16 +1293,24 @@ pub(crate) mod imp {
         FullTurboquant(NativeRotatingKvCacheTurboQuant),
     }
 
+    /// `match` every [`NativeGemma4LayerCache`] variant to the same
+    /// expression, with the inner cache bound to `$c`.
+    macro_rules! each_layer_cache {
+        ($cache:expr, $c:ident => $body:expr) => {
+            match $cache {
+                NativeGemma4LayerCache::Sliding($c) => $body,
+                NativeGemma4LayerCache::Full($c) => $body,
+                NativeGemma4LayerCache::FullQuantized($c) => $body,
+                NativeGemma4LayerCache::SlidingQuantized($c) => $body,
+                NativeGemma4LayerCache::SlidingTurboquant($c) => $body,
+                NativeGemma4LayerCache::FullTurboquant($c) => $body,
+            }
+        };
+    }
+
     impl NativeGemma4LayerCache {
         pub fn offset(&self) -> usize {
-            match self {
-                NativeGemma4LayerCache::Sliding(c) => c.offset(),
-                NativeGemma4LayerCache::Full(c) => c.offset(),
-                NativeGemma4LayerCache::FullQuantized(c) => c.offset(),
-                NativeGemma4LayerCache::SlidingQuantized(c) => c.offset(),
-                NativeGemma4LayerCache::SlidingTurboquant(c) => c.offset(),
-                NativeGemma4LayerCache::FullTurboquant(c) => c.offset(),
-            }
+            each_layer_cache!(self, c => c.offset())
         }
 
         pub fn cached_len(&self) -> usize {
@@ -1556,25 +1325,11 @@ pub(crate) mod imp {
         }
 
         pub fn empty(&self) -> bool {
-            match self {
-                NativeGemma4LayerCache::Sliding(c) => c.empty(),
-                NativeGemma4LayerCache::Full(c) => c.empty(),
-                NativeGemma4LayerCache::FullQuantized(c) => c.empty(),
-                NativeGemma4LayerCache::SlidingQuantized(c) => c.empty(),
-                NativeGemma4LayerCache::SlidingTurboquant(c) => c.empty(),
-                NativeGemma4LayerCache::FullTurboquant(c) => c.empty(),
-            }
+            each_layer_cache!(self, c => c.empty())
         }
 
         pub fn clear(&mut self) {
-            match self {
-                NativeGemma4LayerCache::Sliding(c) => c.clear(),
-                NativeGemma4LayerCache::Full(c) => c.clear(),
-                NativeGemma4LayerCache::FullQuantized(c) => c.clear(),
-                NativeGemma4LayerCache::SlidingQuantized(c) => c.clear(),
-                NativeGemma4LayerCache::SlidingTurboquant(c) => c.clear(),
-                NativeGemma4LayerCache::FullTurboquant(c) => c.clear(),
-            }
+            each_layer_cache!(self, c => c.clear())
         }
 
         pub fn as_sliding_mut(&mut self) -> Result<&mut NativeRotatingKvCache> {
@@ -1603,21 +1358,6 @@ pub(crate) mod imp {
                 )),
             }
         }
-
-        pub fn as_sliding_quantized_mut(&mut self) -> Result<&mut NativeRotatingKvCacheQuantized> {
-            match self {
-                NativeGemma4LayerCache::SlidingQuantized(c) => Ok(c),
-                _ => Err(anyhow!(
-                    "NativeGemma4LayerCache: expected SlidingQuantized, got non-SlidingQuantized"
-                )),
-            }
-        }
-    }
-
-    fn gemma4_quant_kv_enabled() -> bool {
-        std::env::var("LUMEN_GEMMA4_QUANT_KV")
-            .map(|v| v == "1")
-            .unwrap_or(false)
     }
 
     /// Opt-in env gate for the Tier 1B sliding quantized cache. Default OFF
@@ -1642,30 +1382,6 @@ pub(crate) mod imp {
             .unwrap_or(false)
     }
 
-    /// TurboQuant Stage-1 sliding cache opt-in. Default OFF.
-    /// When set, replaces the mlx-affine SlidingQuantized cache with the
-    /// TurboQuant Stage-1 path (rotate K + Lloyd-Max nearest-centroid against
-    /// fixed N(0,1) codebook + per-vector σ). V uses Lloyd-Max without rotation.
-    /// Mutually exclusive with `LUMEN_GEMMA4_QUANT_KV_SLIDING` (TurboQuant
-    /// takes precedence when both set).
-    ///
-    /// Legacy entry point — reads only the static env var (no per-request
-    /// adaptive decision). New code should consult [`Gemma4TqMode`] /
-    /// [`resolve_tq_for_request`] instead and pass the resolved boolean into
-    /// the cache constructor explicitly.
-    fn gemma4_quant_kv_sliding_turboquant_enabled() -> bool {
-        // For backward compatibility with code paths that don't know the
-        // per-request prompt length yet (e.g. `tq_bake_r_enabled` reads at
-        // model-load time): treat MODE=on as ON, MODE=auto as ON (so V/Wo
-        // bake is still applied — that's harmless when TQ is OFF at runtime
-        // because R@R^T = I cancels), and MODE=off as OFF. Legacy env var
-        // continues to work.
-        match gemma4_tq_mode() {
-            Gemma4TqMode::Off => false,
-            Gemma4TqMode::On | Gemma4TqMode::Auto => true,
-        }
-    }
-
     /// Three-way TurboQuant mode controlled by `LUMEN_GEMMA4_TQ_MODE`.
     ///
     /// * `Off` — never apply TurboQuant; sliding cache stays in bf16.
@@ -1678,35 +1394,49 @@ pub(crate) mod imp {
     /// Backward compatibility: when `LUMEN_GEMMA4_TQ_MODE` is unset, falls
     /// back to the legacy `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=0/1`
     /// gate so existing deployments keep working unchanged.
+    pub type Gemma4TqMode = Gemma4KvQuantMode;
+
+    pub fn gemma4_tq_mode() -> Gemma4TqMode {
+        kv_quant_mode(
+            "LUMEN_GEMMA4_TQ_MODE",
+            std::env::var("LUMEN_GEMMA4_TQ_MODE"),
+            || std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT"),
+        )
+    }
+
+    /// Off / on / auto, the shape of both KV-quantization switches
+    /// ([`Gemma4TqMode`] and [`Gemma4QuantKvMode`]).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Gemma4TqMode {
+    pub enum Gemma4KvQuantMode {
         Off,
         On,
         Auto,
     }
 
-    pub fn gemma4_tq_mode() -> Gemma4TqMode {
-        if let Ok(s) = std::env::var("LUMEN_GEMMA4_TQ_MODE") {
+    /// Parse a three-way KV-quantization mode from its env value `raw` (read
+    /// as `var`). Unset falls back to the legacy boolean gate, read only then:
+    /// `1` is `On`, anything else `Off`. An unknown value warns and is `Off`.
+    fn kv_quant_mode(
+        var: &str,
+        raw: Result<String, std::env::VarError>,
+        legacy: impl FnOnce() -> Result<String, std::env::VarError>,
+    ) -> Gemma4KvQuantMode {
+        if let Ok(s) = raw {
             return match s.trim().to_ascii_lowercase().as_str() {
-                "off" | "0" | "false" | "no" => Gemma4TqMode::Off,
-                "on" | "1" | "true" | "yes" => Gemma4TqMode::On,
-                "auto" => Gemma4TqMode::Auto,
+                "off" | "0" | "false" | "no" => Gemma4KvQuantMode::Off,
+                "on" | "1" | "true" | "yes" => Gemma4KvQuantMode::On,
+                "auto" => Gemma4KvQuantMode::Auto,
                 other => {
-                    eprintln!(
-                        "[gemma4] WARN unknown LUMEN_GEMMA4_TQ_MODE={other:?}, defaulting to off"
-                    );
-                    Gemma4TqMode::Off
+                    eprintln!("[gemma4] WARN unknown {var}={other:?}, defaulting to off");
+                    Gemma4KvQuantMode::Off
                 }
             };
         }
         // Legacy env var fallback (kept for backward compat).
-        if std::env::var("LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            Gemma4TqMode::On
+        if legacy().map(|v| v == "1").unwrap_or(false) {
+            Gemma4KvQuantMode::On
         } else {
-            Gemma4TqMode::Off
+            Gemma4KvQuantMode::Off
         }
     }
 
@@ -1747,37 +1477,14 @@ pub(crate) mod imp {
     /// Empirical motivation (2026-05-26 sweep): simple Q4 ≈ bf16 in perf
     /// at 8K-32K (within ±5%), so Auto-mode threshold at 8K trades zero
     /// perceived speed for 4× KV memory headroom on long-context requests.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Gemma4QuantKvMode {
-        Off,
-        On,
-        Auto,
-    }
+    pub type Gemma4QuantKvMode = Gemma4KvQuantMode;
 
     pub fn gemma4_quant_kv_mode() -> Gemma4QuantKvMode {
-        if let Ok(s) = std::env::var("LUMEN_GEMMA4_QUANT_KV_MODE") {
-            return match s.trim().to_ascii_lowercase().as_str() {
-                "off" | "0" | "false" | "no" => Gemma4QuantKvMode::Off,
-                "on" | "1" | "true" | "yes" => Gemma4QuantKvMode::On,
-                "auto" => Gemma4QuantKvMode::Auto,
-                other => {
-                    eprintln!(
-                        "[gemma4] WARN unknown LUMEN_GEMMA4_QUANT_KV_MODE={other:?}, \
-                         defaulting to off"
-                    );
-                    Gemma4QuantKvMode::Off
-                }
-            };
-        }
-        // Legacy env var fallback (kept for backward compat).
-        if std::env::var("LUMEN_GEMMA4_QUANT_KV")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            Gemma4QuantKvMode::On
-        } else {
-            Gemma4QuantKvMode::Off
-        }
+        kv_quant_mode(
+            "LUMEN_GEMMA4_QUANT_KV_MODE",
+            std::env::var("LUMEN_GEMMA4_QUANT_KV_MODE"),
+            || std::env::var("LUMEN_GEMMA4_QUANT_KV"),
+        )
     }
 
     /// Auto-mode prompt-length threshold (in tokens) at which Q4 kicks in.
@@ -1886,20 +1593,6 @@ pub(crate) mod imp {
         layers: Vec<NativeGemma4LayerCache>,
     }
 
-    /// Read a present Array into the disk-record blob, returning its index;
-    /// `None` for an absent slot. (P2 Gemma4 disk persistence helper.)
-    fn push_record(records: &mut Vec<ArrayRecord>, a: Option<&Array>) -> Result<Option<usize>> {
-        match a {
-            None => Ok(None),
-            Some(arr) => {
-                let rec = record_from_array(arr)?;
-                let id = records.len();
-                records.push(rec);
-                Ok(Some(id))
-            }
-        }
-    }
-
     impl NativeGemma4PromptCache {
         /// Allocate caches for every layer of `cfg`. mlx_lm semantics:
         ///   layer_type == "full_attention"    → KVCache()
@@ -1938,28 +1631,6 @@ pub(crate) mod imp {
                     ]),
                     None => Ok(vec![None, None, None]),
                 }
-            };
-            // Serialize a TurboQuant rotating cache (shared by Full/Sliding TQ).
-            let tq_records = |recs: &mut Vec<ArrayRecord>,
-                              c: &NativeRotatingKvCacheTurboQuant,
-                              kind: LayerKindTag|
-             -> Result<LayerMeta> {
-                let arrays = vec![
-                    push_record(recs, c.keys_codes())?,
-                    push_record(recs, c.keys_sigma())?,
-                    push_record(recs, c.values_codes())?,
-                    push_record(recs, c.values_sigma())?,
-                    push_record(recs, c.keys_signs())?,
-                    push_record(recs, c.keys_residual_norm())?,
-                ];
-                let mut m = LayerMeta::new(kind, c.offset());
-                m.arrays = arrays;
-                m.max_size = Some(c.max_size());
-                m.keep = Some(c.keep());
-                m.idx = Some(c.idx());
-                m.bits = Some(c.bits());
-                m.qjl_m = c.qjl_m();
-                Ok(m)
             };
 
             for layer in &self.layers {
@@ -2007,14 +1678,18 @@ pub(crate) mod imp {
                         metas.push(m);
                     }
                     NativeGemma4LayerCache::SlidingTurboquant(c) => {
-                        metas.push(tq_records(
+                        metas.push(turboquant_meta(
                             &mut records,
                             c,
                             LayerKindTag::SlidingTurboquant,
                         )?);
                     }
                     NativeGemma4LayerCache::FullTurboquant(c) => {
-                        metas.push(tq_records(&mut records, c, LayerKindTag::FullTurboquant)?);
+                        metas.push(turboquant_meta(
+                            &mut records,
+                            c,
+                            LayerKindTag::FullTurboquant,
+                        )?);
                     }
                 }
             }
@@ -2026,19 +1701,7 @@ pub(crate) mod imp {
         /// from `metas` (written by the same model — guarded by the disk-store
         /// fingerprint), so no model config is needed here.
         pub fn from_disk_records(metas: &[LayerMeta], records: &[ArrayRecord]) -> Result<Self> {
-            let get = |id: Option<usize>| -> Result<Option<Array>> {
-                match id {
-                    None => Ok(None),
-                    Some(i) => {
-                        let rec = records.get(i).ok_or_else(|| {
-                            anyhow!(
-                                "kv_disk: Gemma4 from_disk_records record index {i} out of range"
-                            )
-                        })?;
-                        Ok(Some(record_to_array(rec)?))
-                    }
-                }
-            };
+            let get = |id: Option<usize>| array_at(records, id);
             // Reconstruct a quantized `(packed, scales, biases)` 3-tuple from
             // three consecutive `m.arrays` slots starting at `base`.
             let get3 = |m: &LayerMeta, base: usize| -> Result<Option<(Array, Array, Array)>> {
@@ -2053,37 +1716,6 @@ pub(crate) mod imp {
                     )),
                 }
             };
-            // Reconstruct a TurboQuant rotating cache (shared Full/Sliding TQ).
-            let tq_from = |m: &LayerMeta| -> Result<NativeRotatingKvCacheTurboQuant> {
-                let slot = |i: usize| get(m.arrays.get(i).copied().flatten());
-                let max_size = m
-                    .max_size
-                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing max_size"))?;
-                let keep = m
-                    .keep
-                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing keep"))?;
-                let idx = m
-                    .idx
-                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing idx"))?;
-                let bits = m
-                    .bits
-                    .ok_or_else(|| anyhow!("kv_disk: Gemma4 TQ layer missing bits"))?;
-                Ok(NativeRotatingKvCacheTurboQuant::from_parts(
-                    slot(0)?,
-                    slot(1)?,
-                    slot(2)?,
-                    slot(3)?,
-                    slot(4)?,
-                    slot(5)?,
-                    m.offset,
-                    max_size,
-                    keep,
-                    idx,
-                    bits,
-                    m.qjl_m,
-                ))
-            };
-
             let mut layers = Vec::with_capacity(metas.len());
             for m in metas {
                 match m.kind {
@@ -2166,10 +1798,14 @@ pub(crate) mod imp {
                         ));
                     }
                     LayerKindTag::SlidingTurboquant => {
-                        layers.push(NativeGemma4LayerCache::SlidingTurboquant(tq_from(m)?));
+                        layers.push(NativeGemma4LayerCache::SlidingTurboquant(
+                            turboquant_from_meta(m, records)?,
+                        ));
                     }
                     LayerKindTag::FullTurboquant => {
-                        layers.push(NativeGemma4LayerCache::FullTurboquant(tq_from(m)?));
+                        layers.push(NativeGemma4LayerCache::FullTurboquant(
+                            turboquant_from_meta(m, records)?,
+                        ));
                     }
                     other => {
                         return Err(anyhow!(
@@ -2467,6 +2103,7 @@ pub(crate) mod imp {
     ///
     /// For sliding-attention layers, the window cutoff is applied so queries
     /// only see the last `sliding_window` keys.
+    #[allow(dead_code)] // tests only; the forward uses `make_attention_mask_for_layer_chunked`
     pub fn make_attention_mask_for_layer(
         kind: NativeGemma4LayerType,
         cfg: &NativeGemma4TextConfig,
@@ -2939,18 +2576,6 @@ pub(crate) mod imp {
 
     // ───────────────────────── resolved per-layer weights ─────────────────────────
 
-    /// Quantized linear tensor triple `(weight, scales, biases?)` plus its
-    /// `(group_size, bits, mode)` dispatch params. Mirrors Qwen3.5's
-    /// `ResolvedLinear`.
-    pub struct ResolvedGemma4QuantLinear {
-        pub weight: Array,
-        pub scales: Array,
-        pub biases: Option<Array>,
-        pub group_size: i32,
-        pub bits: i32,
-        pub mode: &'static CStr,
-    }
-
     /// `embed_tokens` is the one weight that may legitimately ship as bf16:
     /// `imatrix_mixed_quant.py` (and mlx-lm's `convert.py` predicate path)
     /// keeps the embedding table at bf16 by default since the gather/lookup
@@ -2958,41 +2583,41 @@ pub(crate) mod imp {
     /// and the bpw savings are negligible (~0.5% of total) against the
     /// quality hit. mlx-lm's loader infers quant vs bf16 from the presence
     /// of `.scales`; we mirror that here. All other linear layers go
-    /// through `ResolvedGemma4QuantLinear` unchanged (they're always
+    /// through `ResolvedLinear` unchanged (they're always
     /// quantized in production catalog builds).
     pub enum EmbedTokensWeights {
-        Quantized(ResolvedGemma4QuantLinear),
+        Quantized(ResolvedLinear),
         Bf16(Array),
     }
 
     pub struct ResolvedGemma4AttnWeights {
-        pub q_proj: ResolvedGemma4QuantLinear,
-        pub k_proj: ResolvedGemma4QuantLinear,
+        pub q_proj: ResolvedLinear,
+        pub k_proj: ResolvedLinear,
         /// Absent on full-attention layers when `attention_k_eq_v=true` —
         /// the forward path reuses `k_proj`'s output for values.
-        pub v_proj: Option<ResolvedGemma4QuantLinear>,
-        pub o_proj: ResolvedGemma4QuantLinear,
+        pub v_proj: Option<ResolvedLinear>,
+        pub o_proj: ResolvedLinear,
         pub q_norm: Array,
         pub k_norm: Array,
     }
 
     pub struct ResolvedGemma4DenseMlpWeights {
-        pub gate_proj: ResolvedGemma4QuantLinear,
-        pub up_proj: ResolvedGemma4QuantLinear,
-        pub down_proj: ResolvedGemma4QuantLinear,
+        pub gate_proj: ResolvedLinear,
+        pub up_proj: ResolvedLinear,
+        pub down_proj: ResolvedLinear,
     }
 
     pub struct ResolvedGemma4ExpertsWeights {
         /// Shape `[num_experts, moe_intermediate, hidden]` (quantized).
-        pub gate_proj: ResolvedGemma4QuantLinear,
-        pub up_proj: ResolvedGemma4QuantLinear,
+        pub gate_proj: ResolvedLinear,
+        pub up_proj: ResolvedLinear,
         /// Shape `[num_experts, hidden, moe_intermediate]`.
-        pub down_proj: ResolvedGemma4QuantLinear,
+        pub down_proj: ResolvedLinear,
     }
 
     pub struct ResolvedGemma4RouterWeights {
         /// Shape `[num_experts, hidden]`, 8-bit per the override map.
-        pub proj: ResolvedGemma4QuantLinear,
+        pub proj: ResolvedLinear,
         /// Shape `[hidden]` — pre-router RMSNorm scale (raw, before root_size).
         pub scale: Array,
         /// pre-computed `scale * hidden^-0.5` for the
@@ -3040,12 +2665,12 @@ pub(crate) mod imp {
         weights: &NativeGemma4Weights,
         cfg: &NativeGemma4Config,
         base: &str,
-    ) -> Result<ResolvedGemma4QuantLinear> {
+    ) -> Result<ResolvedLinear> {
         let weight = require_clone(weights, &format!("{base}.weight"))?;
         let scales = require_clone(weights, &format!("{base}.scales"))?;
         let biases = weights.get(&format!("{base}.biases")).cloned();
         let (group_size, bits, mode) = quant_params_for(cfg, base)?;
-        Ok(ResolvedGemma4QuantLinear {
+        Ok(ResolvedLinear {
             weight,
             scales,
             biases,
@@ -3233,11 +2858,11 @@ pub(crate) mod imp {
     /// runtime, `V_rot = X @ W_v_rot^T` produces V already in rotated
     /// space — the explicit `rotate_last_axis(V, R)` call can be skipped.
     fn bake_r_into_v_proj(
-        lin: &ResolvedGemma4QuantLinear,
+        lin: &ResolvedLinear,
         r_arr: &Array,
         h_kv: i32,
         head_dim: i32,
-    ) -> Result<ResolvedGemma4QuantLinear> {
+    ) -> Result<ResolvedLinear> {
         // Optional re-quant precision override: rotated weights may have a
         // noise distribution that mlx-affine 4-bit can't tolerate well.
         // `LUMEN_GEMMA4_TQ_BAKE_BITS` (default = source bits) lets us pin
@@ -3301,7 +2926,7 @@ pub(crate) mod imp {
             quantize_with_mode(&w_rot_flat, lin.group_size, target_bits, lin.mode)
                 .context("bake_r_into_v_proj: re-quantize")?;
 
-        Ok(ResolvedGemma4QuantLinear {
+        Ok(ResolvedLinear {
             weight: packed,
             scales,
             biases,
@@ -3320,11 +2945,11 @@ pub(crate) mod imp {
     ///
     /// (Equivalent to `R^T` applied along W_o's head_dim block per head.)
     fn bake_r_into_o_proj(
-        lin: &ResolvedGemma4QuantLinear,
+        lin: &ResolvedLinear,
         r_arr: &Array,
         h: i32,
         head_dim: i32,
-    ) -> Result<ResolvedGemma4QuantLinear> {
+    ) -> Result<ResolvedLinear> {
         let w_bf16 = dequantize_with_mode(
             &lin.weight,
             &lin.scales,
@@ -3369,7 +2994,7 @@ pub(crate) mod imp {
             quantize_with_mode(&w_rot_flat, lin.group_size, lin.bits, lin.mode)
                 .context("bake_r_into_o_proj: re-quantize")?;
 
-        Ok(ResolvedGemma4QuantLinear {
+        Ok(ResolvedLinear {
             weight: packed,
             scales,
             biases,
@@ -3460,12 +3085,11 @@ pub(crate) mod imp {
         const_softcap_inv: Array,
         const_softcap: Array,
         const_last_idx_one: Array, // last_pos index used by argmax_last_token_lazy in decode steps (L=1)
-        // True iff Wv/Wo were baked with the Haar rotation R at load
+        // True iff Wv / Wo were baked with the Haar rotation R at load
         // time. When set, the SlidingTurboquant forward path skips the
-        // runtime V rotation matmul *and* the V_dq un-rotation matmul.
+        // runtime V rotation matmul / the V_dq un-rotation matmul.
         // Set by `load()` when `LUMEN_GEMMA4_QUANT_KV_SLIDING_TURBOQUANT=1`
         // + `LUMEN_GEMMA4_TQ_BAKE_R != "0"` (default ON when TQ is on).
-        tq_bake_active: bool,
         // Independent gates per-leg so we can A/B Wv-only vs Wo-only.
         tq_bake_v_active: bool,
         tq_bake_o_active: bool,
@@ -3768,7 +3392,6 @@ pub(crate) mod imp {
                 const_softcap_inv,
                 const_softcap,
                 const_last_idx_one,
-                tq_bake_active,
                 tq_bake_v_active,
                 tq_bake_o_active,
                 tq_bake_o_full_attn_active,
@@ -3817,19 +3440,6 @@ pub(crate) mod imp {
         /// gate.
         pub fn mtp_enabled(&self) -> bool {
             self.mtp.is_some()
-        }
-
-        /// TQ rotation-bake state set at load time. `(bake_v, bake_o)`.
-        /// Exposed so the startup log can surface whether the runtime V
-        /// rotation matmul + V_dq un-rotation are actually being skipped.
-        pub fn tq_bake_state(&self) -> (bool, bool) {
-            (self.tq_bake_v_active, self.tq_bake_o_active)
-        }
-
-        /// Exposes whether Wo bake is also active on full-attention layers.
-        /// Independent flag because full-attn uses a separate R (D=512).
-        pub fn tq_bake_o_full_attn_state(&self) -> bool {
-            self.tq_bake_o_full_attn_active
         }
 
         /// Toggle the MTP capture hook in `forward_array_impl`. When set,
@@ -4285,28 +3895,6 @@ pub(crate) mod imp {
             self.config.text_config.vocab_size
         }
 
-        /// Single quantized-linear application. Wraps
-        /// `quantized_matmul_with_mode(transpose=true, …)`.
-        ///
-        /// bf16-throughout residual stream is canonical
-        /// (gate-on parity with mlx-lm at long context). The legacy
-        /// `LUMEN_GEMMA4_NO_F32_CAST=0` f32-cast fallback was removed
-        /// 2026-05-14 after 6+ months of dormancy. History in
-        /// `phase_1_6_regression_resolved_missing_gate.md`.
-        fn qmatmul(lin: &ResolvedGemma4QuantLinear, x: &Array) -> Result<Array> {
-            quantized_matmul_with_mode(
-                x,
-                &lin.weight,
-                &lin.scales,
-                lin.biases.as_ref(),
-                /* transpose */ true,
-                lin.group_size,
-                lin.bits,
-                lin.mode,
-            )
-            .context("qmatmul: quantized_matmul_with_mode failed")
-        }
-
         /// Mirrors mlx-lm's `RMSNormNoScale` (used for Gemma 4's `v_norm`):
         /// `y = x * rsqrt(mean(x*x, axis=-1) + eps)` — no learnable scale.
         ///
@@ -4367,16 +3955,16 @@ pub(crate) mod imp {
             } else {
                 None
             };
-            let q_raw = Self::qmatmul(&lw.attn.q_proj, x)?;
+            let q_raw = lw.attn.q_proj.apply(x)?;
             let q = mlx_rs::ops::reshape(&q_raw, &[b, l, n_heads, head_dim])
                 .context("attn: reshape Q failed")?;
             // q_norm timed under norms bucket below.
-            let k_raw = Self::qmatmul(&lw.attn.k_proj, x)?;
+            let k_raw = lw.attn.k_proj.apply(x)?;
             let k_4d = mlx_rs::ops::reshape(&k_raw, &[b, l, n_kv, head_dim])
                 .context("attn: reshape K failed")?;
             let v_4d = match &lw.attn.v_proj {
                 Some(v_proj) => {
-                    let v_raw = Self::qmatmul(v_proj, x)?;
+                    let v_raw = v_proj.apply(x)?;
                     mlx_rs::ops::reshape(&v_raw, &[b, l, n_kv, head_dim])
                         .context("attn: reshape V failed")?
                 }
@@ -4539,7 +4127,7 @@ pub(crate) mod imp {
                     .context("qkv_quant: transpose output")?;
                 let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant: reshape output flat")?;
-                let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
+                let out_final = lw.attn.o_proj.apply(&attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -4636,7 +4224,7 @@ pub(crate) mod imp {
                     .context("qkv_quant_sliding: transpose output")?;
                 let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("qkv_quant_sliding: reshape output flat")?;
-                let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
+                let out_final = lw.attn.o_proj.apply(&attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -5189,7 +4777,7 @@ pub(crate) mod imp {
                     .context("tq_sliding: transpose output")?;
                 let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                     .context("tq_sliding: reshape output flat")?;
-                let out_final = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
+                let out_final = lw.attn.o_proj.apply(&attn_flat)?;
                 if let Some(t0) = oproj_start {
                     bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
                 }
@@ -5488,7 +5076,7 @@ pub(crate) mod imp {
                 .context("attn: transpose output failed")?;
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, n_heads * head_dim])
                 .context("attn: reshape output failed")?;
-            let out = Self::qmatmul(&lw.attn.o_proj, &attn_flat)?;
+            let out = lw.attn.o_proj.apply(&attn_flat)?;
             if let Some(t0) = oproj_start {
                 bump_gemma4_attn_qkvo_ms(t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -5537,16 +5125,12 @@ pub(crate) mod imp {
             // Fall through to legacy path if compile dispatch fails
             // (e.g. biases missing). The fused helper logs via `.context`,
             // and the legacy path is bit-identical fallback.
-            let gate = Self::qmatmul(&w.gate_proj, x)?;
-            let up = Self::qmatmul(&w.up_proj, x)?;
+            let gate = w.gate_proj.apply(x)?;
+            let up = w.up_proj.apply(x)?;
             let activated = Self::geglu_apply(&gate, &up)?;
-            Self::qmatmul(&w.down_proj, &activated)
+            w.down_proj.apply(&activated)
         }
 
-        /// Router forward: `rms_norm(x, scale * h^-0.5, eps) → proj → top-k →
-        /// softmax → × per_expert_scale[indices]`.
-        ///
-        /// Returns `(indices, weights)` with shape `[B, L, top_k]` each.
         /// Compute router (scores, indices) without applying the routing tail
         /// weights. Used by the combined routing+experts compile path so the
         /// tail can be folded into the same compile slot as the experts.
@@ -5560,7 +5144,7 @@ pub(crate) mod imp {
             let eps = cfg.rms_norm_eps;
 
             let normed = rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
-            let scores = Self::qmatmul(&w.proj, &normed)?;
+            let scores = w.proj.apply(&normed)?;
             let last_axis = (scores.ndim() as i32) - 1;
             let num_experts = scores.shape()[last_axis as usize];
             let partitioned = mlx_rs::ops::argpartition_axis(&scores, -top_k, last_axis)
@@ -5570,37 +5154,21 @@ pub(crate) mod imp {
             Ok((scores, indices))
         }
 
+        /// Router forward: `rms_norm(x, scale * h^-0.5, eps) → proj → top-k →
+        /// softmax → × per_expert_scale[indices]`.
+        ///
+        /// Returns `(indices, weights)` with shape `[B, L, top_k]` each.
         fn router_forward(
             &self,
             x: &Array,
             w: &ResolvedGemma4RouterWeights,
         ) -> Result<(Array, Array)> {
-            let cfg = &self.config.text_config;
-            let hidden = cfg.hidden_size as f32;
-            let top_k = cfg.top_k_experts as i32;
-            let eps = cfg.rms_norm_eps;
-
-            // 1. rms_norm with weight = scale * hidden^-0.5
-            //
-            // `scaled_weight` is now pre-computed at model load
-            // (see resolve_layer → ResolvedGemma4RouterWeights.scaled_weight).
-            // Saves 1 Array::from_f32 + 1 multiply per layer per decode step
-            // = 60 mlx ops per step across 30 MoE layers.
-            let _ = (hidden,); // hidden no longer needed in the hot path
-            let normed = rms_norm(x, &w.scaled_weight, eps).context("router: rms_norm")?;
-
-            // 2. expert_scores = proj(normed)  → [B, L, num_experts]
-            let scores = Self::qmatmul(&w.proj, &normed)?;
-
-            // 3. argpartition + Ellipsis-slice stay outside the compile slot
-            //    because mlx compile cannot infer the dynamic Slice output
-            //    shape. The slice carries no GPU work — it's a stride view.
+            // 1-3. rms_norm (weight `scale * hidden^-0.5`, pre-computed at
+            //      load) → proj → argpartition + Ellipsis-slice. The slice
+            //      stays outside the compile slot because mlx compile cannot
+            //      infer its dynamic output shape; it carries no GPU work.
+            let (scores, indices) = self.router_compute_scores_indices(x, w)?;
             let last_axis = (scores.ndim() as i32) - 1;
-            let num_experts = scores.shape()[last_axis as usize];
-            let partitioned = mlx_rs::ops::argpartition_axis(&scores, -top_k, last_axis)
-                .context("router: argpartition_axis failed")?;
-            let start = num_experts - top_k;
-            let indices = partitioned.index((Ellipsis, start..));
 
             // 4-6. Fused tail: take_along → softmax(precise) →
             //      take_axis(per_expert_scale, indices) → ×
@@ -5687,105 +5255,20 @@ pub(crate) mod imp {
             // group_size=64, bits=4, transpose=true, sorted_indices=false,
             // mode="affine" into the traced graph at first call. Falls back
             // to legacy 3-gather_qmm chain on any error or if env disables.
-            let down = if !do_sort
+            let fused = if !do_sort
                 && gemma4_experts_fuse_enabled()
                 && w.gate_proj.bits == 4
                 && w.gate_proj.group_size == 64
                 && w.gate_proj.mode == MODE_AFFINE
             {
-                match gemma4_experts_fused(&x_for_qmm, &idx_for_qmm, w) {
-                    Ok(down) => down,
-                    Err(_) => {
-                        // Legacy fallback if fusion fails (e.g. biases missing).
-                        let x_gate = gather_qmm_with_mode(
-                            &x_for_qmm,
-                            &w.gate_proj.weight,
-                            &w.gate_proj.scales,
-                            w.gate_proj.biases.as_ref(),
-                            None,
-                            Some(&idx_for_qmm),
-                            true,
-                            w.gate_proj.group_size,
-                            w.gate_proj.bits,
-                            w.gate_proj.mode,
-                            do_sort,
-                        )
-                        .context("experts: gather_qmm(gate_proj) failed")?;
-                        let x_up = gather_qmm_with_mode(
-                            &x_for_qmm,
-                            &w.up_proj.weight,
-                            &w.up_proj.scales,
-                            w.up_proj.biases.as_ref(),
-                            None,
-                            Some(&idx_for_qmm),
-                            true,
-                            w.up_proj.group_size,
-                            w.up_proj.bits,
-                            w.up_proj.mode,
-                            do_sort,
-                        )
-                        .context("experts: gather_qmm(up_proj) failed")?;
-                        let activated = Self::geglu_apply(&x_gate, &x_up)?;
-                        gather_qmm_with_mode(
-                            &activated,
-                            &w.down_proj.weight,
-                            &w.down_proj.scales,
-                            w.down_proj.biases.as_ref(),
-                            None,
-                            Some(&idx_for_qmm),
-                            true,
-                            w.down_proj.group_size,
-                            w.down_proj.bits,
-                            w.down_proj.mode,
-                            do_sort,
-                        )
-                        .context("experts: gather_qmm(down_proj) failed")?
-                    }
-                }
+                // Legacy chain below if fusion fails (e.g. biases missing).
+                gemma4_experts_fused(&x_for_qmm, &idx_for_qmm, w).ok()
             } else {
-                let x_gate = gather_qmm_with_mode(
-                    &x_for_qmm,
-                    &w.gate_proj.weight,
-                    &w.gate_proj.scales,
-                    w.gate_proj.biases.as_ref(),
-                    None,
-                    Some(&idx_for_qmm),
-                    true,
-                    w.gate_proj.group_size,
-                    w.gate_proj.bits,
-                    w.gate_proj.mode,
-                    do_sort,
-                )
-                .context("experts: gather_qmm(gate_proj) failed")?;
-                let x_up = gather_qmm_with_mode(
-                    &x_for_qmm,
-                    &w.up_proj.weight,
-                    &w.up_proj.scales,
-                    w.up_proj.biases.as_ref(),
-                    None,
-                    Some(&idx_for_qmm),
-                    true,
-                    w.up_proj.group_size,
-                    w.up_proj.bits,
-                    w.up_proj.mode,
-                    do_sort,
-                )
-                .context("experts: gather_qmm(up_proj) failed")?;
-                let activated = Self::geglu_apply(&x_gate, &x_up)?;
-                gather_qmm_with_mode(
-                    &activated,
-                    &w.down_proj.weight,
-                    &w.down_proj.scales,
-                    w.down_proj.biases.as_ref(),
-                    None,
-                    Some(&idx_for_qmm),
-                    true,
-                    w.down_proj.group_size,
-                    w.down_proj.bits,
-                    w.down_proj.mode,
-                    do_sort,
-                )
-                .context("experts: gather_qmm(down_proj) failed")?
+                None
+            };
+            let down = match fused {
+                Some(down) => down,
+                None => Self::experts_unfused(&x_for_qmm, &idx_for_qmm, w, do_sort)?,
             };
 
             // Unsort + reshape to [B, L, K, 1, hidden], squeeze axis -2.
@@ -5812,6 +5295,67 @@ pub(crate) mod imp {
             let summed = mlx_rs::ops::sum_axis(&weighted, -2, /* keep_dims */ false)
                 .context("experts: sum(axis=-2) failed")?;
             Ok(summed)
+        }
+
+        /// The unfused expert GLU: `gather_qmm_with_mode` gate / up → GeGLU →
+        /// down, each projection at its own quant params. `sorted` says
+        /// whether `idx` was sorted by expert (the prefill branch).
+        fn experts_unfused(
+            x: &Array,
+            idx: &Array,
+            w: &ResolvedGemma4ExpertsWeights,
+            sorted: bool,
+        ) -> Result<Array> {
+            let gqmm = |xi: &Array, lin: &ResolvedLinear, name: &str| {
+                gather_qmm_with_mode(
+                    xi,
+                    &lin.weight,
+                    &lin.scales,
+                    lin.biases.as_ref(),
+                    None,
+                    Some(idx),
+                    true,
+                    lin.group_size,
+                    lin.bits,
+                    lin.mode,
+                    sorted,
+                )
+                .with_context(|| format!("experts: gather_qmm({name}) failed"))
+            };
+            let x_gate = gqmm(x, &w.gate_proj, "gate_proj")?;
+            let x_up = gqmm(x, &w.up_proj, "up_proj")?;
+            let activated = Self::geglu_apply(&x_gate, &x_up)?;
+            gqmm(&activated, &w.down_proj, "down_proj")
+        }
+
+        /// The dense branch of a decoder layer, unfused:
+        /// `pre_feedforward_layernorm` → dense MLP → `post_feedforward_layernorm_1`.
+        fn dense_branch_unfused(
+            h: &Array,
+            lw: &ResolvedGemma4LayerWeights,
+            eps: f32,
+        ) -> Result<Array> {
+            let h1 = rms_norm(h, &lw.pre_feedforward_layernorm, eps)
+                .context("layer: pre_feedforward_layernorm")?;
+            let h1 = Self::dense_mlp_forward(&h1, &lw.dense_mlp)?;
+            rms_norm(&h1, &lw.post_feedforward_layernorm_1, eps)
+                .context("layer: post_feedforward_layernorm_1")
+        }
+
+        /// A decoder layer's epilogue, unfused: `h1 + h2` →
+        /// `post_feedforward_layernorm` → + residual → × `layer_scalar`.
+        fn epilogue_unfused(
+            h1: &Array,
+            h2: &Array,
+            residual: &Array,
+            lw: &ResolvedGemma4LayerWeights,
+            eps: f32,
+        ) -> Result<Array> {
+            let h = mlx_rs::ops::add(h1, h2).context("layer: h1 + h2")?;
+            let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
+                .context("layer: post_feedforward_layernorm")?;
+            let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (ff)")?;
+            mlx_rs::ops::multiply(&h, &lw.layer_scalar).context("layer: × layer_scalar")
         }
 
         /// Full Gemma 4 decoder layer forward: input_norm → attention →
@@ -5894,20 +5438,10 @@ pub(crate) mod imp {
                     &lw.dense_mlp,
                 ) {
                     Ok(out) => out,
-                    Err(_) => {
-                        let h1 = rms_norm(&h, &lw.pre_feedforward_layernorm, eps)
-                            .context("layer: pre_feedforward_layernorm")?;
-                        let h1 = Self::dense_mlp_forward(&h1, &lw.dense_mlp)?;
-                        rms_norm(&h1, &lw.post_feedforward_layernorm_1, eps)
-                            .context("layer: post_feedforward_layernorm_1")?
-                    }
+                    Err(_) => Self::dense_branch_unfused(&h, lw, eps)?,
                 }
             } else {
-                let h1 = rms_norm(&h, &lw.pre_feedforward_layernorm, eps)
-                    .context("layer: pre_feedforward_layernorm")?;
-                let h1 = Self::dense_mlp_forward(&h1, &lw.dense_mlp)?;
-                rms_norm(&h1, &lw.post_feedforward_layernorm_1, eps)
-                    .context("layer: post_feedforward_layernorm_1")?
+                Self::dense_branch_unfused(&h, lw, eps)?
             };
             if let Some(t0) = dense_start {
                 if !skip_eval_barriers {
@@ -6111,22 +5645,11 @@ pub(crate) mod imp {
                     &lw.layer_scalar,
                 ) {
                     Ok(out) => out,
-                    Err(_) => {
-                        // Unfused fallback (bit-identical).
-                        let h = mlx_rs::ops::add(&h1, &h2).context("layer: h1 + h2")?;
-                        let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
-                            .context("layer: post_feedforward_layernorm")?;
-                        let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (ff)")?;
-                        mlx_rs::ops::multiply(&h, &lw.layer_scalar)
-                            .context("layer: × layer_scalar")?
-                    }
+                    // Unfused fallback (bit-identical).
+                    Err(_) => Self::epilogue_unfused(&h1, &h2, residual, lw, eps)?,
                 }
             } else {
-                let h = mlx_rs::ops::add(&h1, &h2).context("layer: h1 + h2")?;
-                let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
-                    .context("layer: post_feedforward_layernorm")?;
-                let h = mlx_rs::ops::add(residual, &h).context("layer: +residual (ff)")?;
-                mlx_rs::ops::multiply(&h, &lw.layer_scalar).context("layer: × layer_scalar")?
+                Self::epilogue_unfused(&h1, &h2, residual, lw, eps)?
             };
             Ok(h)
         }
@@ -6156,12 +5679,7 @@ pub(crate) mod imp {
             let h = mlx_rs::ops::add(residual_in, &h).context("post_attn: +residual (attn)")?;
             let residual: &Array = &h;
 
-            // Dense MLP (unfused): pre_ff_norm → mlp → post_ff_1.
-            let h1 = rms_norm(&h, &lw.pre_feedforward_layernorm, eps)
-                .context("post_attn: pre_feedforward_layernorm")?;
-            let h1 = Self::dense_mlp_forward(&h1, &lw.dense_mlp)?;
-            let h1 = rms_norm(&h1, &lw.post_feedforward_layernorm_1, eps)
-                .context("post_attn: post_feedforward_layernorm_1")?;
+            let h1 = Self::dense_branch_unfused(&h, lw, eps)?;
 
             // MoE (unfused legacy): router → pre_norm → experts → post_norm.
             let (indices, weights) = self.router_forward(&h, &lw.router)?;
@@ -6171,12 +5689,7 @@ pub(crate) mod imp {
             let h2 = rms_norm(&h2, &lw.post_feedforward_layernorm_2, eps)
                 .context("post_attn: post_feedforward_layernorm_2")?;
 
-            // Epilogue (unfused): add → post_ff_norm → +residual → ×layer_scalar.
-            let h = mlx_rs::ops::add(&h1, &h2).context("post_attn: h1 + h2")?;
-            let h = rms_norm(&h, &lw.post_feedforward_layernorm, eps)
-                .context("post_attn: post_feedforward_layernorm")?;
-            let h = mlx_rs::ops::add(residual, &h).context("post_attn: +residual (ff)")?;
-            mlx_rs::ops::multiply(&h, &lw.layer_scalar).context("post_attn: × layer_scalar")
+            Self::epilogue_unfused(&h1, &h2, residual, lw, eps)
         }
 
         /// Phase 3: one batched decode forward over N single-token sequences,
@@ -6252,28 +5765,7 @@ pub(crate) mod imp {
             let h = rms_norm(&h, &self.final_norm, cfg.rms_norm_eps)
                 .context("forward_decode_batch: final_norm")?;
             let logits = self.tied_lm_head_plus_softcap(&h)?;
-            self.argmax_rows(&logits)
-        }
-
-        /// Per-row argmax over `[N, 1, vocab]` logits → `Vec<u32>` of length N
-        /// (single eval via `try_as_slice`). Phase 3 batched-decode counterpart
-        /// of `argmax_last_token` (which is `[1,1]`-only).
-        fn argmax_rows(&self, logits: &Array) -> Result<Vec<u32>> {
-            if logits.ndim() != 3 {
-                return Err(anyhow!(
-                    "argmax_rows: expected [N, 1, V] logits, got ndim={}",
-                    logits.ndim()
-                ));
-            }
-            let idx0 = Array::from_int(0);
-            let rows = mlx_rs::ops::indexing::take_axis(logits, &idx0, 1)
-                .context("argmax_rows: take_axis(0, axis=1)")?;
-            let am = mlx_rs::ops::indexing::argmax_axis(&rows, -1, /* keep_dims */ false)
-                .context("argmax_rows: argmax_axis(-1)")?;
-            let slice = am
-                .try_as_slice::<u32>()
-                .map_err(|err| anyhow!("argmax_rows: read failed: {err}"))?;
-            Ok(slice.to_vec())
+            argmax_rows(&logits)
         }
 
         /// Embedding lookup with affine-quant rows (4-bit) + biases support.

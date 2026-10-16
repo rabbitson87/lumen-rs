@@ -942,6 +942,7 @@ pub fn turboquant_fused_attn(
 #[cfg(all(test, feature = "mlx-native"))]
 mod qjl_correctness_tests {
     use super::*;
+    use crate::test_support::bf16_normal;
     use mlx_rs::{Array, Dtype, random};
 
     /// One-sided cosine similarity ⟨x, y⟩ / (‖x‖ ‖y‖) computed in f32 and
@@ -987,6 +988,20 @@ mod qjl_correctness_tests {
         Ok(m.item::<f32>().sqrt())
     }
 
+    /// `(MSE, mean square of r, MSE / mean square)` of `f` against the
+    /// reference `r`, both read in f32.
+    fn rel_mse(r: &Array, f: &Array) -> (f32, f32, f32) {
+        let r = r.as_dtype(Dtype::Float32).unwrap();
+        let f = f.as_dtype(Dtype::Float32).unwrap();
+        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
+        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
+        let nelems = r.size() as f32;
+        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
+        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
+        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
+        (mse_val, r_var, mse_val / (r_var + 1e-12))
+    }
+
     /// End-to-end QJL pipeline on a synthetic Gaussian K. Returns a table
     /// `[(bits, cos_stage1, cos_qjl, mse_stage1, mse_qjl, ip_rmse_stage1,
     ///   ip_rmse_qjl)]`.
@@ -996,15 +1011,11 @@ mod qjl_correctness_tests {
         bits_sweep: &[u32],
     ) -> Result<Vec<(u32, f32, f32, f32, f32, f32, f32)>> {
         // Synthesize K ≈ N(0,1) (what K_rot looks like after Haar rotation).
-        let key = random::key(0xDEADBEEFu64)?;
-        let k_true_f32 = random::normal::<f32>(shape, None, None, &key)?;
-        let k_true_bf16 = k_true_f32.as_dtype(Dtype::Bfloat16)?;
+        let k_true_bf16 = bf16_normal(shape, 0xDEADBEEF);
 
         // Random Q for inner-product accuracy probe — independent key so Q
         // and K aren't trivially correlated.
-        let key_q = random::key(0xBADCAFE0u64)?;
-        let q_f32 = random::normal::<f32>(shape, None, None, &key_q)?;
-        let q_bf16 = q_f32.as_dtype(Dtype::Bfloat16)?;
+        let q_bf16 = bf16_normal(shape, 0xBADCAFE0);
 
         let d = *shape.last().unwrap() as usize;
         let proj = qjl_projection_matrix_f32(d, m, TURBOQUANT_SEED)?;
@@ -1104,9 +1115,7 @@ mod qjl_correctness_tests {
         let m = 128;
         let bits = 4u32;
 
-        let key = random::key(0x1234_5678u64).unwrap();
-        let k_true_f32 = random::normal::<f32>(&shape[..], None, None, &key).unwrap();
-        let k_true_bf16 = k_true_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        let k_true_bf16 = bf16_normal(&shape, 0x1234_5678);
         let proj = qjl_projection_matrix_f32(d, m, TURBOQUANT_SEED).unwrap();
         let centroids = lloyd_max_centroids(bits).unwrap();
 
@@ -1385,9 +1394,7 @@ mod qjl_correctness_tests {
         let d = 256usize;
         let bits = 4u32;
 
-        let key = random::key(0xABCDEF01u64).unwrap();
-        let v_f32 = random::normal::<f32>(&shape[..], None, None, &key).unwrap();
-        let v_bf16 = v_f32.as_dtype(Dtype::Bfloat16).unwrap();
+        let v_bf16 = bf16_normal(&shape, 0xABCDEF01);
 
         let r_arr = rotation_matrix_f32(d, TURBOQUANT_SEED).unwrap();
         let centroids = lloyd_max_centroids(bits).unwrap();
@@ -1448,113 +1455,21 @@ mod qjl_correctness_tests {
         );
     }
 
-    /// `turboquant_qk_inline` must match the reference path
-    ///   `lloyd_max_dequantize_scaled(K_codes, K_sigma) → bf16 matmul(Q, K_dq^T)`
-    /// up to bf16 fma-ordering noise. Both paths accumulate in f32 inside the
-    /// kernel/qmatmul but the reduction order differs, so we use a tight
-    /// relative-MSE bound rather than bit-identical equality.
-    ///
-    /// Test uses H == H_kv (no GQA broadcast) to keep the reference reduction
-    /// trivial. GQA correctness is exercised separately by the kernel
-    /// constraint `H % H_kv == 0` (validated in the factory) and end-to-end
-    /// via the integration A/B at the call site.
-    #[test]
-    fn qk_inline_matches_dequant_then_matmul() {
-        use mlx_rs::random;
-        let bits = 4u32;
-        let b: i32 = 1;
-        let h: i32 = 8;
-        let h_kv: i32 = 8; // no GQA in this unit test
-        let t: i32 = 1;
-        let n: i32 = 128;
-        let d: i32 = 256;
-        let centroids = lloyd_max_centroids(bits).unwrap();
-
-        let key_q = random::key(0xA11CE001u64).unwrap();
-        let key_k = random::key(0xA11CE002u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-
-        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
-        // Reference: materialize K_dq, transpose last two axes, then matmul.
-        let k_dq = lloyd_max_dequantize_scaled(&k_codes, &k_sigma, &centroids).unwrap();
-        let k_dq_t = mlx_rs::ops::transpose_axes(&k_dq, &[0, 1, 3, 2]).unwrap();
-        let scores_ref = mlx_rs::ops::matmul(&q_bf16, &k_dq_t).unwrap();
-
-        let scores_fused =
-            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
-
-        let r = scores_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = scores_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * n) as f32;
-        let sum_arr = mlx_rs::ops::sum(&sq, false).unwrap();
-        let mse_val = sum_arr.item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_sum_arr = mlx_rs::ops::sum(&r_sq, false).unwrap();
-        let r_var = r_sum_arr.item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
-        eprintln!(
-            "qk_inline vs reference: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
-            mse_val, r_var, rel
-        );
-        // Both paths f32-accumulate identical math; difference comes from
-        // bf16 store rounding at the end. Tight bound.
-        assert!(
-            rel < 1e-3,
-            "qk_inline output relative MSE too large vs reference: rel={}",
-            rel
-        );
-    }
-
-    /// D=512 variant of `qk_inline_matches_dequant_then_matmul`. Exercises
-    /// the `lumen_tq_qk_inline_d512` Metal kernel (VPT=16) — the kernel that
-    /// crashes in full-attn end-to-end runs. Same correctness contract: rel
-    /// MSE < 1e-3 vs the dequant + bf16 matmul reference. Failure mode this
-    /// test isolates: if mlx-rs swallows the crash error in the full forward
-    /// path, here the kernel is dispatched alone so the underlying mlx
-    /// exception surfaces directly via `.unwrap()`.
-    #[test]
-    fn qk_inline_d512_matches_dequant_then_matmul() {
-        use mlx_rs::random;
-        let bits = 4u32;
-        let b: i32 = 1;
-        let h: i32 = 32; // Gemma 4 full-attn H
-        let h_kv: i32 = 2; // Gemma 4 full-attn H_kv (GQA group=16)
-        let t: i32 = 1;
-        let n: i32 = 64;
-        let d: i32 = 512; // global_head_dim
-        let centroids = lloyd_max_centroids(bits).unwrap();
-
-        let key_q = random::key(0xD512001u64).unwrap();
-        let key_k = random::key(0xD512002u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+    /// `turboquant_qk_inline` against dequantize → expand K's `H_kv` heads to
+    /// Q's `H` → bf16 matmul, at decode (`T = 1`) and 4 bits. With `H == H_kv`
+    /// the expansion is the identity.
+    fn check_qk_inline(h: i32, h_kv: i32, n: i32, d: i32, seeds: [u64; 2], label: &str) {
+        let (b, t) = (1, 1);
+        let centroids = lloyd_max_centroids(4).unwrap();
+        let q_bf16 = bf16_normal(&[b, h, t, d], seeds[0]);
+        let k_rot_bf16 = bf16_normal(&[b, h_kv, n, d], seeds[1]);
 
         let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
 
-        // Reference: dequant + GQA-broadcast K + matmul. With GQA the K head
-        // axis must be expanded to match Q's H. Easiest reference: replicate
-        // K along the head dim via reshape + broadcast, then matmul with Q.
+        // [B, H_kv, N, D] → [B, H_kv, 1, N, D] → broadcast to
+        // [B, H_kv, group, N, D] → [B, H, N, D], then matmul with Q.
         let k_dq = lloyd_max_dequantize_scaled(&k_codes, &k_sigma, &centroids).unwrap();
         let group = h / h_kv;
-        // [B, H_kv, N, D] → [B, H_kv, 1, N, D] → broadcast to [B, H_kv, group, N, D]
-        //                → [B, H, N, D]
         let k_dq_5d = mlx_rs::ops::reshape(&k_dq, &[b, h_kv, 1, n, d]).unwrap();
         let k_dq_b = mlx_rs::ops::broadcast_to(&k_dq_5d, &[b, h_kv, group, n, d]).unwrap();
         let k_dq_full = mlx_rs::ops::reshape(&k_dq_b, &[b, h, n, d]).unwrap();
@@ -1564,28 +1479,42 @@ mod qjl_correctness_tests {
         let scores_fused =
             super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
 
-        let r = scores_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = scores_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * n) as f32;
-        let sum_arr = mlx_rs::ops::sum(&sq, false).unwrap();
-        let mse_val = sum_arr.item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_sum_arr = mlx_rs::ops::sum(&r_sq, false).unwrap();
-        let r_var = r_sum_arr.item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
-        eprintln!(
-            "qk_inline_d512 vs reference: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
-            mse_val, r_var, rel
-        );
+        let (mse_val, r_var, rel) = rel_mse(&scores_ref, &scores_fused);
+        eprintln!("{label} vs reference: MSE={mse_val:.3e}, ref_var={r_var:.3e}, rel={rel:.3e}");
+        // Both paths f32-accumulate identical math; difference comes from
+        // bf16 store rounding at the end. Tight bound.
         assert!(
             rel < 1e-3,
-            "qk_inline_d512 output relative MSE too large vs reference: rel={}",
-            rel
+            "{label} output relative MSE too large vs reference: rel={rel}"
         );
+    }
+
+    /// `turboquant_qk_inline` must match the reference path
+    ///   `lloyd_max_dequantize_scaled(K_codes, K_sigma) → bf16 matmul(Q, K_dq^T)`
+    /// up to bf16 fma-ordering noise. Both paths accumulate in f32 inside the
+    /// kernel/qmatmul but the reduction order differs, so we use a tight
+    /// relative-MSE bound rather than bit-identical equality.
+    ///
+    /// Test uses H == H_kv (no GQA broadcast); the GQA case is
+    /// `qk_inline_d512_matches_dequant_then_matmul`, and the kernel constraint
+    /// `H % H_kv == 0` is validated in the factory and end-to-end via the
+    /// integration A/B at the call site.
+    #[test]
+    fn qk_inline_matches_dequant_then_matmul() {
+        check_qk_inline(8, 8, 128, 256, [0xA11CE001, 0xA11CE002], "qk_inline");
+    }
+
+    /// D=512 variant of `qk_inline_matches_dequant_then_matmul`, at Gemma 4's
+    /// full-attention shape (H=32, H_kv=2: GQA group 16). Exercises the
+    /// `lumen_tq_qk_inline_d512` Metal kernel (VPT=16) — the kernel that
+    /// crashes in full-attn end-to-end runs. Same correctness contract: rel
+    /// MSE < 1e-3 vs the dequant + bf16 matmul reference. Failure mode this
+    /// test isolates: if mlx-rs swallows the crash error in the full forward
+    /// path, here the kernel is dispatched alone so the underlying mlx
+    /// exception surfaces directly via `.unwrap()`.
+    #[test]
+    fn qk_inline_d512_matches_dequant_then_matmul() {
+        check_qk_inline(32, 2, 64, 512, [0xD512001, 0xD512002], "qk_inline_d512");
     }
 
     /// `turboquant_sv_inline` must match the reference path
@@ -1599,7 +1528,6 @@ mod qjl_correctness_tests {
     /// at the decode call site.
     #[test]
     fn sv_inline_matches_dequant_then_matmul() {
-        use mlx_rs::random;
         let bits = 4u32;
         let b: i32 = 1;
         let h: i32 = 8;
@@ -1609,16 +1537,8 @@ mod qjl_correctness_tests {
         let d: i32 = 256;
         let centroids = lloyd_max_centroids(bits).unwrap();
 
-        let key_s = random::key(0xB055ED01u64).unwrap();
-        let key_v = random::key(0xB055ED02u64).unwrap();
-        let scores_bf16 = random::normal::<f32>(&[b, h, t, n], None, None, &key_s)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let v_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+        let scores_bf16 = bf16_normal(&[b, h, t, n], 0xB055ED01);
+        let v_rot_bf16 = bf16_normal(&[b, h_kv, n, d], 0xB055ED02);
 
         let (v_codes, v_sigma) = lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
         // Reference: materialize V_dq, then S · V_dq.
@@ -1628,17 +1548,7 @@ mod qjl_correctness_tests {
         let out_fused =
             super::turboquant_sv_inline(&scores_bf16, &v_codes, &v_sigma, &centroids).unwrap();
 
-        let r = out_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = out_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * d) as f32;
-        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
+        let (mse_val, r_var, rel) = rel_mse(&out_ref, &out_fused);
         eprintln!(
             "sv_inline vs reference: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
             mse_val, r_var, rel
@@ -1650,43 +1560,16 @@ mod qjl_correctness_tests {
         );
     }
 
-    /// `turboquant_fused_attn` must match the 3-stage reference
-    ///   `qk_inline → softmax → sv_inline` up to f32 accumulation noise.
-    /// This is the correctness oracle for the fused kernel: same math, just
-    /// one Metal dispatch instead of three.
-    ///
-    /// Test uses H == H_kv (no GQA) and small N to keep the reference
-    /// computation simple and the softmax numerically benign. Failures fall
-    /// into two buckets: kernel arithmetic (per-thread loops, exp / sum
-    /// updates) or kernel layout (cross-SG aggregation, output write
-    /// offset). Both surface as rel MSE > 1e-3 here.
-    #[test]
-    fn fused_attn_matches_qk_softmax_sv_reference() {
-        use mlx_rs::random;
-        let bits = 4u32;
-        let b: i32 = 1;
-        let h: i32 = 8;
-        let h_kv: i32 = 8; // no GQA
-        let t: i32 = 1;
-        let n: i32 = 128;
-        let d: i32 = 256;
-        let centroids = lloyd_max_centroids(bits).unwrap();
-
-        let key_q = random::key(0xFA5ED001u64).unwrap();
-        let key_k = random::key(0xFA5ED002u64).unwrap();
-        let key_v = random::key(0xFA5ED003u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let v_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+    /// `turboquant_fused_attn` against the 3-stage reference
+    /// `qk_inline → softmax → sv_inline` at decode (`T = 1`) and 4 bits.
+    /// `qk_inline` and `sv_inline` handle GQA internally
+    /// (`h_kv = h * H_kv / H`); softmax is shape-only.
+    fn check_fused_attn(h: i32, h_kv: i32, n: i32, d: i32, seeds: [u64; 3], label: &str) {
+        let (b, t) = (1, 1);
+        let centroids = lloyd_max_centroids(4).unwrap();
+        let q_bf16 = bf16_normal(&[b, h, t, d], seeds[0]);
+        let k_rot_bf16 = bf16_normal(&[b, h_kv, n, d], seeds[1]);
+        let v_rot_bf16 = bf16_normal(&[b, h_kv, n, d], seeds[2]);
 
         let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
         let (v_codes, v_sigma) = lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
@@ -1705,159 +1588,64 @@ mod qjl_correctness_tests {
         )
         .unwrap();
 
-        let r = out_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = out_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * d) as f32;
-        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
-        eprintln!(
-            "fused_attn vs (qk+softmax+sv) reference: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
-            mse_val, r_var, rel
-        );
+        let (mse_val, r_var, rel) = rel_mse(&out_ref, &out_fused);
+        eprintln!("fused_attn ({label}): MSE={mse_val:.3e}, ref_var={r_var:.3e}, rel={rel:.3e}");
         assert!(
             rel < 1e-3,
-            "fused_attn output relative MSE too large vs reference: rel={}",
-            rel
+            "fused_attn ({label}) rel MSE too large: rel={rel}"
         );
     }
 
-    /// GQA variant of `fused_attn_matches_qk_softmax_sv_reference` — the
-    /// no-GQA test confirms kernel arithmetic; this one validates the GQA
-    /// indexing (`h_kv = h * H_kv / H`). Mismatch in this test pins the bug
-    /// to the per-head dispatch inside the kernel.
+    /// `turboquant_fused_attn` must match the 3-stage reference
+    ///   `qk_inline → softmax → sv_inline` up to f32 accumulation noise.
+    /// This is the correctness oracle for the fused kernel: same math, just
+    /// one Metal dispatch instead of three.
+    ///
+    /// Test uses H == H_kv (no GQA) and small N to keep the reference
+    /// computation simple and the softmax numerically benign. Failures fall
+    /// into two buckets: kernel arithmetic (per-thread loops, exp / sum
+    /// updates) or kernel layout (cross-SG aggregation, output write
+    /// offset). Both surface as rel MSE > 1e-3 here.
+    #[test]
+    fn fused_attn_matches_qk_softmax_sv_reference() {
+        check_fused_attn(
+            8,
+            8,
+            128,
+            256,
+            [0xFA5ED001, 0xFA5ED002, 0xFA5ED003],
+            "no GQA H=8",
+        );
+    }
+
+    /// GQA variant of `fused_attn_matches_qk_softmax_sv_reference`, at Gemma
+    /// 4's sliding shape (H=32, H_kv=8: group 4) — the no-GQA test confirms
+    /// kernel arithmetic; this one validates the GQA indexing
+    /// (`h_kv = h * H_kv / H`). Mismatch in this test pins the bug to the
+    /// per-head dispatch inside the kernel.
     #[test]
     fn fused_attn_gqa_matches_reference() {
-        use mlx_rs::random;
-        let bits = 4u32;
-        let b: i32 = 1;
-        let h: i32 = 32; // Gemma 4 sliding H
-        let h_kv: i32 = 8; // sliding H_kv (group=4)
-        let t: i32 = 1;
-        let n: i32 = 128;
-        let d: i32 = 256;
-        let centroids = lloyd_max_centroids(bits).unwrap();
-
-        let key_q = random::key(0xFA5EDA01u64).unwrap();
-        let key_k = random::key(0xFA5EDA02u64).unwrap();
-        let key_v = random::key(0xFA5EDA03u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let v_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-
-        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
-        let (v_codes, v_sigma) = lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
-
-        // Reference: same 3-stage chain. qk_inline + sv_inline handle GQA
-        // internally (`h_kv = h * H_kv / H`); softmax is shape-only.
-        let scores_ref =
-            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
-        let last_axis = (scores_ref.ndim() as i32) - 1;
-        let attn_w_ref = mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
-        let out_ref =
-            super::turboquant_sv_inline(&attn_w_ref, &v_codes, &v_sigma, &centroids).unwrap();
-
-        let out_fused = super::turboquant_fused_attn(
-            &q_bf16, &k_codes, &k_sigma, &v_codes, &v_sigma, &centroids, 1.0,
-        )
-        .unwrap();
-
-        let r = out_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = out_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * d) as f32;
-        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
-        eprintln!(
-            "fused_attn (GQA H=32 H_kv=8): MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
-            mse_val, r_var, rel
+        check_fused_attn(
+            32,
+            8,
+            128,
+            256,
+            [0xFA5EDA01, 0xFA5EDA02, 0xFA5EDA03],
+            "GQA H=32 H_kv=8",
         );
-        assert!(rel < 1e-3, "fused_attn GQA rel MSE too large: rel={}", rel);
     }
 
     /// Full-attn shape variant: H=32, H_kv=2 (group=16), D=512 (global_head_dim).
     /// Tests the `_d512` source-duplicated kernel under tight GQA.
     #[test]
     fn fused_attn_d512_gqa_matches_reference() {
-        use mlx_rs::random;
-        let bits = 4u32;
-        let b: i32 = 1;
-        let h: i32 = 32; // Gemma 4 full-attn H
-        let h_kv: i32 = 2; // full-attn H_kv (group=16)
-        let t: i32 = 1;
-        let n: i32 = 64;
-        let d: i32 = 512;
-        let centroids = lloyd_max_centroids(bits).unwrap();
-
-        let key_q = random::key(0xFAD512A01u64).unwrap();
-        let key_k = random::key(0xFAD512A02u64).unwrap();
-        let key_v = random::key(0xFAD512A03u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let v_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_v)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-
-        let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
-        let (v_codes, v_sigma) = lloyd_max_quantize_stage1_fused(&v_rot_bf16, &centroids).unwrap();
-
-        let scores_ref =
-            super::turboquant_qk_inline(&q_bf16, &k_codes, &k_sigma, &centroids).unwrap();
-        let last_axis = (scores_ref.ndim() as i32) - 1;
-        let attn_w_ref = mlx_rs::ops::softmax_axis(&scores_ref, last_axis, Some(true)).unwrap();
-        let out_ref =
-            super::turboquant_sv_inline(&attn_w_ref, &v_codes, &v_sigma, &centroids).unwrap();
-
-        let out_fused = super::turboquant_fused_attn(
-            &q_bf16, &k_codes, &k_sigma, &v_codes, &v_sigma, &centroids, 1.0,
-        )
-        .unwrap();
-
-        let r = out_ref.as_dtype(Dtype::Float32).unwrap();
-        let f = out_fused.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * d) as f32;
-        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
-
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
-
-        let rel = mse_val / (r_var + 1e-12);
-        eprintln!(
-            "fused_attn (D=512 GQA H=32 H_kv=2): MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
-            mse_val, r_var, rel
-        );
-        assert!(
-            rel < 1e-3,
-            "fused_attn D=512 GQA rel MSE too large: rel={}",
-            rel
+        check_fused_attn(
+            32,
+            2,
+            64,
+            512,
+            [0xFAD512A01, 0xFAD512A02, 0xFAD512A03],
+            "D=512 GQA H=32 H_kv=2",
         );
     }
 
@@ -1867,7 +1655,6 @@ mod qjl_correctness_tests {
     /// unpacking are consistent.
     #[test]
     fn packed4_path_matches_unpacked_path() {
-        use mlx_rs::random;
         let bits = 4u32;
         let b: i32 = 1;
         let h: i32 = 8;
@@ -1877,16 +1664,8 @@ mod qjl_correctness_tests {
         let d: i32 = 256;
         let centroids = lloyd_max_centroids(bits).unwrap();
 
-        let key_q = random::key(0xDEAD0001u64).unwrap();
-        let key_k = random::key(0xBEEF0002u64).unwrap();
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+        let q_bf16 = bf16_normal(&[b, h, t, d], 0xDEAD0001);
+        let k_rot_bf16 = bf16_normal(&[b, h_kv, n, d], 0xBEEF0002);
 
         // Unpacked path (reference).
         let (k_codes, k_sigma) = lloyd_max_quantize_stage1_fused(&k_rot_bf16, &centroids).unwrap();
@@ -1908,16 +1687,7 @@ mod qjl_correctness_tests {
             super::turboquant_qk_inline_packed4(&q_bf16, &k_codes_pkd, &k_sigma_pkd, &centroids)
                 .unwrap();
 
-        // Compare f32 versions.
-        let r = scores_unpacked.as_dtype(Dtype::Float32).unwrap();
-        let f = scores_packed.as_dtype(Dtype::Float32).unwrap();
-        let diff = mlx_rs::ops::subtract(&r, &f).unwrap();
-        let sq = mlx_rs::ops::multiply(&diff, &diff).unwrap();
-        let nelems = (b * h * t * n) as f32;
-        let mse_val = mlx_rs::ops::sum(&sq, false).unwrap().item::<f32>() / nelems;
-        let r_sq = mlx_rs::ops::multiply(&r, &r).unwrap();
-        let r_var = mlx_rs::ops::sum(&r_sq, false).unwrap().item::<f32>() / nelems;
-        let rel = mse_val / (r_var + 1e-12);
+        let (mse_val, r_var, rel) = rel_mse(&scores_unpacked, &scores_packed);
         eprintln!(
             "packed4 path vs unpacked: MSE={:.3e}, ref_var={:.3e}, rel={:.3e}",
             mse_val, r_var, rel
@@ -1939,7 +1709,6 @@ mod qjl_correctness_tests {
     #[test]
     #[ignore = "microbenchmark, not an assertion; needs Metal — run with --ignored"]
     fn bench_packed4_vs_unpacked_qk() {
-        use mlx_rs::random;
         use std::time::Instant;
 
         let bits = 4u32;
@@ -1950,17 +1719,9 @@ mod qjl_correctness_tests {
         let n: i32 = 1024; // sliding-window size
         let d: i32 = 256;
         let centroids = lloyd_max_centroids(bits).unwrap();
-        let key_q = random::key(0xC0FFEE01u64).unwrap();
-        let key_k = random::key(0xC0FFEE02u64).unwrap();
 
-        let q_bf16 = random::normal::<f32>(&[b, h, t, d], None, None, &key_q)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
-        let k_rot_bf16 = random::normal::<f32>(&[b, h_kv, n, d], None, None, &key_k)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap();
+        let q_bf16 = bf16_normal(&[b, h, t, d], 0xC0FFEE01);
+        let k_rot_bf16 = bf16_normal(&[b, h_kv, n, d], 0xC0FFEE02);
 
         // Pre-encode once for each path. eval to materialize.
         let (k_codes_u8, k_sigma_u8) =

@@ -469,7 +469,7 @@ unchanged to six decimal places — the speedup does not move the output.
 | `PORT`, `LUMEN_HOST` | HTTP listen address (defaults `127.0.0.1:41110`). `HOST` is honoured when it is an IP address. |
 | `LUMEN_API_KEY` | Require this key on every route but `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`. Unset = no auth. |
 | `LUMEN_CORS` | `off` (default) \| `localhost` \| `all` — which browser origins may read responses. |
-| `LUMEN_MLX_BACKEND` | `native` \| `pyo3` \| `subprocess`. Picks the mlx runner. Defaults to `native`. |
+| `LUMEN_MLX_BACKEND` | `native` (or `mlx-native`), the only mlx runner and the default. The removed `pyo3` / `subprocess` runners are refused at load. |
 | `LUMEN_EMBEDDING_BATCH_ROWS` | Rows per padded embedding forward pass (default 32; `1` disables batching). |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | Disable the explicit eval-sync after prefill (advanced; see source comments). |
 | `LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0` | Opt-out of the custom flash-attention primitive (default on). |
@@ -553,7 +553,6 @@ mask entirely.
 |---|---|---|
 | `lumen-mlx` | `mlx-native` | The MLX runner — Gemma 4, Qwen 2.5/3.5/3.6, and the embedding encoder. On by default via `lumen-server`. |
 | `lumen-mlx` | `mlx-native-metal` | `mlx-native` + `mlx-rs/metal`. |
-| `lumen-mlx` | `mlx-pyo3` | PyO3 / mlx-lm subprocess fallback (development only). |
 | `lumen-diffusion` | `mlx-native` | FLUX.2-dev text-to-image backend. |
 | `lumen-server` | `mlx-native` *(default)* | Pulls both of the above. |
 

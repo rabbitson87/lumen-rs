@@ -24,6 +24,7 @@ pub use imp::layer_norm_no_affine;
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::layer_norm_no_affine;
+    use crate::test_util::assert_all_close;
     use mlx_rs::Array;
 
     /// LayerNorm of [1,2,3,4] over last axis: mean=2.5, var=1.25,
@@ -34,10 +35,7 @@ mod parity_tests {
         let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 4]);
         let out = layer_norm_no_affine(&x, 1e-6).expect("ln must succeed");
         out.eval().expect("mlx eval must succeed");
-        let observed: &[f32] = out.as_slice();
         let expected = [-1.34163f32, -0.44721, 0.44721, 1.34163];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!((got - exp).abs() < 1e-3, "[{i}]: got {got}, expected {exp}");
-        }
+        assert_all_close("layer_norm", out.as_slice(), &expected, 1e-3);
     }
 }

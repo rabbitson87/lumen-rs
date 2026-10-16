@@ -27,7 +27,7 @@ pub(crate) mod imp {
     use std::sync::{Arc, OnceLock};
     use std::time::Instant;
 
-    use crate::chat_io::BackendStreamEvent;
+    use crate::chat_io::{BackendStreamEvent, PromptSource};
     use crate::gemma4_chat::imp::{ChatMessage, ChatRole, Gemma4ChatTemplate, RenderOptions};
     use crate::gemma4_critical_correction::CorrectionTable;
     use crate::grammar::{Gemma4GrammarState, GrammarMode, shared_factory_from_tokenizer};
@@ -584,6 +584,18 @@ pub(crate) mod imp {
             .collect()
     }
 
+    /// The tools a prompt renders: none under `tool_choice: "none"`, which
+    /// strips the definitions from the system turn, and all of them otherwise.
+    fn effective_tools<'a, 't>(
+        tools: &'a [crate::chat_io::ToolDef<'t>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    ) -> &'a [crate::chat_io::ToolDef<'t>] {
+        match tool_choice {
+            crate::chat_io::ResolvedToolChoice::None => &[],
+            _ => tools,
+        }
+    }
+
     /// Phase 3: live per-sequence decode state for the batched scheduler.
     /// Holds one independent rotating Gemma 4 cache + its token position. Mirrors
     /// the Qwen runner's `NativeSeqState`; populated at `prefill`, advanced at
@@ -591,13 +603,6 @@ pub(crate) mod imp {
     struct NativeGemma4SeqState {
         cache: crate::gemma4_moe::imp::NativeGemma4PromptCache,
         position: usize,
-    }
-
-    /// What a prefix-cached route renders its prompt from.
-    #[derive(Clone, Copy)]
-    enum CachedPrompt<'m, 't> {
-        Flat(&'m [(String, String)]),
-        History(&'m [crate::chat_io::ChatTurn<'t>]),
     }
 
     pub struct Gemma4Backend {
@@ -1645,66 +1650,36 @@ pub(crate) mod imp {
             Ok(stats.generated_tokens)
         }
 
-        /// `/v1/chat/completions` path: render → generate → parse.
+        /// `/v1/chat/completions` path, without the prefix cache: render →
+        /// generate → parse.
         ///
         /// Returns the parsed response (visible text, reasoning, tool calls)
         /// so the HTTP layer can ship structured fields per the OpenAI spec.
-        /// Structured-history variant of `chat`. Used when the request
-        /// includes assistant messages with `tool_calls` or `role:"tool"`
-        /// messages (i.e. turn-2+ of an agent loop). Renders the Gemma 4
-        /// model turn with interleaved tool_call / tool_response blocks
-        /// then runs the same generate + parse path as `chat`.
-        pub fn chat_from_history(
-            &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            tools: &[crate::chat_io::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        ) -> Result<ParsedResponse> {
-            self.chat_from_history_with_images(
-                turns,
-                &[],
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                thinking,
-                tools,
-                tool_choice,
-            )
-        }
-
-        /// [`Self::chat_from_history`] with images attached to `User` turns.
+        /// A `History` source is a request that includes assistant messages
+        /// with `tool_calls` or `role:"tool"` messages (i.e. turn-2+ of an
+        /// agent loop): the Gemma 4 model turn renders with interleaved
+        /// tool_call / tool_response blocks, then runs the same generate +
+        /// parse path.
         ///
-        /// `images[i]` holds the encoded byte streams on `turns[i]` — indexed
-        /// by **turn**, since the caller expands one request message into
-        /// several turns. Empty is byte-identical to [`Self::chat_from_history`].
+        /// `images[i]` holds the encoded image byte streams attached to
+        /// message `i` — to **turn** `i` for a history, since the caller
+        /// expands one request message into several turns. Empty is
+        /// byte-identical to the text-only path.
         #[allow(clippy::too_many_arguments)]
-        pub fn chat_from_history_with_images(
+        pub(crate) fn chat_from(
             &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
+            source: PromptSource<'_, '_>,
             images: &[Vec<Vec<u8>>],
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
             ov: &crate::SamplingOverrides,
             thinking: bool,
-            tools: &[crate::chat_io::ToolDef<'_>],
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (counts, prepared) = self.measure_turn_images(images)?;
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
-                turns,
-                &counts,
-                thinking,
-                tools,
-                tool_choice,
-                false,
-            )?;
+            let (prompt, prefill_tokens, prepared) =
+                self.build_image_prompt(source, images, thinking, tools, tool_choice, false)?;
             let cfg = GenerateConfig {
                 max_new_tokens,
                 stop_on_eos: true,
@@ -1716,125 +1691,18 @@ pub(crate) mod imp {
                 self.model
                     .generate_with_cache_and_images(&prompt, &prepared, &cfg, None)?
             };
-            eprintln!(
-                "[gemma4] chat_from_history done: {} tokens in {:.0}ms ({:.1} tok/s)",
-                stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
-            );
-
-            let mut parser = ResponseParser::new(&self.chat);
-            for tok in &prefill_tokens {
-                parser.push(*tok)?;
+            match source {
+                PromptSource::Flat(_) => log_chat_done(
+                    stats.prompt_tokens,
+                    stats.prefill_ms,
+                    stats.decode_steps,
+                    stats.decode_ms,
+                ),
+                PromptSource::History(_) => eprintln!(
+                    "[gemma4] chat_from_history done: {} tokens in {:.0}ms ({:.1} tok/s)",
+                    stats.decode_steps, stats.decode_ms, stats.decode_tok_per_sec
+                ),
             }
-            for token in &stats.generated_tokens {
-                parser.push(*token)?;
-            }
-            parser.finalize()
-        }
-
-        pub fn chat(
-            &mut self,
-            messages: &[(String, String)],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        ) -> Result<ParsedResponse> {
-            self.chat_with_images(
-                messages,
-                &[],
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                thinking,
-                tools,
-                tool_choice,
-            )
-        }
-
-        /// Render an image-bearing prompt and return it alongside the images in
-        /// prompt order.
-        ///
-        /// Every image is measured first — the prompt must reserve exactly as
-        /// many `<|image|>` placeholders as the tower will emit soft tokens,
-        /// and that count depends on the image's aspect ratio. Measuring runs
-        /// decode + resize only, not the tower.
-        ///
-        /// The returned `PreparedImage`s are flattened in prompt order, matching
-        /// the placeholder runs the renderer just emitted, which is the pairing
-        /// `encode_images_for_prompt` relies on. They are carried rather than
-        /// re-derived so each image is decoded and resized exactly once.
-        #[allow(clippy::too_many_arguments)]
-        fn build_image_prompt(
-            &self,
-            messages: &[(String, String)],
-            images: &[Vec<Vec<u8>>],
-            thinking: bool,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            close_thought_channel: bool,
-        ) -> Result<(Vec<u32>, Vec<u32>, Vec<crate::gemma4_vision::PreparedImage>)> {
-            let mut counts: Vec<Vec<usize>> = Vec::with_capacity(images.len());
-            let mut flat: Vec<crate::gemma4_vision::PreparedImage> = Vec::new();
-            for per_msg in images {
-                let mut row = Vec::with_capacity(per_msg.len());
-                for bytes in per_msg {
-                    let prepared = self.model.prepare_image(bytes)?;
-                    row.push(prepared.num_soft_tokens);
-                    flat.push(prepared);
-                }
-                counts.push(row);
-            }
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_with_images(
-                messages,
-                &counts,
-                thinking,
-                tools,
-                tool_choice,
-                close_thought_channel,
-            )?;
-            Ok((prompt, prefill_tokens, flat))
-        }
-
-        /// [`Self::chat`] with inline images.
-        ///
-        /// `images[i]` holds the encoded image byte streams attached to
-        /// `messages[i]`. An empty slice is byte-identical to [`Self::chat`].
-        #[allow(clippy::too_many_arguments)]
-        pub fn chat_with_images(
-            &mut self,
-            messages: &[(String, String)],
-            images: &[Vec<Vec<u8>>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens, flat) =
-                self.build_image_prompt(messages, images, thinking, tools, tool_choice, false)?;
-            let cfg = GenerateConfig {
-                max_new_tokens,
-                stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p, ov),
-            };
-            let stats = if flat.is_empty() {
-                self.model.generate(&prompt, &cfg)?
-            } else {
-                self.model
-                    .generate_with_cache_and_images(&prompt, &flat, &cfg, None)?
-            };
-            log_chat_done(
-                stats.prompt_tokens,
-                stats.prefill_ms,
-                stats.decode_steps,
-                stats.decode_ms,
-            );
 
             let mut parser = ResponseParser::new(&self.chat);
             // Phase 1.6: feed tool_choice prefill tokens to the parser
@@ -1850,6 +1718,41 @@ pub(crate) mod imp {
                 parser.push(*token)?;
             }
             parser.finalize()
+        }
+
+        /// Render `source`'s prompt with its images and return it alongside
+        /// the images in prompt order.
+        ///
+        /// Every image is measured first — the prompt must reserve exactly as
+        /// many `<|image|>` placeholders as the tower will emit soft tokens,
+        /// and that count depends on the image's aspect ratio. Measuring runs
+        /// decode + resize only, not the tower.
+        ///
+        /// The returned `PreparedImage`s are flattened in prompt order, matching
+        /// the placeholder runs the renderer just emitted, which is the pairing
+        /// `encode_images_for_prompt` relies on. They are carried rather than
+        /// re-derived so each image is decoded and resized exactly once. With
+        /// nothing attached the prompt is the text-only one.
+        #[allow(clippy::too_many_arguments)]
+        fn build_image_prompt(
+            &self,
+            source: PromptSource<'_, '_>,
+            images: &[Vec<Vec<u8>>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<(Vec<u32>, Vec<u32>, Vec<crate::gemma4_vision::PreparedImage>)> {
+            let (counts, prepared) = self.measure_turn_images(images)?;
+            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_for(
+                source,
+                &counts,
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )?;
+            Ok((prompt, prefill_tokens, prepared))
         }
 
         /// Phase 1.6: assemble prompt + tool_choice prefill in one call.
@@ -1889,11 +1792,7 @@ pub(crate) mod imp {
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
             close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools: &[crate::gemma4_tools::imp::ToolDef<'_>] = match tool_choice {
-                ResolvedToolChoice::None => &[],
-                _ => tools,
-            };
+            let effective_tools = effective_tools(tools, tool_choice);
             let has_images = image_counts.iter().any(|c| !c.is_empty());
 
             let mut prompt = if !has_images {
@@ -1934,8 +1833,39 @@ pub(crate) mod imp {
             Ok((prompt, prefill))
         }
 
-        /// History variant of `build_prompt_and_prefill`.
-        /// The prompt and prefill both prefix-cached routes send. A JSON
+        /// [`Self::build_prompt_and_prefill_with_images`] or its history twin,
+        /// whichever `source` takes.
+        fn build_prompt_and_prefill_for(
+            &self,
+            source: PromptSource<'_, '_>,
+            image_counts: &[Vec<usize>],
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+            close_thought_channel: bool,
+        ) -> Result<(Vec<u32>, Vec<u32>)> {
+            match source {
+                PromptSource::Flat(messages) => self.build_prompt_and_prefill_with_images(
+                    messages,
+                    image_counts,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    close_thought_channel,
+                ),
+                PromptSource::History(turns) => self
+                    .build_prompt_and_prefill_from_history_with_images(
+                        turns,
+                        image_counts,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        close_thought_channel,
+                    ),
+            }
+        }
+
+        /// The prompt and prefill every prefix-cached route sends. A JSON
         /// grammar masks from token 0, so with a schema the prompt has to close
         /// the thought channel the model would otherwise open there — as every
         /// uncached route does (`gemma-thought-channel`). One place decides it,
@@ -1943,32 +1873,25 @@ pub(crate) mod imp {
         /// decision too: the generation tail's length depends on it.
         fn cached_prompt_and_prefill(
             &self,
-            input: CachedPrompt<'_, '_>,
+            input: PromptSource<'_, '_>,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
             response_schema: Option<&serde_json::Value>,
         ) -> Result<(Vec<u32>, Vec<u32>, bool)> {
             let close_thought_channel = response_schema.is_some();
-            let (prompt, prefill) = match input {
-                CachedPrompt::Flat(messages) => self.build_prompt_and_prefill(
-                    messages,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    close_thought_channel,
-                ),
-                CachedPrompt::History(turns) => self.build_prompt_and_prefill_from_history(
-                    turns,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    close_thought_channel,
-                ),
-            }?;
+            let (prompt, prefill) = self.build_prompt_and_prefill_for(
+                input,
+                &[],
+                thinking,
+                tools,
+                tool_choice,
+                close_thought_channel,
+            )?;
             Ok((prompt, prefill, close_thought_channel))
         }
 
+        /// History variant of `build_prompt_and_prefill`.
         fn build_prompt_and_prefill_from_history(
             &self,
             turns: &[crate::chat_io::ChatTurn<'_>],
@@ -1999,11 +1922,7 @@ pub(crate) mod imp {
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
             close_thought_channel: bool,
         ) -> Result<(Vec<u32>, Vec<u32>)> {
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
-                ResolvedToolChoice::None => &[],
-                _ => tools,
-            };
+            let effective_tools = effective_tools(tools, tool_choice);
             let mut prompt = self.build_chat_input_from_history_with_images(
                 turns,
                 thinking,
@@ -2030,46 +1949,28 @@ pub(crate) mod imp {
         /// sports-matching case where every item shares a >1k-token system
         /// prompt. Returns 0 (no caching) when there's no worthwhile shared
         /// prefix (single message, or the head render isn't a clean prefix).
+        /// The same for a structured-`ChatTurn` source (tool-aware
+        /// follow-ups): every turn but the final one is the shared prefix.
         fn batch_fanout_boundary(
             &self,
-            messages: &[(String, String)],
+            source: PromptSource<'_, '_>,
             thinking: bool,
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             full_prompt: &[u32],
         ) -> usize {
-            if messages.len() < 2 {
-                return 0;
-            }
-            let head = &messages[..messages.len() - 1];
-            let head_ids = match self.build_chat_input_no_gen(head, thinking, tools) {
-                Ok(v) => v,
-                Err(_) => return 0,
+            let head_ids = match source {
+                PromptSource::Flat(messages) if messages.len() >= 2 => {
+                    let head = &messages[..messages.len() - 1];
+                    self.build_chat_input_no_gen(head, thinking, tools)
+                }
+                PromptSource::History(turns) if turns.len() >= 2 => {
+                    let head = &turns[..turns.len() - 1];
+                    self.build_chat_input_from_history_no_gen(head, thinking, tools)
+                }
+                _ => return 0,
             };
-            full_prompt
-                .iter()
-                .zip(head_ids.iter())
-                .take_while(|(a, b)| a == b)
-                .count()
-                .min(full_prompt.len().saturating_sub(1))
-        }
-
-        /// `batch_fanout_boundary` for the structured-`ChatTurn` entry points
-        /// (tool-aware follow-ups). Same semantics: render all turns except the
-        /// final one as the shared-prefix boundary.
-        fn batch_fanout_boundary_from_history(
-            &self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
-            thinking: bool,
-            tools: &[crate::chat_io::ToolDef<'_>],
-            full_prompt: &[u32],
-        ) -> usize {
-            if turns.len() < 2 {
+            let Ok(head_ids) = head_ids else {
                 return 0;
-            }
-            let head = &turns[..turns.len() - 1];
-            let head_ids = match self.build_chat_input_from_history_no_gen(head, thinking, tools) {
-                Ok(v) => v,
-                Err(_) => return 0,
             };
             full_prompt
                 .iter()
@@ -2158,16 +2059,21 @@ pub(crate) mod imp {
         /// `key` (under `sys_key`) so sibling requests fork from it. Prefills
         /// `prompt[..boundary]` only (no decode → `offset == boundary`), clones
         /// it as the snapshot, and leaves `cache` advanced to `boundary` so the
-        /// caller continues with the suffix on the same cache. No-op when
-        /// `boundary == 0` (nothing worth caching).
+        /// caller continues with the suffix on the same cache. The boundary is
+        /// [`Self::batch_fanout_boundary`] of `source` under `tools`; no-op
+        /// when it is 0 (nothing worth caching). `route` names the caller in
+        /// the error.
         fn prime_system_snapshot(
             &mut self,
             cache: &mut NativeGemma4PromptCache,
             prompt: &[u32],
             key: &str,
-            boundary: usize,
-            ctx: &'static str,
+            source: PromptSource<'_, '_>,
+            thinking: bool,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            route: &'static str,
         ) -> Result<()> {
+            let boundary = self.batch_fanout_boundary(source, thinking, tools, prompt);
             if boundary == 0 {
                 return Ok(());
             }
@@ -2178,12 +2084,41 @@ pub(crate) mod imp {
             self.model
                 .forward_last_token_chunked(&prompt[..boundary], cache)
                 .and_then(|logits| Ok(logits.eval()?))
-                .context(ctx)?;
+                .with_context(|| format!("{route}: prime boundary prefill"))?;
             self.save_prefix_snapshot(&Self::sys_key(key), cache, &prompt[..boundary]);
             Ok(())
         }
 
-        /// Prefix-cache-aware `chat()` variant for the Moltis batch workload.
+        /// [`Self::chat_with_prefix_cache_from`] for flat `(role, content)`
+        /// messages.
+        pub fn chat_with_prefix_cache(
+            &mut self,
+            messages: &[(String, String)],
+            max_new_tokens: usize,
+            temperature: f32,
+            top_p: f32,
+            ov: &crate::SamplingOverrides,
+            thinking: bool,
+            prefix_cache_key: &str,
+            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
+            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        ) -> Result<ParsedResponse> {
+            self.chat_with_prefix_cache_from(
+                PromptSource::Flat(messages),
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                prefix_cache_key,
+                tools,
+                tool_choice,
+            )
+        }
+
+        /// Prefix-cache-aware [`Self::chat_from`] for the Moltis batch workload,
+        /// and for tool-aware completion requests that issue follow-up calls
+        /// after a tool result arrives (a `History` source).
         ///
         /// **When to use**: caller has a batch of requests that share a
         /// large common prefix (e.g. same system prompt) and want to amortize
@@ -2203,9 +2138,9 @@ pub(crate) mod imp {
         /// decode make `truncate_to` lossy. For the Moltis sports-matching
         /// workload with ≤4K context and ≤150 output tokens, the sliding
         /// window (1024) won't rotate, so snapshots are exact.
-        pub fn chat_with_prefix_cache(
+        pub(crate) fn chat_with_prefix_cache_from(
             &mut self,
-            messages: &[(String, String)],
+            source: PromptSource<'_, '_>,
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
@@ -2215,10 +2150,19 @@ pub(crate) mod imp {
             tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
             tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) =
-                self.build_prompt_and_prefill(messages, thinking, tools, tool_choice, false)?;
+            let (route, log_tag) = match source {
+                PromptSource::Flat(_) => ("chat_with_prefix_cache", ""),
+                PromptSource::History(_) => (
+                    "chat_from_history_with_prefix_cache",
+                    " (from-history non-streaming)",
+                ),
+            };
+            // No schema reaches this route — a grammar request decodes through
+            // the streaming one — so the thought channel stays as rendered.
+            let (prompt, prefill_tokens, _) =
+                self.cached_prompt_and_prefill(source, thinking, tools, tool_choice, None)?;
             if prompt.is_empty() {
-                return Err(anyhow!("chat_with_prefix_cache: empty prompt"));
+                return Err(anyhow!("{route}: empty prompt"));
             }
 
             // ── Lookup + cache fork (dual-snapshot strategy) ──
@@ -2227,26 +2171,17 @@ pub(crate) mod imp {
             // rollback. On a miss we prime the system-boundary snapshot so
             // sibling requests (same system prompt, varying query) fork from
             // it — works even for >sliding_window prefixes.
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools_for_boundary: &[crate::gemma4_tools::imp::ToolDef<'_>] =
-                match tool_choice {
-                    ResolvedToolChoice::None => &[],
-                    _ => tools,
-                };
+            let effective_tools_for_boundary = effective_tools(tools, tool_choice);
             let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
             if hit_kind == "miss" {
-                let boundary = self.batch_fanout_boundary(
-                    messages,
-                    thinking,
-                    effective_tools_for_boundary,
-                    &prompt,
-                );
                 self.prime_system_snapshot(
                     &mut cache,
                     &prompt,
                     prefix_cache_key,
-                    boundary,
-                    "chat_with_prefix_cache: prime boundary prefill",
+                    source,
+                    thinking,
+                    effective_tools_for_boundary,
+                    route,
                 )?;
             }
 
@@ -2254,7 +2189,7 @@ pub(crate) mod imp {
             let suffix_len = prompt.len().saturating_sub(prefilled);
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} prefilled={prefilled} suffix_len={suffix_len}"
+                 result={hit_kind} prefilled={prefilled} suffix_len={suffix_len}{log_tag}"
             );
 
             // ── Generate (suffix prefill + decode) ──
@@ -2270,7 +2205,7 @@ pub(crate) mod imp {
             let stats = self
                 .model
                 .generate_with_cache(suffix, &cfg, Some(&mut cache))
-                .context("chat_with_prefix_cache: generate_with_cache")?;
+                .with_context(|| format!("{route}: generate_with_cache"))?;
             log_chat_done(
                 stats.prompt_tokens,
                 stats.prefill_ms,
@@ -2509,15 +2444,18 @@ pub(crate) mod imp {
             }
         }
 
-        /// Streaming variant of `chat_with_prefix_cache`. Mirrors the same
-        /// lookup → fork → suffix-prefill → snapshot flow but routes through
-        /// `decode_streaming_with_prompt` so per-token `BackendStreamEvent`s
-        /// reach the caller's SSE writer. Used by the chat-stream HTTP path
-        /// (the GUI / OpenAI clients) when an auto-key from the system
-        /// prompt or an explicit session_id resolves to a string.
-        pub fn chat_streaming_with_prefix_cache(
+        /// Streaming variant of [`Self::chat_with_prefix_cache_from`]. Mirrors
+        /// the same lookup → fork → suffix-prefill → snapshot flow but routes
+        /// through `decode_streaming_with_prompt` so per-token
+        /// `BackendStreamEvent`s reach the caller's SSE writer. Used by the
+        /// chat-stream HTTP path (the GUI / OpenAI clients) when an auto-key
+        /// from the system prompt or an explicit session_id resolves to a
+        /// string — and, from a `History` source, by turn-2+ requests that
+        /// include `tool_calls` or `role:"tool"` entries the flat `(role,
+        /// content)` tuple shape can't represent.
+        pub(crate) fn chat_streaming_with_prefix_cache_from(
             &mut self,
-            messages: &[(String, String)],
+            source: PromptSource<'_, '_>,
             max_new_tokens: usize,
             temperature: f32,
             top_p: f32,
@@ -2529,15 +2467,22 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
+            let (route, log_tag) = match source {
+                PromptSource::Flat(_) => ("chat_streaming_with_prefix_cache", ""),
+                PromptSource::History(_) => (
+                    "chat_streaming_from_history_with_prefix_cache",
+                    " (from-history)",
+                ),
+            };
             let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
-                CachedPrompt::Flat(messages),
+                source,
                 thinking,
                 tools,
                 tool_choice,
                 response_schema,
             )?;
             if prompt.is_empty() {
-                return Err(anyhow!("chat_streaming_with_prefix_cache: empty prompt"));
+                return Err(anyhow!("{route}: empty prompt"));
             }
             // Compute the trailing `<start_of_turn>model\n` (+ optional empty
             // thought channel + optional tool_choice prefill) length so the
@@ -2551,12 +2496,7 @@ pub(crate) mod imp {
             // inflates trailing_header_len by hundreds-to-thousands of
             // tokens (and we'd snapshot way too early, cache becomes a
             // misleading subset of the actual prompt prefix).
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools_for_no_gen: &[crate::gemma4_tools::imp::ToolDef<'_>] =
-                match tool_choice {
-                    ResolvedToolChoice::None => &[],
-                    _ => tools,
-                };
+            let effective_tools_for_no_gen = effective_tools(tools, tool_choice);
             // `prompt` is `render_to_ids_with_tools(add_gen=true) +
             // tool_choice_prefill`. `no_gen` is
             // `render_to_ids_with_tools(add_gen=false)`. Diff =
@@ -2569,7 +2509,16 @@ pub(crate) mod imp {
                 &prefill_tokens,
                 thinking,
                 close_thought_channel,
-                || self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen),
+                || match source {
+                    PromptSource::Flat(messages) => {
+                        self.build_chat_input_no_gen(messages, thinking, effective_tools_for_no_gen)
+                    }
+                    PromptSource::History(turns) => self.build_chat_input_from_history_no_gen(
+                        turns,
+                        thinking,
+                        effective_tools_for_no_gen,
+                    ),
+                },
             );
             // Dual-snapshot: fork the longest strict-prefix snapshot (full or
             // system) with no rollback; on a miss prime the system-boundary
@@ -2579,24 +2528,20 @@ pub(crate) mod imp {
             // one streaming call maintains BOTH snapshots.
             let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
             if hit_kind == "miss" {
-                let boundary = self.batch_fanout_boundary(
-                    messages,
-                    thinking,
-                    effective_tools_for_no_gen,
-                    &prompt,
-                );
                 self.prime_system_snapshot(
                     &mut cache,
                     &prompt,
                     prefix_cache_key,
-                    boundary,
-                    "chat_streaming_with_prefix_cache: prime boundary prefill",
+                    source,
+                    thinking,
+                    effective_tools_for_no_gen,
+                    route,
                 )?;
             }
             let suffix_len = prompt.len().saturating_sub(cache.offset());
             eprintln!(
                 "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}",
+                 result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len}{log_tag}",
                 cache.offset()
             );
             let grammar = self.select_grammar_state(
@@ -2620,198 +2565,8 @@ pub(crate) mod imp {
             )
         }
 
-        /// History variant of `chat_streaming_with_prefix_cache` — same
-        /// caching behavior but builds the prompt from structured
-        /// `ChatTurn`s (turn-2+ requests that include `tool_calls` or
-        /// `role:"tool"` entries the flat `(role, content)` tuple shape
-        /// can't represent).
-        pub fn chat_streaming_from_history_with_prefix_cache(
-            &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            prefix_cache_key: &str,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            response_schema: Option<&serde_json::Value>,
-            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
-        ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens, close_thought_channel) = self.cached_prompt_and_prefill(
-                CachedPrompt::History(turns),
-                thinking,
-                tools,
-                tool_choice,
-                response_schema,
-            )?;
-            if prompt.is_empty() {
-                return Err(anyhow!(
-                    "chat_streaming_from_history_with_prefix_cache: empty prompt"
-                ));
-            }
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools_for_no_gen: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
-                ResolvedToolChoice::None => &[],
-                _ => tools,
-            };
-            // Pass the same `effective_tools` as the full prompt build so the
-            // diff captures ONLY the generation prompt (+ optional tool_choice
-            // prefill) — not tool definitions in the system block (those are
-            // shared across turns and must NOT be excluded from the snapshot).
-            let trailing_header_len = self.generation_tail_len(
-                &prompt,
-                &prefill_tokens,
-                thinking,
-                close_thought_channel,
-                || {
-                    self.build_chat_input_from_history_no_gen(
-                        turns,
-                        thinking,
-                        effective_tools_for_no_gen,
-                    )
-                },
-            );
-            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
-            if hit_kind == "miss" {
-                let boundary = self.batch_fanout_boundary_from_history(
-                    turns,
-                    thinking,
-                    effective_tools_for_no_gen,
-                    &prompt,
-                );
-                self.prime_system_snapshot(
-                    &mut cache,
-                    &prompt,
-                    prefix_cache_key,
-                    boundary,
-                    "chat_streaming_from_history_with_prefix_cache: prime boundary prefill",
-                )?;
-            }
-            let suffix_len = prompt.len().saturating_sub(cache.offset());
-            eprintln!(
-                "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} prefilled={} suffix_len={suffix_len} header_tail={trailing_header_len} (from-history)",
-                cache.offset()
-            );
-            let grammar = self.select_grammar_state(
-                tools,
-                tool_choice,
-                response_schema,
-                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-            );
-            self.decode_streaming_with_prompt(
-                prompt,
-                prefill_tokens,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                grammar,
-                Some(cache),
-                Some((prefix_cache_key.to_string(), trailing_header_len)),
-                None, /* vision */
-                on_event,
-            )
-        }
-
-        /// Non-streaming history variant — used by tool-aware completion
-        /// requests that issue follow-up calls after a tool result arrives.
-        /// Same lookup → fork → snapshot pattern as `chat_with_prefix_cache`,
-        /// but the prompt comes from `ChatTurn`s instead of `(role,
-        /// content)` tuples.
-        pub fn chat_from_history_with_prefix_cache(
-            &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            prefix_cache_key: &str,
-            tools: &[crate::chat_io::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history(
-                turns,
-                thinking,
-                tools,
-                tool_choice,
-                false,
-            )?;
-            if prompt.is_empty() {
-                return Err(anyhow!("chat_from_history_with_prefix_cache: empty prompt"));
-            }
-            // Dual-snapshot strategy (see `chat_with_prefix_cache`): fork the
-            // longest strict-prefix snapshot (no rollback), prime the
-            // system-boundary snapshot on a miss.
-            use crate::chat_io::ResolvedToolChoice;
-            let effective_tools_for_boundary: &[crate::chat_io::ToolDef<'_>] = match tool_choice {
-                ResolvedToolChoice::None => &[],
-                _ => tools,
-            };
-            let (mut cache, hit_kind) = self.prefix_fork(&prompt, prefix_cache_key);
-            if hit_kind == "miss" {
-                let boundary = self.batch_fanout_boundary_from_history(
-                    turns,
-                    thinking,
-                    effective_tools_for_boundary,
-                    &prompt,
-                );
-                self.prime_system_snapshot(
-                    &mut cache,
-                    &prompt,
-                    prefix_cache_key,
-                    boundary,
-                    "chat_from_history_with_prefix_cache: prime boundary prefill",
-                )?;
-            }
-
-            let prefilled = cache.offset();
-            let suffix_len = prompt.len().saturating_sub(prefilled);
-            eprintln!(
-                "[gemma4-backend] prefix-cache key={prefix_cache_key:?} \
-                 result={hit_kind} prefilled={prefilled} suffix_len={suffix_len} (from-history non-streaming)"
-            );
-
-            // No post-decode snapshot — the boundary snapshot above is reused
-            // without rollback by subsequent requests.
-            let suffix = &prompt[prefilled..];
-            let cfg = GenerateConfig {
-                max_new_tokens,
-                stop_on_eos: true,
-                sampling: build_sampling_config(temperature, top_p, ov),
-            };
-            let stats = self
-                .model
-                .generate_with_cache(suffix, &cfg, Some(&mut cache))
-                .context("chat_from_history_with_prefix_cache: generate_with_cache")?;
-            log_chat_done(
-                stats.prompt_tokens,
-                stats.prefill_ms,
-                stats.decode_steps,
-                stats.decode_ms,
-            );
-
-            let mut parser = ResponseParser::new(&self.chat);
-            for tok in &prefill_tokens {
-                parser.push(*tok)?;
-            }
-            for token in &stats.generated_tokens {
-                parser.push(*token)?;
-            }
-            parser.finalize()
-        }
-
-        /// Streaming variant of `chat()`. Calls `on_token` once per
-        /// generated token with the *decoded* text fragment (special
-        /// tokens stripped) so the caller can flush SSE events as they
-        /// arrive.
-        ///
-        /// Returns the same `ParsedResponse` as `chat()` after the loop
-        /// completes — caller may use it to compute final token counts
-        /// or to inspect tool calls / reasoning content separately.
+        /// [`Self::chat_streaming_from`] for flat messages with no images: the
+        /// text-only streaming route, uncached.
         pub fn chat_streaming(
             &mut self,
             messages: &[(String, String)],
@@ -2825,134 +2580,8 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill(
-                messages,
-                thinking,
-                tools,
-                tool_choice,
-                response_schema.is_some(),
-            )?;
-            let grammar = self.select_grammar_state(
-                tools,
-                tool_choice,
-                response_schema,
-                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-            );
-            self.decode_streaming_with_prompt(
-                prompt,
-                prefill_tokens,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                grammar,
-                None, /* pre_built_cache */
-                None, /* snapshot_prefix_key */
-                None, /* vision */
-                on_event,
-            )
-        }
-
-        /// [`Self::chat_streaming`] with inline images.
-        ///
-        /// `images[i]` holds the encoded image byte streams attached to
-        /// `messages[i]`. With nothing attached this is byte-identical to
-        /// [`Self::chat_streaming`], so callers can route every request here.
-        ///
-        /// Images are encoded once, up front, and handed to the prefill loop;
-        /// the chunked prefill then splices each image's rows into whichever
-        /// chunk covers them. Decode is pure text and takes the unchanged
-        /// path. Like the non-streaming variant this skips the prefix cache —
-        /// the cached prefix is keyed on text alone, and a vision prompt's
-        /// placeholder rows only mean anything together with the image they
-        /// were spliced from.
-        #[allow(clippy::too_many_arguments)]
-        pub fn chat_streaming_with_images(
-            &mut self,
-            messages: &[(String, String)],
-            images: &[Vec<Vec<u8>>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            response_schema: Option<&serde_json::Value>,
-            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
-        ) -> Result<ParsedResponse> {
-            if !images.iter().any(|v| !v.is_empty()) {
-                return self.chat_streaming(
-                    messages,
-                    max_new_tokens,
-                    temperature,
-                    top_p,
-                    ov,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    response_schema,
-                    on_event,
-                );
-            }
-
-            let (prompt, prefill_tokens, flat) = self.build_image_prompt(
-                messages,
-                images,
-                thinking,
-                tools,
-                tool_choice,
-                response_schema.is_some(),
-            )?;
-            // Encode before the prefill loop starts: the runs are prompt-global
-            // and every chunk needs to be able to look up any of them.
-            let vision = self
-                .model
-                .encode_images_for_prompt(&prompt, &flat)
-                .context("chat_streaming: encode images")?;
-            let grammar = self.select_grammar_state(
-                tools,
-                tool_choice,
-                response_schema,
-                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
-            );
-            self.decode_streaming_with_prompt(
-                prompt,
-                prefill_tokens,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                grammar,
-                None, /* pre_built_cache — images bypass the prefix cache */
-                None, /* snapshot_prefix_key */
-                Some(vision),
-                on_event,
-            )
-        }
-
-        /// Phase 1.5: structured-history variant of `chat_streaming` for
-        /// turn-2+ agent loops. The flat-history streaming path can't
-        /// represent `role:"tool"` messages — this one routes through
-        /// the structured renderer (`build_chat_input_from_history`)
-        /// and shares the same decode loop. Used when the request's
-        /// message stream includes an assistant `tool_calls` or
-        /// `role:"tool"` entry.
-        pub fn chat_streaming_from_history(
-            &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
-            max_new_tokens: usize,
-            temperature: f32,
-            top_p: f32,
-            ov: &crate::SamplingOverrides,
-            thinking: bool,
-            tools: &[crate::gemma4_tools::imp::ToolDef<'_>],
-            tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-            response_schema: Option<&serde_json::Value>,
-            on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
-        ) -> Result<ParsedResponse> {
-            self.chat_streaming_from_history_with_images(
-                turns,
+            self.chat_streaming_from(
+                PromptSource::Flat(messages),
                 &[],
                 max_new_tokens,
                 temperature,
@@ -2966,11 +2595,28 @@ pub(crate) mod imp {
             )
         }
 
-        /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+        /// Streaming variant of [`Self::chat_from`]. Calls `on_event` once per
+        /// generated token with the *decoded* text fragment (special tokens
+        /// stripped) so the caller can flush SSE events as they arrive.
+        ///
+        /// Returns the same `ParsedResponse` as `chat_from()` after the loop
+        /// completes — caller may use it to compute final token counts
+        /// or to inspect tool calls / reasoning content separately. A
+        /// `History` source is the turn-2+ agent loop shape (assistant
+        /// `tool_calls`, `role:"tool"`), rendered by the structured renderer
+        /// (`build_chat_input_from_history`) into the same decode loop.
+        ///
+        /// Images are encoded once, up front, and handed to the prefill loop;
+        /// the chunked prefill then splices each image's rows into whichever
+        /// chunk covers them. Decode is pure text and takes the unchanged
+        /// path. This route skips the prefix cache — the cached prefix is
+        /// keyed on text alone, and a vision prompt's placeholder rows only
+        /// mean anything together with the image they were spliced from. With
+        /// nothing attached it is byte-identical to the text-only route.
         #[allow(clippy::too_many_arguments)]
-        pub fn chat_streaming_from_history_with_images(
+        pub(crate) fn chat_streaming_from(
             &mut self,
-            turns: &[crate::chat_io::ChatTurn<'_>],
+            source: PromptSource<'_, '_>,
             images: &[Vec<Vec<u8>>],
             max_new_tokens: usize,
             temperature: f32,
@@ -2982,22 +2628,27 @@ pub(crate) mod imp {
             response_schema: Option<&serde_json::Value>,
             on_event: impl FnMut(BackendStreamEvent<'_>) -> Result<()>,
         ) -> Result<ParsedResponse> {
-            let (counts, prepared) = self.measure_turn_images(images)?;
-            let (prompt, prefill_tokens) = self.build_prompt_and_prefill_from_history_with_images(
-                turns,
-                &counts,
+            let (prompt, prefill_tokens, prepared) = self.build_image_prompt(
+                source,
+                images,
                 thinking,
                 tools,
                 tool_choice,
                 response_schema.is_some(),
             )?;
+            // Encode before the prefill loop starts: the runs are prompt-global
+            // and every chunk needs to be able to look up any of them.
             let vision = if prepared.is_empty() {
                 None
             } else {
+                let route = match source {
+                    PromptSource::Flat(_) => "chat_streaming",
+                    PromptSource::History(_) => "chat_streaming_from_history",
+                };
                 Some(
                     self.model
                         .encode_images_for_prompt(&prompt, &prepared)
-                        .context("chat_streaming_from_history: encode images")?,
+                        .with_context(|| format!("{route}: encode images"))?,
                 )
             };
             let grammar = self.select_grammar_state(
@@ -4291,7 +3942,7 @@ pub(crate) mod imp {
             let cached = |schema| {
                 let (prompt, prefill, _) = backend
                     .cached_prompt_and_prefill(
-                        CachedPrompt::Flat(&messages),
+                        PromptSource::Flat(&messages),
                         false,
                         &[],
                         &auto,
@@ -4357,8 +4008,9 @@ pub(crate) mod imp {
 
             let msgs = vec![("user".to_string(), "Say hi in one word.".to_string())];
             let resp = backend
-                .chat(
-                    &msgs,
+                .chat_from(
+                    PromptSource::Flat(&msgs),
+                    &[],
                     8,
                     0.0,
                     1.0,

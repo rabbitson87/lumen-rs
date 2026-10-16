@@ -372,10 +372,7 @@ mod tests {
     /// the exact failure this file is written against.
     #[test]
     fn every_in_scope_file_exists() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .to_path_buf();
+        let root = crate::repo_root();
         for f in IN_SCOPE {
             let p = root.join("crates").join(f);
             assert!(p.exists(), "in-scope file does not exist: {}", p.display());

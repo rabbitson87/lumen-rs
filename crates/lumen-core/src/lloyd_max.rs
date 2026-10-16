@@ -1,7 +1,8 @@
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
-use std::io::{Read, Write};
 
 use thiserror::Error;
+
+use crate::binfile;
 
 #[derive(Error, Debug)]
 pub enum CodebookError {
@@ -188,47 +189,21 @@ impl LloydMaxCodebook {
     /// Format: magic(4) + bits(u32 LE) + n_levels(u32 LE) + boundaries(f64 LE) + centroids(f64 LE).
     pub fn save(&self, path: &str) -> Result<(), CodebookError> {
         let mut f = std::fs::File::create(path)?;
-        f.write_all(MAGIC)?;
-        f.write_all(&self.bits.to_le_bytes())?;
-        let n = self.n_levels() as u32;
-        f.write_all(&n.to_le_bytes())?;
-        for &b in &self.boundaries {
-            f.write_all(&b.to_le_bytes())?;
-        }
-        for &c in &self.centroids {
-            f.write_all(&c.to_le_bytes())?;
-        }
+        binfile::write_header(&mut f, MAGIC, &[self.bits, self.n_levels() as u32])?;
+        binfile::write_f64s(&mut f, &self.boundaries)?;
+        binfile::write_f64s(&mut f, &self.centroids)?;
         Ok(())
     }
 
     /// Load codebook from binary file.
     pub fn load(path: &str) -> Result<Self, CodebookError> {
         let mut f = std::fs::File::open(path)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let Some([bits, n_levels]) = binfile::read_header(&mut f, MAGIC)? else {
             return Err(CodebookError::BadMagic);
-        }
-
-        let mut buf4 = [0u8; 4];
-        f.read_exact(&mut buf4)?;
-        let bits = u32::from_le_bytes(buf4);
-
-        f.read_exact(&mut buf4)?;
-        let n_levels = u32::from_le_bytes(buf4) as usize;
-
-        let mut buf8 = [0u8; 8];
-        let mut boundaries = Vec::with_capacity(n_levels + 1);
-        for _ in 0..=n_levels {
-            f.read_exact(&mut buf8)?;
-            boundaries.push(f64::from_le_bytes(buf8));
-        }
-
-        let mut centroids = Vec::with_capacity(n_levels);
-        for _ in 0..n_levels {
-            f.read_exact(&mut buf8)?;
-            centroids.push(f64::from_le_bytes(buf8));
-        }
+        };
+        let n_levels = n_levels as usize;
+        let boundaries = binfile::read_f64s(&mut f, n_levels + 1)?;
+        let centroids = binfile::read_f64s(&mut f, n_levels)?;
 
         Ok(Self {
             boundaries,

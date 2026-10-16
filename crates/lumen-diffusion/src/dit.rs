@@ -28,42 +28,18 @@
 
 #[cfg(feature = "mlx-native")]
 mod imp {
-    use std::collections::HashMap;
     use std::path::Path;
 
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result};
     use mlx_rs::Array;
     use mlx_rs::ops::{concatenate_axis, split, split_sections};
 
     use crate::ops::layernorm::layer_norm_no_affine;
-    use crate::ops::linear_nobias::linear_nobias;
-    use crate::ops::qlinear::{QuantLinear, qlinear};
+    use crate::ops::qlinear::Linear;
     use crate::ops::rope4d::{apply_rope_bshd, concat_seq, pos_embed};
     use crate::ops::silu::silu;
     use crate::ops::timestep_embed::timestep_embedding;
-
-    // ── linear (dense BF16 or mlx affine-quantized) ───────────────────────────
-
-    /// A DiT linear weight. klein checkpoints are dense BF16 (`x @ Wᵀ`, stored
-    /// pre-transposed `[in,out]`); the dev-32B checkpoint is mlx affine 4-bit
-    /// (`{weight,scales,biases}` packed). A single [`Linear::apply`] hides the
-    /// difference so the forward pass is identical for both.
-    pub enum Linear {
-        /// Dense `[in, out]` (already transposed at load) — `matmul(x, w)`.
-        Dense(Array),
-        /// mlx affine 4-bit packed `{weight,scales,biases}`.
-        Quant(QuantLinear),
-    }
-
-    impl Linear {
-        #[inline]
-        fn apply(&self, x: &Array) -> Result<Array> {
-            match self {
-                Linear::Dense(w) => linear_nobias(x, w),
-                Linear::Quant(q) => qlinear(x, q),
-            }
-        }
-    }
+    use crate::weights::Weights;
 
     // ── config ────────────────────────────────────────────────────────────────
 
@@ -139,226 +115,6 @@ mod imp {
         }
     }
 
-    // ── safetensors loader (self-contained, mirrors vae.rs) ───────────────────
-
-    struct TensorMeta {
-        dtype: String,
-        shape: Vec<i32>,
-        start: usize,
-        end: usize,
-    }
-
-    struct SafeTensors {
-        metas: HashMap<String, TensorMeta>,
-        data_start: usize,
-        blob: Vec<u8>,
-    }
-
-    impl SafeTensors {
-        fn load(path: impl AsRef<Path>) -> Result<Self> {
-            let blob = std::fs::read(path.as_ref())
-                .with_context(|| format!("reading safetensors {:?}", path.as_ref()))?;
-            if blob.len() < 8 {
-                bail!("safetensors file too short");
-            }
-            let hlen = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
-            let header_end = 8 + hlen;
-            let header: serde_json::Value = serde_json::from_slice(&blob[8..header_end])
-                .context("parsing safetensors JSON header")?;
-            let obj = header
-                .as_object()
-                .ok_or_else(|| anyhow!("safetensors header not an object"))?;
-            let mut metas = HashMap::new();
-            for (name, v) in obj {
-                if name == "__metadata__" {
-                    continue;
-                }
-                let dtype = v["dtype"].as_str().unwrap().to_string();
-                let shape: Vec<i32> = v["shape"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|d| d.as_i64().unwrap() as i32)
-                    .collect();
-                let offs = v["data_offsets"].as_array().unwrap();
-                metas.insert(
-                    name.clone(),
-                    TensorMeta {
-                        dtype,
-                        shape,
-                        start: offs[0].as_u64().unwrap() as usize,
-                        end: offs[1].as_u64().unwrap() as usize,
-                    },
-                );
-            }
-            Ok(Self {
-                metas,
-                data_start: header_end,
-                blob,
-            })
-        }
-
-        /// Load a tensor as f32 in its native (PyTorch) shape.
-        fn raw(&self, name: &str) -> Result<Array> {
-            let m = self
-                .metas
-                .get(name)
-                .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
-            let bytes = &self.blob[self.data_start + m.start..self.data_start + m.end];
-            let data: Vec<f32> = match m.dtype.as_str() {
-                "BF16" => bytes
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect(),
-                "F32" => bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                "F16" => bytes
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect(),
-                other => bail!("unsupported dtype {other} for {name}"),
-            };
-            Ok(Array::from_slice(&data, &m.shape))
-        }
-
-        /// Linear weight: diffusers `[out,in]` → mlx `[in,out]` for `matmul`.
-        fn linw(&self, name: &str) -> Result<Array> {
-            let w = self
-                .raw(name)?
-                .transpose_axes(&[1, 0])
-                .with_context(|| format!("linear weight transpose {name}"))?;
-            w.eval().with_context(|| format!("eval linw {name}"))?;
-            Ok(w)
-        }
-
-        /// 1-D vector (RMSNorm weight) as-is.
-        fn vec(&self, name: &str) -> Result<Array> {
-            let v = self.raw(name)?;
-            v.eval().with_context(|| format!("eval vec {name}"))?;
-            Ok(v)
-        }
-
-        fn has(&self, name: &str) -> bool {
-            self.metas.contains_key(name)
-        }
-
-        /// Raw U32 packed tensor (no transpose), evaluated.
-        fn u32_raw(&self, name: &str) -> Result<Array> {
-            let m = self
-                .metas
-                .get(name)
-                .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
-            if m.dtype != "U32" {
-                bail!("expected U32 for {name}, got {}", m.dtype);
-            }
-            let bytes = &self.blob[self.data_start + m.start..self.data_start + m.end];
-            let data: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let a = Array::from_slice(&data, &m.shape);
-            a.eval().with_context(|| format!("eval u32 {name}"))?;
-            Ok(a)
-        }
-    }
-
-    // ── unified weight source: single-file (klein) or sharded (dev) ───────────
-
-    /// Loads DiT tensors from either a single safetensors file (klein BF16) or
-    /// a directory of shards keyed by `model.safetensors.index.json` (dev 4-bit).
-    pub struct DitWeights {
-        shards: Vec<SafeTensors>,
-        /// tensor name → shard index (empty for the single-file case).
-        key_shard: HashMap<String, usize>,
-    }
-
-    impl DitWeights {
-        /// Open a single `.safetensors` file (klein) or a directory of shards
-        /// (dev — must contain `model.safetensors.index.json`).
-        pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-            let path = path.as_ref();
-            if path.is_dir() {
-                let index_path = path.join("model.safetensors.index.json");
-                let index: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(&index_path)
-                        .with_context(|| format!("reading index {index_path:?}"))?,
-                )
-                .context("parsing model.safetensors.index.json")?;
-                let weight_map = index
-                    .get("weight_map")
-                    .and_then(|m| m.as_object())
-                    .ok_or_else(|| anyhow!("index.json missing weight_map"))?;
-                let mut shard_files: Vec<String> = weight_map
-                    .values()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
-                shard_files.sort();
-                shard_files.dedup();
-                let mut file_index: HashMap<String, usize> = HashMap::new();
-                let mut shards = Vec::with_capacity(shard_files.len());
-                for (i, f) in shard_files.iter().enumerate() {
-                    shards.push(SafeTensors::load(path.join(f))?);
-                    file_index.insert(f.clone(), i);
-                }
-                let mut key_shard = HashMap::new();
-                for (k, v) in weight_map {
-                    if let Some(f) = v.as_str()
-                        && let Some(&si) = file_index.get(f)
-                    {
-                        key_shard.insert(k.clone(), si);
-                    }
-                }
-                Ok(Self { shards, key_shard })
-            } else {
-                Ok(Self {
-                    shards: vec![SafeTensors::load(path)?],
-                    key_shard: HashMap::new(),
-                })
-            }
-        }
-
-        #[inline]
-        fn shard_for(&self, name: &str) -> &SafeTensors {
-            match self.key_shard.get(name) {
-                Some(&si) => &self.shards[si],
-                None => &self.shards[0],
-            }
-        }
-
-        fn has(&self, name: &str) -> bool {
-            if self.key_shard.is_empty() {
-                self.shards[0].has(name)
-            } else {
-                self.key_shard.contains_key(name)
-            }
-        }
-
-        /// 1-D vector (RMSNorm weight) as f32.
-        fn vec(&self, name: &str) -> Result<Array> {
-            self.shard_for(name).vec(name)
-        }
-
-        /// A linear weight: quantized (mlx affine 4-bit) iff a `.scales` sibling
-        /// exists, else dense BF16 (`[out,in]` → transposed to `[in,out]`).
-        fn linear(&self, name: &str) -> Result<Linear> {
-            let wname = format!("{name}.weight");
-            let sname = format!("{name}.scales");
-            let s = self.shard_for(&sname);
-            if self.has(&sname) {
-                let q = QuantLinear {
-                    weight: s.u32_raw(&wname)?,
-                    scales: s.vec(&sname)?,
-                    biases: s.vec(&format!("{name}.biases"))?,
-                };
-                Ok(Linear::Quant(q))
-            } else {
-                Ok(Linear::Dense(self.shard_for(&wname).linw(&wname)?))
-            }
-        }
-    }
-
     // ── weight bundles ────────────────────────────────────────────────────────
 
     struct DoubleAttnW {
@@ -418,7 +174,17 @@ mod imp {
         /// file (klein) or a directory of mlx affine 4-bit shards (dev). The
         /// quantized/dense choice is per-linear (`.scales` presence).
         pub fn load(path: impl AsRef<Path>, cfg: DitConfig) -> Result<Self> {
-            let st = DitWeights::open(path)?;
+            let st = Weights::open(path)?;
+            // Every DiT tensor is evaluated as it loads, the packed 4-bit
+            // triples included.
+            let linear = |name: &str| -> Result<Linear> {
+                let l = st.linear(name)?;
+                if let Linear::Quant(q) = &l {
+                    q.eval()
+                        .with_context(|| format!("eval packed linear {name}"))?;
+                }
+                Ok(l)
+            };
 
             // Key-name mapping differs between the klein (diffusers) and dev
             // (mflux) checkpoints: klein nests the timestep MLP under
@@ -444,26 +210,26 @@ mod imp {
                 };
                 double_blocks.push(DoubleBlockW {
                     attn: DoubleAttnW {
-                        to_q: st.linear(&format!("{ap}.to_q"))?,
-                        to_k: st.linear(&format!("{ap}.to_k"))?,
-                        to_v: st.linear(&format!("{ap}.to_v"))?,
-                        to_out: st.linear(&to_out_name)?,
+                        to_q: linear(&format!("{ap}.to_q"))?,
+                        to_k: linear(&format!("{ap}.to_k"))?,
+                        to_v: linear(&format!("{ap}.to_v"))?,
+                        to_out: linear(&to_out_name)?,
                         norm_q: st.vec(&format!("{ap}.norm_q.weight"))?,
                         norm_k: st.vec(&format!("{ap}.norm_k.weight"))?,
-                        add_q: st.linear(&format!("{ap}.add_q_proj"))?,
-                        add_k: st.linear(&format!("{ap}.add_k_proj"))?,
-                        add_v: st.linear(&format!("{ap}.add_v_proj"))?,
-                        to_add_out: st.linear(&format!("{ap}.to_add_out"))?,
+                        add_q: linear(&format!("{ap}.add_q_proj"))?,
+                        add_k: linear(&format!("{ap}.add_k_proj"))?,
+                        add_v: linear(&format!("{ap}.add_v_proj"))?,
+                        to_add_out: linear(&format!("{ap}.to_add_out"))?,
                         norm_added_q: st.vec(&format!("{ap}.norm_added_q.weight"))?,
                         norm_added_k: st.vec(&format!("{ap}.norm_added_k.weight"))?,
                     },
                     ff: FeedForwardW {
-                        linear_in: st.linear(&format!("{p}.ff.linear_in"))?,
-                        linear_out: st.linear(&format!("{p}.ff.linear_out"))?,
+                        linear_in: linear(&format!("{p}.ff.linear_in"))?,
+                        linear_out: linear(&format!("{p}.ff.linear_out"))?,
                     },
                     ff_context: FeedForwardW {
-                        linear_in: st.linear(&format!("{p}.ff_context.linear_in"))?,
-                        linear_out: st.linear(&format!("{p}.ff_context.linear_out"))?,
+                        linear_in: linear(&format!("{p}.ff_context.linear_in"))?,
+                        linear_out: linear(&format!("{p}.ff_context.linear_out"))?,
                     },
                 });
             }
@@ -472,8 +238,8 @@ mod imp {
             for i in 0..cfg.num_single_layers {
                 let ap = format!("single_transformer_blocks.{i}.attn");
                 single_blocks.push(SingleBlockW {
-                    to_qkv_mlp: st.linear(&format!("{ap}.to_qkv_mlp_proj"))?,
-                    to_out: st.linear(&format!("{ap}.to_out"))?,
+                    to_qkv_mlp: linear(&format!("{ap}.to_qkv_mlp_proj"))?,
+                    to_out: linear(&format!("{ap}.to_out"))?,
                     norm_q: st.vec(&format!("{ap}.norm_q.weight"))?,
                     norm_k: st.vec(&format!("{ap}.norm_k.weight"))?,
                 });
@@ -483,27 +249,27 @@ mod imp {
             let (guidance_linear_1, guidance_linear_2) =
                 if cfg.guidance_embeds && st.has("time_guidance_embed.guidance_linear_1.weight") {
                     (
-                        Some(st.linear("time_guidance_embed.guidance_linear_1")?),
-                        Some(st.linear("time_guidance_embed.guidance_linear_2")?),
+                        Some(linear("time_guidance_embed.guidance_linear_1")?),
+                        Some(linear("time_guidance_embed.guidance_linear_2")?),
                     )
                 } else {
                     (None, None)
                 };
 
             Ok(Self {
-                x_embedder: st.linear("x_embedder")?,
-                context_embedder: st.linear("context_embedder")?,
-                ts_linear_1: st.linear(&format!("{ts_prefix}.linear_1"))?,
-                ts_linear_2: st.linear(&format!("{ts_prefix}.linear_2"))?,
+                x_embedder: linear("x_embedder")?,
+                context_embedder: linear("context_embedder")?,
+                ts_linear_1: linear(&format!("{ts_prefix}.linear_1"))?,
+                ts_linear_2: linear(&format!("{ts_prefix}.linear_2"))?,
                 guidance_linear_1,
                 guidance_linear_2,
-                mod_img: st.linear("double_stream_modulation_img.linear")?,
-                mod_txt: st.linear("double_stream_modulation_txt.linear")?,
-                mod_single: st.linear("single_stream_modulation.linear")?,
+                mod_img: linear("double_stream_modulation_img.linear")?,
+                mod_txt: linear("double_stream_modulation_txt.linear")?,
+                mod_single: linear("single_stream_modulation.linear")?,
                 double_blocks,
                 single_blocks,
-                norm_out: st.linear("norm_out.linear")?,
-                proj_out: st.linear("proj_out")?,
+                norm_out: linear("norm_out.linear")?,
+                proj_out: linear("proj_out")?,
                 cfg,
             })
         }
@@ -856,33 +622,8 @@ pub use imp::{Dit, DitConfig};
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::{Dit, DitConfig};
+    use crate::test_util::{klein_dit_path, read_f32_bin, read_i32_bin};
     use mlx_rs::Array;
-
-    // Klein DiT (bf16), resolved from the local HF cache.
-    fn dit_path() -> std::path::PathBuf {
-        crate::hf_cache::snapshot_path_or_rel(
-            crate::repos::VAE,
-            "transformer/diffusion_pytorch_model.safetensors",
-        )
-    }
-
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not f32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    fn read_i32_bin(path: &str) -> Vec<i32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not i32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
 
     /// cosine + mean-abs over flat buffers.
     fn metrics(label: &str, obs: &[f32], exp: &[f32]) -> (f64, f64) {
@@ -926,7 +667,7 @@ mod parity_tests {
         latent.eval().unwrap();
         text.eval().unwrap();
 
-        let dit = Dit::load(dit_path(), cfg).expect("load DiT weights");
+        let dit = Dit::load(klein_dit_path(), cfg).expect("load DiT weights");
         let (out, d0, sg) = dit
             .forward_debug(&latent, &text, 0.5, &img_ids, &txt_ids)
             .expect("forward");

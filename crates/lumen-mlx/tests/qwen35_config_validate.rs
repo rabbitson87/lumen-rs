@@ -17,6 +17,9 @@
 //! Written table-driven for the same reason the fault sweeps are: the point is
 //! case density per line of test code, not a hand-picked example per rule.
 
+mod common;
+
+use common::{quant, tc, top};
 use lumen_mlx::qwen35_config::{MlpKind, NativeModelConfig};
 use serde_json::{Value, json};
 
@@ -64,31 +67,7 @@ fn moe() -> Value {
 }
 
 fn load(v: &Value) -> NativeModelConfig {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("config.json");
-    std::fs::write(&path, serde_json::to_string(v).unwrap()).expect("write");
-    NativeModelConfig::load(&path).expect("fixture must parse")
-}
-
-/// Set `text_config.<key>`.
-fn tc(v: &Value, key: &str, val: Value) -> Value {
-    let mut v = v.clone();
-    v["text_config"]
-        .as_object_mut()
-        .unwrap()
-        .insert(key.into(), val);
-    v
-}
-
-/// Set a top-level key.
-fn top(v: &Value, key: &str, val: Value) -> Value {
-    let mut v = v.clone();
-    v.as_object_mut().unwrap().insert(key.into(), val);
-    v
-}
-
-fn quant(mode: &str, bits: u32, group: u32) -> Value {
-    json!({ "mode": mode, "bits": bits, "group_size": group })
+    common::load_config(v, NativeModelConfig::load)
 }
 
 // ───────────────────────────── baselines ─────────────────────────────

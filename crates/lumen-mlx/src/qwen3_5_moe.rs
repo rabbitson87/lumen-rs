@@ -43,7 +43,6 @@
 // primitives without depending on Qwen3.5-MoE assembly.
 
 #[cfg(feature = "mlx-native")]
-#[allow(dead_code)] // accessor APIs (config/weights/keys/len/is_empty/first_full_attn_layer) reserved for future inspection / debugging consumers
 mod imp {
     use anyhow::{Context, Result, anyhow};
     use mlx_rs::Array;
@@ -85,7 +84,7 @@ mod imp {
     use crate::native_ssm::{
         compute_g, gated_delta_step_kernel, gated_delta_step_kernel_capture, rms_norm_gated,
     };
-    use crate::qwen3_5_mtp::{HiTrainCfg, MtpLoraPos, MtpLoraSet, Qwen35MtpBlock, Qwen35MtpLinear};
+    use crate::qwen3_5_mtp::Qwen35MtpBlock;
     use lumen_core::sampling::{
         SamplingConfig, Xorshift64, sample_distribution, sampling_distribution, speculative_accept,
     };
@@ -174,52 +173,6 @@ mod imp {
         kv_bf16::set(on);
     }
 
-    /// Top-`k` softmax over a full logits row → `(ids, probs)` where `probs` are
-    /// TRUE marginals `exp(logit - logsumexp(full row))` (NOT renormalized over
-    /// the top-k). The dropped tail is tiny for a peaked next-token dist, so the
-    /// truncated set is a faithful soft target for KL distillation. Head-internal
-    /// MTP PoC only.
-    fn topk_softmax(row: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
-        let n = row.len();
-        let k = k.min(n).max(1);
-        let mut idx: Vec<usize> = (0..n).collect();
-        if k < n {
-            // Partition so the first k indices are the k largest logits.
-            idx.select_nth_unstable_by(k - 1, |&a, &b| {
-                row[b]
-                    .partial_cmp(&row[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            idx.truncate(k);
-        }
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let lse = max + row.iter().map(|&x| (x - max).exp()).sum::<f32>().ln();
-        let ids: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
-        let probs: Vec<f32> = idx.iter().map(|&i| (row[i] - lse).exp()).collect();
-        (ids, probs)
-    }
-
-    /// Rebuild an `MtpLoraSet` from a flat `value_and_grad` arg list. `args` is
-    /// `[A0, B0, A1, B1, ...]` in the same order as `positions`. Head-internal
-    /// MTP PoC only.
-    fn build_lora_set(positions: &[MtpLoraPos], args: &[Array]) -> MtpLoraSet {
-        let mut set = MtpLoraSet::default();
-        for (i, p) in positions.iter().enumerate() {
-            let pair = Some((args[2 * i].clone(), args[2 * i + 1].clone()));
-            match p {
-                MtpLoraPos::Eh => set.eh_proj = pair,
-                MtpLoraPos::Q => set.q = pair,
-                MtpLoraPos::K => set.k = pair,
-                MtpLoraPos::V => set.v = pair,
-                MtpLoraPos::O => set.o = pair,
-                MtpLoraPos::Gate => set.gate = pair,
-                MtpLoraPos::Up => set.up = pair,
-                MtpLoraPos::Down => set.down = pair,
-            }
-        }
-        set
-    }
-
     // config.json parsing lives in the ungated `qwen35_config` module so a
     // tier-0 sweep can reach it without the GPU stack; re-exported here so
     // every call site keeps its `imp::` path.
@@ -252,7 +205,7 @@ mod imp {
     /// already clean errors from upstream, so this checks only what upstream
     /// does not: that the bytes the header promises are actually present.
     /// Costs one `metadata()` plus a header parse per shard, once per load.
-    fn validate_safetensors_complete(path: &Path) -> Result<()> {
+    pub(crate) fn validate_safetensors_complete(path: &Path) -> Result<()> {
         use std::io::Read;
 
         let mut f = std::fs::File::open(path)
@@ -463,7 +416,11 @@ mod imp {
     // access + a single `quantized_matmul_with_mode` call, mirroring how
     // Python's `nn.Linear.__call__` carries pre-bound module attributes.
 
-    /// One MXFP4/affine quantized linear projection — pre-resolved.
+    /// One quantized linear projection, resolved at load: its `(weight,
+    /// scales, biases?)` tensors and the `(group_size, bits, mode)` they are
+    /// dispatched with. Qwen's trunk and MTP head and Gemma 4's text and
+    /// vision towers all use it.
+    #[derive(Clone)]
     pub struct ResolvedLinear {
         pub weight: Array,
         pub scales: Array,
@@ -471,6 +428,47 @@ mod imp {
         pub group_size: i32,
         pub bits: i32,
         pub mode: &'static CStr,
+    }
+
+    /// Per-row argmax over `[N, 1, vocab]` logits → `Vec<u32>` of length N,
+    /// the batched decode's pick (Qwen and Gemma 4 alike). One eval, through
+    /// `try_as_slice`.
+    pub fn argmax_rows(logits: &Array) -> Result<Vec<u32>> {
+        if logits.ndim() != 3 {
+            return Err(anyhow!(
+                "argmax_rows: expected [N, 1, V] logits, got ndim={}",
+                logits.ndim()
+            ));
+        }
+        // Drop the L==1 axis → [N, V].
+        let idx0 = Array::from_int(0);
+        let rows = logits
+            .take_axis(&idx0, 1)
+            .context("argmax_rows: take_axis(0, axis=1) failed")?;
+        // Argmax over vocab, keeping the batch axis → [N].
+        let am = mlx_rs::ops::indexing::argmax_axis(&rows, -1, /* keep_dims */ false)
+            .context("argmax_rows: argmax_axis(-1) failed")?;
+        let slice = am
+            .try_as_slice::<u32>()
+            .map_err(|err| anyhow!("argmax_rows: read failed: {err}"))?;
+        Ok(slice.to_vec())
+    }
+
+    impl ResolvedLinear {
+        /// `y = x @ deq(W).T` at this projection's own quant params.
+        pub fn apply(&self, x: &Array) -> Result<Array> {
+            quantized_matmul_with_mode(
+                x,
+                &self.weight,
+                &self.scales,
+                self.biases.as_ref(),
+                /* transpose */ true,
+                self.group_size,
+                self.bits,
+                self.mode,
+            )
+            .context("quantized linear: matmul failed")
+        }
     }
 
     /// Pre-resolved weights for one linear-attention (GatedDeltaNet) layer.
@@ -632,8 +630,11 @@ mod imp {
         pub down_proj: ResolvedLinear,
     }
 
-    /// Resolve `(group_size, bits, mode)` for a quantized layer — same logic
-    /// as `quant_params_with_mode` but free-standing for use during load().
+    /// Resolve `(group_size, bits, mode)` for a quantized layer. A per-tensor
+    /// override is **affine** (mlx-lm's `_quantize` calls
+    /// `to_quantized(group_size=…, bits=…)` without a `mode=` kwarg, so the
+    /// `"affine"` default applies); every other tensor follows the top-level
+    /// `quantization_config.mode`.
     fn quant_params_resolve(config: &NativeModelConfig, base: &str) -> (i32, i32, &'static CStr) {
         let cfg = config.quantization_config.as_ref();
         if let Some(q) = cfg
@@ -1236,44 +1237,6 @@ mod imp {
         // of the O(D) full-trunk replay. Drained by `take_ssm_captures()`.
         ssm_capture_slot: Mutex<Vec<(usize, Array, Array)>>,
         ssm_capture_enabled: AtomicBool,
-        // MTP drift corrector (per-depth diagonal affine). `Some` when loaded
-        // via `set_mtp_corrector`; applied in the drafter loop to the chained
-        // hidden so deep drafts stay in-distribution (raises accept at K>=2).
-        mtp_corrector: Mutex<Option<lumen_core::mtp_corrector::MtpCorrector>>,
-        // Calibration accumulator. `Some` while collecting (draft_hidden,
-        // target_hidden) pairs to FIT a corrector; drained by
-        // `take_mtp_calib()`. Mutually exclusive with `mtp_corrector` in
-        // practice (calibrate the raw chain, then apply the fitted corrector).
-        mtp_calib: Mutex<Option<lumen_core::mtp_corrector::CorrectorStats>>,
-        // Orthogonal-Procrustes corrector + its calib accumulator (the
-        // rotation shot — rotation survives the head's input RMSNorm where the
-        // diagonal scale washed out). Same (x,y) pairing as `mtp_calib`.
-        mtp_procrustes: Mutex<Option<lumen_core::mtp_procrustes::ProcrustesCorrector>>,
-        mtp_proc_calib: Mutex<Option<lumen_core::mtp_procrustes::ProcrustesStats>>,
-        // C4 trained lm_head LoRA: `(A [rank,hidden], B [vocab,rank])`. When
-        // installed, the drafter corrects its logits `logits += (norm_out·Aᵀ)·Bᵀ`
-        // (norm_out = the returned chained hidden = the lm_head input). Trained
-        // on (norm_out, trunk-argmax) pairs via CE — the only accept-aligned
-        // lever (optimizes the head OUTPUT, not hidden L2 which proved inert).
-        mtp_c4_lmhead: Mutex<Option<(Array, Array)>>,
-        // C4 calibration: collected (x = norm_out host row, target = trunk argmax).
-        mtp_c4_calib: Mutex<Option<(Vec<Vec<f32>>, Vec<u32>)>>,
-        // Head-internal C4 PoC calibration: k=0 (embed row, h_pre row, trunk-argmax
-        // target, trunk soft target = top-64 (ids, probs)). Unlike mtp_c4_calib
-        // (frozen post-block hidden → lm_head LoRA, dead generalization), this
-        // trains a LoRA INSIDE the block (any of eh/q/k/v/o/gate/up/down) via
-        // `forward_train_lora_multi` so the head's own forward reshapes the
-        // hidden. The soft target enables a KL/distillation objective (vs the
-        // CE-to-argmax that overfit). Decisive untested accept lever for dense.
-        #[allow(clippy::type_complexity)]
-        mtp_hi_calib: Mutex<
-            Option<(
-                Vec<Vec<f32>>,
-                Vec<Vec<f32>>,
-                Vec<u32>,
-                Vec<(Vec<u32>, Vec<f32>)>,
-            )>,
-        >,
         /// Image encoder. `Some` only when `LUMEN_VISION=1` **and** the
         /// checkpoint still carries `vision_tower.*` weights. `None` leaves the
         /// text path byte-for-byte unchanged, memory footprint included.
@@ -1433,13 +1396,6 @@ mod imp {
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
                 ssm_capture_slot: Mutex::new(Vec::new()),
-                mtp_corrector: Mutex::new(None),
-                mtp_calib: Mutex::new(None),
-                mtp_procrustes: Mutex::new(None),
-                mtp_proc_calib: Mutex::new(None),
-                mtp_c4_lmhead: Mutex::new(None),
-                mtp_c4_calib: Mutex::new(None),
-                mtp_hi_calib: Mutex::new(None),
                 ssm_capture_enabled: AtomicBool::new(false),
                 embed_weight,
                 embed_scales,
@@ -1461,6 +1417,7 @@ mod imp {
             &self.config.text_config
         }
 
+        #[allow(dead_code)] // reserved for inspection / debugging consumers
         pub fn weights(&self) -> &NativeWeights {
             &self.weights
         }
@@ -1534,71 +1491,6 @@ mod imp {
                 max_pos,
                 bits,
             )
-        }
-
-        /// Resolve `(group_size, bits)` for a quantized linear layer.
-        /// Looks up per-tensor overrides in the config (keyed by the tensor
-        /// path *without* `.weight`/`.scales` suffix), falling back to the
-        /// top-level mxfp4 default. Used by callers that already know the
-        /// mode (embedding lookup, etc.).
-        fn quant_params(&self, base: &str) -> (i32, i32) {
-            let (gs, bits, _mode) = self.quant_params_with_mode(base);
-            (gs, bits)
-        }
-
-        /// Resolve `(group_size, bits, mode)` for a quantized layer.
-        /// Convention (mirrors mlx_lm `_quantize`'s `class_predicate`):
-        ///
-        /// * Per-tensor override present → mode is **affine** (mlx-lm calls
-        ///   `to_quantized(group_size=…, bits=…)` without a `mode=` kwarg, so
-        ///   `to_quantized`'s default kicks in, which is `"affine"`).
-        /// * No override → top-level `quantization_config.mode`. For Qwen3.5-
-        ///   MoE that's always `mxfp4`.
-        fn quant_params_with_mode(&self, base: &str) -> (i32, i32, &'static CStr) {
-            let cfg = self.config.quantization_config.as_ref();
-            if let Some(q) = cfg
-                && let Some(o) = q.overrides.get(base)
-            {
-                return (o.group_size as i32, o.bits as i32, MODE_AFFINE);
-            }
-            cfg.map(|q| (q.group_size as i32, q.bits as i32, MODE_MXFP4))
-                .unwrap_or((32, 4, MODE_MXFP4))
-        }
-
-        /// Mode-aware Linear forward: `y = x @ deq(W).T`. The mode is
-        /// selected per-tensor by `quant_params_with_mode`; the loader
-        /// pulls `{base}.weight`, `{base}.scales`, and (for affine) the
-        /// optional `{base}.biases` from the sanitized bag.
-        fn linear(&self, base: &str, x: &Array) -> Result<Array> {
-            let w = self.weights.require(&format!("{base}.weight"))?;
-            let s = self.weights.require(&format!("{base}.scales"))?;
-            let biases = self.weights.get(&format!("{base}.biases"));
-            let (group_size, bits, mode) = self.quant_params_with_mode(base);
-            quantized_matmul_with_mode(x, w, s, biases, true, group_size, bits, mode)
-                .with_context(|| format!("linear: {base} matmul failed"))
-        }
-
-        /// Backwards-compatible alias retained for the attention call sites
-        /// authored before the mode-aware refactor — defers to `linear`.
-        fn mxfp4_linear(&self, base: &str, x: &Array) -> Result<Array> {
-            self.linear(base, x)
-        }
-
-        /// D1 lever — pre-resolved Linear forward. Skips the
-        /// HashMap+format!() chain that `linear()` does per call. The
-        /// `ResolvedLinear` is built once at `load()` time.
-        fn linear_pre(&self, lin: &ResolvedLinear, x: &Array) -> Result<Array> {
-            quantized_matmul_with_mode(
-                x,
-                &lin.weight,
-                &lin.scales,
-                lin.biases.as_ref(),
-                true,
-                lin.group_size,
-                lin.bits,
-                lin.mode,
-            )
-            .context("linear_pre: matmul failed")
         }
 
         /// Cast helper — MXFP4 matmul output dtype follows activation dtype,
@@ -1926,11 +1818,11 @@ mod imp {
             // (1) q/k/v projections. MXFP4 matmul output follows activation
             //     dtype — pass f32 in, get f32 out, but cast unconditionally
             //     to keep the contract resilient if MLX changes defaults.
-            let q_proj_raw = self.linear_pre(&lw.q_proj, x)?;
+            let q_proj_raw = lw.q_proj.apply(x)?;
             let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
-            let k_proj_raw = self.linear_pre(&lw.k_proj, x)?;
+            let k_proj_raw = lw.k_proj.apply(x)?;
             let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
-            let v_proj_raw = self.linear_pre(&lw.v_proj, x)?;
+            let v_proj_raw = lw.v_proj.apply(x)?;
             let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
 
             // (2a) Reshape q_proj to [B, L, num_heads, head_dim*2] and split
@@ -2033,7 +1925,7 @@ mod imp {
             };
 
             // (8) o_proj: project back to hidden_size.
-            let o_proj_raw = self.linear_pre(&lw.o_proj, &gated)?;
+            let o_proj_raw = lw.o_proj.apply(&gated)?;
             Self::to_f32(o_proj_raw, &format!("layer{layer_idx}.o_proj"))
         }
 
@@ -2210,7 +2102,7 @@ mod imp {
             //     returns the input dtype (f32 here) so the casts were
             //     identity ops adding only graph nodes.
             let t_in_proj = timing_on.then(Instant::now);
-            let mixed_qkv = self.linear_pre(&lw.in_proj_qkv, x)?;
+            let mixed_qkv = lw.in_proj_qkv.apply(x)?;
             // PROBE lever-A gate-0: skip the 3 small in_proj matmuls (z/b/a).
             // Only valid with LINCOMPUTE skip (which returns early below using
             // only mixed_qkv) — the dummies are never consumed.
@@ -2218,9 +2110,9 @@ mod imp {
             let (z_4d, b_pre, a_pre) = if skip_inproj_small {
                 (mixed_qkv.clone(), mixed_qkv.clone(), mixed_qkv.clone())
             } else {
-                let z_flat = self.linear_pre(&lw.in_proj_z, x)?;
-                let b_pre = self.linear_pre(&lw.in_proj_b, x)?;
-                let a_pre = self.linear_pre(&lw.in_proj_a, x)?;
+                let z_flat = lw.in_proj_z.apply(x)?;
+                let b_pre = lw.in_proj_b.apply(x)?;
+                let a_pre = lw.in_proj_a.apply(x)?;
                 let z_4d = mlx_rs::ops::reshape(&z_flat, &[b, s, nv, dv])
                     .context("layer_linear_attn_forward: reshape z failed")?;
                 (z_4d, b_pre, a_pre)
@@ -2272,7 +2164,7 @@ mod imp {
                 };
                 let out_flat = mlx_rs::ops::reshape(&v_slice, &[b, s, value_dim])
                     .context("probe: reshape out_flat failed")?;
-                let out_proj_raw = self.linear_pre(&lw.out_proj, &out_flat)?;
+                let out_proj_raw = lw.out_proj.apply(&out_flat)?;
                 return Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.probe_out_proj"));
             }
 
@@ -2538,7 +2430,7 @@ mod imp {
             let out_normed = rms_norm_gated(&out_kernel, &z_4d, norm_w, eps)?;
             let out_flat = mlx_rs::ops::reshape(&out_normed, &[b, s, value_dim])
                 .context("layer_linear_attn_forward: reshape out_flat failed")?;
-            let out_proj_raw = self.linear_pre(&lw.out_proj, &out_flat)?;
+            let out_proj_raw = lw.out_proj.apply(&out_flat)?;
             let out_final = Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.out_proj"))?;
             if let Some(t0) = t_out {
                 out_final
@@ -2547,128 +2439,6 @@ mod imp {
                 bump_linear_out_proj_ms(t0.elapsed().as_secs_f64() * 1000.0);
             }
             Ok(out_final)
-        }
-
-        /// Resolve the per-tensor `(group_size, bits, mode)` and weight
-        /// references into the structures `native_moe::moe_block_forward`
-        /// needs.
-        fn moe_weights(&self, layer_idx: usize) -> Result<MoeBlockWeights<'_>> {
-            let cfg = self.text_config();
-            let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
-
-            // gate (8-bit affine override)
-            let (gate_gs, gate_bits, _gate_mode) =
-                self.quant_params_with_mode(&format!("{prefix}.gate"));
-            let gate_w = self.weights.require(&format!("{prefix}.gate.weight"))?;
-            let gate_s = self.weights.require(&format!("{prefix}.gate.scales"))?;
-            let gate_b = self.weights.require(&format!("{prefix}.gate.biases"))?;
-
-            // shared_expert_gate (8-bit affine override; output dim = 1)
-            let (sg_gs, sg_bits, _sg_mode) =
-                self.quant_params_with_mode(&format!("{prefix}.shared_expert_gate"));
-            let sg_w = self
-                .weights
-                .require(&format!("{prefix}.shared_expert_gate.weight"))?;
-            let sg_s = self
-                .weights
-                .require(&format!("{prefix}.shared_expert_gate.scales"))?;
-            let sg_b = self
-                .weights
-                .require(&format!("{prefix}.shared_expert_gate.biases"))?;
-
-            // switch_mlp (mxfp4 default — 4-bit, group_size=32, no biases)
-            let (sw_gs, sw_bits, sw_mode) =
-                self.quant_params_with_mode(&format!("{prefix}.switch_mlp.gate_proj"));
-            let sw_gate_w = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.gate_proj.weight"))?;
-            let sw_gate_s = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.gate_proj.scales"))?;
-            let sw_up_w = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.up_proj.weight"))?;
-            let sw_up_s = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.up_proj.scales"))?;
-            let sw_down_w = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.down_proj.weight"))?;
-            let sw_down_s = self
-                .weights
-                .require(&format!("{prefix}.switch_mlp.down_proj.scales"))?;
-
-            // shared_expert (mxfp4 default)
-            let (se_gs, se_bits, se_mode) =
-                self.quant_params_with_mode(&format!("{prefix}.shared_expert.gate_proj"));
-            let se_gate_w = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.gate_proj.weight"))?;
-            let se_gate_s = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.gate_proj.scales"))?;
-            let se_up_w = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.up_proj.weight"))?;
-            let se_up_s = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.up_proj.scales"))?;
-            let se_down_w = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.down_proj.weight"))?;
-            let se_down_s = self
-                .weights
-                .require(&format!("{prefix}.shared_expert.down_proj.scales"))?;
-
-            Ok(MoeBlockWeights {
-                gate: AffineGateWeights {
-                    weight: gate_w,
-                    scales: gate_s,
-                    biases: gate_b,
-                    group_size: gate_gs,
-                    bits: gate_bits,
-                },
-                switch_glu: SwitchGluWeights {
-                    gate_proj: SwitchExpertWeights {
-                        weight: sw_gate_w,
-                        scales: sw_gate_s,
-                        biases: None,
-                    },
-                    up_proj: SwitchExpertWeights {
-                        weight: sw_up_w,
-                        scales: sw_up_s,
-                        biases: None,
-                    },
-                    down_proj: SwitchExpertWeights {
-                        weight: sw_down_w,
-                        scales: sw_down_s,
-                        biases: None,
-                    },
-                    group_size: sw_gs,
-                    bits: sw_bits,
-                    mode: sw_mode,
-                },
-                shared_expert: SharedMlpWeights {
-                    gate_proj_w: se_gate_w,
-                    gate_proj_s: se_gate_s,
-                    up_proj_w: se_up_w,
-                    up_proj_s: se_up_s,
-                    down_proj_w: se_down_w,
-                    down_proj_s: se_down_s,
-                    group_size: se_gs,
-                    bits: se_bits,
-                    mode: se_mode,
-                },
-                shared_gate: AffineGateWeights {
-                    weight: sg_w,
-                    scales: sg_s,
-                    biases: sg_b,
-                    group_size: sg_gs,
-                    bits: sg_bits,
-                },
-                top_k: cfg.num_experts_per_tok as i32,
-                norm_topk_prob: cfg.norm_topk_prob,
-            })
         }
 
         /// One-layer MoE block dispatch. `x` is the
@@ -2692,13 +2462,13 @@ mod imp {
         /// Dense SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
         /// Mirrors `native_moe`'s shared-expert SwiGLU but as the whole MLP.
         fn layer_dense_mlp_forward(&self, x: &Array, d: &DenseMlpWeights) -> Result<Array> {
-            // `linear_pre` carries each linear's affine biases (the 9B/27B dense
+            // `ResolvedLinear::apply` carries each linear's affine biases (the 9B/27B dense
             // MLP is affine-quantized WITH biases — unlike the mxfp4 shared
             // expert, so `native_moe::shared_mlp` (biases=None) can't be reused).
             // Gate+up fusion: one QMV `[.., 2*interm]` then split (bit-identical,
             // saves one dispatch/layer — the decode matvec is dispatch-bound).
             let (gate, up) = if let Some(gu) = &d.gate_up_proj {
-                let fused = self.linear_pre(gu, x)?;
+                let fused = gu.apply(x)?;
                 let parts = mlx_rs::ops::split(&fused, 2, -1)
                     .context("dense mlp: split fused gate_up failed")?;
                 let mut it = parts.into_iter();
@@ -2706,12 +2476,16 @@ mod imp {
                 let up = it.next().expect("dense mlp: fused split[1] (up)");
                 (gate, up)
             } else {
-                let gate = self.linear_pre(
-                    d.gate_proj.as_ref().expect("dense mlp: gate_proj missing"),
-                    x,
-                )?;
-                let up =
-                    self.linear_pre(d.up_proj.as_ref().expect("dense mlp: up_proj missing"), x)?;
+                let gate = d
+                    .gate_proj
+                    .as_ref()
+                    .expect("dense mlp: gate_proj missing")
+                    .apply(x)?;
+                let up = d
+                    .up_proj
+                    .as_ref()
+                    .expect("dense mlp: up_proj missing")
+                    .apply(x)?;
                 (gate, up)
             };
             // Reuse the landed mxfp4 SwiGLU fusion (-0.671ms/step, t=-29σ) — the
@@ -2725,7 +2499,7 @@ mod imp {
                 mlx_rs::ops::multiply(&silu_gate, &up)
                     .context("dense mlp: silu(gate) * up failed")?
             };
-            let raw = self.linear_pre(&d.down_proj, &act)?;
+            let raw = d.down_proj.apply(&act)?;
             Self::to_f32(raw, "dense.mlp")
         }
 
@@ -2798,6 +2572,7 @@ mod imp {
         /// equal, contiguous from the cache offset) is equivalent to
         /// [`Self::forward_with_opts`] but takes the slower unfused rope, so
         /// callers with no image should keep using that.
+        #[allow(dead_code)] // tests only
         pub fn forward_with_positions(
             &self,
             input_ids: &[u32],
@@ -2850,6 +2625,7 @@ mod imp {
         }
 
         /// Is the image tower loaded and usable?
+        #[allow(dead_code)] // tests only
         pub fn vision_available(&self) -> bool {
             self.vision.is_some()
         }
@@ -3245,7 +3021,7 @@ mod imp {
             let t_lm = timing_on.then(Instant::now);
             let normed_out = rms_norm(&hidden_for_head, &self.final_norm_weight, cfg.rms_norm_eps)?;
             let logits = if let Some(lm_head) = &self.lm_head {
-                self.linear_pre(lm_head, &normed_out)?
+                lm_head.apply(&normed_out)?
             } else {
                 // Tied path — fold the embed tensors directly.
                 quantized_matmul_with_mode(
@@ -3492,7 +3268,7 @@ mod imp {
             // Final norm + lm_head over [N, 1, hidden] → [N, 1, vocab], per-row argmax.
             let normed_out = rms_norm(&hidden_states, &self.final_norm_weight, cfg.rms_norm_eps)?;
             let logits = if let Some(lm_head) = &self.lm_head {
-                self.linear_pre(lm_head, &normed_out)?
+                lm_head.apply(&normed_out)?
             } else {
                 quantized_matmul_with_mode(
                     &normed_out,
@@ -3507,30 +3283,7 @@ mod imp {
                 .context("forward_decode_batch: tied lm_head matmul failed")?
             };
             let logits_f32 = Self::to_f32(logits, "forward_decode_batch.lm_head")?;
-            self.argmax_rows(&logits_f32)
-        }
-
-        /// Per-row argmax over `[N, 1, vocab]` logits → `Vec<u32>` of length N.
-        /// Single eval via `try_as_slice` (mirrors `argmax_last_token`'s tail).
-        fn argmax_rows(&self, logits: &Array) -> Result<Vec<u32>> {
-            if logits.ndim() != 3 {
-                return Err(anyhow!(
-                    "argmax_rows: expected [N, 1, V] logits, got ndim={}",
-                    logits.ndim()
-                ));
-            }
-            // Drop the L==1 axis → [N, V].
-            let idx0 = Array::from_int(0);
-            let rows = logits
-                .take_axis(&idx0, 1)
-                .context("argmax_rows: take_axis(0, axis=1) failed")?;
-            // Argmax over vocab, keeping the batch axis → [N].
-            let am = mlx_rs::ops::indexing::argmax_axis(&rows, -1, /* keep_dims */ false)
-                .context("argmax_rows: argmax_axis(-1) failed")?;
-            let slice = am
-                .try_as_slice::<u32>()
-                .map_err(|err| anyhow!("argmax_rows: read failed: {err}"))?;
-            Ok(slice.to_vec())
+            argmax_rows(&logits_f32)
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -3679,714 +3432,15 @@ mod imp {
             self.mtp_capture_slot.lock().ok().and_then(|mut s| s.take())
         }
 
-        /// Install (or clear) the MTP drift corrector. Applied in the drafter
-        /// loop to the chained hidden at each depth.
-        pub fn set_mtp_corrector(&self, c: Option<lumen_core::mtp_corrector::MtpCorrector>) {
-            if let Ok(mut slot) = self.mtp_corrector.lock() {
-                *slot = c;
-            }
-        }
-
-        /// True when a corrector is installed (drafter pulls hidden to host).
-        fn mtp_corrector_active(&self) -> bool {
-            self.mtp_corrector
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Start collecting calibration stats (`depth_count = max draft K`).
-        pub fn enable_mtp_calib(&self, depth_count: usize) {
-            let hidden = self.text_config().hidden_size;
-            if let Ok(mut slot) = self.mtp_calib.lock() {
-                *slot = Some(lumen_core::mtp_corrector::CorrectorStats::new(
-                    depth_count,
-                    hidden,
-                ));
-            }
-        }
-
-        fn mtp_calib_active(&self) -> bool {
-            self.mtp_calib.lock().map(|s| s.is_some()).unwrap_or(false)
-        }
-
-        /// Drain the calibration accumulator (e.g. to `finalize()` + save).
-        pub fn take_mtp_calib(&self) -> Option<lumen_core::mtp_corrector::CorrectorStats> {
-            self.mtp_calib.lock().ok().and_then(|mut s| s.take())
-        }
-
-        // ── Orthogonal-Procrustes corrector (the rotation shot) ──────────
-        /// Install (or clear) the Procrustes corrector. Applied in the drafter
-        /// loop as `h ← s·(h-mean_x)·R + mean_y` at each depth.
-        pub fn set_mtp_procrustes(
-            &self,
-            c: Option<lumen_core::mtp_procrustes::ProcrustesCorrector>,
-        ) {
-            if let Ok(mut slot) = self.mtp_procrustes.lock() {
-                *slot = c;
-            }
-        }
-
-        fn mtp_procrustes_active(&self) -> bool {
-            self.mtp_procrustes
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Start collecting Procrustes calibration stats (`depth_count = K`).
-        /// Heavy: allocates `depth_count · hidden²` f64 for the cross-product.
-        pub fn enable_mtp_proc_calib(&self, depth_count: usize) {
-            let hidden = self.text_config().hidden_size;
-            if let Ok(mut slot) = self.mtp_proc_calib.lock() {
-                *slot = Some(lumen_core::mtp_procrustes::ProcrustesStats::new(
-                    depth_count,
-                    hidden,
-                ));
-            }
-        }
-
-        fn mtp_proc_calib_active(&self) -> bool {
-            self.mtp_proc_calib
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Drain the Procrustes calibration accumulator.
-        pub fn take_mtp_proc_calib(&self) -> Option<lumen_core::mtp_procrustes::ProcrustesStats> {
-            self.mtp_proc_calib.lock().ok().and_then(|mut s| s.take())
-        }
-
-        // ── C4 trained lm_head LoRA (the accept-aligned lever) ───────────
-        /// Apply the trunk lm_head to a post-final-norm hidden `x` (`[*, hidden]`)
-        /// → logits `[*, vocab]`. Mirrors the trunk forward's lm_head branch
-        /// (untied `lm_head` else tied embed). `x` is ALREADY normed (it's the
-        /// MTP block's `norm_out`), so no rms_norm here.
-        fn lm_head_apply(&self, x: &Array) -> Result<Array> {
-            let logits = if let Some(lm_head) = &self.lm_head {
-                self.linear_pre(lm_head, x)?
-            } else {
-                quantized_matmul_with_mode(
-                    x,
-                    &self.embed_weight,
-                    &self.embed_scales,
-                    None,
-                    true,
-                    self.embed_group,
-                    self.embed_bits,
-                    self.embed_mode,
-                )
-                .context("lm_head_apply: tied lm_head matmul failed")?
-            };
-            Self::to_f32(logits, "lm_head_apply")
-        }
-
-        /// Begin collecting C4 calibration: `(norm_out row, trunk-argmax token)`.
-        pub fn enable_mtp_c4_calib(&self) {
-            if let Ok(mut slot) = self.mtp_c4_calib.lock() {
-                *slot = Some((Vec::new(), Vec::new()));
-            }
-        }
-
-        fn mtp_c4_calib_active(&self) -> bool {
-            self.mtp_c4_calib
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        fn mtp_c4_active(&self) -> bool {
-            self.mtp_c4_lmhead
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Begin head-internal C4 PoC calibration: k=0 `(embed row, h_pre row,
-        /// trunk-argmax target)`.
-        pub fn enable_mtp_hi_calib(&self) {
-            if let Ok(mut slot) = self.mtp_hi_calib.lock() {
-                *slot = Some((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
-            }
-        }
-
-        fn mtp_hi_calib_active(&self) -> bool {
-            self.mtp_hi_calib
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Correct draft logits with the trained lm_head LoRA:
-        /// `logits + (h·Aᵀ)·Bᵀ`. `h` is the lm_head input (`norm_out`, the
-        /// returned chained hidden). No-op if no adapter installed.
-        fn apply_c4_lmhead(&self, logits: &Array, h: &Array) -> Result<Array> {
-            let slot = match self.mtp_c4_lmhead.lock() {
-                Ok(s) => s,
-                Err(_) => return Ok(logits.clone()),
-            };
-            let Some((a, b)) = slot.as_ref() else {
-                return Ok(logits.clone());
-            };
-            // delta = (h @ Aᵀ) @ Bᵀ → [.., b_out]. B's first dim selects mode:
-            //   b_out == hidden → HIDDEN mode: logits = lm_head(h + delta_h)
-            //   b_out == vocab  → LOGIT  mode: logits = logits + delta
-            let hidden = self.text_config().hidden_size as i32;
-            let ha = h.matmul(&a.transpose_axes(&[1, 0])?)?; // [.., r]
-            let delta = ha.matmul(&b.transpose_axes(&[1, 0])?)?; // [.., b_out]
-            if b.shape()[0] == hidden {
-                let corrected = h.add(&delta)?;
-                self.lm_head_apply(&corrected)
-                    .context("apply_c4_lmhead: hidden-mode lm_head failed")
-            } else {
-                logits
-                    .add(&delta)
-                    .context("apply_c4_lmhead: logits + delta failed")
-            }
-        }
-
-        /// Train the C4 lm_head LoRA from the collected calibration pairs and
-        /// INSTALL it. CE-to-trunk-argmax loss over minibatches; base lm_head
-        /// frozen (its logits are a per-batch constant), only `A`/`B` learn via
-        /// `value_and_grad` + hand-rolled Adam (validated in `smoke_lora_train`).
-        pub fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
-            use mlx_rs::transforms::value_and_grad_with_argnums;
-            let (xs, targets) = {
-                let mut slot = self
-                    .mtp_c4_calib
-                    .lock()
-                    .map_err(|_| anyhow!("c4 calib lock poisoned"))?;
-                slot.take()
-                    .ok_or_else(|| anyhow!("no C4 calibration in progress"))?
-            };
-            let n = xs.len();
-            if n == 0 || n != targets.len() {
-                return Err(anyhow!("C4 calib empty or mismatched ({n} rows)"));
-            }
-            let hidden = self.text_config().hidden_size;
-            // Flatten host rows → X [n, hidden].
-            let mut flat = Vec::with_capacity(n * hidden);
-            for r in &xs {
-                if r.len() != hidden {
-                    return Err(anyhow!("C4 calib row len {} != hidden {hidden}", r.len()));
-                }
-                flat.extend_from_slice(r);
-            }
-            let x_all = Array::from_slice(&flat, &[n as i32, hidden as i32]);
-            let t_all: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
-            let tgt_all = Array::from_slice(&t_all, &[n as i32]);
-
-            // Probe vocab from a 1-row lm_head application.
-            let row0 = x_all.take_axis(Array::from_slice(&[0i32], &[1]), 0)?;
-            let probe = self.lm_head_apply(&row0)?;
-            let vocab = probe.shape()[probe.ndim() - 1];
-
-            // HIDDEN mode (LUMEN_C4_HIDDEN=1): the adapter corrects the lm_head
-            // INPUT (`logits = lm_head(x + (x·Aᵀ)·Bᵀ)`) with a HIDDEN-sized
-            // `B[hidden,r]` — far fewer params than the vocab-sized logit
-            // adapter, and the logit delta is constrained to lm_head's column
-            // space (a strong generalizing inductive bias). Trained on the same
-            // output CE. The lm_head being linear, `lm_head(x+δ)=lm_head(x)+δ·Wᵀ`,
-            // so we materialize the dense `Wᵀ` (`[hidden,vocab]`) ONCE via
-            // `lm_head_apply(I)` to keep the training graph differentiable
-            // (avoids needing a quantized_matmul input-vjp).
-            let hidden_mode = std::env::var("LUMEN_C4_HIDDEN").as_deref() == Ok("1");
-            let b_out = if hidden_mode { hidden as i32 } else { vocab };
-            let wt_dense: Option<Array> = if hidden_mode {
-                let eye = Array::eye::<f32>(hidden as i32, None, None)?;
-                let wt = self
-                    .lm_head_apply(&eye)?
-                    .as_dtype(mlx_rs::Dtype::Bfloat16)?; // [hidden, vocab]
-                wt.eval()?;
-                eprintln!(
-                    "[c4-train] HIDDEN mode: dense lm_head Wᵀ {:?} materialized",
-                    wt.shape()
-                );
-                Some(wt)
-            } else {
-                None
-            };
-
-            // LoRA params: A [r,h] small random, B [b_out,r] zeros (delta starts 0).
-            mlx_rs::random::seed(1234)?;
-            let r = rank as i32;
-            let mut a = mlx_rs::random::normal::<f32>(&[r, hidden as i32], None, None, None)?
-                .multiply(Array::from_f32((1.0 / hidden as f32).sqrt()))?;
-            let mut b = Array::zeros::<f32>(&[b_out, r])?;
-            a.eval()?;
-            b.eval()?;
-            let (mut ma, mut va) = (
-                Array::zeros::<f32>(&[r, hidden as i32])?,
-                Array::zeros::<f32>(&[r, hidden as i32])?,
-            );
-            let (mut mb, mut vb) = (
-                Array::zeros::<f32>(&[b_out, r])?,
-                Array::zeros::<f32>(&[b_out, r])?,
-            );
-            let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-
-            // Decoupled weight decay (AdamW).
-            let wd: f32 = std::env::var("LUMEN_C4_WD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
-            let adam =
-                |p: &Array, g: &Array, m: &mut Array, v: &mut Array, t: i32| -> Result<Array> {
-                    *m = m
-                        .multiply(Array::from_f32(b1))?
-                        .add(&g.multiply(Array::from_f32(1.0 - b1))?)?;
-                    *v = v
-                        .multiply(Array::from_f32(b2))?
-                        .add(&g.multiply(g)?.multiply(Array::from_f32(1.0 - b2))?)?;
-                    let mhat = m.divide(Array::from_f32(1.0 - b1.powi(t)))?;
-                    let vhat = v.divide(Array::from_f32(1.0 - b2.powi(t)))?;
-                    let upd = mhat.divide(&mlx_rs::ops::sqrt(&vhat)?.add(Array::from_f32(eps))?)?;
-                    let stepped = p.subtract(&upd.multiply(Array::from_f32(lr))?)?;
-                    if wd > 0.0 {
-                        stepped
-                            .multiply(Array::from_f32(1.0 - lr * wd))
-                            .map_err(Into::into)
-                    } else {
-                        Ok(stepped)
-                    }
-                };
-
-            // Train / held-out split (last 20% = held-out; in broad-corpus mode
-            // these are the LAST prompts' rows ⇒ a cross-context generalization
-            // gate). Early-stop: keep the (A,B) with the best HELD-OUT argmax
-            // accuracy (= would-be greedy accept), never the train-CE-minimizing
-            // last step — that memorizes (the vocab-sized B routes per token).
-            let n_ho = (n / 5).clamp(1, n.saturating_sub(1).max(1));
-            let n_tr = (n - n_ho).max(1);
-            let tr_idx = Array::from_slice(&(0..n_tr as i32).collect::<Vec<_>>(), &[n_tr as i32]);
-            let ho_idx =
-                Array::from_slice(&(n_tr as i32..n as i32).collect::<Vec<_>>(), &[n_ho as i32]);
-            let x_tr = x_all.take_axis(&tr_idx, 0)?;
-            let t_tr = tgt_all.take_axis(&tr_idx, 0)?;
-            let x_ho = x_all.take_axis(&ho_idx, 0)?;
-            let t_ho = tgt_all.take_axis(&ho_idx, 0)?;
-            let base_ho = self.lm_head_apply(&x_ho)?; // frozen held-out base logits
-            base_ho.eval()?;
-            // Held-out baseline accept proxy (no adapter).
-            let ho_acc = |a: &Array, b: &Array| -> Result<f32> {
-                let ha = x_ho.matmul(&a.transpose_axes(&[1, 0])?)?;
-                let delta = ha.matmul(&b.transpose_axes(&[1, 0])?)?; // [n_ho, b_out]
-                let delta_logits = match &wt_dense {
-                    Some(wt) => delta
-                        .as_dtype(mlx_rs::Dtype::Bfloat16)?
-                        .matmul(wt)?
-                        .as_dtype(mlx_rs::Dtype::Float32)?,
-                    None => delta,
-                };
-                let logits = base_ho.add(&delta_logits)?;
-                let pred = mlx_rs::ops::indexing::argmax_axis(&logits, 1, false)?
-                    .as_dtype(mlx_rs::Dtype::Int32)?;
-                let acc = pred
-                    .eq(&t_ho)?
-                    .as_dtype(mlx_rs::Dtype::Float32)?
-                    .mean(false)?;
-                acc.eval()?;
-                Ok(acc.item::<f32>())
-            };
-            let zero_b = Array::zeros::<f32>(&[b_out, r])?;
-            let base_ho_acc = ho_acc(&a, &zero_b)?;
-
-            let batch = n_tr.min(128);
-            let mut best = (base_ho_acc, a.clone(), b.clone());
-            for step in 1..=steps as i32 {
-                let start = ((step as usize - 1) * batch) % n_tr;
-                let idx: Vec<i32> = (0..batch).map(|i| ((start + i) % n_tr) as i32).collect();
-                let idx_arr = Array::from_slice(&idx, &[batch as i32]);
-                let xb = x_tr.take_axis(&idx_arr, 0)?; // [batch, hidden]
-                let tb = t_tr.take_axis(&idx_arr, 0)?; // [batch]
-                let base_logits = self.lm_head_apply(&xb)?; // frozen constant
-                base_logits.eval()?;
-                let bsz = batch as i32;
-                let loss_fn = {
-                    let xb = xb.clone();
-                    let base = base_logits.clone();
-                    let tb = tb.clone();
-                    let wt = wt_dense.clone();
-                    move |args: &[Array]| -> Vec<Array> {
-                        let a = &args[0];
-                        let b = &args[1];
-                        let ha = xb.matmul(a.transpose_axes(&[1, 0]).unwrap()).unwrap();
-                        let delta = ha.matmul(b.transpose_axes(&[1, 0]).unwrap()).unwrap();
-                        // HIDDEN mode: map the hidden-space delta through the
-                        // frozen dense lm_head into logit space; else delta IS
-                        // the logit correction.
-                        let delta_logits = match &wt {
-                            Some(w) => delta
-                                .as_dtype(mlx_rs::Dtype::Bfloat16)
-                                .unwrap()
-                                .matmul(w)
-                                .unwrap()
-                                .as_dtype(mlx_rs::Dtype::Float32)
-                                .unwrap(),
-                            None => delta,
-                        };
-                        let logits = base.add(&delta_logits).unwrap();
-                        let lse = logits.logsumexp_axis(1, false).unwrap();
-                        let tl = logits
-                            .take_along_axis(tb.reshape(&[bsz, 1]).unwrap(), 1)
-                            .unwrap()
-                            .reshape(&[bsz])
-                            .unwrap();
-                        vec![lse.subtract(&tl).unwrap().mean(false).unwrap()]
-                    }
-                };
-                let (loss, grads) = value_and_grad_with_argnums(loss_fn, &[0i32, 1i32][..])(&[
-                    a.clone(),
-                    b.clone(),
-                ])?;
-                a = adam(&a, &grads[0], &mut ma, &mut va, step)?;
-                b = adam(&b, &grads[1], &mut mb, &mut vb, step)?;
-                a.eval()?;
-                b.eval()?;
-                if step == 1 || step % 5 == 0 || step == steps as i32 {
-                    let hacc = ho_acc(&a, &b)?;
-                    if hacc > best.0 {
-                        best = (hacc, a.clone(), b.clone());
-                    }
-                    eprintln!(
-                        "[c4-train] step {step}: CE={:.4} heldout_acc={hacc:.3} (best {:.3}, base {base_ho_acc:.3})",
-                        loss[0].item::<f32>(),
-                        best.0
-                    );
-                }
-            }
-            // Install the best-held-out checkpoint only if it beats the
-            // no-adapter baseline; otherwise leave the adapter UNINSTALLED
-            // (identity) so a non-generalizing fit can't hurt serving.
-            let best_acc = best.0;
-            if best_acc > base_ho_acc + 1e-4 {
-                if let Ok(mut slot) = self.mtp_c4_lmhead.lock() {
-                    *slot = Some((best.1, best.2));
-                }
-                eprintln!(
-                    "[c4-train] installed best checkpoint: heldout_acc {best_acc:.3} > base {base_ho_acc:.3} (rank={rank}, n_tr={n_tr}, n_ho={n_ho}, vocab={vocab})"
-                );
-            } else {
-                eprintln!(
-                    "[c4-train] NOT installed: best heldout_acc {best_acc:.3} did not beat base {base_ho_acc:.3} — adapter does not generalize (rank={rank}, n={n})"
-                );
-            }
-            Ok(())
-        }
-
-        /// Head-internal C4 PoC: train rank-`r` LoRAs on a SUBSET of the MTP
-        /// block's projections (`cfg.positions` ⊆ {eh,q,k,v,o,gate,up,down})
-        /// against the trunk's k=0 target, via `forward_train_lora_multi`
-        /// (gradients flow through the block's attention + MLP — the path the
-        /// dead frozen-hidden lm_head C4 could NOT reach). `cfg.kl` switches the
-        /// objective from CE-to-argmax to top-`topk` distillation KL against the
-        /// trunk's verify distribution (the variation probed after CE overfit).
-        /// Returns `(held_out_accept_before, held_out_accept_best)` — the
-        /// DECISION GATE: if held-out doesn't move, the single head is the
-        /// ceiling (fold). Does NOT install; PoC measurement only.
-        pub fn train_mtp_headinternal(&self, cfg: HiTrainCfg) -> Result<(f32, f32)> {
-            use mlx_rs::transforms::value_and_grad_with_argnums;
-            let (es, hs, tgts, soft) = {
-                let mut slot = self
-                    .mtp_hi_calib
-                    .lock()
-                    .map_err(|_| anyhow!("hi calib lock poisoned"))?;
-                slot.take()
-                    .ok_or_else(|| anyhow!("no head-internal calibration in progress"))?
-            };
-            let n = es.len();
-            if n == 0 || n != hs.len() || n != tgts.len() || n != soft.len() {
-                return Err(anyhow!("hi calib empty or mismatched (n={n})"));
-            }
-            let HiTrainCfg {
-                rank,
-                steps,
-                lr,
-                weight_decay,
-                positions,
-                kl,
-                topk,
-                seed,
-            } = cfg;
-            if positions.is_empty() {
-                return Err(anyhow!("hi train: no LoRA positions selected"));
-            }
-            let topk = topk.clamp(1, 64);
-            let block = self
-                .mtp
-                .as_ref()
-                .ok_or_else(|| anyhow!("train_mtp_headinternal: MTP block not enabled"))?;
-            let hidden = self.text_config().hidden_size;
-            let h32 = hidden as i32;
-            let flat = |rows: &[Vec<f32>]| -> Result<Array> {
-                let mut f = Vec::with_capacity(n * hidden);
-                for r in rows {
-                    if r.len() != hidden {
-                        return Err(anyhow!("hi calib row {} != hidden {hidden}", r.len()));
-                    }
-                    f.extend_from_slice(r);
-                }
-                Ok(Array::from_slice(&f, &[n as i32, 1, h32]))
-            };
-            let x_e = flat(&es)?;
-            let x_h = flat(&hs)?;
-            let t_all = Array::from_slice(
-                &tgts.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-                &[n as i32],
-            );
-            let fnorm = self.final_norm_weight.clone();
-            let lmhead = self.trunk_lm_head_view();
-
-            // Per-position LoRA (in, out) dims.
-            let intermediate = || -> Result<i32> {
-                block.dense_intermediate().ok_or_else(|| {
-                    anyhow!("MLP-position LoRA needs a Dense MTP block (MoE unsupported)")
-                })
-            };
-            let dim_in_out = |p: MtpLoraPos| -> Result<(i32, i32)> {
-                Ok(match p {
-                    MtpLoraPos::Eh => (2 * h32, h32),
-                    MtpLoraPos::Q => (h32, block.q_out_dim()),
-                    MtpLoraPos::K => (h32, block.kv_out_dim()),
-                    MtpLoraPos::V => (h32, block.kv_out_dim()),
-                    MtpLoraPos::O => (block.o_in_dim(), h32),
-                    MtpLoraPos::Gate | MtpLoraPos::Up => (h32, intermediate()?),
-                    MtpLoraPos::Down => (intermediate()?, h32),
-                })
-            };
-
-            // Train / held-out split (last 20% = held-out → cross-context, since
-            // the broad calib's last rows are the last prompts). The decisive
-            // gate: train ONLY on the train split, measure accept on held-out.
-            let n_ho = (n / 5).clamp(1, n.saturating_sub(1).max(1));
-            let n_tr = (n - n_ho).max(1);
-            let tr_idx = Array::from_slice(&(0..n_tr as i32).collect::<Vec<_>>(), &[n_tr as i32]);
-            let ho_idx =
-                Array::from_slice(&(n_tr as i32..n as i32).collect::<Vec<_>>(), &[n_ho as i32]);
-            let (xe_tr, xh_tr, t_tr) = (
-                x_e.take_axis(&tr_idx, 0)?,
-                x_h.take_axis(&tr_idx, 0)?,
-                t_all.take_axis(&tr_idx, 0)?,
-            );
-            let (xe_ho, xh_ho, t_ho) = (
-                x_e.take_axis(&ho_idx, 0)?,
-                x_h.take_axis(&ho_idx, 0)?,
-                t_all.take_axis(&ho_idx, 0)?,
-            );
-
-            // Top-k soft target arrays (train split only — held-out uses accept).
-            let (soft_ids_tr, soft_ps_tr) = {
-                let m = n_tr;
-                let mut ids = Vec::with_capacity(m * topk);
-                let mut ps = Vec::with_capacity(m * topk);
-                for (rid, rp) in soft.iter().take(n_tr) {
-                    for j in 0..topk {
-                        if j < rid.len() {
-                            ids.push(rid[j] as i32);
-                            ps.push(rp[j]);
-                        } else {
-                            ids.push(0);
-                            ps.push(0.0);
-                        }
-                    }
-                }
-                (
-                    Array::from_slice(&ids, &[m as i32, topk as i32]),
-                    Array::from_slice(&ps, &[m as i32, topk as i32]),
-                )
-            };
-
-            // Accept (argmax-match) on a (embed,h_pre,target) set at the current
-            // flat LoRA args.
-            let accept =
-                |args: &[Array], xe: &Array, xh: &Array, tg: &Array, m: usize| -> Result<f32> {
-                    let set = build_lora_set(&positions, args);
-                    let logits = block
-                        .forward_train_lora_multi(xe, xh, &set, &fnorm, &lmhead)?
-                        .reshape(&[m as i32, -1])?;
-                    let pred = mlx_rs::ops::indexing::argmax_axis(&logits, 1, false)?
-                        .as_dtype(mlx_rs::Dtype::Int32)?;
-                    let eq = pred.eq(tg)?.as_dtype(mlx_rs::Dtype::Float32)?.mean(false)?;
-                    eq.eval()?;
-                    Ok(eq.item::<f32>())
-                };
-
-            // Init flat args [A0,B0,A1,B1,...]: A [r,in] small-random, B [out,r]
-            // zero (delta starts 0 → identical to the real baseline draft).
-            mlx_rs::random::seed(seed)?;
-            let r = rank as i32;
-            let mut args: Vec<Array> = Vec::with_capacity(positions.len() * 2);
-            for &p in &positions {
-                let (din, dout) = dim_in_out(p)?;
-                let a = mlx_rs::random::normal::<f32>(&[r, din], None, None, None)?
-                    .multiply(Array::from_f32((1.0 / din as f32).sqrt()))?;
-                let b = Array::zeros::<f32>(&[dout, r])?;
-                a.eval()?;
-                b.eval()?;
-                args.push(a);
-                args.push(b);
-            }
-            let n_args = args.len();
-            let argnums: Vec<i32> = (0..n_args as i32).collect();
-            let ho_before = accept(&args, &xe_ho, &xh_ho, &t_ho, n_ho)?;
-
-            // Per-arg AdamW state.
-            let mut m_state: Vec<Array> = args
-                .iter()
-                .map(|a| Array::zeros::<f32>(a.shape()).unwrap())
-                .collect();
-            let mut v_state: Vec<Array> = args
-                .iter()
-                .map(|a| Array::zeros::<f32>(a.shape()).unwrap())
-                .collect();
-            let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
-            let wd = weight_decay;
-            let adam =
-                |p: &Array, g: &Array, m: &mut Array, v: &mut Array, t: i32| -> Result<Array> {
-                    *m = m
-                        .multiply(Array::from_f32(b1))?
-                        .add(&g.multiply(Array::from_f32(1.0 - b1))?)?;
-                    *v = v
-                        .multiply(Array::from_f32(b2))?
-                        .add(&g.multiply(g)?.multiply(Array::from_f32(1.0 - b2))?)?;
-                    let mhat = m.divide(Array::from_f32(1.0 - b1.powi(t)))?;
-                    let vhat = v.divide(Array::from_f32(1.0 - b2.powi(t)))?;
-                    let upd = mhat.divide(&mlx_rs::ops::sqrt(&vhat)?.add(Array::from_f32(eps))?)?;
-                    // Decoupled weight decay (AdamW): p -= lr*(upd + wd*p).
-                    let step_dir = if wd > 0.0 {
-                        upd.add(&p.multiply(Array::from_f32(wd))?)?
-                    } else {
-                        upd
-                    };
-                    p.subtract(&step_dir.multiply(Array::from_f32(lr))?)
-                        .map_err(Into::into)
-                };
-
-            // loss_fn trains on the TRAIN split only (held-out untouched).
-            let (xe_c, xh_c, t_c) = (xe_tr.clone(), xh_tr.clone(), t_tr.clone());
-            let fnorm_l = fnorm.clone();
-            let lmhead_l = self.trunk_lm_head_view();
-            let positions_l = positions.clone();
-            let (sid, sps) = (soft_ids_tr.clone(), soft_ps_tr.clone());
-            let m_tr = n_tr;
-            let kl_obj = kl;
-            let loss_fn = move |args: &[Array]| -> Vec<Array> {
-                let set = build_lora_set(&positions_l, args);
-                let logits = block
-                    .forward_train_lora_multi(&xe_c, &xh_c, &set, &fnorm_l, &lmhead_l)
-                    .unwrap()
-                    .reshape(&[m_tr as i32, -1])
-                    .unwrap();
-                let loss = if kl_obj {
-                    // Distillation cross-entropy −Σ_topk p·log_softmax(draft). The
-                    // dropped tail makes it a truncated KL (the entropy term is a
-                    // param-free constant → same gradient as full KL).
-                    let lse = logits.logsumexp_axis(1, true).unwrap(); // [m,1]
-                    let logp = logits.subtract(&lse).unwrap(); // [m,vocab]
-                    let gathered = logp.take_along_axis(&sid, 1).unwrap(); // [m,topk]
-                    let per = gathered.multiply(&sps).unwrap().sum_axis(1, false).unwrap(); // [m]
-                    per.multiply(Array::from_f32(-1.0))
-                        .unwrap()
-                        .mean(false)
-                        .unwrap()
-                } else {
-                    let lse = logits.logsumexp_axis(1, false).unwrap();
-                    let tl = logits
-                        .take_along_axis(t_c.reshape(&[m_tr as i32, 1]).unwrap(), 1)
-                        .unwrap()
-                        .reshape(&[m_tr as i32])
-                        .unwrap();
-                    lse.subtract(&tl).unwrap().mean(false).unwrap()
-                };
-                vec![loss]
-            };
-            let mut vg = value_and_grad_with_argnums(loss_fn, &argnums[..]);
-            // Early-stop: keep the args with the best HELD-OUT accept (the
-            // generalizing checkpoint, not the train-loss-minimizing last step).
-            let mut best_ho = ho_before;
-            let mut best_args = args.clone();
-            // Stable-plateau metric: mean held-out over the LAST quarter of
-            // steps. The per-step `best` is a max over `steps` noisy evals (n_ho
-            // samples, σ≈sqrt(p(1-p)/n_ho)) → upward-biased by max-selection
-            // (E[max] ≈ baseline + ~2.5σ even with a no-op LoRA). The tail-mean
-            // is the honest "did the LoRA settle ABOVE baseline" signal.
-            let mut ho_hist: Vec<f32> = Vec::with_capacity(steps);
-            for step in 1..=steps as i32 {
-                let (loss, grads) = vg(&args)?;
-                for i in 0..n_args {
-                    args[i] = adam(&args[i], &grads[i], &mut m_state[i], &mut v_state[i], step)?;
-                    args[i].eval()?;
-                }
-                let ho = accept(&args, &xe_ho, &xh_ho, &t_ho, n_ho)?;
-                ho_hist.push(ho);
-                if ho > best_ho {
-                    best_ho = ho;
-                    best_args = args.clone();
-                }
-                if step <= 8 || step % 20 == 0 || step == steps as i32 {
-                    let tr = accept(&args, &xe_tr, &xh_tr, &t_tr, n_tr)?;
-                    eprintln!(
-                        "[hi-train] step {step:>3}: loss={:.4} train-acc={tr:.3} heldout-acc={ho:.3}",
-                        loss[0].item::<f32>()
-                    );
-                }
-            }
-            let _ = best_args;
-            let tail_start = ho_hist.len().saturating_sub((steps / 4).max(1));
-            let tail = &ho_hist[tail_start..];
-            let tail_mean = if tail.is_empty() {
-                ho_before
-            } else {
-                tail.iter().sum::<f32>() / tail.len() as f32
-            };
-            // 1σ of the held-out accept estimate (binomial), for a noise yardstick.
-            let sigma = ((ho_before * (1.0 - ho_before)) / n_ho as f32).sqrt();
-            let pos_str = positions
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join("+");
-            eprintln!(
-                "[hi-train] DONE n={n} (tr={n_tr} ho={n_ho}) pos={pos_str} obj={} rank={rank} wd={wd}: \
-                 HELD-OUT before {ho_before:.3} | tail-mean {tail_mean:.3} (Δ {:+.3}, {:.1}σ) | max {best_ho:.3} (selection-biased)",
-                if kl { "kl" } else { "ce" },
-                tail_mean - ho_before,
-                if sigma > 0.0 {
-                    (tail_mean - ho_before) / sigma
-                } else {
-                    0.0
-                }
-            );
-            // Return the HONEST tail-mean as the verdict number (not the biased max).
-            Ok((ho_before, tail_mean))
-        }
-
-        /// Pull a `[1, 1, hidden]` (or `[1, hidden]`) array to a host `Vec<f32>`.
-        fn hidden_to_host_f32(&self, h: &Array) -> Result<Vec<f32>> {
-            let f = h
-                .as_dtype(mlx_rs::Dtype::Float32)
-                .context("mtp corrector: cast hidden to f32 failed")?;
-            f.eval().context("mtp corrector: eval hidden failed")?;
-            Ok(f.as_slice::<f32>().to_vec())
-        }
-
-        /// Build a `Qwen35MtpLinear` view of the trunk's lm_head — direct
-        /// reference (refcount bump) to the same packed/scales/biases tensors.
-        /// Falls back to the tied-embed tensors when `lm_head` is None
-        /// (matches the trunk forward path's tied lm_head branch).
-        fn trunk_lm_head_view(&self) -> Qwen35MtpLinear {
+        /// The trunk's lm_head as a `ResolvedLinear` — direct reference
+        /// (refcount bump) to the same packed/scales/biases tensors. Falls
+        /// back to the tied-embed tensors when `lm_head` is None (matches the
+        /// trunk forward path's tied lm_head branch).
+        fn trunk_lm_head_view(&self) -> ResolvedLinear {
             if let Some(lm) = &self.lm_head {
-                Qwen35MtpLinear {
-                    weight: lm.weight.clone(),
-                    scales: lm.scales.clone(),
-                    biases: lm.biases.clone(),
-                    group_size: lm.group_size,
-                    bits: lm.bits,
-                    mode: lm.mode,
-                }
+                lm.clone()
             } else {
-                Qwen35MtpLinear {
+                ResolvedLinear {
                     weight: self.embed_weight.clone(),
                     scales: self.embed_scales.clone(),
                     biases: None,
@@ -4601,26 +3655,6 @@ mod imp {
             // q[draft] and the residual (p-q)+ at the reject position).
             let trunk_final_norm_w = self.final_norm_weight.clone();
             let trunk_lm_head = self.trunk_lm_head_view();
-            // Drift-corrector / calibration plumbing. Corrector: apply to the
-            // chained hidden (host round-trip) before feeding the next draft
-            // step. Calib: stash the RAW per-depth chained hidden to pair with
-            // the verify-true hidden after Step C.
-            let corr_active = self.mtp_corrector_active();
-            let proc_active = self.mtp_procrustes_active();
-            let calib_active = self.mtp_calib_active();
-            let proc_calib_active = self.mtp_proc_calib_active();
-            let c4_calib_active = self.mtp_c4_calib_active();
-            let c4_active = self.mtp_c4_active();
-            let hi_calib_active = self.mtp_hi_calib_active();
-            // Head-internal PoC: stash k=0 block inputs (embed, h_pre) → paired
-            // with preds[0] in Step D.
-            let mut hi_k0: Option<(Vec<f32>, Vec<f32>)> = None;
-            // Pull the raw chained hidden to host when ANY corrector/calib
-            // (diagonal / Procrustes / C4) needs it.
-            let need_host = calib_active || proc_calib_active || c4_calib_active;
-            let apply_corr = corr_active || proc_active;
-            let hidden_dim = self.text_config().hidden_size as i32;
-            let mut draft_hiddens_host: Vec<Vec<f32>> = Vec::new();
             let mut last_h = trunk_h;
             let mut last_tok = next_token;
             let mut drafts: Vec<u32> = Vec::with_capacity(n_draft);
@@ -4633,12 +3667,6 @@ mod imp {
                 let embeds = self
                     .embed_lookup_single(last_tok)
                     .with_context(|| format!("mtp_step: Step B embed k={k}"))?;
-                if hi_calib_active && k == 0 {
-                    hi_k0 = Some((
-                        self.hidden_to_host_f32(&embeds)?,
-                        self.hidden_to_host_f32(&last_h)?,
-                    ));
-                }
                 let (logits_b, new_h) = block
                     .forward(
                         &embeds,
@@ -4649,15 +3677,6 @@ mod imp {
                         &trunk_lm_head,
                     )
                     .with_context(|| format!("mtp_step: Step B block.forward k={k}"))?;
-                // C4 lm_head LoRA: correct the draft logits using norm_out
-                // (= the returned chained hidden = the lm_head input). Only
-                // affects which token is DRAFTED; the hidden chain is unchanged.
-                let logits_b = if c4_active {
-                    self.apply_c4_lmhead(&logits_b, &new_h)
-                        .with_context(|| format!("mtp_step: Step B c4 apply k={k}"))?
-                } else {
-                    logits_b
-                };
                 let draft_tok = if sampling {
                     let mut row = self.logits_row_to_cpu_f32(&logits_b, -1)?;
                     let q = sampling_distribution(&mut row, &[], &cfg);
@@ -4669,34 +3688,7 @@ mod imp {
                         .with_context(|| format!("mtp_step: Step B argmax k={k}"))?
                 };
                 drafts.push(draft_tok);
-                if need_host {
-                    // Raw (uncorrected) chained hidden at depth k+1 → x.
-                    draft_hiddens_host.push(self.hidden_to_host_f32(&new_h)?);
-                }
-                // Chain the hidden, applying the corrector (depth k+1) so the
-                // next draft step sees an in-distribution hidden. Procrustes
-                // takes precedence over the diagonal when both are installed.
-                last_h = if apply_corr {
-                    let mut hv = if need_host {
-                        draft_hiddens_host[draft_hiddens_host.len() - 1].clone()
-                    } else {
-                        self.hidden_to_host_f32(&new_h)?
-                    };
-                    if proc_active {
-                        if let Ok(slot) = self.mtp_procrustes.lock()
-                            && let Some(c) = slot.as_ref()
-                        {
-                            c.apply(&mut hv, k + 1);
-                        }
-                    } else if let Ok(slot) = self.mtp_corrector.lock()
-                        && let Some(c) = slot.as_ref()
-                    {
-                        c.apply(&mut hv, k + 1);
-                    }
-                    Array::from_slice(&hv, &[1, 1, hidden_dim])
-                } else {
-                    new_h
-                };
+                last_h = new_h;
                 last_tok = draft_tok;
             }
             // mtp_kv offset is now n_draft (drafter wrote one slot per draft).
@@ -4724,47 +3716,11 @@ mod imp {
             if use_capture {
                 self.set_ssm_capture_enabled(true);
             }
-            // Calibration: capture the trunk's true per-position hidden so we
-            // can pair verify_hidden[k] (target) with draft_hiddens_host[k] (x).
-            if calib_active || proc_calib_active {
-                self.set_mtp_capture_enabled(true);
-            }
             let verify_logits = self
                 .forward(&verify_in, trunk_cache)
                 .context("mtp_step: Step C trunk verify forward")?;
             if use_capture {
                 self.set_ssm_capture_enabled(false);
-            }
-            if calib_active || proc_calib_active {
-                self.set_mtp_capture_enabled(false);
-                if let Some(vh) = self.take_captured_h() {
-                    // vh = [1, K+1, hidden]; verify position k = true hidden at
-                    // the position draft_hiddens_host[k] estimates. Pair them.
-                    let n_pairs = n_draft.min(draft_hiddens_host.len());
-                    let ys: Vec<Option<Vec<f32>>> = (0..n_pairs)
-                        .map(|k| self.logits_row_to_cpu_f32(&vh, k as i32).ok())
-                        .collect();
-                    if calib_active
-                        && let Ok(mut slot) = self.mtp_calib.lock()
-                        && let Some(stats) = slot.as_mut()
-                    {
-                        for k in 0..n_pairs {
-                            if let Some(y) = &ys[k] {
-                                stats.observe(k + 1, &draft_hiddens_host[k], y);
-                            }
-                        }
-                    }
-                    if proc_calib_active
-                        && let Ok(mut slot) = self.mtp_proc_calib.lock()
-                        && let Some(stats) = slot.as_mut()
-                    {
-                        for k in 0..n_pairs {
-                            if let Some(y) = &ys[k] {
-                                stats.observe(k + 1, &draft_hiddens_host[k], y);
-                            }
-                        }
-                    }
-                }
             }
             let captures = if use_capture {
                 self.take_ssm_captures()
@@ -4830,35 +3786,6 @@ mod imp {
                     eprintln!(
                         "[qwen3_5 mtp_step m_pre={m_pre}] next_token={next_token} drafts={drafts:?} preds={preds:?}"
                     );
-                }
-                // C4 calib: pair each draft's lm_head input (norm_out =
-                // draft_hiddens_host[k]) with the trunk's correct token
-                // (preds[k]). Trains the lm_head LoRA to re-aim the draft logits.
-                if c4_calib_active
-                    && let Ok(mut slot) = self.mtp_c4_calib.lock()
-                    && let Some((xs, tgts)) = slot.as_mut()
-                {
-                    for k in 0..n_draft.min(draft_hiddens_host.len()) {
-                        xs.push(draft_hiddens_host[k].clone());
-                        tgts.push(preds[k]);
-                    }
-                }
-                if hi_calib_active {
-                    // Soft target for the KL/distillation objective: top-64 of
-                    // the trunk's verify distribution at position 0 (the k=0
-                    // target). Captured to host; renormalization happens at train.
-                    let soft0 = {
-                        let row = self.logits_row_to_cpu_f32(&verify_logits, 0)?;
-                        topk_softmax(&row, 64)
-                    };
-                    if let (Some((e, h)), Ok(mut slot)) = (&hi_k0, self.mtp_hi_calib.lock())
-                        && let Some((es, hs, tgts, soft)) = slot.as_mut()
-                    {
-                        es.push(e.clone());
-                        hs.push(h.clone());
-                        tgts.push(preds[0]);
-                        soft.push(soft0);
-                    }
                 }
                 let mut acc = 0usize;
                 for k in 0..n_draft {
@@ -5322,6 +4249,16 @@ pub(crate) use imp::{NativeQuantizationConfig, NativeQuantizationOverride, Nativ
 /// bundled into the sweep.
 #[cfg(feature = "mlx-native")]
 pub use imp::{NativeLayerType, NativeModelConfig, NativeTextConfig, NativeWeights};
+
+/// Gemma 4's weight loader runs the same truncation check on each shard: a
+/// shard cut inside its data section otherwise loads without error.
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::validate_safetensors_complete;
+
+/// The quantized linear projection Gemma 4 (text and vision) and the MTP head
+/// resolve their weights into too, and the batched decode's argmax.
+#[cfg(feature = "mlx-native")]
+pub(crate) use imp::{ResolvedLinear, argmax_rows};
 
 // MTP types are part of the public surface (Phase 2 S3) — re-exported from
 // the crate root via `lumen_mlx::MtpStepOutput`.

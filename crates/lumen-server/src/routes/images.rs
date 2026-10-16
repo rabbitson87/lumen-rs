@@ -4,11 +4,12 @@
 //! channel-actor (`DiffusionHandle`). When no diffusion backend is loaded
 //! (i.e. the server is in `chat` mode), this returns 503.
 
-use atomic_http::external::http::{Request, Response, StatusCode};
+use atomic_http::external::http::{Request, Response};
 use atomic_http::*;
 
+use super::{reply_err, respond};
 use crate::diffusion_engine::{DiffusionHandle, GenerateParams};
-use crate::types::{ErrorResponse, ImageData, ImageGenerationRequest, ImageGenerationResponse};
+use crate::types::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 
 /// Upper bound on `n` to avoid a single request monopolizing the (single,
 /// blocking) diffusion worker for an unbounded time.
@@ -16,7 +17,7 @@ const MAX_IMAGES_PER_REQUEST: usize = 4;
 
 pub async fn handle(
     request: Request<ArenaBody>,
-    mut response: Response<ArenaWriter>,
+    response: Response<ArenaWriter>,
     diffusion: Option<DiffusionHandle>,
 ) -> Result<(), SendableError> {
     // 503 when the image backend is not loaded (chat-only mode).
@@ -91,20 +92,5 @@ pub async fn handle(
         .unwrap_or_default()
         .as_secs();
     let resp = ImageGenerationResponse { created, data };
-    response.body_mut().set_arena_json(&resp)?;
-    *response.status_mut() = StatusCode::from_u16(200)?;
-    response.responser_arena().await?;
-    Ok(())
-}
-
-async fn reply_err(
-    mut response: Response<ArenaWriter>,
-    message: impl Into<String>,
-    code: u16,
-) -> Result<(), SendableError> {
-    let err = ErrorResponse::new(message, code);
-    response.body_mut().set_arena_json(&err)?;
-    *response.status_mut() = StatusCode::from_u16(code)?;
-    response.responser_arena().await?;
-    Ok(())
+    respond(response, 200, &resp).await
 }

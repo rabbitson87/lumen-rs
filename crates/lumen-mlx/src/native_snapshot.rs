@@ -18,13 +18,13 @@
 //! for the PyO3-side semantics this module mirrors.
 
 #[cfg(feature = "mlx-native")]
-#[allow(dead_code)] // public surface used by runner_native.rs once snapshot stubs are wired
 mod imp {
     use anyhow::{Context, Result, anyhow, bail};
     use mlx_rs::Array;
 
     use crate::kv_disk::{
-        ArrayRecord, LayerKindTag, LayerMeta, record_from_array, record_to_array,
+        ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record, turboquant_from_meta,
+        turboquant_meta,
     };
     use crate::native_cache::{
         NativeKvCacheQuantized, NativeLayerCache, NativePromptCache,
@@ -130,6 +130,7 @@ mod imp {
             self.is_deep
         }
 
+        #[allow(dead_code)] // tests only
         pub fn layer_count(&self) -> usize {
             self.layers.len()
         }
@@ -140,79 +141,69 @@ mod imp {
         /// subsequent in-place lazy-graph evaluations on the source could
         /// surface through the shared buffer.
         pub fn capture_shallow(cache: &NativePromptCache, position: usize) -> Result<Self> {
-            let layers = cache
-                .layers()
-                .iter()
-                .map(|l| -> Result<LayerSnapshot> {
-                    match l {
-                        NativeLayerCache::Full(c) => Ok(LayerSnapshot::Full {
-                            // Capture logical-length view, not the padded
-                            // buffer — restore path will refill via
-                            // update_and_fetch + grow on next step.
-                            keys: c.keys_view()?,
-                            values: c.values_view()?,
-                            offset: c.offset(),
-                        }),
-                        NativeLayerCache::Linear(c) => Ok(LayerSnapshot::Linear {
-                            slots: c.slots().to_vec(),
-                            offset: c.offset(),
-                            lengths: c.lengths().cloned(),
-                            left_padding: c.left_padding().cloned(),
-                        }),
-                        NativeLayerCache::FullTurboquant(c) => {
-                            Ok(LayerSnapshot::FullTurboquant(c.clone()))
-                        }
-                        NativeLayerCache::FullQuantized(c) => {
-                            Ok(LayerSnapshot::FullQuantized(c.clone()))
-                        }
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Self {
-                layers,
-                position,
-                is_deep: false,
-            })
+            Self::capture(cache, position, false)
         }
 
         /// Materializes independent Array buffers via `eval` + `deep_clone`.
         /// Required for fork-to-new-seq usage (Track A1 prefix cache).
         pub fn capture_deep(cache: &NativePromptCache, position: usize) -> Result<Self> {
+            Self::capture(cache, position, true)
+        }
+
+        fn capture(cache: &NativePromptCache, position: usize, deep: bool) -> Result<Self> {
+            // Deep: an independent buffer per array. Shallow: the array itself
+            // (a refcount bump).
+            let own = |a: Option<Array>| -> Result<Option<Array>> {
+                if deep {
+                    deep_clone_option(a.as_ref())
+                } else {
+                    Ok(a)
+                }
+            };
             let layers = cache
                 .layers()
                 .iter()
                 .map(|l| -> Result<LayerSnapshot> {
-                    match l {
-                        NativeLayerCache::Full(c) => Ok(LayerSnapshot::Full {
-                            keys: deep_clone_option(c.keys_view()?.as_ref())?,
-                            values: deep_clone_option(c.values_view()?.as_ref())?,
+                    Ok(match l {
+                        NativeLayerCache::Full(c) => LayerSnapshot::Full {
+                            // Capture logical-length view, not the padded
+                            // buffer — restore path will refill via
+                            // update_and_fetch + grow on next step.
+                            keys: own(c.keys_view()?)?,
+                            values: own(c.values_view()?)?,
                             offset: c.offset(),
-                        }),
-                        NativeLayerCache::Linear(c) => {
-                            let mut slots = Vec::with_capacity(c.slots().len());
-                            for slot in c.slots() {
-                                slots.push(deep_clone_option(slot.as_ref())?);
-                            }
-                            Ok(LayerSnapshot::Linear {
-                                slots,
-                                offset: c.offset(),
-                                lengths: deep_clone_option(c.lengths())?,
-                                left_padding: deep_clone_option(c.left_padding())?,
+                        },
+                        NativeLayerCache::Linear(c) => LayerSnapshot::Linear {
+                            slots: c
+                                .slots()
+                                .iter()
+                                .map(|slot| own(slot.clone()))
+                                .collect::<Result<Vec<_>>>()?,
+                            offset: c.offset(),
+                            lengths: own(c.lengths().cloned())?,
+                            left_padding: own(c.left_padding().cloned())?,
+                        },
+                        NativeLayerCache::FullTurboquant(c) => {
+                            LayerSnapshot::FullTurboquant(if deep {
+                                c.deep_clone()?
+                            } else {
+                                c.clone()
                             })
                         }
-                        NativeLayerCache::FullTurboquant(c) => {
-                            Ok(LayerSnapshot::FullTurboquant(c.deep_clone()?))
-                        }
                         NativeLayerCache::FullQuantized(c) => {
-                            Ok(LayerSnapshot::FullQuantized(deep_clone_quantized(c)?))
+                            LayerSnapshot::FullQuantized(if deep {
+                                deep_clone_quantized(c)?
+                            } else {
+                                c.clone()
+                            })
                         }
-                    }
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Self {
                 layers,
                 position,
-                is_deep: true,
+                is_deep: deep,
             })
         }
 
@@ -221,20 +212,7 @@ mod imp {
         /// the caller should release it after restore (single-shot semantics
         /// from `runner_native::restore_state`).
         pub fn restore_into(&self, cache: &mut NativePromptCache) -> Result<()> {
-            if cache.len() != self.layers.len() {
-                return Err(anyhow!(
-                    "PromptCacheSnapshot::restore_into: layer count mismatch (cache={}, snap={})",
-                    cache.len(),
-                    self.layers.len()
-                ));
-            }
-            for (i, snap) in self.layers.iter().enumerate() {
-                let layer = cache.layer_mut(i).ok_or_else(|| {
-                    anyhow!("PromptCacheSnapshot::restore_into: layer {i} missing")
-                })?;
-                apply_layer(layer, snap, /* fork = */ false, i)?;
-            }
-            Ok(())
+            self.apply_to(cache, /* fork = */ false, "restore_into")
         }
 
         /// Install this (deep) snapshot into a freshly-constructed cache.
@@ -250,18 +228,24 @@ mod imp {
             if !self.is_deep {
                 return self.restore_into(cache);
             }
+            self.apply_to(cache, /* fork = */ true, "install_into_fresh")
+        }
+
+        /// Write every layer's captured state into `cache` (see
+        /// [`apply_layer`]); `what` names the caller in errors.
+        fn apply_to(&self, cache: &mut NativePromptCache, fork: bool, what: &str) -> Result<()> {
             if cache.len() != self.layers.len() {
                 return Err(anyhow!(
-                    "PromptCacheSnapshot::install_into_fresh: layer count mismatch (cache={}, snap={})",
+                    "PromptCacheSnapshot::{what}: layer count mismatch (cache={}, snap={})",
                     cache.len(),
                     self.layers.len()
                 ));
             }
             for (i, snap) in self.layers.iter().enumerate() {
-                let layer = cache.layer_mut(i).ok_or_else(|| {
-                    anyhow!("PromptCacheSnapshot::install_into_fresh: layer {i} missing")
-                })?;
-                apply_layer(layer, snap, /* fork = */ true, i)?;
+                let layer = cache
+                    .layer_mut(i)
+                    .ok_or_else(|| anyhow!("PromptCacheSnapshot::{what}: layer {i} missing"))?;
+                apply_layer(layer, snap, fork, i)?;
             }
             Ok(())
         }
@@ -289,8 +273,8 @@ mod imp {
                         values,
                         offset,
                     } => {
-                        let keys_id = push_opt(&mut records, keys.as_ref())?;
-                        let values_id = push_opt(&mut records, values.as_ref())?;
+                        let keys_id = push_record(&mut records, keys.as_ref())?;
+                        let values_id = push_record(&mut records, values.as_ref())?;
                         let mut m = LayerMeta::new(LayerKindTag::Full, *offset);
                         m.arrays = vec![keys_id, values_id];
                         metas.push(m);
@@ -303,10 +287,10 @@ mod imp {
                     } => {
                         let mut arrays = Vec::with_capacity(slots.len());
                         for slot in slots {
-                            arrays.push(push_opt(&mut records, slot.as_ref())?);
+                            arrays.push(push_record(&mut records, slot.as_ref())?);
                         }
-                        let lengths_id = push_opt(&mut records, lengths.as_ref())?;
-                        let left_padding_id = push_opt(&mut records, left_padding.as_ref())?;
+                        let lengths_id = push_record(&mut records, lengths.as_ref())?;
+                        let left_padding_id = push_record(&mut records, left_padding.as_ref())?;
                         let mut m = LayerMeta::new(LayerKindTag::Linear, *offset);
                         m.arrays = arrays;
                         m.lengths_id = lengths_id;
@@ -314,27 +298,11 @@ mod imp {
                         metas.push(m);
                     }
                     LayerSnapshot::FullTurboquant(tq) => {
-                        // Compressed ring: [keys_codes, keys_sigma, values_codes,
-                        // values_sigma, keys_signs?, keys_residual_norm?]. codes
-                        // are uint8, sigma/residual_norm f32, signs bf16 — all
-                        // round-trip through ArrayRecord. Rotating bookkeeping
-                        // (max_size/keep/idx/bits/qjl_m) goes in LayerMeta.
-                        let arrays = vec![
-                            push_opt(&mut records, tq.keys_codes())?,
-                            push_opt(&mut records, tq.keys_sigma())?,
-                            push_opt(&mut records, tq.values_codes())?,
-                            push_opt(&mut records, tq.values_sigma())?,
-                            push_opt(&mut records, tq.keys_signs())?,
-                            push_opt(&mut records, tq.keys_residual_norm())?,
-                        ];
-                        let mut m = LayerMeta::new(LayerKindTag::FullTurboquant, tq.offset());
-                        m.arrays = arrays;
-                        m.max_size = Some(tq.max_size());
-                        m.keep = Some(tq.keep());
-                        m.idx = Some(tq.idx());
-                        m.bits = Some(tq.bits());
-                        m.qjl_m = tq.qjl_m();
-                        metas.push(m);
+                        metas.push(turboquant_meta(
+                            &mut records,
+                            tq,
+                            LayerKindTag::FullTurboquant,
+                        )?);
                     }
                     LayerSnapshot::FullQuantized(_) => bail!(
                         "to_records: affine-quantized full-attention KV \
@@ -355,19 +323,7 @@ mod imp {
             position: usize,
             is_deep: bool,
         ) -> Result<Self> {
-            let get = |id: Option<usize>| -> Result<Option<Array>> {
-                match id {
-                    None => Ok(None),
-                    Some(i) => {
-                        let rec = records.get(i).ok_or_else(|| {
-                            anyhow!(
-                                "PromptCacheSnapshot::from_records: record index {i} out of range"
-                            )
-                        })?;
-                        Ok(Some(record_to_array(rec)?))
-                    }
-                }
-            };
+            let get = |id: Option<usize>| array_at(records, id);
 
             let mut layers = Vec::with_capacity(metas.len());
             for m in metas {
@@ -408,36 +364,9 @@ mod imp {
                         );
                     }
                     LayerKindTag::FullTurboquant => {
-                        let max_size = m.max_size.ok_or_else(|| {
-                            anyhow!("from_records: FullTurboquant layer missing max_size")
-                        })?;
-                        let keep = m.keep.ok_or_else(|| {
-                            anyhow!("from_records: FullTurboquant layer missing keep")
-                        })?;
-                        let idx = m.idx.ok_or_else(|| {
-                            anyhow!("from_records: FullTurboquant layer missing idx")
-                        })?;
-                        let bits = m.bits.ok_or_else(|| {
-                            anyhow!("from_records: FullTurboquant layer missing bits")
-                        })?;
-                        let slot = |i: usize| -> Result<Option<Array>> {
-                            get(m.arrays.get(i).copied().flatten())
-                        };
-                        let tq = NativeRotatingKvCacheTurboQuant::from_parts(
-                            slot(0)?, // keys_codes
-                            slot(1)?, // keys_sigma
-                            slot(2)?, // values_codes
-                            slot(3)?, // values_sigma
-                            slot(4)?, // keys_signs
-                            slot(5)?, // keys_residual_norm
-                            m.offset,
-                            max_size,
-                            keep,
-                            idx,
-                            bits,
-                            m.qjl_m,
-                        );
-                        layers.push(LayerSnapshot::FullTurboquant(tq));
+                        layers.push(LayerSnapshot::FullTurboquant(turboquant_from_meta(
+                            m, records,
+                        )?));
                     }
                 }
             }
@@ -447,20 +376,6 @@ mod imp {
                 position,
                 is_deep,
             })
-        }
-    }
-
-    /// Read a present `Array` into the blob and return its index; `None` for an
-    /// absent Array.
-    fn push_opt(records: &mut Vec<ArrayRecord>, a: Option<&Array>) -> Result<Option<usize>> {
-        match a {
-            None => Ok(None),
-            Some(arr) => {
-                let rec = record_from_array(arr)?;
-                let id = records.len();
-                records.push(rec);
-                Ok(Some(id))
-            }
         }
     }
 

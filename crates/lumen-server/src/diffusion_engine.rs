@@ -62,17 +62,13 @@ impl DiffusionHandle {
 
     /// Generate a single image. Returns the PNG bytes or an error string.
     pub async fn generate(&self, params: GenerateParams) -> anyhow::Result<GeneratedImage> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(DiffusionRequest::Generate {
-                params,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("diffusion service channel closed"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("diffusion service dropped reply"))?
+        crate::engine::request_reply(
+            &self.tx,
+            |reply| DiffusionRequest::Generate { params, reply },
+            "diffusion service channel closed",
+            "diffusion service dropped reply",
+        )
+        .await?
     }
 }
 

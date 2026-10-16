@@ -32,7 +32,6 @@ pub enum OverallHealth {
     /// Returned by the frontend as the initial state before `doctor_run`
     /// completes. The Rust side never constructs this — present for the
     /// serde enum surface.
-    #[allow(dead_code)]
     Unknown,
 }
 

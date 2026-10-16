@@ -310,9 +310,9 @@ impl ModelBackend {
     }
 
     /// [`Self::chat`] with inline images (`images[i]` belongs to `messages[i]`).
-    /// Requires a vision-capable model (Gemma 4 or Qwen 3.6, with
-    /// `LUMEN_VISION=1`); the backend rejects the request rather than silently
-    /// answering without the image.
+    /// Empty `images` is [`Self::chat`] itself. An attached image requires a
+    /// vision-capable model (Gemma 4 or Qwen 3.6, with `LUMEN_VISION=1`); the
+    /// backend rejects the request rather than silently answering without it.
     #[allow(clippy::too_many_arguments)]
     fn chat_with_images(
         &mut self,
@@ -345,42 +345,10 @@ impl ModelBackend {
         }
     }
 
-    fn chat_streaming<F>(
-        &mut self,
-        messages: &[(String, String)],
-        max_new_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        ov: &SamplingOverrides,
-        thinking: bool,
-        session_id: Option<&str>,
-        tools: &[ToolDef<'_>],
-        tool_choice: &ResolvedToolChoice<'_>,
-        response_schema: Option<&serde_json::Value>,
-        on_event: F,
-    ) -> Result<ParsedResponse>
-    where
-        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
-    {
-        match self {
-            Self::Mlx(m) => m.chat_streaming(
-                messages,
-                max_new_tokens,
-                temperature,
-                top_p,
-                ov,
-                thinking,
-                session_id,
-                tools,
-                tool_choice,
-                response_schema,
-                on_event,
-            ),
-        }
-    }
-
-    /// [`Self::chat_from_history`] with images attached to `User` turns.
-    /// Only a vision-capable MLX backend (Gemma 4 or Qwen 3.6) can consume them.
+    /// Structured-history dispatch — used when the request contains
+    /// `assistant.tool_calls` or `role:"tool"` entries — with images attached
+    /// to `User` turns. Empty `images` is the text-only history path; only a
+    /// vision-capable MLX backend (Gemma 4 or Qwen 3.6) can consume them.
     #[allow(clippy::too_many_arguments)]
     fn chat_from_history_with_images(
         &mut self,
@@ -413,7 +381,7 @@ impl ModelBackend {
         }
     }
 
-    /// [`Self::chat_streaming_from_history`] with images on `User` turns.
+    /// Streaming [`Self::chat_from_history_with_images`].
     #[allow(clippy::too_many_arguments)]
     fn chat_streaming_from_history_with_images<F>(
         &mut self,
@@ -451,9 +419,9 @@ impl ModelBackend {
         }
     }
 
-    /// [`Self::chat_streaming`] with inline images. Only the MLX Gemma 4
-    /// backend can consume them; every other backend rejects the request
-    /// rather than streaming an answer that never saw the image.
+    /// Streaming [`Self::chat_with_images`]. Empty `images` is the text-only
+    /// path; a backend that cannot see images rejects the request rather than
+    /// streaming an answer that never saw the image.
     #[allow(clippy::too_many_arguments)]
     fn chat_streaming_with_images<F>(
         &mut self,
@@ -489,82 +457,6 @@ impl ModelBackend {
                 on_event,
             ),
         }
-    }
-}
-
-impl ModelBackend {
-    /// Structured-history dispatch — used when the request contains
-    /// `assistant.tool_calls` or `role:"tool"` entries. Only the Mlx
-    /// (Gemma 4) path gets the full structured renderer; legacy backends
-    /// (Candle Qwen / Gemma / GemmaGguf / Qwen35Moe) flatten the history
-    /// to plain `(role, content)` (dropping tool metadata) and call the
-    /// existing chat path. Tool turns are surfaced as user-role
-    /// `"[tool result] ..."` text so legacy paths don't reject them
-    /// outright — quality may suffer until each backend gains a real
-    /// tool-aware renderer.
-    fn chat_from_history(
-        &mut self,
-        turns: &[ChatTurn<'_>],
-        max_new_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        ov: &SamplingOverrides,
-        thinking: bool,
-        session_id: Option<&str>,
-        tools: &[ToolDef<'_>],
-        tool_choice: &ResolvedToolChoice<'_>,
-        response_schema: Option<&serde_json::Value>,
-    ) -> Result<ParsedResponse> {
-        let Self::Mlx(m) = self;
-        m.chat_from_history(
-            turns,
-            max_new_tokens,
-            temperature,
-            top_p,
-            ov,
-            thinking,
-            session_id,
-            tools,
-            tool_choice,
-            response_schema,
-        )
-    }
-
-    /// Phase 1.5: streaming variant of `chat_from_history`. Mlx path
-    /// (Gemma 4) routes through the structured renderer; legacy
-    /// backends flatten + delegate to `chat_streaming` so the request
-    /// doesn't error out.
-    fn chat_streaming_from_history<F>(
-        &mut self,
-        turns: &[ChatTurn<'_>],
-        max_new_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        ov: &SamplingOverrides,
-        thinking: bool,
-        session_id: Option<&str>,
-        tools: &[ToolDef<'_>],
-        tool_choice: &ResolvedToolChoice<'_>,
-        response_schema: Option<&serde_json::Value>,
-        on_event: F,
-    ) -> Result<ParsedResponse>
-    where
-        F: FnMut(BackendStreamEvent<'_>) -> Result<()>,
-    {
-        let Self::Mlx(m) = self;
-        m.chat_streaming_from_history(
-            turns,
-            max_new_tokens,
-            temperature,
-            top_p,
-            ov,
-            thinking,
-            session_id,
-            tools,
-            tool_choice,
-            response_schema,
-            on_event,
-        )
     }
 }
 
@@ -795,37 +687,9 @@ impl InferenceEngine {
             // `turns` is 1:1 with `req.messages` and the turn strip applies the
             // same predicate as the flat one, so the surviving turns line up
             // with `images` — which is already indexed by the survivors.
-            match images.as_deref() {
-                Some(imgs) => self.backend.chat_from_history_with_images(
-                    turns,
-                    imgs,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking_on,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    req.response_json_schema().as_ref(),
-                )?,
-                None => self.backend.chat_from_history(
-                    turns,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking_on,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    req.response_json_schema().as_ref(),
-                )?,
-            }
-        } else if let Some(images) = images.as_deref() {
-            self.backend.chat_with_images(
-                &messages,
-                images,
+            self.backend.chat_from_history_with_images(
+                turns,
+                images.as_deref().unwrap_or_default(),
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
@@ -837,8 +701,9 @@ impl InferenceEngine {
                 req.response_json_schema().as_ref(),
             )?
         } else {
-            self.backend.chat(
+            self.backend.chat_with_images(
                 &messages,
+                images.as_deref().unwrap_or_default(),
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
@@ -1285,39 +1150,20 @@ impl InferenceEngine {
                 false,
             ) + image_tokens;
             guard_prompt_fits(&self.backend, prompt_tokens)?;
-            if turn_images.iter().any(|v| !v.is_empty()) {
-                self.backend.chat_from_history_with_images(
-                    &turns,
-                    &turn_images,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    None,
-                )?
-            } else {
-                self.backend.chat_from_history(
-                    &turns,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    // Anthropic /v1/messages has no `response_format`.
-                    None,
-                )?
-            }
+            self.backend.chat_from_history_with_images(
+                &turns,
+                &turn_images,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                // Anthropic /v1/messages has no `response_format`.
+                None,
+            )?
         } else {
             prompt_tokens = self.backend.count_chat_prompt_tokens(
                 &messages,
@@ -1328,40 +1174,21 @@ impl InferenceEngine {
                 false,
             ) + image_tokens;
             guard_prompt_fits(&self.backend, prompt_tokens)?;
-            if let Some(images) = images.as_deref() {
-                self.backend.chat_with_images(
-                    &messages,
-                    images,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    None,
-                )?
-            } else {
-                // Plain path — uses the flat messages built above. Matches
-                // the pre-Phase-1.4 behavior bit-for-bit.
-                self.backend.chat(
-                    &messages,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    None,
-                )?
-            }
+            // With no image attached this is the plain text path over the
+            // flat messages built above.
+            self.backend.chat_with_images(
+                &messages,
+                images.as_deref().unwrap_or_default(),
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                None,
+            )?
         };
 
         // Bug A: resolve abbreviated tool names by unique suffix match.
@@ -1633,38 +1460,21 @@ impl InferenceEngine {
             };
             let thinking =
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-            match images.as_deref() {
-                Some(imgs) => self.backend.chat_streaming_from_history_with_images(
-                    turns,
-                    imgs,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    response_schema.as_ref(),
-                    on_event,
-                ),
-                None => self.backend.chat_streaming_from_history(
-                    turns,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    response_schema.as_ref(),
-                    on_event,
-                ),
-            }
+            self.backend.chat_streaming_from_history_with_images(
+                turns,
+                images.as_deref().unwrap_or_default(),
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                response_schema.as_ref(),
+                on_event,
+            )
         } else {
-            // Bound first so both the text and the image dispatch below can
-            // take it — only one of them runs.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
                     BackendStreamEvent::Text(t) => {
@@ -1718,35 +1528,20 @@ impl InferenceEngine {
             };
             let thinking =
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-            match images.as_ref() {
-                Some(imgs) => self.backend.chat_streaming_with_images(
-                    &messages,
-                    imgs,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    response_schema.as_ref(),
-                    on_event,
-                ),
-                None => self.backend.chat_streaming(
-                    &messages,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    response_schema.as_ref(),
-                    on_event,
-                ),
-            }
+            self.backend.chat_streaming_with_images(
+                &messages,
+                images.as_deref().unwrap_or_default(),
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                response_schema.as_ref(),
+                on_event,
+            )
         };
 
         match result {
@@ -2136,41 +1931,21 @@ impl InferenceEngine {
                 }
                 Ok(())
             };
-            if turn_images.iter().any(|v| !v.is_empty()) {
-                self.backend.chat_streaming_from_history_with_images(
-                    &turns,
-                    &turn_images,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    None,
-                    on_event,
-                )
-            } else {
-                self.backend.chat_streaming_from_history(
-                    &turns,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    req.enable_thinking_with_backend_default(
-                        self.backend.is_reasoning_first_family(),
-                    ),
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    // Anthropic Messages API has no `response_format` field.
-                    None,
-                    on_event,
-                )
-            }
+            self.backend.chat_streaming_from_history_with_images(
+                &turns,
+                &turn_images,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family()),
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                // Anthropic Messages API has no `response_format` field.
+                None,
+                on_event,
+            )
         } else {
             prompt_tokens = self.backend.count_chat_prompt_tokens(
                 &messages,
@@ -2183,7 +1958,6 @@ impl InferenceEngine {
             if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
                 return;
             }
-            // Bound first so both dispatches below can take it — only one runs.
             let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
                 match ev {
                     BackendStreamEvent::Text(t) => {
@@ -2205,36 +1979,21 @@ impl InferenceEngine {
             };
             let thinking =
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
-            match images.as_deref() {
-                Some(imgs) => self.backend.chat_streaming_with_images(
-                    &messages,
-                    imgs,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    // Anthropic Messages API has no `response_format` field.
-                    None,
-                    on_event,
-                ),
-                None => self.backend.chat_streaming(
-                    &messages,
-                    req.max_tokens,
-                    req.temperature,
-                    req.top_p,
-                    &ov,
-                    thinking,
-                    req.session_id.as_deref(),
-                    &tools_owned,
-                    &tool_choice,
-                    None,
-                    on_event,
-                ),
-            }
+            self.backend.chat_streaming_with_images(
+                &messages,
+                images.as_deref().unwrap_or_default(),
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                &ov,
+                thinking,
+                req.session_id.as_deref(),
+                &tools_owned,
+                &tool_choice,
+                // Anthropic Messages API has no `response_format` field.
+                None,
+                on_event,
+            )
         };
 
         match result {
@@ -3270,49 +3029,36 @@ impl EngineHandle {
         &self.load_stats
     }
 
+    /// [`request_reply`] to the engine thread.
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> EngineRequest,
+    ) -> Result<T> {
+        request_reply(
+            &self.tx,
+            make,
+            "engine channel closed",
+            "engine dropped reply",
+        )
+        .await
+    }
+
     pub async fn chat_completion(
         &self,
         req: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(EngineRequest::ChatCompletion {
-                req,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("engine channel closed"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine dropped reply"))?
+        self.request(|reply| EngineRequest::ChatCompletion { req, reply })
+            .await?
     }
 
     pub async fn completion(&self, req: CompletionRequest) -> Result<CompletionResponse> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(EngineRequest::Completion {
-                req,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("engine channel closed"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine dropped reply"))?
+        self.request(|reply| EngineRequest::Completion { req, reply })
+            .await?
     }
 
     pub async fn anthropic_messages(&self, req: AnthropicRequest) -> Result<AnthropicResponse> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(EngineRequest::AnthropicMessages {
-                req,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("engine channel closed"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine dropped reply"))?
+        self.request(|reply| EngineRequest::AnthropicMessages { req, reply })
+            .await?
     }
 
     pub async fn chat_completion_streaming(
@@ -3340,61 +3086,50 @@ impl EngineHandle {
     }
 
     pub async fn list_models(&self) -> ModelListResponse {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .tx
-            .send(EngineRequest::ListModels { reply: reply_tx })
-            .await;
-        reply_rx.await.unwrap_or_else(|_| ModelListResponse {
-            object: "list".into(),
-            data: vec![],
-        })
+        self.request(|reply| EngineRequest::ListModels { reply })
+            .await
+            .unwrap_or_else(|_| ModelListResponse {
+                object: "list".into(),
+                data: vec![],
+            })
     }
 
     pub async fn drop_session(&self, session_id: String) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(EngineRequest::DropSession {
-                session_id,
-                reply: reply_tx,
-            })
+        self.request(|reply| EngineRequest::DropSession { session_id, reply })
             .await
-            .is_err()
-        {
-            return false;
-        }
-        reply_rx.await.unwrap_or(false)
+            .unwrap_or(false)
     }
 
     pub async fn drop_prefix_cache(&self, key: String) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(EngineRequest::DropPrefixCache {
-                key,
-                reply: reply_tx,
-            })
+        self.request(|reply| EngineRequest::DropPrefixCache { key, reply })
             .await
-            .is_err()
-        {
-            return false;
-        }
-        reply_rx.await.unwrap_or(false)
+            .unwrap_or(false)
     }
 
     pub async fn clear_prefix_cache(&self) -> usize {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(EngineRequest::ClearPrefixCache { reply: reply_tx })
+        self.request(|reply| EngineRequest::ClearPrefixCache { reply })
             .await
-            .is_err()
-        {
-            return 0;
-        }
-        reply_rx.await.unwrap_or(0)
+            .unwrap_or(0)
     }
+}
+
+/// Send `make(reply)` to a channel actor and wait for its reply.
+///
+/// `closed` and `dropped` are the caller's wording for the two ways the actor
+/// can be gone: before it took the request, and after it took it without
+/// answering. The engine, the embedding service and the diffusion worker each
+/// name themselves in them.
+pub(crate) async fn request_reply<R, T>(
+    tx: &mpsc::Sender<R>,
+    make: impl FnOnce(oneshot::Sender<T>) -> R,
+    closed: &'static str,
+    dropped: &'static str,
+) -> Result<T> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(make(reply_tx))
+        .await
+        .map_err(|_| anyhow::anyhow!(closed))?;
+    reply_rx.await.map_err(|_| anyhow::anyhow!(dropped))
 }
 
 /// Resolve an MLX multi-request feature flag. An explicit per-feature env var

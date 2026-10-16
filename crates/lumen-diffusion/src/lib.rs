@@ -65,3 +65,11 @@ pub mod pipeline;
 
 #[cfg(feature = "mlx-native")]
 pub mod dev_pipeline;
+
+#[cfg(all(test, feature = "mlx-native"))]
+mod test_util;
+
+// The safetensors reader. Its parsing needs no MLX, so its tests run in the
+// featureless build too.
+#[cfg(any(test, feature = "mlx-native"))]
+mod weights;

@@ -310,7 +310,7 @@ trained on that sentence.
 | `LUMEN_EMBEDDING_BATCH_ROWS=1` | off | Force naive 8-bit GEMM (embedding path) |
 | `LUMEN_GEMMA4_CUSTOM_FLASH_ATTN=0` | on | Disable custom flash-attn primitive |
 | `LUMEN_GEMMA4_PREFILL_SYNC=0` | on | Skip explicit eval-sync after prefill |
-| `LUMEN_MLX_BACKEND=native\|pyo3\|subprocess` | **native** | Picks the mlx runner. `native` is the Apple-silicon-optimized mlx-rs path |
+| `LUMEN_MLX_BACKEND=native` | **native** | The mlx-rs runner, the only one. `mlx-native` is accepted too; the removed `pyo3` / `subprocess` runners are refused |
 
 **The Qwen 3.6 fusion opt-outs that used to be listed here are gone**, and were
 gone from the code long before they were removed from this table: seven

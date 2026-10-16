@@ -330,32 +330,9 @@ pub use imp::quantized_sdpa_decode;
 #[cfg(all(test, feature = "mlx-native"))]
 mod tests {
     use super::imp::quantized_sdpa_decode;
+    use crate::test_support::{agreement, bf16_normal_std};
+    use mlx_rs::Array;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    use mlx_rs::{Array, Dtype, random};
-
-    fn normal(shape: &[i32], std_dev: f32, seed: u64) -> Array {
-        let key = random::key(seed).unwrap();
-        random::normal::<f32>(shape, None, Some(std_dev), &key)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap()
-    }
-
-    fn cosine(a: &Array, b: &Array) -> f64 {
-        let flat = |x: &Array| {
-            let x = x.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
-            x.eval().unwrap();
-            x.as_slice::<f32>().to_vec()
-        };
-        let (a, b) = (flat(a), flat(b));
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (&x, &y) in a.iter().zip(&b) {
-            dot += x as f64 * y as f64;
-            na += x as f64 * x as f64;
-            nb += y as f64 * y as f64;
-        }
-        dot / (na.sqrt() * nb.sqrt())
-    }
 
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
@@ -374,10 +351,10 @@ mod tests {
         for bits in [8, 4] {
             for (i, &(h, h_kv, d, n)) in cases.iter().enumerate() {
                 let seed = 0xf5ed + 100 * i as u64 + bits as u64;
-                let q = normal(&[1, h, 1, d], 1.0 / (d as f32).sqrt(), seed);
+                let q = bf16_normal_std(&[1, h, 1, d], 1.0 / (d as f32).sqrt(), seed);
                 // A view into a longer buffer, as the cache hands it out.
                 let quantize = |s: u64| {
-                    let buf = normal(&[1, h_kv, n + 256, d], 1.0, s);
+                    let buf = bf16_normal_std(&[1, h_kv, n + 256, d], 1.0, s);
                     let (w, sc, bi) = mlx_rs::ops::quantize(&buf, GROUP_SIZE, bits).unwrap();
                     let cut = |a: Array| a.index((Ellipsis, 0..n, ..));
                     (cut(w), cut(sc), cut(bi))
@@ -397,7 +374,7 @@ mod tests {
                 .unwrap();
                 let got = quantized_sdpa_decode(&q, &k, &v, GROUP_SIZE, bits).expect("kernel");
                 assert_eq!(got.shape(), want.shape());
-                let cos = cosine(&got, &want);
+                let (cos, _) = agreement(&got, &want);
                 eprintln!("[quantized-sdpa] bits={bits} h={h}/{h_kv} d={d} n={n} cos={cos:.6}");
                 if cos < 0.9999 {
                     failures.push(format!(
@@ -412,13 +389,13 @@ mod tests {
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn fused_quantized_decode_rejects_layouts_it_cannot_read() {
-        let q = normal(&[1, 16, 1, 128], 1.0, 1);
-        let buf = normal(&[1, 2, 64, 128], 1.0, 2);
+        let q = bf16_normal_std(&[1, 16, 1, 128], 1.0, 1);
+        let buf = bf16_normal_std(&[1, 2, 64, 128], 1.0, 2);
         let t = mlx_rs::ops::quantize(&buf, 64, 4).unwrap();
         // 4 elements per lane at 4 bits is half a packed word.
         assert!(quantized_sdpa_decode(&q, &t, &t, 64, 4).is_err());
-        let q2 = normal(&[1, 16, 2, 256], 1.0, 3);
-        let buf2 = normal(&[1, 2, 64, 256], 1.0, 4);
+        let q2 = bf16_normal_std(&[1, 16, 2, 256], 1.0, 3);
+        let buf2 = bf16_normal_std(&[1, 2, 64, 256], 1.0, 4);
         let t2 = mlx_rs::ops::quantize(&buf2, 64, 8).unwrap();
         assert!(
             quantized_sdpa_decode(&q2, &t2, &t2, 64, 8).is_err(),

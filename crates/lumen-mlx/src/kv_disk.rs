@@ -737,6 +737,7 @@ fn now_unix() -> u64 {
 #[cfg(feature = "mlx-native")]
 mod mlx_conv {
     use super::*;
+    use crate::native_cache::NativeRotatingKvCacheTurboQuant;
     use mlx_rs::{Array, Dtype};
 
     impl DtypeTag {
@@ -907,10 +908,103 @@ mod mlx_conv {
         arr.eval().context("kv_disk: eval reconstructed array")?;
         Ok(arr)
     }
+
+    /// Append a present `Array` to the record blob and return its index;
+    /// `None` for an absent one.
+    pub fn push_record(records: &mut Vec<ArrayRecord>, a: Option<&Array>) -> Result<Option<usize>> {
+        match a {
+            None => Ok(None),
+            Some(arr) => {
+                let rec = record_from_array(arr)?;
+                let id = records.len();
+                records.push(rec);
+                Ok(Some(id))
+            }
+        }
+    }
+
+    /// Rebuild the `Array` that record `id` holds; `None` for an absent slot.
+    pub fn array_at(records: &[ArrayRecord], id: Option<usize>) -> Result<Option<Array>> {
+        match id {
+            None => Ok(None),
+            Some(i) => {
+                let rec = records
+                    .get(i)
+                    .ok_or_else(|| anyhow!("kv_disk: record index {i} out of range"))?;
+                Ok(Some(record_to_array(rec)?))
+            }
+        }
+    }
+
+    /// Persist a TurboQuant rotating cache (Qwen's full-attention layers,
+    /// Gemma 4's full and sliding ones): its arrays in the fixed order
+    /// `[keys_codes, keys_sigma, values_codes, values_sigma, keys_signs?,
+    /// keys_residual_norm?]` — uint8 codes, f32 sigma / residual norm, bf16
+    /// signs — and the ring bookkeeping in the returned `LayerMeta`.
+    pub fn turboquant_meta(
+        records: &mut Vec<ArrayRecord>,
+        c: &NativeRotatingKvCacheTurboQuant,
+        kind: LayerKindTag,
+    ) -> Result<LayerMeta> {
+        let arrays = vec![
+            push_record(records, c.keys_codes())?,
+            push_record(records, c.keys_sigma())?,
+            push_record(records, c.values_codes())?,
+            push_record(records, c.values_sigma())?,
+            push_record(records, c.keys_signs())?,
+            push_record(records, c.keys_residual_norm())?,
+        ];
+        let mut m = LayerMeta::new(kind, c.offset());
+        m.arrays = arrays;
+        m.max_size = Some(c.max_size());
+        m.keep = Some(c.keep());
+        m.idx = Some(c.idx());
+        m.bits = Some(c.bits());
+        m.qjl_m = c.qjl_m();
+        Ok(m)
+    }
+
+    /// Inverse of [`turboquant_meta`].
+    pub fn turboquant_from_meta(
+        m: &LayerMeta,
+        records: &[ArrayRecord],
+    ) -> Result<NativeRotatingKvCacheTurboQuant> {
+        let kind = m.kind;
+        let max_size = m
+            .max_size
+            .ok_or_else(|| anyhow!("kv_disk: {kind:?} layer missing max_size"))?;
+        let keep = m
+            .keep
+            .ok_or_else(|| anyhow!("kv_disk: {kind:?} layer missing keep"))?;
+        let idx = m
+            .idx
+            .ok_or_else(|| anyhow!("kv_disk: {kind:?} layer missing idx"))?;
+        let bits = m
+            .bits
+            .ok_or_else(|| anyhow!("kv_disk: {kind:?} layer missing bits"))?;
+        let slot = |i: usize| array_at(records, m.arrays.get(i).copied().flatten());
+        Ok(NativeRotatingKvCacheTurboQuant::from_parts(
+            slot(0)?, // keys_codes
+            slot(1)?, // keys_sigma
+            slot(2)?, // values_codes
+            slot(3)?, // values_sigma
+            slot(4)?, // keys_signs
+            slot(5)?, // keys_residual_norm
+            m.offset,
+            max_size,
+            keep,
+            idx,
+            bits,
+            m.qjl_m,
+        ))
+    }
 }
 
 #[cfg(feature = "mlx-native")]
-pub use mlx_conv::{record_from_array, record_to_array};
+pub use mlx_conv::{
+    array_at, push_record, record_from_array, record_to_array, turboquant_from_meta,
+    turboquant_meta,
+};
 
 // ---------------------------------------------------------------------------
 // Tests

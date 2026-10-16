@@ -1,6 +1,7 @@
-use atomic_http::external::http::{Request, Response, StatusCode};
+use atomic_http::external::http::{Request, Response};
 use atomic_http::*;
 
+use super::respond;
 use crate::engine::EngineHandle;
 
 /// `GET /v1/loads` — pure-JSON serving stats snapshot (WS-F #2).
@@ -11,12 +12,9 @@ use crate::engine::EngineHandle;
 /// this stays cheap and never queues behind an in-flight generation.
 pub async fn handle(
     _request: Request<ArenaBody>,
-    mut response: Response<ArenaWriter>,
+    response: Response<ArenaWriter>,
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
     let snapshot = handle.load_stats().snapshot();
-    response.body_mut().set_arena_json(&snapshot)?;
-    *response.status_mut() = StatusCode::from_u16(200)?;
-    response.responser_arena().await?;
-    Ok(())
+    respond(response, 200, &snapshot).await
 }

@@ -635,196 +635,14 @@ pub(crate) use imp::{
     sparse_keep_pages,
 };
 
-// SDPA bit-identical vs MLX reference.
+// The causal-mask builders and split attention, checked against what a mask
+// means and against plain SDPA — no fixture files.
 //
-// Fixtures produced by `scripts/generate_sdpa_fixture.py` (magic `TQSA`).
-//
-// `#[ignore]`'d — MLX FFI requires non-sandbox host with Metal device.
+// `#[ignore]`'d tests need a non-sandbox host with a Metal device.
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::sdpa;
     use mlx_rs::Array;
-    use std::path::{Path, PathBuf};
-
-    const MAGIC: &[u8; 4] = b"TQSA";
-    const HEADER_LEN: usize = 4 /* magic */ + 8 * 4 /* 8 u32 */;
-
-    fn fixture_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("lumen-mlx manifest dir has a parent (crates/)")
-            .join("lumen-metal")
-            .join("tests")
-            .join("fixtures")
-    }
-
-    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-    }
-    fn slice_f32(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    struct SdpaFixture {
-        batch: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        q_seq: usize,
-        kv_seq: usize,
-        head_dim: usize,
-        causal: bool,
-        scale: f32,
-        q: Vec<f32>,
-        k: Vec<f32>,
-        v: Vec<f32>,
-        expected_y: Vec<f32>,
-    }
-
-    fn load_fixture(name: &str) -> Option<SdpaFixture> {
-        let path = fixture_dir().join(format!("embed_sdpa_{name}.bin"));
-        let bytes = std::fs::read(&path).ok()?;
-        if bytes.len() < HEADER_LEN || &bytes[..4] != MAGIC {
-            panic!("sdpa fixture {path:?} has bad header");
-        }
-        let batch = read_u32_le(&bytes, 4) as usize;
-        let n_heads = read_u32_le(&bytes, 8) as usize;
-        let n_kv_heads = read_u32_le(&bytes, 12) as usize;
-        let q_seq = read_u32_le(&bytes, 16) as usize;
-        let kv_seq = read_u32_le(&bytes, 20) as usize;
-        let head_dim = read_u32_le(&bytes, 24) as usize;
-        let causal = read_u32_le(&bytes, 28) != 0;
-        let scale = f32::from_bits(read_u32_le(&bytes, 32));
-
-        let q_count = batch * n_heads * q_seq * head_dim;
-        let kv_count = batch * n_kv_heads * kv_seq * head_dim;
-        let mut cur = HEADER_LEN;
-        let q = slice_f32(&bytes[cur..cur + q_count * 4]);
-        cur += q_count * 4;
-        let k = slice_f32(&bytes[cur..cur + kv_count * 4]);
-        cur += kv_count * 4;
-        let v = slice_f32(&bytes[cur..cur + kv_count * 4]);
-        cur += kv_count * 4;
-        let expected_y = slice_f32(&bytes[cur..cur + q_count * 4]);
-
-        Some(SdpaFixture {
-            batch,
-            n_heads,
-            n_kv_heads,
-            q_seq,
-            kv_seq,
-            head_dim,
-            causal,
-            scale,
-            q,
-            k,
-            v,
-            expected_y,
-        })
-    }
-
-    fn run_fixture(name: &str) {
-        let Some(fx) = load_fixture(name) else {
-            eprintln!(
-                "SKIP sdpa/{name}: fixture missing under {}. Run `python scripts/generate_sdpa_fixture.py` first.",
-                fixture_dir().display()
-            );
-            return;
-        };
-
-        let q = Array::from_slice(
-            &fx.q,
-            &[
-                fx.batch as i32,
-                fx.n_heads as i32,
-                fx.q_seq as i32,
-                fx.head_dim as i32,
-            ],
-        );
-        let k = Array::from_slice(
-            &fx.k,
-            &[
-                fx.batch as i32,
-                fx.n_kv_heads as i32,
-                fx.kv_seq as i32,
-                fx.head_dim as i32,
-            ],
-        );
-        let v = Array::from_slice(
-            &fx.v,
-            &[
-                fx.batch as i32,
-                fx.n_kv_heads as i32,
-                fx.kv_seq as i32,
-                fx.head_dim as i32,
-            ],
-        );
-
-        let out = sdpa(&q, &k, &v, fx.scale, fx.causal).expect("mlx-rs SDPA FFI must succeed");
-        assert_eq!(
-            out.shape(),
-            &[
-                fx.batch as i32,
-                fx.n_heads as i32,
-                fx.q_seq as i32,
-                fx.head_dim as i32,
-            ],
-            "{name}: sdpa output shape mismatch"
-        );
-        assert_eq!(
-            out.dtype(),
-            mlx_rs::Dtype::Float32,
-            "{name}: sdpa output dtype unexpectedly changed"
-        );
-        out.eval().expect("mlx eval must succeed");
-
-        let observed: &[f32] = out.as_slice();
-        assert_eq!(
-            observed.len(),
-            fx.expected_y.len(),
-            "{name}: sdpa output flat-size mismatch"
-        );
-
-        let mut mismatches = 0usize;
-        for (i, (&got, &expected)) in observed.iter().zip(fx.expected_y.iter()).enumerate() {
-            if got.to_bits() != expected.to_bits() {
-                if mismatches < 5 {
-                    eprintln!(
-                        "sdpa/{name}[{i}]: 0x{:08x} ({got}) vs ref 0x{:08x} ({expected})",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches,
-            0,
-            "{name}: {mismatches}/{} elements diverged from MLX reference",
-            observed.len()
-        );
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn prefill_causal_sdpa_matches_mlx() {
-        run_fixture("prefill_causal");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn decode_q1_sdpa_matches_mlx() {
-        run_fixture("decode_q1");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn gqa_prefill_sdpa_matches_mlx() {
-        run_fixture("gqa_prefill");
-    }
 
     // ───────────────────── build_causal_mask (Gemma 4 sliding) ─────────────────────
 
@@ -1052,34 +870,7 @@ mod parity_tests {
 #[cfg(all(test, feature = "mlx-native"))]
 mod windowed_kernel_tests {
     use super::imp::{build_causal_mask_abs, sdpa, sdpa_with_mask};
-    use mlx_rs::{Array, Dtype, random};
-
-    /// Cosine over every element, and the largest absolute difference.
-    /// Flattened first: an attention output can be a strided view, and
-    /// `as_slice` reads memory order.
-    pub(super) fn agreement(a: &Array, b: &Array) -> (f64, f32) {
-        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
-        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
-        a.eval().unwrap();
-        b.eval().unwrap();
-        let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-        let (mut dot, mut na, mut nb, mut worst) = (0f64, 0f64, 0f64, 0f32);
-        for (&x, &y) in a.iter().zip(b) {
-            dot += x as f64 * y as f64;
-            na += x as f64 * x as f64;
-            nb += y as f64 * y as f64;
-            worst = worst.max((x - y).abs());
-        }
-        (dot / (na.sqrt() * nb.sqrt()), worst)
-    }
-
-    fn normal(shape: &[i32], seed: u64) -> Array {
-        let key = random::key(seed).unwrap();
-        random::normal::<f32>(shape, None, None, &key)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap()
-    }
+    use crate::test_support::{agreement, bf16_normal};
 
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
@@ -1109,9 +900,9 @@ mod windowed_kernel_tests {
         let mut failures = Vec::new();
         for (i, &(q_len, k_len)) in shapes.iter().enumerate() {
             let seed = 1000 * i as u64;
-            let q = normal(&[1, 16, q_len as i32, 256], seed);
-            let k = normal(&[1, 8, k_len as i32, 256], seed + 1);
-            let v = normal(&[1, 8, k_len as i32, 256], seed + 2);
+            let q = bf16_normal(&[1, 16, q_len as i32, 256], seed);
+            let k = bf16_normal(&[1, 8, k_len as i32, 256], seed + 1);
+            let v = bf16_normal(&[1, 8, k_len as i32, 256], seed + 2);
             let scale = 1.0 / 16.0;
             let kernel =
                 mlx_rs::metal::lumen_sdpa_windowed(&q, &k, &v, scale, WINDOW as i32, &stream)
@@ -1160,9 +951,9 @@ mod windowed_kernel_tests {
             let seed = 7000 + 1000 * i as u64;
             // head_dim 128: without a window the steel kernel serves 64/80/128
             // only (256 falls back to the unfused path, which is not under test).
-            let q = normal(&[1, 16, q_len as i32, 128], seed);
-            let k = normal(&[1, 8, k_len as i32, 128], seed + 1);
-            let v = normal(&[1, 8, k_len as i32, 128], seed + 2);
+            let q = bf16_normal(&[1, 16, q_len as i32, 128], seed);
+            let k = bf16_normal(&[1, 8, k_len as i32, 128], seed + 1);
+            let v = bf16_normal(&[1, 8, k_len as i32, 128], seed + 2);
             let scale = 1.0 / (128f32).sqrt();
             let kernel = sdpa(&q, &k, &v, scale, true).expect("causal kernel");
             let mask = build_causal_mask_abs(k_len - q_len, q_len, 0, k_len, None)
@@ -1196,19 +987,11 @@ mod quantized_kv_attention_tests {
         QuantizedTriple, build_causal_mask_abs, build_causal_mask_legacy_bf16,
         quantized_kv_attention, sdpa, sdpa_with_mask,
     };
-    use super::windowed_kernel_tests::agreement;
-    use mlx_rs::{Array, Dtype, random};
+    use crate::test_support::{agreement, bf16_normal_std};
+    use mlx_rs::{Array, Dtype};
 
     const GROUP_SIZE: i32 = 64;
     const BITS: i32 = 8;
-
-    fn normal(shape: &[i32], std_dev: f32, seed: u64) -> Array {
-        let key = random::key(seed).unwrap();
-        random::normal::<f32>(shape, None, Some(std_dev), &key)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap()
-    }
 
     fn quantize(x: &Array) -> QuantizedTriple {
         mlx_rs::ops::quantize(x, GROUP_SIZE, BITS).expect("quantize")
@@ -1233,9 +1016,9 @@ mod quantized_kv_attention_tests {
         for (i, &(h, h_kv, d, q_len, k_len, window)) in cases.iter().enumerate() {
             let seed = 9000 + 1000 * i as u64;
             // Gemma 4's softmax scale is 1.0, so the queries arrive scaled.
-            let q = normal(&[1, h, q_len, d], 1.0 / (d as f32).sqrt(), seed);
-            let k = quantize(&normal(&[1, h_kv, k_len, d], 1.0, seed + 1));
-            let v = quantize(&normal(&[1, h_kv, k_len, d], 1.0, seed + 2));
+            let q = bf16_normal_std(&[1, h, q_len, d], 1.0 / (d as f32).sqrt(), seed);
+            let k = quantize(&bf16_normal_std(&[1, h_kv, k_len, d], 1.0, seed + 1));
+            let v = quantize(&bf16_normal_std(&[1, h_kv, k_len, d], 1.0, seed + 2));
             let (k_ref, v_ref) = (dequantize(&k), dequantize(&v));
             let masks = if q_len > 1 {
                 let (q_len, k_len) = (q_len as usize, k_len as usize);
@@ -1290,18 +1073,10 @@ mod quantized_kv_attention_tests {
 #[cfg(all(test, feature = "mlx-native"))]
 mod page_sparse_tests {
     use super::imp::{sdpa, sdpa_page_sparse};
-    use super::windowed_kernel_tests::agreement;
     use crate::native_cache::{DIGEST_PAGE, NativeKvCache};
+    use crate::test_support::{agreement, bf16_normal_std};
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    use mlx_rs::{Array, Dtype, random};
-
-    fn normal(shape: &[i32], std_dev: f32, seed: u64) -> Array {
-        let key = random::key(seed).unwrap();
-        random::normal::<f32>(shape, None, Some(std_dev), &key)
-            .unwrap()
-            .as_dtype(Dtype::Bfloat16)
-            .unwrap()
-    }
+    use mlx_rs::{Array, Dtype};
 
     /// Keeping every page is dense attention, and a page the query points at
     /// is found wherever it sits.
@@ -1310,10 +1085,10 @@ mod page_sparse_tests {
     fn page_sparse_finds_the_page_the_query_points_at() {
         let (h, h_kv, d, n) = (16, 2, 256, 20_000 + 37);
         let scale = 1.0 / (d as f32).sqrt();
-        let q = normal(&[1, h, 1, d], 1.0, 1);
+        let q = bf16_normal_std(&[1, h, 1, d], 1.0, 1);
         // Background keys score near zero; one page, deep in the past, is the
         // query itself scaled up, so it should carry most of the attention.
-        let background = normal(&[1, h_kv, n, d], 0.2, 2);
+        let background = bf16_normal_std(&[1, h_kv, n, d], 0.2, 2);
         let target_page = 40i32;
         let page = DIGEST_PAGE as i32;
         let q_kv = mlx_rs::ops::reshape(&q, &[1, h_kv, h / h_kv, d])
@@ -1335,7 +1110,7 @@ mod page_sparse_tests {
             2,
         )
         .unwrap();
-        let values = normal(&[1, h_kv, n, d], 1.0, 3);
+        let values = bf16_normal_std(&[1, h_kv, n, d], 1.0, 3);
         let mut cache = NativeKvCache::new();
         let (k, v) = cache.update_and_fetch(&keys, &values).unwrap();
         let digest = cache.page_digest().unwrap().expect("digest");
@@ -1373,21 +1148,16 @@ mod page_sparse_tests {
 #[cfg(all(test, feature = "mlx-native"))]
 mod d512_decode_tests {
     use super::imp::sdpa;
-    use super::windowed_kernel_tests::agreement;
-    use mlx_rs::{Array, Dtype, random};
+    use crate::test_support::{agreement, bf16_normal};
+    use mlx_rs::{Array, Dtype};
 
     #[test]
     #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
     fn d512_decode_matches_an_f32_reference() {
         let (h, h_kv, d) = (16, 2, 512);
         for (i, n) in [600, 9000].into_iter().enumerate() {
-            let key = random::key(0xd512 + i as u64).unwrap();
-            let normal = |shape: &[i32]| {
-                random::normal::<f32>(shape, None, None, &key)
-                    .unwrap()
-                    .as_dtype(Dtype::Bfloat16)
-                    .unwrap()
-            };
+            // q, k and v share one key.
+            let normal = |shape: &[i32]| bf16_normal(shape, 0xd512 + i as u64);
             let q = normal(&[1, h, 1, d]);
             let k = normal(&[1, h_kv, n, d]);
             let v = normal(&[1, h_kv, n, d]);

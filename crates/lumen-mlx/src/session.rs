@@ -28,8 +28,8 @@
 //!   most chat templates do — resumes from the conversation boundary instead of
 //!   prefilling everything again. For a `NativePromptCache` the rollback pair is
 //!   `native_snapshot::RollbackPoint::capture` / `restore_into`, and
-//!   `prefill_grid` says how the family's bulk prefill is chunked and whether a
-//!   cut inside a chunk computes the same rows (see `session_feed`).
+//!   `prefill_grid` says how the family's bulk prefill is chunked — points go
+//!   on its chunk boundaries, the only exact cuts (see `session_feed`).
 
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -207,8 +207,8 @@ lumen_flags::flag! {
     ///
     /// **`Optimization`: the output does not change, by construction.** The
     /// point is placed by cutting the prefill, and `session_feed::plan_feed`
-    /// only cuts where every row still goes through the kernels one bulk pass
-    /// uses, keeping that pass's chunk grid. A resumed turn re-feeds what
+    /// only cuts on the bulk pass's own chunk grid, so every call is one of
+    /// that pass's chunks. A resumed turn re-feeds what
     /// follows the point through the same bulk path, which is what a cold
     /// prefill of the longer prompt does — `extend` reproduces a bulk prefill
     /// bit-identically (`session_reuse_reproduces_a_cold_prefill`).

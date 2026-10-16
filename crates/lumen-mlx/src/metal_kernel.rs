@@ -17,6 +17,16 @@ mod imp {
     use mlx_rs::{Array, Dtype};
     use std::ffi::CString;
 
+    /// `Ok` for an mlx-c success status (0), otherwise an error naming the
+    /// call. `call` is formatted only on failure.
+    fn check(status: i32, call: impl std::fmt::Display) -> Result<()> {
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!("{call} returned {status}"))
+        }
+    }
+
     /// RAII-guarded `mlx_fast_metal_kernel_config`. Drop frees via
     /// `mlx_fast_metal_kernel_config_free`.
     pub struct MetalKernelConfig {
@@ -55,35 +65,20 @@ mod imp {
                     dtype.into(),
                 )
             };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_add_output_arg returned {status}"
-                ));
-            }
-            Ok(())
+            check(status, "mlx_fast_metal_kernel_config_add_output_arg")
         }
 
         pub fn set_grid(&self, g1: i32, g2: i32, g3: i32) -> Result<()> {
             let status =
                 unsafe { mlx_sys::mlx_fast_metal_kernel_config_set_grid(self.inner, g1, g2, g3) };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_set_grid returned {status}"
-                ));
-            }
-            Ok(())
+            check(status, "mlx_fast_metal_kernel_config_set_grid")
         }
 
         pub fn set_thread_group(&self, t1: i32, t2: i32, t3: i32) -> Result<()> {
             let status = unsafe {
                 mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(self.inner, t1, t2, t3)
             };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_set_thread_group returned {status}"
-                ));
-            }
-            Ok(())
+            check(status, "mlx_fast_metal_kernel_config_set_thread_group")
         }
 
         pub fn add_template_arg_dtype(&self, name: &str, dtype: Dtype) -> Result<()> {
@@ -96,11 +91,10 @@ mod imp {
                     dtype.into(),
                 )
             };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_add_template_arg_dtype({name}) returned {status}"
-                ));
-            }
+            check(
+                status,
+                format_args!("mlx_fast_metal_kernel_config_add_template_arg_dtype({name})"),
+            )?;
             #[cfg(test)]
             self.dtype_args
                 .borrow_mut()
@@ -118,31 +112,10 @@ mod imp {
                     value,
                 )
             };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_add_template_arg_int({name}) returned {status}"
-                ));
-            }
-            Ok(())
-        }
-
-        #[allow(dead_code)]
-        pub fn add_template_arg_bool(&self, name: &str, value: bool) -> Result<()> {
-            let cname =
-                CString::new(name).map_err(|_| anyhow!("template arg name contains nul byte"))?;
-            let status = unsafe {
-                mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
-                    self.inner,
-                    cname.as_ptr(),
-                    value,
-                )
-            };
-            if status != 0 {
-                return Err(anyhow!(
-                    "mlx_fast_metal_kernel_config_add_template_arg_bool({name}) returned {status}"
-                ));
-            }
-            Ok(())
+            check(
+                status,
+                format_args!("mlx_fast_metal_kernel_config_add_template_arg_int({name})"),
+            )
         }
     }
 
@@ -228,11 +201,7 @@ mod imp {
                 let status =
                     unsafe { mlx_sys::mlx_vector_string_append_value(inputs_guard.0, cs.as_ptr()) };
                 name_storage.push(cs);
-                if status != 0 {
-                    return Err(anyhow!(
-                        "mlx_vector_string_append_value (input) returned {status}"
-                    ));
-                }
+                check(status, "mlx_vector_string_append_value (input)")?;
             }
 
             let outputs_vec = unsafe { mlx_sys::mlx_vector_string_new() };
@@ -245,11 +214,7 @@ mod imp {
                     mlx_sys::mlx_vector_string_append_value(outputs_guard.0, cs.as_ptr())
                 };
                 output_name_storage.push(cs);
-                if status != 0 {
-                    return Err(anyhow!(
-                        "mlx_vector_string_append_value (output) returned {status}"
-                    ));
-                }
+                check(status, "mlx_vector_string_append_value (output)")?;
             }
 
             let inner = unsafe {
@@ -301,11 +266,7 @@ mod imp {
             for arr in inputs {
                 let status =
                     unsafe { mlx_sys::mlx_vector_array_append_value(input_guard.0, arr.as_ptr()) };
-                if status != 0 {
-                    return Err(anyhow!(
-                        "mlx_vector_array_append_value (input) returned {status}"
-                    ));
-                }
+                check(status, "mlx_vector_array_append_value (input)")?;
             }
 
             let stream = unsafe { mlx_sys::mlx_default_gpu_stream_new() };

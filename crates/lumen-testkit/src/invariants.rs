@@ -187,6 +187,19 @@ pub fn assert_tools_block_contract(declared: &[&str], rendered: &str, extra: Opt
     }
 }
 
+/// Can this tool name be written into `call:NAME{` and read back unambiguously?
+///
+/// `call:` is the killer — a name containing it is indistinguishable from a
+/// second call. Braces and commas terminate the name or the argument list.
+/// The tool-surface drivers assert "a well-formed stream yields only declared
+/// names" only when every declared name passes this.
+pub fn stream_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("call:")
+        && !name.contains(['{', '}', ',', '\n', '\r'])
+        && name.trim() == name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

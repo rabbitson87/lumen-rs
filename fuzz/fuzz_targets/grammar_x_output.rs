@@ -18,13 +18,7 @@ use libfuzzer_sys::fuzz_target;
 use lumen_mlx::gemma4_tool_syntax::parse_tool_call_body;
 use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::generators::{GrammarAndOutput, Mutation};
-
-fn stream_safe(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains("call:")
-        && !name.contains(['{', '}', ',', '\n', '\r'])
-        && name.trim() == name
-}
+use lumen_testkit::invariants::stream_safe;
 
 fuzz_target!(|g: GrammarAndOutput| {
     // Grammar side: must survive whatever schema the output was paired with.

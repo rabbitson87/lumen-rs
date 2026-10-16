@@ -10,7 +10,7 @@ use lumen_server::embedding::EmbeddingHandle;
 #[cfg(feature = "mlx-native")]
 use lumen_server::embedding::EmbeddingService;
 use lumen_server::engine::{EngineHandle, InferenceEngine};
-use lumen_server::types::{AnthropicError, ErrorResponse};
+use lumen_server::types::AnthropicError;
 use lumen_server::{catalog, routes};
 use std::sync::Arc;
 
@@ -568,16 +568,14 @@ async fn handle_connection(
     }
 }
 
-async fn llm_not_loaded(mut response: Response<ArenaWriter>) -> Result<(), SendableError> {
-    let err = ErrorResponse::new(
+async fn llm_not_loaded(response: Response<ArenaWriter>) -> Result<(), SendableError> {
+    routes::reply_err(
+        response,
         "LLM not loaded — server is in image-only mode (LUMEN_SERVE=image). \
          Use LUMEN_SERVE=chat or LUMEN_SERVE=hybrid to enable chat endpoints.",
         503,
-    );
-    response.body_mut().set_arena_json(&err)?;
-    *response.status_mut() = StatusCode::from_u16(503)?;
-    response.responser_arena().await?;
-    Ok(())
+    )
+    .await
 }
 
 /// CORS preflight: the methods the API serves and whatever headers the browser
@@ -605,32 +603,20 @@ async fn preflight(
 
 /// 401 in the error shape the caller's SDK parses: Anthropic's on
 /// `/v1/messages`, OpenAI's everywhere else.
-async fn unauthorized(
-    mut response: Response<ArenaWriter>,
-    path: &str,
-) -> Result<(), SendableError> {
+async fn unauthorized(response: Response<ArenaWriter>, path: &str) -> Result<(), SendableError> {
     let message = "missing or invalid API key (LUMEN_API_KEY): send it as \
                    `Authorization: Bearer <key>` or `x-api-key: <key>`";
     if path == "/v1/messages" {
         let mut err = AnthropicError::new(message);
         err.error.r#type = "authentication_error".into();
-        response.body_mut().set_arena_json(&err)?;
+        routes::respond(response, 401, &err).await
     } else {
-        response
-            .body_mut()
-            .set_arena_json(&ErrorResponse::new(message, 401))?;
+        routes::reply_err(response, message, 401).await
     }
-    *response.status_mut() = StatusCode::from_u16(401)?;
-    response.responser_arena().await?;
-    Ok(())
 }
 
-async fn handle_not_found(mut response: Response<ArenaWriter>) -> Result<(), SendableError> {
-    let err = ErrorResponse::new("not found", 404);
-    response.body_mut().set_arena_json(&err)?;
-    *response.status_mut() = StatusCode::from_u16(404)?;
-    response.responser_arena().await?;
-    Ok(())
+async fn handle_not_found(response: Response<ArenaWriter>) -> Result<(), SendableError> {
+    routes::reply_err(response, "not found", 404).await
 }
 
 #[cfg(test)]

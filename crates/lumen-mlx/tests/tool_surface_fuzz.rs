@@ -33,6 +33,7 @@
 use lumen_mlx::gemma4_tool_syntax::{gemma4_args_to_json, parse_tool_call_body};
 use lumen_mlx::grammar::{ToolCalls, build_qwen35_tool_grammar_lark};
 use lumen_testkit::generators::{ChatRequest, GrammarAndOutput, Mutation, ToolSet, seeded_inputs};
+use lumen_testkit::invariants::stream_safe;
 
 /// Every entry point below is reached with both well-formed and malformed
 /// input; anything that panics fails the test by unwinding out of it.
@@ -114,17 +115,6 @@ fn parser_survives_generated_tool_call_streams() {
         "the declared-name invariant was never reachable: every well-formed draw had an \
          unencodable name, so the sharpest assertion here ran zero times"
     );
-}
-
-/// Can this name be written into `call:NAME{` and read back unambiguously?
-///
-/// `call:` is the killer — a name containing it is indistinguishable from a
-/// second call. Braces and commas terminate the name or the argument list.
-fn stream_safe(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains("call:")
-        && !name.contains(['{', '}', ',', '\n', '\r'])
-        && name.trim() == name
 }
 
 /// `gemma4_args_to_json` is reached directly as well as through the body

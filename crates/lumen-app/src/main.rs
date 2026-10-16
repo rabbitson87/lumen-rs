@@ -3,16 +3,13 @@
     windows_subsystem = "windows"
 )]
 
-mod catalog;
 mod commands;
-mod config;
-mod doctor;
-mod models;
-mod server;
 mod state;
-mod sysinfo;
 mod updater;
 
+// The library half of the crate, imported under the same names so the
+// bin-only modules reach it as `crate::config` and friends.
+use lumen_app::{catalog, config, doctor, models, server, sysinfo};
 use state::AppState;
 use tauri::Manager;
 

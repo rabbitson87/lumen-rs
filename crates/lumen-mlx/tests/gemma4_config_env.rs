@@ -13,53 +13,9 @@
 //! only place a *valid* config yields a different model depending on the
 //! environment, with nothing in the file to explain the difference.
 
-use lumen_mlx::gemma4_config::NativeGemma4Config;
-use serde_json::{Value, json};
+mod common;
 
-fn dense() -> Value {
-    json!({
-        "model_type": "gemma4",
-        "text_config": {
-            "model_type": "gemma4_text",
-            "hidden_size": 5376,
-            "head_dim": 256,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "num_hidden_layers": 4,
-            "vocab_size": 1000,
-            "intermediate_size": 8192,
-            "rms_norm_eps": 1e-6,
-            "sliding_window": 512,
-            "sliding_window_pattern": 4,
-            "max_position_embeddings": 4096,
-            "final_logit_softcapping": 30.0,
-            "enable_moe_block": false,
-            "layer_types": [
-                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
-            ],
-            "rope_parameters": {
-                "full_attention": { "rope_theta": 1000000.0 },
-                "sliding_attention": { "rope_theta": 10000.0 }
-            }
-        }
-    })
-}
-
-fn tc(v: &Value, key: &str, val: Value) -> Value {
-    let mut v = v.clone();
-    v["text_config"]
-        .as_object_mut()
-        .unwrap()
-        .insert(key.into(), val);
-    v
-}
-
-fn load(v: &Value) -> NativeGemma4Config {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("config.json");
-    std::fs::write(&path, serde_json::to_string(v).unwrap()).expect("write");
-    NativeGemma4Config::load(&path).expect("fixture must parse")
-}
+use common::gemma4::{dense, load, moe};
 
 /// `LUMEN_SLIDING_WINDOW` and `LUMEN_MAX_CTX` let the desktop app rewrite two
 /// model dimensions at load time. They are the only place in this file where a
@@ -173,13 +129,7 @@ fn the_top_k_override_applies_and_ignores_junk() {
     let set = |v: &str| unsafe { std::env::set_var("LUMEN_GEMMA4_TOP_K", v) };
     let clear = || unsafe { std::env::remove_var("LUMEN_GEMMA4_TOP_K") };
 
-    let moe = {
-        let v = dense();
-        let v = tc(&v, "enable_moe_block", json!(true));
-        let v = tc(&v, "num_experts", json!(128));
-        let v = tc(&v, "top_k_experts", json!(8));
-        tc(&v, "moe_intermediate_size", json!(1024))
-    };
+    let moe = moe();
 
     clear();
     assert_eq!(

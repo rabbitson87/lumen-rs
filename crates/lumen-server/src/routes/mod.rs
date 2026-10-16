@@ -9,7 +9,37 @@ pub mod models;
 pub mod prefix_cache;
 pub mod sessions;
 
-use atomic_http::external::http::HeaderMap;
+use atomic_http::external::http::{HeaderMap, Response, StatusCode};
+use atomic_http::*;
+
+use crate::types::ErrorResponse;
+
+/// Send `body` as the JSON response, with `status`.
+pub async fn respond<T: serde::Serialize>(
+    mut response: Response<ArenaWriter>,
+    status: u16,
+    body: &T,
+) -> Result<(), SendableError> {
+    response.body_mut().set_arena_json(body)?;
+    *response.status_mut() = StatusCode::from_u16(status)?;
+    response.responser_arena().await?;
+    Ok(())
+}
+
+/// [`respond`] with the OpenAI error shape, `status` doubling as its `code`.
+pub async fn reply_err(
+    response: Response<ArenaWriter>,
+    message: impl Into<String>,
+    status: u16,
+) -> Result<(), SendableError> {
+    respond(response, status, &ErrorResponse::new(message, status)).await
+}
+
+/// The `{id}` of a `{prefix}{id}` path: a single, non-empty segment.
+pub fn path_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
 
 /// The head of a server-sent-events response.
 ///

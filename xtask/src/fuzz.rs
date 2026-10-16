@@ -28,6 +28,7 @@
 //! both directories, so seeds feed every soak without polluting the repo with
 //! generated state.
 
+use crate::repo_root;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -214,14 +215,6 @@ fn preflight() -> Result<(), String> {
         return Err("cargo-fuzz missing — install with: cargo install cargo-fuzz".to_string());
     }
     Ok(())
-}
-
-fn repo_root() -> PathBuf {
-    // xtask always runs from a checkout; CARGO_MANIFEST_DIR is xtask/.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask sits one level below the repo root")
-        .to_path_buf()
 }
 
 fn artifact_files(root: &Path, target: &str) -> Vec<PathBuf> {

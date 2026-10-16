@@ -83,8 +83,7 @@ lumen-core = { path = "crates/lumen-core" }
 lumen-testkit = { path = "crates/lumen-testkit" }
 turboquant-cache = { path = "crates/turboquant-cache" }
 
-# Linear algebra & numerics
-faer = "0.24"
+# Numerics
 rand = "0.10.1"
 rand_distr = "0.6.0"
 

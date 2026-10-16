@@ -108,7 +108,10 @@
 
 use std::time::Instant;
 
+mod common;
+
 use anyhow::{Result, anyhow};
+use common::{build_prompt, parse_usize_list, seq_seed, settled_active};
 use lumen_mlx::metal_memory::{clear_cache, get_active_memory};
 use lumen_mlx::{KV_CACHE_STEP, MlxBackend, MlxBatchedSeqDriver};
 
@@ -124,16 +127,6 @@ const DEFAULT_WIDTHS: &[usize] = &[1, 2, 4, 8];
 const PROFILE_SHORT: &[usize] = &[120, 190, 300, 150, 210, 130, 480, 170];
 const PROFILE_MIXED: &[usize] = &[200, 800, 1500, 400, 3000, 260, 650, 1100];
 const PROFILE_LONG: &[usize] = &[2000, 4000, 8000, 3000, 6000, 2500, 5000, 7000];
-
-/// Filler vocabulary. Common short words so the tokenizer yields roughly one
-/// token per word, which makes the length-targeting loop converge in 2-3 tries.
-const WORDS: &[&str] = &[
-    "system", "value", "record", "matrix", "signal", "buffer", "window", "kernel", "vector",
-    "planet", "garden", "silver", "market", "reason", "letter", "number", "moment", "figure",
-    "branch", "circle", "stream", "camera", "ticket", "island", "friend", "orange", "bridge",
-    "packet", "column", "target", "sample", "region", "handle", "author", "series", "corner",
-    "policy", "device", "格子", "회로", "réseau",
-];
 
 struct Args {
     model_id: String,
@@ -246,72 +239,6 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
-fn parse_usize_list(s: &str) -> Result<Vec<usize>> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            p.parse::<usize>().map_err(|_| {
-                anyhow!("expected a comma-separated list of positive integers, got {s:?}")
-            })
-        })
-        .collect()
-}
-
-/// Deterministic per-sequence filler. Seeded by `seq_ix` so two sequences in the
-/// same batch diverge at the first word — the point is to *avoid* an accidental
-/// shared prefix.
-fn filler(seq_ix: usize, n_words: usize) -> String {
-    let mut state =
-        0x9E37_79B9_7F4A_7C15u64 ^ ((seq_ix as u64 + 1).wrapping_mul(0x517C_C1B7_2722_0A95));
-    let mut out = String::with_capacity(n_words * 7);
-    for w in 0..n_words {
-        // xorshift64* — deterministic, no dependency, good enough for filler.
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let pick = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize;
-        if w > 0 {
-            out.push(' ');
-        }
-        out.push_str(WORDS[pick % WORDS.len()]);
-    }
-    out
-}
-
-/// Build a prompt for `seq_ix` whose rendered token count is at least
-/// `target`, converging by measuring rather than guessing at the tokenizer's
-/// words-per-token ratio.
-fn build_prompt(
-    driver: &dyn MlxBatchedSeqDriver,
-    seq_ix: usize,
-    target: usize,
-) -> Result<Vec<u32>> {
-    let mut words = target.max(8);
-    let mut best: Option<Vec<u32>> = None;
-    for _ in 0..8 {
-        let msgs = vec![(
-            "user".to_string(),
-            format!("Summarize the following log:\n{}", filler(seq_ix, words)),
-        )];
-        let ids = driver.build_chat_input(&msgs, false, None)?;
-        let n = ids.len();
-        if n >= target {
-            // First length at or above target wins; overshoot past +5% means
-            // stepping back down for a tighter fit is worth one more round.
-            if n <= target + target / 20 {
-                return Ok(ids);
-            }
-            best = Some(ids);
-            words = ((words as f64) * (target as f64 / n as f64)).ceil() as usize + 1;
-        } else {
-            let grow = ((words as f64) * (target as f64 / n.max(1) as f64)).ceil() as usize;
-            words = grow.max(words + 4);
-        }
-    }
-    best.ok_or_else(|| anyhow!("could not reach {target} tokens for seq {seq_ix} in 8 rounds"))
-}
-
 /// `ceil(len / block) * block`, summed over sequences. Layer count, head count
 /// and dtype cancel out of the ratio against `real`, so this is exact.
 fn rounded_total(lens: &[usize], block: usize) -> usize {
@@ -320,37 +247,6 @@ fn rounded_total(lens: &[usize], block: usize) -> usize {
 
 fn active_bytes() -> usize {
     get_active_memory().unwrap_or(0)
-}
-
-/// Active memory once the reusable pool has stopped shrinking.
-///
-/// A single `clear_cache()` is not enough. It frees already-released buffers,
-/// and MLX does not always release everything before the call returns, so the
-/// same condition at the same shape reports either its true value or that value
-/// plus a fixed ~127 MB. On a resident figure of a few hundred MB that is large
-/// enough to invert an A/B. Loop until two readings agree; the minimum is
-/// correct because the contaminant only ever adds.
-fn settled_active() -> usize {
-    // The wait is load-bearing, not defensive. `LUMEN_NATIVE_DEFER_CLEAR_CACHE`
-    // is on by default, so `remove_seq` hands the clear to a background worker
-    // (~45 ms). Two back-to-back readings taken before that worker runs are
-    // equal to each other and both wrong, which is how a settle loop without a
-    // sleep exits early on the contaminated value.
-    let mut best = usize::MAX;
-    let mut prev = usize::MAX;
-    let mut stable = 0;
-    for _ in 0..12 {
-        let _ = clear_cache();
-        let now = active_bytes();
-        best = best.min(now);
-        stable = if now == prev { stable + 1 } else { 0 };
-        if stable >= 2 {
-            break;
-        }
-        prev = now;
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    best
 }
 
 fn gb(bytes: usize) -> f64 {
@@ -421,7 +317,7 @@ fn run_width(
     let mut ids = Vec::with_capacity(n);
     let mut prompts = Vec::with_capacity(n);
     for (i, &t) in targets.iter().enumerate() {
-        prompts.push(build_prompt(driver, i, t)?);
+        prompts.push(build_prompt(driver, seq_seed(i), t)?);
         ids.push(*next_id);
         *next_id += 1;
     }

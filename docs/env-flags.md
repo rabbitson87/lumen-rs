@@ -243,8 +243,8 @@ Leave a rollback point at each chat turn's conversation boundary, so
 
  **`Optimization`: the output does not change, by construction.** The
  point is placed by cutting the prefill, and `session_feed::plan_feed`
- only cuts where every row still goes through the kernels one bulk pass
- uses, keeping that pass's chunk grid. A resumed turn re-feeds what
+ only cuts on the bulk pass's own chunk grid, so every call is one of
+ that pass's chunks. A resumed turn re-feeds what
  follows the point through the same bulk path, which is what a cold
  prefill of the longer prompt does — `extend` reproduces a bulk prefill
  bit-identically (`session_reuse_reproduces_a_cold_prefill`).

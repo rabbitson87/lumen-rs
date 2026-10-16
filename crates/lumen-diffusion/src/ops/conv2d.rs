@@ -40,7 +40,6 @@ mod imp {
 }
 
 #[cfg(feature = "mlx-native")]
-#[allow(unused_imports)] // Consumed by the VAE decoder (Phase 0).
 pub use imp::conv2d;
 
 // Self-verifying parity tests.
@@ -52,6 +51,7 @@ pub use imp::conv2d;
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::conv2d;
+    use crate::test_util::assert_all_close;
     use mlx_rs::Array;
 
     /// 3×3 input, 2×2 all-ones kernel, valid padding → each output is the sum of
@@ -81,14 +81,8 @@ mod parity_tests {
         );
         out.eval().expect("mlx eval must succeed");
 
-        let observed: &[f32] = out.as_slice();
         let expected = [12.0f32, 16.0, 24.0, 28.0];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-4,
-                "conv2d[{i}]: got {got}, expected {exp} (orientation/sum mismatch)"
-            );
-        }
+        assert_all_close("conv2d", out.as_slice(), &expected, 1e-4);
     }
 
     /// stride-2 over a 4×4 input with a 2×2 kernel → 2×2 output. Verifies the
@@ -116,13 +110,7 @@ mod parity_tests {
         assert_eq!(out.shape(), &[1, 2, 2, 1], "stride-2 output shape mismatch");
         out.eval().expect("mlx eval must succeed");
 
-        let observed: &[f32] = out.as_slice();
         let expected = [14.0f32, 22.0, 46.0, 54.0];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-4,
-                "conv2d_stride2[{i}]: got {got}, expected {exp}"
-            );
-        }
+        assert_all_close("conv2d_stride2", out.as_slice(), &expected, 1e-4);
     }
 }
