@@ -125,6 +125,9 @@ cd ~/Documents/GitHub/lumen-rs
 # submodule pin; for mlx core bumps, in mlx-c's CMakeLists.txt
 # FetchContent_Declare.
 cargo xtask test                          # confirm rebuild + suite
+# MLX core bumps: also the weight-gated checks the suite cannot run, on a
+# dense and a MoE Qwen checkpoint (`LUMEN_QWEN35_MODEL_DIR`) — at least
+# `tests::a_rollback_point_changes_no_token`
 git commit -am "deps: bump <fork> to <short-sha>"
 git push origin main
 ```
@@ -211,7 +214,6 @@ should return only mid-prose references (Phase X mid-sentence is OK).
 |---|---|---|---|
 | `mlx-native` | `lumen-mlx`, `lumen-diffusion`, `lumen-server` | Native MLX runner (Gemma 4, Qwen 2.5/3.5/3.6 dense + MoE) plus the FLUX.2-dev diffusion backend. The only backend. | ✅ **on** (default) |
 | `mlx-native-metal` | `lumen-mlx`, `lumen-diffusion` | `mlx-native` + `mlx-rs/metal` | ❌ off |
-| `mlx-pyo3` | `lumen-mlx` | PyO3 subprocess fallback (development only) | ❌ off |
 
 The Candle-era features (`metal`, `turboquant-gpu`, `paged-kv`,
 `qwen3_5_moe`, `legacy-candle`, `turboquant`, `mpsgraph`, `legacy-tests`)
@@ -603,18 +605,26 @@ return the trace. So `extends` fails on every turn and the whole conversation is
 prefilled again — ~25 s a turn on Qwen3.5-9B with an 11.5K-token system prompt.
 `LUMEN_MLX_SESSION_ROLLBACK` leaves a rollback point before the header (full
 attention truncates, only the linear-attention state is kept) and the next turn
-winds back to it: 26.0 s → 0.4 s, replies byte-identical.
+winds back to it instead of prefilling the whole conversation, replies
+byte-identical.
 
 Placing the point means cutting the prefill, and a cut is exact only if every row
-is still computed as the bulk pass computes it. `session_feed::plan_feed` keeps
-the bulk pass's chunk grid and cuts inside a chunk only on dense models, with 32+
-rows on each side — below that MLX routes quantized projections to its vector
-kernel. Mixture-of-experts models mark on chunk boundaries only: `GatherQMM`
-tiles across the rows routed to each expert, so a row depends on which rows share
-its call, and no floor fixes that (a 128-row-floored cut on Qwen3.6-35B-A3B still
-differed from a cold prefill). `a_rollback_point_changes_no_token` measures both
-claims — turn one with and without a point, a resumed turn against a cold
-prefill — and must be run on a dense and a MoE checkpoint. The flag is
+is still computed as the bulk pass computes it. `session_feed::plan_feed` cuts
+only on the bulk pass's chunk grid, so each call is one of that pass's chunks:
+the point goes on the last chunk boundary before the header, and the next turn
+re-feeds from there — at most one chunk (on Qwen3.5-9B, 85 tokens resumed in
+0.2 s, a full 2,115 in 5 s, against 9–11 s cold at 4K). Cutting inside a chunk
+is not exact on either kind of model. On a mixture-of-experts model `GatherQMM`
+tiles across the rows routed to each expert, so a row depends on which rows
+share its call (a 128-row-floored cut on Qwen3.6-35B-A3B still differed from a
+cold prefill). On a dense model it was exact on MLX 0.30 with 32+ rows a piece,
+and stopped being exact on 0.32: split-K quantized matmul splits a call's K sum
+by its threadgroup count, which grows with its rows, so Qwen3.5-9B's 32-output
+linear-attention gate projections split 8 ways in a 2048-row chunk and 64 ways
+in a 32-row piece. `a_rollback_point_changes_no_token` measures the claim — turn
+one with and without a point, a resumed turn against a cold prefill — and must
+be run on a dense and a MoE checkpoint, and after every MLX bump: the bump to
+0.32 passed the suite and broke this test, which needs weights. The flag is
 `Optimization`.
 
 **Giving a new model family session reuse.** All of it lives in
@@ -624,8 +634,8 @@ module doc shows the sequence; `MlxQwen35Backend::chat_streaming_session` is the
 worked example):
 
 - its runner implements `session::SessionRunner`. `prefill` / `extend` /
-  `remove_seq` alone give exact-extension reuse. `prefill_grid` (chunk size, and
-  `min_piece: None` for mixture-of-experts) plus `mark_rollback` / `rollback`
+  `remove_seq` alone give exact-extension reuse. `prefill_grid` (the chunk size
+  the bulk prefill runs in) plus `mark_rollback` / `rollback`
   (`RollbackPoint::capture` / `restore_into` on a `NativePromptCache`) add
   resuming from the conversation boundary. Implement the three together: the
   defaults refuse, so a family that skips all three is correct, just slower on
@@ -637,9 +647,9 @@ worked example):
   point — never a wrong one.
 
 Then run `a_rollback_point_changes_no_token` on a checkpoint of the family before
-turning it on: the planner's "dense cuts are exact" rule is a measurement about
-MLX's kernels, and a family with different layers has to be measured, not
-assumed. Sliding-window (rotating) caches cannot roll back past a wrap and have
+turning it on: "a bulk prefill fed chunk by chunk is the same computation" is
+a property of how the runner feeds chunks, and a family with different layers
+has to be measured, not assumed. Sliding-window (rotating) caches cannot roll back past a wrap and have
 no `RollbackPoint` arm — Gemma 4 reuses through its own prefix cache instead.
 
 **Run-time kernels are compiled on the user's Mac, for the user's macOS.** MLX

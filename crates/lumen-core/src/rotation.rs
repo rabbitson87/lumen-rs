@@ -1,8 +1,8 @@
-use std::io::{Read, Write};
-
 use rand::prelude::*;
 use rand_distr::StandardNormal;
 use thiserror::Error;
+
+use crate::binfile;
 
 #[derive(Error, Debug)]
 pub enum RotationError {
@@ -10,8 +10,6 @@ pub enum RotationError {
     Io(#[from] std::io::Error),
     #[error("invalid rotation file (bad magic)")]
     BadMagic,
-    #[error("dimension mismatch: expected {expected}, got {got}")]
-    DimMismatch { expected: usize, got: usize },
 }
 
 /// Random orthogonal matrix for rotating KV vectors before quantization.
@@ -134,33 +132,19 @@ impl RotationMatrix {
     /// Format: magic(4) + dim(u32 LE) + seed(u64 LE) + f32 array (row-major LE).
     pub fn save(&self, path: &str) -> Result<(), RotationError> {
         let mut f = std::fs::File::create(path)?;
-        f.write_all(MAGIC)?;
-        f.write_all(&(self.dim as u32).to_le_bytes())?;
-        for &val in &self.matrix {
-            f.write_all(&val.to_le_bytes())?;
-        }
+        binfile::write_header(&mut f, MAGIC, &[self.dim as u32])?;
+        binfile::write_f32s(&mut f, &self.matrix)?;
         Ok(())
     }
 
     /// Load rotation matrix from binary file.
     pub fn load(path: &str) -> Result<Self, RotationError> {
         let mut f = std::fs::File::open(path)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let Some([dim]) = binfile::read_header(&mut f, MAGIC)? else {
             return Err(RotationError::BadMagic);
-        }
-
-        let mut buf4 = [0u8; 4];
-        f.read_exact(&mut buf4)?;
-        let dim = u32::from_le_bytes(buf4) as usize;
-
-        let n_elems = dim * dim;
-        let mut matrix = Vec::with_capacity(n_elems);
-        for _ in 0..n_elems {
-            f.read_exact(&mut buf4)?;
-            matrix.push(f32::from_le_bytes(buf4));
-        }
+        };
+        let dim = dim as usize;
+        let matrix = binfile::read_f32s(&mut f, dim * dim)?;
 
         Ok(Self { matrix, dim })
     }

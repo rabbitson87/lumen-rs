@@ -35,8 +35,8 @@ mod imp {
     // Mirrors `mlx_lm/models/gated_delta.py::compute_g` op-for-op; lives in
     // a separate fn so it can flow into `compile_boxed_slice` via the
     // `&[Array] -> Result<Vec<Array>, Exception>` form. Keep this body
-    // equivalent to `compute_g_legacy` — both are exercised by the parity
-    // fixtures.
+    // equivalent to `compute_g_legacy`, which `LUMEN_NATIVE_COMPILE=0` serves
+    // instead.
     fn compute_g_compiled_inner(args: &[Array]) -> std::result::Result<Vec<Array>, Exception> {
         let a_log = &args[0];
         let a = &args[1];
@@ -236,14 +236,37 @@ mod imp {
         beta: &Array,
         state_in: &Array,
     ) -> Result<(Array, Array)> {
+        let mut outputs = gated_delta_dispatch(q, k, v, g, beta, state_in, false)?.into_iter();
+        let y = outputs.next().expect("kernel produced y");
+        let state_out = outputs.next().expect("kernel produced state_out");
+        Ok((y, state_out))
+    }
+
+    /// Shared dispatch of the two gated-delta kernels: one shape check, one
+    /// template set, one grid. `capture` picks the capture kernel and its
+    /// extra `state_per_pos` output.
+    fn gated_delta_dispatch(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+        state_in: &Array,
+        capture: bool,
+    ) -> Result<Vec<Array>> {
         use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
 
+        let fn_name = if capture {
+            "gated_delta_step_kernel_capture"
+        } else {
+            "gated_delta_step_kernel"
+        };
         // Pull dimensions from input shapes. Indices follow the Python ref.
         let q_shape = q.shape();
         let v_shape = v.shape();
         if q_shape.len() != 4 || v_shape.len() != 4 {
             return Err(anyhow::anyhow!(
-                "gated_delta_step_kernel: q/v must be 4-D, got q={:?} v={:?}",
+                "{fn_name}: q/v must be 4-D, got q={:?} v={:?}",
                 q_shape,
                 v_shape
             ));
@@ -257,18 +280,34 @@ mod imp {
 
         if head_k_dim % 32 != 0 {
             return Err(anyhow::anyhow!(
-                "gated_delta_step_kernel: head_k_dim must be a multiple of 32 (kernel uses simdgroup reduction over a tile of 32), got {head_k_dim}"
+                "{fn_name}: head_k_dim must be a multiple of 32 (kernel uses simdgroup reduction over a tile of 32), got {head_k_dim}"
             ));
         }
 
-        let kernel = MetalKernel::new(
-            "gated_delta_step",
-            &["q", "k", "v", "g", "beta", "state_in", "T"],
-            &["y", "state_out"],
-            GATED_DELTA_KERNEL_SOURCE,
-            /* ensure_row_contiguous */ true,
-            /* atomic_outputs */ false,
-        )?;
+        // Each kernel is constructed with its name as a literal: `cargo xtask
+        // test` reads the names off `MetalKernel::new` calls to check that
+        // every kernel ran in its Metal 3.1 pass.
+        let (kernel, n_outputs) = if capture {
+            let kernel = MetalKernel::new(
+                "gated_delta_step_capture",
+                &["q", "k", "v", "g", "beta", "state_in", "T"],
+                &["y", "state_out", "state_per_pos"],
+                GATED_DELTA_CAPTURE_KERNEL_SOURCE,
+                /* ensure_row_contiguous */ true,
+                /* atomic_outputs */ false,
+            )?;
+            (kernel, 3)
+        } else {
+            let kernel = MetalKernel::new(
+                "gated_delta_step",
+                &["q", "k", "v", "g", "beta", "state_in", "T"],
+                &["y", "state_out"],
+                GATED_DELTA_KERNEL_SOURCE,
+                /* ensure_row_contiguous */ true,
+                /* atomic_outputs */ false,
+            )?;
+            (kernel, 2)
+        };
 
         let config = MetalKernelConfig::new();
         config.add_template_arg_dtype("InT", q.dtype())?;
@@ -291,16 +330,17 @@ mod imp {
 
         config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
         config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
+        if capture {
+            config.add_output_arg(
+                &[b, seq, n_v_heads, head_v_dim, head_k_dim],
+                state_in.dtype(),
+            )?;
+        }
 
         // T is a 0-d int scalar input. MLX dereferences scalar arrays at
         // call sites, so the kernel sees T as an int value.
         let t_scalar = Array::from_int(seq);
-
-        let outputs = kernel.apply(&[q, k, v, g, beta, state_in, &t_scalar], &config, 2)?;
-        let mut iter = outputs.into_iter();
-        let y = iter.next().expect("kernel produced y");
-        let state_out = iter.next().expect("kernel produced state_out");
-        Ok((y, state_out))
+        kernel.apply(&[q, k, v, g, beta, state_in, &t_scalar], &config, n_outputs)
     }
 
     /// Capture variant of the gated-delta kernel: identical recurrence, but
@@ -388,71 +428,10 @@ mod imp {
         beta: &Array,
         state_in: &Array,
     ) -> Result<(Array, Array, Array)> {
-        use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
-
-        let q_shape = q.shape();
-        let v_shape = v.shape();
-        if q_shape.len() != 4 || v_shape.len() != 4 {
-            return Err(anyhow::anyhow!(
-                "gated_delta_step_kernel_capture: q/v must be 4-D, got q={:?} v={:?}",
-                q_shape,
-                v_shape
-            ));
-        }
-        let b = q_shape[0];
-        let seq = q_shape[1];
-        let n_k_heads = q_shape[2];
-        let head_k_dim = q_shape[3];
-        let n_v_heads = v_shape[2];
-        let head_v_dim = v_shape[3];
-
-        if head_k_dim % 32 != 0 {
-            return Err(anyhow::anyhow!(
-                "gated_delta_step_kernel_capture: head_k_dim must be a multiple of 32, got {head_k_dim}"
-            ));
-        }
-
-        let kernel = MetalKernel::new(
-            "gated_delta_step_capture",
-            &["q", "k", "v", "g", "beta", "state_in", "T"],
-            &["y", "state_out", "state_per_pos"],
-            GATED_DELTA_CAPTURE_KERNEL_SOURCE,
-            /* ensure_row_contiguous */ true,
-            /* atomic_outputs */ false,
-        )?;
-
-        let config = MetalKernelConfig::new();
-        config.add_template_arg_dtype("InT", q.dtype())?;
-        config.add_template_arg_dtype("StT", state_in.dtype())?;
-        config.add_template_arg_int("Dk", head_k_dim)?;
-        config.add_template_arg_int("Dv", head_v_dim)?;
-        config.add_template_arg_int("Hk", n_k_heads)?;
-        config.add_template_arg_int("Hv", n_v_heads)?;
-
-        config.set_grid(32, head_v_dim, b * n_v_heads)?;
-        // Threadgroup y (Dv tiling) tunes occupancy — x=32 fixed (simd_sum over
-        // the Dk tile). y only affects scheduling, not the result. Default 4;
-        // `LUMEN_SSM_TG_Y` sweeps {1,2,4,8,16} (must divide head_v_dim).
-        let tg_y = std::env::var("LUMEN_SSM_TG_Y")
-            .ok()
-            .and_then(|s| s.parse::<i32>().ok())
-            .filter(|&y| y >= 1 && head_v_dim % y == 0)
-            .unwrap_or(4);
-        config.set_thread_group(32, tg_y, 1)?;
-
-        config.add_output_arg(&[b, seq, n_v_heads, head_v_dim], q.dtype())?;
-        config.add_output_arg(&[b, n_v_heads, head_v_dim, head_k_dim], state_in.dtype())?;
-        config.add_output_arg(
-            &[b, seq, n_v_heads, head_v_dim, head_k_dim],
-            state_in.dtype(),
-        )?;
-
-        let t_scalar = Array::from_int(seq);
-        let outputs = kernel.apply(&[q, k, v, g, beta, state_in, &t_scalar], &config, 3)?;
-        let mut iter = outputs.into_iter();
-        let y = iter.next().expect("kernel produced y");
-        let state_out = iter.next().expect("kernel produced state_out");
-        let state_per_pos = iter.next().expect("kernel produced state_per_pos");
+        let mut outputs = gated_delta_dispatch(q, k, v, g, beta, state_in, true)?.into_iter();
+        let y = outputs.next().expect("kernel produced y");
+        let state_out = outputs.next().expect("kernel produced state_out");
+        let state_per_pos = outputs.next().expect("kernel produced state_per_pos");
         Ok((y, state_out, state_per_pos))
     }
 
@@ -775,618 +754,20 @@ pub use imp::{
     rms_norm_gated, rms_norm_gated_fused, rms_norm_gated_legacy,
 };
 
-// compute_g bit-identical vs MLX reference.
-//
-// Fixtures produced by `scripts/generate_compute_g_fixture.py` (magic `TQGG`).
-#[cfg(all(test, feature = "mlx-native"))]
-mod parity_tests {
-    use super::imp::{compute_g, rms_norm_gated, rms_norm_gated_fused, rms_norm_gated_legacy};
-    use mlx_rs::Array;
-    use std::path::{Path, PathBuf};
-
-    const MAGIC: &[u8; 4] = b"TQGG";
-    const HEADER_LEN: usize = 4 /* magic */ + 3 * 4 /* 3 u32 */;
-    const GATED_MAGIC: &[u8; 4] = b"TQRG";
-    const GATED_HEADER_LEN: usize = 4 /* magic */ + 4 * 4 /* 4 u32 */;
-
-    fn fixture_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("lumen-mlx manifest dir has a parent (crates/)")
-            .join("lumen-metal")
-            .join("tests")
-            .join("fixtures")
-    }
-
-    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-    }
-    fn slice_f32(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    struct ComputeGFixture {
-        batch: usize,
-        seq: usize,
-        num_v_heads: usize,
-        a_log: Vec<f32>,
-        a: Vec<f32>,
-        dt_bias: Vec<f32>,
-        expected_y: Vec<f32>,
-    }
-
-    fn load_fixture(name: &str) -> Option<ComputeGFixture> {
-        let path = fixture_dir().join(format!("embed_compute_g_{name}.bin"));
-        let bytes = std::fs::read(&path).ok()?;
-        if bytes.len() < HEADER_LEN || &bytes[..4] != MAGIC {
-            panic!("compute_g fixture {path:?} has bad header");
-        }
-        let batch = read_u32_le(&bytes, 4) as usize;
-        let seq = read_u32_le(&bytes, 8) as usize;
-        let num_v_heads = read_u32_le(&bytes, 12) as usize;
-
-        let mut cur = HEADER_LEN;
-        let a_log = slice_f32(&bytes[cur..cur + num_v_heads * 4]);
-        cur += num_v_heads * 4;
-        let a_count = batch * seq * num_v_heads;
-        let a = slice_f32(&bytes[cur..cur + a_count * 4]);
-        cur += a_count * 4;
-        let dt_bias = slice_f32(&bytes[cur..cur + num_v_heads * 4]);
-        cur += num_v_heads * 4;
-        let expected_y = slice_f32(&bytes[cur..cur + a_count * 4]);
-
-        Some(ComputeGFixture {
-            batch,
-            seq,
-            num_v_heads,
-            a_log,
-            a,
-            dt_bias,
-            expected_y,
-        })
-    }
-
-    fn run_fixture(name: &str) {
-        let Some(fx) = load_fixture(name) else {
-            eprintln!(
-                "SKIP compute_g/{name}: fixture missing under {}. Run `python scripts/generate_compute_g_fixture.py` first.",
-                fixture_dir().display()
-            );
-            return;
-        };
-
-        let a_log = Array::from_slice(&fx.a_log, &[fx.num_v_heads as i32]);
-        let a = Array::from_slice(
-            &fx.a,
-            &[fx.batch as i32, fx.seq as i32, fx.num_v_heads as i32],
-        );
-        let dt_bias = Array::from_slice(&fx.dt_bias, &[fx.num_v_heads as i32]);
-
-        let out = compute_g(&a_log, &a, &dt_bias).expect("compute_g must succeed");
-        assert_eq!(
-            out.shape(),
-            &[fx.batch as i32, fx.seq as i32, fx.num_v_heads as i32],
-            "{name}: compute_g output shape mismatch"
-        );
-        assert_eq!(
-            out.dtype(),
-            mlx_rs::Dtype::Float32,
-            "{name}: compute_g output dtype unexpectedly changed"
-        );
-        out.eval().expect("mlx eval must succeed");
-
-        let observed: &[f32] = out.as_slice();
-        assert_eq!(
-            observed.len(),
-            fx.expected_y.len(),
-            "{name}: compute_g output flat-size mismatch"
-        );
-
-        let mut mismatches = 0usize;
-        for (i, (&got, &expected)) in observed.iter().zip(fx.expected_y.iter()).enumerate() {
-            if got.to_bits() != expected.to_bits() {
-                if mismatches < 5 {
-                    eprintln!(
-                        "compute_g/{name}[{i}]: 0x{:08x} ({got}) vs ref 0x{:08x} ({expected})",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches,
-            0,
-            "{name}: {mismatches}/{} elements diverged from MLX reference",
-            observed.len()
-        );
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn tiny_compute_g_matches_mlx() {
-        run_fixture("tiny");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn multi_head_compute_g_matches_mlx() {
-        run_fixture("multi_head");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn prod_heads_compute_g_matches_mlx() {
-        run_fixture("prod_heads");
-    }
-
-    // ─── Phase 3b.5.c: rms_norm_gated parity ────────────────────────────────
-
-    struct GatedFixture {
-        batch: usize,
-        seq: usize,
-        hidden: usize,
-        eps: f32,
-        h: Vec<f32>,
-        z: Vec<f32>,
-        w: Vec<f32>,
-        expected_y: Vec<f32>,
-    }
-
-    fn load_gated_fixture(name: &str) -> Option<GatedFixture> {
-        let path = fixture_dir().join(format!("embed_rms_norm_gated_{name}.bin"));
-        let bytes = std::fs::read(&path).ok()?;
-        if bytes.len() < GATED_HEADER_LEN || &bytes[..4] != GATED_MAGIC {
-            panic!("rms_norm_gated fixture {path:?} has bad header");
-        }
-        let batch = read_u32_le(&bytes, 4) as usize;
-        let seq = read_u32_le(&bytes, 8) as usize;
-        let hidden = read_u32_le(&bytes, 12) as usize;
-        let eps = f32::from_bits(read_u32_le(&bytes, 16));
-
-        let count = batch * seq * hidden;
-        let mut cur = GATED_HEADER_LEN;
-        let h = slice_f32(&bytes[cur..cur + count * 4]);
-        cur += count * 4;
-        let z = slice_f32(&bytes[cur..cur + count * 4]);
-        cur += count * 4;
-        let w = slice_f32(&bytes[cur..cur + hidden * 4]);
-        cur += hidden * 4;
-        let expected_y = slice_f32(&bytes[cur..cur + count * 4]);
-
-        Some(GatedFixture {
-            batch,
-            seq,
-            hidden,
-            eps,
-            h,
-            z,
-            w,
-            expected_y,
-        })
-    }
-
-    fn run_gated_fixture(name: &str) {
-        let Some(fx) = load_gated_fixture(name) else {
-            eprintln!(
-                "SKIP rms_norm_gated/{name}: fixture missing under {}. Run `python scripts/generate_rms_norm_gated_fixture.py` first.",
-                fixture_dir().display()
-            );
-            return;
-        };
-
-        let h = Array::from_slice(&fx.h, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
-        let z = Array::from_slice(&fx.z, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
-        let w = Array::from_slice(&fx.w, &[fx.hidden as i32]);
-
-        let out = rms_norm_gated(&h, &z, &w, fx.eps).expect("rms_norm_gated must succeed");
-        assert_eq!(
-            out.shape(),
-            &[fx.batch as i32, fx.seq as i32, fx.hidden as i32],
-            "{name}: rms_norm_gated output shape mismatch"
-        );
-        // Output should match `hidden_states.dtype()` — fixture is f32 so
-        // we expect f32 here. If we ever pass bf16/f16 inputs, the test
-        // would need a downcast-then-upcast comparison; not covered yet.
-        assert_eq!(
-            out.dtype(),
-            mlx_rs::Dtype::Float32,
-            "{name}: rms_norm_gated output dtype unexpectedly changed"
-        );
-        out.eval().expect("mlx eval must succeed");
-
-        let observed: &[f32] = out.as_slice();
-        assert_eq!(
-            observed.len(),
-            fx.expected_y.len(),
-            "{name}: rms_norm_gated output flat-size mismatch"
-        );
-
-        let mut mismatches = 0usize;
-        for (i, (&got, &expected)) in observed.iter().zip(fx.expected_y.iter()).enumerate() {
-            if got.to_bits() != expected.to_bits() {
-                if mismatches < 5 {
-                    eprintln!(
-                        "rms_norm_gated/{name}[{i}]: 0x{:08x} ({got}) vs ref 0x{:08x} ({expected})",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches,
-            0,
-            "{name}: {mismatches}/{} elements diverged from MLX reference",
-            observed.len()
-        );
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn tiny_rms_norm_gated_matches_mlx() {
-        run_gated_fixture("tiny");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn multi_rms_norm_gated_matches_mlx() {
-        run_gated_fixture("multi");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn head_v_dim_rms_norm_gated_matches_mlx() {
-        run_gated_fixture("head_v_dim");
-    }
-
-    // ─── Phase G5-A parity: fused kernel vs legacy composed path ────────────
-    //
-    // The fused kernel's reduction tree differs from `mlx.fast.rms_norm`, so
-    // bit-identical parity is not expected. Tolerance bounds derived from
-    // fp32 round-off on a `D=128` simdgroup-wide sum (≤ ~1e-6 relative on
-    // inv_rms) compounded with one silu * x * weight multiply.
-    fn run_fused_vs_legacy_fixture(name: &str) {
-        let Some(fx) = load_gated_fixture(name) else {
-            eprintln!(
-                "SKIP rms_norm_gated_fused/{name}: fixture missing under {}. Run `python scripts/generate_rms_norm_gated_fixture.py` first.",
-                fixture_dir().display()
-            );
-            return;
-        };
-
-        if fx.hidden % 32 != 0 {
-            eprintln!(
-                "SKIP rms_norm_gated_fused/{name}: fixture hidden={} not multiple of 32 (fused kernel uses simdgroup-wide reduction)",
-                fx.hidden
-            );
-            return;
-        }
-
-        let h = Array::from_slice(&fx.h, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
-        let z = Array::from_slice(&fx.z, &[fx.batch as i32, fx.seq as i32, fx.hidden as i32]);
-        let w = Array::from_slice(&fx.w, &[fx.hidden as i32]);
-
-        let legacy =
-            rms_norm_gated_legacy(&h, &z, &w, fx.eps).expect("rms_norm_gated_legacy must succeed");
-        let fused =
-            rms_norm_gated_fused(&h, &z, &w, fx.eps).expect("rms_norm_gated_fused must succeed");
-
-        assert_eq!(
-            legacy.shape(),
-            fused.shape(),
-            "{name}: fused vs legacy shape mismatch"
-        );
-        assert_eq!(
-            legacy.dtype(),
-            fused.dtype(),
-            "{name}: fused vs legacy dtype mismatch"
-        );
-        legacy.eval().expect("legacy eval must succeed");
-        fused.eval().expect("fused eval must succeed");
-
-        let legacy_slice: &[f32] = legacy.as_slice();
-        let fused_slice: &[f32] = fused.as_slice();
-        assert_eq!(
-            legacy_slice.len(),
-            fused_slice.len(),
-            "{name}: fused vs legacy flat-size mismatch"
-        );
-
-        // Tolerance: atol 1e-5 + rtol 1e-4 on element-wise. Empirically the
-        // fp32 inv_rms agreement between MLX's built-in and our simdgroup
-        // sum is ~1 ULP; compounded with silu·x·w·inv_rms the worst-case
-        // element diverges by O(eps_machine · |z| · |x|). For fixture
-        // values bounded by O(1) this bound is well under 1e-4 rel.
-        const ATOL: f32 = 1e-5;
-        const RTOL: f32 = 1e-4;
-        let mut mismatches = 0usize;
-        let mut max_abs_err: f32 = 0.0;
-        let mut max_rel_err: f32 = 0.0;
-        for (i, (&got, &expected)) in fused_slice.iter().zip(legacy_slice.iter()).enumerate() {
-            let abs_err = (got - expected).abs();
-            let denom = expected.abs().max(1e-12);
-            let rel_err = abs_err / denom;
-            max_abs_err = max_abs_err.max(abs_err);
-            max_rel_err = max_rel_err.max(rel_err);
-            let tol = ATOL + RTOL * expected.abs();
-            if abs_err > tol {
-                if mismatches < 5 {
-                    eprintln!(
-                        "rms_norm_gated_fused/{name}[{i}]: got={got} (0x{:08x}) vs legacy={expected} (0x{:08x}) abs_err={abs_err:.3e} rel_err={rel_err:.3e} tol={tol:.3e}",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches,
-            0,
-            "{name}: {mismatches}/{} elements outside tolerance (max abs={:.3e} max rel={:.3e})",
-            fused_slice.len(),
-            max_abs_err,
-            max_rel_err
-        );
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn tiny_rms_norm_gated_fused_matches_legacy() {
-        run_fused_vs_legacy_fixture("tiny");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn head_v_dim_rms_norm_gated_fused_matches_legacy() {
-        run_fused_vs_legacy_fixture("head_v_dim");
-    }
-
-    // ─── Phase 3b.5.d: gated_delta_step kernel parity ───────────────────────
-    //
-    // Fixtures produced by `scripts/generate_gated_delta_fixture.py` (magic
-    // `TQGD`). Both Python reference and Rust call the *same* runtime-compiled
-    // Metal kernel from the same source string, so the comparison must be
-    // bit-identical.
-
-    use super::imp::gated_delta_step_kernel;
-
-    const SSM_KERNEL_MAGIC: &[u8; 4] = b"TQGD";
-    const SSM_KERNEL_HEADER_LEN: usize = 4 /* magic */ + 6 * 4 /* 6 u32 */;
-
-    struct GatedDeltaFixture {
-        batch: usize,
-        seq: usize,
-        n_k_heads: usize,
-        n_v_heads: usize,
-        head_k_dim: usize,
-        head_v_dim: usize,
-        q: Vec<f32>,
-        k: Vec<f32>,
-        v: Vec<f32>,
-        g: Vec<f32>,
-        beta: Vec<f32>,
-        state_in: Vec<f32>,
-        expected_y: Vec<f32>,
-        expected_state: Vec<f32>,
-    }
-
-    fn load_gated_delta_fixture(name: &str) -> Option<GatedDeltaFixture> {
-        let path = fixture_dir().join(format!("embed_gated_delta_{name}.bin"));
-        let bytes = std::fs::read(&path).ok()?;
-        if bytes.len() < SSM_KERNEL_HEADER_LEN || &bytes[..4] != SSM_KERNEL_MAGIC {
-            panic!("gated_delta fixture {path:?} has bad header");
-        }
-        let batch = read_u32_le(&bytes, 4) as usize;
-        let seq = read_u32_le(&bytes, 8) as usize;
-        let n_k_heads = read_u32_le(&bytes, 12) as usize;
-        let n_v_heads = read_u32_le(&bytes, 16) as usize;
-        let head_k_dim = read_u32_le(&bytes, 20) as usize;
-        let head_v_dim = read_u32_le(&bytes, 24) as usize;
-
-        let q_count = batch * seq * n_k_heads * head_k_dim;
-        let v_count = batch * seq * n_v_heads * head_v_dim;
-        let gbeta_count = batch * seq * n_v_heads;
-        let state_count = batch * n_v_heads * head_v_dim * head_k_dim;
-
-        let mut cur = SSM_KERNEL_HEADER_LEN;
-        let q = slice_f32(&bytes[cur..cur + q_count * 4]);
-        cur += q_count * 4;
-        let k = slice_f32(&bytes[cur..cur + q_count * 4]);
-        cur += q_count * 4;
-        let v = slice_f32(&bytes[cur..cur + v_count * 4]);
-        cur += v_count * 4;
-        let g = slice_f32(&bytes[cur..cur + gbeta_count * 4]);
-        cur += gbeta_count * 4;
-        let beta = slice_f32(&bytes[cur..cur + gbeta_count * 4]);
-        cur += gbeta_count * 4;
-        let state_in = slice_f32(&bytes[cur..cur + state_count * 4]);
-        cur += state_count * 4;
-        let expected_y = slice_f32(&bytes[cur..cur + v_count * 4]);
-        cur += v_count * 4;
-        let expected_state = slice_f32(&bytes[cur..cur + state_count * 4]);
-
-        Some(GatedDeltaFixture {
-            batch,
-            seq,
-            n_k_heads,
-            n_v_heads,
-            head_k_dim,
-            head_v_dim,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            state_in,
-            expected_y,
-            expected_state,
-        })
-    }
-
-    fn run_gated_delta_fixture(name: &str) {
-        let Some(fx) = load_gated_delta_fixture(name) else {
-            eprintln!(
-                "SKIP gated_delta/{name}: fixture missing under {}. Run `python scripts/generate_gated_delta_fixture.py` first.",
-                fixture_dir().display()
-            );
-            return;
-        };
-
-        let q = Array::from_slice(
-            &fx.q,
-            &[
-                fx.batch as i32,
-                fx.seq as i32,
-                fx.n_k_heads as i32,
-                fx.head_k_dim as i32,
-            ],
-        );
-        let k = Array::from_slice(
-            &fx.k,
-            &[
-                fx.batch as i32,
-                fx.seq as i32,
-                fx.n_k_heads as i32,
-                fx.head_k_dim as i32,
-            ],
-        );
-        let v = Array::from_slice(
-            &fx.v,
-            &[
-                fx.batch as i32,
-                fx.seq as i32,
-                fx.n_v_heads as i32,
-                fx.head_v_dim as i32,
-            ],
-        );
-        let g = Array::from_slice(
-            &fx.g,
-            &[fx.batch as i32, fx.seq as i32, fx.n_v_heads as i32],
-        );
-        let beta = Array::from_slice(
-            &fx.beta,
-            &[fx.batch as i32, fx.seq as i32, fx.n_v_heads as i32],
-        );
-        let state_in = Array::from_slice(
-            &fx.state_in,
-            &[
-                fx.batch as i32,
-                fx.n_v_heads as i32,
-                fx.head_v_dim as i32,
-                fx.head_k_dim as i32,
-            ],
-        );
-
-        let (y, state_out) = gated_delta_step_kernel(&q, &k, &v, &g, &beta, &state_in)
-            .expect("gated_delta_step_kernel must succeed");
-
-        assert_eq!(
-            y.shape(),
-            &[
-                fx.batch as i32,
-                fx.seq as i32,
-                fx.n_v_heads as i32,
-                fx.head_v_dim as i32,
-            ],
-            "{name}: y shape mismatch"
-        );
-        assert_eq!(
-            state_out.shape(),
-            &[
-                fx.batch as i32,
-                fx.n_v_heads as i32,
-                fx.head_v_dim as i32,
-                fx.head_k_dim as i32,
-            ],
-            "{name}: state_out shape mismatch"
-        );
-        y.eval().expect("eval y must succeed");
-        state_out.eval().expect("eval state_out must succeed");
-
-        let observed_y: &[f32] = y.as_slice();
-        let observed_state: &[f32] = state_out.as_slice();
-
-        assert_eq!(observed_y.len(), fx.expected_y.len(), "{name}: y flat-size");
-        assert_eq!(
-            observed_state.len(),
-            fx.expected_state.len(),
-            "{name}: state flat-size"
-        );
-
-        let mut y_mismatches = 0usize;
-        for (i, (&got, &expected)) in observed_y.iter().zip(fx.expected_y.iter()).enumerate() {
-            if got.to_bits() != expected.to_bits() {
-                if y_mismatches < 5 {
-                    eprintln!(
-                        "gated_delta/{name}.y[{i}]: 0x{:08x} ({got}) vs ref 0x{:08x} ({expected})",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                y_mismatches += 1;
-            }
-        }
-        assert_eq!(y_mismatches, 0, "{name}: {y_mismatches} y mismatches");
-
-        let mut state_mismatches = 0usize;
-        for (i, (&got, &expected)) in observed_state
-            .iter()
-            .zip(fx.expected_state.iter())
-            .enumerate()
-        {
-            if got.to_bits() != expected.to_bits() {
-                if state_mismatches < 5 {
-                    eprintln!(
-                        "gated_delta/{name}.state[{i}]: 0x{:08x} ({got}) vs ref 0x{:08x} ({expected})",
-                        got.to_bits(),
-                        expected.to_bits()
-                    );
-                }
-                state_mismatches += 1;
-            }
-        }
-        assert_eq!(
-            state_mismatches, 0,
-            "{name}: {state_mismatches} state mismatches"
-        );
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn tiny_gated_delta_kernel_matches_mlx() {
-        run_gated_delta_fixture("tiny");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn multi_head_gated_delta_kernel_matches_mlx() {
-        run_gated_delta_fixture("multi_head");
-    }
-
-    #[test]
-    #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
-    fn decode_q1_gated_delta_kernel_matches_mlx() {
-        run_gated_delta_fixture("decode_q1");
-    }
-}
-
 #[cfg(all(test, feature = "mlx-native"))]
 mod capture_kernel_tests {
     use super::imp::{gated_delta_step_kernel, gated_delta_step_kernel_capture};
     use mlx_rs::{Array, Dtype};
 
-    fn mk(n: usize, seed: f32) -> Vec<f32> {
+    /// Deterministic inputs in [-0.5, 0.5]: `sin((i + 1) * seed) / 2`.
+    pub(super) fn mk(n: usize, seed: f32) -> Vec<f32> {
         (0..n)
             .map(|i| ((i as f32 + 1.0) * seed).sin() * 0.5)
             .collect()
     }
+    /// Computed on the GPU, whose `max` propagates NaN, so a NaN output fails
+    /// the bit-identity checks below. `fused_kernel_tests` has its own,
+    /// host-side one for its tolerance checks.
     fn max_abs_diff(a: &Array, b: &Array) -> f32 {
         let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
         let m = d.max(None).unwrap().as_dtype(Dtype::Float32).unwrap();
@@ -1461,19 +842,13 @@ mod capture_kernel_tests {
 }
 
 // Every run-time kernel in this file has to run in a test with no fixture, in
-// f32 and in the bf16 the models use: the parity tests above need dumps from
-// the deleted lumen-metal crate and skip without them, and `cargo xtask test`'s
-// macOS 14 pass (Metal 3.1) only checks instantiations a test actually runs.
+// f32 and in the bf16 the models use: `cargo xtask test`'s macOS 14 pass
+// (Metal 3.1) only checks instantiations a test actually runs.
 #[cfg(all(test, feature = "mlx-native"))]
 mod fused_kernel_tests {
+    use super::capture_kernel_tests::mk;
     use super::imp::{inproj_tail_fused, rms_norm_gated_fused, rms_norm_gated_legacy};
     use mlx_rs::{Array, Dtype};
-
-    fn mk(n: usize, seed: f32) -> Vec<f32> {
-        (0..n)
-            .map(|i| ((i as f32 + 1.0) * seed).sin() * 0.5)
-            .collect()
-    }
 
     fn values(a: &Array) -> Vec<f32> {
         let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();

@@ -31,162 +31,21 @@
 
 #[cfg(feature = "mlx-native")]
 mod imp {
-    use std::collections::HashMap;
     use std::path::Path;
 
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result, bail};
     use mlx_rs::Array;
 
     use crate::ops::conv2d::conv2d;
     use crate::ops::groupnorm::group_norm;
     use crate::ops::linear::linear;
     use crate::ops::silu::silu;
+    use crate::weights::Weights;
 
     const NUM_GROUPS: i32 = 32;
     const EPS: f32 = 1e-6;
     /// BatchNorm eps for the packed-latent denorm (mflux `Flux2BatchNormStats`).
     const BN_EPS: f32 = 1e-4;
-
-    // ── safetensors loader ────────────────────────────────────────────────────
-
-    struct TensorMeta {
-        dtype: String,
-        shape: Vec<i32>,
-        start: usize,
-        end: usize,
-    }
-
-    /// A loaded safetensors blob: JSON header metadata + raw tensor bytes.
-    pub struct SafeTensors {
-        metas: HashMap<String, TensorMeta>,
-        data_start: usize,
-        blob: Vec<u8>,
-    }
-
-    impl SafeTensors {
-        /// Parse `8-byte LE header length + JSON header + tensor bytes`.
-        pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-            let blob = std::fs::read(path.as_ref())
-                .with_context(|| format!("reading safetensors {:?}", path.as_ref()))?;
-            if blob.len() < 8 {
-                bail!("safetensors file too short");
-            }
-            let hlen = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
-            let header_end = 8 + hlen;
-            if blob.len() < header_end {
-                bail!("safetensors header length {hlen} exceeds file size");
-            }
-            let header: serde_json::Value = serde_json::from_slice(&blob[8..header_end])
-                .context("parsing safetensors JSON header")?;
-            let obj = header
-                .as_object()
-                .ok_or_else(|| anyhow!("safetensors header is not an object"))?;
-
-            let mut metas = HashMap::new();
-            for (name, v) in obj {
-                if name == "__metadata__" {
-                    continue;
-                }
-                let dtype = v
-                    .get("dtype")
-                    .and_then(|d| d.as_str())
-                    .ok_or_else(|| anyhow!("tensor {name} missing dtype"))?
-                    .to_string();
-                let shape: Vec<i32> = v
-                    .get("shape")
-                    .and_then(|s| s.as_array())
-                    .ok_or_else(|| anyhow!("tensor {name} missing shape"))?
-                    .iter()
-                    .map(|d| d.as_i64().map(|x| x as i32))
-                    .collect::<Option<_>>()
-                    .ok_or_else(|| anyhow!("tensor {name} shape not all ints"))?;
-                let offs = v
-                    .get("data_offsets")
-                    .and_then(|o| o.as_array())
-                    .ok_or_else(|| anyhow!("tensor {name} missing data_offsets"))?;
-                let start = offs[0].as_u64().unwrap() as usize;
-                let end = offs[1].as_u64().unwrap() as usize;
-                metas.insert(
-                    name.clone(),
-                    TensorMeta {
-                        dtype,
-                        shape,
-                        start,
-                        end,
-                    },
-                );
-            }
-
-            Ok(Self {
-                metas,
-                data_start: header_end,
-                blob,
-            })
-        }
-
-        pub fn has(&self, name: &str) -> bool {
-            self.metas.contains_key(name)
-        }
-
-        /// Load a tensor as an f32 [`Array`] in its native (PyTorch) shape.
-        fn raw(&self, name: &str) -> Result<Array> {
-            let m = self
-                .metas
-                .get(name)
-                .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
-            let bytes = &self.blob[self.data_start + m.start..self.data_start + m.end];
-            let data: Vec<f32> = match m.dtype.as_str() {
-                "BF16" => {
-                    if !bytes.len().is_multiple_of(2) {
-                        bail!("BF16 tensor {name} has odd byte length");
-                    }
-                    bytes
-                        .chunks_exact(2)
-                        .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                        .collect()
-                }
-                "F32" => bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                "F16" => bytes
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect(),
-                other => bail!("unsupported dtype {other} for tensor {name}"),
-            };
-            Ok(Array::from_slice(&data, &m.shape))
-        }
-
-        /// Conv weight: PyTorch `[Cout,Cin,kH,kW]` → mlx `[Cout,kH,kW,Cin]`.
-        fn conv_weight(&self, name: &str) -> Result<Array> {
-            let w = self.raw(name)?;
-            let w = w
-                .transpose_axes(&[0, 2, 3, 1])
-                .with_context(|| format!("conv weight transpose {name}"))?;
-            w.eval()
-                .with_context(|| format!("eval conv weight {name}"))?;
-            Ok(w)
-        }
-
-        /// Linear weight: diffusers `[out,in]` → mlx `[in,out]` for `matmul`.
-        fn linear_weight(&self, name: &str) -> Result<Array> {
-            let w = self.raw(name)?;
-            let w = w
-                .transpose_axes(&[1, 0])
-                .with_context(|| format!("linear weight transpose {name}"))?;
-            w.eval()
-                .with_context(|| format!("eval linear weight {name}"))?;
-            Ok(w)
-        }
-
-        /// 1-D vector (bias / norm weight) loaded as-is.
-        fn vec(&self, name: &str) -> Result<Array> {
-            let v = self.raw(name)?;
-            v.eval().with_context(|| format!("eval vec {name}"))?;
-            Ok(v)
-        }
-    }
 
     // ── weight bundles ────────────────────────────────────────────────────────
 
@@ -196,7 +55,7 @@ mod imp {
     }
 
     impl ConvW {
-        fn load(st: &SafeTensors, prefix: &str) -> Result<Self> {
+        fn load(st: &Weights, prefix: &str) -> Result<Self> {
             Ok(Self {
                 weight: st.conv_weight(&format!("{prefix}.weight"))?,
                 bias: st.vec(&format!("{prefix}.bias"))?,
@@ -210,7 +69,7 @@ mod imp {
     }
 
     impl NormW {
-        fn load(st: &SafeTensors, prefix: &str) -> Result<Self> {
+        fn load(st: &Weights, prefix: &str) -> Result<Self> {
             Ok(Self {
                 weight: st.vec(&format!("{prefix}.weight"))?,
                 bias: st.vec(&format!("{prefix}.bias"))?,
@@ -229,7 +88,7 @@ mod imp {
     }
 
     impl ResnetW {
-        fn load(st: &SafeTensors, prefix: &str, c_in: i32, c_out: i32) -> Result<Self> {
+        fn load(st: &Weights, prefix: &str, c_in: i32, c_out: i32) -> Result<Self> {
             let shortcut = if c_in != c_out {
                 Some(ConvW::load(st, &format!("{prefix}.conv_shortcut"))?)
             } else {
@@ -253,7 +112,7 @@ mod imp {
     }
 
     impl LinearW {
-        fn load(st: &SafeTensors, prefix: &str) -> Result<Self> {
+        fn load(st: &Weights, prefix: &str) -> Result<Self> {
             Ok(Self {
                 weight: st.linear_weight(&format!("{prefix}.weight"))?,
                 bias: st.vec(&format!("{prefix}.bias"))?,
@@ -270,7 +129,7 @@ mod imp {
     }
 
     impl AttnW {
-        fn load(st: &SafeTensors, prefix: &str, _channels: i32) -> Result<Self> {
+        fn load(st: &Weights, prefix: &str, _channels: i32) -> Result<Self> {
             Ok(Self {
                 group_norm: NormW::load(st, &format!("{prefix}.group_norm"))?,
                 to_q: LinearW::load(st, &format!("{prefix}.to_q"))?,
@@ -305,7 +164,7 @@ mod imp {
         /// Load all decoder + `post_quant_conv` weights from a diffusers
         /// `safetensors` file.
         pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-            let st = SafeTensors::load(path)?;
+            let st = Weights::open_file(path)?;
 
             // reversed block_out_channels = [512, 512, 256, 128]
             let block_io: [(i32, i32); 4] = [(512, 512), (512, 512), (512, 256), (256, 128)];
@@ -581,51 +440,14 @@ mod imp {
 }
 
 #[cfg(feature = "mlx-native")]
-pub use imp::{SafeTensors, VaeDecoder};
+pub use imp::VaeDecoder;
 
 // ── parity test against the numpy golden reference (/tmp/vae_*.bin) ───────────
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::VaeDecoder;
+    use crate::test_util::{cf_to_cl, klein_vae_path, read_f32_bin};
     use mlx_rs::Array;
-
-    // Klein VAE, resolved from the local HF cache (shared dev/klein FLUX.2 VAE).
-    fn vae_path() -> std::path::PathBuf {
-        crate::hf_cache::snapshot_path_or_rel(
-            crate::repos::VAE,
-            "vae/diffusion_pytorch_model.safetensors",
-        )
-    }
-
-    /// Reorder a channels-first `[B,C,H,W]` flat buffer into channels-last
-    /// `[B,H,W,C]` flat order — pure index math, so we never have to materialize
-    /// a transposed mlx array (mlx `as_slice` reads the physical buffer and
-    /// ignores a lazy transpose's strides). The native decoder output is already
-    /// contiguous channels-last, so comparing in channels-last space is exact.
-    fn cf_to_cl(cf: &[f32], b: usize, c: usize, h: usize, w: usize) -> Vec<f32> {
-        let mut out = vec![0.0f32; cf.len()];
-        for bi in 0..b {
-            for ci in 0..c {
-                for hi in 0..h {
-                    for wi in 0..w {
-                        let src = ((bi * c + ci) * h + hi) * w + wi;
-                        let dst = ((bi * h + hi) * w + wi) * c + ci;
-                        out[dst] = cf[src];
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not f32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
 
     /// Compare a native channels-last `[B,H,W,C]` array against a channels-first
     /// reference bin, in channels-last space (no mlx transpose involved).
@@ -669,7 +491,7 @@ mod parity_tests {
         let latent = Array::from_slice(&latent_cf, &[1, 32, 16, 16]);
         let latent_cl = latent.transpose_axes(&[0, 2, 3, 1]).unwrap();
         latent_cl.eval().unwrap();
-        let decoder = VaeDecoder::load(vae_path()).expect("load VAE weights");
+        let decoder = VaeDecoder::load(klein_vae_path()).expect("load VAE weights");
         let (a, b, c) = decoder.decode_debug_stages(&latent_cl).unwrap();
         cmp_chlast_vs_cf(
             "after_conv_in",
@@ -720,7 +542,7 @@ mod parity_tests {
             .expect("latent transpose to channels-last");
         latent_cl.eval().expect("eval latent");
 
-        let decoder = VaeDecoder::load(vae_path()).expect("load VAE weights");
+        let decoder = VaeDecoder::load(klein_vae_path()).expect("load VAE weights");
         let out_cl = decoder.decode(&latent_cl).expect("decode"); // [1,128,128,3]
         assert_eq!(
             out_cl.shape(),

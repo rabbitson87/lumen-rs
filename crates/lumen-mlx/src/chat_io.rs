@@ -97,6 +97,20 @@ pub struct AssistantToolCall<'a> {
     pub arguments: &'a JsonValue,
 }
 
+/// What a chat request renders its prompt from: the flat `(role, content)`
+/// pairs, or the structured turns a tool-history request needs.
+///
+/// Lets one route carry either shape to the point where they genuinely differ
+/// — the renderer, the prefix-cache key, the cached head — instead of keeping a
+/// twin of the whole route per shape. It never converts one into the other:
+/// the two render differently and key the cache differently, so a flat request
+/// is not a one-turn history.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PromptSource<'m, 't> {
+    Flat(&'m [(String, String)]),
+    History(&'m [ChatTurn<'t>]),
+}
+
 /// Phase 1.6c: streaming events emitted from the backend's decode loop
 /// up to the engine. Replaces the old `Fn(&str)` text-only callback so
 /// backends can also signal "I just parsed the name of a tool call"

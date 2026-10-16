@@ -37,6 +37,7 @@
 //! them enabled is slower by roughly an order of magnitude on the GPU
 //! harnesses; a run without them says nothing about buffer bounds.
 
+use crate::repo_root;
 use std::process::{Command, ExitCode};
 
 const FEATURES: &str = "lumen-mlx/mlx-native";
@@ -53,15 +54,7 @@ const VALIDATION_ENV: &[(&str, &str)] = &[
 /// Where `lumen_testkit::cases` accumulates. Truncated before the run so the
 /// count reflects this run and not every run since the last `cargo clean`.
 fn cases_file() -> std::path::PathBuf {
-    workspace_root()
-        .join("target")
-        .join("effective-cases.jsonl")
-}
-
-/// The repository root, whatever directory `cargo xtask` was run from.
-fn workspace_root() -> std::path::PathBuf {
-    let xtask = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    xtask.parent().unwrap_or(xtask).to_path_buf()
+    repo_root().join("target").join("effective-cases.jsonl")
 }
 
 /// Sum of the `n` fields written during the run, with the largest contributors.
@@ -225,7 +218,7 @@ fn oldest_metal_kernel_pass(validate: bool) -> bool {
             return false;
         }
     };
-    let root = workspace_root();
+    let root = repo_root();
     let mut names: Vec<String> = Vec::new();
     let mut untested: Vec<String> = Vec::new();
     let mut declared: Vec<String> = Vec::new();
@@ -405,7 +398,7 @@ fn declared_kernels(src: &str) -> Result<Vec<String>, String> {
 /// untracked ones included, so a new kernel is checked before it is staged.
 fn kernel_files() -> Result<Vec<String>, String> {
     let out = Command::new("git")
-        .current_dir(workspace_root())
+        .current_dir(repo_root())
         .args([
             "grep",
             "-l",

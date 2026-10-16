@@ -38,38 +38,12 @@ mod imp {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result};
     use mlx_rs::Array;
 
-    use crate::ops::linear_nobias::linear_nobias;
-    use crate::ops::qlinear::{BITS, GROUP_SIZE, QuantLinear, qlinear};
+    use crate::ops::qlinear::{BITS, GROUP_SIZE, Linear};
     use crate::ops::silu::silu;
-
-    // ── linear (mlx affine-quantized 4-bit OR dense BF16) ─────────────────────
-    //
-    // Mirrors `crate::dit::Linear`: the 4-bit encoder stores each projection as
-    // a packed `{weight,scales,biases}` triple; the bf16 encoder stores a single
-    // dense `[out,in]` BF16 weight (already transposed to `[in,out]` at load).
-    // A single [`linear`] dispatch hides the difference so the forward pass is
-    // byte-identical for the 4-bit path and correct for the bf16 path.
-
-    /// One Mistral projection: mlx affine 4-bit packed, or dense BF16.
-    enum Linear {
-        /// mlx affine 4-bit packed `{weight,scales,biases}` (applied via `qlinear`).
-        Quant(QuantLinear),
-        /// Dense `[in,out]` BF16 weight (already transposed) — `matmul(x, w)`.
-        Dense(Array),
-    }
-
-    /// Apply a [`Linear`]: quantized → `qlinear` (unchanged 4-bit path), dense →
-    /// bias-free `x @ Wᵀ`.
-    #[inline]
-    fn linear(x: &Array, l: &Linear) -> Result<Array> {
-        match l {
-            Linear::Quant(q) => qlinear(x, q),
-            Linear::Dense(w) => linear_nobias(x, w),
-        }
-    }
+    use crate::weights::Weights;
 
     // ── model config ──────────────────────────────────────────────────────────
     pub const HIDDEN: i32 = 5120;
@@ -87,222 +61,6 @@ mod imp {
     /// (40 → 30 layers), enabling encoder + DiT co-residence on a 36 GB Mac.
     /// = `max(CAPTURE_LAYERS)`.
     pub const LOAD_LAYERS: usize = 30;
-
-    // ── sharded safetensors loader ──────────────────────────────────────────────
-
-    struct TensorMeta {
-        dtype: String,
-        shape: Vec<i32>,
-        start: usize,
-        end: usize,
-    }
-
-    /// One safetensors shard: parsed JSON header + raw tensor bytes.
-    struct Shard {
-        metas: HashMap<String, TensorMeta>,
-        data_start: usize,
-        blob: Vec<u8>,
-    }
-
-    impl Shard {
-        fn load(path: impl AsRef<Path>) -> Result<Self> {
-            let blob = std::fs::read(path.as_ref())
-                .with_context(|| format!("reading shard {:?}", path.as_ref()))?;
-            if blob.len() < 8 {
-                bail!("safetensors shard too short");
-            }
-            let hlen = u64::from_le_bytes(blob[0..8].try_into().unwrap()) as usize;
-            let header_end = 8 + hlen;
-            if blob.len() < header_end {
-                bail!("safetensors header length {hlen} exceeds shard size");
-            }
-            let header: serde_json::Value = serde_json::from_slice(&blob[8..header_end])
-                .context("parsing safetensors JSON header")?;
-            let obj = header
-                .as_object()
-                .ok_or_else(|| anyhow!("safetensors header is not an object"))?;
-            let mut metas = HashMap::new();
-            for (name, v) in obj {
-                if name == "__metadata__" {
-                    continue;
-                }
-                let dtype = v
-                    .get("dtype")
-                    .and_then(|d| d.as_str())
-                    .ok_or_else(|| anyhow!("tensor {name} missing dtype"))?
-                    .to_string();
-                let shape: Vec<i32> = v
-                    .get("shape")
-                    .and_then(|s| s.as_array())
-                    .ok_or_else(|| anyhow!("tensor {name} missing shape"))?
-                    .iter()
-                    .map(|d| d.as_i64().map(|x| x as i32))
-                    .collect::<Option<_>>()
-                    .ok_or_else(|| anyhow!("tensor {name} shape not all ints"))?;
-                let offs = v
-                    .get("data_offsets")
-                    .and_then(|o| o.as_array())
-                    .ok_or_else(|| anyhow!("tensor {name} missing data_offsets"))?;
-                let start = offs[0].as_u64().unwrap() as usize;
-                let end = offs[1].as_u64().unwrap() as usize;
-                metas.insert(
-                    name.clone(),
-                    TensorMeta {
-                        dtype,
-                        shape,
-                        start,
-                        end,
-                    },
-                );
-            }
-            Ok(Self {
-                metas,
-                data_start: header_end,
-                blob,
-            })
-        }
-
-        fn bytes(&self, m: &TensorMeta) -> &[u8] {
-            &self.blob[self.data_start + m.start..self.data_start + m.end]
-        }
-    }
-
-    /// All shards of a model + the key→shard map from `index.json`.
-    pub struct ShardedModel {
-        shards: Vec<Shard>,
-        /// tensor name → index into `shards`.
-        key_shard: HashMap<String, usize>,
-    }
-
-    impl ShardedModel {
-        /// Load every shard referenced by `<dir>/model.safetensors.index.json`.
-        pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
-            let dir = dir.as_ref();
-            let index_path = dir.join("model.safetensors.index.json");
-            let index: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&index_path)
-                    .with_context(|| format!("reading index {index_path:?}"))?,
-            )
-            .context("parsing model.safetensors.index.json")?;
-            let weight_map = index
-                .get("weight_map")
-                .and_then(|m| m.as_object())
-                .ok_or_else(|| anyhow!("index.json missing weight_map"))?;
-
-            // Distinct shard filenames in deterministic order.
-            let mut shard_files: Vec<String> = weight_map
-                .values()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            shard_files.sort();
-            shard_files.dedup();
-
-            let mut file_index: HashMap<String, usize> = HashMap::new();
-            let mut shards = Vec::with_capacity(shard_files.len());
-            for (i, f) in shard_files.iter().enumerate() {
-                shards.push(Shard::load(dir.join(f))?);
-                file_index.insert(f.clone(), i);
-            }
-
-            let mut key_shard = HashMap::new();
-            for (k, v) in weight_map {
-                if let Some(f) = v.as_str()
-                    && let Some(&si) = file_index.get(f)
-                {
-                    key_shard.insert(k.clone(), si);
-                }
-            }
-            Ok(Self { shards, key_shard })
-        }
-
-        /// True iff a tensor with this exact name exists in any shard.
-        fn has(&self, name: &str) -> bool {
-            self.key_shard.contains_key(name)
-        }
-
-        fn meta(&self, name: &str) -> Result<(&Shard, &TensorMeta)> {
-            let &si = self
-                .key_shard
-                .get(name)
-                .ok_or_else(|| anyhow!("tensor not in index: {name}"))?;
-            let shard = &self.shards[si];
-            let m = shard
-                .metas
-                .get(name)
-                .ok_or_else(|| anyhow!("tensor not found in shard: {name}"))?;
-            Ok((shard, m))
-        }
-
-        /// Load a `U32` packed tensor as-is (shape preserved). Used for the
-        /// packed 4-bit quantized weight matrices.
-        fn u32_tensor(&self, name: &str) -> Result<Array> {
-            let (shard, m) = self.meta(name)?;
-            if m.dtype != "U32" {
-                bail!("expected U32 for {name}, got {}", m.dtype);
-            }
-            let bytes = shard.bytes(m);
-            let data: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            Ok(Array::from_slice(&data, &m.shape))
-        }
-
-        /// Load a `BF16` (or `F16`/`F32`) tensor as an f32 [`Array`].
-        fn f32_tensor(&self, name: &str) -> Result<Array> {
-            let (shard, m) = self.meta(name)?;
-            let bytes = shard.bytes(m);
-            let data: Vec<f32> = match m.dtype.as_str() {
-                "BF16" => bytes
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect(),
-                "F16" => bytes
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                    .collect(),
-                "F32" => bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                other => bail!("unsupported dtype {other} for {name}"),
-            };
-            Ok(Array::from_slice(&data, &m.shape))
-        }
-
-        /// Load a quantized linear's `{weight,scales,biases}` triple.
-        fn qlinear(&self, prefix: &str) -> Result<QuantLinear> {
-            Ok(QuantLinear {
-                weight: self.u32_tensor(&format!("{prefix}.weight"))?,
-                scales: self.f32_tensor(&format!("{prefix}.scales"))?,
-                biases: self.f32_tensor(&format!("{prefix}.biases"))?,
-            })
-        }
-
-        /// Load a dense BF16 weight `[out, in]` and transpose once to `[in, out]`
-        /// so it can be applied as `matmul(x, w)` (bias-free `x @ Wᵀ`). Evaluated
-        /// to bound the lazy graph at load (mirrors `dit::SafeTensors::linw`).
-        fn dense_weight(&self, prefix: &str) -> Result<Array> {
-            let w = self
-                .f32_tensor(&format!("{prefix}.weight"))?
-                .transpose_axes(&[1, 0])
-                .with_context(|| format!("transpose dense weight {prefix}"))?;
-            w.eval()
-                .with_context(|| format!("eval dense weight {prefix}"))?;
-            Ok(w)
-        }
-
-        /// A projection: mlx affine 4-bit (iff a `<prefix>.scales` sibling
-        /// exists) else dense BF16. The auto-detect makes `MistralEncoder::load`
-        /// work for BOTH the 4-bit and bf16 encoder dirs.
-        fn linear(&self, prefix: &str) -> Result<Linear> {
-            if self.has(&format!("{prefix}.scales")) {
-                Ok(Linear::Quant(self.qlinear(prefix)?))
-            } else {
-                Ok(Linear::Dense(self.dense_weight(prefix)?))
-            }
-        }
-    }
 
     // ── weight bundles ──────────────────────────────────────────────────────────
 
@@ -334,7 +92,7 @@ mod imp {
         /// (`black-forest-labs/FLUX.2-dev/text_encoder/`, sharded BF16) — the
         /// quantized/dense choice is per-tensor by `.scales` presence.
         pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
-            let m = ShardedModel::load(dir)?;
+            let m = Weights::open_sharded(dir)?;
             let pfx = "language_model.model";
 
             // Embedding table → [vocab, hidden] f32. 4-bit: dequantize the
@@ -342,13 +100,13 @@ mod imp {
             // already the [vocab,hidden] table — load it as-is (no dequant).
             // `embed` gathers rows by token id from whichever form.
             let embed_table = if m.has(&format!("{pfx}.embed_tokens.scales")) {
-                let embed_w = m.u32_tensor(&format!("{pfx}.embed_tokens.weight"))?;
-                let embed_s = m.f32_tensor(&format!("{pfx}.embed_tokens.scales"))?;
-                let embed_b = m.f32_tensor(&format!("{pfx}.embed_tokens.biases"))?;
+                let embed_w = m.u32(&format!("{pfx}.embed_tokens.weight"))?;
+                let embed_s = m.f32(&format!("{pfx}.embed_tokens.scales"))?;
+                let embed_b = m.f32(&format!("{pfx}.embed_tokens.biases"))?;
                 mlx_rs::ops::dequantize(&embed_w, &embed_s, &embed_b, GROUP_SIZE, BITS)
                     .context("dequantize embed_tokens")?
             } else {
-                m.f32_tensor(&format!("{pfx}.embed_tokens.weight"))
+                m.f32(&format!("{pfx}.embed_tokens.weight"))
                     .context("load dense bf16 embed_tokens")?
             };
             embed_table.eval().context("eval embed_table")?;
@@ -360,13 +118,13 @@ mod imp {
             for li in 0..LOAD_LAYERS {
                 let lp = format!("{pfx}.layers.{li}");
                 layers.push(LayerW {
-                    input_layernorm: m.f32_tensor(&format!("{lp}.input_layernorm.weight"))?,
+                    input_layernorm: m.f32(&format!("{lp}.input_layernorm.weight"))?,
                     q_proj: m.linear(&format!("{lp}.self_attn.q_proj"))?,
                     k_proj: m.linear(&format!("{lp}.self_attn.k_proj"))?,
                     v_proj: m.linear(&format!("{lp}.self_attn.v_proj"))?,
                     o_proj: m.linear(&format!("{lp}.self_attn.o_proj"))?,
                     post_attention_layernorm: m
-                        .f32_tensor(&format!("{lp}.post_attention_layernorm.weight"))?,
+                        .f32(&format!("{lp}.post_attention_layernorm.weight"))?,
                     gate_proj: m.linear(&format!("{lp}.mlp.gate_proj"))?,
                     up_proj: m.linear(&format!("{lp}.mlp.up_proj"))?,
                     down_proj: m.linear(&format!("{lp}.mlp.down_proj"))?,
@@ -426,9 +184,9 @@ mod imp {
                 let x = mlx_rs::fast::rms_norm(&h, &lw.input_layernorm, RMS_EPS)
                     .context("attn rms_norm")?;
 
-                let q = linear(&x, &lw.q_proj)?; // [1,T,4096]
-                let k = linear(&x, &lw.k_proj)?; // [1,T,1024]
-                let v = linear(&x, &lw.v_proj)?; // [1,T,1024]
+                let q = lw.q_proj.apply(&x)?; // [1,T,4096]
+                let k = lw.k_proj.apply(&x)?; // [1,T,1024]
+                let v = lw.v_proj.apply(&x)?; // [1,T,1024]
 
                 // [1,T,H,D] -> [1,H,T,D]
                 let q = q
@@ -456,17 +214,17 @@ mod imp {
                 let attn =
                     attn.transpose_axes(&[0, 2, 1, 3])?
                         .reshape(&[1, ti, N_HEADS * HEAD_DIM])?;
-                let attn = linear(&attn, &lw.o_proj)?; // [1,T,hidden]
+                let attn = lw.o_proj.apply(&attn)?; // [1,T,hidden]
                 h = r.add(&attn).context("attn residual add")?;
 
                 // ── SwiGLU MLP ──
                 let r2 = h.clone();
                 let x = mlx_rs::fast::rms_norm(&h, &lw.post_attention_layernorm, RMS_EPS)
                     .context("mlp rms_norm")?;
-                let g = silu(&linear(&x, &lw.gate_proj)?)?;
-                let u = linear(&x, &lw.up_proj)?;
+                let g = silu(&lw.gate_proj.apply(&x)?)?;
+                let u = lw.up_proj.apply(&x)?;
                 let gu = g.multiply(&u).context("swiglu gate*up")?;
-                let down = linear(&gu, &lw.down_proj)?;
+                let down = lw.down_proj.apply(&gu)?;
                 h = r2.add(&down).context("mlp residual add")?;
 
                 // Eval each layer's hidden to bound the lazy graph / memory.
@@ -520,24 +278,7 @@ pub use imp::{MistralEncoder, default_weights_dir};
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::MistralEncoder;
-
-    fn read_i32_bin(path: &str) -> Vec<i32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not i32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not f32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
+    use crate::test_util::{read_f32_bin, read_i32_bin};
 
     /// max-abs, mean-abs, cosine over the slice of `[T, D]` rows in
     /// `[row_lo, row_hi)` (real-token positions only).

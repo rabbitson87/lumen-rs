@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
     println!("--- D5a.1 smoke: native target-hidden capture ---");
     println!(
         "backend           = {}",
-        std::env::var("LUMEN_MLX_BACKEND").unwrap_or_else(|_| "(default = pyo3)".into())
+        std::env::var("LUMEN_MLX_BACKEND").unwrap_or_else(|_| "(default = native)".into())
     );
     println!("model             = {model_id}");
     println!("target_layer_ids  = {target_layer_ids:?}");

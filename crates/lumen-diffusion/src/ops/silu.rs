@@ -17,12 +17,12 @@ mod imp {
 }
 
 #[cfg(feature = "mlx-native")]
-#[allow(unused_imports)] // Consumed by the VAE decoder (Phase 0).
 pub use imp::silu;
 
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::silu;
+    use crate::test_util::assert_all_close;
     use mlx_rs::Array;
 
     /// silu(0)=0, silu(1)=1/(1+e^-1)=0.7310586, silu(-1)=-0.2689414,
@@ -33,13 +33,7 @@ mod parity_tests {
         let x = Array::from_slice(&[0.0f32, 1.0, -1.0, 2.0], &[4]);
         let out = silu(&x).expect("silu must succeed");
         out.eval().expect("mlx eval must succeed");
-        let observed: &[f32] = out.as_slice();
         let expected = [0.0f32, 0.7310586, -0.26894143, 1.7615942];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-5,
-                "silu[{i}]: got {got}, expected {exp}"
-            );
-        }
+        assert_all_close("silu", out.as_slice(), &expected, 1e-5);
     }
 }

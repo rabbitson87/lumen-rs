@@ -41,8 +41,8 @@ use std::ffi::CStr;
 use crate::native_attention::sdpa;
 use crate::native_cache::NativeKvCache;
 use crate::native_norm::rms_norm;
-use crate::native_quant::quantized_matmul_with_mode;
 use crate::native_rope::rope;
+use crate::qwen3_5_moe::ResolvedLinear;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config + weight bundles
@@ -70,26 +70,14 @@ pub struct Qwen35MtpDims {
     pub attn_output_gate: bool,
 }
 
-/// Pre-resolved (load-time) linear projection. Mirrors
-/// `qwen3_5_moe::ResolvedLinear` so MTP load paths can reuse the same
-/// dequant pipeline.
-pub struct Qwen35MtpLinear {
-    pub weight: Array,
-    pub scales: Array,
-    pub biases: Option<Array>,
-    pub group_size: i32,
-    pub bits: i32,
-    pub mode: &'static CStr,
-}
-
 /// Self-attention weights for the MTP layer. Layout matches the trunk's
 /// full-attn layer — `mtp.layers.0.self_attn.{q,k,v,o}_proj.weight` plus
 /// per-head q_norm / k_norm.
 pub struct Qwen35MtpAttnWeights {
-    pub q_proj: Qwen35MtpLinear,
-    pub k_proj: Qwen35MtpLinear,
-    pub v_proj: Qwen35MtpLinear,
-    pub o_proj: Qwen35MtpLinear,
+    pub q_proj: ResolvedLinear,
+    pub k_proj: ResolvedLinear,
+    pub v_proj: ResolvedLinear,
+    pub o_proj: ResolvedLinear,
     pub q_norm_weight: Array, // [head_dim]
     pub k_norm_weight: Array, // [head_dim]
 }
@@ -98,9 +86,9 @@ pub struct Qwen35MtpAttnWeights {
 ///
 /// 27B Qwen3.6 uses Dense in the MTP block (and in every trunk layer).
 pub struct Qwen35MtpDenseMlp {
-    pub gate_proj: Qwen35MtpLinear,
-    pub up_proj: Qwen35MtpLinear,
-    pub down_proj: Qwen35MtpLinear,
+    pub gate_proj: ResolvedLinear,
+    pub up_proj: ResolvedLinear,
+    pub down_proj: ResolvedLinear,
 }
 
 /// MoE MLP weights — `gate` router + per-expert switch_glu tiles + a dense
@@ -241,7 +229,7 @@ pub struct Qwen35MtpBlock {
     pub dims: Qwen35MtpDims,
     // ── MTP-specific projections + norms (pre-attention) ─────────────────
     /// `mtp.fc.weight` — [hidden, 2*hidden]. concat(e_norm,h_norm) -> hidden.
-    pub eh_proj: Qwen35MtpLinear,
+    pub eh_proj: ResolvedLinear,
     /// `mtp.pre_fc_norm_embedding.weight` — [hidden]
     pub enorm: Array,
     /// `mtp.pre_fc_norm_hidden.weight` — [hidden]
@@ -260,103 +248,6 @@ pub struct Qwen35MtpBlock {
     // shared_head_head is **always** the trunk's lm_head on Qwen3.6 —
     // the checkpoint never ships `mtp.shared_head_head.*`. Caller threads
     // the trunk's lm_head through `forward()`.
-}
-
-/// Which projection inside the MTP block a head-internal LoRA targets. Drives
-/// the position-expansion experiment (eh-only vs attention / MLP). PoC-only.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MtpLoraPos {
-    Eh,
-    Q,
-    K,
-    V,
-    O,
-    Gate,
-    Up,
-    Down,
-}
-
-impl MtpLoraPos {
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s.trim().to_ascii_lowercase().as_str() {
-            "eh" | "eh_proj" | "fc" => Self::Eh,
-            "q" | "q_proj" => Self::Q,
-            "k" | "k_proj" => Self::K,
-            "v" | "v_proj" => Self::V,
-            "o" | "o_proj" => Self::O,
-            "gate" | "gate_proj" => Self::Gate,
-            "up" | "up_proj" => Self::Up,
-            "down" | "down_proj" => Self::Down,
-            _ => return None,
-        })
-    }
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Eh => "eh",
-            Self::Q => "q",
-            Self::K => "k",
-            Self::V => "v",
-            Self::O => "o",
-            Self::Gate => "gate",
-            Self::Up => "up",
-            Self::Down => "down",
-        }
-    }
-}
-
-/// A set of optional rank-`r` LoRA factors, one per projection. The delta added
-/// to each projection's output is `y += (x · Aᵀ) · Bᵀ` with `A:[r, in]`,
-/// `B:[out, r]`; `None` leaves that projection frozen. Used ONLY by the
-/// head-internal training PoC (`forward_train_lora_multi`); the serving forward
-/// always passes `None`.
-#[derive(Default)]
-pub struct MtpLoraSet {
-    pub eh_proj: Option<(Array, Array)>,
-    pub q: Option<(Array, Array)>,
-    pub k: Option<(Array, Array)>,
-    pub v: Option<(Array, Array)>,
-    pub o: Option<(Array, Array)>,
-    pub gate: Option<(Array, Array)>,
-    pub up: Option<(Array, Array)>,
-    pub down: Option<(Array, Array)>,
-}
-
-/// Config for the head-internal MTP LoRA training PoC. `positions` selects the
-/// projections that receive a LoRA; `kl` switches the objective from CE-to-
-/// argmax to top-`topk` distillation KL against the trunk's verify distribution.
-#[derive(Clone)]
-pub struct HiTrainCfg {
-    pub rank: usize,
-    pub steps: usize,
-    pub lr: f32,
-    pub weight_decay: f32,
-    pub positions: Vec<MtpLoraPos>,
-    pub kl: bool,
-    pub topk: usize,
-    /// LoRA-init RNG seed. Vary to probe whether a marginal held-out lift is
-    /// seed-stable (real) or noise (flips sign across seeds).
-    pub seed: u64,
-}
-
-impl Default for HiTrainCfg {
-    fn default() -> Self {
-        Self {
-            rank: 8,
-            steps: 120,
-            lr: 0.02,
-            weight_decay: 0.0,
-            positions: vec![MtpLoraPos::Eh],
-            kl: false,
-            topk: 16,
-            seed: 1234,
-        }
-    }
-}
-
-/// `y += (x · Aᵀ) · Bᵀ` LoRA delta. x:[B,T,in] A:[r,in] B:[out,r] → [B,T,out].
-fn lora_delta(x: &Array, a: &Array, b: &Array) -> Result<Array> {
-    Ok(x.matmul(&a.transpose_axes(&[1, 0])?)?
-        .matmul(&b.transpose_axes(&[1, 0])?)?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +281,7 @@ impl Qwen35MtpBlock {
         cache: &mut NativeKvCache,
         causal: bool,
         trunk_final_norm_weight: &Array,
-        trunk_lm_head: &Qwen35MtpLinear,
+        trunk_lm_head: &ResolvedLinear,
     ) -> Result<(Array, Array)> {
         // ── shape sanity ─────────────────────────────────────────────────
         let e_shape = embeds.shape();
@@ -447,7 +338,8 @@ impl Qwen35MtpBlock {
         // ── (2) eh_proj: [2*hidden] -> [hidden] ──────────────────────────
         stat("concat", &concat);
         let mut cur = self
-            .linear_pre(&self.eh_proj, &concat)
+            .eh_proj
+            .apply(&concat)
             .context("Qwen35MtpBlock: eh_proj failed")?;
         cur = self.to_f32(cur, "eh_proj_out")?;
         stat("after_eh_proj", &cur);
@@ -490,8 +382,8 @@ impl Qwen35MtpBlock {
         };
         let norm_out = rms_norm(&cur, norm_w, eps).context("Qwen35MtpBlock: head norm failed")?;
         stat("norm_out", &norm_out);
-        let logits = self
-            .linear_pre(trunk_lm_head, &norm_out)
+        let logits = trunk_lm_head
+            .apply(&norm_out)
             .context("Qwen35MtpBlock: lm_head failed")?;
         stat("logits", &logits);
 
@@ -513,155 +405,6 @@ impl Qwen35MtpBlock {
         Ok((logits, chained_hidden))
     }
 
-    /// TRAINING forward for the head-internal C4 LoRA PoC (accept-lever probe).
-    ///
-    /// Identical math to [`forward`] but (a) adds a rank-`r` LoRA delta to the
-    /// `eh_proj` (mtp.fc) output — `cur += (concat·Aᵀ)·Bᵀ`, A`[r,2h]` B`[h,r]` —
-    /// so a `value_and_grad` over `(a, b)` trains a correction INSIDE the block
-    /// (gradients flow back through attention + MLP, unlike the dead frozen-hidden
-    /// lm_head-only C4); (b) uses a FRESH per-call KV cache so each calib row is
-    /// independent (k=0 draft: `[N, 1, hidden]`, self-attention only); (c) returns
-    /// only the logits. Frozen quantized weights in `self` are constants w.r.t.
-    /// the LoRA args. Autograd through the dense op chain proven by
-    /// `examples/mtp_autograd_probe.rs`. PoC-only; not on the serving path.
-    pub fn forward_train_lora(
-        &self,
-        embeds: &Array,
-        h_pre: &Array,
-        lora_a: &Array, // [r, 2*hidden]
-        lora_b: &Array, // [hidden, r]
-        trunk_final_norm_weight: &Array,
-        trunk_lm_head: &Qwen35MtpLinear,
-    ) -> Result<Array> {
-        let b = embeds.shape()[0];
-        let t = embeds.shape()[1];
-        let eps = self.dims.rms_norm_eps;
-
-        let e_n = rms_norm(embeds, &self.enorm, eps)?;
-        let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
-        let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
-
-        // eh_proj base (frozen quant) + LoRA delta.
-        let base = self.linear_pre(&self.eh_proj, &concat)?;
-        let base = self.to_f32(base, "eh_proj_out")?;
-        let lo = concat
-            .matmul(&lora_a.transpose_axes(&[1, 0])?)? // [B,T,r]
-            .matmul(&lora_b.transpose_axes(&[1, 0])?)?; // [B,T,hidden]
-        let mut cur = base.add(&lo)?;
-
-        // attention sub-block (fresh cache → each row is a standalone k=0 draft).
-        let mut cache = NativeKvCache::new();
-        let res_attn = cur.clone();
-        let cur_n = rms_norm(&cur, &self.input_layernorm, eps)?;
-        let attn_out = self.self_attention_forward(&cur_n, b, t, t > 1, &mut cache)?;
-        cur = mlx_rs::ops::add(&attn_out, &res_attn)?;
-
-        // MLP sub-block.
-        let res_ffn = cur.clone();
-        let cur_n = rms_norm(&cur, &self.post_attention_layernorm, eps)?;
-        let mlp_out = match &self.mlp {
-            Qwen35MtpMlp::Dense(d) => self.dense_mlp_forward(&cur_n, d)?,
-            Qwen35MtpMlp::Moe(m) => self.moe_mlp_forward(&cur_n, m)?,
-        };
-        cur = mlx_rs::ops::add(&mlp_out, &res_ffn)?;
-
-        // head norm + lm_head.
-        let norm_w = self
-            .shared_head_norm
-            .as_ref()
-            .unwrap_or(trunk_final_norm_weight);
-        let norm_out = rms_norm(&cur, norm_w, eps)?;
-        self.linear_pre(trunk_lm_head, &norm_out)
-    }
-
-    /// Position-expanded training forward — like [`forward_train_lora`] but the
-    /// LoRA delta can land on ANY subset of {eh_proj, q, k, v, o, gate, up,
-    /// down} (the position-expansion experiment). Gradients flow through the
-    /// whole block; frozen quant weights are constants w.r.t. the deltas. Fresh
-    /// per-call KV cache → each calib row is a standalone k=0 draft. Returns the
-    /// logits `[B, T, vocab]`. PoC-only; never on the serving path.
-    pub fn forward_train_lora_multi(
-        &self,
-        embeds: &Array,
-        h_pre: &Array,
-        lora: &MtpLoraSet,
-        trunk_final_norm_weight: &Array,
-        trunk_lm_head: &Qwen35MtpLinear,
-    ) -> Result<Array> {
-        let b = embeds.shape()[0];
-        let t = embeds.shape()[1];
-        let eps = self.dims.rms_norm_eps;
-
-        let e_n = rms_norm(embeds, &self.enorm, eps)?;
-        let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
-        let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
-
-        let base = self.to_f32(self.linear_pre(&self.eh_proj, &concat)?, "eh_proj_out")?;
-        let mut cur = self.apply_lora_opt(base, &concat, lora.eh_proj.as_ref())?;
-
-        let mut cache = NativeKvCache::new();
-        let res_attn = cur.clone();
-        let cur_n = rms_norm(&cur, &self.input_layernorm, eps)?;
-        let attn_out =
-            self.self_attention_forward_lora(&cur_n, b, t, t > 1, &mut cache, Some(lora))?;
-        cur = mlx_rs::ops::add(&attn_out, &res_attn)?;
-
-        let res_ffn = cur.clone();
-        let cur_n = rms_norm(&cur, &self.post_attention_layernorm, eps)?;
-        let mlp_out = match &self.mlp {
-            Qwen35MtpMlp::Dense(d) => self.dense_mlp_forward_lora(&cur_n, d, Some(lora))?,
-            Qwen35MtpMlp::Moe(m) => self.moe_mlp_forward(&cur_n, m)?,
-        };
-        cur = mlx_rs::ops::add(&mlp_out, &res_ffn)?;
-
-        let norm_w = self
-            .shared_head_norm
-            .as_ref()
-            .unwrap_or(trunk_final_norm_weight);
-        let norm_out = rms_norm(&cur, norm_w, eps)?;
-        self.linear_pre(trunk_lm_head, &norm_out)
-    }
-
-    /// `base + (x·Aᵀ)·Bᵀ` when a LoRA pair is present; identity otherwise.
-    fn apply_lora_opt(
-        &self,
-        base: Array,
-        x: &Array,
-        lora: Option<&(Array, Array)>,
-    ) -> Result<Array> {
-        match lora {
-            Some((a, b)) => base.add(&lora_delta(x, a, b)?).map_err(Into::into),
-            None => Ok(base),
-        }
-    }
-
-    // ── dims accessors for the LoRA-shape bookkeeping in the train fn ─────────
-    /// q projection output width = num_heads * (head_dim * (gate ? 2 : 1)).
-    pub fn q_out_dim(&self) -> i32 {
-        let q_last = if self.dims.attn_output_gate {
-            self.dims.head_dim * 2
-        } else {
-            self.dims.head_dim
-        };
-        (self.dims.num_attention_heads * q_last) as i32
-    }
-    /// k / v projection output width = num_kv * head_dim.
-    pub fn kv_out_dim(&self) -> i32 {
-        (self.dims.num_key_value_heads * self.dims.head_dim) as i32
-    }
-    /// o projection input width = num_heads * head_dim.
-    pub fn o_in_dim(&self) -> i32 {
-        (self.dims.num_attention_heads * self.dims.head_dim) as i32
-    }
-    /// Dense MLP intermediate size (gate_proj out-dim from scales rows); `None`
-    /// for MoE blocks (MLP-position LoRA unsupported there).
-    pub fn dense_intermediate(&self) -> Option<i32> {
-        match &self.mlp {
-            Qwen35MtpMlp::Dense(d) => Some(d.gate_proj.scales.shape()[0]),
-            Qwen35MtpMlp::Moe(_) => None,
-        }
-    }
-
     /// Self-attention with the block's own KV cache. Same structure as the
     /// trunk's `layer_full_attn_forward` in `qwen3_5_moe.rs` — same q/gate
     /// split + q_norm/k_norm + partial-rotary RoPE + GQA SDPA.
@@ -673,21 +416,6 @@ impl Qwen35MtpBlock {
         causal: bool,
         cache: &mut NativeKvCache,
     ) -> Result<Array> {
-        self.self_attention_forward_lora(x, b, t, causal, cache, None)
-    }
-
-    /// LoRA-aware self-attention. `lora=None` (serving path) is byte-identical
-    /// to the original — only an `Option` check per projection differs. When
-    /// `Some`, adds the q/k/v/o LoRA deltas (position-expansion PoC).
-    fn self_attention_forward_lora(
-        &self,
-        x: &Array,
-        b: i32,
-        t: i32,
-        causal: bool,
-        cache: &mut NativeKvCache,
-        lora: Option<&MtpLoraSet>,
-    ) -> Result<Array> {
         let num_heads = self.dims.num_attention_heads as i32;
         let num_kv = self.dims.num_key_value_heads as i32;
         let head_dim = self.dims.head_dim as i32;
@@ -698,15 +426,12 @@ impl Qwen35MtpBlock {
         let attn = &self.attention;
 
         // (1) q/k/v projections.
-        let q_proj_raw = self.linear_pre(&attn.q_proj, x)?;
+        let q_proj_raw = attn.q_proj.apply(x)?;
         let q_proj = self.to_f32(q_proj_raw, "mtp.q_proj")?;
-        let q_proj = self.apply_lora_opt(q_proj, x, lora.and_then(|l| l.q.as_ref()))?;
-        let k_proj_raw = self.linear_pre(&attn.k_proj, x)?;
+        let k_proj_raw = attn.k_proj.apply(x)?;
         let k_proj = self.to_f32(k_proj_raw, "mtp.k_proj")?;
-        let k_proj = self.apply_lora_opt(k_proj, x, lora.and_then(|l| l.k.as_ref()))?;
-        let v_proj_raw = self.linear_pre(&attn.v_proj, x)?;
+        let v_proj_raw = attn.v_proj.apply(x)?;
         let v_proj = self.to_f32(v_proj_raw, "mtp.v_proj")?;
-        let v_proj = self.apply_lora_opt(v_proj, x, lora.and_then(|l| l.v.as_ref()))?;
 
         // (2a) Reshape q to [B, T, num_heads, head_dim * (gate?2:1)] and
         //      split into (queries, gate) when attn_output_gate is on.
@@ -775,31 +500,18 @@ impl Qwen35MtpBlock {
         };
 
         // (8) o_proj.
-        let o_proj_raw = self.linear_pre(&attn.o_proj, &gated)?;
-        let o_proj = self.to_f32(o_proj_raw, "mtp.o_proj")?;
-        self.apply_lora_opt(o_proj, &gated, lora.and_then(|l| l.o.as_ref()))
+        let o_proj_raw = attn.o_proj.apply(&gated)?;
+        self.to_f32(o_proj_raw, "mtp.o_proj")
     }
 
     /// Dense SwiGLU MLP. Same dispatch shape as the trunk's `shared_mlp`
     /// path in `native_moe::shared_mlp`: separate gate_proj + up_proj +
     /// silu(gate) * up + down_proj.
     fn dense_mlp_forward(&self, x: &Array, w: &Qwen35MtpDenseMlp) -> Result<Array> {
-        self.dense_mlp_forward_lora(x, w, None)
-    }
-
-    /// LoRA-aware dense MLP. `lora=None` is byte-identical to the serving path.
-    fn dense_mlp_forward_lora(
-        &self,
-        x: &Array,
-        w: &Qwen35MtpDenseMlp,
-        lora: Option<&MtpLoraSet>,
-    ) -> Result<Array> {
-        let gate = self.linear_pre(&w.gate_proj, x)?;
+        let gate = w.gate_proj.apply(x)?;
         let gate = self.to_f32(gate, "mtp.mlp.gate")?;
-        let gate = self.apply_lora_opt(gate, x, lora.and_then(|l| l.gate.as_ref()))?;
-        let up = self.linear_pre(&w.up_proj, x)?;
+        let up = w.up_proj.apply(x)?;
         let up = self.to_f32(up, "mtp.mlp.up")?;
-        let up = self.apply_lora_opt(up, x, lora.and_then(|l| l.up.as_ref()))?;
         // SwiGLU: silu(gate) * up == sigmoid(gate) * gate * up. Mirrors the
         // expansion used in `native_moe::swiglu_compiled_inner` so a future
         // fuse pass can swap in the compiled-graph variant trivially.
@@ -807,9 +519,8 @@ impl Qwen35MtpBlock {
         let silu_gate = mlx_rs::ops::multiply(&gate, &sig).context("mtp.mlp gate * sig")?;
         let activated =
             mlx_rs::ops::multiply(&silu_gate, &up).context("mtp.mlp silu(gate) * up")?;
-        let down = self.linear_pre(&w.down_proj, &activated)?;
-        let down = self.to_f32(down, "mtp.mlp.down")?;
-        self.apply_lora_opt(down, &activated, lora.and_then(|l| l.down.as_ref()))
+        let down = w.down_proj.apply(&activated)?;
+        self.to_f32(down, "mtp.mlp.down")
     }
 
     /// MoE MLP — wraps `native_moe::moe_block_forward` with the MTP block's
@@ -871,19 +582,6 @@ impl Qwen35MtpBlock {
         moe_block_forward(x, &view)
     }
 
-    /// Debug: run only enorm/hnorm/concat/eh_proj on explicit inputs.
-    /// Used by the numeric reference-comparison harness to isolate the
-    /// through-fc path. embeds/h_pre are [1, 1, hidden].
-    pub fn debug_through_fc(&self, embeds: &Array, h_pre: &Array) -> Result<(Array, Array, Array)> {
-        let eps = self.dims.rms_norm_eps;
-        let e_n = rms_norm(embeds, &self.enorm, eps)?;
-        let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
-        let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
-        let fc_out = self.linear_pre(&self.eh_proj, &concat)?;
-        let fc_out = self.to_f32(fc_out, "debug_fc_out")?;
-        Ok((e_n, h_n, fc_out))
-    }
-
     /// Debug: run the FULL block forward on explicit (embeds, h_pre) and
     /// return every intermediate stage, for layer-by-layer comparison against
     /// the mlx Python reference. Mirrors `forward` exactly (steps 1-6) but uses
@@ -900,7 +598,7 @@ impl Qwen35MtpBlock {
         let e_n = rms_norm(embeds, &self.enorm, eps)?;
         let h_n = rms_norm(h_pre, &self.hnorm, eps)?;
         let concat = mlx_rs::ops::concatenate_axis(&[&e_n, &h_n], -1)?;
-        let fc_out = self.to_f32(self.linear_pre(&self.eh_proj, &concat)?, "dbg.fc")?;
+        let fc_out = self.to_f32(self.eh_proj.apply(&concat)?, "dbg.fc")?;
 
         let b = embeds.shape()[0];
         let t = embeds.shape()[1];
@@ -934,20 +632,6 @@ impl Qwen35MtpBlock {
             ("post_mlp", post_mlp),
             ("norm_out", norm_out),
         ])
-    }
-
-    fn linear_pre(&self, lin: &Qwen35MtpLinear, x: &Array) -> Result<Array> {
-        quantized_matmul_with_mode(
-            x,
-            &lin.weight,
-            &lin.scales,
-            lin.biases.as_ref(),
-            true,
-            lin.group_size,
-            lin.bits,
-            lin.mode,
-        )
-        .context("Qwen35MtpBlock::linear_pre matmul failed")
     }
 
     fn to_f32(&self, arr: Array, what: &str) -> Result<Array> {
@@ -1288,7 +972,7 @@ pub fn load_block_from_hf(
     let take_linear = |tensors: &mut HashMap<String, Array>,
                        name: &str,
                        expect_shape: [i32; 2]|
-     -> Result<Qwen35MtpLinear> {
+     -> Result<ResolvedLinear> {
         use crate::native_quant::MODE_AFFINE;
         // Pre-quantized affine head (27B Speed): the weight ships packed (U32)
         // alongside `.scales` + `.biases`. Load directly and infer the layout
@@ -1317,7 +1001,7 @@ pub fn load_block_from_hf(
             let bits = (32 * packed_in) / in_features.max(1);
             let n_groups = scales.shape()[1];
             let group_size = in_features / n_groups.max(1);
-            return Ok(Qwen35MtpLinear {
+            return Ok(ResolvedLinear {
                 weight,
                 scales,
                 biases,
@@ -1331,7 +1015,7 @@ pub fn load_block_from_hf(
             let (packed, scales, biases) =
                 quantize_with_mode(&w, quant.group_size(), quant.bits(), mode)
                     .with_context(|| format!("{name}: quantize at load failed"))?;
-            Ok(Qwen35MtpLinear {
+            Ok(ResolvedLinear {
                 weight: packed,
                 scales,
                 biases,
@@ -1342,7 +1026,7 @@ pub fn load_block_from_hf(
         } else {
             Err(anyhow!(
                 "load_block_from_hf: Bf16 carrier path not yet implemented \
-                 (Qwen35MtpLinear assumes a quantized weight layout); use \
+                 (ResolvedLinear assumes a quantized weight layout); use \
                  Affine4 or Mxfp4"
             ))
         }
@@ -1733,7 +1417,7 @@ pub fn smoke_forward_with_synth_trunk(
     let (lm_packed, lm_scales, lm_biases) =
         quantize_with_mode(&lm_head_w_bf16, group_size, 4, MODE_AFFINE)
             .context("smoke_forward: quantize lm_head")?;
-    let trunk_lm_head = Qwen35MtpLinear {
+    let trunk_lm_head = ResolvedLinear {
         weight: lm_packed,
         scales: lm_scales,
         biases: lm_biases,
@@ -1864,7 +1548,7 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
     let inter = intermediate_size as i32;
 
     // Helper: random f32 array of given shape -> quantized Linear at mode.
-    let make_linear = |out: i32, in_: i32, label: &str| -> Result<Qwen35MtpLinear> {
+    let make_linear = |out: i32, in_: i32, label: &str| -> Result<ResolvedLinear> {
         // mlx_rs `random::uniform` returns a small-range array suitable as
         // a synthetic weight payload. The exact distribution doesn't affect
         // latency (FFI graph is shape-only) — but matching real-weight
@@ -1876,7 +1560,7 @@ pub fn run_step_b_synthetic_bench(t_values: &[i32], runs: usize) -> Result<Vec<S
             .with_context(|| format!("{label}: cast bf16 failed"))?;
         let (packed, scales, biases) = quantize_with_mode(&w_bf16, group_size, bits, mode)
             .with_context(|| format!("{label}: quantize_with_mode failed"))?;
-        Ok(Qwen35MtpLinear {
+        Ok(ResolvedLinear {
             weight: packed,
             scales,
             biases,

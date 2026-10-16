@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 lumen-core = { workspace = true }
-turboquant-cache = { workspace = true }
 lumen-mlx = { path = "../lumen-mlx" }
 # Native FLUX.2-dev text-to-image backend. Optional — pulled in only when the
 # server's `mlx-native` feature is on (gates the heavy mlx-sys fork + ~30 GB

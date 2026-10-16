@@ -28,15 +28,23 @@ pub async fn get_config(state: State<'_, AppState>) -> CmdResult<PersistentConfi
     Ok(g.clone())
 }
 
+/// Apply `edit` to the config, persist it, and return what was saved.
+async fn update_with(
+    state: &AppState,
+    edit: impl FnOnce(&mut PersistentConfig),
+) -> CmdResult<PersistentConfig> {
+    let mut g = state.config.lock().await;
+    edit(&mut g);
+    g.save().map_err(err)?;
+    Ok(g.clone())
+}
+
 #[tauri::command]
 pub async fn update_server_config(
     state: State<'_, AppState>,
     server: ServerConfig,
 ) -> CmdResult<PersistentConfig> {
-    let mut g = state.config.lock().await;
-    g.server = server;
-    g.save().map_err(err)?;
-    Ok(g.clone())
+    update_with(&state, |c| c.server = server).await
 }
 
 #[tauri::command]
@@ -44,10 +52,7 @@ pub async fn update_quant_config(
     state: State<'_, AppState>,
     quant: QuantConfig,
 ) -> CmdResult<PersistentConfig> {
-    let mut g = state.config.lock().await;
-    g.quant = quant;
-    g.save().map_err(err)?;
-    Ok(g.clone())
+    update_with(&state, |c| c.quant = quant).await
 }
 
 #[tauri::command]
@@ -55,10 +60,7 @@ pub async fn update_context_config(
     state: State<'_, AppState>,
     context: ContextConfig,
 ) -> CmdResult<PersistentConfig> {
-    let mut g = state.config.lock().await;
-    g.context = context;
-    g.save().map_err(err)?;
-    Ok(g.clone())
+    update_with(&state, |c| c.context = context).await
 }
 
 #[tauri::command]
@@ -66,10 +68,7 @@ pub async fn update_advanced_config(
     state: State<'_, AppState>,
     advanced: AdvancedConfig,
 ) -> CmdResult<PersistentConfig> {
-    let mut g = state.config.lock().await;
-    g.advanced = advanced;
-    g.save().map_err(err)?;
-    Ok(g.clone())
+    update_with(&state, |c| c.advanced = advanced).await
 }
 
 #[tauri::command]
@@ -77,10 +76,7 @@ pub async fn update_env_overrides(
     state: State<'_, AppState>,
     env_overrides: BTreeMap<String, String>,
 ) -> CmdResult<PersistentConfig> {
-    let mut g = state.config.lock().await;
-    g.env_overrides = env_overrides;
-    g.save().map_err(err)?;
-    Ok(g.clone())
+    update_with(&state, |c| c.env_overrides = env_overrides).await
 }
 
 /// Names of env vars that are also editable via dedicated UI fields. The

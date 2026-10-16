@@ -23,7 +23,7 @@
 //! then names it. This mirrors how the plan intended bisection to work rather
 //! than paying N suite runs on every invocation.
 
-use std::path::{Path, PathBuf};
+use crate::repo_root;
 use std::process::{Command, ExitCode};
 
 const DOCS_PATH: &str = "docs/env-flags.md";
@@ -285,19 +285,15 @@ fn check_documented_envs_exist() -> Result<Vec<(String, usize, String)>, String>
     // settings**, min 128 / max 8192 / default 512, whose reader went with the
     // Candle backend in `7eacd3a`. A doc that lies costs a reader a minute; a
     // UI control that lies is a switch the user watches do nothing.
-    let docs = Command::new("git")
-        .current_dir(repo_root())
-        .args([
-            "ls-files",
-            "*.md",
-            "crates/lumen-app/frontend/src/lib/env-schema.ts",
-            "crates/lumen-app/frontend/src/messages/*.ts",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let docs = crate::git(&[
+        "ls-files",
+        "*.md",
+        "crates/lumen-app/frontend/src/lib/env-schema.ts",
+        "crates/lumen-app/frontend/src/messages/*.ts",
+    ])?;
 
     let mut dead = Vec::new();
-    for file in String::from_utf8_lossy(&docs.stdout).lines() {
+    for file in docs.lines() {
         if RULE_DEFINITIONS.iter().any(|d| file.ends_with(d)) {
             continue;
         }
@@ -341,29 +337,25 @@ fn env_tokens(line: &str, prefixes: &[&str]) -> Vec<String> {
 
 /// Does `var` appear anywhere under `crates/` or `xtask/`?
 fn source_mentions(var: &str) -> Result<bool, String> {
-    let out = Command::new("git")
-        .current_dir(repo_root())
-        .args([
-            "grep",
-            "-l",
-            "--fixed-strings",
-            var,
-            "--",
-            // Backend crates + xtask only. NOT `crates/` wholesale: that would
-            // include the frontend files this check now scans, so a variable
-            // named only in `env-schema.ts` would find itself and pass — a
-            // check that reports clean because it is looking in a mirror.
-            "crates/lumen-core",
-            "crates/lumen-mlx",
-            "crates/lumen-server",
-            "crates/lumen-diffusion",
-            "crates/lumen-app/src",
-            "crates/turboquant-cache",
-            "xtask/",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    Ok(!out.stdout.is_empty())
+    let out = crate::git(&[
+        "grep",
+        "-l",
+        "--fixed-strings",
+        var,
+        "--",
+        // Backend crates + xtask only. NOT `crates/` wholesale: that would
+        // include the frontend files this check now scans, so a variable
+        // named only in `env-schema.ts` would find itself and pass — a
+        // check that reports clean because it is looking in a mirror.
+        "crates/lumen-core",
+        "crates/lumen-mlx",
+        "crates/lumen-server",
+        "crates/lumen-diffusion",
+        "crates/lumen-app/src",
+        "crates/turboquant-cache",
+        "xtask/",
+    ])?;
+    Ok(!out.is_empty())
 }
 
 /// The unmanaged-flag ratchet.
@@ -396,30 +388,31 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// `LUMEN_CORS` (task 019): lumen-app's access settings, which the server
 /// finally reads. A bind address, a key and a three-way mode — none of them a
 /// boolean, so `flag!` cannot hold them, and none gates an optimization.
-const UNMANAGED_BASELINE: usize = 193;
+/// 193 -> 187 with the PyO3 and subprocess runners: `LUMEN_MLX_SUBPROCESS`,
+/// `LUMEN_MLX_RUNNER`, `LUMEN_MLX_PYTHON`, `LUMEN_MLX_TASKPOLICY`,
+/// `LUMEN_MLX_VENV` and the golden recorder's `LUMEN_MLX_GOLDEN_OUT`.
+/// 187 -> 185 with the MTP adapter experiments: `LUMEN_C4_HIDDEN` and
+/// `LUMEN_C4_WD`.
+const UNMANAGED_BASELINE: usize = 185;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.
 fn audit_env_vars(flags: &[Flag]) -> Result<(Vec<String>, Vec<String>), String> {
-    let out = Command::new("git")
-        .current_dir(repo_root())
-        .args([
-            "grep",
-            "-oh",
-            "-E",
-            r#"env::var(_os)?\("LUMEN_[A-Z0-9_]*"\)"#,
-            "--",
-            "crates/lumen-core/src",
-            "crates/lumen-mlx/src",
-            "crates/lumen-server/src",
-            "crates/lumen-diffusion/src",
-            "crates/lumen-app/src",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = crate::git(&[
+        "grep",
+        "-oh",
+        "-E",
+        r#"env::var(_os)?\("LUMEN_[A-Z0-9_]*"\)"#,
+        "--",
+        "crates/lumen-core/src",
+        "crates/lumen-mlx/src",
+        "crates/lumen-server/src",
+        "crates/lumen-diffusion/src",
+        "crates/lumen-app/src",
+    ])?;
     let registered: std::collections::HashSet<&str> =
         flags.iter().map(|f| f.env.as_str()).collect();
-    let mut all: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let mut all: Vec<String> = out
         .lines()
         .filter_map(|l| l.split('"').nth(1).map(str::to_string))
         .collect();
@@ -441,11 +434,7 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
     // `--check` fail on lumen-flags' own two test flags — the same mistake the
     // coverage tool made with assertions in inline test modules, which is worth
     // noting as a pattern: test-only code keeps getting counted as API.
-    let out = Command::new("git")
-        .current_dir(repo_root())
-        .args(["grep", "-n", "env: \"", "--", "crates/*/src/*.rs"])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = crate::git(&["grep", "-n", "env: \"", "--", "crates/*/src/*.rs"])?;
     // `-A 1` because only a `#[cfg(test)]` on a **module** may be treated as the
     // start of test-only territory. Matching the bare attribute counted any
     // test-gated item — a struct, an impl block, an enum variant — as the file's
@@ -455,19 +444,15 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
     // `LUMEN_QWEN35_REASONING_EFFORT` out of the count. Nothing failed, because
     // the check only errors on declared-but-unregistered — the flag just quietly
     // stopped being watched, which is the failure this tool exists to prevent.
-    let cfg_test = Command::new("git")
-        .current_dir(repo_root())
-        .args([
-            "grep",
-            "-n",
-            "-A",
-            "1",
-            "#\\[cfg(test)\\]",
-            "--",
-            "crates/*/src/*.rs",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let cfg_test = crate::git(&[
+        "grep",
+        "-n",
+        "-A",
+        "1",
+        "#\\[cfg(test)\\]",
+        "--",
+        "crates/*/src/*.rs",
+    ])?;
 
     // file -> first `#[cfg(test)] mod` line, if any.
     let mut test_mod_at: std::collections::BTreeMap<String, usize> =
@@ -475,7 +460,7 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
     // `git grep -A 1` emits `file:NN:text` for a hit and `file-NN-text` for the
     // trailing context line, so a hit and its successor are paired by order.
     let mut pending: Option<(String, usize)> = None;
-    for line in String::from_utf8_lossy(&cfg_test.stdout).lines() {
+    for line in cfg_test.lines() {
         if let Some((file, no, _)) = split_grep_line(line, ':') {
             pending = Some((file, no));
             continue;
@@ -503,7 +488,7 @@ fn grep_declared_envs() -> Result<Vec<String>, String> {
     }
 
     let mut envs = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let mut parts = line.splitn(3, ':');
         let (Some(file), Some(no), Some(text)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
@@ -646,13 +631,6 @@ fn run_equivalence(flags: &[Flag], one_at_a_time: bool) -> ExitCode {
         eprintln!("broken alternate paths: {broken:?}");
         ExitCode::FAILURE
     }
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask sits one level below the repo root")
-        .to_path_buf()
 }
 
 #[cfg(test)]

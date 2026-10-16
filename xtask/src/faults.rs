@@ -198,10 +198,7 @@ mod tests {
     /// than it claims.
     #[test]
     fn every_named_target_exists() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .to_path_buf();
+        let root = crate::repo_root();
         for s in SWEEPS {
             if s.target.is_empty() {
                 continue;

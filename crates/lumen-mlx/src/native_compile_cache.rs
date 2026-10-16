@@ -8,10 +8,9 @@
 //! ```
 //!
 //! creates a fresh `Compiled<F, G>` struct and runs its `Drop`
-//! (`mlx_detail_compile_erase`) on every call. The Phase 1 microbench
-//! (`crates/lumen-mlx/examples/bench_compile_overhead.rs`) measured this
-//! at ~0.0278ms/call on Apple Silicon — at 30 layers per decode step that is
-//! ~0.83ms wasted on wrapper alloc/Drop.
+//! (`mlx_detail_compile_erase`) on every call. A Phase 1 microbench (since
+//! deleted) measured this at ~0.0278ms/call on Apple Silicon — at 30 layers
+//! per decode step that is ~0.83ms wasted on wrapper alloc/Drop.
 //!
 //! This module provides a `OnceLock<Mutex<CompiledMulti>>`-backed cache that
 //! constructs the wrapper exactly once per call site (via the

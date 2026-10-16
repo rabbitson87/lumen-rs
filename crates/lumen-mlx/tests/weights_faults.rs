@@ -14,16 +14,26 @@
 //! validates that the bytes the header promises are actually present, and this
 //! sweep pins both halves: every truncation is rejected, and every *intact*
 //! file still loads.
+//!
+//! Gemma 4 has its own `NativeGemma4Weights::load_dir`, which skipped the check
+//! until it was shared; the last test holds it to the same behaviour.
 
+use lumen_mlx::gemma4::NativeGemma4Weights;
 use lumen_mlx::qwen3_5_moe_config::NativeWeights;
 use lumen_testkit::faults::{
     Corruption, TensorSpec, build_safetensors, corrupt, minimal_safetensors, truncation_offsets,
 };
 
-/// Write `bytes` as the only shard in a fresh directory and load it.
-fn load_shard(bytes: &[u8]) -> (tempfile::TempDir, anyhow::Result<NativeWeights>) {
+/// A fresh directory holding `bytes` as its only shard.
+fn shard_dir(bytes: &[u8]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("model.safetensors"), bytes).expect("write shard");
+    dir
+}
+
+/// Write `bytes` as the only shard in a fresh directory and load it.
+fn load_shard(bytes: &[u8]) -> (tempfile::TempDir, anyhow::Result<NativeWeights>) {
+    let dir = shard_dir(bytes);
     let res = NativeWeights::load_dir(dir.path());
     (dir, res)
 }
@@ -155,4 +165,32 @@ fn empty_directory_is_named_as_the_problem() {
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("safetensors"), "got: {msg}");
+}
+
+/// Gemma 4's loader walks shards on its own, and it used to read them without
+/// the completeness check: the same cut shard that Qwen rejects loaded with
+/// wrong weights and no error.
+#[test]
+fn gemma4_rejects_a_data_section_truncation_too() {
+    let good = minimal_safetensors();
+    let dir = shard_dir(&good);
+    let w = NativeGemma4Weights::load_dir(dir.path())
+        .expect("the unmutated fixture must load — otherwise the rejections test nothing");
+    assert!(w.get("weight").is_some() && w.get("bias").is_some());
+
+    for cut in [1usize, 16, 60] {
+        let bad = corrupt(&good, Corruption::TruncateAt(good.len() - cut));
+        let dir = shard_dir(&bad);
+        let Err(err) = NativeGemma4Weights::load_dir(dir.path()) else {
+            panic!(
+                "Gemma 4 loaded a shard missing its last {cut} data bytes — the \
+                 silent-corruption path: wrong weights with no error anywhere"
+            )
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("truncated") && msg.contains("short"),
+            "the error must say the file is short so the fix is obvious (re-download): {msg}"
+        );
+    }
 }

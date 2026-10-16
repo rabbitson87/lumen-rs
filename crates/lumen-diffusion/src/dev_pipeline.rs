@@ -239,29 +239,14 @@ pub use imp::{DEFAULT_GUIDANCE, DevImage, DevPipeline, image_to_png, image_to_rg
 #[cfg(all(test, feature = "mlx-native"))]
 mod smoke_tests {
     use super::imp::{DevPipeline, image_to_rgb8};
+    use crate::test_util::{klein_vae_path, read_f32_bin};
     use mlx_rs::Array;
 
-    // 4-bit dev DiT + shared VAE, resolved from the local HF cache.
+    // 4-bit dev DiT, resolved from the local HF cache.
     fn dit_dir() -> String {
         crate::hf_cache::snapshot_path_or_rel(crate::repos::DIT_4BIT, "transformer")
             .to_string_lossy()
             .into_owned()
-    }
-    fn vae_path() -> String {
-        crate::hf_cache::snapshot_path_or_rel(
-            crate::repos::VAE,
-            "vae/diffusion_pytorch_model.safetensors",
-        )
-        .to_string_lossy()
-        .into_owned()
-    }
-
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
     }
 
     /// Minimal e2e: 256×256, 4 steps, reusing the validated text embedding.
@@ -281,7 +266,7 @@ mod smoke_tests {
         prompt_embeds.eval().unwrap();
         let txt_ids = vec![0i32; (TXT_SEQ * 4) as usize];
 
-        let pipe = DevPipeline::load(&dit_dir(), &vae_path()).expect("load dev pipeline");
+        let pipe = DevPipeline::load(&dit_dir(), &klein_vae_path()).expect("load dev pipeline");
         let result = pipe
             .generate(&prompt_embeds, &txt_ids, 256, 256, 4, 0)
             .expect("generate");

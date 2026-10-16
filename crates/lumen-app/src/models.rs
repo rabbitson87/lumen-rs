@@ -942,24 +942,16 @@ mod tests {
         .unwrap();
     }
 
-    /// Write a syntactically-valid (but tiny) safetensors file whose
-    /// header advertises a `body_len`-byte body. Used to fabricate
-    /// both "well-formed" and "truncated" shards in tests without
-    /// pulling in the real `safetensors` crate.
+    /// A well-formed shard: the header and the body agree.
     fn write_safetensors(path: &Path, body_len: u64) {
-        let header_json = format!(
-            "{{\"t\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[0,{}]}}}}",
-            body_len / 4,
-            body_len,
-        );
-        let header_bytes = header_json.as_bytes();
-        let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&(header_bytes.len() as u64).to_le_bytes())
-            .unwrap();
-        f.write_all(header_bytes).unwrap();
-        f.write_all(&vec![0u8; body_len as usize]).unwrap();
+        write_truncated_safetensors(path, body_len, body_len);
     }
 
+    /// Write a syntactically-valid (but tiny) safetensors file whose
+    /// header advertises an `advertised_body`-byte body and which carries
+    /// `actual_body` bytes of it. Used to fabricate both "well-formed" and
+    /// "truncated" shards in tests without pulling in the real
+    /// `safetensors` crate.
     fn write_truncated_safetensors(path: &Path, advertised_body: u64, actual_body: u64) {
         let header_json = format!(
             "{{\"t\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[0,{}]}}}}",

@@ -13,6 +13,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::config_serde::deserialize_token_ids;
+
 // ───────────────────────── config.json parsing ─────────────────────────
 
 /// Top-level config.json wrapper for `gemma4` (text-only deploy ignores
@@ -206,25 +208,6 @@ pub struct NativeGemma4QuantizationOverride {
     /// present, must be one of `"affine" | "mxfp4"`.
     #[serde(default)]
     pub mode: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TokenIdValue {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<TokenIdValue>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(TokenIdValue::One(id)) => vec![id],
-        Some(TokenIdValue::Many(ids)) => ids,
-        None => Vec::new(),
-    })
 }
 
 fn default_sliding_window_pattern() -> usize {

@@ -250,10 +250,14 @@ pub enum BackendMode {
     /// "candle"`, and `toml::from_str` hard-errors on an unknown variant —
     /// which happens *before* `migrate_in_place` can rewrite anything. The
     /// alias lets those configs load, and the v8 migration re-saves them.
-    #[serde(alias = "candle")]
+    ///
+    /// `mlx-pyo3` is aliased for the same reason: the PyO3 runner it selected
+    /// was removed, and a config that chose it would otherwise fail to load.
+    /// It lands on `Auto`, which the server serves on the native runner, and
+    /// the next save writes `auto`.
+    #[serde(alias = "candle", alias = "mlx-pyo3")]
     Auto,
     MlxNative,
-    MlxPyo3,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -658,6 +662,24 @@ max_batch = 6
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         let out = toml::to_string_pretty(&cfg).expect("serialize");
         assert!(!out.contains("tokenizer_id"), "written back out:\n{out}");
+    }
+
+    /// A config saved while the PyO3 runner existed must still load, and must
+    /// not write the removed variant back out.
+    #[test]
+    fn removed_mlx_pyo3_backend_loads_as_auto() {
+        let stored = toml::to_string_pretty(&PersistentConfig::default())
+            .expect("serialize")
+            .replace("backend_mode = \"auto\"", "backend_mode = \"mlx-pyo3\"");
+        assert!(
+            stored.contains("mlx-pyo3"),
+            "the fixture must carry the old value"
+        );
+        let cfg: PersistentConfig =
+            toml::from_str(&stored).expect("a config naming mlx-pyo3 must still deserialize");
+        assert_eq!(cfg.advanced.backend_mode, BackendMode::Auto);
+        let out = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(!out.contains("pyo3"), "written back out:\n{out}");
     }
 
     /// Guards the 7 -> 8 class of bug: a migration step that exists but is

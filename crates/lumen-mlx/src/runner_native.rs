@@ -12,104 +12,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    #[cfg(test)]
-    const MLX_SMOKE_CHILD_MODE_ENV: &str = "TQ_MLX_SMOKE_CHILD_MODE";
-    #[cfg(test)]
-    const MLX_SMOKE_METAL_AVAILABLE_MODE: &str = "metal_available";
-    #[cfg(test)]
-    const MLX_SMOKE_METADATA_MODE: &str = "metadata";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_EMPTY_MODE: &str = "raw_array_empty";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE: &str = "raw_array_new_int";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE: &str = "raw_array_new_bool";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE: &str = "raw_array_new_float32";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE: &str = "raw_array_new_float64";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE: &str = "raw_array_new_data_int";
-    #[cfg(test)]
-    const MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE: &str = "raw_array_new_data_empty_int";
-    #[cfg(test)]
-    const MLX_SMOKE_SCALAR_ITEM_MODE: &str = "scalar_item";
-    #[cfg(test)]
-    const MLX_SMOKE_ARGMAX_EVAL_MODE: &str = "argmax_eval";
-    #[cfg(test)]
-    const MLX_SMOKE_SAFETENSORS_MODE: &str = "safetensors";
-
-    #[cfg(test)]
-    fn log_mlx_smoke_phase(mode: &str, phase: &str) -> Result<()> {
-        use std::io::{self, Write};
-
-        let mut stderr = io::stderr().lock();
-        writeln!(stderr, "native mlx-rs smoke [{mode}]: {phase}")
-            .map_err(|err| anyhow!("failed to write native mlx-rs smoke marker: {err}"))?;
-        stderr
-            .flush()
-            .map_err(|err| anyhow!("failed to flush native mlx-rs smoke marker: {err}"))?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    unsafe extern "C" fn log_mlx_error_handler(
-        msg: *const std::os::raw::c_char,
-        _data: *mut std::os::raw::c_void,
-    ) {
-        use std::ffi::CStr;
-        use std::io::{self, Write};
-
-        let message = if msg.is_null() {
-            "<null mlx error>"
-        } else {
-            unsafe { CStr::from_ptr(msg) }
-                .to_str()
-                .unwrap_or("<non-utf8 mlx error>")
-        };
-
-        let _ = writeln!(
-            io::stderr().lock(),
-            "native mlx-rs smoke [mlx_error]: {message}"
-        );
-    }
-
-    #[cfg(test)]
-    fn install_mlx_smoke_error_handler() {
-        unsafe {
-            mlx_sys::mlx_set_error_handler(Some(log_mlx_error_handler), std::ptr::null_mut(), None);
-        }
-    }
-
-    #[cfg(test)]
-    fn mlx_metal_available_smoke() -> Result<()> {
-        log_mlx_smoke_phase(
-            MLX_SMOKE_METAL_AVAILABLE_MODE,
-            "before mlx_metal_is_available",
-        )?;
-        let mut is_available = false;
-        let status = unsafe { mlx_sys::mlx_metal_is_available(&mut is_available as *mut bool) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_METAL_AVAILABLE_MODE,
-            "after mlx_metal_is_available",
-        )?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys metal availability smoke returned status {status}"
-            ));
-        }
-        log_mlx_smoke_phase(
-            MLX_SMOKE_METAL_AVAILABLE_MODE,
-            if is_available {
-                "metal available"
-            } else {
-                "metal unavailable"
-            },
-        )?;
-
-        Ok(())
-    }
-
+    use crate::config_serde::deserialize_token_ids;
     use crate::kv_disk::{DiskKvStore, KvManifest};
     use crate::native_cache::{NativeKvCache, NativePromptCache, SharedPrefixKv};
     use crate::native_runtime::{FineTimings, take_fine_timings};
@@ -513,28 +416,6 @@ mod imp {
     }
 
     #[allow(dead_code)]
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    enum TokenIdValue {
-        One(u32),
-        Many(Vec<u32>),
-    }
-
-    // Only `NativeModelConfig`'s derive reads it, and only tests load that.
-    #[allow(dead_code)]
-    fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = Option::<TokenIdValue>::deserialize(deserializer)?;
-        Ok(match value {
-            Some(TokenIdValue::One(id)) => vec![id],
-            Some(TokenIdValue::Many(ids)) => ids,
-            None => Vec::new(),
-        })
-    }
-
-    #[allow(dead_code)]
     struct NativeSafetensorWeights {
         tensors: std::collections::HashMap<String, Array>,
     }
@@ -558,393 +439,6 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
-    fn mlx_raw_array_empty_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_EMPTY_MODE,
-            "installed mlx error handler",
-        )?;
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "before mlx_array_new")?;
-        let value = unsafe { mlx_sys::mlx_array_new() };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "after mlx_array_new")?;
-        if value.ctx.is_null() {
-            log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "empty handle")?;
-            return Ok(());
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "after mlx_array_free")?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys empty array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_int_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE,
-            "installed mlx error handler",
-        )?;
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE, "before mlx_array_new_int")?;
-        let value = unsafe { mlx_sys::mlx_array_new_int(7) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE, "after mlx_array_new_int")?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE, "after mlx_array_free")?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_bool_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE,
-            "installed mlx error handler",
-        )?;
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE,
-            "before mlx_array_new_bool",
-        )?;
-        let value = unsafe { mlx_sys::mlx_array_new_bool(true) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE,
-            "after mlx_array_new_bool",
-        )?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw bool array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE, "after mlx_array_free")?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw bool array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_float32_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE,
-            "installed mlx error handler",
-        )?;
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE,
-            "before mlx_array_new_float32",
-        )?;
-        let value = unsafe { mlx_sys::mlx_array_new_float32(7.0) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE,
-            "after mlx_array_new_float32",
-        )?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw float32 array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE, "after mlx_array_free")?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw float32 array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_float64_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE,
-            "installed mlx error handler",
-        )?;
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE,
-            "before mlx_array_new_float64",
-        )?;
-        let value = unsafe { mlx_sys::mlx_array_new_float64(7.0) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE,
-            "after mlx_array_new_float64",
-        )?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw float64 array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE, "after mlx_array_free")?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw float64 array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_data_int_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
-            "installed mlx error handler",
-        )?;
-        let data = [7_i32];
-        let shape = [1_i32];
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
-            "before mlx_array_new_data",
-        )?;
-        let value = unsafe {
-            mlx_sys::mlx_array_new_data(
-                data.as_ptr().cast(),
-                shape.as_ptr(),
-                shape.len() as i32,
-                mlx_sys::mlx_dtype__MLX_INT32,
-            )
-        };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
-            "after mlx_array_new_data",
-        )?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw int data array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
-            "after mlx_array_free",
-        )?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw int data array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_raw_array_new_data_empty_int_smoke() -> Result<()> {
-        install_mlx_smoke_error_handler();
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
-            "installed mlx error handler",
-        )?;
-        let data: [i32; 0] = [];
-        let shape = [0_i32];
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
-            "before mlx_array_new_data",
-        )?;
-        let value = unsafe {
-            mlx_sys::mlx_array_new_data(
-                data.as_ptr().cast(),
-                shape.as_ptr(),
-                shape.len() as i32,
-                mlx_sys::mlx_dtype__MLX_INT32,
-            )
-        };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
-            "after mlx_array_new_data",
-        )?;
-        if value.ctx.is_null() {
-            return Err(anyhow!(
-                "native mlx-sys raw empty int data array constructor returned an empty handle"
-            ));
-        }
-
-        let status = unsafe { mlx_sys::mlx_array_free(value) };
-        log_mlx_smoke_phase(
-            MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
-            "after mlx_array_free",
-        )?;
-        if status != 0 {
-            return Err(anyhow!(
-                "native mlx-sys raw empty int data array free returned status {status}"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_tensor_metadata_smoke() -> Result<()> {
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before Array::from_int")?;
-        let value = Array::from_int(7);
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after Array::from_int")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before ndim")?;
-        if value.ndim() != 0 {
-            return Err(anyhow!(
-                "native mlx-rs tensor metadata smoke returned ndim {}, expected scalar ndim 0",
-                value.ndim()
-            ));
-        }
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after ndim")?;
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before size")?;
-        if value.size() != 1 {
-            return Err(anyhow!(
-                "native mlx-rs tensor metadata smoke returned size {}, expected 1",
-                value.size()
-            ));
-        }
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after size")?;
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before shape")?;
-        if !value.shape().is_empty() {
-            return Err(anyhow!(
-                "native mlx-rs tensor metadata smoke returned shape {:?}, expected scalar shape []",
-                value.shape()
-            ));
-        }
-        log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after shape")?;
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_tensor_scalar_item_smoke() -> Result<()> {
-        log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "before Array::from_int")?;
-        let value = Array::from_int(7);
-        log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "after Array::from_int")?;
-        log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "before try_item")?;
-        let observed = value.try_item::<i32>().map_err(|err| {
-            anyhow!("native mlx-rs tensor smoke failed during scalar read: {err}")
-        })?;
-        log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "after try_item")?;
-        if observed != 7 {
-            return Err(anyhow!(
-                "native mlx-rs tensor smoke returned scalar {observed}, expected 7"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_tensor_argmax_eval_smoke() -> Result<()> {
-        use mlx_rs::ops::indexing;
-
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before Array::from_slice")?;
-        let values = Array::from_slice(&[0.25_f32, 3.5, -1.0, 2.0], &[4]);
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after Array::from_slice")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before argmax")?;
-        let index = indexing::argmax(&values, false)?;
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after argmax")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before eval")?;
-        index
-            .eval()
-            .map_err(|err| anyhow!("native mlx-rs argmax smoke failed during eval: {err}"))?;
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after eval")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before try_item")?;
-        let observed = index.try_item::<u32>().map_err(|err| {
-            anyhow!("native mlx-rs argmax smoke failed during scalar read: {err}")
-        })?;
-        log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after try_item")?;
-        if observed != 1 {
-            return Err(anyhow!(
-                "native mlx-rs argmax smoke returned index {observed}, expected 1"
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn mlx_tensor_safetensors_smoke() -> Result<()> {
-        use mlx_rs::ops::indexing;
-        use std::collections::HashMap;
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before Array::from_slice")?;
-        let values = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after Array::from_slice")?;
-
-        let path = std::env::temp_dir().join(format!(
-            "lumen_mlx_native_smoke_{}.safetensors",
-            std::process::id()
-        ));
-
-        let mut arrays = HashMap::new();
-        arrays.insert("weights".to_string(), values);
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before save_safetensors")?;
-        Array::save_safetensors(&arrays, None, &path)
-            .map_err(|err| anyhow!("native mlx-rs safetensors smoke failed during save: {err}"))?;
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after save_safetensors")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before load_safetensors")?;
-        let loaded = NativeSafetensorWeights::load_file(&path)?;
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after load_safetensors")?;
-
-        let _ = std::fs::remove_file(&path);
-
-        let loaded_values = loaded.get_required("weights")?;
-        if loaded_values.shape() != [2, 2] {
-            return Err(anyhow!(
-                "native mlx-rs safetensors smoke loaded shape {:?}, expected [2, 2]",
-                loaded_values.shape()
-            ));
-        }
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before argmax")?;
-        let index = indexing::argmax(loaded_values, false)?;
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after argmax")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before eval")?;
-        index
-            .eval()
-            .map_err(|err| anyhow!("native mlx-rs safetensors smoke failed during eval: {err}"))?;
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after eval")?;
-
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before try_item")?;
-        let observed = index.try_item::<u32>().map_err(|err| {
-            anyhow!("native mlx-rs safetensors smoke failed during scalar read: {err}")
-        })?;
-        log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after try_item")?;
-        if observed != 3 {
-            return Err(anyhow!(
-                "native mlx-rs safetensors smoke returned argmax {observed}, expected 3"
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Resolve `model_id` to a local directory containing `config.json` plus
     /// `*.safetensors` shards. If `model_id` already names a local directory,
     /// returns it as-is. Otherwise treats `model_id` as a HuggingFace Hub repo
@@ -953,8 +447,7 @@ mod imp {
     /// returns the snapshot directory path.
     ///
     /// Network failures, gated repos, or repos without safetensors shards
-    /// surface as a typed error pointing the user back to either a local
-    /// directory or `LUMEN_MLX_BACKEND=pyo3`.
+    /// surface as a typed error pointing the user to a local directory.
     pub(crate) fn resolve_model_dir(model_id: &str) -> Result<PathBuf> {
         if model_id.is_empty() {
             return Err(anyhow!(
@@ -973,7 +466,7 @@ mod imp {
 
         let info = repo.info().with_context(|| {
             format!(
-                "native mlx-rs runner: list HF Hub files for `{model_id}` (set LUMEN_MLX_BACKEND=pyo3 or pass a local model directory if offline)"
+                "native mlx-rs runner: list HF Hub files for `{model_id}` (pass a local model directory if offline)"
             )
         })?;
 
@@ -1910,26 +1403,13 @@ mod imp {
             last_token: u32,
             mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
         ) -> Result<(u32, usize)> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native mlx-rs runner: model not loaded"))?;
-            let state = self.seqs.get_mut(&seq_id).ok_or_else(|| {
-                anyhow!("native mlx-rs runner: decode_step_masked on unknown seq_id {seq_id}")
-            })?;
-            let logits = model
-                .forward_with_opts(&[last_token], &mut state.cache, /* last_only */ true)
-                .with_context(|| {
-                    format!("native mlx-rs runner: masked decode forward (seq_id={seq_id})")
-                })?;
             // Pull last-position logits to host (single eval), mask, argmax.
-            let mut buf = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
-                .context("native mlx-rs runner: masked decode last-logits-to-cpu failed")?;
-            mask(&mut buf).context("native mlx-rs runner: grammar mask callback failed")?;
-            let next_tok = argmax_host_f32(&buf)
-                .ok_or_else(|| anyhow!("native mlx-rs runner: masked decode empty logit buffer"))?;
-            state.position += 1;
-            Ok((next_tok, state.position))
+            self.decode_step_pick(seq_id, last_token, &mut |buf| {
+                mask(buf).context("native mlx-rs runner: grammar mask callback failed")?;
+                argmax_host_f32(buf).ok_or_else(|| {
+                    anyhow!("native mlx-rs runner: masked decode empty logit buffer")
+                })
+            })
         }
 
         /// [`Self::decode_step_masked`] with the final pick handed to the
@@ -2080,121 +1560,6 @@ mod imp {
 
         pub(crate) fn mtp_enabled(&self) -> bool {
             self.model.as_ref().is_some_and(|m| m.mtp_enabled())
-        }
-
-        /// Start MTP corrector calibration (collect drift pairs up to depth K).
-        pub(crate) fn enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: enable_mtp_calib before model loaded"))?;
-            model.enable_mtp_calib(depth_count);
-            Ok(())
-        }
-
-        /// Drain calibration stats, fit a corrector, return its serialized bytes.
-        pub(crate) fn finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: finalize_mtp_calib before model loaded"))?;
-            let stats = model
-                .take_mtp_calib()
-                .ok_or_else(|| anyhow!("native runner: no calibration in progress"))?;
-            for (d, (n, pre, post)) in stats.drift_report(eps).into_iter().enumerate() {
-                eprintln!(
-                    "[mtp-calib] depth {} : n={n} rel-MAE pre={pre:.4} post(affine)={post:.4}",
-                    d + 1
-                );
-            }
-            Ok(stats.finalize(eps).to_bytes())
-        }
-
-        /// Install a corrector from its serialized bytes (or clear with empty).
-        pub(crate) fn set_mtp_corrector_bytes(&self, bytes: &[u8]) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: set_mtp_corrector before model loaded"))?;
-            let corr = lumen_core::mtp_corrector::MtpCorrector::from_bytes(bytes)
-                .ok_or_else(|| anyhow!("native runner: corrector bytes failed to parse"))?;
-            model.set_mtp_corrector(Some(corr));
-            Ok(())
-        }
-
-        // ── Orthogonal-Procrustes corrector (the rotation shot) ──────────
-        pub(crate) fn enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
-            let model = self.model.as_ref().ok_or_else(|| {
-                anyhow!("native runner: enable_mtp_proc_calib before model loaded")
-            })?;
-            model.enable_mtp_proc_calib(depth_count);
-            Ok(())
-        }
-
-        /// Drain Procrustes stats, print the decisive residual report
-        /// (`rel_raw` vs `rel_proc` per depth), return the fitted corrector bytes.
-        pub(crate) fn finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
-            let model = self.model.as_ref().ok_or_else(|| {
-                anyhow!("native runner: finalize_mtp_proc_calib before model loaded")
-            })?;
-            let stats = model
-                .take_mtp_proc_calib()
-                .ok_or_else(|| anyhow!("native runner: no Procrustes calibration in progress"))?;
-            for (d, (n, raw, proc)) in stats.residual_report().into_iter().enumerate() {
-                eprintln!(
-                    "[mtp-proc-calib] depth {} : n={n} rel-MAE raw={raw:.4} post(rotation)={proc:.4}",
-                    d + 1
-                );
-            }
-            Ok(stats.finalize().to_bytes())
-        }
-
-        pub(crate) fn set_mtp_procrustes_bytes(&self, bytes: &[u8]) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: set_mtp_procrustes before model loaded"))?;
-            let corr = lumen_core::mtp_procrustes::ProcrustesCorrector::from_bytes(bytes)
-                .ok_or_else(|| anyhow!("native runner: procrustes bytes failed to parse"))?;
-            model.set_mtp_procrustes(Some(corr));
-            Ok(())
-        }
-
-        // ── C4 trained lm_head LoRA ──────────────────────────────────────
-        pub(crate) fn enable_mtp_c4_calib(&self) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: enable_mtp_c4_calib before model loaded"))?;
-            model.enable_mtp_c4_calib();
-            Ok(())
-        }
-
-        pub(crate) fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: train_mtp_c4_lmhead before model loaded"))?;
-            model.train_mtp_c4_lmhead(rank, steps, lr)
-        }
-
-        pub(crate) fn enable_mtp_hi_calib(&self) -> Result<()> {
-            let model = self
-                .model
-                .as_ref()
-                .ok_or_else(|| anyhow!("native runner: enable_mtp_hi_calib before model loaded"))?;
-            model.enable_mtp_hi_calib();
-            Ok(())
-        }
-
-        pub(crate) fn train_mtp_headinternal(
-            &self,
-            cfg: crate::qwen3_5_mtp::HiTrainCfg,
-        ) -> Result<(f32, f32)> {
-            let model = self.model.as_ref().ok_or_else(|| {
-                anyhow!("native runner: train_mtp_headinternal before model loaded")
-            })?;
-            model.train_mtp_headinternal(cfg)
         }
 
         pub(crate) fn mtp_step(
@@ -2358,20 +1723,13 @@ mod imp {
             Ok(())
         }
 
-        /// The shape of a bulk prefill of `n` tokens: its chunk size, and
-        /// whether — and from how many rows — a piece cut inside a chunk is
-        /// still computed the same way. A mixture-of-experts model allows no
-        /// such cut (see [`crate::session_feed::PrefillGrid::min_piece`]).
-        /// `None` before a model is loaded.
+        /// The shape of a bulk prefill of `n` tokens: the chunk size it runs
+        /// in, whose boundaries are the only places a rollback point can cut
+        /// it exactly (see `session_feed`). `None` before a model is loaded.
         pub(crate) fn prefill_grid(&self, n: usize) -> Option<crate::session_feed::PrefillGrid> {
             let model = self.model.as_ref()?;
-            let min_piece = match model.config().text_config.mlp_kind() {
-                crate::qwen35_config::MlpKind::Moe => None,
-                crate::qwen35_config::MlpKind::Dense => Some(crate::session_feed::MIN_BULK_PIECE),
-            };
             Some(crate::session_feed::PrefillGrid {
                 chunk: prefill_chunk_decision(model, n).chunk,
-                min_piece,
             })
         }
 
@@ -2808,24 +2166,360 @@ mod imp {
             Ok(())
         }
 
+        // ───────────── MLX FFI smokes, each in a child process ─────────────
+        //
+        // `mlx_smoke_child_entry` does nothing in a normal run. Each
+        // `*_isolated` test re-runs this test binary filtered to it, with
+        // `TQ_MLX_SMOKE_CHILD_MODE` naming one smoke, so a crash inside MLX
+        // takes down the child rather than the test run. The child logs a
+        // marker before and after each step, and the parent reads them back.
+        const MLX_SMOKE_CHILD_MODE_ENV: &str = "TQ_MLX_SMOKE_CHILD_MODE";
+        const MLX_SMOKE_METAL_AVAILABLE_MODE: &str = "metal_available";
+        const MLX_SMOKE_METADATA_MODE: &str = "metadata";
+        const MLX_SMOKE_RAW_ARRAY_EMPTY_MODE: &str = "raw_array_empty";
+        const MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE: &str = "raw_array_new_int";
+        const MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE: &str = "raw_array_new_bool";
+        const MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE: &str = "raw_array_new_float32";
+        const MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE: &str = "raw_array_new_float64";
+        const MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE: &str = "raw_array_new_data_int";
+        const MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE: &str = "raw_array_new_data_empty_int";
+        const MLX_SMOKE_SCALAR_ITEM_MODE: &str = "scalar_item";
+        const MLX_SMOKE_ARGMAX_EVAL_MODE: &str = "argmax_eval";
+        const MLX_SMOKE_SAFETENSORS_MODE: &str = "safetensors";
+
+        fn log_mlx_smoke_phase(mode: &str, phase: &str) -> Result<()> {
+            use std::io::{self, Write};
+
+            let mut stderr = io::stderr().lock();
+            writeln!(stderr, "native mlx-rs smoke [{mode}]: {phase}")
+                .map_err(|err| anyhow!("failed to write native mlx-rs smoke marker: {err}"))?;
+            stderr
+                .flush()
+                .map_err(|err| anyhow!("failed to flush native mlx-rs smoke marker: {err}"))?;
+            Ok(())
+        }
+
+        unsafe extern "C" fn log_mlx_error_handler(
+            msg: *const std::os::raw::c_char,
+            _data: *mut std::os::raw::c_void,
+        ) {
+            use std::ffi::CStr;
+            use std::io::{self, Write};
+
+            let message = if msg.is_null() {
+                "<null mlx error>"
+            } else {
+                unsafe { CStr::from_ptr(msg) }
+                    .to_str()
+                    .unwrap_or("<non-utf8 mlx error>")
+            };
+
+            let _ = writeln!(
+                io::stderr().lock(),
+                "native mlx-rs smoke [mlx_error]: {message}"
+            );
+        }
+
+        fn install_mlx_smoke_error_handler() {
+            unsafe {
+                mlx_sys::mlx_set_error_handler(
+                    Some(log_mlx_error_handler),
+                    std::ptr::null_mut(),
+                    None,
+                );
+            }
+        }
+
+        fn mlx_metal_available_smoke() -> Result<()> {
+            log_mlx_smoke_phase(
+                MLX_SMOKE_METAL_AVAILABLE_MODE,
+                "before mlx_metal_is_available",
+            )?;
+            let mut is_available = false;
+            let status = unsafe { mlx_sys::mlx_metal_is_available(&mut is_available as *mut bool) };
+            log_mlx_smoke_phase(
+                MLX_SMOKE_METAL_AVAILABLE_MODE,
+                "after mlx_metal_is_available",
+            )?;
+            if status != 0 {
+                return Err(anyhow!(
+                    "native mlx-sys metal availability smoke returned status {status}"
+                ));
+            }
+            log_mlx_smoke_phase(
+                MLX_SMOKE_METAL_AVAILABLE_MODE,
+                if is_available {
+                    "metal available"
+                } else {
+                    "metal unavailable"
+                },
+            )?;
+
+            Ok(())
+        }
+
+        fn mlx_raw_array_empty_smoke() -> Result<()> {
+            install_mlx_smoke_error_handler();
+            log_mlx_smoke_phase(
+                MLX_SMOKE_RAW_ARRAY_EMPTY_MODE,
+                "installed mlx error handler",
+            )?;
+            log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "before mlx_array_new")?;
+            let value = unsafe { mlx_sys::mlx_array_new() };
+            log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "after mlx_array_new")?;
+            if value.ctx.is_null() {
+                log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "empty handle")?;
+                return Ok(());
+            }
+
+            let status = unsafe { mlx_sys::mlx_array_free(value) };
+            log_mlx_smoke_phase(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE, "after mlx_array_free")?;
+            if status != 0 {
+                return Err(anyhow!(
+                    "native mlx-sys empty array free returned status {status}"
+                ));
+            }
+
+            Ok(())
+        }
+
+        /// The raw `mlx-sys` constructors the diagnostic smokes call, one per
+        /// mode: `(mode, constructor, what its errors call the array, call)`.
+        const RAW_ARRAY_CTORS: &[(&str, &str, &str, fn() -> mlx_sys::mlx_array)] = &[
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE,
+                "mlx_array_new_int",
+                "raw",
+                || unsafe { mlx_sys::mlx_array_new_int(7) },
+            ),
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE,
+                "mlx_array_new_bool",
+                "raw bool",
+                || unsafe { mlx_sys::mlx_array_new_bool(true) },
+            ),
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE,
+                "mlx_array_new_float32",
+                "raw float32",
+                || unsafe { mlx_sys::mlx_array_new_float32(7.0) },
+            ),
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE,
+                "mlx_array_new_float64",
+                "raw float64",
+                || unsafe { mlx_sys::mlx_array_new_float64(7.0) },
+            ),
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
+                "mlx_array_new_data",
+                "raw int data",
+                || new_int32_data(&[7], &[1]),
+            ),
+            (
+                MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
+                "mlx_array_new_data",
+                "raw empty int data",
+                || new_int32_data(&[], &[0]),
+            ),
+        ];
+
+        fn new_int32_data(data: &[i32], shape: &[i32]) -> mlx_sys::mlx_array {
+            unsafe {
+                mlx_sys::mlx_array_new_data(
+                    data.as_ptr().cast(),
+                    shape.as_ptr(),
+                    shape.len() as i32,
+                    mlx_sys::mlx_dtype__MLX_INT32,
+                )
+            }
+        }
+
+        /// Build one array with a raw `mlx-sys` constructor and free it,
+        /// logging each step so the parent can tell how far the child got.
+        fn raw_array_ctor_smoke(
+            mode: &str,
+            ctor: &str,
+            what: &str,
+            make: fn() -> mlx_sys::mlx_array,
+        ) -> Result<()> {
+            install_mlx_smoke_error_handler();
+            log_mlx_smoke_phase(mode, "installed mlx error handler")?;
+            log_mlx_smoke_phase(mode, &format!("before {ctor}"))?;
+            let value = make();
+            log_mlx_smoke_phase(mode, &format!("after {ctor}"))?;
+            if value.ctx.is_null() {
+                return Err(anyhow!(
+                    "native mlx-sys {what} array constructor returned an empty handle"
+                ));
+            }
+
+            let status = unsafe { mlx_sys::mlx_array_free(value) };
+            log_mlx_smoke_phase(mode, "after mlx_array_free")?;
+            if status != 0 {
+                return Err(anyhow!(
+                    "native mlx-sys {what} array free returned status {status}"
+                ));
+            }
+
+            Ok(())
+        }
+
+        fn mlx_tensor_metadata_smoke() -> Result<()> {
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before Array::from_int")?;
+            let value = Array::from_int(7);
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after Array::from_int")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before ndim")?;
+            if value.ndim() != 0 {
+                return Err(anyhow!(
+                    "native mlx-rs tensor metadata smoke returned ndim {}, expected scalar ndim 0",
+                    value.ndim()
+                ));
+            }
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after ndim")?;
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before size")?;
+            if value.size() != 1 {
+                return Err(anyhow!(
+                    "native mlx-rs tensor metadata smoke returned size {}, expected 1",
+                    value.size()
+                ));
+            }
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after size")?;
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "before shape")?;
+            if !value.shape().is_empty() {
+                return Err(anyhow!(
+                    "native mlx-rs tensor metadata smoke returned shape {:?}, expected scalar shape []",
+                    value.shape()
+                ));
+            }
+            log_mlx_smoke_phase(MLX_SMOKE_METADATA_MODE, "after shape")?;
+
+            Ok(())
+        }
+
+        fn mlx_tensor_scalar_item_smoke() -> Result<()> {
+            log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "before Array::from_int")?;
+            let value = Array::from_int(7);
+            log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "after Array::from_int")?;
+            log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "before try_item")?;
+            let observed = value.try_item::<i32>().map_err(|err| {
+                anyhow!("native mlx-rs tensor smoke failed during scalar read: {err}")
+            })?;
+            log_mlx_smoke_phase(MLX_SMOKE_SCALAR_ITEM_MODE, "after try_item")?;
+            if observed != 7 {
+                return Err(anyhow!(
+                    "native mlx-rs tensor smoke returned scalar {observed}, expected 7"
+                ));
+            }
+
+            Ok(())
+        }
+
+        fn mlx_tensor_argmax_eval_smoke() -> Result<()> {
+            use mlx_rs::ops::indexing;
+
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before Array::from_slice")?;
+            let values = Array::from_slice(&[0.25_f32, 3.5, -1.0, 2.0], &[4]);
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after Array::from_slice")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before argmax")?;
+            let index = indexing::argmax(&values, false)?;
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after argmax")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before eval")?;
+            index
+                .eval()
+                .map_err(|err| anyhow!("native mlx-rs argmax smoke failed during eval: {err}"))?;
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after eval")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "before try_item")?;
+            let observed = index.try_item::<u32>().map_err(|err| {
+                anyhow!("native mlx-rs argmax smoke failed during scalar read: {err}")
+            })?;
+            log_mlx_smoke_phase(MLX_SMOKE_ARGMAX_EVAL_MODE, "after try_item")?;
+            if observed != 1 {
+                return Err(anyhow!(
+                    "native mlx-rs argmax smoke returned index {observed}, expected 1"
+                ));
+            }
+
+            Ok(())
+        }
+
+        fn mlx_tensor_safetensors_smoke() -> Result<()> {
+            use mlx_rs::ops::indexing;
+            use std::collections::HashMap;
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before Array::from_slice")?;
+            let values = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after Array::from_slice")?;
+
+            let path = std::env::temp_dir().join(format!(
+                "lumen_mlx_native_smoke_{}.safetensors",
+                std::process::id()
+            ));
+
+            let mut arrays = HashMap::new();
+            arrays.insert("weights".to_string(), values);
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before save_safetensors")?;
+            Array::save_safetensors(&arrays, None, &path).map_err(|err| {
+                anyhow!("native mlx-rs safetensors smoke failed during save: {err}")
+            })?;
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after save_safetensors")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before load_safetensors")?;
+            let loaded = NativeSafetensorWeights::load_file(&path)?;
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after load_safetensors")?;
+
+            let _ = std::fs::remove_file(&path);
+
+            let loaded_values = loaded.get_required("weights")?;
+            if loaded_values.shape() != [2, 2] {
+                return Err(anyhow!(
+                    "native mlx-rs safetensors smoke loaded shape {:?}, expected [2, 2]",
+                    loaded_values.shape()
+                ));
+            }
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before argmax")?;
+            let index = indexing::argmax(loaded_values, false)?;
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after argmax")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before eval")?;
+            index.eval().map_err(|err| {
+                anyhow!("native mlx-rs safetensors smoke failed during eval: {err}")
+            })?;
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after eval")?;
+
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "before try_item")?;
+            let observed = index.try_item::<u32>().map_err(|err| {
+                anyhow!("native mlx-rs safetensors smoke failed during scalar read: {err}")
+            })?;
+            log_mlx_smoke_phase(MLX_SMOKE_SAFETENSORS_MODE, "after try_item")?;
+            if observed != 3 {
+                return Err(anyhow!(
+                    "native mlx-rs safetensors smoke returned argmax {observed}, expected 3"
+                ));
+            }
+
+            Ok(())
+        }
+
         #[test]
         fn mlx_smoke_child_entry() -> Result<()> {
             match std::env::var(MLX_SMOKE_CHILD_MODE_ENV).as_deref() {
                 Ok(MLX_SMOKE_METAL_AVAILABLE_MODE) => mlx_metal_available_smoke(),
                 Ok(MLX_SMOKE_METADATA_MODE) => mlx_tensor_metadata_smoke(),
                 Ok(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE) => mlx_raw_array_empty_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE) => mlx_raw_array_new_int_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE) => mlx_raw_array_new_bool_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE) => mlx_raw_array_new_float32_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE) => mlx_raw_array_new_float64_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE) => mlx_raw_array_new_data_int_smoke(),
-                Ok(MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE) => {
-                    mlx_raw_array_new_data_empty_int_smoke()
-                }
                 Ok(MLX_SMOKE_SCALAR_ITEM_MODE) => mlx_tensor_scalar_item_smoke(),
                 Ok(MLX_SMOKE_ARGMAX_EVAL_MODE) => mlx_tensor_argmax_eval_smoke(),
                 Ok(MLX_SMOKE_SAFETENSORS_MODE) => mlx_tensor_safetensors_smoke(),
-                Ok(mode) => Err(anyhow!("unknown native mlx-rs child smoke mode: {mode}")),
+                Ok(mode) => match RAW_ARRAY_CTORS.iter().find(|ctor| ctor.0 == mode) {
+                    Some(&(mode, ctor, what, make)) => raw_array_ctor_smoke(mode, ctor, what, make),
+                    None => Err(anyhow!("unknown native mlx-rs child smoke mode: {mode}")),
+                },
                 Err(_) => Ok(()),
             }
         }
@@ -2833,62 +2527,29 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for raw mlx-sys metal availability; runs MLX FFI in a child process"]
         fn mlx_metal_available_smoke_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_METAL_AVAILABLE_MODE)?;
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "native mlx-sys metal availability child smoke failed with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                ));
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr
-                .contains("native mlx-rs smoke [metal_available]: after mlx_metal_is_available")
-            {
-                return Err(anyhow!(
-                    "native mlx-sys metal availability child smoke did not reach completion marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_completes(
+                MLX_SMOKE_METAL_AVAILABLE_MODE,
+                "native mlx-sys metal availability",
+                "native mlx-rs smoke [metal_available]: after mlx_metal_is_available",
+            )
         }
 
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys empty array constructor; runs MLX FFI in a child process"]
         fn mlx_raw_array_empty_smoke_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_RAW_ARRAY_EMPTY_MODE)?;
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "native mlx-sys empty array child smoke failed with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                ));
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("native mlx-rs smoke [raw_array_empty]: after mlx_array_new") {
-                return Err(anyhow!(
-                    "native mlx-sys empty array child smoke did not reach completion marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_completes(
+                MLX_SMOKE_RAW_ARRAY_EMPTY_MODE,
+                "native mlx-sys empty array",
+                "native mlx-rs smoke [raw_array_empty]: after mlx_array_new",
+            )
         }
 
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys int allocation path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_int_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_INT_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_int]: before mlx_array_new_int",
                 "native mlx-rs smoke [raw_array_new_int]: after mlx_array_free",
             )
@@ -2897,8 +2558,9 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys bool allocation path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_bool_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_BOOL_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_bool]: before mlx_array_new_bool",
                 "native mlx-rs smoke [raw_array_new_bool]: after mlx_array_free",
             )
@@ -2907,8 +2569,9 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys float32 allocation path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_float32_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_FLOAT32_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_float32]: before mlx_array_new_float32",
                 "native mlx-rs smoke [raw_array_new_float32]: after mlx_array_free",
             )
@@ -2917,8 +2580,9 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys float64 allocation path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_float64_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_FLOAT64_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_float64]: before mlx_array_new_float64",
                 "native mlx-rs smoke [raw_array_new_float64]: after mlx_array_free",
             )
@@ -2927,8 +2591,9 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys int data array constructor path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_data_int_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_DATA_INT_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_data_int]: before mlx_array_new_data",
                 "native mlx-rs smoke [raw_array_new_data_int]: after mlx_array_free",
             )
@@ -2937,8 +2602,9 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for the raw mlx-sys empty int data array constructor path; runs the unsafe path in a child process"]
         fn mlx_raw_array_new_data_empty_int_diagnostic_isolated() -> Result<()> {
-            assert_raw_array_constructor_diagnostic(
+            assert_child_diagnostic(
                 MLX_SMOKE_RAW_ARRAY_NEW_DATA_EMPTY_INT_MODE,
+                "native mlx-sys raw array",
                 "native mlx-rs smoke [raw_array_new_data_empty_int]: before mlx_array_new_data",
                 "native mlx-rs smoke [raw_array_new_data_empty_int]: after mlx_array_free",
             )
@@ -2947,114 +2613,44 @@ mod imp {
         #[test]
         #[ignore = "diagnostic smoke for mlx-rs allocation/metadata; runs MLX FFI in a child process"]
         fn mlx_metadata_smoke_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_METADATA_MODE)?;
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "native mlx-rs metadata child smoke failed with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                ));
-            }
-
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("native mlx-rs smoke [metadata]: after shape") {
-                return Err(anyhow!(
-                    "native mlx-rs metadata child smoke did not reach completion marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_completes(
+                MLX_SMOKE_METADATA_MODE,
+                "native mlx-rs metadata",
+                "native mlx-rs smoke [metadata]: after shape",
+            )
         }
 
         #[test]
         #[ignore = "diagnostic smoke for the mlx-rs scalar read path; runs the unsafe path in a child process"]
         fn mlx_scalar_item_diagnostic_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_SCALAR_ITEM_MODE)?;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if output.status.success() {
-                if stderr.contains("native mlx-rs smoke [scalar_item]: after try_item") {
-                    return Ok(());
-                }
-                return Err(anyhow!(
-                    "native mlx-rs scalar child smoke exited successfully without reaching completion marker\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            if !stderr.contains("native mlx-rs smoke [scalar_item]: before Array::from_int") {
-                return Err(anyhow!(
-                    "native mlx-rs scalar child smoke failed before reaching the allocation marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_diagnostic(
+                MLX_SMOKE_SCALAR_ITEM_MODE,
+                "native mlx-rs scalar",
+                "native mlx-rs smoke [scalar_item]: before Array::from_int",
+                "native mlx-rs smoke [scalar_item]: after try_item",
+            )
         }
 
         #[test]
         #[ignore = "diagnostic smoke for mlx-rs argmax/eval; runs MLX FFI in a child process"]
         fn mlx_argmax_eval_diagnostic_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_ARGMAX_EVAL_MODE)?;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if output.status.success() {
-                if stderr.contains("native mlx-rs smoke [argmax_eval]: after try_item") {
-                    return Ok(());
-                }
-                return Err(anyhow!(
-                    "native mlx-rs argmax/eval child smoke exited successfully without reaching completion marker\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            if !stderr.contains("native mlx-rs smoke [argmax_eval]: before Array::from_slice") {
-                return Err(anyhow!(
-                    "native mlx-rs argmax/eval child smoke failed before reaching the allocation marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_diagnostic(
+                MLX_SMOKE_ARGMAX_EVAL_MODE,
+                "native mlx-rs argmax/eval",
+                "native mlx-rs smoke [argmax_eval]: before Array::from_slice",
+                "native mlx-rs smoke [argmax_eval]: after try_item",
+            )
         }
 
         #[test]
         #[ignore = "diagnostic smoke for mlx-rs safetensors save/load; runs MLX FFI in a child process"]
         fn mlx_safetensors_diagnostic_isolated() -> Result<()> {
-            let output = run_mlx_smoke_child(MLX_SMOKE_SAFETENSORS_MODE)?;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            if output.status.success() {
-                if stderr.contains("native mlx-rs smoke [safetensors]: after try_item") {
-                    return Ok(());
-                }
-                return Err(anyhow!(
-                    "native mlx-rs safetensors child smoke exited successfully without reaching completion marker\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            if !stderr.contains("native mlx-rs smoke [safetensors]: before Array::from_slice") {
-                return Err(anyhow!(
-                    "native mlx-rs safetensors child smoke failed before reaching the allocation marker with status {}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    stderr,
-                ));
-            }
-
-            Ok(())
+            assert_child_diagnostic(
+                MLX_SMOKE_SAFETENSORS_MODE,
+                "native mlx-rs safetensors",
+                "native mlx-rs smoke [safetensors]: before Array::from_slice",
+                "native mlx-rs smoke [safetensors]: after try_item",
+            )
         }
 
         fn run_mlx_smoke_child(mode: &str) -> Result<Output> {
@@ -3068,8 +2664,38 @@ mod imp {
             Ok(output)
         }
 
-        fn assert_raw_array_constructor_diagnostic(
+        /// The child must exit cleanly and log `marker`. `what` opens the
+        /// error message.
+        fn assert_child_completes(mode: &str, what: &str, marker: &str) -> Result<()> {
+            let output = run_mlx_smoke_child(mode)?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "{what} child smoke failed with status {}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains(marker) {
+                return Err(anyhow!(
+                    "{what} child smoke did not reach completion marker with status {}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    stderr,
+                ));
+            }
+
+            Ok(())
+        }
+
+        /// A diagnostic smoke may crash the child, as long as it got as far as
+        /// `before_marker`; a child that exits cleanly must have logged
+        /// `after_marker`. `what` opens the error message.
+        fn assert_child_diagnostic(
             mode: &str,
+            what: &str,
             before_marker: &str,
             after_marker: &str,
         ) -> Result<()> {
@@ -3081,7 +2707,7 @@ mod imp {
                     return Ok(());
                 }
                 return Err(anyhow!(
-                    "native mlx-sys raw array child smoke exited successfully without reaching completion marker\nstdout:\n{}\nstderr:\n{}",
+                    "{what} child smoke exited successfully without reaching completion marker\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     stderr,
                 ));
@@ -3089,7 +2715,7 @@ mod imp {
 
             if !stderr.contains(before_marker) {
                 return Err(anyhow!(
-                    "native mlx-sys raw array child smoke failed before reaching the allocation marker with status {}\nstdout:\n{}\nstderr:\n{}",
+                    "{what} child smoke failed before reaching the allocation marker with status {}\nstdout:\n{}\nstderr:\n{}",
                     output.status,
                     String::from_utf8_lossy(&output.stdout),
                     stderr,

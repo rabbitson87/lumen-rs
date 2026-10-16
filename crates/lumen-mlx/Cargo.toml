@@ -93,15 +93,9 @@ mlx-sys = { git = "https://github.com/rabbitson87/mlx-rs", rev = "e7244a229c5554
 objc2 = { version = "0.6.4", optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { version = "0.3.2", optional = true }
-# PyO3 — in-process Python interpreter for the mlx-lm Pyo3Runner (Qwen
-# backend only). Gemma 4 native path is pure Rust + mlx-rs. Gate behind
-# the `mlx-pyo3` feature so production builds (Gemma 4) can be PyO3-free
-# and ship a Python.framework-independent binary.
-pyo3 = { version = "0.28.3", features = ["auto-initialize"], optional = true }
 
 [features]
 default = []
-mlx-pyo3 = ["dep:pyo3"]
 mlx-native = [
     "dep:mlx-rs",
     "dep:mlx-sys",
@@ -134,10 +128,6 @@ lumen-testkit = { path = "../lumen-testkit" }
 # the build that would have caught it.
 [[example]]
 name = "bench_affine4_qmv_decode"
-required-features = ["mlx-native"]
-
-[[example]]
-name = "bench_mtp_headinternal_poc"
 required-features = ["mlx-native"]
 
 [[example]]

@@ -29,14 +29,13 @@ pub mod imp {
     use mlx_rs::Dtype;
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
 
-    use std::sync::OnceLock;
-
     // ───────────────────────────── config ─────────────────────────────
 
     // The `vision_config` block is pure serde + arithmetic validation, so it
     // lives in the ungated `qwen35_config` module alongside the rest of this
     // config.json. Re-exported here so call sites are untouched.
     pub use crate::qwen35_config::NativeQwen36VisionConfig;
+    use crate::vision_splice::tower::{take, take_t, vision_eval_every, vision_f32_enabled};
 
     /// LayerNorm epsilon. Hard-coded upstream (`nn.LayerNorm(..., eps=1e-6)`)
     /// rather than read from the config, so it is hard-coded here too.
@@ -46,29 +45,6 @@ pub mod imp {
     /// (`Qwen3VLVisionRotaryEmbedding(head_dim // 2)` takes `theta=10000.0` by
     /// default) — the text tower's much larger `rope_theta` does not apply.
     const VISION_ROPE_THETA: f32 = 10_000.0;
-
-    /// Run the tower in float32 instead of the checkpoint's bf16.
-    fn vision_f32_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("LUMEN_VISION_F32")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false)
-        })
-    }
-
-    /// Drain the lazy graph every N encoder blocks. Same rationale as the
-    /// Gemma 4 tower: without it every block's activations stay live until the
-    /// first eval and peak memory climbs by GBs on a long patch grid.
-    fn vision_eval_every() -> usize {
-        static EVERY: OnceLock<usize> = OnceLock::new();
-        *EVERY.get_or_init(|| {
-            std::env::var("LUMEN_VISION_EVAL_EVERY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4)
-        })
-    }
 
     // ───────────────────────────── weights ─────────────────────────────
 
@@ -112,28 +88,6 @@ pub mod imp {
         blocks: Vec<VisionBlock>,
         merger: VisionMerger,
         dtype: Dtype,
-    }
-
-    fn take(
-        weights: &std::collections::HashMap<String, Array>,
-        name: &str,
-        dtype: Dtype,
-    ) -> Result<Array> {
-        weights
-            .get(name)
-            .ok_or_else(|| anyhow!("vision weight `{name}` not found"))?
-            .as_dtype(dtype)
-            .with_context(|| format!("cast `{name}` to {dtype:?}"))
-    }
-
-    /// Look up an `[out, in]` linear weight and return it as `[in, out]`.
-    fn take_t(
-        weights: &std::collections::HashMap<String, Array>,
-        name: &str,
-        dtype: Dtype,
-    ) -> Result<Array> {
-        let w = take(weights, name, dtype)?;
-        mlx_rs::ops::transpose(&w).with_context(|| format!("transpose(`{name}`)"))
     }
 
     impl NativeQwen36VisionTower {

@@ -138,43 +138,8 @@ pub use imp::KleinPipeline;
 mod parity_tests {
     use super::imp::KleinPipeline;
     use crate::scheduler;
+    use crate::test_util::{cf_to_cl, klein_dit_path, klein_vae_path, read_f32_bin, read_i32_bin};
     use mlx_rs::Array;
-
-    // Klein DiT + VAE (bf16), resolved from the local HF cache.
-    fn dit_path() -> String {
-        crate::hf_cache::snapshot_path_or_rel(
-            crate::repos::VAE,
-            "transformer/diffusion_pytorch_model.safetensors",
-        )
-        .to_string_lossy()
-        .into_owned()
-    }
-    fn vae_path() -> String {
-        crate::hf_cache::snapshot_path_or_rel(
-            crate::repos::VAE,
-            "vae/diffusion_pytorch_model.safetensors",
-        )
-        .to_string_lossy()
-        .into_owned()
-    }
-
-    fn read_f32_bin(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not f32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-
-    fn read_i32_bin(path: &str) -> Vec<i32> {
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert_eq!(bytes.len() % 4, 0, "{path} not i32-aligned");
-        bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
 
     fn read_dims() -> (i32, i32, i32, i32) {
         let d = read_i32_bin("/tmp/klein_dims.bin");
@@ -182,23 +147,6 @@ mod parity_tests {
     }
 
     use lumen_testkit::cosine;
-
-    /// Reorder channels-first `[B,C,H,W]` flat → channels-last `[B,H,W,C]`.
-    fn cf_to_cl(cf: &[f32], b: usize, c: usize, h: usize, w: usize) -> Vec<f32> {
-        let mut out = vec![0.0f32; cf.len()];
-        for bi in 0..b {
-            for ci in 0..c {
-                for hi in 0..h {
-                    for wi in 0..w {
-                        let src = ((bi * c + ci) * h + hi) * w + wi;
-                        let dst = ((bi * h + hi) * w + wi) * c + ci;
-                        out[dst] = cf[src];
-                    }
-                }
-            }
-        }
-        out
-    }
 
     /// Standalone VAE packed-decode parity: feed mflux's FINAL packed latents,
     /// compare decoded image to mflux's image.
@@ -214,7 +162,7 @@ mod parity_tests {
         let packed_arr = Array::from_slice(&packed, &[1, 128, lat_h, lat_w]);
         packed_arr.eval().unwrap();
 
-        let vae = VaeDecoder::load(vae_path()).expect("load VAE");
+        let vae = VaeDecoder::load(klein_vae_path()).expect("load VAE");
 
         // Glue-only check: bn-denorm + unpatchify vs an f32 reference computed
         // identically (channels-first [1,32,2lh,2lw]). This isolates the
@@ -309,7 +257,8 @@ mod parity_tests {
         assert_eq!(text_ids.len(), (txt_seq * 4) as usize, "text_ids len");
 
         // 2. run the Rust pipeline.
-        let pipe = KleinPipeline::load(&dit_path(), &vae_path()).expect("load pipeline");
+        let pipe =
+            KleinPipeline::load(&klein_dit_path(), &klein_vae_path()).expect("load pipeline");
         let (per_step, image) = pipe
             .generate_with_trace(
                 &prompt_embeds,

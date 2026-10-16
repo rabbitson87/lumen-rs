@@ -1,24 +1,22 @@
-use atomic_http::external::http::{Request, Response, StatusCode};
+use atomic_http::external::http::{Request, Response};
 use atomic_http::*;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use super::respond;
 use crate::engine::{EngineHandle, StreamEvent};
 use crate::types::{AnthropicError, AnthropicRequest};
 
 pub async fn handle(
     request: Request<ArenaBody>,
-    mut response: Response<ArenaWriter>,
+    response: Response<ArenaWriter>,
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
     let req: AnthropicRequest = match request.get_json_arena() {
         Ok(r) => r,
         Err(e) => {
             let err = AnthropicError::new(format!("invalid request: {e}"));
-            response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(400)?;
-            response.responser_arena().await?;
-            return Ok(());
+            return respond(response, 400, &err).await;
         }
     };
 
@@ -27,10 +25,7 @@ pub async fn handle(
     }
 
     match handle.anthropic_messages(req).await {
-        Ok(resp) => {
-            response.body_mut().set_arena_json(&resp)?;
-            *response.status_mut() = StatusCode::from_u16(200)?;
-        }
+        Ok(resp) => respond(response, 200, &resp).await,
         Err(e) => {
             let status = crate::types::inference_error_status(&e);
             let mut err = AnthropicError::new(crate::types::inference_error_message(&e));
@@ -39,13 +34,9 @@ pub async fn handle(
             if status == 500 {
                 err.error.r#type = "api_error".into();
             }
-            response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(status)?;
+            respond(response, status, &err).await
         }
     }
-
-    response.responser_arena().await?;
-    Ok(())
 }
 
 /// What `message_start` should report as `input_tokens`, and what is left over.

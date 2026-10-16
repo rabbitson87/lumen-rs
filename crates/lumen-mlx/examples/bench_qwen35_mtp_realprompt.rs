@@ -164,45 +164,6 @@ fn main() -> Result<()> {
     // Tokenize the real prompt BEFORE taking the mutable qwen borrow.
     let prompt = backend.encode(&prompt_text)?;
     println!("prompt tokens: {}", prompt.len());
-    // Optional HELD-OUT eval prompt for the C4 generalization test: calib trains
-    // on `prompt`, the A/B arms run on this different prompt. Encoded upfront
-    // (the qwen borrow below precludes backend.encode later).
-    let eval_prompt: Option<Vec<u32>> = match std::env::var("MTP_C4_EVAL_PROMPT") {
-        Ok(t) if !t.is_empty() => {
-            let e = backend.encode(&t)?;
-            println!("eval prompt tokens: {} (held-out A/B)", e.len());
-            Some(e)
-        }
-        _ => None,
-    };
-    // Broad C4 calibration corpus (diverse topics) — encoded upfront (the qwen
-    // borrow precludes backend.encode later). Used when MTP_C4_BROAD=1 so the
-    // lm_head LoRA learns a generalizable correction, not one prompt's tokens.
-    let c4_broad_prompts: Vec<Vec<u32>> = if std::env::var("MTP_C4_BROAD").as_deref() == Ok("1") {
-        const TOPICS: &[&str] = &[
-            "Explain how a lithium-ion battery stores and releases energy through ion movement between electrodes.",
-            "Describe the process of photosynthesis and how plants convert sunlight into chemical energy.",
-            "Write a short story about a lighthouse keeper who discovers a message in a bottle.",
-            "Summarize the causes and consequences of the fall of the Roman Empire.",
-            "Explain the difference between TCP and UDP and when each protocol is preferred.",
-            "How does a transformer neural network use self-attention to process sequences?",
-            "Give a recipe for a simple sourdough bread including the fermentation steps.",
-            "Explain the theory of plate tectonics and how it shapes mountains and oceans.",
-            "What are the key principles of object-oriented programming with examples?",
-            "Describe how vaccines train the immune system to recognize pathogens.",
-            "Explain compound interest and how it affects long-term savings growth.",
-            "Write a dialogue between two travelers debating the merits of trains versus planes.",
-        ];
-        let mut v = Vec::new();
-        for t in TOPICS {
-            v.push(backend.encode(t)?);
-        }
-        println!("C4 broad calib corpus: {} prompts", v.len());
-        v
-    } else {
-        Vec::new()
-    };
-
     let qwen = backend
         .as_qwen35_mut()
         .ok_or_else(|| anyhow!("backend is not the Qwen3.5 family"))?;
@@ -225,119 +186,9 @@ fn main() -> Result<()> {
     }
     println!("mtp head enabled.");
 
-    // ───────── Calibration mode (MTP_CALIB_OUT=<path>) ─────────
-    // Collect per-depth (recursive draft hidden, trunk true hidden) pairs over
-    // a greedy run, fit the diagonal-affine corrector, save, and exit.
-    if let Ok(calib_out) = std::env::var("MTP_CALIB_OUT") {
-        let calib_gen = env_usize("MTP_CALIB_GEN", 512);
-        println!("=== CALIBRATION: depth={k} gen={calib_gen} -> {calib_out} ===");
-        qwen.qwen35_enable_mtp_calib(k)?;
-        let seq_c: u64 = 2003;
-        let (mut last_c, _p) = qwen.prefill(seq_c, &prompt)?;
-        let mut emitted = 0usize;
-        while emitted < calib_gen {
-            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
-            emitted += out.committed.len();
-            last_c = *out.committed.last().expect("calib commit non-empty");
-        }
-        qwen.remove_seq(seq_c)?;
-        let bytes = qwen.qwen35_finalize_mtp_calib(1e-6)?;
-        std::fs::write(&calib_out, &bytes)?;
-        println!(
-            "calibration done: {emitted} tokens, corrector {} bytes -> {calib_out}",
-            bytes.len()
-        );
-        return Ok(());
-    }
-
-    // ───────── Procrustes calibration (MTP_PROC_CALIB_OUT=<path>) ─────────
-    // The rotation shot: fit a per-depth scaled-rotation corrector and print
-    // the decisive residual report (rel_raw vs rel_proc). If rel_proc stays
-    // near rel_raw, x,y are near-uncorrelated → dead; if it drops far, wire it.
-    if let Ok(calib_out) = std::env::var("MTP_PROC_CALIB_OUT") {
-        let calib_gen = env_usize("MTP_CALIB_GEN", 256);
-        println!("=== PROCRUSTES CALIBRATION: depth={k} gen={calib_gen} -> {calib_out} ===");
-        qwen.qwen35_enable_mtp_proc_calib(k)?;
-        let seq_c: u64 = 2013;
-        let (mut last_c, _p) = qwen.prefill(seq_c, &prompt)?;
-        let mut emitted = 0usize;
-        while emitted < calib_gen {
-            let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
-            emitted += out.committed.len();
-            last_c = *out.committed.last().expect("proc-calib commit non-empty");
-        }
-        qwen.remove_seq(seq_c)?;
-        let bytes = qwen.qwen35_finalize_mtp_proc_calib()?;
-        std::fs::write(&calib_out, &bytes)?;
-        println!(
-            "procrustes calibration done: {emitted} tokens, corrector {} bytes -> {calib_out}",
-            bytes.len()
-        );
-        return Ok(());
-    }
-
-    // ───────── C4 lm_head LoRA train (MTP_C4_TRAIN=1) ─────────
-    // The accept-aligned lever: collect (lm_head-input, trunk-argmax) calib
-    // pairs over a greedy 2-forward run, train a rank-r lm_head LoRA on CE,
-    // INSTALL it, then fall through to the normal A/B (which now drafts with
-    // the corrected logits). Force 2-forward (calib/apply wired there).
-    if std::env::var("MTP_C4_TRAIN").as_deref() == Ok("1") {
-        let calib_gen = env_usize("MTP_CALIB_GEN", 512);
-        let rank = env_usize("MTP_C4_RANK", 8);
-        let steps = env_usize("MTP_C4_STEPS", 120);
-        let lr: f32 = std::env::var("MTP_C4_LR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.02);
-        println!("=== C4 TRAIN: calib_gen={calib_gen} rank={rank} steps={steps} lr={lr} K={k} ===");
-        qwen.qwen35_enable_mtp_c4_calib()?;
-        // Calib corpus: broad multi-prompt set (generalizes) or the single
-        // default prompt (overfits — kept for the in-sample A/B).
-        let calib_set: Vec<&[u32]> = if !c4_broad_prompts.is_empty() {
-            c4_broad_prompts.iter().map(|p| p.as_slice()).collect()
-        } else {
-            vec![prompt.as_slice()]
-        };
-        let per = (calib_gen / calib_set.len()).max(8);
-        for (i, cp) in calib_set.iter().enumerate() {
-            let seq_c: u64 = 2023 + i as u64;
-            let (mut last_c, _p) = qwen.prefill(seq_c, cp)?;
-            let mut emitted = 0usize;
-            while emitted < per {
-                let out = qwen.qwen35_mtp_step(seq_c, last_c, k, &Default::default())?;
-                emitted += out.committed.len();
-                last_c = *out.committed.last().expect("c4-calib commit non-empty");
-            }
-            qwen.remove_seq(seq_c)?;
-        }
-        qwen.qwen35_train_mtp_c4_lmhead(rank, steps, lr)?;
-        println!("C4 lm_head LoRA trained + installed; running A/B with it active.");
-    }
-
-    // ───────── Optional corrector load (MTP_CORRECTOR=<path>) ─────────
-    if let Ok(corr_path) = std::env::var("MTP_CORRECTOR") {
-        let bytes = std::fs::read(&corr_path)?;
-        qwen.qwen35_load_mtp_corrector(&bytes)?;
-        println!("corrector loaded: {} bytes from {corr_path}", bytes.len());
-    }
-
-    // ───────── Optional Procrustes corrector load (MTP_PROCRUSTES=<path>) ─────────
-    if let Ok(corr_path) = std::env::var("MTP_PROCRUSTES") {
-        let bytes = std::fs::read(&corr_path)?;
-        qwen.qwen35_load_mtp_procrustes(&bytes)?;
-        println!(
-            "procrustes corrector loaded: {} bytes from {corr_path}",
-            bytes.len()
-        );
-    }
-
-    // The A/B arms run on the held-out eval prompt when set (C4 generalization),
-    // else the same prompt used everywhere.
-    let ab_prompt: &[u32] = eval_prompt.as_deref().unwrap_or(&prompt);
-
     // ───────── Pass A — baseline single-token decode ─────────
     let seq_a: u64 = 2001;
-    let (mut last_a, mut pos_a) = qwen.prefill(seq_a, ab_prompt)?;
+    let (mut last_a, mut pos_a) = qwen.prefill(seq_a, &prompt)?;
     for _ in 0..warmup {
         let (n, p) = qwen.decode_step(seq_a, last_a, pos_a)?;
         last_a = n;
@@ -370,7 +221,7 @@ fn main() -> Result<()> {
         .unwrap_or(1.0);
     println!("mtp acceptance: temp={mtp_temp} top_p={mtp_topp}");
     let seq_b: u64 = 2002;
-    let (mut last_b, _pos_b) = qwen.prefill(seq_b, ab_prompt)?;
+    let (mut last_b, _pos_b) = qwen.prefill(seq_b, &prompt)?;
     for _ in 0..warmup {
         let w = qwen.qwen35_mtp_step(seq_b, last_b, k, &Default::default())?;
         last_b = *w.committed.last().expect("warmup commit");

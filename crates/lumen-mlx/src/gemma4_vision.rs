@@ -28,7 +28,8 @@ pub mod imp {
 
     use std::sync::OnceLock;
 
-    use crate::native_quant::quantized_matmul_with_mode;
+    use crate::qwen3_5_moe::ResolvedLinear;
+    use crate::vision_splice::tower::{take, take_t, vision_eval_every, vision_f32_enabled};
 
     // ───────────────────────────── config ─────────────────────────────
 
@@ -36,32 +37,6 @@ pub mod imp {
     // lives in the ungated `gemma4_config` module alongside the rest of this
     // config.json. Re-exported here so call sites are untouched.
     pub use crate::gemma4_config::{NativeGemma4VisionConfig, NativeGemma4VisionRope};
-
-    /// Run the tower in float32 instead of the checkpoint's bf16.
-    /// Used by the golden-tensor parity test, which compares against a
-    /// float32 PyTorch reference; production leaves this off.
-    fn vision_f32_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("LUMEN_VISION_F32")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false)
-        })
-    }
-
-    /// Drain the lazy graph every N encoder layers. `0` disables draining
-    /// (fastest, highest peak memory). Default 4 keeps the live set to a few
-    /// layers' activations, which matters on 36 GB machines where the 26B text
-    /// weights already occupy ~15 GB.
-    fn vision_eval_every() -> usize {
-        static EVERY: OnceLock<usize> = OnceLock::new();
-        *EVERY.get_or_init(|| {
-            std::env::var("LUMEN_VISION_EVAL_EVERY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4)
-        })
-    }
 
     /// Per-image soft-token budget. Lower values shrink the patch grid
     /// quadratically in attention cost and linearly in activation memory
@@ -122,16 +97,6 @@ pub mod imp {
         pub mode: &'static std::ffi::CStr,
     }
 
-    /// Quantized `embed_vision.embedding_projection`.
-    struct VisionProjection {
-        weight: Array,
-        scales: Array,
-        biases: Option<Array>,
-        group_size: i32,
-        bits: i32,
-        mode: &'static std::ffi::CStr,
-    }
-
     pub struct NativeGemma4VisionTower {
         cfg: NativeGemma4VisionConfig,
         /// `[3·patch², hidden]`, pre-transposed.
@@ -144,32 +109,10 @@ pub mod imp {
         /// `ones([head_dim])` for the scale-less v_norm — allocated once.
         ones_head_dim: Array,
         layers: Vec<VisionLayer>,
-        projection: VisionProjection,
+        /// Quantized `embed_vision.embedding_projection`.
+        projection: ResolvedLinear,
         /// Working dtype: bf16 in production, f32 under `LUMEN_VISION_F32`.
         dtype: Dtype,
-    }
-
-    /// Look up a weight and cast it to the working dtype.
-    fn take(
-        weights: &std::collections::HashMap<String, Array>,
-        name: &str,
-        dtype: Dtype,
-    ) -> Result<Array> {
-        weights
-            .get(name)
-            .ok_or_else(|| anyhow!("vision weight `{name}` not found"))?
-            .as_dtype(dtype)
-            .with_context(|| format!("cast `{name}` to {dtype:?}"))
-    }
-
-    /// Look up a `[out, in]` projection and return it transposed to `[in, out]`.
-    fn take_t(
-        weights: &std::collections::HashMap<String, Array>,
-        name: &str,
-        dtype: Dtype,
-    ) -> Result<Array> {
-        let w = take(weights, name, dtype)?;
-        mlx_rs::ops::transpose(&w).with_context(|| format!("transpose(`{name}`)"))
     }
 
     impl NativeGemma4VisionTower {
@@ -329,7 +272,7 @@ pub mod imp {
                 std_scale: take(weights, "vision_tower.std_scale", Dtype::Float32)?,
                 ones_head_dim,
                 layers,
-                projection: VisionProjection {
+                projection: ResolvedLinear {
                     weight: proj_w,
                     scales: proj_s,
                     biases: proj_b,
@@ -481,17 +424,9 @@ pub mod imp {
             let normed =
                 crate::native_norm::rms_norm(&pooled, &self.ones_head_dim_like_hidden()?, eps)
                     .context("projection: pre-projection RMSNorm")?;
-            quantized_matmul_with_mode(
-                &normed,
-                &self.projection.weight,
-                &self.projection.scales,
-                self.projection.biases.as_ref(),
-                /* transpose */ true,
-                self.projection.group_size,
-                self.projection.bits,
-                self.projection.mode,
-            )
-            .context("projection: quantized_matmul")
+            self.projection
+                .apply(&normed)
+                .context("projection: quantized_matmul")
         }
 
         /// `ones([hidden_size])` for the scale-less pre-projection RMSNorm.

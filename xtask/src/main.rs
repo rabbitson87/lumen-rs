@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo xtask test                 # the workspace suite, features + serial
-//! cargo xtask test -p lumen-metal  # extra args pass through to cargo test
+//! cargo xtask test -p lumen-mlx    # extra args pass through to cargo test
 //! cargo xtask red-green            # verify every regression guard
 //! cargo xtask red-green --list     # names + the symptom each defect caused
 //! cargo xtask red-green lark-opener
@@ -20,6 +20,9 @@ mod gate;
 mod red_green;
 mod test_all;
 mod tiers;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const USAGE: &str = "usage: cargo xtask <test [--validate] [CARGO ARGS…] | red-green [--list] [NAME…] | fuzz <TARGET…|--all|--list> [--minutes N] | flags [--list|--docs|--check|--one-at-a-time] | coverage [--mcdc] [--html] | gate [--quick] | tiers | faults [--cancel]>";
 
@@ -43,4 +46,27 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(2)
         }
     }
+}
+
+/// The repository root, whatever directory `cargo xtask` was run from.
+fn repo_root() -> PathBuf {
+    // CARGO_MANIFEST_DIR is `<workspace>/xtask`.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask sits one level below the repo root")
+        .to_path_buf()
+}
+
+/// `git ARGS` run at the repository root, returning its stdout.
+///
+/// The exit status is deliberately not checked: `git grep` exits 1 when
+/// nothing matches, which is the good case for most callers. A caller that has
+/// to tell "no match" from a failure runs git itself.
+fn git(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .current_dir(repo_root())
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

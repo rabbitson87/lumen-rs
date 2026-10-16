@@ -146,45 +146,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // PyO3 decode_step stage breakdown when LUMEN_PYO3_DECODE_STAGE_TIMING=1.
-    {
-        let pyo3_stage = b.take_pyo3_decode_stage_timings().unwrap_or_default();
-        if !pyo3_stage.is_empty() && pyo3_stage.len() >= steps {
-            // Drop warmup entries to align with the timed decode loop.
-            let timed = &pyo3_stage[pyo3_stage.len() - steps..];
-            let n = timed.len() as f64;
-            let sum_ns = |f: fn(&(u64, u64, u64, u64)) -> u64| -> f64 {
-                timed.iter().map(f).sum::<u64>() as f64
-            };
-            let arr_us = sum_ns(|t| t.0) / 1000.0 / n;
-            let fwd_us = sum_ns(|t| t.1) / 1000.0 / n;
-            let sync_us = sum_ns(|t| t.2) / 1000.0 / n;
-            let tail_us = sum_ns(|t| t.3) / 1000.0 / n;
-            let total_us = arr_us + fwd_us + sync_us + tail_us;
-            let pct = |v: f64| 100.0 * v / total_us;
-            println!(
-                "  [pyo3-stage] arr:     {arr_us:>8.2}us ({:>5.1}%)",
-                pct(arr_us)
-            );
-            println!(
-                "  [pyo3-stage] forward: {fwd_us:>8.2}us ({:>5.1}%)  (lazy graph build)",
-                pct(fwd_us)
-            );
-            println!(
-                "  [pyo3-stage] sync:    {sync_us:>8.2}us ({:>5.1}%)  (argmax + .item() forces GPU)",
-                pct(sync_us)
-            );
-            println!(
-                "  [pyo3-stage] tail:    {tail_us:>8.2}us ({:>5.1}%)  (kv quant + state)",
-                pct(tail_us)
-            );
-            println!(
-                "  [pyo3-stage] sum = {:.3}ms (measured mean = {mean:.3}ms)",
-                total_us / 1000.0
-            );
-        }
-    }
-
     // Layer-kind fine breakdown (embed / full_attn / linear_attn / moe / lm_head).
     if let Some(fine_log) = b.take_native_decode_fine_timing_log() {
         if fine_log.len() >= steps {

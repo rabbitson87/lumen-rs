@@ -1,8 +1,8 @@
-use std::io::{Read, Write};
-
 use rand::prelude::*;
 use rand_distr::StandardNormal;
 use thiserror::Error;
+
+use crate::binfile;
 
 #[derive(Error, Debug)]
 pub enum QjlError {
@@ -10,8 +10,6 @@ pub enum QjlError {
     Io(#[from] std::io::Error),
     #[error("invalid QJL file (bad magic)")]
     BadMagic,
-    #[error("dimension mismatch: expected {expected}, got {got}")]
-    DimMismatch { expected: usize, got: usize },
 }
 
 /// Quantized Johnson-Lindenstrauss (QJL) projector for 1-bit residual encoding.
@@ -143,36 +141,19 @@ impl QJLProjector {
     /// Format: magic(4) + dim(u32 LE) + m(u32 LE) + f32 array (row-major LE).
     pub fn save(&self, path: &str) -> Result<(), QjlError> {
         let mut f = std::fs::File::create(path)?;
-        f.write_all(MAGIC)?;
-        f.write_all(&(self.dim as u32).to_le_bytes())?;
-        f.write_all(&(self.m as u32).to_le_bytes())?;
-        for &val in &self.proj_matrix {
-            f.write_all(&val.to_le_bytes())?;
-        }
+        binfile::write_header(&mut f, MAGIC, &[self.dim as u32, self.m as u32])?;
+        binfile::write_f32s(&mut f, &self.proj_matrix)?;
         Ok(())
     }
 
     /// Load projector from binary file.
     pub fn load(path: &str) -> Result<Self, QjlError> {
         let mut f = std::fs::File::open(path)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        let Some([dim, m]) = binfile::read_header(&mut f, MAGIC)? else {
             return Err(QjlError::BadMagic);
-        }
-
-        let mut buf4 = [0u8; 4];
-        f.read_exact(&mut buf4)?;
-        let dim = u32::from_le_bytes(buf4) as usize;
-        f.read_exact(&mut buf4)?;
-        let m = u32::from_le_bytes(buf4) as usize;
-
-        let n_elems = m * dim;
-        let mut proj_matrix = Vec::with_capacity(n_elems);
-        for _ in 0..n_elems {
-            f.read_exact(&mut buf4)?;
-            proj_matrix.push(f32::from_le_bytes(buf4));
-        }
+        };
+        let (dim, m) = (dim as usize, m as usize);
+        let proj_matrix = binfile::read_f32s(&mut f, m * dim)?;
 
         Ok(Self {
             proj_matrix,

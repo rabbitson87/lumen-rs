@@ -15,6 +15,8 @@ mod imp {
     use anyhow::{Context, Result};
     use mlx_rs::Array;
 
+    use crate::ops::linear_nobias::linear_nobias;
+
     /// mlx-lm affine quantization parameters for the FLUX.2 weights.
     pub const GROUP_SIZE: i32 = 64;
     pub const BITS: i32 = 4;
@@ -30,6 +32,16 @@ mod imp {
         pub biases: Array,
     }
 
+    impl QuantLinear {
+        /// Evaluate the three packed tensors.
+        pub fn eval(&self) -> Result<()> {
+            for a in [&self.weight, &self.scales, &self.biases] {
+                a.eval().context("qlinear: eval packed tensor failed")?;
+            }
+            Ok(())
+        }
+    }
+
     /// `y = x @ dequant(qw.weight)ᵀ` (no bias term — Mistral projections are
     /// bias-free). `x`: `[.., in]` → `y`: `[.., out]`.
     pub fn qlinear(x: &Array, qw: &QuantLinear) -> Result<Array> {
@@ -39,7 +51,30 @@ mod imp {
         )
         .context("qlinear: quantized_matmul FFI failed")
     }
+
+    /// A bias-free projection as the checkpoint stores it: mlx affine 4-bit
+    /// packed (the dev DiT, the 4-bit text encoder) or dense (klein, the bf16
+    /// encoder). [`Linear::apply`] hides the difference, so a forward pass is
+    /// the same code for both.
+    pub enum Linear {
+        /// Dense `[in, out]` (already transposed at load) — `matmul(x, w)`.
+        Dense(Array),
+        /// mlx affine 4-bit packed `{weight,scales,biases}`.
+        Quant(QuantLinear),
+    }
+
+    impl Linear {
+        /// `x @ Wᵀ`: `qlinear` for a packed weight, `linear_nobias` for a
+        /// dense one.
+        #[inline]
+        pub fn apply(&self, x: &Array) -> Result<Array> {
+            match self {
+                Linear::Dense(w) => linear_nobias(x, w),
+                Linear::Quant(q) => qlinear(x, q),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "mlx-native")]
-pub use imp::{BITS, GROUP_SIZE, QuantLinear, qlinear};
+pub use imp::{BITS, GROUP_SIZE, Linear, QuantLinear, qlinear};

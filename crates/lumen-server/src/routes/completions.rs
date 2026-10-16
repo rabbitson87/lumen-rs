@@ -1,38 +1,25 @@
-use atomic_http::external::http::{Request, Response, StatusCode};
+use atomic_http::external::http::{Request, Response};
 use atomic_http::*;
 
+use super::{reply_err, respond};
 use crate::engine::EngineHandle;
-use crate::types::{CompletionRequest, ErrorResponse};
+use crate::types::CompletionRequest;
 
 pub async fn handle(
     request: Request<ArenaBody>,
-    mut response: Response<ArenaWriter>,
+    response: Response<ArenaWriter>,
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
     let req: CompletionRequest = match request.get_json_arena() {
         Ok(r) => r,
-        Err(e) => {
-            let err = ErrorResponse::new(format!("invalid request: {e}"), 400);
-            response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(400)?;
-            response.responser_arena().await?;
-            return Ok(());
-        }
+        Err(e) => return reply_err(response, format!("invalid request: {e}"), 400).await,
     };
 
     match handle.completion(req).await {
-        Ok(resp) => {
-            response.body_mut().set_arena_json(&resp)?;
-            *response.status_mut() = StatusCode::from_u16(200)?;
-        }
+        Ok(resp) => respond(response, 200, &resp).await,
         Err(e) => {
             let status = crate::types::inference_error_status(&e);
-            let err = ErrorResponse::new(crate::types::inference_error_message(&e), status);
-            response.body_mut().set_arena_json(&err)?;
-            *response.status_mut() = StatusCode::from_u16(status)?;
+            reply_err(response, crate::types::inference_error_message(&e), status).await
         }
     }
-
-    response.responser_arena().await?;
-    Ok(())
 }

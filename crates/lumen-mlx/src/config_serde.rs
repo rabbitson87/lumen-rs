@@ -23,6 +23,28 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// A token-id field that ships either as one id or as a list —
+/// `"eos_token_id": 1` and `"eos_token_id": [1, 106]` are both in the wild —
+/// read as a list; `null` reads as empty.
+pub fn deserialize_token_ids<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TokenIdValue {
+        One(u32),
+        Many(Vec<u32>),
+    }
+
+    let value = Option::<TokenIdValue>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(TokenIdValue::One(id)) => vec![id],
+        Some(TokenIdValue::Many(ids)) => ids,
+        None => Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

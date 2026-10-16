@@ -18,76 +18,12 @@
 //!   full vs sliding layers. Getting one wrong builds attention with the wrong
 //!   head count and never errors.
 
-use lumen_mlx::gemma4_config::{NativeGemma4Config, NativeGemma4LayerType};
-use serde_json::{Value, json};
+mod common;
 
-// ───────────────────────────── fixtures ─────────────────────────────
-
-/// A minimal **dense** Gemma 4 config that validates. `sliding_window_pattern`
-/// defaults such that 4 layers with one full-attention entry is consistent.
-fn dense() -> Value {
-    json!({
-        "model_type": "gemma4",
-        "text_config": {
-            "model_type": "gemma4_text",
-            "hidden_size": 5376,
-            "head_dim": 256,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "num_hidden_layers": 4,
-            "vocab_size": 1000,
-            "intermediate_size": 8192,
-            "rms_norm_eps": 1e-6,
-            "sliding_window": 512,
-            "sliding_window_pattern": 4,
-            "max_position_embeddings": 4096,
-            "final_logit_softcapping": 30.0,
-            "enable_moe_block": false,
-            "layer_types": [
-                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
-            ],
-            "rope_parameters": {
-                "full_attention": { "rope_theta": 1000000.0 },
-                "sliding_attention": { "rope_theta": 10000.0 }
-            }
-        }
-    })
-}
-
-/// The 26B-A4B shape: MoE enabled, so the expert-size rules apply.
-fn moe() -> Value {
-    let v = dense();
-    let v = tc(&v, "enable_moe_block", json!(true));
-    let v = tc(&v, "num_experts", json!(128));
-    let v = tc(&v, "top_k_experts", json!(8));
-    tc(&v, "moe_intermediate_size", json!(1024))
-}
-
-fn load(v: &Value) -> NativeGemma4Config {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("config.json");
-    std::fs::write(&path, serde_json::to_string(v).unwrap()).expect("write");
-    NativeGemma4Config::load(&path).expect("fixture must parse")
-}
-
-fn tc(v: &Value, key: &str, val: Value) -> Value {
-    let mut v = v.clone();
-    v["text_config"]
-        .as_object_mut()
-        .unwrap()
-        .insert(key.into(), val);
-    v
-}
-
-fn top(v: &Value, key: &str, val: Value) -> Value {
-    let mut v = v.clone();
-    v.as_object_mut().unwrap().insert(key.into(), val);
-    v
-}
-
-fn quant(mode: &str, bits: u32, group: u32) -> Value {
-    json!({ "mode": mode, "bits": bits, "group_size": group })
-}
+use common::gemma4::{dense, load, moe};
+use common::{quant, tc, top};
+use lumen_mlx::gemma4_config::NativeGemma4LayerType;
+use serde_json::json;
 
 // ───────────────────────────── baselines ─────────────────────────────
 

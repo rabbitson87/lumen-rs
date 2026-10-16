@@ -51,62 +51,15 @@
 
 use std::time::Instant;
 
+mod common;
+
 use anyhow::{Result, anyhow};
+use common::{FILLER_SEED, build_prompt, parse_usize_list};
 use lumen_mlx::metal_memory::{clear_cache, get_active_memory};
 use lumen_mlx::{MlxBackend, MlxBatchedSeqDriver};
 
 const CHUNK_ENV: &str = "LUMEN_QWEN35_PREFILL_CHUNK";
 const DEFAULT_CHUNKS: &[usize] = &[2048, 1024, 512, 256];
-
-/// Filler vocabulary — same bank as `kv_concurrency_ab`, so a prompt of a given
-/// target length is comparable between the two harnesses.
-const WORDS: &[&str] = &[
-    "system", "value", "record", "matrix", "signal", "buffer", "window", "kernel", "vector",
-    "planet", "garden", "silver", "market", "reason", "letter", "number", "moment", "figure",
-    "branch", "circle", "stream", "camera", "ticket", "island", "friend", "orange", "bridge",
-    "packet", "column", "target", "sample", "region", "handle", "author", "series", "corner",
-    "policy", "device", "格子", "회로", "réseau",
-];
-
-fn filler(n_words: usize) -> String {
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut out = String::with_capacity(n_words * 7);
-    for w in 0..n_words {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let pick = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize;
-        if w > 0 {
-            out.push(' ');
-        }
-        out.push_str(WORDS[pick % WORDS.len()]);
-    }
-    out
-}
-
-fn build_prompt(driver: &dyn MlxBatchedSeqDriver, target: usize) -> Result<Vec<u32>> {
-    let mut words = target.max(8);
-    let mut best: Option<Vec<u32>> = None;
-    for _ in 0..8 {
-        let msgs = vec![(
-            "user".to_string(),
-            format!("Summarize the following log:\n{}", filler(words)),
-        )];
-        let ids = driver.build_chat_input(&msgs, false, None)?;
-        let n = ids.len();
-        if n >= target {
-            if n <= target + target / 20 {
-                return Ok(ids);
-            }
-            best = Some(ids);
-            words = ((words as f64) * (target as f64 / n as f64)).ceil() as usize + 1;
-        } else {
-            let grow = ((words as f64) * (target as f64 / n.max(1) as f64)).ceil() as usize;
-            words = grow.max(words + 4);
-        }
-    }
-    best.ok_or_else(|| anyhow!("could not reach {target} tokens in 8 rounds"))
-}
 
 struct Run {
     chunk: usize,
@@ -158,17 +111,6 @@ fn run_at_chunk(
     })
 }
 
-fn parse_usize_list(s: &str) -> Result<Vec<usize>> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            p.parse::<usize>()
-                .map_err(|_| anyhow!("expected comma-separated positive integers, got {s:?}"))
-        })
-        .collect()
-}
-
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     let model_id = std::env::var("MODEL_ID")
@@ -218,13 +160,13 @@ fn main() -> Result<()> {
     let driver = backend.batched_seq_driver_mut();
 
     // Prime so the baseline is weights-resident, not zero — MLX loads lazily.
-    let warm = build_prompt(driver, 64)?;
+    let warm = build_prompt(driver, FILLER_SEED, 64)?;
     run_at_chunk(driver, &warm, chunks[0], 2, 900_001, 0)?;
     let _ = clear_cache();
     let baseline = get_active_memory().unwrap_or(0);
     println!("baseline      = {:.2} GB\n", baseline as f64 / 1e9);
 
-    let prompt = build_prompt(driver, prompt_tokens)?;
+    let prompt = build_prompt(driver, FILLER_SEED, prompt_tokens)?;
     println!("prompt        = {} tokens\n", prompt.len());
 
     let mut runs = Vec::new();

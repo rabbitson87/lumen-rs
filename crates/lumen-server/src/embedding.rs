@@ -16,6 +16,7 @@
 //! the same state as `EMBEDDING_MODEL_ID` being unset, which `/v1/embeddings`
 //! already answers with a 503.
 
+use crate::engine::request_reply;
 use anyhow::Result;
 use lumen_mlx::embedding::EmbeddingBatch;
 use tokio::sync::{mpsc, oneshot};
@@ -47,27 +48,29 @@ impl EmbeddingHandle {
         Self { tx }
     }
 
+    /// [`request_reply`] to the embedding service.
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> EmbeddingRequest,
+    ) -> Result<T> {
+        request_reply(
+            &self.tx,
+            make,
+            "embedding service channel closed",
+            "embedding service dropped reply",
+        )
+        .await
+    }
+
     pub async fn embed(&self, texts: Vec<String>) -> Result<EmbeddingBatch> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(EmbeddingRequest::Embed {
-                texts,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("embedding service channel closed"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("embedding service dropped reply"))?
+        self.request(|reply| EmbeddingRequest::Embed { texts, reply })
+            .await?
     }
 
     pub async fn info(&self) -> Option<EmbeddingInfo> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(EmbeddingRequest::Info { reply: reply_tx })
+        self.request(|reply| EmbeddingRequest::Info { reply })
             .await
-            .ok()?;
-        reply_rx.await.ok()
+            .ok()
     }
 }
 

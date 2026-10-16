@@ -16,7 +16,7 @@ use std::path::Path;
 /// Null-tolerant field decoding, shared with the Gemma 4 parser. See
 /// [`crate::config_serde::null_as_default`] for why plain `#[serde(default)]`
 /// is not enough.
-use crate::config_serde::null_as_default;
+use crate::config_serde::{deserialize_token_ids, null_as_default};
 
 // ───────────────────────── config.json parsing ─────────────────────────
 
@@ -223,25 +223,6 @@ pub struct NativeQuantizationConfig {
 pub struct NativeQuantizationOverride {
     pub group_size: usize,
     pub bits: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TokenIdValue {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-fn deserialize_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<TokenIdValue>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(TokenIdValue::One(id)) => vec![id],
-        Some(TokenIdValue::Many(ids)) => ids,
-        None => Vec::new(),
-    })
 }
 
 impl NativeModelConfig {

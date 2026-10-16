@@ -1,30 +1,17 @@
-//! MLX backend with three runner implementations selected via
-//! `LUMEN_MLX_BACKEND`:
+//! MLX backend for the Qwen 3.5/3.6 family and Gemma 4.
 //!
-//! - **PyO3 in-process (default, `pyo3`)**: embeds a CPython interpreter via
-//!   PyO3 and imports `mlx_runner.MlxRunner` directly. No subprocess, no IPC
-//!   pipe — each `prefill` / `decode_step` is a Python method call inside the
-//!   Rust process, serialized through the GIL. Closes the ~21 % IPC overhead
-//!   vs Phase 1. Also the only runner that supports Track A1 prefix caching
-//!   (snapshot/restore/fork).
+//! Qwen runs on `runner_native::NativeMlxRunner`, a pure-Rust port over
+//! `mlx-rs` with no Python in the process, and Gemma 4 on its own native
+//! backend (`gemma4`). Both are built only when the `mlx-native` Cargo feature
+//! is enabled; without it the crate still builds, and loading a model fails
+//! with an error naming the feature. The native runner accepts both local
+//! model directories and HF Hub repo ids, and its parity harness replays a
+//! recorded golden transcript (`LUMEN_MLX_GOLDEN_IN`).
 //!
-//! - **Subprocess JSON-RPC (`subprocess`)**: `LUMEN_MLX_BACKEND=subprocess`
-//!   or the legacy `LUMEN_MLX_SUBPROCESS=1` falls back to spawning `python
-//!   mlx_runner.py` and pipes newline-delimited JSON. Kept as a debugging aid
-//!   + as the supported path for environments where embedding Python
-//!     (libpython linkage) is impractical.
-//!
-//! - **Native Rust mlx-rs (`native`)**: `LUMEN_MLX_BACKEND=native` selects
-//!   `runner_native::NativeMlxRunner`, a pure-Rust port over `mlx-rs`. No
-//!   Python in the process. Built only when the `mlx-native` Cargo feature is
-//!   enabled. Validated against the PyO3 runner via the parity harness
-//!   (`LUMEN_MLX_GOLDEN_IN`); see `.ai/memory/active/mlx-rs-native-port/` for
-//!   the staged port plan and current gate status. Native runner accepts both
-//!   local model directories and HF Hub repo ids — same UX as PyO3.
-//!
-//! The public `MlxBackend` API is identical for all three — `MlxBackend::load`
-//! picks the runner based on the env var, and dispatches each method to the
-//! chosen variant.
+//! `LUMEN_MLX_BACKEND` is still read: unset, `native` and `mlx-native` all
+//! select the native runner. The PyO3 and subprocess runners that `pyo3` and
+//! `subprocess` used to select have been removed, and naming one is an error
+//! (see [`check_backend_env`]).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -100,8 +87,7 @@ pub mod metal_memory {
 /// crates (e.g. `lumen-server`) can `use lumen_mlx::gemma4::*`.
 ///
 /// Only available with `--features mlx-native`. With the feature off the
-/// re-exports vanish along with the underlying types, mirroring the
-/// existing native-vs-pyo3 split.
+/// re-exports vanish along with the underlying types.
 #[cfg(feature = "mlx-native")]
 pub mod gemma4 {
     pub use crate::gemma4_backend::imp::Gemma4Backend;
@@ -112,8 +98,9 @@ pub mod gemma4 {
     };
     pub use crate::gemma4_moe::imp::{
         Gemma4Breakdown, GenerateConfig, GenerateStats, MtpStepOutput, NativeGemma4Config,
-        NativeGemma4Model, NativeGemma4PromptCache, quant_params_for, set_forward_step,
-        set_quant_kv_fused_attn, set_quant_kv_prefill_dequant, take_gemma4_breakdown,
+        NativeGemma4Model, NativeGemma4PromptCache, NativeGemma4Weights, quant_params_for,
+        set_forward_step, set_quant_kv_fused_attn, set_quant_kv_prefill_dequant,
+        take_gemma4_breakdown,
     };
     pub use crate::gemma4_response::imp::{
         ParseState, ParsedResponse, ParsedToolCall, ResponseParser, TOK_TOOL_CALL_CLOSE,
@@ -152,14 +139,12 @@ mod native_compile_cache;
 mod native_conv1d;
 mod native_embedding;
 mod native_kernels;
-mod native_lm_head;
 #[cfg(feature = "mlx-native")]
 pub mod native_metal_bridge;
 mod native_moe;
 mod native_norm;
 mod native_quant;
 mod native_rope;
-mod native_router;
 mod native_runtime;
 mod native_snapshot;
 pub mod native_ssm;
@@ -207,26 +192,24 @@ pub mod qwen3_5_moe_config {
 pub fn flags_link_anchor() {}
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_mtp::{
-    HiTrainCfg, MtpLoadQuant, MtpLoraPos, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock,
-    Qwen35MtpDims, StepBBenchPoint, load_block_from_hf, mtp_shape_from_text_config,
-    run_step_b_synthetic_bench, smoke_forward_with_synth_trunk,
+    MtpLoadQuant, MtpMlpConfig, MtpMoeConfig, Qwen35MtpBlock, Qwen35MtpDims, StepBBenchPoint,
+    load_block_from_hf, mtp_shape_from_text_config, run_step_b_synthetic_bench,
+    smoke_forward_with_synth_trunk,
 };
 mod runner_native;
-#[cfg(feature = "mlx-pyo3")]
-mod runner_pyo3;
-mod runner_subprocess;
 mod session;
 mod session_feed;
 mod spec_decode;
+#[cfg(all(test, feature = "mlx-native"))]
+mod test_support;
 #[cfg(feature = "mlx-native")]
 mod turboquant;
 
 use runner_native::NativeMlxRunner;
 
+use chat_io::PromptSource;
+
 pub use native_runtime::FineTimings;
-#[cfg(feature = "mlx-pyo3")]
-use runner_pyo3::Pyo3Runner;
-use runner_subprocess::SubprocessRunner;
 
 /// Per-request sampling overrides. `None` = fall back to env/family default.
 /// Extend with new fields (min_p, penalties, stop, logit_bias) without
@@ -284,8 +267,8 @@ pub struct ProbeRows {
     /// quality; a flip at a large gap is a genuinely changed prediction. Used
     /// by `examples/kv_bf16_quality.rs` to tell those apart.
     ///
-    /// Empty when the runner does not compute it (the PyO3 path); check the
-    /// length before indexing.
+    /// Empty when the runner does not compute it; check the length before
+    /// indexing.
     pub row_top2_gap: Vec<f32>,
     pub position: usize,
 }
@@ -306,9 +289,7 @@ trait Runner {
         _tokens: &[u32],
         _images: &[crate::qwen36_vision::PreparedImage],
     ) -> Result<(u32, usize)> {
-        Err(anyhow!(
-            "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
-        ))
+        Err(anyhow!("image input requires the native MLX runner"))
     }
     fn decode_step(
         &mut self,
@@ -376,109 +357,6 @@ trait Runner {
     /// point stays, so the same position can be returned to again.
     fn rollback(&mut self, _seq_id: u64) -> Result<usize> {
         Err(anyhow!("{} runner has no rollback points", self.name()))
-    }
-}
-
-impl Runner for SubprocessRunner {
-    fn name(&self) -> &'static str {
-        "subprocess"
-    }
-
-    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        SubprocessRunner::prefill(self, seq_id, tokens)
-    }
-
-    fn decode_step(
-        &mut self,
-        seq_id: u64,
-        last_token: u32,
-        position: usize,
-    ) -> Result<(u32, usize)> {
-        SubprocessRunner::decode_step(self, seq_id, last_token, position)
-    }
-
-    fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
-        SubprocessRunner::remove_seq(self, seq_id)
-    }
-
-    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        SubprocessRunner::extend(self, seq_id, tokens)
-    }
-
-    fn forward_probe(&mut self, seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
-        SubprocessRunner::forward_probe(self, seq_id, tokens)
-    }
-
-    fn snapshot_state(&mut self, seq_id: u64) -> Result<u64> {
-        SubprocessRunner::snapshot_state(self, seq_id)
-    }
-
-    fn restore_state(&mut self, seq_id: u64, snapshot_id: u64) -> Result<usize> {
-        SubprocessRunner::restore_state(self, seq_id, snapshot_id)
-    }
-
-    fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
-        SubprocessRunner::release_snapshot(self, snapshot_id)
-    }
-
-    fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {
-        SubprocessRunner::snapshot_state_deep(self, seq_id)
-    }
-
-    fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
-        SubprocessRunner::fork_from_snapshot(self, snapshot_id, dst_seq_id)
-    }
-}
-
-#[cfg(feature = "mlx-pyo3")]
-impl Runner for Pyo3Runner {
-    fn name(&self) -> &'static str {
-        "pyo3"
-    }
-
-    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        Pyo3Runner::prefill(self, seq_id, tokens)
-    }
-
-    fn decode_step(
-        &mut self,
-        seq_id: u64,
-        last_token: u32,
-        position: usize,
-    ) -> Result<(u32, usize)> {
-        Pyo3Runner::decode_step(self, seq_id, last_token, position)
-    }
-
-    fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
-        Pyo3Runner::remove_seq(self, seq_id)
-    }
-
-    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
-        Pyo3Runner::extend(self, seq_id, tokens)
-    }
-
-    fn forward_probe(&mut self, seq_id: u64, tokens: &[u32]) -> Result<ProbeRows> {
-        Pyo3Runner::forward_probe(self, seq_id, tokens)
-    }
-
-    fn snapshot_state(&mut self, seq_id: u64) -> Result<u64> {
-        Pyo3Runner::snapshot_state(self, seq_id)
-    }
-
-    fn restore_state(&mut self, seq_id: u64, snapshot_id: u64) -> Result<usize> {
-        Pyo3Runner::restore_state(self, seq_id, snapshot_id)
-    }
-
-    fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
-        Pyo3Runner::release_snapshot(self, snapshot_id)
-    }
-
-    fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {
-        Pyo3Runner::snapshot_state_deep(self, seq_id)
-    }
-
-    fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
-        Pyo3Runner::fork_from_snapshot(self, snapshot_id, dst_seq_id)
     }
 }
 
@@ -568,8 +446,7 @@ impl Runner for NativeMlxRunner {
     }
 }
 
-/// Loads the HF tokenizer that mirrors what mlx_lm uses internally. We keep a
-/// Rust copy so encode/decode happen without crossing the Python boundary.
+/// Loads the HF tokenizer that mirrors what mlx_lm uses internally.
 fn load_tokenizer_via_hub(model_id: &str) -> Result<TextTokenizer> {
     // If `model_id` is itself a local directory (the desktop control plane
     // passes absolute paths for models already on disk), try `tokenizer.json`
@@ -625,17 +502,7 @@ fn resolve_tokenizer_json_path(model_id: &str) -> Result<PathBuf> {
         .context("download tokenizer.json for grammar factory")
 }
 
-/// Crate-level resource directory (where `python/mlx_runner.py` lives). PyO3
-/// adds this to `sys.path`; the subprocess runner uses the file path directly.
-fn crate_python_dir() -> PathBuf {
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    crate_dir.join("python")
-}
-
 enum RunnerImpl {
-    Subprocess(SubprocessRunner),
-    #[cfg(feature = "mlx-pyo3")]
-    Pyo3(Pyo3Runner),
     Native(NativeMlxRunner),
     /// Test-only: replays a fixed token script so the decode loops can be
     /// driven with no model, no weights and no GPU. See [`TokenScriptRunner`].
@@ -799,9 +666,6 @@ impl Runner for TokenScriptRunner {
 impl RunnerImpl {
     fn as_runner(&self) -> &dyn Runner {
         match self {
-            Self::Subprocess(r) => r,
-            #[cfg(feature = "mlx-pyo3")]
-            Self::Pyo3(r) => r,
             Self::Native(r) => r,
             #[cfg(test)]
             Self::Scripted(r) => r,
@@ -810,12 +674,32 @@ impl RunnerImpl {
 
     fn as_runner_mut(&mut self) -> &mut dyn Runner {
         match self {
-            Self::Subprocess(r) => r,
-            #[cfg(feature = "mlx-pyo3")]
-            Self::Pyo3(r) => r,
             Self::Native(r) => r,
             #[cfg(test)]
             Self::Scripted(r) => r,
+        }
+    }
+
+    /// The native runner. `None` only for the test-only scripted runner, which
+    /// has no tower, no MTP head, no disk tier and no grammar hook — so the
+    /// native-only methods below answer from here instead of each matching on
+    /// the variant.
+    #[cfg(feature = "mlx-native")]
+    fn native(&self) -> Option<&NativeMlxRunner> {
+        match self {
+            Self::Native(r) => Some(r),
+            #[cfg(test)]
+            Self::Scripted(_) => None,
+        }
+    }
+
+    /// The native runner, mutably; `None` for the scripted one, as for
+    /// `native`.
+    fn native_mut(&mut self) -> Option<&mut NativeMlxRunner> {
+        match self {
+            Self::Native(r) => Some(r),
+            #[cfg(test)]
+            Self::Scripted(_) => None,
         }
     }
 
@@ -842,30 +726,21 @@ impl RunnerImpl {
     /// the other runners have no tower to size against.
     #[cfg(feature = "mlx-native")]
     fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
-        match self {
-            Self::Native(r) => r.prepare_image(encoded),
-            _ => Err(anyhow!(
-                "image input requires the native MLX runner (LUMEN_MLX_BACKEND=native)"
-            )),
-        }
+        self.native()
+            .ok_or_else(|| anyhow!("image input requires the native MLX runner"))?
+            .prepare_image(encoded)
     }
 
     /// Token id whose embedding rows the vision features replace.
     #[cfg(feature = "mlx-native")]
     fn image_token_id(&self) -> Option<u32> {
-        match self {
-            Self::Native(r) => r.image_token_id(),
-            _ => None,
-        }
+        self.native()?.image_token_id()
     }
 
     /// The loaded tower's config, for header-only prompt sizing.
     #[cfg(feature = "mlx-native")]
     fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
-        match self {
-            Self::Native(r) => r.vision_config(),
-            _ => None,
-        }
+        self.native()?.vision_config()
     }
 
     fn decode_step(
@@ -933,10 +808,9 @@ impl RunnerImpl {
         prefix_tokens: &[u32],
         last_token: Option<u32>,
     ) -> Result<()> {
-        match self {
-            Self::Native(r) => r.persist_snapshot_disk(snapshot_id, key, prefix_tokens, last_token),
-            _ => Ok(()),
-        }
+        self.native_mut().map_or(Ok(()), |r| {
+            r.persist_snapshot_disk(snapshot_id, key, prefix_tokens, last_token)
+        })
     }
 
     /// L2 disk tier — rehydrate a persisted snapshot. Native-only; other
@@ -946,40 +820,22 @@ impl RunnerImpl {
         key: &str,
         prompt_ids: &[u32],
     ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
-        match self {
-            Self::Native(r) => r.load_persisted_disk(key, prompt_ids),
-            _ => Ok(None),
-        }
+        self.native_mut()
+            .map_or(Ok(None), |r| r.load_persisted_disk(key, prompt_ids))
     }
 
     fn take_native_decode_timing_log(&mut self) -> Option<Vec<(f64, f64)>> {
-        match self {
-            Self::Native(r) => r.take_decode_timing_log(),
-            _ => None,
-        }
+        self.native_mut()?.take_decode_timing_log()
     }
 
     fn take_native_decode_fine_timing_log(&mut self) -> Option<Vec<FineTimings>> {
-        match self {
-            Self::Native(r) => r.take_decode_fine_timing_log(),
-            _ => None,
-        }
-    }
-
-    fn take_pyo3_decode_stage_timings(&mut self) -> Result<Vec<(u64, u64, u64, u64)>> {
-        match self {
-            #[cfg(feature = "mlx-pyo3")]
-            Self::Pyo3(r) => r.take_decode_stage_timings(),
-            _ => Ok(Vec::new()),
-        }
+        self.native_mut()?.take_decode_fine_timing_log()
     }
 
     /// Native-only DFlash-style prefill that captures per-target-layer
-    /// post-MLP residual hiddens. Errors on non-native backends; the Pyo3 /
-    /// Subprocess paths already have their own DFlash entry points wired
-    /// through `mlx_runner.py::dflash_prefill`. Returns `(next_token,
-    /// position, captured_hiddens)` where each captured `mlx_rs::Array` has
-    /// shape `[1, prompt_len, hidden]` in the order of `capture_layer_ids`.
+    /// post-MLP residual hiddens. Returns `(next_token, position,
+    /// captured_hiddens)` where each captured `mlx_rs::Array` has shape
+    /// `[1, prompt_len, hidden]` in the order of `capture_layer_ids`.
     #[cfg(feature = "mlx-native")]
     fn prefill_with_capture(
         &mut self,
@@ -987,13 +843,11 @@ impl RunnerImpl {
         tokens: &[u32],
         capture_layer_ids: &[usize],
     ) -> Result<(u32, usize, Vec<mlx_rs::Array>)> {
-        match self {
-            Self::Native(r) => r.prefill_with_capture(seq_id, tokens, capture_layer_ids),
-            _ => Err(anyhow!(
-                "prefill_with_capture is only supported on the native (mlx-rs) backend; \
-                 set LUMEN_MLX_BACKEND=native"
-            )),
-        }
+        self.native_mut()
+            .ok_or_else(|| {
+                anyhow!("prefill_with_capture is only supported on the native (mlx-rs) backend")
+            })?
+            .prefill_with_capture(seq_id, tokens, capture_layer_ids)
     }
 
     /// Grammar-aware decode step (WS-C #2). Native-only. Runs the normal
@@ -1009,13 +863,13 @@ impl RunnerImpl {
         last_token: u32,
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
-        match self {
-            Self::Native(r) => r.decode_step_masked(seq_id, last_token, mask),
-            _ => Err(anyhow!(
-                "decode_step_masked (grammar) is only supported on the native (mlx-rs) backend; \
-                 set LUMEN_MLX_BACKEND=native"
-            )),
-        }
+        self.native_mut()
+            .ok_or_else(|| {
+                anyhow!(
+                    "decode_step_masked (grammar) is only supported on the native (mlx-rs) backend"
+                )
+            })?
+            .decode_step_masked(seq_id, last_token, mask)
     }
 
     /// [`Self::decode_step_masked`] with the pick handed to the caller — the
@@ -1028,118 +882,25 @@ impl RunnerImpl {
         last_token: u32,
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
     ) -> Result<(u32, usize)> {
-        match self {
-            Self::Native(r) => r.decode_step_pick(seq_id, last_token, pick),
-            _ => Err(anyhow!(
-                "sampling is only supported on the native (mlx-rs) backend; \
-                 set LUMEN_MLX_BACKEND=native"
-            )),
-        }
+        self.native_mut()
+            .ok_or_else(|| anyhow!("sampling is only supported on the native (mlx-rs) backend"))?
+            .decode_step_pick(seq_id, last_token, pick)
     }
 
     /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
     /// Phase 2 S3 wiring — see `qwen3_5_moe::mtp_step` for cycle semantics.
     #[cfg(feature = "mlx-native")]
     fn enable_qwen35_mtp(&mut self, block: crate::qwen3_5_mtp::Qwen35MtpBlock) -> Result<()> {
-        match self {
-            Self::Native(r) => r.enable_mtp(block),
-            _ => Err(anyhow!(
-                "enable_qwen35_mtp is only supported on the native (mlx-rs) backend; \
-                 set LUMEN_MLX_BACKEND=native"
-            )),
-        }
+        self.native_mut()
+            .ok_or_else(|| {
+                anyhow!("enable_qwen35_mtp is only supported on the native (mlx-rs) backend")
+            })?
+            .enable_mtp(block)
     }
 
     #[cfg(feature = "mlx-native")]
     fn qwen35_mtp_enabled(&self) -> bool {
-        match self {
-            Self::Native(r) => r.mtp_enabled(),
-            _ => false,
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
-        match self {
-            Self::Native(r) => r.enable_mtp_calib(depth_count),
-            _ => Err(anyhow!("enable_mtp_calib requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
-        match self {
-            Self::Native(r) => r.finalize_mtp_calib(eps),
-            _ => Err(anyhow!("finalize_mtp_calib requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn set_mtp_corrector_bytes(&self, bytes: &[u8]) -> Result<()> {
-        match self {
-            Self::Native(r) => r.set_mtp_corrector_bytes(bytes),
-            _ => Err(anyhow!("set_mtp_corrector requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
-        match self {
-            Self::Native(r) => r.enable_mtp_proc_calib(depth_count),
-            _ => Err(anyhow!("enable_mtp_proc_calib requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
-        match self {
-            Self::Native(r) => r.finalize_mtp_proc_calib(),
-            _ => Err(anyhow!(
-                "finalize_mtp_proc_calib requires the native backend"
-            )),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn set_mtp_procrustes_bytes(&self, bytes: &[u8]) -> Result<()> {
-        match self {
-            Self::Native(r) => r.set_mtp_procrustes_bytes(bytes),
-            _ => Err(anyhow!("set_mtp_procrustes requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn enable_mtp_c4_calib(&self) -> Result<()> {
-        match self {
-            Self::Native(r) => r.enable_mtp_c4_calib(),
-            _ => Err(anyhow!("enable_mtp_c4_calib requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
-        match self {
-            Self::Native(r) => r.train_mtp_c4_lmhead(rank, steps, lr),
-            _ => Err(anyhow!("train_mtp_c4_lmhead requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn enable_mtp_hi_calib(&self) -> Result<()> {
-        match self {
-            Self::Native(r) => r.enable_mtp_hi_calib(),
-            _ => Err(anyhow!("enable_mtp_hi_calib requires the native backend")),
-        }
-    }
-
-    #[cfg(feature = "mlx-native")]
-    fn train_mtp_headinternal(&self, cfg: crate::qwen3_5_mtp::HiTrainCfg) -> Result<(f32, f32)> {
-        match self {
-            Self::Native(r) => r.train_mtp_headinternal(cfg),
-            _ => Err(anyhow!(
-                "train_mtp_headinternal requires the native backend"
-            )),
-        }
+        self.native().is_some_and(|r| r.mtp_enabled())
     }
 
     #[cfg(feature = "mlx-native")]
@@ -1150,13 +911,11 @@ impl RunnerImpl {
         n_draft: usize,
         sampling: &lumen_core::sampling::SamplingConfig,
     ) -> Result<crate::qwen3_5_moe::MtpStepOutput> {
-        match self {
-            Self::Native(r) => r.mtp_step(seq_id, committed_token, n_draft, sampling),
-            _ => Err(anyhow!(
-                "qwen35_mtp_step is only supported on the native (mlx-rs) backend; \
-                 set LUMEN_MLX_BACKEND=native"
-            )),
-        }
+        self.native_mut()
+            .ok_or_else(|| {
+                anyhow!("qwen35_mtp_step is only supported on the native (mlx-rs) backend")
+            })?
+            .mtp_step(seq_id, committed_token, n_draft, sampling)
     }
 }
 
@@ -1223,64 +982,32 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RunnerKind {
-    Pyo3,
-    Subprocess,
-    Native,
-}
-
-fn truthy_env(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
-}
-
-fn runner_kind_from_env(
-    backend: Option<&str>,
-    legacy_subprocess: Option<&str>,
-) -> Result<RunnerKind> {
-    if let Some(raw) = backend {
-        let normalized = raw.trim().to_ascii_lowercase();
-        return match normalized.as_str() {
-            "" => Ok(default_runner_kind()),
-            "pyo3" | "python" | "in-process" | "in_process" => Ok(RunnerKind::Pyo3),
-            "subprocess" | "process" | "json-rpc" | "json_rpc" => Ok(RunnerKind::Subprocess),
-            "native" | "mlx-rs" | "mlx_rs" => Ok(RunnerKind::Native),
-            _ => Err(anyhow!(
-                "unsupported LUMEN_MLX_BACKEND={raw:?}; expected pyo3, subprocess, or native"
-            )),
-        };
+/// Check `LUMEN_MLX_BACKEND` against the one runner there is.
+///
+/// Unset, empty and every spelling of the native runner pass. `pyo3` and
+/// `subprocess` (and their aliases) named runners that have been removed, and
+/// they are an error rather than a warning: whoever set one expected that
+/// runner, and serving native in its place would let an A/B quietly measure
+/// native against itself. A build without the old `mlx-pyo3` feature — every
+/// release — already refused `pyo3` at load the same way.
+fn check_backend_env(backend: Option<&str>) -> Result<()> {
+    let Some(raw) = backend else {
+        return Ok(());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        // `mlx-native` is what the desktop app's "MLX native" setting
+        // writes; it names the Cargo feature the runner is built under.
+        "" | "native" | "mlx-native" | "mlx_native" | "mlx-rs" | "mlx_rs" => Ok(()),
+        "pyo3" | "python" | "in-process" | "in_process" | "subprocess" | "process" | "json-rpc"
+        | "json_rpc" => Err(anyhow!(
+            "LUMEN_MLX_BACKEND={raw:?} selects a runner that was removed: the PyO3 and \
+             subprocess runners are gone and the native runner is the only one. Unset \
+             LUMEN_MLX_BACKEND or set it to `native`."
+        )),
+        _ => Err(anyhow!(
+            "unsupported LUMEN_MLX_BACKEND={raw:?}; expected `native` or nothing"
+        )),
     }
-
-    if truthy_env(legacy_subprocess) {
-        Ok(RunnerKind::Subprocess)
-    } else {
-        Ok(default_runner_kind())
-    }
-}
-
-/// Built-in default runner. When the `mlx-native` feature is compiled in we
-/// prefer the native mlx-rs path because it lands ~+57% throughput vs PyO3
-/// on Qwen3.6-35B-A3B-mxfp4 (and 33× vs Candle at PROMPT_LEN=2048). PyO3
-/// remains the fallback when the native feature isn't compiled in.
-#[inline]
-fn default_runner_kind() -> RunnerKind {
-    #[cfg(feature = "mlx-native")]
-    {
-        RunnerKind::Native
-    }
-    #[cfg(not(feature = "mlx-native"))]
-    {
-        RunnerKind::Pyo3
-    }
-}
-
-fn selected_runner_kind() -> Result<RunnerKind> {
-    let backend = std::env::var("LUMEN_MLX_BACKEND").ok();
-    let legacy_subprocess = std::env::var("LUMEN_MLX_SUBPROCESS").ok();
-    runner_kind_from_env(backend.as_deref(), legacy_subprocess.as_deref())
 }
 
 /// Compute a process-stable cache key for a chat request based on the system
@@ -1385,6 +1112,187 @@ fn gemma4_grammar_would_constrain(
     !tools.is_empty()
         && !matches!(tool_choice, crate::chat_io::ResolvedToolChoice::None)
         && crate::gemma4_backend::imp::gemma4_grammar_lark_enabled()
+}
+
+/// [`auto_prefix_key`] or [`auto_prefix_key_from_turns`], whichever shape
+/// `source` has.
+#[cfg(feature = "mlx-native")]
+fn auto_prefix_key_for(
+    source: PromptSource<'_, '_>,
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Option<String> {
+    match source {
+        PromptSource::Flat(messages) => auto_prefix_key(messages, effort),
+        PromptSource::History(turns) => auto_prefix_key_from_turns(turns, effort),
+    }
+}
+
+/// The Gemma 4 arm of [`MlxBackend::chat`] and [`MlxBackend::chat_from_history`].
+///
+/// Resolves the prefix-cache key the same way for both shapes — explicit
+/// `session_id` > auto-hash of the leading system content — and falls through
+/// to the uncached route when neither yields a key (e.g. a user-first chat with
+/// no system turn).
+///
+/// The batched `generate()` path applies no grammar at all, so any request that
+/// would have one runs through the streaming decode with a no-op sink and
+/// returns its ParsedResponse — the cached streaming route when a key resolves.
+/// It used to take the uncached one every time, and agent clients send tools on
+/// every request, so each turn paid a cold prefill (~19-20 s at 16K tokens).
+///
+/// This covers `response_format` and tool calls alike. Leaving tools out is
+/// what let a non-streaming `tool_choice=required` return `迎get_weather`: no
+/// matcher was ever built, so the name was whatever the model felt like, and
+/// only the response parser's fuzzy repair stood between that and the client.
+#[cfg(feature = "mlx-native")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_chat(
+    m: &mut crate::gemma4::Gemma4Backend,
+    source: PromptSource<'_, '_>,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    ov: &SamplingOverrides,
+    thinking: bool,
+    session_id: Option<&str>,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    response_schema: Option<&serde_json::Value>,
+    effort: Option<crate::chat_io::ReasoningEffort>,
+) -> Result<crate::chat_io::ParsedResponse> {
+    if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
+        // The grammar masks generated tokens only, so the prompt
+        // can still come from the prefix cache.
+        let key = session_id
+            .map(String::from)
+            .or_else(|| auto_prefix_key_for(source, effort));
+        if let Some(k) = key {
+            return m.chat_streaming_with_prefix_cache_from(
+                source,
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                &k,
+                tools,
+                tool_choice,
+                response_schema,
+                |_| Ok(()),
+            );
+        }
+        return m.chat_streaming_from(
+            source,
+            &[],
+            max_new_tokens,
+            temperature,
+            top_p,
+            ov,
+            thinking,
+            tools,
+            tool_choice,
+            response_schema,
+            |_| Ok(()),
+        );
+    }
+    // Resolve prefix-cache key. Priority:
+    //   1. Explicit `session_id` from the request (deterministic
+    //      across clients that opt in).
+    //   2. Auto-key from the system prompt hash (works for any
+    //      OpenAI-style client that doesn't know about
+    //      `session_id` but does include a stable system turn —
+    //      the common case for chat UIs).
+    let key = session_id
+        .map(String::from)
+        .or_else(|| auto_prefix_key_for(source, effort));
+    match key {
+        Some(k) => m.chat_with_prefix_cache_from(
+            source,
+            max_new_tokens,
+            temperature,
+            top_p,
+            ov,
+            thinking,
+            &k,
+            tools,
+            tool_choice,
+        ),
+        None => m.chat_from(
+            source,
+            &[],
+            max_new_tokens,
+            temperature,
+            top_p,
+            ov,
+            thinking,
+            tools,
+            tool_choice,
+        ),
+    }
+}
+
+/// The Gemma 4 arm of [`MlxBackend::chat_streaming`] and
+/// [`MlxBackend::chat_streaming_from_history`].
+///
+/// Prefix-cache wiring (landed v0.4.7) — this is the path GUI / OpenAI
+/// streaming clients hit. Previously `let _ = session_id;` discarded the chance
+/// to fork from a shared system-prompt cache; turn-2+ requests would
+/// cold-prefill the entire 5K-token chat history every time. With auto-key from
+/// the system turn, the chat history grows by ~70 tokens per turn and we
+/// prefill only the new suffix → ~5s → ~100ms per turn. A history source is
+/// the turn-2+ tool-call loop, where the saved common prefix is even larger
+/// (system + tool defs + multiple prior assistant/tool exchanges).
+#[cfg(feature = "mlx-native")]
+#[allow(clippy::too_many_arguments)]
+fn gemma4_chat_streaming<F>(
+    m: &mut crate::gemma4::Gemma4Backend,
+    source: PromptSource<'_, '_>,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    ov: &SamplingOverrides,
+    thinking: bool,
+    session_id: Option<&str>,
+    tools: &[crate::chat_io::ToolDef<'_>],
+    tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+    response_schema: Option<&serde_json::Value>,
+    effort: Option<crate::chat_io::ReasoningEffort>,
+    on_event: F,
+) -> Result<crate::chat_io::ParsedResponse>
+where
+    F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
+{
+    let key = session_id
+        .map(String::from)
+        .or_else(|| auto_prefix_key_for(source, effort));
+    match key {
+        Some(k) => m.chat_streaming_with_prefix_cache_from(
+            source,
+            max_new_tokens,
+            temperature,
+            top_p,
+            ov,
+            thinking,
+            &k,
+            tools,
+            tool_choice,
+            response_schema,
+            on_event,
+        ),
+        None => m.chat_streaming_from(
+            source,
+            &[],
+            max_new_tokens,
+            temperature,
+            top_p,
+            ov,
+            thinking,
+            tools,
+            tool_choice,
+            response_schema,
+            on_event,
+        ),
+    }
 }
 
 lumen_flags::flag! {
@@ -1740,8 +1648,7 @@ impl MlxBatchedSeqDriver for crate::gemma4::Gemma4Backend {
 }
 
 pub enum MlxBackend {
-    /// Qwen 2.5 / 3.5 / 3.6 (dense + MoE). Loaded via `NativeMlxRunner`
-    /// (or the legacy pyo3 / subprocess runners for fallback).
+    /// Qwen 2.5 / 3.5 / 3.6 (dense + MoE). Loaded via `NativeMlxRunner`.
     Qwen35Family(MlxQwen35Backend),
     /// Gemma 4 26B-A4B MoE (3-bit / 4-bit MLX shards).
     #[cfg(feature = "mlx-native")]
@@ -2146,12 +2053,13 @@ impl MlxBackend {
                     let _ = (tools, tool_choice, session_id);
                     let seq_id = m.alloc_seq_id();
                     return m.chat_response_format(
-                        messages,
+                        PromptSource::Flat(messages),
                         &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
                         schema,
+                        |_| {},
                         effort,
                     );
                 }
@@ -2163,7 +2071,7 @@ impl MlxBackend {
                     let _ = session_id; // tool-aware path doesn't yet use prefix-cache
                     let seq_id = m.alloc_seq_id();
                     return m.chat_with_tools(
-                        messages,
+                        PromptSource::Flat(messages),
                         &[],
                         max_new_tokens,
                         thinking,
@@ -2171,6 +2079,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        |_| Ok(()),
                         effort,
                     );
                 }
@@ -2218,89 +2127,20 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => {
-                // The batched `generate()` path below applies no grammar at
-                // all, so any request that would have one runs through the
-                // streaming decode with a no-op sink and returns its
-                // ParsedResponse — the cached streaming route when a key
-                // resolves. It used to take the uncached one every time, and
-                // agent clients send tools on every request, so each turn paid
-                // a cold prefill (~19-20 s at 16K tokens).
-                //
-                // This covers `response_format` and tool calls alike. Leaving
-                // tools out is what let a non-streaming `tool_choice=required`
-                // return `迎get_weather`: no matcher was ever built, so the
-                // name was whatever the model felt like, and only the response
-                // parser's fuzzy repair stood between that and the client.
-                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
-                    // The grammar masks generated tokens only, so the prompt
-                    // can still come from the prefix cache.
-                    let key = session_id
-                        .map(String::from)
-                        .or_else(|| auto_prefix_key(messages, effort));
-                    if let Some(k) = key {
-                        return m.chat_streaming_with_prefix_cache(
-                            messages,
-                            max_new_tokens,
-                            temperature,
-                            top_p,
-                            ov,
-                            thinking,
-                            &k,
-                            tools,
-                            tool_choice,
-                            response_schema,
-                            |_| Ok(()),
-                        );
-                    }
-                    return m.chat_streaming(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        |_| Ok(()),
-                    );
-                }
-                // Resolve prefix-cache key. Priority:
-                //   1. Explicit `session_id` from the request (deterministic
-                //      across clients that opt in).
-                //   2. Auto-key from the system prompt hash (works for any
-                //      OpenAI-style client that doesn't know about
-                //      `session_id` but does include a stable system turn —
-                //      the common case for chat UIs).
-                let key = session_id
-                    .map(String::from)
-                    .or_else(|| auto_prefix_key(messages, effort));
-                if let Some(k) = key {
-                    m.chat_with_prefix_cache(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        &k,
-                        tools,
-                        tool_choice,
-                    )
-                } else {
-                    m.chat(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                    )
-                }
-            }
+            Self::Gemma4(m) => gemma4_chat(
+                m,
+                PromptSource::Flat(messages),
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                effort,
+            ),
         }
     }
 
@@ -2351,8 +2191,8 @@ impl MlxBackend {
                 // applies a grammar, so a non-streaming request that wants one
                 // runs it with a no-op sink.
                 if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
-                    return m.chat_streaming_with_images(
-                        messages,
+                    return m.chat_streaming_from(
+                        PromptSource::Flat(messages),
                         images,
                         max_new_tokens,
                         temperature,
@@ -2365,8 +2205,8 @@ impl MlxBackend {
                         |_| Ok(()),
                     );
                 }
-                m.chat_with_images(
-                    messages,
+                m.chat_from(
+                    PromptSource::Flat(messages),
                     images,
                     max_new_tokens,
                     temperature,
@@ -2386,18 +2226,19 @@ impl MlxBackend {
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
                     return m.chat_response_format(
-                        messages,
+                        PromptSource::Flat(messages),
                         images,
                         max_new_tokens,
                         thinking,
                         seq_id,
                         schema,
+                        |_| {},
                         effort,
                     );
                 }
                 if !tools.is_empty() {
                     return m.chat_with_tools(
-                        messages,
+                        PromptSource::Flat(messages),
                         images,
                         max_new_tokens,
                         thinking,
@@ -2405,6 +2246,7 @@ impl MlxBackend {
                         tools,
                         tool_choice,
                         crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                        |_| Ok(()),
                         effort,
                     );
                 }
@@ -2475,8 +2317,8 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                m.chat_streaming_with_images(
-                    messages,
+                m.chat_streaming_from(
+                    PromptSource::Flat(messages),
                     images,
                     max_new_tokens,
                     temperature,
@@ -2499,8 +2341,8 @@ impl MlxBackend {
                     let mut sink = |chunk: &str| {
                         let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
                     };
-                    return m.chat_streaming_response_format(
-                        messages,
+                    return m.chat_response_format(
+                        PromptSource::Flat(messages),
                         images,
                         max_new_tokens,
                         thinking,
@@ -2511,8 +2353,8 @@ impl MlxBackend {
                     );
                 }
                 if !tools.is_empty() {
-                    return m.chat_streaming_with_tools(
-                        messages,
+                    return m.chat_with_tools(
+                        PromptSource::Flat(messages),
                         images,
                         max_new_tokens,
                         thinking,
@@ -2597,8 +2439,8 @@ impl MlxBackend {
                 // Only the streaming decode applies a grammar; run it with a
                 // no-op sink for the non-streaming call.
                 if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
-                    return m.chat_streaming_from_history_with_images(
-                        turns,
+                    return m.chat_streaming_from(
+                        PromptSource::History(turns),
                         images,
                         max_new_tokens,
                         temperature,
@@ -2611,8 +2453,8 @@ impl MlxBackend {
                         |_| Ok(()),
                     );
                 }
-                m.chat_from_history_with_images(
-                    turns,
+                m.chat_from(
+                    PromptSource::History(turns),
                     images,
                     max_new_tokens,
                     temperature,
@@ -2628,18 +2470,19 @@ impl MlxBackend {
                 let seq_id = m.alloc_seq_id();
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
-                    return m.chat_response_format_from_history(
-                        turns,
+                    return m.chat_response_format(
+                        PromptSource::History(turns),
                         images,
                         max_new_tokens,
                         thinking,
                         seq_id,
                         schema,
+                        |_| {},
                         effort,
                     );
                 }
-                m.chat_with_tools_from_history(
-                    turns,
+                m.chat_with_tools(
+                    PromptSource::History(turns),
                     images,
                     max_new_tokens,
                     thinking,
@@ -2647,6 +2490,7 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    |_| Ok(()),
                     effort,
                 )
             }
@@ -2686,13 +2530,14 @@ impl MlxBackend {
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
                     let seq_id = m.alloc_seq_id();
-                    return m.chat_response_format_from_history(
-                        turns,
+                    return m.chat_response_format(
+                        PromptSource::History(turns),
                         &[],
                         max_new_tokens,
                         thinking,
                         seq_id,
                         schema,
+                        |_| {},
                         effort,
                     );
                 }
@@ -2705,8 +2550,8 @@ impl MlxBackend {
                 // block but still emits the assistant tool_calls and
                 // tool_response blocks correctly.
                 let seq_id = m.alloc_seq_id();
-                m.chat_with_tools_from_history(
-                    turns,
+                m.chat_with_tools(
+                    PromptSource::History(turns),
                     &[],
                     max_new_tokens,
                     thinking,
@@ -2714,83 +2559,25 @@ impl MlxBackend {
                     tools,
                     tool_choice,
                     crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                    |_| Ok(()),
                     effort,
                 )
             }
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => {
-                // Prefix-cache wiring (was Phase 1.4 TODO; landed v0.4.7).
-                // Same key-resolution policy as the flat-message `chat()`
-                // path above — explicit session_id > auto-hash of System
-                // turn content. Falls through to the no-prefix-cache path
-                // when neither yields a key (e.g. user-first chat with no
-                // system turn).
-                // Mirror the flat `chat` path — a request that would get a
-                // grammar routes through the grammar-aware streaming decode
-                // with a no-op sink, because the cache/`generate` path applies
-                // none: the cached streaming route when a key resolves.
-                if gemma4_grammar_would_constrain(response_schema, tools, tool_choice) {
-                    // The grammar masks generated tokens only, so the prompt
-                    // can still come from the prefix cache.
-                    let key = session_id
-                        .map(String::from)
-                        .or_else(|| auto_prefix_key_from_turns(turns, effort));
-                    if let Some(k) = key {
-                        return m.chat_streaming_from_history_with_prefix_cache(
-                            turns,
-                            max_new_tokens,
-                            temperature,
-                            top_p,
-                            ov,
-                            thinking,
-                            &k,
-                            tools,
-                            tool_choice,
-                            response_schema,
-                            |_| Ok(()),
-                        );
-                    }
-                    return m.chat_streaming_from_history(
-                        turns,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        |_| Ok(()),
-                    );
-                }
-                let key = session_id
-                    .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
-                if let Some(k) = key {
-                    m.chat_from_history_with_prefix_cache(
-                        turns,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        &k,
-                        tools,
-                        tool_choice,
-                    )
-                } else {
-                    m.chat_from_history(
-                        turns,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                    )
-                }
-            }
+            Self::Gemma4(m) => gemma4_chat(
+                m,
+                PromptSource::History(turns),
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                effort,
+            ),
         }
     }
 
@@ -2835,8 +2622,8 @@ impl MlxBackend {
                     let mut text_adapter = |chunk: &str| {
                         let _ = on_event(BackendStreamEvent::Text(chunk));
                     };
-                    return m.chat_streaming_response_format(
-                        messages,
+                    return m.chat_response_format(
+                        PromptSource::Flat(messages),
                         &[],
                         max_new_tokens,
                         thinking,
@@ -2853,8 +2640,8 @@ impl MlxBackend {
                 if !tools.is_empty() {
                     let _ = session_id;
                     let seq_id = m.alloc_seq_id();
-                    return m.chat_streaming_with_tools(
-                        messages,
+                    return m.chat_with_tools(
+                        PromptSource::Flat(messages),
                         &[],
                         max_new_tokens,
                         thinking,
@@ -2933,47 +2720,21 @@ impl MlxBackend {
                 })
             }
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => {
-                // Prefix-cache wiring (landed v0.4.7) — this is the path
-                // GUI / OpenAI streaming clients hit. Previously
-                // `let _ = session_id;` discarded the chance to fork from
-                // a shared system-prompt cache; turn-2+ requests would
-                // cold-prefill the entire 5K-token chat history every
-                // time. With auto-key from the system turn, the chat
-                // history grows by ~70 tokens per turn and we prefill
-                // only the new suffix → ~5s → ~100ms per turn.
-                let key = session_id
-                    .map(String::from)
-                    .or_else(|| auto_prefix_key(messages, effort));
-                if let Some(k) = key {
-                    m.chat_streaming_with_prefix_cache(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        &k,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        on_event,
-                    )
-                } else {
-                    m.chat_streaming(
-                        messages,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        on_event,
-                    )
-                }
-            }
+            Self::Gemma4(m) => gemma4_chat_streaming(
+                m,
+                PromptSource::Flat(messages),
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                effort,
+                on_event,
+            ),
         }
     }
 
@@ -3022,8 +2783,8 @@ impl MlxBackend {
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => {
                 let _ = session_id;
-                m.chat_streaming_from_history_with_images(
-                    turns,
+                m.chat_streaming_from(
+                    PromptSource::History(turns),
                     images,
                     max_new_tokens,
                     temperature,
@@ -3045,8 +2806,8 @@ impl MlxBackend {
                     let mut sink = |chunk: &str| {
                         let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
                     };
-                    return m.chat_streaming_response_format_from_history(
-                        turns,
+                    return m.chat_response_format(
+                        PromptSource::History(turns),
                         images,
                         max_new_tokens,
                         thinking,
@@ -3056,8 +2817,8 @@ impl MlxBackend {
                         effort,
                     );
                 }
-                m.chat_streaming_with_tools_from_history(
-                    turns,
+                m.chat_with_tools(
+                    PromptSource::History(turns),
                     images,
                     max_new_tokens,
                     thinking,
@@ -3095,7 +2856,6 @@ impl MlxBackend {
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
         let effort = self.resolved_effort(ov);
-        use crate::chat_io::ParsedResponse;
         match self {
             Self::Qwen35Family(m) => {
                 let _ = session_id;
@@ -3114,8 +2874,8 @@ impl MlxBackend {
                     let mut text_adapter = |chunk: &str| {
                         let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
                     };
-                    return m.chat_streaming_response_format_from_history(
-                        turns,
+                    return m.chat_response_format(
+                        PromptSource::History(turns),
                         &[],
                         max_new_tokens,
                         thinking,
@@ -3129,8 +2889,8 @@ impl MlxBackend {
                 // through the tool-aware path — same rationale as the
                 // non-streaming `chat_from_history` branch above.
                 let seq_id = m.alloc_seq_id();
-                m.chat_streaming_with_tools_from_history(
-                    turns,
+                m.chat_with_tools(
+                    PromptSource::History(turns),
                     &[],
                     max_new_tokens,
                     thinking,
@@ -3143,46 +2903,22 @@ impl MlxBackend {
                 )
             }
             #[cfg(feature = "mlx-native")]
-            Self::Gemma4(m) => {
-                // Prefix-cache wiring (landed v0.4.7). Same key resolution
-                // as the flat-message streaming path; the structured-turns
-                // shape is used by turn-2+ tool-call loops where the saved
-                // common prefix is even larger (system + tool defs +
-                // multiple prior assistant/tool exchanges).
-                let key = session_id
-                    .map(String::from)
-                    .or_else(|| auto_prefix_key_from_turns(turns, effort));
-                if let Some(k) = key {
-                    m.chat_streaming_from_history_with_prefix_cache(
-                        turns,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        &k,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        on_event,
-                    )
-                } else {
-                    m.chat_streaming_from_history(
-                        turns,
-                        max_new_tokens,
-                        temperature,
-                        top_p,
-                        ov,
-                        thinking,
-                        tools,
-                        tool_choice,
-                        response_schema,
-                        on_event,
-                    )
-                }
-            }
+            Self::Gemma4(m) => gemma4_chat_streaming(
+                m,
+                PromptSource::History(turns),
+                max_new_tokens,
+                temperature,
+                top_p,
+                ov,
+                thinking,
+                session_id,
+                tools,
+                tool_choice,
+                response_schema,
+                effort,
+                on_event,
+            ),
         }
-        .map(|p: ParsedResponse| p)
     }
 
     /// Unified completion (`/v1/completions`) — greedy raw token generation.
@@ -3412,50 +3148,19 @@ impl MlxQwen35Backend {
 }
 
 impl MlxQwen35Backend {
-    /// Load the model. Default path is PyO3 in-process. `LUMEN_MLX_BACKEND`
-    /// selects the runner (`pyo3`, `subprocess`, or `native`); legacy
-    /// `LUMEN_MLX_SUBPROCESS=1` still switches to the subprocess JSON-RPC
-    /// fallback. The `native` runner (built with the `mlx-native` feature) is
-    /// gated by the parity harness — see `LUMEN_MLX_GOLDEN_IN`. The native
-    /// runner accepts both a local model directory (containing `config.json`
-    /// plus `*.safetensors` shards) and a HuggingFace Hub repo id (e.g.
-    /// `mlx-community/Qwen3.6-35B-A3B-mxfp4`); the latter is downloaded into
-    /// the standard HF cache on first use.
+    /// Load the model on the native runner (built with the `mlx-native`
+    /// feature), which is gated by the parity harness — see
+    /// `LUMEN_MLX_GOLDEN_IN`. Accepts both a local model directory
+    /// (containing `config.json` plus `*.safetensors` shards) and a
+    /// HuggingFace Hub repo id (e.g. `mlx-community/Qwen3.6-35B-A3B-mxfp4`);
+    /// the latter is downloaded into the standard HF cache on first use.
     pub fn load(model_id: &str) -> Result<Self> {
-        let runner_kind = selected_runner_kind()?;
-        let (runner, eos_tokens, vocab_size) = match runner_kind {
-            RunnerKind::Subprocess => {
-                eprintln!("[mlx] runner=subprocess (LUMEN_MLX_BACKEND=subprocess)");
-                let mut r = SubprocessRunner::spawn()?;
-                let info = r.load(model_id)?;
-                (RunnerImpl::Subprocess(r), info.eos_tokens, info.vocab_size)
-            }
-            #[cfg(feature = "mlx-pyo3")]
-            RunnerKind::Pyo3 => {
-                eprintln!(
-                    "[mlx] runner=pyo3 (in-process, set LUMEN_MLX_BACKEND=subprocess for fallback)"
-                );
-                let mut r = Pyo3Runner::new()?;
-                let info = r.load(model_id)?;
-                (RunnerImpl::Pyo3(r), info.eos_tokens, info.vocab_size)
-            }
-            #[cfg(not(feature = "mlx-pyo3"))]
-            RunnerKind::Pyo3 => {
-                return Err(anyhow!(
-                    "RunnerKind::Pyo3 requested but lumen-mlx was built without \
-                     the `mlx-pyo3` feature. Rebuild with `--features mlx-pyo3` or \
-                     use a different backend (native / subprocess)."
-                ));
-            }
-            RunnerKind::Native => {
-                eprintln!(
-                    "[mlx] runner=native (mlx-rs Phase 3d.5; parity gate via LUMEN_MLX_GOLDEN_IN)"
-                );
-                let mut r = NativeMlxRunner::new()?;
-                let info = r.load(model_id)?;
-                (RunnerImpl::Native(r), info.eos_tokens, info.vocab_size)
-            }
-        };
+        check_backend_env(std::env::var("LUMEN_MLX_BACKEND").ok().as_deref())?;
+        eprintln!("[mlx] runner=native (mlx-rs Phase 3d.5; parity gate via LUMEN_MLX_GOLDEN_IN)");
+        let mut r = NativeMlxRunner::new()?;
+        let info = r.load(model_id)?;
+        let (runner, eos_tokens, vocab_size) =
+            (RunnerImpl::Native(r), info.eos_tokens, info.vocab_size);
 
         let tokenizer = match load_tokenizer_via_hub(model_id) {
             Ok(tok) => Some(tok),
@@ -3733,18 +3438,6 @@ impl MlxQwen35Backend {
         self.runner.take_native_decode_fine_timing_log()
     }
 
-    /// Drains the per-step PyO3 decode_step stage timings when
-    /// `LUMEN_PYO3_DECODE_STAGE_TIMING=1` was set. Returns
-    /// `(arr_ns, forward_ns, sync_ns, tail_ns)` per step where:
-    ///   - arr_ns:     `mx.array([[last_token]])` creation
-    ///   - forward_ns: `self.model(arr, cache=cache)` (lazy graph build)
-    ///   - sync_ns:    `mx.argmax(...).item()` (forces GPU sync)
-    ///   - tail_ns:    `_apply_kv_quant` + state update
-    ///     Returns empty Vec for non-PyO3 backends or when env was not set.
-    pub fn take_pyo3_decode_stage_timings(&mut self) -> Result<Vec<(u64, u64, u64, u64)>> {
-        self.runner.take_pyo3_decode_stage_timings()
-    }
-
     pub fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
         self.runner.remove_seq(seq_id)
     }
@@ -3767,9 +3460,6 @@ impl MlxQwen35Backend {
     /// `mlx_rs::ops::concatenate_axis(&hiddens, -1)` to build the
     /// `target_hidden` tensor expected by the DFlash draft (matches the
     /// `fc` weight layout `[len(target_layer_ids) * hidden, hidden]`).
-    ///
-    /// Errors when invoked against the Pyo3 / Subprocess backends. Use
-    /// `LUMEN_MLX_BACKEND=native` to select the supported runner.
     #[cfg(feature = "mlx-native")]
     pub fn prefill_with_capture(
         &mut self,
@@ -3781,8 +3471,7 @@ impl MlxQwen35Backend {
             .prefill_with_capture(seq_id, tokens, capture_layer_ids)
     }
 
-    /// Install a loaded Qwen3.5/3.6 MTP drafter block. Native-only (errors on
-    /// PyO3 / Subprocess runners). After enable, callers may use
+    /// Install a loaded Qwen3.5/3.6 MTP drafter block. After enable, callers may use
     /// [`Self::qwen35_mtp_step`] to advance one speculative cycle. Phase 2
     /// S3 surface — gating + opt-in env lives in the upper engine.
     #[cfg(feature = "mlx-native")]
@@ -3794,76 +3483,6 @@ impl MlxQwen35Backend {
     #[cfg(feature = "mlx-native")]
     pub fn qwen35_mtp_enabled(&self) -> bool {
         self.runner.qwen35_mtp_enabled()
-    }
-
-    /// Begin MTP drift-corrector calibration: subsequent `qwen35_mtp_step`
-    /// calls accumulate (recursive draft hidden, trunk true hidden) pairs up to
-    /// `depth_count` (= max draft K used during calibration).
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_enable_mtp_calib(&self, depth_count: usize) -> Result<()> {
-        self.runner.enable_mtp_calib(depth_count)
-    }
-
-    /// Finish calibration: fit the corrector and return its serialized bytes
-    /// (write to a file, then load via `qwen35_load_mtp_corrector`).
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_finalize_mtp_calib(&self, eps: f32) -> Result<Vec<u8>> {
-        self.runner.finalize_mtp_calib(eps)
-    }
-
-    /// Install a fitted corrector (serialized bytes from
-    /// `qwen35_finalize_mtp_calib`). Applied in the drafter loop thereafter.
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_load_mtp_corrector(&self, bytes: &[u8]) -> Result<()> {
-        self.runner.set_mtp_corrector_bytes(bytes)
-    }
-
-    /// Start orthogonal-Procrustes calibration (the rotation shot). Heavy:
-    /// allocates `depth_count · hidden²` f64.
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_enable_mtp_proc_calib(&self, depth_count: usize) -> Result<()> {
-        self.runner.enable_mtp_proc_calib(depth_count)
-    }
-
-    /// Finish Procrustes calibration: prints the decisive residual report
-    /// (rel_raw vs rel_proc per depth) and returns the fitted corrector bytes.
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_finalize_mtp_proc_calib(&self) -> Result<Vec<u8>> {
-        self.runner.finalize_mtp_proc_calib()
-    }
-
-    /// Install a fitted Procrustes corrector (serialized bytes).
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_load_mtp_procrustes(&self, bytes: &[u8]) -> Result<()> {
-        self.runner.set_mtp_procrustes_bytes(bytes)
-    }
-
-    /// Begin C4 calibration (collect lm_head-input / trunk-argmax pairs).
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_enable_mtp_c4_calib(&self) -> Result<()> {
-        self.runner.enable_mtp_c4_calib()
-    }
-
-    /// Train + install the C4 lm_head LoRA from collected calib pairs.
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_train_mtp_c4_lmhead(&self, rank: usize, steps: usize, lr: f32) -> Result<()> {
-        self.runner.train_mtp_c4_lmhead(rank, steps, lr)
-    }
-
-    /// Begin head-internal PoC calibration (collect k=0 embed/h_pre/target).
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_enable_mtp_hi_calib(&self) -> Result<()> {
-        self.runner.enable_mtp_hi_calib()
-    }
-
-    /// Train the head-internal (eh_proj) LoRA on collected calib; returns
-    /// `(in_sample_accept_before, in_sample_accept_after)` — the GO/fold gate.
-    #[cfg(feature = "mlx-native")]
-    pub fn qwen35_train_mtp_headinternal(
-        &self,
-        cfg: crate::qwen3_5_mtp::HiTrainCfg,
-    ) -> Result<(f32, f32)> {
-        self.runner.train_mtp_headinternal(cfg)
     }
 
     /// Advance one MTP speculative cycle. See `qwen3_5_moe::mtp_step` for
@@ -3897,8 +3516,7 @@ impl MlxQwen35Backend {
     fn try_enable_qwen35_mtp_from_env(&mut self) -> Result<()> {
         // `LUMEN_QWEN35_MTP`: "0"/"false" hard-disables; "1"/"true" forces on
         // (errors loudly if prerequisites missing); UNSET = AUTO — enable when
-        // the loaded model ships a self-contained MTP head and we're on the
-        // native runner. This makes self-contained MTPLX repos "just work"
+        // the loaded model ships a self-contained MTP head. This makes self-contained MTPLX repos "just work"
         // (17.5 tok/s) without any env vars; the escape hatch is MTP=0.
         let env_val = std::env::var("LUMEN_QWEN35_MTP").ok();
         let explicit_off = env_val
@@ -3912,17 +3530,6 @@ impl MlxQwen35Backend {
             .as_deref()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-
-        // MTP runs only on the native runner. Auto mode skips silently on other
-        // runners; explicit on fails loudly so misconfig is visible.
-        if !matches!(self.runner, RunnerImpl::Native(_)) {
-            if explicit_on {
-                return Err(anyhow!(
-                    "LUMEN_QWEN35_MTP=1 requires the native runner (set LUMEN_MLX_BACKEND=native)"
-                ));
-            }
-            return Ok(());
-        }
 
         // Resolve the dir holding the MTP head.
         // * Explicit `LUMEN_QWEN35_HF_ORIGINAL` is honored ONLY under explicit
@@ -4009,13 +3616,6 @@ impl MlxQwen35Backend {
         let Some(cfg) = spec_decode::read_draft_config() else {
             return; // LUMEN_MLX_DRAFT_MODEL unset → feature OFF.
         };
-        if !matches!(self.runner, RunnerImpl::Native(_)) {
-            eprintln!(
-                "[mlx-draft] LUMEN_MLX_DRAFT_MODEL set but target runner is not native — \
-                 draft spec-decode DISABLED (set LUMEN_MLX_BACKEND=native to use it)"
-            );
-            return;
-        }
         let t0 = std::time::Instant::now();
         let mut runner = match NativeMlxRunner::new() {
             Ok(r) => r,
@@ -5092,20 +4692,30 @@ impl MlxQwen35Backend {
         })
     }
 
-    /// `response_format` non-streaming chat (flat messages). Builds a
-    /// JSON-schema grammar from `schema` and runs the masked decode loop.
-    pub fn chat_response_format(
+    /// `response_format` chat. Builds a JSON-schema grammar from `schema` and
+    /// runs the masked decode loop, forwarding each visible JSON fragment to
+    /// `on_token` (a non-streaming caller passes a no-op).
+    ///
+    /// A `History` source routes the turns through the tool-aware renderer (it
+    /// is the only renderer that represents assistant.tool_calls / role:tool
+    /// turns) with no tools.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn chat_response_format<F>(
         &mut self,
-        messages: &[(String, String)],
+        source: PromptSource<'_, '_>,
         images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
         seq_id: u64,
         schema: &serde_json::Value,
+        on_token: F,
         effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse> {
+    ) -> Result<crate::chat_io::ParsedResponse>
+    where
+        F: FnMut(&str),
+    {
         let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking, effort)?;
+            self.build_response_format_input(source, images, thinking, effort)?;
         let grammar = self.build_qwen35_response_format_grammar(schema);
         self.chat_response_format_impl(
             prompt_ids,
@@ -5113,75 +4723,63 @@ impl MlxQwen35Backend {
             grammar,
             max_new_tokens,
             seq_id,
-            |_| {},
+            on_token,
         )
     }
 
-    /// Prompt for a flat-message `response_format` request, with or without
-    /// images. Split out so the streaming and non-streaming entry points cannot
-    /// drift on how the placeholder runs are built.
+    /// Prompt for a `response_format` request, with or without images. Split
+    /// out so the streaming and non-streaming entry points cannot drift on how
+    /// the placeholder runs are built.
+    ///
+    /// A `History` source goes through the tool-aware renderer with no tools —
+    /// it is the only one that can represent assistant `tool_calls` /
+    /// `role:tool` turns — so the same `User`-turn-only image rule applies.
     fn build_response_format_input(
         &self,
-        messages: &[(String, String)],
-        images: &[Vec<Vec<u8>>],
-        thinking: bool,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
-        if !images.iter().any(|v| !v.is_empty()) {
-            return Ok((
-                self.build_chat_input(messages, thinking, effort)?,
-                Vec::new(),
-            ));
-        }
-        #[cfg(feature = "mlx-native")]
-        {
-            self.build_chat_input_with_images(messages, images, thinking, effort)
-        }
-        #[cfg(not(feature = "mlx-native"))]
-        {
-            Err(anyhow!(
-                "image input requires a build with the `mlx-native` feature"
-            ))
-        }
-    }
-
-    /// Structured-history counterpart of
-    /// [`build_response_format_input`](Self::build_response_format_input).
-    ///
-    /// Goes through the tool-aware renderer with no tools — it is the only one
-    /// that can represent assistant `tool_calls` / `role:tool` turns — so the
-    /// same `User`-turn-only image rule applies.
-    fn build_response_format_input_from_history(
-        &self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
+        source: PromptSource<'_, '_>,
         images: &[Vec<Vec<u8>>],
         thinking: bool,
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<(Vec<u32>, Vec<crate::qwen36_vision::PreparedImage>)> {
         use crate::chat_io::ResolvedToolChoice;
         if !images.iter().any(|v| !v.is_empty()) {
-            let (ids, _prefill, _prefill_tokens) = self
-                .build_chat_input_with_tools_from_history_split(
-                    turns,
-                    thinking,
-                    &[],
-                    &ResolvedToolChoice::None,
-                    effort,
-                )?;
+            let ids = match source {
+                PromptSource::Flat(messages) => {
+                    self.build_chat_input(messages, thinking, effort)?
+                }
+                PromptSource::History(turns) => {
+                    let (ids, _prefill, _prefill_tokens) = self
+                        .build_chat_input_with_tools_from_history_split(
+                            turns,
+                            thinking,
+                            &[],
+                            &ResolvedToolChoice::None,
+                            effort,
+                        )?;
+                    ids
+                }
+            };
             return Ok((ids, Vec::new()));
         }
         #[cfg(feature = "mlx-native")]
         {
-            let (ids, _prefill, _prefill_tokens, prepared) = self
-                .build_chat_input_with_tools_and_images_from_history_split(
-                    turns,
-                    images,
-                    thinking,
-                    &[],
-                    &ResolvedToolChoice::None,
-                    effort,
-                )?;
-            Ok((ids, prepared))
+            match source {
+                PromptSource::Flat(messages) => {
+                    self.build_chat_input_with_images(messages, images, thinking, effort)
+                }
+                PromptSource::History(turns) => {
+                    let (ids, _prefill, _prefill_tokens, prepared) = self
+                        .build_chat_input_with_tools_and_images_from_history_split(
+                            turns,
+                            images,
+                            thinking,
+                            &[],
+                            &ResolvedToolChoice::None,
+                            effort,
+                        )?;
+                    Ok((ids, prepared))
+                }
+            }
         }
         #[cfg(not(feature = "mlx-native"))]
         {
@@ -5189,93 +4787,6 @@ impl MlxQwen35Backend {
                 "image input requires a build with the `mlx-native` feature"
             ))
         }
-    }
-
-    /// `response_format` streaming chat (flat messages). Same as
-    /// [`chat_response_format`] but forwards each visible JSON fragment to
-    /// `on_token`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn chat_streaming_response_format<F>(
-        &mut self,
-        messages: &[(String, String)],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        schema: &serde_json::Value,
-        on_token: F,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse>
-    where
-        F: FnMut(&str),
-    {
-        let (prompt_ids, prepared) =
-            self.build_response_format_input(messages, images, thinking, effort)?;
-        let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(
-            prompt_ids,
-            prepared,
-            grammar,
-            max_new_tokens,
-            seq_id,
-            on_token,
-        )
-    }
-
-    /// `response_format` non-streaming chat (structured history). Routes the
-    /// turns through the tool-aware renderer (it is the only renderer that
-    /// represents assistant.tool_calls / role:tool turns) with no tools, then
-    /// runs the JSON-schema masked decode loop.
-    pub fn chat_response_format_from_history(
-        &mut self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        schema: &serde_json::Value,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse> {
-        let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
-        let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(
-            prompt_ids,
-            prepared,
-            grammar,
-            max_new_tokens,
-            seq_id,
-            |_| {},
-        )
-    }
-
-    /// `response_format` streaming chat (structured history).
-    #[allow(clippy::too_many_arguments)]
-    pub fn chat_streaming_response_format_from_history<F>(
-        &mut self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        schema: &serde_json::Value,
-        on_token: F,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse>
-    where
-        F: FnMut(&str),
-    {
-        let (prompt_ids, prepared) =
-            self.build_response_format_input_from_history(turns, images, thinking, effort)?;
-        let grammar = self.build_qwen35_response_format_grammar(schema);
-        self.chat_response_format_impl(
-            prompt_ids,
-            prepared,
-            grammar,
-            max_new_tokens,
-            seq_id,
-            on_token,
-        )
     }
 
     /// Streaming chat. Calls `on_token` with each new decoded text fragment.
@@ -5561,142 +5072,25 @@ impl MlxQwen35Backend {
         Ok(out)
     }
 
-    /// Phase 2: tool-aware non-streaming chat. Routes through the
-    /// Qwen 3.6 nested-XML chat template and parses any
-    /// `<tool_call>...</tool_call>` blocks from the model's output.
-    /// Bypasses MTP / spec-decode / prefix-cache for now — tool-calling
-    /// is a feature gate and the fast paths can be re-added once the
-    /// happy path is verified on real hardware.
-    pub fn chat_with_tools(
-        &mut self,
-        messages: &[(String, String)],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        tools: &[crate::chat_io::ToolDef<'_>],
-        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        calls: crate::grammar::ToolCalls,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse> {
-        self.chat_with_tools_flat(
-            messages,
-            images,
-            max_new_tokens,
-            thinking,
-            seq_id,
-            tools,
-            tool_choice,
-            calls,
-            |_ev| Ok(()),
-            effort,
-        )
-    }
-
-    /// Phase 2: tool-aware streaming chat. Emits
-    /// `BackendStreamEvent::Text` for visible-text deltas and
-    /// `BackendStreamEvent::ToolCallStart { name }` the moment the
-    /// parser sees `<function=NAME>`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn chat_streaming_with_tools<F>(
-        &mut self,
-        messages: &[(String, String)],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        tools: &[crate::chat_io::ToolDef<'_>],
-        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        calls: crate::grammar::ToolCalls,
-        on_event: F,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse>
-    where
-        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
-    {
-        self.chat_with_tools_flat(
-            messages,
-            images,
-            max_new_tokens,
-            thinking,
-            seq_id,
-            tools,
-            tool_choice,
-            calls,
-            on_event,
-            effort,
-        )
-    }
-
-    /// Structured-history non-streaming variant.
-    pub fn chat_with_tools_from_history(
-        &mut self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        tools: &[crate::chat_io::ToolDef<'_>],
-        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        calls: crate::grammar::ToolCalls,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse> {
-        self.chat_with_tools_history(
-            turns,
-            images,
-            max_new_tokens,
-            thinking,
-            seq_id,
-            tools,
-            tool_choice,
-            calls,
-            |_ev| Ok(()),
-            effort,
-        )
-    }
-
-    /// Structured-history streaming variant.
-    #[allow(clippy::too_many_arguments)]
-    pub fn chat_streaming_with_tools_from_history<F>(
-        &mut self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        tools: &[crate::chat_io::ToolDef<'_>],
-        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        calls: crate::grammar::ToolCalls,
-        on_event: F,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse>
-    where
-        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
-    {
-        self.chat_with_tools_history(
-            turns,
-            images,
-            max_new_tokens,
-            thinking,
-            seq_id,
-            tools,
-            tool_choice,
-            calls,
-            on_event,
-            effort,
-        )
-    }
-
-    /// Prompt-building half of the flat-message tool path, shared by the
-    /// streaming and non-streaming entry points (they differ only in the sink).
+    /// Phase 2: tool-aware chat. Routes through the Qwen 3.6 nested-XML chat
+    /// template and parses any `<tool_call>...</tool_call>` blocks from the
+    /// model's output. Emits `BackendStreamEvent::Text` for visible-text
+    /// deltas and `BackendStreamEvent::ToolCallStart { name }` the moment the
+    /// parser sees `<function=NAME>`; a non-streaming caller passes a no-op
+    /// `on_event`. Bypasses MTP / spec-decode for now — tool-calling is a
+    /// feature gate and the fast paths can be re-added once the happy path is
+    /// verified on real hardware.
+    ///
+    /// This is the prompt-building half: the flat and history shapes differ
+    /// only in the renderer, the prefix-cache key and the cached head.
     ///
     /// Images turn off both prefix-cache reuse and the incremental boundary:
     /// each is keyed on text alone, so a hit would hand this request KV rows
     /// built from another request's pixels.
     #[allow(clippy::too_many_arguments)]
-    fn chat_with_tools_flat<F>(
+    pub(crate) fn chat_with_tools<F>(
         &mut self,
-        messages: &[(String, String)],
+        source: PromptSource<'_, '_>,
         images: &[Vec<Vec<u8>>],
         max_new_tokens: usize,
         thinking: bool,
@@ -5711,52 +5105,70 @@ impl MlxQwen35Backend {
         F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
     {
         let has_images = images.iter().any(|v| !v.is_empty());
-        #[cfg(feature = "mlx-native")]
         let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
-            self.build_chat_input_with_tools_and_images_split(
-                messages,
-                images,
-                thinking,
-                tools,
-                tool_choice,
-                effort,
-            )?
-        } else {
-            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
-                messages,
-                thinking,
-                tools,
-                tool_choice,
-                effort,
-            )?;
-            (ids, prefill, prefill_tokens, Vec::new())
-        };
-        #[cfg(not(feature = "mlx-native"))]
-        let (prompt_ids, prefill, prefill_tokens, prepared) = {
-            if has_images {
+            #[cfg(feature = "mlx-native")]
+            {
+                match source {
+                    PromptSource::Flat(messages) => self
+                        .build_chat_input_with_tools_and_images_split(
+                            messages,
+                            images,
+                            thinking,
+                            tools,
+                            tool_choice,
+                            effort,
+                        )?,
+                    PromptSource::History(turns) => self
+                        .build_chat_input_with_tools_and_images_from_history_split(
+                            turns,
+                            images,
+                            thinking,
+                            tools,
+                            tool_choice,
+                            effort,
+                        )?,
+                }
+            }
+            #[cfg(not(feature = "mlx-native"))]
+            {
                 return Err(anyhow!(
                     "image input requires a build with the `mlx-native` feature"
                 ));
             }
-            let (ids, prefill, prefill_tokens) = self.build_chat_input_with_tools_split(
-                messages,
-                thinking,
-                tools,
-                tool_choice,
-                effort,
-            )?;
+        } else {
+            let (ids, prefill, prefill_tokens) = match source {
+                PromptSource::Flat(messages) => self.build_chat_input_with_tools_split(
+                    messages,
+                    thinking,
+                    tools,
+                    tool_choice,
+                    effort,
+                ),
+                PromptSource::History(turns) => self
+                    .build_chat_input_with_tools_from_history_split(
+                        turns,
+                        thinking,
+                        tools,
+                        tool_choice,
+                        effort,
+                    ),
+            }?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
-        let prefix_key = if has_images {
-            None
+        let (prefix_key, boundary_head) = if has_images {
+            (None, None)
         } else {
-            auto_prefix_key(messages, effort)
-        };
-        let boundary_head = if has_images {
-            None
-        } else {
-            Self::system_tools_head(messages, tools, effort)
+            match source {
+                PromptSource::Flat(messages) => (
+                    auto_prefix_key(messages, effort),
+                    Self::system_tools_head(messages, tools, effort),
+                ),
+                PromptSource::History(turns) => (
+                    auto_prefix_key_from_turns(turns, effort),
+                    Self::system_tools_head_from_turns(turns, tools, effort),
+                ),
+            }
         };
         self.chat_with_tools_impl(
             prompt_ids,
@@ -5779,96 +5191,7 @@ impl MlxQwen35Backend {
         )
     }
 
-    /// Structured-history counterpart of [`chat_with_tools_flat`](Self::chat_with_tools_flat).
-    #[allow(clippy::too_many_arguments)]
-    fn chat_with_tools_history<F>(
-        &mut self,
-        turns: &[crate::chat_io::ChatTurn<'_>],
-        images: &[Vec<Vec<u8>>],
-        max_new_tokens: usize,
-        thinking: bool,
-        seq_id: u64,
-        tools: &[crate::chat_io::ToolDef<'_>],
-        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
-        calls: crate::grammar::ToolCalls,
-        on_event: F,
-        effort: Option<crate::chat_io::ReasoningEffort>,
-    ) -> Result<crate::chat_io::ParsedResponse>
-    where
-        F: FnMut(crate::chat_io::BackendStreamEvent<'_>) -> Result<()>,
-    {
-        let has_images = images.iter().any(|v| !v.is_empty());
-        #[cfg(feature = "mlx-native")]
-        let (prompt_ids, prefill, prefill_tokens, prepared) = if has_images {
-            self.build_chat_input_with_tools_and_images_from_history_split(
-                turns,
-                images,
-                thinking,
-                tools,
-                tool_choice,
-                effort,
-            )?
-        } else {
-            let (ids, prefill, prefill_tokens) = self
-                .build_chat_input_with_tools_from_history_split(
-                    turns,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    effort,
-                )?;
-            (ids, prefill, prefill_tokens, Vec::new())
-        };
-        #[cfg(not(feature = "mlx-native"))]
-        let (prompt_ids, prefill, prefill_tokens, prepared) = {
-            if has_images {
-                return Err(anyhow!(
-                    "image input requires a build with the `mlx-native` feature"
-                ));
-            }
-            let (ids, prefill, prefill_tokens) = self
-                .build_chat_input_with_tools_from_history_split(
-                    turns,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    effort,
-                )?;
-            (ids, prefill, prefill_tokens, Vec::new())
-        };
-        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
-        let prefix_key = if has_images {
-            None
-        } else {
-            auto_prefix_key_from_turns(turns, effort)
-        };
-        let boundary_head = if has_images {
-            None
-        } else {
-            Self::system_tools_head_from_turns(turns, tools, effort)
-        };
-        self.chat_with_tools_impl(
-            prompt_ids,
-            prefill,
-            prefill_tokens,
-            grammar,
-            calls,
-            max_new_tokens,
-            seq_id,
-            prefix_key.as_deref(),
-            boundary_head,
-            if force_required_params_enabled() {
-                force_required_params_map(tools)
-            } else {
-                Default::default()
-            },
-            prepared,
-            thinking,
-            on_event,
-        )
-    }
-
-    /// Shared decode loop for the four tool-aware entry points. Prefill
+    /// Shared decode loop behind [`Self::chat_with_tools`]. Prefill
     /// the prompt (including any tool_choice prefill suffix), feed the
     /// prefill string into the parser so its state machine starts at
     /// the right place (`InToolCallHeader` for Required, `InToolCallBody`
@@ -6147,11 +5470,11 @@ impl MlxQwen35Backend {
         // here the structure does not cleanly admit a "issue next forward
         // before CPU work" deferral:
         //   1. `decode_step` / `decode_step_masked` are a FUSED black box
-        //      across the `MlxRunner` trait (Subprocess / PyO3 / Native):
+        //      across the `Runner` trait:
         //      they forward, host-sync, argmax, and return only the *token*
         //      (`(u32, usize)`), not the lazy logits array. Overlapping the
         //      next forward would require returning lazy logits and splitting
-        //      sampling out across all four backends — an invasive trait
+        //      sampling out of every runner — an invasive trait
         //      refactor out of scope here.
         //   2. The grammar-masked path applies its mask BETWEEN forward and
         //      argmax on a host copy, so the chosen token isn't known until
@@ -7466,46 +6789,35 @@ mod tests {
     };
     use crate::session::{SessionRunner, auto_session_enabled, session_rollback_enabled};
 
-    #[cfg(feature = "mlx-native")]
-    const DEFAULT_RUNNER: RunnerKind = RunnerKind::Native;
-    #[cfg(not(feature = "mlx-native"))]
-    const DEFAULT_RUNNER: RunnerKind = RunnerKind::Pyo3;
-
     #[test]
-    fn runner_kind_default_matches_compiled_feature() {
-        assert_eq!(runner_kind_from_env(None, None).unwrap(), DEFAULT_RUNNER);
+    fn backend_env_unset_or_native_passes() {
+        for raw in [None, Some(""), Some("native"), Some("mlx-rs")] {
+            check_backend_env(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+        }
+    }
+
+    /// The app's "MLX native" backend setting exports
+    /// `LUMEN_MLX_BACKEND=mlx-native`; the server must start on it.
+    #[test]
+    fn backend_env_accepts_app_mlx_native_spelling() {
+        for raw in ["mlx-native", "mlx_native", " MLX-Native "] {
+            check_backend_env(Some(raw)).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+        }
+    }
+
+    /// Naming a removed runner fails at load instead of serving native under
+    /// the other runner's name.
+    #[test]
+    fn backend_env_rejects_removed_runners() {
+        for raw in ["pyo3", "subprocess", " PyO3 ", "json-rpc"] {
+            let err = check_backend_env(Some(raw)).unwrap_err().to_string();
+            assert!(err.contains("removed"), "{raw:?}: {err}");
+        }
     }
 
     #[test]
-    fn runner_kind_accepts_explicit_backend() {
-        assert_eq!(
-            runner_kind_from_env(Some("subprocess"), None).unwrap(),
-            RunnerKind::Subprocess
-        );
-        assert_eq!(
-            runner_kind_from_env(Some("pyo3"), Some("1")).unwrap(),
-            RunnerKind::Pyo3
-        );
-    }
-
-    #[test]
-    fn runner_kind_preserves_legacy_subprocess_env() {
-        assert_eq!(
-            runner_kind_from_env(None, Some("1")).unwrap(),
-            RunnerKind::Subprocess
-        );
-        assert_eq!(
-            runner_kind_from_env(None, Some("0")).unwrap(),
-            DEFAULT_RUNNER
-        );
-    }
-
-    #[test]
-    fn runner_kind_accepts_native_backend() {
-        assert_eq!(
-            runner_kind_from_env(Some("native"), None).unwrap(),
-            RunnerKind::Native
-        );
+    fn backend_env_rejects_unknown_values() {
+        assert!(check_backend_env(Some("candle")).is_err());
     }
 
     #[cfg(not(feature = "mlx-native"))]
@@ -7644,7 +6956,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns Python + downloads/loads ~19GB model"]
+    #[ignore = "downloads/loads ~19GB model"]
     fn smoke_load_prefill_decode() {
         let backend = MlxBackend::load("mlx-community/Qwen3.6-35B-A3B-mxfp4").unwrap();
         // Unwrap to the Qwen35 inner for the low-level prefill / decode_step
@@ -7658,33 +6970,6 @@ mod tests {
         let (_second, pos2) = b.decode_step(1, first, pos).unwrap();
         assert!(pos2 == 4);
         b.remove_seq(1).unwrap();
-    }
-
-    #[cfg(feature = "mlx-pyo3")]
-    #[test]
-    #[ignore = "spawns Python + downloads/loads ~19GB model; set LUMEN_MLX_GOLDEN_OUT to write JSON"]
-    fn record_pyo3_golden_transcript() {
-        let model_id = std::env::var("MODEL_ID")
-            .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-mxfp4".to_string());
-        let prompt_tokens = parse_prompt_tokens_env().unwrap_or_else(|| vec![12, 34, 56]);
-        let decode_steps = std::env::var("STEPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
-
-        let mut runner = Pyo3Runner::new().unwrap();
-        runner.load(&model_id).unwrap();
-        let transcript =
-            capture_runner_transcript(&mut runner, &model_id, 1, &prompt_tokens, decode_steps)
-                .unwrap();
-        let json = serde_json::to_string_pretty(&transcript).unwrap();
-
-        if let Ok(path) = std::env::var("LUMEN_MLX_GOLDEN_OUT") {
-            std::fs::write(&path, json).unwrap();
-            eprintln!("wrote PyO3 MLX golden transcript to {path}");
-        } else {
-            println!("{json}");
-        }
     }
 
     fn sample_transcript() -> RunnerTranscript {
@@ -7762,8 +7047,8 @@ mod tests {
     const CHAT_BLUE: u32 = 11;
 
     /// A scripted backend whose every reply is `Blue`, fed through a runner
-    /// that reports a dense model's 2048-token prefill grid — the shape the
-    /// native runner has.
+    /// that reports a 64-token prefill grid — the native runner's shape, at a
+    /// size these short prompts cross.
     fn chat_backend(preserves_thinking: bool) -> MlxQwen35Backend {
         let tokenizer =
             <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
@@ -7773,10 +7058,7 @@ mod tests {
         b.preserves_thinking_on_replay = preserves_thinking;
         let r = b.script_runner();
         r.feed_token = Some(CHAT_BLUE);
-        r.grid = Some(session_feed::PrefillGrid {
-            chunk: 2048,
-            min_piece: Some(session_feed::MIN_BULK_PIECE),
-        });
+        r.grid = Some(session_feed::PrefillGrid { chunk: 64 });
         b
     }
 
@@ -7806,14 +7088,14 @@ mod tests {
             let mut b = chat_backend(false);
             let system = "S ".repeat(80);
             let turn1 = [("system", system.as_str()), ("user", "U1")];
-            // 91 prompt tokens, a 4-token header from 87. The point goes 32
-            // rows before the end, so both pieces stay bulk-sized.
+            // 91 prompt tokens, a 4-token header from 87. The point goes to
+            // the last chunk boundary before the header.
             assert_eq!(
                 chat_turn(&mut b, &turn1),
                 vec![
-                    ScriptFeed::Prefill(59),
-                    ScriptFeed::Mark(59),
-                    ScriptFeed::Extend(32)
+                    ScriptFeed::Prefill(64),
+                    ScriptFeed::Mark(64),
+                    ScriptFeed::Extend(27)
                 ]
             );
 
@@ -7825,7 +7107,7 @@ mod tests {
             ];
             assert_eq!(
                 chat_turn(&mut b, &turn2),
-                vec![ScriptFeed::Rollback(59), ScriptFeed::Extend(40)],
+                vec![ScriptFeed::Rollback(64), ScriptFeed::Extend(35)],
                 "turn two must wind back to the point and feed only what follows it"
             );
             assert_eq!(b.session_count(), 1, "the turn continues its own session");
@@ -8334,14 +7616,16 @@ mod tests {
     /// that places it nor in the turn that resumes from it.
     ///
     /// The point is placed by cutting the prefill, and `session_feed` only cuts
-    /// where every row still runs through the kernels a bulk pass uses. That
-    /// is an argument about MLX's kernel selection; this is the measurement.
+    /// on the bulk pass's own chunk grid. That is an argument about how the
+    /// runner feeds chunks; this is the measurement.
     /// Turn one with points on must equal turn one with them off, and a resumed
     /// turn two must equal a cold prefill of the same prompt. The lengths put
     /// the prefill's last chunk at 4, 20 and 50 rows (short, inside the
     /// small-row kernel range, and bulk), at a full grid of two chunks, and at
     /// one short prompt, so each branch of the planner is taken. Run it on a
-    /// dense and a mixture-of-experts checkpoint: they cut differently.
+    /// dense and a mixture-of-experts checkpoint, and again after every MLX
+    /// bump: a dense cut inside a chunk passed this on MLX 0.30 and failed it
+    /// on 0.32, when split-K made a call's sums depend on its row count.
     #[test]
     #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
     fn a_rollback_point_changes_no_token() {
@@ -8373,7 +7657,7 @@ mod tests {
             .prefill_grid(4096)
             .expect("native runner reports its grid");
         let chunk = grid.chunk;
-        eprintln!("chunk={chunk} min_piece={:?}", grid.min_piece);
+        eprintln!("chunk={chunk}");
         for target in [
             600,
             2 * chunk + 4,
@@ -8416,12 +7700,9 @@ mod tests {
             let p2 = m.build_chat_input(&turn2, false, None).expect("prompt 2");
             let session = m.sessions.get("on").expect("session kept");
             if point.is_none() {
-                // Only a model without cuts inside a chunk may lack one, and
-                // only below a chunk's length.
-                assert!(
-                    grid.min_piece.is_none() && n < chunk,
-                    "no rollback point placed (prompt {n})"
-                );
+                // Points go on chunk boundaries, so only a prompt shorter
+                // than a chunk may lack one.
+                assert!(n < chunk, "no rollback point placed (prompt {n})");
                 eprintln!("  no chunk boundary before the header; nothing to resume");
             } else if session.extends(&p2) {
                 eprintln!("  turn two extends the whole session; not a resume");
@@ -8756,7 +8037,7 @@ mod tests {
         ];
         let expected: Vec<Vec<u32>> = cases.iter().map(|c| decode(&tools, c)).collect();
         let (response_format, _images) = backend
-            .build_response_format_input_from_history(&turns, &[], false, None)
+            .build_response_format_input(PromptSource::History(&turns), &[], false, None)
             .expect("response_format render");
         // The flattened pairs the engine counted before.
         let flat: Vec<(String, String)> = [
@@ -8865,20 +8146,6 @@ mod tests {
             "ExactlyOne consumed {consumed_one} tokens and OneOrMore {consumed_many}: \
              the cap has to end the turn, not filter the output"
         );
-    }
-
-    #[allow(dead_code)] // no caller: the harness that read PROMPT_TOKENS moved to
-    // `bench_qwen35_mtp_realprompt`, which parses its own.
-    fn parse_prompt_tokens_env() -> Option<Vec<u32>> {
-        let raw = std::env::var("PROMPT_TOKENS").ok()?;
-        let tokens: Vec<u32> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()
-            .ok()?;
-        (!tokens.is_empty()).then_some(tokens)
     }
 
     #[derive(Default)]

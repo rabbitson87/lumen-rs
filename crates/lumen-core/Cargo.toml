@@ -10,7 +10,6 @@ description = "TurboQuant KV cache vector quantization — pure Rust core"
 workspace = true
 
 [dependencies]
-faer = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 serde = { workspace = true }

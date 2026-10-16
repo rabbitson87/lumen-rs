@@ -25,6 +25,7 @@ pub use imp::linear_nobias;
 #[cfg(all(test, feature = "mlx-native"))]
 mod parity_tests {
     use super::imp::linear_nobias;
+    use crate::test_util::assert_all_close;
     use mlx_rs::Array;
 
     #[test]
@@ -36,10 +37,7 @@ mod parity_tests {
         let out = linear_nobias(&x, &w).expect("linear_nobias must succeed");
         assert_eq!(out.shape(), &[1, 3]);
         out.eval().expect("mlx eval must succeed");
-        let observed: &[f32] = out.as_slice();
         let expected = [1.0f32, 2.0, 3.0];
-        for (i, (&got, &exp)) in observed.iter().zip(expected.iter()).enumerate() {
-            assert!((got - exp).abs() < 1e-4, "[{i}]: got {got}, expected {exp}");
-        }
+        assert_all_close("linear_nobias", out.as_slice(), &expected, 1e-4);
     }
 }
