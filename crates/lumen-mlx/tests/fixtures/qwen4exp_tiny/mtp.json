@@ -1,0 +1,45 @@
+{
+ "bits": {
+  "mtp.fc_embedding": 4,
+  "mtp.fc_hidden": 4,
+  "mtp.hyper_connection_mixer.input_mix_weight_down": 4,
+  "mtp.hyper_connection_mixer.input_mix_weight_up": 4,
+  "mtp.layers.0.attn_hyper_connection.block_inject_weight": 4,
+  "mtp.layers.0.attn_hyper_connection.input_mix_weight_down": 4,
+  "mtp.layers.0.attn_hyper_connection.input_mix_weight_up": 4,
+  "mtp.layers.0.mlp.gate": 8,
+  "mtp.layers.0.mlp.shared_expert.down_proj": 4,
+  "mtp.layers.0.mlp.shared_expert.gate_proj": 4,
+  "mtp.layers.0.mlp.shared_expert.up_proj": 4,
+  "mtp.layers.0.mlp.shared_expert_gate": 8,
+  "mtp.layers.0.mlp.switch_mlp.down_proj": 4,
+  "mtp.layers.0.mlp.switch_mlp.gate_proj": 4,
+  "mtp.layers.0.mlp.switch_mlp.up_proj": 4,
+  "mtp.layers.0.mlp_hyper_connection.block_inject_weight": 4,
+  "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down": 4,
+  "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up": 4,
+  "mtp.layers.0.self_attn.indexer.index_qk_proj": 4,
+  "mtp.layers.0.self_attn.k_proj": 4,
+  "mtp.layers.0.self_attn.o_proj": 4,
+  "mtp.layers.0.self_attn.q_proj": 4,
+  "mtp.layers.0.self_attn.v_proj": 4
+ },
+ "gate_up_order": "gate_first",
+ "group_size": 32,
+ "norms": "folded",
+ "quantization": {
+  "default": {
+   "bits": 4,
+   "group_size": 32
+  },
+  "mtp.layers.0.mlp.gate": {
+   "bits": 8,
+   "group_size": 64
+  },
+  "mtp.layers.0.mlp.shared_expert_gate": {
+   "bits": 8,
+   "group_size": 64
+  }
+ },
+ "source": "qwen4exp_tiny_fixture.py"
+}

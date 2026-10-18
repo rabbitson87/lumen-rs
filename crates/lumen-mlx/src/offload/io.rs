@@ -106,17 +106,70 @@ struct AutoMode {
     last_free: AtomicU64,
 }
 
-/// One read: `len` bytes at `offset` of file `file`, copied to `dst`.
-pub(crate) struct ReadJob {
-    pub file: usize,
-    pub offset: u64,
+/// Where part of a read goes: `len` bytes starting `at` bytes into the read, copied to `dst`.
+pub(crate) struct Part {
+    pub at: usize,
     pub len: usize,
     pub dst: *mut u8,
 }
 
-// SAFETY: the destination is only written by the one worker that owns the job,
-// and `IoPool::run` is `unsafe` precisely so its caller vouches for the pointer.
+/// One read: `len` bytes at `offset` of file `file`, scattered to its parts' destinations
+/// (usually one part covering the whole read).
+pub(crate) struct ReadJob {
+    pub file: usize,
+    pub offset: u64,
+    pub len: usize,
+    pub parts: Vec<Part>,
+}
+
+impl ReadJob {
+    /// A read whose bytes all go to `dst`.
+    pub(crate) fn single(file: usize, offset: u64, len: usize, dst: *mut u8) -> Self {
+        Self {
+            file,
+            offset,
+            len,
+            parts: vec![Part { at: 0, len, dst }],
+        }
+    }
+}
+
+// SAFETY: each destination is only written by the one worker that owns the job,
+// and `IoPool::run` is `unsafe` precisely so its caller vouches for the pointers.
 unsafe impl Send for ReadJob {}
+
+/// The largest read two or more neighbouring ranges are merged into. A merged read is one
+/// `pread` for what used to be several, but each worker's scratch buffer grows to the biggest
+/// read it has seen, so the cap bounds that (lanes x cap).
+const MAX_MERGED_READ: usize = 4 << 20;
+
+/// Merge ranges that sit back to back in one file into one read that scatters to each range's
+/// destination: an expert whose parts the pack stores together becomes a single read, and in
+/// the original layout, neighbouring experts' bytes of one tensor do.
+fn coalesce(mut jobs: Vec<ReadJob>) -> Vec<ReadJob> {
+    if jobs.len() < 2 {
+        return jobs;
+    }
+    jobs.sort_by_key(|j| (j.file, j.offset));
+    let mut out: Vec<ReadJob> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if let Some(prev) = out.last_mut()
+            && prev.file == job.file
+            && prev.offset + prev.len as u64 == job.offset
+            && prev.len + job.len <= MAX_MERGED_READ
+        {
+            let base = prev.len;
+            prev.len += job.len;
+            prev.parts.extend(job.parts.into_iter().map(|part| Part {
+                at: base + part.at,
+                ..part
+            }));
+        } else {
+            out.push(job);
+        }
+    }
+    out
+}
 
 struct Batch {
     jobs: Vec<ReadJob>,
@@ -347,7 +400,7 @@ impl IoPool {
             return Ok(IoTicket { done: None });
         }
         self.retune();
-        let shards = shard(jobs, self.lanes);
+        let shards = shard(coalesce(jobs), self.lanes);
         let done = Arc::new(Done::new(shards.len()));
         let tx = self
             .tx
@@ -536,10 +589,12 @@ fn read_one(
         }
     }
     let read_done = Instant::now();
-    // SAFETY: the caller of `IoPool::run` guaranteed `dst` is valid for `len`
-    // bytes, unaliased and unread until the batch completes; `buf` is our own
-    // scratch, so the regions cannot overlap.
-    unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), job.dst, job.len) };
+    for part in &job.parts {
+        // SAFETY: the caller of `IoPool::run` guaranteed every `dst` is valid for its `len`
+        // bytes, unaliased and unread until the batch completes; `buf` is our own scratch, so
+        // the regions cannot overlap, and the parts lie inside the bytes just read.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr().add(part.at), part.dst, part.len) };
+    }
     profile.jobs.fetch_add(1, Ordering::Relaxed);
     profile.bytes.fetch_add(job.len as u64, Ordering::Relaxed);
     profile.read_ns.fetch_add(
@@ -574,12 +629,7 @@ mod tests {
     }
 
     fn job(file: usize, offset: u64, dst: &mut [u8]) -> ReadJob {
-        ReadJob {
-            file,
-            offset,
-            len: dst.len(),
-            dst: dst.as_mut_ptr(),
-        }
+        ReadJob::single(file, offset, dst.len(), dst.as_mut_ptr())
     }
 
     #[test]
@@ -679,12 +729,7 @@ mod tests {
         // The shard test never runs the jobs, so any destination pointer will do.
         let mut dummy = vec![0u8; 1];
         let dst = dummy.as_mut_ptr();
-        let mk = move |len| ReadJob {
-            file: 0,
-            offset: 0,
-            len,
-            dst,
-        };
+        let mk = move |len| ReadJob::single(0, 0, len, dst);
         let jobs: Vec<ReadJob> = [800, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]
             .into_iter()
             .map(&mk)
@@ -717,6 +762,44 @@ mod tests {
         let b = s.get(100_000);
         assert_eq!(b.len(), 100_000);
         assert_eq!(b.as_ptr() as usize % SCRATCH_ALIGN, 0);
+    }
+    #[test]
+    fn neighbouring_ranges_become_one_read_that_scatters_to_each_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, data) = file_with(dir.path(), "a", 1 << 20, 7);
+        let mut bufs = [vec![0u8; 100], vec![0u8; 300], vec![0u8; 50], vec![0u8; 70]];
+        // Ranges 0, 1 and 2 touch; 3 is somewhere else.
+        let offs = [1000u64, 1100, 1400, 9000];
+        let jobs: Vec<ReadJob> = bufs
+            .iter_mut()
+            .zip(offs)
+            .map(|(b, o)| job(0, o, b))
+            .collect();
+        let merged = coalesce(jobs);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].len, 450);
+        assert_eq!(merged[0].parts.len(), 3);
+        let pool = IoPool::new(&[p], 2, IoMode::Direct).unwrap();
+        // SAFETY: the destinations are distinct buffers that outlive the call.
+        unsafe { pool.run(merged) }.unwrap();
+        for (b, o) in bufs.iter().zip(offs) {
+            assert_eq!(b[..], data[o as usize..o as usize + b.len()]);
+        }
+        assert_eq!(pool.profile().jobs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_merged_read_never_exceeds_the_cap() {
+        let mut dummy = vec![0u8; 1];
+        let dst = dummy.as_mut_ptr();
+        let each = MAX_MERGED_READ / 3 + 1;
+        let jobs: Vec<ReadJob> = (0..7)
+            .map(|i| ReadJob::single(0, (i * each) as u64, each, dst))
+            .collect();
+        let merged = coalesce(jobs);
+        assert!(merged.iter().all(|j| j.len <= MAX_MERGED_READ));
+        assert_eq!(merged.iter().map(|j| j.len).sum::<usize>(), 7 * each);
+        assert_eq!(merged.iter().map(|j| j.parts.len()).sum::<usize>(), 7);
     }
 }
 
@@ -754,12 +837,7 @@ mod auto_tests {
                 set_direct_on(f, direct);
             }
             let mut out = vec![0u8; 300_000];
-            let job = ReadJob {
-                file: 0,
-                offset: 12_345,
-                len: out.len(),
-                dst: out.as_mut_ptr(),
-            };
+            let job = ReadJob::single(0, 12_345, out.len(), out.as_mut_ptr());
             // SAFETY: `out` outlives the call and nothing else touches it.
             unsafe { pool.run(vec![job]) }.unwrap();
             assert_eq!(out[..], data[12_345..12_345 + 300_000], "direct={direct}");

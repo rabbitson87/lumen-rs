@@ -4,6 +4,7 @@
 //! comments name the reference function a block mirrors. Activations are f32
 //! (the quantized matmuls take f32 and return f32), like the Qwen3.5 port.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +27,10 @@ use crate::native_rope::rope;
 use crate::native_ssm::{compute_g, gated_delta_step_kernel};
 use crate::offload::{IoMode, IoTuning, MoeOffload};
 use crate::qwen3_5_moe::{NativeWeights, ResolvedLinear};
+
+mod mtp;
+pub use mtp::MtpMode;
+use mtp::{MtpHead, MtpState};
 
 // ---- small helpers -------------------------------------------------------------------------
 
@@ -312,6 +317,32 @@ struct Qsa {
     indexer: Indexer,
 }
 
+impl Qsa {
+    fn load(weights: &NativeWeights, cfg: &Qwen4ExpConfig, b: &str) -> Result<Self> {
+        Ok(Self {
+            q_proj: Proj::load(weights, cfg, &format!("{b}.q_proj"))?,
+            k_proj: Proj::load(weights, cfg, &format!("{b}.k_proj"))?,
+            v_proj: Proj::load(weights, cfg, &format!("{b}.v_proj"))?,
+            o_proj: Proj::load(weights, cfg, &format!("{b}.o_proj"))?,
+            q_norm: centered_norm(weights, cfg, &format!("{b}.q_norm.weight"))?,
+            k_norm: centered_norm(weights, cfg, &format!("{b}.k_norm.weight"))?,
+            indexer: Indexer {
+                index_qk_proj: Proj::load(weights, cfg, &format!("{b}.indexer.index_qk_proj"))?,
+                q_layernorm: centered_norm(
+                    weights,
+                    cfg,
+                    &format!("{b}.indexer.q_layernorm.weight"),
+                )?,
+                k_layernorm: centered_norm(
+                    weights,
+                    cfg,
+                    &format!("{b}.indexer.k_layernorm.weight"),
+                )?,
+            },
+        })
+    }
+}
+
 enum Mixer {
     Gdn(Gdn),
     Qsa(Qsa),
@@ -387,7 +418,22 @@ struct MoeLayer {
 
 impl MoeLayer {
     fn load(weights: &NativeWeights, cfg: &Qwen4ExpConfig, layer: usize) -> Result<Self> {
-        let base = format!("language_model.model.layers.{layer}.mlp");
+        Self::load_at(
+            weights,
+            cfg,
+            &format!("language_model.model.layers.{layer}.mlp"),
+            layer as u16,
+        )
+    }
+
+    /// The block whose tensors live under `base` (`<layer>.mlp`); `layer` names it to the
+    /// offload engine (unused when the experts are resident).
+    fn load_at(
+        weights: &NativeWeights,
+        cfg: &Qwen4ExpConfig,
+        base: &str,
+        layer: u16,
+    ) -> Result<Self> {
         let stacked = |proj: &str| -> Result<Stacked> {
             let b = format!("{base}.switch_mlp.{proj}");
             Ok(Stacked {
@@ -398,7 +444,7 @@ impl MoeLayer {
         };
         let q = cfg.quant.for_base(&format!("{base}.switch_mlp"));
         Ok(Self {
-            layer: layer as u16,
+            layer,
             gate: Gate::load(weights, cfg, &format!("{base}.gate"))?,
             shared_gate: Gate::load(weights, cfg, &format!("{base}.shared_expert_gate"))?,
             switch_gate: stacked("gate_proj")?,
@@ -500,6 +546,9 @@ pub struct Qwen4ExpModel {
     mixer: HyperConnection,
     lm_head: Option<Proj>,
     offload: Option<MoeOffload>,
+    /// The MTP draft head, when its weights are next to the checkpoint and `LoadOptions::mtp`
+    /// allows it.
+    mtp: Option<MtpHead>,
     /// `ones(hidden)`, the weight of a group norm whose scale is applied afterwards.
     ones_hidden: Array,
 }
@@ -550,6 +599,8 @@ pub struct Qwen4ExpCache {
     /// The last `ngram_size - 1` tokens (EOS before the text starts).
     ngram_tail: Vec<u32>,
     tokens: usize,
+    /// The draft head's cache, for a model that has one.
+    mtp: Option<MtpState>,
 }
 
 impl Qwen4ExpCache {
@@ -587,6 +638,17 @@ impl Qwen4ExpCache {
             m.arrays = vec![push_record(&mut records, conv.as_ref())?];
             metas.push(m);
         }
+        // The draft head's cache goes last: without it a restored sequence cannot speculate.
+        if let Some(h) = &self.mtp {
+            let mut m = LayerMeta::new(LayerKindTag::Full, h.qsa.kv.offset());
+            m.arrays = vec![
+                push_record(&mut records, h.qsa.kv.keys_view()?.as_ref())?,
+                push_record(&mut records, h.qsa.kv.values_view()?.as_ref())?,
+                push_record(&mut records, h.qsa.indexer_keys.as_ref())?,
+                push_record(&mut records, h.last_multi.as_ref())?,
+            ];
+            metas.push(m);
+        }
         Ok((metas, records))
     }
 
@@ -601,7 +663,9 @@ impl Qwen4ExpCache {
         eos: u32,
     ) -> Result<Self> {
         let want = fresh.layers.len() + fresh.ple_conv.len();
-        if metas.len() != want {
+        // One more record than the trunk's is the draft head's cache.
+        let has_head_state = metas.len() == want + 1;
+        if metas.len() != want && !has_head_state {
             bail!(
                 "persisted state has {} layers, the model has {want}",
                 metas.len()
@@ -631,6 +695,17 @@ impl Qwen4ExpCache {
         for (k, conv) in fresh.ple_conv.iter_mut().enumerate() {
             *conv = slot(&metas[n_layers + k], 0)?;
         }
+        if let Some(head) = fresh.mtp.as_mut() {
+            if has_head_state {
+                let m = &metas[want];
+                head.qsa.kv.set_state(slot(m, 0)?, slot(m, 1)?, m.offset);
+                head.qsa.indexer_keys = slot(m, 2)?;
+                head.last_multi = slot(m, 3)?;
+            } else {
+                // A state saved without the head cannot be drafted from.
+                fresh.mtp = None;
+            }
+        }
         fresh.tokens = tokens.len();
         // The n-gram hashes see the last `ngram_context` tokens, EOS before the start.
         fresh.ngram_tail = if tokens.len() >= ngram_context {
@@ -655,6 +730,9 @@ impl Qwen4ExpCache {
             out.extend(layer.arrays());
         }
         out.extend(self.ple_conv.iter().flatten());
+        if let Some(m) = &self.mtp {
+            out.extend(m.arrays());
+        }
         out
     }
 
@@ -686,6 +764,8 @@ pub struct LoadOptions {
     /// Serve the routed experts from an SSD-backed slot pool of about this many bytes.
     pub expert_budget_bytes: Option<u64>,
     pub ngram: NgramSource,
+    /// Load the MTP draft head (`mtp.safetensors`) when present.
+    pub mtp: MtpMode,
 }
 
 impl Qwen4ExpModel {
@@ -698,6 +778,7 @@ impl Qwen4ExpModel {
             LoadOptions {
                 expert_budget_bytes,
                 ngram: NgramSource::Auto,
+                mtp: MtpMode::Off,
             },
         )
     }
@@ -707,6 +788,16 @@ impl Qwen4ExpModel {
         let mut cfg = Qwen4ExpConfig::load(model_dir)?;
         let mut weights = NativeWeights::load_dir(model_dir)?;
         weights.sanitize()?;
+        // `mtp.safetensors` sits in the same directory, so the loader picked it up under
+        // `language_model.mtp.*`. The head is its own thing: take it out before the trunk is read.
+        let head_tensors: HashMap<String, Array> = weights
+            .take_prefix("language_model.mtp.")
+            .into_iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("language_model.")
+                    .map(|k| (k.to_string(), v))
+            })
+            .collect();
         materialize_trunk(&weights, expert_budget_bytes.is_none())
             .context("qwen4_exp: read the resident weights")?;
         cfg.norms_centered = detect_centered_norms(&weights, &cfg)?;
@@ -746,32 +837,7 @@ impl Qwen4ExpModel {
                     })
                 }
                 LayerKind::FullAttention => {
-                    let b = format!("{base}.self_attn");
-                    Mixer::Qsa(Qsa {
-                        q_proj: Proj::load(&weights, &cfg, &format!("{b}.q_proj"))?,
-                        k_proj: Proj::load(&weights, &cfg, &format!("{b}.k_proj"))?,
-                        v_proj: Proj::load(&weights, &cfg, &format!("{b}.v_proj"))?,
-                        o_proj: Proj::load(&weights, &cfg, &format!("{b}.o_proj"))?,
-                        q_norm: centered_norm(&weights, &cfg, &format!("{b}.q_norm.weight"))?,
-                        k_norm: centered_norm(&weights, &cfg, &format!("{b}.k_norm.weight"))?,
-                        indexer: Indexer {
-                            index_qk_proj: Proj::load(
-                                &weights,
-                                &cfg,
-                                &format!("{b}.indexer.index_qk_proj"),
-                            )?,
-                            q_layernorm: centered_norm(
-                                &weights,
-                                &cfg,
-                                &format!("{b}.indexer.q_layernorm.weight"),
-                            )?,
-                            k_layernorm: centered_norm(
-                                &weights,
-                                &cfg,
-                                &format!("{b}.indexer.k_layernorm.weight"),
-                            )?,
-                        },
-                    })
+                    Mixer::Qsa(Qsa::load(&weights, &cfg, &format!("{base}.self_attn"))?)
                 }
             };
             let ple = match ple_layers.iter().position(|&l| l == i) {
@@ -811,20 +877,40 @@ impl Qwen4ExpModel {
         } else {
             Some(Proj::load(&weights, &cfg, "language_model.lm_head")?)
         };
+        let want_head = options.mtp != MtpMode::Off && !head_tensors.is_empty();
         let offload = match expert_budget_bytes {
-            Some(bytes) => Some(
-                MoeOffload::open(
-                    model_dir,
-                    bytes,
-                    cfg.num_experts_per_tok,
-                    IoTuning::from_env()?,
+            Some(bytes) => {
+                // The draft head's experts go through the same pool as the trunk's: their 1.4 GB
+                // would otherwise be resident, taken from it.
+                let io = IoTuning {
+                    mtp_experts: want_head,
+                    ..IoTuning::from_env()?
+                };
+                Some(
+                    MoeOffload::open(model_dir, bytes, cfg.num_experts_per_tok, io)
+                        .context("qwen4_exp: expert offload")?,
                 )
-                .context("qwen4_exp: expert offload")?,
-            ),
+            }
             None => None,
         };
         let ones_hidden = mlx_rs::ops::ones::<f32>(&[cfg.hidden_size as i32])?;
         ones_hidden.eval()?;
+        let mtp = if want_head {
+            let head = MtpHead::load(head_tensors, model_dir, &cfg, offload.is_some())
+                .context("qwen4_exp: MTP head")?;
+            eprintln!(
+                "[qwen4_exp] MTP draft head loaded ({:.2} GB resident{})",
+                head.resident_bytes as f64 / 1e9,
+                if head.streamed {
+                    ", its experts in the pool"
+                } else {
+                    ""
+                }
+            );
+            Some(head)
+        } else {
+            None
+        };
         Ok(Self {
             cfg,
             embed,
@@ -832,6 +918,7 @@ impl Qwen4ExpModel {
             mixer,
             lm_head,
             offload,
+            mtp,
             ones_hidden,
         })
     }
@@ -913,6 +1000,7 @@ impl Qwen4ExpModel {
             ple_conv: vec![None; self.cfg.ple_layers().len()],
             ngram_tail: vec![self.cfg.eos_token_id; self.cfg.ngram_size - 1],
             tokens: 0,
+            mtp: self.mtp.as_ref().map(|_| MtpState::new()),
         }
     }
 }
@@ -1033,10 +1121,25 @@ fn load_ple(
 
 // ---- forward -------------------------------------------------------------------------------
 
+/// What [`Qwen4ExpModel::forward_verify`] returns.
+pub(crate) struct Verified {
+    /// `[1, 2, vocab]` f32: row 0 predicts the token after the pending one, row 1 the token
+    /// after the draft.
+    pub logits: Array,
+    /// `[1, 2, hc*hidden]`: the final residual streams of the two rows (the draft head's input).
+    pub multi: Array,
+    /// The sequence's state after the first row alone: what stays if the draft is rejected.
+    pub first: Qwen4ExpCache,
+}
+
 /// Tokens a layer-major prefill keeps in flight: each layer's experts are read from the SSD
 /// once per group this size, and the group's residual streams (40 KB a token) wait in memory
 /// between layers. A group is long enough that a layer's compute outlasts the read of the next.
 const PREFILL_GROUP_TOKENS: usize = 8192;
+
+/// A pass of at most this many rows is a decode step or a speculative verify: it keeps nothing
+/// alive between layers worth settling.
+const DECODE_ROWS: i32 = 4;
 
 /// Routes every layer call to the staging path while it lives (see `MoeOffload::set_bulk_hint`).
 struct BulkHint<'a>(&'a MoeOffload);
@@ -1080,15 +1183,20 @@ impl Qwen4ExpModel {
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some((k, ple)) = &layer.ple {
                 let injected = self
-                    .ple_forward(ple, &h, &history, ids.len(), &mut cache.ple_conv[*k])
+                    .ple_forward(ple, &h, &history, ids.len(), &mut cache.ple_conv[*k], None)
                     .with_context(|| format!("layer {i}: n-gram injection"))?;
                 h = mlx_rs::ops::add(&h, &injected)?;
             }
             h = self
-                .layer_forward(layer, &h, &mut cache.layers[i])
+                .layer_forward(layer, &h, &mut cache.layers[i], None)
                 .with_context(|| format!("layer {i}"))?;
         }
 
+        let first = cache.tokens == 0;
+        if let Some(st) = cache.mtp.as_mut() {
+            self.mtp_consume(st, ids, &h, first)
+                .context("qwen4_exp: feed the draft head")?;
+        }
         let h = if last_only && l > 1 {
             h.try_index((.., (l - 1)..l, ..))?
         } else {
@@ -1110,9 +1218,108 @@ impl Qwen4ExpModel {
         Ok(logits)
     }
 
+    /// Two rows `[pending token, draft]` through the model in one pass, keeping what a
+    /// rejected draft needs: the state as it stood after the first row alone. `cache` ends
+    /// after both rows. The draft head's cache is untouched here (the caller finishes the
+    /// round with [`Self::mtp_finish_round`]).
+    pub(crate) fn forward_verify(
+        &self,
+        ids: &[u32],
+        cache: &mut Qwen4ExpCache,
+    ) -> Result<Verified> {
+        if ids.len() != 2 {
+            bail!("qwen4_exp verify: {} rows, expected 2", ids.len());
+        }
+        if cache.layers.len() != self.layers.len() {
+            bail!("qwen4_exp verify: cache has {} layers", cache.layers.len());
+        }
+        let keep = self.cfg.ngram_size - 1;
+        let base_tokens = cache.tokens;
+        let mut history = cache.ngram_tail.clone();
+        history.extend_from_slice(ids);
+
+        let mut h = self.embed_streams(ids)?;
+        let mut gdn_first: Vec<Option<GdnState>> = vec![None; self.layers.len()];
+        let mut ple_first: Vec<Option<Array>> = vec![None; cache.ple_conv.len()];
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some((k, ple)) = &layer.ple {
+                let injected = self
+                    .ple_forward(
+                        ple,
+                        &h,
+                        &history,
+                        2,
+                        &mut cache.ple_conv[*k],
+                        Some(&mut ple_first[*k]),
+                    )
+                    .with_context(|| format!("layer {i}: n-gram injection"))?;
+                h = mlx_rs::ops::add(&h, &injected)?;
+            }
+            h = self
+                .layer_forward(layer, &h, &mut cache.layers[i], Some(&mut gdn_first[i]))
+                .with_context(|| format!("layer {i}"))?;
+        }
+        let multi = h.clone();
+        let (mixed, _) = self.hyper_mix(&self.mixer, &h)?;
+        let head = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| anyhow!("qwen4_exp: tied embeddings are not supported"))?;
+        let logits = to_f32(head.apply(&mixed)?)?;
+        cache.tokens += 2;
+        cache.ngram_tail = history[history.len() - keep..].to_vec();
+
+        // The state after the first row alone.
+        let mut layers = Vec::with_capacity(cache.layers.len());
+        for (i, st) in cache.layers.iter().enumerate() {
+            layers.push(match st {
+                LayerState::Gdn(_) => LayerState::Gdn(
+                    gdn_first[i]
+                        .take()
+                        .ok_or_else(|| anyhow!("layer {i}: the first row's state was not kept"))?,
+                ),
+                LayerState::Qsa(q) => {
+                    let n = q.kv.offset();
+                    let mut q1 = q.clone();
+                    let (k, v) = q.kv.prefix_views(n - 1)?;
+                    q1.kv.set_state(k, v, n - 1);
+                    q1.indexer_keys = match q.indexer_keys.as_ref() {
+                        Some(keys) => Some(owned(&keys.try_index((.., ..(n as i32 - 1), ..))?)?),
+                        None => None,
+                    };
+                    LayerState::Qsa(q1)
+                }
+            });
+        }
+        let first = Qwen4ExpCache {
+            layers,
+            ple_conv: ple_first,
+            ngram_tail: history[1..1 + keep].to_vec(),
+            tokens: base_tokens + 1,
+            mtp: cache.mtp.clone(),
+        };
+        let mut pending = cache.arrays();
+        pending.extend(first.arrays());
+        pending.push(&logits);
+        pending.push(&multi);
+        mlx_rs::transforms::eval(pending).context("qwen4_exp: evaluate the verify pass")?;
+        Ok(Verified {
+            logits,
+            multi,
+            first,
+        })
+    }
+
     /// The residual streams `[1, L, hc * hidden]` a token run starts from: its embeddings,
     /// repeated once per stream.
     fn embed_streams(&self, ids: &[u32]) -> Result<Array> {
+        let cfg = &self.cfg;
+        let embedded = to_f32(self.embed_untiled(ids)?)?;
+        Ok(mlx_rs::ops::tile(&embedded, &[1, 1, cfg.hc_count as i32])?)
+    }
+
+    /// The dequantized embedding rows of `ids`, `[1, L, hidden]`.
+    fn embed_untiled(&self, ids: &[u32]) -> Result<Array> {
         let cfg = &self.cfg;
         let (l, d) = (ids.len() as i32, cfg.hidden_size as i32);
         if let Some(&bad) = ids.iter().find(|&&t| t as usize >= cfg.vocab_size) {
@@ -1133,8 +1340,7 @@ impl Qwen4ExpModel {
             MODE_AFFINE,
         )
         .context("qwen4_exp: embed_tokens lookup")?;
-        let embedded = mlx_rs::ops::reshape(&to_f32(embedded)?, &[1, l, d])?;
-        Ok(mlx_rs::ops::tile(&embedded, &[1, 1, cfg.hc_count as i32])?)
+        Ok(mlx_rs::ops::reshape(&embedded, &[1, l, d])?)
     }
 
     /// Feed `ids` as several chunks (ending at the offsets `cuts`, the last being `ids.len()`),
@@ -1280,12 +1486,13 @@ impl Qwen4ExpModel {
                             &history[s..keep + e],
                             e - s,
                             &mut cache.ple_conv[*k],
+                            None,
                         )
                         .with_context(|| format!("layer {i}: n-gram injection"))?;
                     *h = mlx_rs::ops::add(&*h, &injected)?;
                 }
                 *h = self
-                    .layer_forward(layer, h, &mut cache.layers[i])
+                    .layer_forward(layer, h, &mut cache.layers[i], None)
                     .with_context(|| format!("layer {i}"))?;
                 if layer_major {
                     // Settle the chunk before the next one starts: the staged experts the
@@ -1298,6 +1505,20 @@ impl Qwen4ExpModel {
                     if let Some((k, _)) = &layer.ple {
                         snap_ple[*k] = cache.ple_conv[*k].clone();
                     }
+                }
+            }
+        }
+
+        // The draft head reads the final residual streams of every position: feed it the
+        // group's (the state at the mark is the head's as of the marked chunk).
+        let mut mtp_snapshot = None;
+        if let Some(st) = cache.mtp.as_mut() {
+            for (p, h) in streams.iter().enumerate() {
+                let (s, e) = bounds[p];
+                self.mtp_consume(st, &ids[s..e], h, base_tokens + s == 0)
+                    .context("qwen4_exp: feed the draft head")?;
+                if mark_piece == Some(p) {
+                    mtp_snapshot = Some(st.clone());
                 }
             }
         }
@@ -1332,6 +1553,7 @@ impl Qwen4ExpModel {
             ple_conv: snap_ple,
             ngram_tail: history[m..keep + m].to_vec(),
             tokens: base_tokens + m,
+            mtp: mtp_snapshot,
         });
         Ok((logits, snapshot))
     }
@@ -1381,20 +1603,26 @@ impl Qwen4ExpModel {
         Ok(mlx_rs::ops::add(h, &spread)?)
     }
 
-    fn layer_forward(&self, layer: &Layer, h: &Array, state: &mut LayerState) -> Result<Array> {
+    fn layer_forward(
+        &self,
+        layer: &Layer,
+        h: &Array,
+        state: &mut LayerState,
+        first_row: Option<&mut Option<GdnState>>,
+    ) -> Result<Array> {
         let (x, inject) = self.hyper_mix(&layer.attn_hc, h)?;
         let inject = inject.ok_or_else(|| anyhow!("attn hyper-connection has no inject weight"))?;
         let x = match (&layer.mixer, &mut *state) {
-            (Mixer::Gdn(w), LayerState::Gdn(st)) => self.gdn_forward(w, &x, st)?,
+            (Mixer::Gdn(w), LayerState::Gdn(st)) => self.gdn_forward(w, &x, st, first_row)?,
             (Mixer::Qsa(w), LayerState::Qsa(st)) => self.qsa_forward(w, &x, st)?,
             _ => bail!("cache layer kind does not match the layer"),
         };
-        if x.shape()[1] > 1 {
+        if x.shape()[1] > DECODE_ROWS {
             // A prefill chunk: settle this layer's new state now. Nothing downstream needs
             // it, so left lazy it would keep the layer's chunk-sized convolution input alive
             // until the end of the pass (36 layers x 42 KB per token: 6 GB at 4,096 tokens).
             // One extra sync per layer per chunk, against seconds of chunk. A decode step
-            // (one row) holds next to nothing and skips it.
+            // (one row) or a verify pass (a few) holds next to nothing and skips it.
             let mut pending = state.arrays();
             pending.push(&x);
             mlx_rs::transforms::eval(pending).context("evaluate the layer's new state")?;
@@ -1409,7 +1637,16 @@ impl Qwen4ExpModel {
     }
 
     /// `GatedDeltaNet.__call__`.
-    fn gdn_forward(&self, w: &Gdn, x: &Array, st: &mut GdnState) -> Result<Array> {
+    /// `first_row` asks for the state as it stood after the first of two rows (a verify pass
+    /// may keep only that row): the convolution window is a slice of the same input and the
+    /// recurrence runs one step per kernel call, which is the fused kernel's own arithmetic.
+    fn gdn_forward(
+        &self,
+        w: &Gdn,
+        x: &Array,
+        st: &mut GdnState,
+        first_row: Option<&mut Option<GdnState>>,
+    ) -> Result<Array> {
         let cfg = &self.cfg;
         let (b, s) = (x.shape()[0], x.shape()[1]);
         let (nk, nv) = (
@@ -1459,7 +1696,34 @@ impl Qwen4ExpModel {
             Some(s0) => s0.clone(),
             None => mlx_rs::ops::zeros_dtype(&[b, nv, dv, dk], Dtype::Float32)?,
         };
-        let (out, new_state) = gated_delta_step_kernel(&q, &k, &v, &g, &beta, &state_in)?;
+        let (out, new_state) = match first_row {
+            Some(first) if s == 2 => {
+                let row4 = |a: &Array, r: i32| a.try_index((.., r..(r + 1), .., ..));
+                let row3 = |a: &Array, r: i32| a.try_index((.., r..(r + 1), ..));
+                let (out0, state0) = gated_delta_step_kernel(
+                    &row4(&q, 0)?,
+                    &row4(&k, 0)?,
+                    &row4(&v, 0)?,
+                    &row3(&g, 0)?,
+                    &row3(&beta, 0)?,
+                    &state_in,
+                )?;
+                let (out1, state1) = gated_delta_step_kernel(
+                    &row4(&q, 1)?,
+                    &row4(&k, 1)?,
+                    &row4(&v, 1)?,
+                    &row3(&g, 1)?,
+                    &row3(&beta, 1)?,
+                    &state0,
+                )?;
+                *first = Some(GdnState {
+                    conv: Some(owned(&conv_input.try_index((.., 1..kernel, ..))?)?),
+                    state: Some(state0),
+                });
+                (mlx_rs::ops::concatenate_axis(&[&out0, &out1], 1)?, state1)
+            }
+            _ => gated_delta_step_kernel(&q, &k, &v, &g, &beta, &state_in)?,
+        };
         st.conv = Some(new_conv);
         st.state = Some(new_state);
 
@@ -1624,6 +1888,7 @@ impl Qwen4ExpModel {
         history: &[u32],
         n_new: usize,
         conv: &mut Option<Array>,
+        first_row: Option<&mut Option<Array>>,
     ) -> Result<Array> {
         let cfg = &self.cfg;
         let (hcn, d) = (cfg.hc_count as i32, cfg.hidden_size as i32);
@@ -1669,6 +1934,9 @@ impl Qwen4ExpModel {
             None => mlx_rs::ops::zeros_dtype(&[1, n, stream], Dtype::Float32)?,
         };
         let full = mlx_rs::ops::concatenate_axis(&[&history_rows, &normed], 1)?;
+        if let (Some(first), 2) = (first_row, s) {
+            *first = Some(owned(&full.try_index((.., 1..(1 + n), ..))?)?);
+        }
         *conv = Some(owned(&full.try_index((.., s..(s + n), ..))?)?);
         let conv_out = mlx_rs::nn::silu(&mlx_rs::ops::conv1d(
             &full,

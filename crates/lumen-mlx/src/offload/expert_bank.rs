@@ -13,8 +13,9 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Dtype;
 
-use super::expert_store::ExpertStore;
+use super::expert_store::{ExpertStore, MTP_LAYER};
 use super::io::{IoMode, IoPool, IoProfile, IoTicket, ReadJob};
+use super::pack::PackMode;
 use super::slot_map::{ExpertKey, Plan, SlotMap, Stats};
 use super::slot_pool::PoolTensor;
 
@@ -82,8 +83,15 @@ fn mlx_dtype(safetensors: &str) -> Result<Dtype> {
 impl ExpertBank {
     /// Open the shards of `dir` and allocate `n_slots` slots per role. The pool must hold the
     /// `STAGING_REGIONS` staging regions (widest layer each) and should have room beside them.
-    pub(crate) fn open(dir: &Path, n_slots: usize, lanes: usize, mode: IoMode) -> Result<Self> {
-        let store = ExpertStore::open(dir)?;
+    pub(crate) fn open(
+        dir: &Path,
+        n_slots: usize,
+        lanes: usize,
+        mode: IoMode,
+        pack: PackMode,
+        with_mtp: bool,
+    ) -> Result<Self> {
+        let store = ExpertStore::open_with(dir, pack, with_mtp)?;
         let first = store
             .layers
             .values()
@@ -163,8 +171,8 @@ impl ExpertBank {
         self.store
             .layers
             .range(layer.saturating_add(1)..)
-            .next()
             .map(|(&l, _)| l)
+            .find(|&l| l != MTP_LAYER)
     }
 
     fn region_base(&self, region: usize) -> usize {
@@ -216,13 +224,13 @@ impl ExpertBank {
             for (role, range) in &ranges.roles {
                 let pool = &self.pools[role];
                 debug_assert_eq!(pool.slot_bytes(), range.bytes);
-                jobs.push(ReadJob {
-                    file: range.file,
-                    offset: range.offset_of(e),
-                    len: range.bytes,
+                jobs.push(ReadJob::single(
+                    range.file,
+                    range.offset_of(e),
+                    range.bytes,
                     // SAFETY (pointer only): written by the IO pool under its contract.
-                    dst: unsafe { pool.slot_ptr(base + e) },
-                });
+                    unsafe { pool.slot_ptr(base + e) },
+                ));
             }
         }
         // SAFETY: every destination is its own slot of the region, which nothing else uses or
@@ -281,13 +289,13 @@ impl ExpertBank {
             for (role, range) in &ranges.roles {
                 let pool = &self.pools[role];
                 debug_assert_eq!(pool.slot_bytes(), range.bytes);
-                jobs.push(ReadJob {
-                    file: range.file,
-                    offset: range.offset_of(key.expert as usize),
-                    len: range.bytes,
+                jobs.push(ReadJob::single(
+                    range.file,
+                    range.offset_of(key.expert as usize),
+                    range.bytes,
                     // SAFETY (pointer only): written by the IO pool under its contract.
-                    dst: unsafe { pool.slot_ptr(slot) },
-                });
+                    unsafe { pool.slot_ptr(slot) },
+                ));
             }
         }
         jobs
@@ -352,7 +360,8 @@ mod tests {
             return;
         };
         let dir = Path::new(&dir);
-        let mut bank = ExpertBank::open(dir, 600, 8, IoMode::Direct).expect("open bank");
+        let mut bank =
+            ExpertBank::open(dir, 600, 8, IoMode::Direct, PackMode::Off, false).expect("open bank");
         assert_eq!(
             bank.roles().count(),
             6,
@@ -461,7 +470,15 @@ mod tests {
             return;
         };
         // Two staging regions of 256 plus eight slots to cache in, once the regions are borrowed.
-        let mut bank = ExpertBank::open(Path::new(&dir), 520, 4, IoMode::Direct).expect("open");
+        let mut bank = ExpertBank::open(
+            Path::new(&dir),
+            520,
+            4,
+            IoMode::Direct,
+            PackMode::Off,
+            false,
+        )
+        .expect("open");
         bank.enter_staging();
         assert!(bank.acquire(999, &[0]).is_err());
         assert!(

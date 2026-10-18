@@ -32,6 +32,9 @@ pub(crate) struct RoleRange {
     pub offset: u64,
     /// Bytes of one expert.
     pub bytes: usize,
+    /// Distance between expert `e`'s bytes and expert `e + 1`'s: `bytes` in a stacked
+    /// checkpoint tensor, a whole record in the expert pack.
+    pub stride: usize,
     /// safetensors dtype string, e.g. `U32`, `BF16`, `U8`.
     pub dtype: String,
     /// Shape of one expert (the stacked shape without its leading axis).
@@ -41,7 +44,7 @@ pub(crate) struct RoleRange {
 impl RoleRange {
     /// Absolute file offset of expert `e`.
     pub(crate) fn offset_of(&self, e: usize) -> u64 {
-        self.offset + (e * self.bytes) as u64
+        self.offset + (e * self.stride) as u64
     }
 }
 
@@ -52,6 +55,10 @@ pub(crate) struct LayerRanges {
     /// Keyed by role: `gate_proj.weight`, `gate_proj.scales`, `up_proj.biases`, ...
     pub roles: BTreeMap<String, RoleRange>,
 }
+
+/// The layer id the draft head's routed experts are registered under: past every trunk layer
+/// (Flash-Next has 48), so layer order, staging and `layer_after` never reach it.
+pub(crate) const MTP_LAYER: u16 = 1000;
 
 /// The shards of one checkpoint and the expert ranges found in them.
 #[derive(Debug)]
@@ -76,11 +83,93 @@ impl ExpertStore {
         Self::from_files(files)
     }
 
+    /// [`Self::open`], then the directory's expert pack if `mode` allows it: when `mode` is
+    /// `Build` and there is no usable pack, the pack is built first. With `with_mtp` the draft
+    /// head's experts are added as layer [`MTP_LAYER`] (they are never part of the pack).
+    pub(crate) fn open_with(
+        dir: &Path,
+        mode: super::pack::PackMode,
+        with_mtp: bool,
+    ) -> Result<Self> {
+        let mut store = Self::open_pack_or_shards(dir, mode)?;
+        if with_mtp {
+            store.add_mtp_layer(dir)?;
+        }
+        Ok(store)
+    }
+
+    fn open_pack_or_shards(dir: &Path, mode: super::pack::PackMode) -> Result<Self> {
+        use super::pack::{self, PackMode};
+        let source = Self::open(dir)?;
+        if mode == PackMode::Off {
+            return Ok(source);
+        }
+        if let Some(packed) = pack::open_pack(dir, &source)? {
+            return Ok(packed);
+        }
+        if mode == PackMode::Build {
+            let started = std::time::Instant::now();
+            eprintln!(
+                "[offload] building the expert pack in {} ...",
+                dir.display()
+            );
+            let path = pack::build(dir, &source, |done, total| {
+                if done % 6 == 0 || done == total {
+                    eprintln!("[offload] expert pack: layer {done} of {total}");
+                }
+            })?;
+            eprintln!(
+                "[offload] expert pack ready in {:.0} s: {}",
+                started.elapsed().as_secs_f64(),
+                path.display()
+            );
+            if let Some(packed) = pack::open_pack(dir, &source)? {
+                return Ok(packed);
+            }
+        }
+        Ok(source)
+    }
+
     pub(crate) fn from_files(files: Vec<PathBuf>) -> Result<Self> {
+        Self::from_files_with(files, expert_role)
+    }
+
+    /// Add the draft head's routed experts (`mtp.safetensors` in `dir`, when there is one) as
+    /// layer [`MTP_LAYER`], so they are served from the slot pool like any layer's.
+    pub(crate) fn add_mtp_layer(&mut self, dir: &Path) -> Result<()> {
+        let path = dir.join("mtp.safetensors");
+        if !path.is_file() {
+            return Ok(());
+        }
+        let head = Self::from_files_with(vec![path.clone()], mtp_expert_role)?;
+        let Some(ranges) = head.layers.into_values().next() else {
+            return Ok(());
+        };
+        let file = self.files.len();
+        self.files.push(path);
+        let roles = ranges
+            .roles
+            .into_iter()
+            .map(|(k, r)| (k, RoleRange { file, ..r }))
+            .collect();
+        self.layers.insert(
+            MTP_LAYER,
+            LayerRanges {
+                n_experts: ranges.n_experts,
+                roles,
+            },
+        );
+        self.check_uniform()
+    }
+
+    fn from_files_with(
+        files: Vec<PathBuf>,
+        extract: fn(&str) -> Option<(u16, String)>,
+    ) -> Result<Self> {
         let mut layers: BTreeMap<u16, LayerRanges> = BTreeMap::new();
         for (file_idx, path) in files.iter().enumerate() {
             for t in read_header(path)? {
-                let Some((layer, role)) = expert_role(&t.name) else {
+                let Some((layer, role)) = extract(&t.name) else {
                     continue;
                 };
                 let (n_experts, tail) = match t.shape.split_first() {
@@ -119,6 +208,7 @@ impl ExpertStore {
                     file: file_idx,
                     offset: t.data_start + t.begin,
                     bytes,
+                    stride: bytes,
                     dtype: t.dtype,
                     tail_shape: tail,
                 };
@@ -209,6 +299,16 @@ fn expert_role(name: &str) -> Option<(u16, String)> {
     let proj_ok = matches!(proj, "gate_proj" | "up_proj" | "down_proj");
     let part_ok = matches!(part, "weight" | "scales" | "biases");
     (proj_ok && part_ok).then(|| (layer, format!("{proj}.{part}")))
+}
+
+/// `(MTP_LAYER, role)` for the draft head's stacked expert tensors
+/// (`mtp.layers.0.mlp.switch_mlp.<proj>.<part>`); `None` for everything else.
+fn mtp_expert_role(name: &str) -> Option<(u16, String)> {
+    let rest = name.strip_prefix("mtp.layers.0.mlp.switch_mlp.")?;
+    let (proj, part) = rest.split_once('.')?;
+    let proj_ok = matches!(proj, "gate_proj" | "up_proj" | "down_proj");
+    let part_ok = matches!(part, "weight" | "scales" | "biases");
+    (proj_ok && part_ok).then(|| (MTP_LAYER, format!("{proj}.{part}")))
 }
 
 pub(crate) struct TensorEntry {
@@ -639,7 +739,7 @@ mod tests {
             ("a.layers.7.mlp.gate.weight", None),
             ("a.layers.7.mlp.shared_expert_gate.weight", None),
             ("a.layers.7.mlp.switch_mlp.gate_proj.bias", None),
-            ("mtp.layers.0.mlp.switch_mlp.gate_proj.weight", None),
+            ("mtp.layers.0.mlp.switch_mlp.gate_proj.weight", None), // the trunk matcher leaves the head alone
             (
                 "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.scales",
                 None,
@@ -653,5 +753,151 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // ---- the expert pack -------------------------------------------------------------------
+
+    use super::super::io::{IoMode, IoPool, ReadJob};
+    use super::super::pack::{self, PackMode};
+
+    /// A two-layer checkpoint in `dir`; returns its tensors' bytes by (layer, role) for comparison.
+    fn two_layer_checkpoint(dir: &Path) -> std::collections::HashMap<(u16, String), Vec<u8>> {
+        let mut parts = noise();
+        parts.extend(layer_tensors(0, 10));
+        parts.extend(layer_tensors(1, 40));
+        let mut by_role = std::collections::HashMap::new();
+        for (name, _, _, data) in &parts {
+            if let Some((layer, role)) = expert_role(name) {
+                by_role.insert((layer, role), data.clone());
+            }
+        }
+        write_all(&dir.join("model-00001.safetensors"), &parts);
+        by_role
+    }
+
+    #[test]
+    fn a_pack_holds_each_expert_as_one_record_made_of_the_shards_own_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = two_layer_checkpoint(dir.path());
+        let source = ExpertStore::open(dir.path()).unwrap();
+        let path = pack::build(dir.path(), &source, |_, _| {}).unwrap();
+        assert_eq!(path, pack::pack_path(dir.path()));
+        assert!(!dir.path().join("experts.lpack.tmp").exists());
+
+        let packed = pack::open_pack(dir.path(), &source)
+            .unwrap()
+            .expect("usable pack");
+        assert_eq!(packed.files, vec![path.clone()]);
+        assert_eq!(packed.expert_bytes(), source.expert_bytes());
+        let file = std::fs::read(&path).unwrap();
+        for (layer, l) in &packed.layers {
+            for (role, r) in &l.roles {
+                let want = &tensors[&(*layer, role.clone())];
+                for e in 0..l.n_experts {
+                    let at = r.offset_of(e) as usize;
+                    assert_eq!(
+                        file[at..at + r.bytes],
+                        want[e * r.bytes..(e + 1) * r.bytes],
+                        "layer {layer} {role} expert {e}"
+                    );
+                }
+            }
+            // The roles of one expert are back to back: one read gets all of them.
+            let mut spans: Vec<(u64, usize)> = l
+                .roles
+                .values()
+                .map(|r| (r.offset_of(1), r.bytes))
+                .collect();
+            spans.sort();
+            for w in spans.windows(2) {
+                assert_eq!(w[0].0 + w[0].1 as u64, w[1].0);
+            }
+        }
+    }
+
+    #[test]
+    fn reading_a_packed_expert_is_one_read_that_lands_in_every_roles_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = two_layer_checkpoint(dir.path());
+        let source = ExpertStore::open(dir.path()).unwrap();
+        pack::build(dir.path(), &source, |_, _| {}).unwrap();
+        let packed = pack::open_pack(dir.path(), &source).unwrap().unwrap();
+        let l = packed.layer(1).unwrap();
+        let mut dsts: Vec<(String, Vec<u8>)> = l
+            .roles
+            .iter()
+            .map(|(k, r)| (k.clone(), vec![0u8; r.bytes]))
+            .collect();
+        let jobs: Vec<ReadJob> = dsts
+            .iter_mut()
+            .map(|(k, d)| {
+                let r = &l.roles[k];
+                ReadJob::single(r.file, r.offset_of(2), r.bytes, d.as_mut_ptr())
+            })
+            .collect();
+        let pool = IoPool::new(&packed.files, 2, IoMode::Direct).unwrap();
+        // SAFETY: the destinations are distinct vectors that outlive the call.
+        unsafe { pool.run(jobs) }.unwrap();
+        for (k, d) in &dsts {
+            let r = &l.roles[k];
+            assert_eq!(
+                d[..],
+                tensors[&(1, k.clone())][2 * r.bytes..3 * r.bytes],
+                "{k}"
+            );
+        }
+        let reads = pool
+            .profile()
+            .jobs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reads, 1, "six ranges of one record should be one read");
+    }
+
+    #[test]
+    fn a_pack_for_other_weights_or_cut_short_is_ignored_and_off_never_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        two_layer_checkpoint(dir.path());
+        let source = ExpertStore::open(dir.path()).unwrap();
+        pack::build(dir.path(), &source, |_, _| {}).unwrap();
+
+        // Auto uses it, Off does not.
+        assert!(
+            ExpertStore::open_with(dir.path(), PackMode::Auto, false)
+                .unwrap()
+                .files[0]
+                .ends_with("experts.lpack")
+        );
+        assert!(
+            ExpertStore::open_with(dir.path(), PackMode::Off, false)
+                .unwrap()
+                .files[0]
+                .ends_with("model-00001.safetensors")
+        );
+
+        // A pack cut short (an interrupted copy) is not used.
+        let path = pack::pack_path(dir.path());
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - 1000]).unwrap();
+        assert!(pack::open_pack(dir.path(), &source).unwrap().is_none());
+        std::fs::write(&path, &full).unwrap();
+        assert!(pack::open_pack(dir.path(), &source).unwrap().is_some());
+
+        // Weights that changed (a shard re-downloaded with other contents) do not match.
+        let mut parts = noise();
+        parts.extend(layer_tensors(0, 11));
+        parts.extend(layer_tensors(1, 40));
+        parts.push((
+            "language_model.model.layers.1.self_attn.extra".into(),
+            "U32",
+            vec![2],
+            bytes(8, 1),
+        ));
+        write_all(&dir.path().join("model-00001.safetensors"), &parts);
+        let changed = ExpertStore::open(dir.path()).unwrap();
+        assert!(pack::open_pack(dir.path(), &changed).unwrap().is_none());
+        // Build refuses without room, and builds when the pack is missing.
+        std::fs::remove_file(&path).unwrap();
+        let built = ExpertStore::open_with(dir.path(), PackMode::Build, false).unwrap();
+        assert!(built.files[0].ends_with("experts.lpack"));
     }
 }

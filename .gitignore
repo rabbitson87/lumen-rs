@@ -74,6 +74,9 @@ scripts/*
 # profiling artifacts and stay local. See crates/lumen-mlx/tests/golden/README.md.
 !scripts/golden/
 !scripts/golden/*.py
+# ...and the one script a user runs: it fetches the MTP draft head's weights
+# (docs/flash-next.md).
+!scripts/qwen4_mtp_fetch.py
 
 # ── Moltis 협조 데이터 (외부 프로젝트 reference data + raw 입력 로그).
 #    Personal eval / pruning ground truth 용도. Public repo 업로드 금지. ──

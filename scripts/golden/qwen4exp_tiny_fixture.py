@@ -10,17 +10,28 @@ group 64), and writes:
   <out>/model.safetensors      real tensor names (language_model.model.layers.N...)
   <out>/reference/outputs.safetensors   ids + reference logits (full prefill, and prefill+decode) +
                                the residual stream after every layer, all float32
+  <out>/mtp.safetensors        the MTP draft head (Slotstream's Tools/reference/mtp_ref.py MTPModule) with
+                               random weights, tensor names prefixed `mtp.`, same quantization plan,
+                               norms stored as the module applies them ("folded" convention)
+  <out>/mtp.json               sidecar: norms convention, group size, bits per quantized tensor base
+  <out>/reference/mtp_outputs.safetensors   the head's inputs (ids, backbone multi stream, token
+                               embeddings) and its outputs: one-shot prefill, and a 39-entry chunk +
+                               8 single-entry steps through a fresh cache (see the last section below)
 
 The weights are float32 (scales and biases too), so both the reference and the Rust port run
 in float32 and agree to rounding error rather than bf16 noise.
 
 usage: python scripts/golden/qwen4exp_tiny_fixture.py <reference_dir> crates/lumen-mlx/tests/fixtures/qwen4exp_tiny
-       <reference_dir> is Slotstream's Tools/reference (github.com/carloslfu/slotstream, MIT);
-       it needs mlx and mlx-lm (any recent version, e.g. the oMLX venv's).
+       <reference_dir> is Slotstream's Tools/reference (github.com/carloslfu/slotstream, MIT; the MTP head
+       reference mtp_ref.py is in the same directory); it needs mlx and mlx-lm.
 
 The output is committed: the Rust tests (src/qwen4_exp/tests.rs) read it, so this only needs
 re-running if the reference or the replica's shape changes. Seeds are fixed, so a rerun
-reproduces the same bytes.
+reproduces the same bytes -- on the SAME mlx: weights, config and mtp.* weights are
+version-independent, but the reference outputs move by ~1e-6 between mlx releases (kernel
+reduction order). The committed files were produced with mlx 0.32.4 / mlx-lm 0.31.4.dev from the
+oMLX checkout's venv (<omlx>/.venv/bin/python3); mlx 0.31.2 reproduces config.json,
+model.safetensors and mtp.* but not outputs.safetensors / mtp_outputs.safetensors byte for byte.
 """
 import json
 import sys
@@ -102,28 +113,35 @@ def reinit(params, path=""):
             out[k] = v
     return out
 
-flat = dict(tree_flatten(model.parameters()))
-new = {}
 INTEGER = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
-for name, w in flat.items():
-    if name.endswith(INTEGER):
-        new[name] = w
-    elif name.endswith("A_log"):
-        new[name] = mx.array(np.log(rng.uniform(1.0, 8.0, w.shape)).astype(np.float32))
-    elif name.endswith("dt_bias"):
-        new[name] = mx.array(rng.normal(0.0, 0.5, w.shape).astype(np.float32))
-    elif name.endswith("norm.weight") or name.endswith("layernorm.weight") or name.endswith("_norm.weight") or "norm_" in name.split(".")[-2]:
-        new[name] = mx.array(rng.uniform(0.7, 1.3, w.shape).astype(np.float32))
-    elif name.endswith("conv1d.weight"):
-        new[name] = mx.array(rng.normal(0.0, 0.4, w.shape).astype(np.float32))
-    elif "ngram_embedding" in name:
-        new[name] = mx.array(rng.normal(0.0, 1.0, w.shape).astype(np.float32))
-    elif w.ndim >= 2:
-        fan_in = w.shape[-1]
-        new[name] = mx.array(rng.normal(0.0, 1.0 / np.sqrt(fan_in), w.shape).astype(np.float32))
-    else:
-        new[name] = w
-model.load_weights(list(new.items()), strict=True)
+
+
+def random_weights(module):
+    """Fresh random, well-conditioned values for every parameter of `module`, drawn from `rng`
+    in parameter order (the MTP head at the end of this script reuses the same recipe)."""
+    new = {}
+    for name, w in dict(tree_flatten(module.parameters())).items():
+        if name.endswith(INTEGER):
+            new[name] = w
+        elif name.endswith("A_log"):
+            new[name] = mx.array(np.log(rng.uniform(1.0, 8.0, w.shape)).astype(np.float32))
+        elif name.endswith("dt_bias"):
+            new[name] = mx.array(rng.normal(0.0, 0.5, w.shape).astype(np.float32))
+        elif name.endswith("norm.weight") or name.endswith("layernorm.weight") or name.endswith("_norm.weight") or "norm_" in name.split(".")[-2]:
+            new[name] = mx.array(rng.uniform(0.7, 1.3, w.shape).astype(np.float32))
+        elif name.endswith("conv1d.weight"):
+            new[name] = mx.array(rng.normal(0.0, 0.4, w.shape).astype(np.float32))
+        elif "ngram_embedding" in name:
+            new[name] = mx.array(rng.normal(0.0, 1.0, w.shape).astype(np.float32))
+        elif w.ndim >= 2:
+            fan_in = w.shape[-1]
+            new[name] = mx.array(rng.normal(0.0, 1.0 / np.sqrt(fan_in), w.shape).astype(np.float32))
+        else:
+            new[name] = w
+    return new
+
+
+model.load_weights(list(random_weights(model).items()), strict=True)
 model.eval()
 
 
@@ -237,3 +255,117 @@ for k, v in streams.items():
 mx.save_safetensors(str(out_dir / "reference" / "outputs.safetensors"), fixture)
 print("wrote", out_dir, "tensors:", len(weights), "prompt", N_PROMPT, "decode", N_DECODE)
 print("top-1 of last position:", int(mx.argmax(full[0, -1])))
+
+
+# =========================================================================================
+# MTP draft head -- everything below runs AFTER every numpy/mx draw and every write above, so
+# the files written above are unaffected by it (model.safetensors, config.json and
+# reference/outputs.safetensors stay byte-identical to the ones committed before this section
+# existed, on the mlx noted in the module docstring).
+#
+# The head is mtp_ref.MTPModule (fusion of token embedding + backbone multi stream, one
+# full_attention decoder layer, its own hyper-connection mixer); the embedding table and lm_head
+# are the main model's. Norm weights are stored exactly as the module applies them ("folded"
+# convention: the +1 of the HF zero-centred norms is already in the value).
+# =========================================================================================
+import mtp_ref  # noqa: E402  (lives next to qwen4_exp.py in <reference_dir>)
+
+mtp = mtp_ref.MTPModule(args.text)
+mtp.load_weights(list(random_weights(mtp).items()), strict=True)
+nn.quantize(mtp, group_size=32, bits=4, class_predicate=plan)  # same plan as the main model
+mtp.eval()
+mx.eval(mtp.parameters())
+
+# ---- weights + sidecar ------------------------------------------------------------------
+mtp_weights = {"mtp." + k: v for k, v in tree_flatten(mtp.parameters())}
+mx.save_safetensors(str(out_dir / "mtp.safetensors"), mtp_weights)
+
+mtp_bits = {}
+mtp_quant = {"default": {"group_size": 32, "bits": 4}}
+for path, mod in mtp.named_modules():
+    if hasattr(mod, "bits") and hasattr(mod, "group_size"):
+        base = "mtp." + path
+        mtp_bits[base] = mod.bits
+        # tie the sidecar to the stored tensors: bits = weight_cols * 32 / (scales_cols * group)
+        w, s = mtp_weights[base + ".weight"], mtp_weights[base + ".scales"]
+        assert w.shape[-1] * 32 == mod.bits * s.shape[-1] * mod.group_size, base
+        if (mod.group_size, mod.bits) != (32, 4):
+            mtp_quant[base] = {"group_size": mod.group_size, "bits": mod.bits}
+(out_dir / "mtp.json").write_text(
+    json.dumps(
+        {
+            "source": "qwen4exp_tiny_fixture.py",
+            "norms": "folded",
+            "gate_up_order": "gate_first",  # moot here: switch_mlp.{gate,up}_proj are stored split
+            "group_size": 32,
+            "bits": mtp_bits,
+            "quantization": mtp_quant,
+        },
+        indent=1,
+        sort_keys=True,
+    )
+    + "\n"
+)
+
+# ---- reference outputs ------------------------------------------------------------------
+# Entry j (j = 1..47) fuses the backbone's pre-mixer multi stream at position j-1 with the
+# embedding of token j; 47 entries. The head's own cache positions start at 0 (entry j sits at
+# position j-1), exactly like mtp_ref.MTPModule driven with a fresh _AttnCache.
+rope = inner.rope
+n_ent = ids.shape[1] - 1
+n_chunk = N_PROMPT - 1  # entries available once the prompt is prefilled: 39
+multi_in = streams[f"after_layer_{TEXT['num_hidden_layers'] - 1}"][:, :n_ent]
+embedded = inner.embed_tokens(ids[:, 1:])
+assert multi_in.shape == (1, n_ent, TEXT["hc_count"] * TEXT["hidden_size"]), multi_in.shape
+assert embedded.shape == (1, n_ent, TEXT["hidden_size"]), embedded.shape
+
+# 1) the whole thing in one call, no cache (the module picks the causal mask itself)
+sample_p, multi_p = mtp(embedded, multi_in, rope, None)
+logits_p = model.lm_head(sample_p)
+
+# 2) prefill chunk + single-entry steps through a fresh attention cache (with its indexer cache)
+mcache = q._AttnCache()
+sample_c, multi_c = mtp(embedded[:, :n_chunk], multi_in[:, :n_chunk], rope, mcache)
+logits_c = model.lm_head(sample_c)
+step_logits, step_multi = [], []
+for i in range(n_chunk, n_ent):
+    s, m = mtp(embedded[:, i : i + 1], multi_in[:, i : i + 1], rope, mcache)
+    step_logits.append(model.lm_head(s))
+    step_multi.append(m)
+logits_s, multi_s = mx.concatenate(step_logits, axis=1), mx.concatenate(step_multi, axis=1)
+mx.eval(logits_p, multi_p, logits_c, multi_c, logits_s, multi_s)
+assert logits_s.shape == (1, n_ent - n_chunk, TEXT["vocab_size"])
+
+d_chunk = float(mx.max(mx.abs(logits_c - logits_p[:, :n_chunk])))
+d_steps = float(mx.max(mx.abs(logits_s - logits_p[:, n_chunk:])))
+dm_chunk = float(mx.max(mx.abs(multi_c - multi_p[:, :n_chunk])))
+dm_steps = float(mx.max(mx.abs(multi_s - multi_p[:, n_chunk:])))
+print(f"MTP head, incremental vs prefill: logits chunk {d_chunk:.3e} steps {d_steps:.3e}; multi chunk {dm_chunk:.3e} steps {dm_steps:.3e}")
+
+# The sparse path has to matter for the head too (budget 16 vs 47 entries) ...
+head_indexer = mtp.layers[0].self_attn.indexer
+saved_budget = head_indexer.token_budget
+head_indexer.token_budget = 10**9
+dense_logits = model.lm_head(mtp(embedded, multi_in, rope, None)[0])
+head_indexer.token_budget = saved_budget
+# ... and the outputs must not hinge on near-ties (top-k routing, indexer blocks): a 1e-6 relative
+# nudge of the inputs has to move the logits by rounding-level amounts only.
+nudge = np.random.default_rng(SEED + 1).normal(0.0, 1e-6, tuple(multi_in.shape)).astype(np.float32)
+nudged_logits = model.lm_head(mtp(embedded, multi_in * (1.0 + mx.array(nudge)), rope, None)[0])
+mx.eval(dense_logits, nudged_logits)
+print(f"MTP head: sparse vs dense attention max |logit diff| = {float(mx.max(mx.abs(dense_logits - logits_p))):.3e}; "
+      f"1e-6 input nudge moves logits by {float(mx.max(mx.abs(nudged_logits - logits_p))):.3e}")
+
+mtp_fixture = {
+    "mtp_ids": mx.array(ids_np),
+    "mtp_multi_in": multi_in.astype(mx.float32),
+    "mtp_embedded": embedded.astype(mx.float32),
+    "mtp_sample_prefill": sample_p.astype(mx.float32),
+    "mtp_multi_prefill": multi_p.astype(mx.float32),
+    "mtp_logits_prefill": logits_p.astype(mx.float32),
+    "mtp_logits_chunk": logits_c.astype(mx.float32),
+    "mtp_logits_steps": logits_s.astype(mx.float32),
+    "mtp_multi_steps": multi_s.astype(mx.float32),
+}
+mx.save_safetensors(str(out_dir / "reference" / "mtp_outputs.safetensors"), mtp_fixture)
+print("wrote MTP head:", len(mtp_weights), "tensors; entries", n_ent, "= chunk", n_chunk, "+ steps", n_ent - n_chunk)

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use mlx_rs::Array;
 
 use super::config::Qwen4ExpConfig;
-use super::model::{LoadOptions, NgramSource, Qwen4ExpModel};
+use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpModel};
 use super::ngram::NgramHasher;
 
 /// The committed replica. A missing fixture fails the test: a skip here would
@@ -275,6 +275,7 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
     let options = |ngram| LoadOptions {
         expert_budget_bytes: None,
         ngram,
+        mtp: MtpMode::Off,
     };
     let run = |model: &Qwen4ExpModel| -> Vec<f32> {
         let mut cache = model.make_cache();
@@ -575,4 +576,330 @@ fn a_prompt_longer_than_a_group_goes_through_in_groups() {
             .unwrap(),
     );
     assert!(next == want_next, "the rollback point differs");
+}
+
+// ---- the MTP draft head -------------------------------------------------------------------
+
+fn mtp_outputs(dir: &std::path::Path) -> HashMap<String, Array> {
+    Array::load_safetensors(dir.join("reference/mtp_outputs.safetensors")).expect("mtp outputs")
+}
+
+fn load_with_head(dir: &std::path::Path, budget: Option<u64>) -> Qwen4ExpModel {
+    Qwen4ExpModel::load_with(
+        dir,
+        LoadOptions {
+            expert_budget_bytes: budget,
+            ngram: NgramSource::Auto,
+            mtp: MtpMode::On,
+        },
+    )
+    .expect("load the replica with its draft head")
+}
+
+/// The head, fed the main model's own residual streams and embeddings, gives the reference's
+/// logits: in one pass over the whole prompt, and as a chunk followed by single entries (the
+/// cache and the sparse indexer, which only matters past 16 keys).
+#[test]
+fn the_draft_head_matches_the_reference() {
+    // The head's experts resident, and served from the expert pool beside the trunk's.
+    for budget in [None, Some(1u64), Some(u64::MAX / 2)] {
+        check_the_draft_head_against_the_reference(budget);
+    }
+}
+
+fn check_the_draft_head_against_the_reference(budget: Option<u64>) {
+    let dir = fixture_dir();
+    let model = load_with_head(&dir, budget);
+    assert!(model.has_mtp());
+    let want = mtp_outputs(&dir);
+    let ids: Vec<u32> = want["mtp_ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let rows = &ids[1..];
+    let multi = &want["mtp_multi_in"];
+    let vocab = model.config().vocab_size;
+
+    let whole = model.mtp_logits_for_test(rows, multi, &[47]).unwrap();
+    let got = host_f32(&whole[0]);
+    let expected = host_f32(&want["mtp_logits_prefill"]);
+    let (max_abs, min_cos) = compare(&got, &expected, vocab);
+    eprintln!("head ({budget:?}), one pass: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+    assert_eq!(argmax_rows(&got, vocab), argmax_rows(&expected, vocab));
+    assert!(
+        min_cos > 0.9999 && max_abs < 5e-3,
+        "{max_abs:e} / {min_cos}"
+    );
+
+    let mut chunks = vec![39];
+    chunks.extend([1; 8]);
+    let parts = model.mtp_logits_for_test(rows, multi, &chunks).unwrap();
+    let chunk = host_f32(&parts[0]);
+    let (max_abs, min_cos) = compare(&chunk, &host_f32(&want["mtp_logits_chunk"]), vocab);
+    eprintln!("head, 39-entry chunk: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+    assert!(
+        min_cos > 0.9999 && max_abs < 5e-3,
+        "{max_abs:e} / {min_cos}"
+    );
+    let steps: Vec<f32> = parts[1..].iter().flat_map(host_f32).collect();
+    let (max_abs, min_cos) = compare(&steps, &host_f32(&want["mtp_logits_steps"]), vocab);
+    eprintln!("head, 8 single entries: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+    assert!(
+        min_cos > 0.9999 && max_abs < 5e-3,
+        "{max_abs:e} / {min_cos}"
+    );
+}
+
+fn fixture_ids(dir: &std::path::Path) -> Vec<u32> {
+    reference(dir)["ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect()
+}
+
+/// A prompt fed through the model leaves the head one entry per token but the first, and the
+/// state a plain decode step leaves keeps it that way.
+#[test]
+fn the_head_keeps_one_entry_per_consumed_token_but_the_first() {
+    let dir = fixture_dir();
+    let model = load_with_head(&dir, None);
+    let ids = fixture_ids(&dir);
+    let mut cache = model.make_cache();
+    model.forward(&ids[..1], &mut cache, true).unwrap();
+    assert_eq!(model.mtp_entries(&cache), 0, "the first token has no entry");
+    let cuts = [16usize, 40];
+    model
+        .forward_pieces(&ids[1..40], &mut cache, &cuts.map(|c| c - 1), None)
+        .unwrap();
+    assert_eq!(cache.len(), 40);
+    assert_eq!(model.mtp_entries(&cache), 39);
+    model.forward(&ids[40..41], &mut cache, true).unwrap();
+    assert_eq!(model.mtp_entries(&cache), 40);
+    assert!(model.mtp_ready(&cache));
+    // A cache made without the head's blessing (restored from a state saved without it) is
+    // not ready.
+    let plain = Qwen4ExpModel::load(&dir, None).unwrap();
+    assert!(!plain.mtp_ready(&plain.make_cache()));
+}
+
+/// Two rows through one verify pass give what two single steps give (to the usual batch
+/// re-association), and the state it keeps for a rejected draft is the state after one step.
+#[test]
+fn a_verify_pass_agrees_with_two_single_steps() {
+    let dir = fixture_dir();
+    let model = load_with_head(&dir, None);
+    let vocab = model.config().vocab_size;
+    let ids = fixture_ids(&dir);
+    let mut base = model.make_cache();
+    model.forward(&ids[..40], &mut base, true).unwrap();
+
+    let (p, d, x) = (ids[40], ids[41], ids[42]);
+    let mut seq_cache = base.clone();
+    let l0 = host_f32(&model.forward(&[p], &mut seq_cache, true).unwrap());
+    let mut after_p = seq_cache.clone();
+    let l1 = host_f32(&model.forward(&[d], &mut seq_cache, true).unwrap());
+
+    let mut full = base.clone();
+    let v = model.forward_verify(&[p, d], &mut full).unwrap();
+    let got = host_f32(&v.logits);
+    let (a0, c0) = compare(&got[..vocab], &l0, vocab);
+    let (a1, c1) = compare(&got[vocab..], &l1, vocab);
+    eprintln!("verify rows vs single steps: row 0 {a0:.2e}/{c0:.6}, row 1 {a1:.2e}/{c1:.6}");
+    assert!(c0 > 0.9999 && a0 < 5e-3 && c1 > 0.9999 && a1 < 5e-3);
+    assert_eq!(argmax_rows(&got[..vocab], vocab), argmax_rows(&l0, vocab));
+    assert_eq!(argmax_rows(&got[vocab..], vocab), argmax_rows(&l1, vocab));
+
+    // The kept first-row state continues like the state after one single step...
+    let mut first = v.first;
+    assert_eq!(first.len(), 41);
+    assert_eq!(full.len(), 42);
+    let from_first = host_f32(&model.forward(&[x], &mut first, true).unwrap());
+    let from_step = host_f32(&model.forward(&[x], &mut after_p, true).unwrap());
+    let (a, c) = compare(&from_first, &from_step, vocab);
+    eprintln!("after a rejected draft vs after one step: {a:.2e}/{c:.6}");
+    assert!(c > 0.9999 && a < 5e-3);
+    // ...and the full state like the state after two.
+    let from_full = host_f32(&model.forward(&[x], &mut full, true).unwrap());
+    let from_two = host_f32(&model.forward(&[x], &mut seq_cache, true).unwrap());
+    let (a, c) = compare(&from_full, &from_two, vocab);
+    eprintln!("after an accepted draft vs after two steps: {a:.2e}/{c:.6}");
+    assert!(c > 0.9999 && a < 5e-3);
+}
+
+/// Cost of a two-row verify pass against a single decode step, on the real checkpoint with its
+/// experts warm (the same state is stepped repeatedly, so every expert it needs is resident).
+/// Prints medians; asserts nothing. Run with `--release --ignored --nocapture` and
+/// `LUMEN_QWEN4_MODEL_DIR` set; `LUMEN_QWEN4_POOL_GB` sizes the pool (default 19.8).
+#[test]
+#[ignore = "needs the real Flash-Next checkpoint; set LUMEN_QWEN4_MODEL_DIR"]
+fn verify_cost_against_a_single_step() {
+    let Ok(dir) = std::env::var("LUMEN_QWEN4_MODEL_DIR") else {
+        return;
+    };
+    let pool_gb: f64 = std::env::var("LUMEN_QWEN4_POOL_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(19.8);
+    let model = load_with_head(std::path::Path::new(&dir), Some((pool_gb * 1e9) as u64));
+    let tok = tokenizers::Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+        .expect("tokenizer");
+    let text = "A hash table maps keys to values using a hash function. When two keys land in \
+                the same bucket the table has a collision, which it resolves by chaining or by \
+                probing for another slot. A table that is too full slows down, so it grows.";
+    let ids: Vec<u32> = tok.encode(text, false).unwrap().get_ids().to_vec();
+    let mut cache = model.make_cache();
+    model.forward(&ids, &mut cache, true).unwrap();
+    // Walk a few steps greedily so the pool holds what this text routes to.
+    let argmax = |l: &Array| -> u32 {
+        let flat = mlx_rs::ops::reshape(l, &[-1]).unwrap();
+        let a = mlx_rs::ops::indexing::argmax_axis(&flat, 0, false).unwrap();
+        a.eval().unwrap();
+        a.item::<u32>()
+    };
+    let mut next = argmax(
+        &model
+            .forward(&ids[ids.len() - 1..], &mut cache.clone(), true)
+            .unwrap(),
+    );
+    for _ in 0..24 {
+        let l = model.forward(&[next], &mut cache, true).unwrap();
+        next = argmax(&l);
+    }
+    let p = next;
+    let d = argmax(&model.forward(&[p], &mut cache.clone(), true).unwrap());
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    let time = |f: &mut dyn FnMut()| {
+        f();
+        f();
+        median(
+            (0..9)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect(),
+        )
+    };
+    model.offload_reset_timing();
+    let single = time(&mut || {
+        let mut c = cache.clone();
+        model.forward(&[p], &mut c, true).unwrap();
+    });
+    eprintln!(
+        "single: {}",
+        model
+            .offload_report()
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
+    );
+    model.offload_reset_timing();
+    let verify = time(&mut || {
+        let mut c = cache.clone();
+        model.forward_verify(&[p, d], &mut c).unwrap();
+    });
+    eprintln!(
+        "verify: {}",
+        model
+            .offload_report()
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
+    );
+    let draft = time(&mut || {
+        let mut c = cache.clone();
+        model.draft_for(&mut c, p).unwrap();
+    });
+    eprintln!(
+        "pool {pool_gb} GB, experts warm: single step {single:.1} ms, verify (2 rows) {verify:.1} ms \
+         ({:.2}x), draft {draft:.1} ms",
+        verify / single
+    );
+    if let Some(r) = model.offload_report() {
+        eprintln!("{r}");
+    }
+}
+
+/// Decode cost per token: plain steps against oracle-draft verify rounds, over different
+/// stretches of one greedy continuation of the real checkpoint (so both pay for the experts
+/// their tokens route to). Prints; asserts nothing.
+#[test]
+#[ignore = "needs the real Flash-Next checkpoint; set LUMEN_QWEN4_MODEL_DIR"]
+fn speculative_rounds_against_plain_steps_per_token() {
+    let Ok(dir) = std::env::var("LUMEN_QWEN4_MODEL_DIR") else {
+        return;
+    };
+    let pool_gb: f64 = std::env::var("LUMEN_QWEN4_POOL_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(19.8);
+    let model = load_with_head(std::path::Path::new(&dir), Some((pool_gb * 1e9) as u64));
+    let tok = tokenizers::Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+        .expect("tokenizer");
+    let text = "Explain, in about 300 words, how a hash table handles collisions and when to resize it. \
+                A hash table maps keys to values using a hash function.";
+    let ids: Vec<u32> = tok.encode(text, false).unwrap().get_ids().to_vec();
+    let argmax = |l: &Array| -> u32 {
+        let flat = mlx_rs::ops::reshape(l, &[-1]).unwrap();
+        let a = mlx_rs::ops::indexing::argmax_axis(&flat, 0, false).unwrap();
+        a.eval().unwrap();
+        a.item::<u32>()
+    };
+    let mut cache = model.make_cache();
+    let logits = model.forward(&ids, &mut cache, true).unwrap();
+    let mut toks = vec![argmax(&logits)];
+    // The continuation: 120 greedy tokens, with snapshots every 40.
+    let mut snaps = vec![cache.clone()];
+    for i in 0..120 {
+        let l = model.forward(&[toks[i]], &mut cache, true).unwrap();
+        toks.push(argmax(&l));
+        if (i + 1) % 40 == 0 {
+            snaps.push(cache.clone());
+        }
+    }
+    // The same stretch of the continuation (tokens 40..80, from snapshot 1) either one plain
+    // step per token or oracle-draft verify rounds; which one comes from `QWEN4_MODE`, one
+    // process each so neither inherits the other's page cache or expert pool.
+    let n = 40;
+    let mode = std::env::var("QWEN4_MODE").unwrap_or_else(|_| "plain".into());
+    model.offload_reset_timing();
+    let mut c = snaps[1].clone();
+    let t = std::time::Instant::now();
+    if mode == "plain" {
+        for i in 40..40 + n {
+            model.forward(&[toks[i]], &mut c, true).unwrap();
+        }
+    } else {
+        let mut i = 40;
+        while i + 1 < 40 + n {
+            model.draft_for(&mut c, toks[i]).unwrap();
+            let mut full = c.clone();
+            let mut v = model
+                .forward_verify(&[toks[i], toks[i + 1]], &mut full)
+                .unwrap();
+            model
+                .mtp_finish_round(&mut v.first, Some(&mut full), &v.multi, toks[i + 1])
+                .unwrap();
+            c = full;
+            i += 2;
+        }
+    }
+    let per_token = t.elapsed().as_secs_f64() * 1e3 / n as f64;
+    eprintln!(
+        "{mode}: {per_token:.1} ms/token | {}",
+        model
+            .offload_report()
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
+    );
 }

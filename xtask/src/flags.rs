@@ -400,7 +400,12 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// reader-thread count and a direct/buffered choice for the same offload, speed
 /// knobs that never change the output. `git grep` only sees tracked files, so
 /// they start counting once `crates/lumen-mlx/src/offload/` is committed.
-const UNMANAGED_BASELINE: usize = 188;
+/// 188 -> 191 with `LUMEN_QWEN4_MTP`, `LUMEN_QWEN4_MTP_FLOOR` and `LUMEN_MOE_PACK` (task 023):
+/// a three-way mode for the draft head, a ratio for when a conversation stops speculating, and a
+/// three-way mode for the contiguous expert pack. None is a boolean; the first two change
+/// which tokens are drafted (the output can differ at near-ties, documented in
+/// `docs/flash-next.md`), the third only the layout the same bytes are read from.
+const UNMANAGED_BASELINE: usize = 191;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

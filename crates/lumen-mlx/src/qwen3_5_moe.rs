@@ -371,6 +371,25 @@ mod imp {
             Ok(())
         }
 
+        /// A bag over already-loaded tensors.
+        pub fn from_tensors(tensors: HashMap<String, Array>) -> Self {
+            Self { tensors }
+        }
+
+        /// Remove and return the tensors whose names start with `prefix`.
+        pub fn take_prefix(&mut self, prefix: &str) -> HashMap<String, Array> {
+            let names: Vec<String> = self
+                .tensors
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            names
+                .into_iter()
+                .filter_map(|k| self.tensors.remove(&k).map(|v| (k, v)))
+                .collect()
+        }
+
         pub fn get(&self, name: &str) -> Option<&Array> {
             self.tensors.get(name)
         }

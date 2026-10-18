@@ -224,6 +224,9 @@ mod native_snapshot;
 pub mod native_ssm;
 #[cfg(feature = "mlx-native")]
 mod offload;
+/// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
+#[cfg(feature = "mlx-native")]
+pub use offload::build_expert_pack;
 mod prefix_cache;
 mod qwen3_5_moe;
 #[cfg(feature = "mlx-native")]
@@ -979,6 +982,22 @@ impl RunnerImpl {
         self.native_mut()
             .ok_or_else(|| anyhow!("sampling is only supported on the native (mlx-rs) backend"))?
             .decode_step_pick(seq_id, last_token, pick)
+    }
+
+    /// [`Self::decode_step_pick`] for an unconstrained sampled step, the one kind a runner with
+    /// a draft head may speculate on: `pick` is applied to the first position's logits, and to
+    /// the second only if the draft matched. Without a head it is the plain step.
+    #[cfg(feature = "mlx-native")]
+    fn decode_step_sampled(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
+    ) -> Result<(u32, usize)> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.decode_step_spec(seq_id, last_token, pick);
+        }
+        self.decode_step_pick(seq_id, last_token, pick)
     }
 
     /// Install a Qwen3.5/3.6 MTP block onto the active runner. Native-only.
@@ -3536,13 +3555,21 @@ impl MlxQwen35Backend {
                 .get(&seq_id)
                 .map(|w| w.iter().copied().collect())
                 .unwrap_or_default();
-            let mut chosen = 0u32;
-            let out = runner.decode_step_pick(seq_id, last_token, &mut |buf| {
+            // A speculative step calls `pick` once or twice and may return a token picked on an
+            // earlier call, so the token to remember is the one returned, not the last picked.
+            // A penalty window depends on the tokens before the position being sampled, which
+            // inside a round is not yet known: those requests take the plain step.
+            let speculate = mtp_sampling_is_supported(Some(&cfg));
+            let mut pick = |buf: &mut [f32]| -> Result<u32> {
                 let probs = sampling_distribution(buf, &history, &cfg);
-                chosen = sample_distribution(&probs, rng);
-                Ok(chosen)
-            })?;
-            self.note_sampled(seq_id, chosen, cfg.repeat_penalty_last_n);
+                Ok(sample_distribution(&probs, rng))
+            };
+            let out = if speculate {
+                runner.decode_step_sampled(seq_id, last_token, &mut pick)?
+            } else {
+                runner.decode_step_pick(seq_id, last_token, &mut pick)?
+            };
+            self.note_sampled(seq_id, out.0, cfg.repeat_penalty_last_n);
             return Ok(out);
         }
         self.runner.decode_step(seq_id, last_token, position)
@@ -3655,6 +3682,11 @@ impl MlxQwen35Backend {
     /// the server boots even if MTP weights are absent.
     #[cfg(feature = "mlx-native")]
     fn try_enable_qwen35_mtp_from_env(&mut self) -> Result<()> {
+        // Flash-Next has its own draft head (`qwen4_exp`'s, loaded with the model); the Qwen3.5
+        // block does not apply to it.
+        if matches!(self.runner, RunnerImpl::Qwen4Exp(_)) {
+            return Ok(());
+        }
         // `LUMEN_QWEN35_MTP`: "0"/"false" hard-disables; "1"/"true" forces on
         // (errors loudly if prerequisites missing); UNSET = AUTO — enable when
         // the loaded model ships a self-contained MTP head. This makes self-contained MTPLX repos "just work"

@@ -331,24 +331,24 @@ impl FileTable {
                 let row = id % self.rows_per_shard;
                 // SAFETY: `n * rb + rb <= buf.len()`; the three slices of a row do not overlap.
                 let dst = unsafe { base.add(n * rb) };
-                jobs.push(ReadJob {
-                    file: shard.weight.0,
-                    offset: shard.weight.1 + row * self.w_bytes as u64,
-                    len: self.w_bytes,
+                jobs.push(ReadJob::single(
+                    shard.weight.0,
+                    shard.weight.1 + row * self.w_bytes as u64,
+                    self.w_bytes,
                     dst,
-                });
-                jobs.push(ReadJob {
-                    file: shard.scales.0,
-                    offset: shard.scales.1 + row * self.s_bytes as u64,
-                    len: self.s_bytes,
-                    dst: unsafe { dst.add(self.w_bytes) },
-                });
-                jobs.push(ReadJob {
-                    file: shard.biases.0,
-                    offset: shard.biases.1 + row * self.s_bytes as u64,
-                    len: self.s_bytes,
-                    dst: unsafe { dst.add(self.w_bytes + self.s_bytes) },
-                });
+                ));
+                jobs.push(ReadJob::single(
+                    shard.scales.0,
+                    shard.scales.1 + row * self.s_bytes as u64,
+                    self.s_bytes,
+                    unsafe { dst.add(self.w_bytes) },
+                ));
+                jobs.push(ReadJob::single(
+                    shard.biases.0,
+                    shard.biases.1 + row * self.s_bytes as u64,
+                    self.s_bytes,
+                    unsafe { dst.add(self.w_bytes + self.s_bytes) },
+                ));
             }
             // SAFETY: every destination is a distinct slice of `buf`, which outlives the
             // call and is not touched until it returns.

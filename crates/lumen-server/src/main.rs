@@ -139,6 +139,29 @@ async fn main() -> Result<(), SendableError> {
         println!("lumen-server {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // `--pack-experts <model dir>`: build the contiguous expert pack of a checkpoint whose
+    // routed experts are served from the SSD (Qwen3.8-Flash-Next): one record per expert
+    // instead of nine scattered ranges, a few percent faster decode for 68 GB of disk. Used by
+    // `LUMEN_MOE_PACK=auto` (the default) once it exists; `LUMEN_MOE_PACK=build` does the same
+    // at startup.
+    if let Some(i) = args.iter().position(|a| a == "--pack-experts") {
+        let dir = args
+            .get(i + 1)
+            .ok_or_else(|| SendableError::from("--pack-experts needs a model directory"))?;
+        #[cfg(feature = "mlx-native")]
+        {
+            let path = lumen_mlx::build_expert_pack(std::path::Path::new(dir))
+                .map_err(|e| SendableError::from(format!("--pack-experts {dir}: {e:#}")))?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            return Err(SendableError::from(format!(
+                "--pack-experts {dir}: built without mlx-native"
+            )));
+        }
+    }
     // `--write-metallib <path>`: write the embedded kernel library out, so the
     // release build can ship this binary's exact copy in the app bundle's
     // `Contents/Resources` (see `lumen_server::metallib`).

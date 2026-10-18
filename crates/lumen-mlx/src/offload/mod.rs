@@ -19,6 +19,7 @@
 pub(crate) mod expert_bank;
 pub(crate) mod expert_store;
 pub(crate) mod io;
+pub(crate) mod pack;
 pub(crate) mod slot_map;
 pub(crate) mod slot_pool;
 
@@ -31,8 +32,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Array;
 
 pub(crate) use expert_bank::{Acquired, ExpertBank, RegionLoad, STAGING_REGIONS};
+pub(crate) use expert_store::MTP_LAYER;
 pub(crate) use expert_store::read_header;
 pub(crate) use io::{IoMode, IoPool, ReadJob};
+pub(crate) use pack::PackMode;
 
 /// Reader threads per bank. Four saturate the SSD for reads of 1 MB and up, but an
 /// expert is 6-9 ranges of 50 KB to 900 KB and a layer call misses several experts, so
@@ -50,6 +53,10 @@ const MAX_LANES: usize = 64;
 pub(crate) struct IoTuning {
     pub lanes: usize,
     pub mode: IoMode,
+    /// Whether the contiguous expert pack is used (and built when missing).
+    pub pack: PackMode,
+    /// Serve the draft head's routed experts (`mtp.safetensors`) from the pool too.
+    pub mtp_experts: bool,
 }
 
 impl Default for IoTuning {
@@ -57,14 +64,17 @@ impl Default for IoTuning {
         Self {
             lanes: DEFAULT_LANES,
             mode: IoMode::Auto,
+            pack: PackMode::Auto,
+            mtp_experts: false,
         }
     }
 }
 
 impl IoTuning {
-    /// `LUMEN_MOE_IO_LANES` (1..=64 reader threads) and `LUMEN_MOE_IO_MODE`
+    /// `LUMEN_MOE_IO_LANES` (1..=64 reader threads), `LUMEN_MOE_IO_MODE`
     /// (`direct` bypasses the page cache, `buffered` uses it, `auto` picks by the
-    /// free memory and is the default). Unset keeps the
+    /// free memory and is the default) and `LUMEN_MOE_PACK` (`auto` uses an expert pack
+    /// when one is there, `off` never does, `build` makes one first; see [`pack`]). Unset keeps the
     /// default; anything unparsable is an error, since a typo that silently fell
     /// back would make an A/B run measure the default twice.
     pub(crate) fn from_env() -> Result<Self> {
@@ -72,6 +82,10 @@ impl IoTuning {
             std::env::var("LUMEN_MOE_IO_LANES").ok().as_deref(),
             std::env::var("LUMEN_MOE_IO_MODE").ok().as_deref(),
         )
+        .and_then(|mut t| {
+            t.pack = PackMode::from_env()?;
+            Ok(t)
+        })
     }
 
     fn parse(lanes: Option<&str>, mode: Option<&str>) -> Result<Self> {
@@ -160,6 +174,25 @@ mod tuning_tests {
             IoMode::Direct
         );
     }
+}
+
+/// Build the contiguous expert pack of the checkpoint in `dir` (68 GB for Flash-Next), or
+/// report that a usable one is already there. For `lumen-server --pack-experts`.
+pub fn build_expert_pack(dir: &Path) -> Result<std::path::PathBuf> {
+    let source = expert_store::ExpertStore::open(dir)?;
+    if pack::open_pack(dir, &source)?.is_some() {
+        return Ok(pack::pack_path(dir));
+    }
+    let started = std::time::Instant::now();
+    let path = pack::build(dir, &source, |done, total| {
+        eprintln!("[offload] expert pack: layer {done} of {total}");
+    })?;
+    eprintln!(
+        "[offload] expert pack ready in {:.0} s: {}",
+        started.elapsed().as_secs_f64(),
+        path.display()
+    );
+    Ok(path)
 }
 
 /// Fewest slots a bank is built with: enough for a decode step of a few
@@ -285,7 +318,7 @@ impl MoeOffload {
     /// Build a bank over `dir` with room for about `budget_bytes` of experts.
     /// `top_k` is how many experts a token routes to per layer.
     pub(crate) fn open(dir: &Path, budget_bytes: u64, top_k: usize, io: IoTuning) -> Result<Self> {
-        let store = expert_store::ExpertStore::open(dir)?;
+        let store = expert_store::ExpertStore::open_with(dir, io.pack, io.mtp_experts)?;
         let per = store.expert_bytes().max(1) as u64;
         let total = store
             .layers
@@ -322,8 +355,20 @@ impl MoeOffload {
                 (per_token as f64 * per as f64 * 1.25) / 1e9,
             );
         }
-        let bank = ExpertBank::open(dir, n_slots, io.lanes, io.mode)
-            .with_context(|| format!("expert offload: bank over {}", dir.display()))?;
+        let bank = ExpertBank::open(
+            dir,
+            n_slots,
+            io.lanes,
+            io.mode,
+            // Any pack this needs was built just above.
+            if io.pack == PackMode::Off {
+                PackMode::Off
+            } else {
+                PackMode::Auto
+            },
+            io.mtp_experts,
+        )
+        .with_context(|| format!("expert offload: bank over {}", dir.display()))?;
         eprintln!(
             "[offload] expert bank: {n_slots} slots x {:.2} MB = {:.2} GB resident of {:.2} GB of routed experts \
              ({} MoE layers, {} experts each), {} read lanes, {:?} reads",

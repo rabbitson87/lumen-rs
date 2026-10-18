@@ -35,6 +35,16 @@ pub struct QuantMap {
 }
 
 impl QuantMap {
+    /// The default spec (what a tensor without an override gets).
+    pub fn default_spec(&self) -> QuantSpec {
+        self.default
+    }
+
+    /// Set the spec of the tensor at `<base>.weight`.
+    pub fn set(&mut self, base: &str, spec: QuantSpec) {
+        self.overrides.insert(base.to_string(), spec);
+    }
+
     /// The spec for the tensor whose weights live at `<base>.weight`. Builds key
     /// their overrides either with or without the `language_model.` prefix.
     pub fn for_base(&self, base: &str) -> QuantSpec {
