@@ -25,7 +25,9 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session::session_rollback_enabled` |
+| `LUMEN_MOE_EVICTION` | off | Optimization | `lumen_mlx::offload::slot_policy::moe_eviction` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
+| `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -251,6 +253,20 @@ Leave a rollback point at each chat turn's conversation boundary, so
  prefill of the longer prompt does — `extend` reproduces a bulk prefill
  bit-identically (`session_reuse_reproduces_a_cold_prefill`).
 
+### `LUMEN_MOE_EVICTION`
+
+*Optimization, default off.*
+
+Which resident expert the SSD expert pool evicts when it is full, for Flash-Next style
+ expert offload. Unset and `0` mean `bias` (the default); `clock` is plain CLOCK. `gclock` is CLOCK with a
+ 2-bit hit counter in place of the reference bit, and loads start at zero. `bias` keeps a
+ decayed hit count per expert and a per-layer table of which experts followed which at the
+ previous token, and evicts the sampled expert it expects least. In trace-driven
+ simulation `gclock` gains 1.6 to 3.4 and `bias` 1.7 to 6.3 decode hit-rate points over
+ CLOCK, at pools from 2 to 20 GB. Never changes the output, only which experts are
+ resident and so how many are read from the SSD; any other value is an error when the
+ pool is built.
+
 ### `LUMEN_MOE_PROBE_LAYER_SYNC`
 
 *Diagnostic, default off.*
@@ -259,6 +275,16 @@ Task 023 Phase 0 probe: read the routed expert ids back to the CPU at
  every MoE layer while every expert stays resident. An exact SSD
  expert cache needs exactly this readback, so the decode-time delta
  against the default is the sync tax on its own. Output unchanged.
+
+### `LUMEN_MOE_TRACE`
+
+*Diagnostic, default off.*
+
+Write a binary trace of the expert pool's layer calls (expert ids in request order, the
+ engine's hit flags, request/pass markers, per-expert token counts for prefill calls and
+ per-call timestamps) to the path in this variable, for replaying a workload against other
+ eviction policies offline. Any value but `0` is the output path. Never changes the output
+ or what is resident; costs one `Option` check per layer call when off.
 
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 

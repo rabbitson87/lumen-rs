@@ -10,8 +10,11 @@
 //! * [`expert_bank`] — the four pieces joined: `acquire(layer, experts)` makes
 //!   experts resident and returns slot numbers for the gather.
 //! * [`slot_pool`] — stacked tensors whose slots the CPU can overwrite in place.
-//! * [`slot_map`] — which `(layer, expert)` lives in which slot: CLOCK
-//!   eviction, pins, and the plan → load → commit protocol.
+//! * [`slot_map`] — which `(layer, expert)` lives in which slot: pins, the free list and the
+//!   plan → load → commit protocol.
+//! * [`slot_policy`] — which resident expert goes when the pool is full: CLOCK, or the
+//!   alternatives a trace replay found better (`LUMEN_MOE_EVICTION`).
+//! * [`trace`] — opt-in recording of every layer call's expert ids (`LUMEN_MOE_TRACE`).
 //!
 //! [`MoeOffload`] is what the model holds: every MoE layer calls
 //! [`MoeOffload::route`] between computing its routing and gathering.
@@ -21,7 +24,11 @@ pub(crate) mod expert_store;
 pub(crate) mod io;
 pub(crate) mod pack;
 pub(crate) mod slot_map;
+pub(crate) mod slot_policy;
 pub(crate) mod slot_pool;
+#[cfg(test)]
+mod slot_replay;
+pub(crate) mod trace;
 
 #[cfg(test)]
 mod exactness_tests;
@@ -243,6 +250,8 @@ pub(crate) struct MoeOffload {
     /// every call then takes the staging path, whatever share of the experts it routes to,
     /// because the layer is already (or about to be) in a region and the next chunk wants it.
     bulk_hint: AtomicBool,
+    /// `LUMEN_MOE_TRACE`: records what every layer call asked for. `None` costs a check per call.
+    trace: Option<trace::RouteTrace>,
 }
 
 /// Sums over the layer calls so far, split by who was working: the host
@@ -344,6 +353,51 @@ fn takes_staging_path(hinted: bool, distinct: usize, indices: usize, experts: us
 /// 40-layer model), so a long run shows how the hit rate settles.
 const STATS_EVERY_CALLS: u64 = 5_000;
 
+/// Hand one layer call to the routing trace: its distinct experts with the engine's hit flags,
+/// and, for calls with more than a few rows, how many tokens chose each expert (all of them, and
+/// the last `TAIL_ROWS`). Only runs when `LUMEN_MOE_TRACE` is set.
+#[allow(clippy::too_many_arguments)]
+fn trace_call(
+    trace: &trace::RouteTrace,
+    layer: u16,
+    inds: &Array,
+    ids: &[u32],
+    index_of: &HashMap<u32, usize>,
+    distinct: &[u16],
+    hits: &[bool],
+    staged: bool,
+    hinted: bool,
+    (entered, evaluated): (std::time::Instant, std::time::Instant),
+) {
+    let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
+    let rows = (ids.len() / k) as u32;
+    let counts = (rows > trace::DECODE_ROWS).then(|| {
+        let tail_from = (rows.saturating_sub(trace::TAIL_ROWS) as usize) * k;
+        let mut total = vec![0u16; distinct.len()];
+        let mut tail = vec![0u16; distinct.len()];
+        for (i, id) in ids.iter().enumerate() {
+            let p = index_of[id];
+            total[p] = total[p].saturating_add(1);
+            if i >= tail_from {
+                tail[p] = tail[p].saturating_add(1);
+            }
+        }
+        (total, tail)
+    });
+    trace.record(&trace::Call {
+        layer,
+        rows,
+        staged,
+        hinted,
+        ids: distinct,
+        hits,
+        counts: counts.as_ref().map(|(t, l)| (t.as_slice(), l.as_slice())),
+        entered,
+        evaluated,
+        done: std::time::Instant::now(),
+    });
+}
+
 impl MoeOffload {
     /// Build a bank over `dir` with room for about `budget_bytes` of experts.
     /// `top_k` is how many experts a token routes to per layer.
@@ -399,6 +453,16 @@ impl MoeOffload {
             io.mtp_experts,
         )
         .with_context(|| format!("expert offload: bank over {}", dir.display()))?;
+        let trace = trace::RouteTrace::from_env(|| trace::Header {
+            budget_bytes,
+            n_slots,
+            regions: bank.regions(),
+            width: widest,
+            top_k,
+            expert_bytes: per,
+            bulk_min_percent: BULK_MIN_PERCENT,
+            layers: store.layers.keys().copied().collect(),
+        })?;
         eprintln!(
             "[offload] expert bank: {n_slots} slots x {:.2} MB = {:.2} GB resident of {:.2} GB of routed experts \
              ({} MoE layers, {} experts each), {} read lanes, {:?} reads",
@@ -417,6 +481,7 @@ impl MoeOffload {
             timing: Mutex::new(Timing::default()),
             expert_bytes: per,
             bulk_hint: AtomicBool::new(false),
+            trace,
         })
     }
 
@@ -609,10 +674,54 @@ impl MoeOffload {
         }
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
         if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
-            return self.route_bulk(&mut bank, layer, inds, entered, evaluated);
+            let routed = self.route_bulk(&mut bank, layer, inds, entered, evaluated)?;
+            if let Some(trace) = &self.trace {
+                // The call changed nothing in the pool map beyond borrowing the staging blocks
+                // (done by now), so residency read here is what the call saw.
+                let hits: Vec<bool> = distinct
+                    .iter()
+                    .map(|&e| bank.is_resident(layer, e))
+                    .collect();
+                trace_call(
+                    trace,
+                    layer,
+                    inds,
+                    &ids,
+                    &index_of,
+                    &distinct,
+                    &hits,
+                    true,
+                    hinted,
+                    (entered, evaluated),
+                );
+            }
+            return Ok(routed);
         }
         self.leave_staging(&mut bank)?;
-        let acquired = bank.acquire(layer, &distinct)?;
+        // Rows, not experts: a decode step or a short verify is a few rows, a prompt chunk many.
+        let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
+        let kind = if ids.len() / k <= trace::DECODE_ROWS as usize {
+            slot_map::CallKind::Decode
+        } else {
+            slot_map::CallKind::Prefill
+        };
+        let acquired = bank.acquire_as(layer, &distinct, kind)?;
+        if let Some(trace) = &self.trace {
+            let missed: Vec<u16> = acquired.missed().collect();
+            let hits: Vec<bool> = distinct.iter().map(|e| !missed.contains(e)).collect();
+            trace_call(
+                trace,
+                layer,
+                inds,
+                &ids,
+                &index_of,
+                &distinct,
+                &hits,
+                false,
+                hinted,
+                (entered, evaluated),
+            );
+        }
         let loaded = acquired.loaded_experts();
         let slot_ids: Vec<u32> = ids.iter().map(|id| acquired.slots[index_of[id]]).collect();
         *pending = Some(acquired);

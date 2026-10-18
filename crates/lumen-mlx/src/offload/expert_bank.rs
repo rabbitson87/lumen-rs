@@ -16,7 +16,7 @@ use mlx_rs::Dtype;
 use super::expert_store::{ExpertStore, MTP_LAYER};
 use super::io::{IoMode, IoPool, IoProfile, IoTicket, ReadJob};
 use super::pack::PackMode;
-use super::slot_map::{ExpertKey, Plan, SlotMap, Stats};
+use super::slot_map::{CallKind, EvictionKind, ExpertKey, Plan, PolicyConfig, SlotMap, Stats};
 use super::slot_pool::PoolTensor;
 
 /// The slots of one `acquire`, pinned until [`ExpertBank::release`].
@@ -31,6 +31,11 @@ impl Acquired {
     /// How many of the requested experts had to be read from disk.
     pub(crate) fn loaded_experts(&self) -> usize {
         self.plan.loads.len()
+    }
+
+    /// The requested experts that were not resident: the misses (for the routing trace).
+    pub(crate) fn missed(&self) -> impl Iterator<Item = u16> + '_ {
+        self.plan.loads.iter().map(|&(key, _)| key.expert)
     }
 }
 
@@ -132,11 +137,18 @@ impl ExpertBank {
             );
         }
         let io = IoPool::new(&store.files, lanes, mode)?;
+        let eviction = EvictionKind::from_env()?;
+        eprintln!("[offload] eviction policy: {}", eviction.name());
+        let policy = PolicyConfig::new(
+            eviction,
+            width,
+            store.layers.keys().filter(|&&l| l != MTP_LAYER).count(),
+        );
         Ok(Self {
             store,
             io,
             pools,
-            map: SlotMap::new(n_slots),
+            map: SlotMap::with_policy(n_slots, &policy),
             n_slots,
             width,
             regions: regions_for(n_slots, width),
@@ -174,6 +186,11 @@ impl ExpertBank {
 
     pub(crate) fn stats(&self) -> Stats {
         self.map.stats()
+    }
+
+    /// Whether `(layer, expert)` is in the pool right now. Does not pin or touch it.
+    pub(crate) fn is_resident(&self, layer: u16, expert: u16) -> bool {
+        self.map.peek(ExpertKey::new(layer, expert)).is_some()
     }
 
     /// Experts in `layer` (0 when it has none).
@@ -322,13 +339,26 @@ impl ExpertBank {
         jobs
     }
 
+    /// [`Self::acquire_as`] for a decode call.
+    #[cfg(test)]
+    pub(crate) fn acquire(&mut self, layer: u16, experts: &[u16]) -> Result<Acquired> {
+        self.acquire_as(layer, experts, CallKind::Decode)
+    }
+
     /// Make `experts` of `layer` resident and pin them. Reads the missing ones
     /// from disk in parallel; nothing is published unless every read succeeded.
+    /// `kind` is what a learning eviction policy needs to tell the token-to-token routing of
+    /// decoding from a prompt chunk's.
     ///
     /// The caller must not have any GPU work queued that reads a slot this call
     /// may rewrite: in the serving loop that holds because the per-layer routing
     /// readback has just completed everything before it.
-    pub(crate) fn acquire(&mut self, layer: u16, experts: &[u16]) -> Result<Acquired> {
+    pub(crate) fn acquire_as(
+        &mut self,
+        layer: u16,
+        experts: &[u16],
+        kind: CallKind,
+    ) -> Result<Acquired> {
         let ranges = self
             .store
             .layer(layer)
@@ -340,7 +370,7 @@ impl ExpertBank {
             );
         }
         let keys: Vec<ExpertKey> = experts.iter().map(|&e| ExpertKey::new(layer, e)).collect();
-        let plan = self.map.plan(&keys).map_err(|e| anyhow!("{e}"))?;
+        let plan = self.map.plan_as(&keys, kind).map_err(|e| anyhow!("{e}"))?;
 
         let jobs = self.jobs_for(&plan, layer);
         // SAFETY: each destination is a distinct slot of a live pool, reserved by
