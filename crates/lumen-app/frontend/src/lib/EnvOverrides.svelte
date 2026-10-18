@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "./i18n.svelte";
+  import { envShadowsTypedKey } from "./memory-estimate";
   import {
     ENV_SCHEMA,
     ENV_SECTIONS,
@@ -13,8 +14,11 @@
     value: Record<string, string>;
     typedKeys: Set<string>;
     onSave: (next: Record<string, string>) => void;
+    /** The selected model is Flash-Next, so the Flash-Next card's settings are in force: an entry
+     *  here with one of their names shadows the card. Otherwise those names are plain entries. */
+    flashNextActive?: boolean;
   }
-  let { value, typedKeys, onSave }: Props = $props();
+  let { value, typedKeys, onSave, flashNextActive = false }: Props = $props();
 
   // Edited copy: stores only the entries the user has actively set. Entries
   // that match `defaultValue` or are absent from `value` render as their
@@ -107,7 +111,7 @@
         </div>
         <div class="flex flex-col gap-1.5">
           {#each sectionEntries as entry (entry.key)}
-            {@const shadowed = typedKeys.has(entry.key)}
+            {@const shadowed = envShadowsTypedKey(entry.key, typedKeys, flashNextActive)}
             {@const setNow = isSet(entry)}
             <div
               class={`grid grid-cols-[1fr_180px_28px] gap-2 items-center py-0.5 ${

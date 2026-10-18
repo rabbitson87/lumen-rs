@@ -12,6 +12,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::config::{BackendMode, CorsMode, PersistentConfig, QuantKvMode, SpecKind};
+use crate::flash_next;
+use crate::sysinfo;
 
 /// What the spawned `lumen-server` loads. Mirrors the server-side `ServeMode`
 /// and maps 1:1 onto `LUMEN_SERVE` (chat → unset/"chat", image → "image",
@@ -405,6 +407,7 @@ impl ServerSupervisor {
             active_model_bytes,
             image_model_id,
             serve,
+            sysinfo::total_ram_bytes(),
         );
 
         let mut child = cmd
@@ -714,7 +717,8 @@ async fn probe_until_ready(
 
 /// Map `PersistentConfig` → subprocess env. Typed fields are emitted first;
 /// `env_overrides` is applied last so it wins on collision (the UI surfaces a
-/// "shadowed by override" warning when this happens).
+/// "shadowed by override" warning when this happens). `ram_bytes` is the machine's RAM, which
+/// decides the one value the app derives from it (see the Flash-Next block below).
 fn apply_env(
     cmd: &mut Command,
     cfg: &PersistentConfig,
@@ -722,6 +726,7 @@ fn apply_env(
     active_model_bytes: Option<u64>,
     image_model_id: Option<&str>,
     serve: ServeKind,
+    ram_bytes: Option<u64>,
 ) {
     // ── Core ────────────────────────────────────────────────────────
     // MODEL_ID selects the LLM; omit it for image-only launches (empty id) so
@@ -870,6 +875,31 @@ fn apply_env(
         cfg.context.default_max_tokens.to_string(),
     );
 
+    // ── Flash-Next settings ────────────────────────────────────────
+    // Only a Flash-Next launch carries them: `LUMEN_MOE_EXPERT_CACHE_GB` means something else to
+    // the other MoE loader, and `LUMEN_MAX_PROMPT_TOKENS` would change another family's prompt
+    // cap. Each is sent only when the user chose a value other than the server's default.
+    //
+    // Flash-Next plans its expert pool around the longest prompt, which it reads as the server's
+    // prompt cap: `LUMEN_MAX_PROMPT_TOKENS`, else the legacy `LUMEN_PREFILL_CHUNK` emitted above
+    // (the Prefill card, 40,960 by default: the other families' setting, and far more KV than a
+    // 16-36 GB Mac can spare). So unless the settings name a longest prompt, send it the
+    // machine's default (16,384 tokens, 8,192 on a tight Mac; the system probe's own fallback is a
+    // 16 GB Mac). An env override of the same name is applied below and wins.
+    if flash_next::is_flash_next_id(model_id) {
+        let typed = cfg.flash_next.env();
+        if !typed.iter().any(|(k, _)| *k == "LUMEN_MAX_PROMPT_TOKENS") {
+            let ram = ram_bytes.unwrap_or(16 << 30);
+            cmd.env(
+                "LUMEN_MAX_PROMPT_TOKENS",
+                flash_next::default_prompt_tokens(cfg, ram).to_string(),
+            );
+        }
+        for (key, value) in typed {
+            cmd.env(key, value);
+        }
+    }
+
     // ── Advanced ───────────────────────────────────────────────────
     match cfg.advanced.backend_mode {
         BackendMode::Auto => {}
@@ -935,6 +965,25 @@ pub fn launch_env(
     image_model_id: Option<&str>,
     serve: ServeKind,
 ) -> BTreeMap<String, String> {
+    launch_env_on(
+        cfg,
+        model_id,
+        active_model_bytes,
+        image_model_id,
+        serve,
+        sysinfo::total_ram_bytes(),
+    )
+}
+
+/// [`launch_env`] on a Mac with `ram_bytes` of RAM, for the one value that depends on it.
+pub fn launch_env_on(
+    cfg: &PersistentConfig,
+    model_id: &str,
+    active_model_bytes: Option<u64>,
+    image_model_id: Option<&str>,
+    serve: ServeKind,
+    ram_bytes: Option<u64>,
+) -> BTreeMap<String, String> {
     let mut cmd = Command::new("/usr/bin/true");
     apply_env(
         &mut cmd,
@@ -943,6 +992,7 @@ pub fn launch_env(
         active_model_bytes,
         image_model_id,
         serve,
+        ram_bytes,
     );
     cmd.as_std()
         .get_envs()
@@ -958,6 +1008,7 @@ pub fn launch_env(
 #[cfg(test)]
 mod launch_env_tests {
     use super::*;
+    use crate::config::{FlashNextConfig, FlashNextDraftHead, FlashNextIoMode, FlashNextPack};
 
     /// The env a default-config UI launch hands the server.
     fn ui_launch_env(model_id: &str) -> BTreeMap<String, String> {
@@ -1033,6 +1084,256 @@ mod launch_env_tests {
             "emitted but not declared in TYPED_ENV_KEYS: {stray:?}",
         );
     }
+
+    const GIB: u64 = 1 << 30;
+    const FLASH_NEXT_ID: &str = "/models/pipenetwork--Qwen3.8-Flash-Next-MLX-4bit";
+
+    /// A launch of `model_id` on a Mac with `ram_gib` of RAM. The MLX memory cap is pinned (the
+    /// default config probes this machine's RAM for it), so the result does not depend on it.
+    fn launch_on(
+        model_id: &str,
+        ram_gib: u64,
+        edit: impl FnOnce(&mut PersistentConfig),
+    ) -> BTreeMap<String, String> {
+        let mut cfg = PersistentConfig::default();
+        cfg.server.memory_limit_gb = Some(64);
+        cfg.server.disable_wired_limit = false;
+        edit(&mut cfg);
+        launch_env_on(
+            &cfg,
+            model_id,
+            None,
+            None,
+            ServeKind::Chat,
+            Some(ram_gib * GIB),
+        )
+    }
+
+    fn cap(env: &BTreeMap<String, String>) -> Option<&str> {
+        env.get("LUMEN_MAX_PROMPT_TOKENS").map(String::as_str)
+    }
+
+    /// Flash-Next reads the server's prompt cap (`LUMEN_MAX_PROMPT_TOKENS`, else the legacy
+    /// `LUMEN_PREFILL_CHUNK`) as the longest prompt to plan its expert pool for. The app always
+    /// emits the Prefill card as `LUMEN_PREFILL_CHUNK` (40,960), which is the other families'
+    /// setting; left alone it would plan a 40K prompt's KV out of a 16-36 GB Mac's pool. So the
+    /// app sends the machine's own default.
+    #[test]
+    fn a_default_flash_next_launch_plans_the_machines_default_prompt() {
+        let big = launch_on(FLASH_NEXT_ID, 36, |_| {});
+        assert_eq!(cap(&big), Some("16384"));
+        let small = launch_on(FLASH_NEXT_ID, 16, |_| {});
+        assert_eq!(cap(&small), Some("8192"));
+        // The cards the other families use are still emitted, and still not what plans it.
+        assert_eq!(
+            big.get("LUMEN_PREFILL_CHUNK").map(String::as_str),
+            Some("40960")
+        );
+        assert_eq!(big.get("LUMEN_MAX_CTX").map(String::as_str), Some("81920"));
+    }
+
+    #[test]
+    fn the_default_follows_the_memory_cap_a_launch_carries() {
+        // A 36 GB Mac held to 8 GiB of MLX memory is a tight machine to the server.
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| c.server.memory_limit_gb = Some(8));
+        assert_eq!(cap(&env), Some("8192"));
+        // With no RAM reading the probe's own 16 GB fallback applies.
+        let mut cfg = PersistentConfig::default();
+        cfg.server.memory_limit_gb = Some(64);
+        let env = launch_env_on(&cfg, FLASH_NEXT_ID, None, None, ServeKind::Chat, None);
+        assert_eq!(cap(&env), Some("8192"));
+    }
+
+    /// A value the user set, as an override or through the calculator's Apply (which writes
+    /// one), always wins: `env_overrides` is applied after everything the app derives.
+    #[test]
+    fn a_prompt_cap_the_user_set_wins() {
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| {
+            c.env_overrides
+                .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "32768".into());
+        });
+        assert_eq!(cap(&env), Some("32768"));
+    }
+
+    #[test]
+    fn other_families_and_image_only_launches_are_unchanged() {
+        for model in [
+            "/models/Qwen3.8-27B-MTPLX-Speed",
+            "/models/gemma-4-26b-a4b-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-mxfp4",
+        ] {
+            let env = launch_on(model, 36, |_| {});
+            assert_eq!(cap(&env), None, "{model}");
+            assert_eq!(
+                env.get("LUMEN_PREFILL_CHUNK").map(String::as_str),
+                Some("40960")
+            );
+        }
+        // An image-only launch has no LLM, so nothing to plan for.
+        let mut cfg = PersistentConfig::default();
+        cfg.server.memory_limit_gb = Some(64);
+        let env = launch_env_on(
+            &cfg,
+            "",
+            None,
+            Some("flux2-dev"),
+            ServeKind::Image,
+            Some(36 * GIB),
+        );
+        assert_eq!(cap(&env), None);
+    }
+
+    /// Every Flash-Next setting, chosen away from the server's default.
+    fn every_flash_next_option_chosen(c: &mut PersistentConfig) {
+        c.flash_next = FlashNextConfig {
+            expert_cache_gb: Some(8.0),
+            max_prompt_tokens: Some(32_768),
+            prefill_chunk: Some(512),
+            pack: FlashNextPack::Build,
+            draft_head: FlashNextDraftHead::Off,
+            io_mode: FlashNextIoMode::Direct,
+            io_lanes: Some(16),
+        };
+    }
+
+    /// The Flash-Next card's settings reach the child as exactly the values chosen (a plain
+    /// number of GB, not `8g`), and the server's defaults are never sent in their place.
+    #[test]
+    fn the_flash_next_options_reach_the_child_exactly_as_set() {
+        let env = launch_on(FLASH_NEXT_ID, 36, every_flash_next_option_chosen);
+        for (key, value) in [
+            ("LUMEN_MOE_EXPERT_CACHE_GB", "8"),
+            ("LUMEN_MAX_PROMPT_TOKENS", "32768"),
+            ("LUMEN_QWEN35_PREFILL_CHUNK", "512"),
+            ("LUMEN_MOE_PACK", "build"),
+            ("LUMEN_QWEN4_MTP", "off"),
+            ("LUMEN_MOE_IO_MODE", "direct"),
+            ("LUMEN_MOE_IO_LANES", "16"),
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
+        }
+        assert!(
+            env.values().all(|v| v != "auto"),
+            "an `auto` default was sent: {env:?}"
+        );
+        // A fractional pool and the other spellings of the choices.
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| {
+            c.flash_next.expert_cache_gb = Some(12.5);
+            c.flash_next.pack = FlashNextPack::Off;
+            c.flash_next.draft_head = FlashNextDraftHead::On;
+            c.flash_next.io_mode = FlashNextIoMode::Buffered;
+        });
+        let get = |k: &str| env.get(k).map(String::as_str);
+        assert_eq!(get("LUMEN_MOE_EXPERT_CACHE_GB"), Some("12.5"));
+        assert_eq!(get("LUMEN_MOE_PACK"), Some("off"));
+        assert_eq!(get("LUMEN_QWEN4_MTP"), Some("on"));
+        assert_eq!(get("LUMEN_MOE_IO_MODE"), Some("buffered"));
+    }
+
+    /// With nothing chosen the app sends none of the options: an unset option is the server's own
+    /// default, not a written-down copy of it. Only the prompt cap is derived (see above).
+    #[test]
+    fn with_nothing_chosen_none_of_the_flash_next_options_is_sent() {
+        let flash_next_keys = [
+            "LUMEN_MOE_EXPERT_CACHE_GB",
+            "LUMEN_QWEN35_PREFILL_CHUNK",
+            "LUMEN_MOE_PACK",
+            "LUMEN_QWEN4_MTP",
+            "LUMEN_MOE_IO_MODE",
+            "LUMEN_MOE_IO_LANES",
+        ];
+        let env = launch_on(FLASH_NEXT_ID, 36, |_| {});
+        for key in flash_next_keys {
+            assert!(!env.contains_key(key), "{key} was sent");
+        }
+        assert_eq!(cap(&env), Some("16384"));
+        // Choosing the default (32 reader threads) is not choosing: still nothing sent.
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| c.flash_next.io_lanes = Some(32));
+        assert!(!env.contains_key("LUMEN_MOE_IO_LANES"));
+    }
+
+    /// A longest prompt chosen in the card replaces the machine's default; clearing it brings the
+    /// default back.
+    #[test]
+    fn a_chosen_prompt_cap_replaces_the_machines_default() {
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| {
+            c.flash_next.max_prompt_tokens = Some(65_536);
+        });
+        assert_eq!(cap(&env), Some("65536"));
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| c.flash_next.max_prompt_tokens = None);
+        assert_eq!(cap(&env), Some("16384"));
+    }
+
+    /// An env override is the escape hatch: applied last, it beats the card's value.
+    #[test]
+    fn an_env_override_beats_the_flash_next_setting() {
+        let env = launch_on(FLASH_NEXT_ID, 36, |c| {
+            every_flash_next_option_chosen(c);
+            c.env_overrides
+                .insert("LUMEN_MOE_EXPERT_CACHE_GB".into(), "20".into());
+            c.env_overrides
+                .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "4096".into());
+        });
+        let get = |k: &str| env.get(k).map(String::as_str);
+        assert_eq!(get("LUMEN_MOE_EXPERT_CACHE_GB"), Some("20"));
+        assert_eq!(cap(&env), Some("4096"));
+        // The settings without an override keep theirs.
+        assert_eq!(get("LUMEN_MOE_IO_LANES"), Some("16"));
+    }
+
+    /// The settings belong to Flash-Next: whatever is stored in them, any other model's launch
+    /// environment is exactly what it is without them, so a value never leaks into another model
+    /// (`LUMEN_MOE_EXPERT_CACHE_GB` is read by the other MoE loader, `LUMEN_MAX_PROMPT_TOKENS` by
+    /// every family).
+    #[test]
+    fn the_flash_next_settings_never_reach_another_models_launch() {
+        for model in [
+            "/models/Qwen3.8-27B-MTPLX-Speed",
+            "/models/gemma-4-26b-a4b-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-mxfp4",
+            "",
+        ] {
+            let plain = launch_on(model, 36, |_| {});
+            let chosen = launch_on(model, 36, every_flash_next_option_chosen);
+            assert_eq!(chosen, plain, "{model:?}");
+            assert_eq!(cap(&chosen), None, "{model:?}");
+        }
+        // An image-only launch has no LLM at all.
+        let launch = |edit: fn(&mut PersistentConfig)| {
+            let mut cfg = PersistentConfig::default();
+            cfg.server.memory_limit_gb = Some(64);
+            edit(&mut cfg);
+            launch_env_on(
+                &cfg,
+                "",
+                None,
+                Some("flux2-dev"),
+                ServeKind::Image,
+                Some(36 * GIB),
+            )
+        };
+        assert_eq!(
+            launch(every_flash_next_option_chosen),
+            launch(|_| {}),
+            "image launch"
+        );
+    }
+
+    /// Everything a Flash-Next launch emits, with every option chosen, is a variable the app
+    /// declares as typed (so an override of it shows the "shadowed" warning).
+    #[test]
+    fn a_flash_next_launch_emits_only_declared_variables() {
+        let env = launch_on(FLASH_NEXT_ID, 36, every_flash_next_option_chosen);
+        let known: std::collections::BTreeSet<&str> = TYPED_ENV_KEYS.iter().copied().collect();
+        let stray: Vec<&String> = env.keys().filter(|k| !known.contains(k.as_str())).collect();
+        assert!(stray.is_empty(), "emitted but not declared: {stray:?}");
+        // And the typed fields cannot name a variable that is not declared.
+        let mut cfg = PersistentConfig::default();
+        every_flash_next_option_chosen(&mut cfg);
+        for (key, _) in cfg.flash_next.env() {
+            assert!(known.contains(key), "{key} is not in TYPED_ENV_KEYS");
+        }
+    }
 }
 
 /// The set of env var names that have dedicated typed UI controls. Used by
@@ -1076,6 +1377,16 @@ pub const TYPED_ENV_KEYS: &[&str] = &[
     "LUMEN_SPEC_K",
     "LUMEN_MLX_BATCH_DECODE",
     "LUMEN_MLX_BATCH_MAX",
+    // The Flash-Next card (`config.flash_next`). Only a Flash-Next launch sends them, and an
+    // override of one still wins. `LUMEN_MAX_PROMPT_TOKENS` is also sent as the machine's
+    // default when the card names no longest prompt.
+    "LUMEN_MOE_EXPERT_CACHE_GB",
+    "LUMEN_MAX_PROMPT_TOKENS",
+    "LUMEN_QWEN35_PREFILL_CHUNK",
+    "LUMEN_MOE_PACK",
+    "LUMEN_QWEN4_MTP",
+    "LUMEN_MOE_IO_MODE",
+    "LUMEN_MOE_IO_LANES",
 ];
 
 /// Public wrapper for `resolve_binary` — used by the doctor module so the

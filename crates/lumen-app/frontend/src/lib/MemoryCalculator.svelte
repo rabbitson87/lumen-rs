@@ -2,6 +2,7 @@
   import { t } from "./i18n.svelte";
   import {
     geometryForModel,
+    isFlashNextModelId,
     estimateAt,
     maxContextTokens,
     recommendForBudget,
@@ -66,6 +67,7 @@
 
   const GB = 1024 * 1024 * 1024;
 
+  const flashNext = $derived(isFlashNextModelId(modelId));
   const geom = $derived(geometryForModel(modelId ?? ""));
 
   let weightsGb = $state(0); // calibratable resident weights (0 ⇒ model anchor)
@@ -265,7 +267,11 @@
 </script>
 
 <div class="text-xs">
-  {#if !geom}
+  {#if flashNext}
+    <!-- Flash-Next streams its experts from the SSD: its memory plan and settings are the
+         Flash-Next card's, not this calculator's. -->
+    <div class="dim text-[11px] leading-normal">{t("memcalc.flashNext")}</div>
+  {:else if !geom}
     <div class="dim text-[11px] leading-normal">
       {t("memcalc.noGeometry").replace("{model}", modelId ?? "—")}
     </div>

@@ -24,6 +24,8 @@
 //   C≈50135, H=2048 → 16·2048·50135·4 = 6.56 GB  (observed ≈ 8.4 GB, +snapshot/MoE)
 // The fixed OVERHEAD term absorbs MoE intermediates / softmax / mask (~1.5 GB).
 
+import type { FlashNextSettings } from "./api";
+
 const GB = 1024 * 1024 * 1024;
 
 /**
@@ -440,3 +442,588 @@ export function geometryForModel(modelId: string): ModelGeometry | null {
 }
 
 export const bytesToGB = (b: number): number => b / GB;
+
+// ── Flash-Next (qwen4-exp): routed experts streamed from the SSD ─────────────
+//
+// A different shape from the families above. The 97 GB checkpoint is NOT resident: ~3.6 GB of
+// trunk stays in memory, the 68 GB of routed experts are served from the SSD through a pool of
+// memory slots, and the server sizes that pool from what the GPU's working set leaves after a
+// prefill's reserve (`plan_memory` in `qwen4_exp/runner.rs`):
+//
+//   reserve = 0.6 GB + 1.1 MB x chunk + KV(longest prompt) + half the attention scores
+//   pool    = usable - trunk - reserve                      (`auto`; never below the floor)
+//
+// so the longest prompt the user allows and the pool trade against each other. That prompt is
+// the server's prompt cap (`LUMEN_MAX_PROMPT_TOKENS`, else the legacy `LUMEN_PREFILL_CHUNK`, which
+// the app sets from the Prefill card) lowered to `LUMEN_MAX_CTX` (the Max context card) when that
+// is smaller; `LUMEN_MAX_CTX` alone never raises it. For Flash-Next the app sends
+// `LUMEN_MAX_PROMPT_TOKENS` itself, the machine's default (16,384 tokens, 8,192 on a tight Mac),
+// unless the user set it, so the Prefill card (the other families' setting) is not the cap.
+// The pool is what decides decode speed.
+//
+// Sizes are decimal bytes, as the server reads them (`LUMEN_MOE_EXPERT_CACHE_GB=10` is 10e9);
+// RAM comes from `SystemInfo.ram_gb`, which is GiB. The constants mirror `src/flash_next.rs`
+// (the test in `memory-estimate.test.ts` reads that file) — change them together.
+
+export const FLASH_NEXT = {
+  trunkBytes: 3.6e9,
+  expertBytes: 2.76e6,
+  /** The smallest pool the server runs with: a staging region plus a layer, 2 x 512 slots. */
+  poolFloorBytes: 2_826_240_000,
+  /** Room for three layers (1,536 slots): the pool lends a second staging region and prefill
+   *  reads the next layer while it computes the current one. Below it prefill is slower. */
+  poolPrefetchBytes: 4_239_360_000,
+  /** A "tight" machine (the GPU may use less than `tightBelowBytes`) takes the smaller values. */
+  defaultChunk: 1024,
+  tightChunk: 512,
+  defaultContext: 16_384,
+  tightContext: 8_192,
+  maxContext: 262_144,
+  tightBelowBytes: 11e9,
+  scoresBudgetBytes: 2e9,
+  tightScoresBudgetBytes: 0.8e9,
+  reserveBaseBytes: 0.6e9,
+  reservePerTokenBytes: 1.1e6,
+  /** 13 layers (12 full-attention + the draft head's) x (K,V of 2 heads x 256 dims + the
+   *  indexer's 128-dim key), f32. */
+  kvBytesPerToken: 59_904,
+  attentionHeads: 24,
+  /** GPU working set as a share of RAM (Apple reports ~2/3 up to 32 GiB, ~3/4 above) and the
+   *  share of it the server lets itself fill (`WORKING_SET_SHARE` in lumen-mlx). */
+  workingSetShareSmall: 2 / 3,
+  workingSetShareLarge: 0.75,
+  smallRamGib: 32,
+  fillableShare: 0.88,
+  /** What it takes on disk. */
+  diskModelBytes: 97e9,
+  diskPackBytes: 68e9,
+  diskMtpBytes: 1.5e9,
+} as const;
+
+/** Same rule as `family_of` in `lumen-server/src/catalog.rs`. */
+export function isFlashNextModelId(id: string | null | undefined): boolean {
+  const s = (id ?? "").toLowerCase();
+  return s.includes("flash-next") || s.includes("qwen4_exp") || s.includes("qwen4-exp");
+}
+
+/** The part of `ramGb` GiB of RAM the server may fill, lowered to `memoryLimitGb` (GiB, what
+ *  `LUMEN_MEMORY_LIMIT_GB` allows) when there is one. */
+export function flashNextUsableBytes(ramGb: number, memoryLimitGb?: number | null): number {
+  const F = FLASH_NEXT;
+  const ram = ramGb * GB;
+  const share = ram <= F.smallRamGib * GB ? F.workingSetShareSmall : F.workingSetShareLarge;
+  const usable = ram * share * F.fillableShare;
+  return memoryLimitGb != null && memoryLimitGb > 0 ? Math.min(usable, memoryLimitGb * GB) : usable;
+}
+
+/** What the memory is spent on for a GPU that may use `usableBytes`. */
+export type FlashNextPlan = {
+  chunk: number;
+  /** The longest prompt the plan holds KV and attention scores for. */
+  ctxTokens: number;
+  tight: boolean;
+  /** 0.6 GB of buffers plus the chunk's activations. */
+  buffersBytes: number;
+  kvBytes: number;
+  /** Half the attention scores of a chunk against the whole context (capped by a budget). */
+  scoresBytes: number;
+  reserveBytes: number;
+  /** What `auto` gives the pool: the rest. Below the floor the model does not fit. */
+  poolBytes: number;
+};
+
+/** The server's plan. `chunk` and `ctxTokens` are what `LUMEN_QWEN35_PREFILL_CHUNK` and
+ *  `LUMEN_MAX_PROMPT_TOKENS` / `LUMEN_MAX_CTX` set; null/undefined take the machine's default. */
+export function flashNextPlan(
+  usableBytes: number,
+  chunk?: number | null,
+  ctxTokens?: number | null,
+): FlashNextPlan {
+  const F = FLASH_NEXT;
+  const tight = usableBytes < F.tightBelowBytes;
+  const c = chunk ?? (tight ? F.tightChunk : F.defaultChunk);
+  const x = ctxTokens ?? (tight ? F.tightContext : F.defaultContext);
+  const budget = tight ? F.tightScoresBudgetBytes : F.scoresBudgetBytes;
+  const scores = Math.min(F.attentionHeads * c * x * 4, budget);
+  const buffers = F.reserveBaseBytes + c * F.reservePerTokenBytes;
+  const kv = x * F.kvBytesPerToken;
+  const reserve = buffers + kv + Math.floor(scores / 2);
+  return {
+    chunk: c,
+    ctxTokens: x,
+    tight,
+    buffersBytes: buffers,
+    kvBytes: kv,
+    scoresBytes: Math.floor(scores / 2),
+    reserveBytes: reserve,
+    poolBytes: Math.max(0, usableBytes - F.trunkBytes - reserve),
+  };
+}
+
+/** The trunk, the smallest pool and the reserve fit the usable memory. */
+export function flashNextPlanFits(plan: FlashNextPlan): boolean {
+  return plan.poolBytes >= FLASH_NEXT.poolFloorBytes;
+}
+
+/** The longest prompt the server plans memory for, from its prompt cap and `LUMEN_MAX_CTX`
+ *  (`context_override` in the server's `qwen4_exp/runner.rs`; mirrored in `flash_next.rs`).
+ *  `LUMEN_MAX_CTX` alone is held to the default context. `null`: the machine's default. */
+export function flashNextPlannedContext(
+  promptCap: number | null,
+  maxCtx: number | null,
+): number | null {
+  if (promptCap != null) return maxCtx != null ? Math.min(promptCap, maxCtx) : promptCap;
+  return maxCtx != null ? Math.min(maxCtx, FLASH_NEXT.defaultContext) : null;
+}
+
+const positiveInt = (v: string | undefined): number | null => {
+  const t = v?.trim();
+  return t && /^\+?\d+$/.test(t) && Number(t) > 0 ? Number(t) : null;
+};
+
+/** The prompt length the server plans for on a GPU that may use `usableBytes` when nothing sets
+ *  it (16,384 tokens, 8,192 on a tight machine); the value the app sends Flash-Next as
+ *  `LUMEN_MAX_PROMPT_TOKENS`. */
+export function flashNextDefaultContext(usableBytes: number): number {
+  return flashNextPlan(usableBytes).ctxTokens;
+}
+
+/** What a launch plans for, from the settings the app holds. `LUMEN_MAX_PROMPT_TOKENS` is the
+ *  user's override when there is one, else the machine's default (what the app sends); the Max
+ *  context card (or a `LUMEN_MAX_CTX` override) only lowers it. */
+export function flashNextLaunchContext(
+  env: Record<string, string>,
+  contextMax: number | undefined,
+  usableBytes: number,
+): {
+  /** The prompt length the plan holds KV for. */
+  planned: number;
+  /** The server's prompt cap as it will read it. */
+  promptCap: number;
+  /** Max context as the server will read it. */
+  maxCtx: number | null;
+  /** The user set `LUMEN_MAX_PROMPT_TOKENS`, rather than the app sending the machine's default. */
+  explicit: boolean;
+} {
+  const explicit = positiveInt(env.LUMEN_MAX_PROMPT_TOKENS);
+  const promptCap = explicit ?? flashNextDefaultContext(usableBytes);
+  const maxCtx =
+    positiveInt(env.LUMEN_MAX_CTX) ?? (contextMax && contextMax > 0 ? contextMax : null);
+  return {
+    planned: flashNextPlannedContext(promptCap, maxCtx) ?? promptCap,
+    promptCap,
+    maxCtx,
+    explicit: explicit != null,
+  };
+}
+
+/** Whether a Mac with `ramGb` GiB runs the model at its default plan. */
+export function flashNextFits(ramGb: number, memoryLimitGb?: number | null): boolean {
+  return flashNextPlanFits(flashNextPlan(flashNextUsableBytes(ramGb, memoryLimitGb)));
+}
+
+/** RAM (GiB) below which the model cannot run at its default plan. */
+export function flashNextMinRamGb(): number {
+  for (let gib = 1; gib <= 1024; gib++) if (flashNextFits(gib)) return gib;
+  return 1024;
+}
+
+/** The longest prompt (tokens) the plan can hold beside `poolBytes` (`null` = the smallest
+ *  pool, i.e. the most this Mac can hold at all). 0 when not even an empty prompt fits. */
+export function flashNextMaxContext(
+  usableBytes: number,
+  chunk?: number | null,
+  poolBytes?: number | null,
+): number {
+  const F = FLASH_NEXT;
+  const pool = Math.max(poolBytes ?? F.poolFloorBytes, F.poolFloorBytes);
+  const fits = (ctx: number) =>
+    F.trunkBytes + pool + flashNextPlan(usableBytes, chunk, ctx).reserveBytes <= usableBytes;
+  if (!fits(0)) return 0;
+  let lo = 0;
+  let hi = F.maxContext;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(mid)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+/** Upper bound for a pool typed by hand: RAM at the app's usual 85% share, less the trunk. */
+export function flashNextMaxPoolGb(ramGb: number): number {
+  const gb = Math.floor((ramGb * GB * 0.85 - FLASH_NEXT.trunkBytes) / 1e9);
+  return Math.max(gb, FLASH_NEXT.poolFloorBytes / 1e9);
+}
+
+export type FlashNextConfig = {
+  usableBytes: number;
+  /** Expert pool in bytes; `null` = `auto` (the plan's). Raised to the floor if smaller. */
+  poolBytes: number | null;
+  chunk: number;
+  ctxTokens: number;
+};
+
+export type FlashNextEstimate = {
+  usableBytes: number;
+  plan: FlashNextPlan;
+  /** The pool actually used: the request, or the plan's, never below the floor. */
+  poolBytes: number;
+  poolRaisedToFloor: boolean;
+  /** trunk + pool + reserve */
+  residentBytes: number;
+  /** residentBytes / usableBytes. > 1 ⇒ a long prompt can fail with `Insufficient Memory`. */
+  utilization: number;
+  /** Everything fits the usable memory. With `auto` it does unless the pool hit its floor. */
+  fits: boolean;
+  /** Under the size that lends a second staging region: slower prefill, nothing fails. */
+  oneStagingRegion: boolean;
+};
+
+export function flashNextEstimate(cfg: FlashNextConfig): FlashNextEstimate {
+  const F = FLASH_NEXT;
+  const plan = flashNextPlan(cfg.usableBytes, cfg.chunk, cfg.ctxTokens);
+  const wanted = cfg.poolBytes ?? plan.poolBytes;
+  const pool = Math.max(wanted, F.poolFloorBytes);
+  const resident = F.trunkBytes + pool + plan.reserveBytes;
+  return {
+    usableBytes: cfg.usableBytes,
+    plan,
+    poolBytes: pool,
+    poolRaisedToFloor: wanted < F.poolFloorBytes,
+    residentBytes: resident,
+    utilization: resident / cfg.usableBytes,
+    // A byte of float slack: with `auto` the sum is `usable` by construction.
+    fits: resident <= cfg.usableBytes + 1,
+    oneStagingRegion: pool < F.poolPrefetchBytes,
+  };
+}
+
+/**
+ * Decode speed (tokens/s) by expert-pool size, measured on a 36 GB M3 Max with a fast
+ * internal SSD (~6.5 GB/s random reads). `shards` reads the shipped weights, `pack` the
+ * contiguous expert pack. The `emulated` points were run on that Mac with its memory limited to
+ * a 16 and a 24 GB Mac's working set: they show what the plan does, not how a real small Mac's
+ * own memory pressure behaves. Prefill (~230 tokens/s) does not depend on the pool.
+ */
+export const FLASH_NEXT_DECODE_TPS: readonly {
+  poolGb: number;
+  shards: number | null;
+  pack: number | null;
+  emulated?: boolean;
+}[] = [
+  { poolGb: 4.2, shards: null, pack: 5.6, emulated: true },
+  { poolGb: 6.7, shards: 5.75, pack: 6.83 },
+  { poolGb: 6.85, shards: null, pack: 6.7, emulated: true },
+  { poolGb: 10, shards: 7.53, pack: 8.22 },
+  { poolGb: 15, shards: 9.73, pack: 10.86 },
+  { poolGb: 19.8, shards: 13, pack: null },
+];
+
+export type FlashNextTps = {
+  tps: number;
+  /** "measured": between two measured pools (interpolated). "below": under the first, the
+   *  first segment's slope continued. "above": over the last, held at its value. */
+  basis: "measured" | "below" | "above";
+  /** The value rests on a point measured with the memory limited to emulate a smaller Mac. */
+  emulated: boolean;
+};
+
+/** Decode speed at `poolBytes`, linearly interpolated from the measurements. `withPack` is
+ *  `null` outside the pack's measured range (4.2–15 GB). */
+export function flashNextDecodeTps(poolBytes: number, withPack = false): FlashNextTps | null {
+  const pts = FLASH_NEXT_DECODE_TPS.flatMap((p) => {
+    const y = withPack ? p.pack : p.shards;
+    return y == null ? [] : [{ x: p.poolGb, y, emulated: p.emulated === true }];
+  });
+  const x = poolBytes / 1e9;
+  const first = pts[0];
+  const last = pts[pts.length - 1];
+  if (x >= last.x) {
+    // The pack was not measured past 15 GB, so nothing is said there.
+    if (withPack && x > last.x) return null;
+    return { tps: last.y, basis: x > last.x ? "above" : "measured", emulated: last.emulated };
+  }
+  if (x < first.x && withPack) return null;
+  let i = pts.findIndex((p, k) => k > 0 && x < p.x);
+  if (i < 1) i = 1;
+  const lo = pts[i - 1];
+  const hi = pts[i];
+  const tps = Math.max(0, lo.y + ((x - lo.x) * (hi.y - lo.y)) / (hi.x - lo.x));
+  return { tps, basis: x < first.x ? "below" : "measured", emulated: lo.emulated || hi.emulated };
+}
+
+/** Disk the model needs, bytes: the shipped weights plus the optional pack and draft head. */
+export function flashNextDiskBytes(opts: { pack: boolean; mtp: boolean }): number {
+  return (
+    FLASH_NEXT.diskModelBytes +
+    (opts.pack ? FLASH_NEXT.diskPackBytes : 0) +
+    (opts.mtp ? FLASH_NEXT.diskMtpBytes : 0)
+  );
+}
+
+// ── The Flash-Next option pickers ────────────────────────────────────────────
+//
+// What the preset chips of the settings show and write. Every option's default equals the
+// server's, and choosing the default removes the override rather than writing it down.
+
+export const FLASH_NEXT_POOL_PRESETS_GB = [4, 6, 8, 12, 16, 20] as const;
+export const FLASH_NEXT_PROMPT_PRESETS = [8_192, 16_384, 32_768, 65_536, 131_072] as const;
+export const FLASH_NEXT_LANE_PRESETS = [8, 16, 32, 64] as const;
+export const FLASH_NEXT_LANES_DEFAULT = 32;
+/** The smallest pool a hand-typed value may name: just above the server's floor. */
+export const FLASH_NEXT_POOL_MIN_GB = 2.9;
+
+/** A pool size in GB as typed: `8`, `8g`, `8GB`, `12.5g` (any case, spaces allowed). `null` when
+ *  it is not a positive number. The server reads the same forms. */
+export function parseGbInput(text: string): number | null {
+  const m = text.trim().match(/^(\d+(?:\.\d+)?)\s*(?:g|gb)?$/i);
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** The plain number of GB the app writes into `LUMEN_MOE_EXPERT_CACHE_GB`: `8`, `12.5`. */
+export function formatGbValue(gb: number): string {
+  return String(Math.round(gb * 100) / 100);
+}
+
+/** A prompt length as typed: tokens (`32768`) or K of 1,024 (`32k`, `1.5K`). `null` when it is
+ *  not a positive whole number of tokens. */
+export function parsePromptInput(text: string): number | null {
+  const m = text.trim().match(/^(\d+(?:\.\d+)?)\s*(k?)$/i);
+  if (!m) return null;
+  const n = Math.round(Number(m[1]) * (m[2] ? 1024 : 1));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** `16384` → `16K` when it is a whole number of K, else with thousands separators. */
+export function formatPromptShort(tokens: number): string {
+  return tokens % 1024 === 0 ? `${tokens / 1024}K` : tokens.toLocaleString("en-US");
+}
+
+/** Estimated decode speed of a pool, from the pack's table when the pack is in use and the pool is
+ *  inside its measured range, else from the shipped weights'. */
+export function flashNextChipTps(
+  poolBytes: number,
+  pack: boolean,
+): (FlashNextTps & { withPack: boolean }) | null {
+  const packed = pack ? flashNextDecodeTps(poolBytes, true) : null;
+  if (packed) return { ...packed, withPack: true };
+  const plain = flashNextDecodeTps(poolBytes);
+  return plain ? { ...plain, withPack: false } : null;
+}
+
+export type FlashNextPoolChip = {
+  /** The pool the chip means in bytes (`auto`: what the plan leaves, never below the floor). */
+  poolBytes: number;
+  tps: (FlashNextTps & { withPack: boolean }) | null;
+  /** The pool fits beside the trunk and the reserve for the current longest prompt. */
+  fits: boolean;
+  /** The largest pool (GB, to 0.1) that fits at this prompt. */
+  maxFitGb: number;
+};
+
+/** What a pool chip shows: `gb` null is `auto`. A preset larger than the pool that fits at the
+ *  current prompt is not offered (the server would lower it and log it). */
+export function flashNextPoolChip(a: {
+  usableBytes: number;
+  chunk: number;
+  ctxTokens: number;
+  gb: number | null;
+  pack: boolean;
+}): FlashNextPoolChip {
+  const plan = flashNextPlan(a.usableBytes, a.chunk, a.ctxTokens);
+  const planFits = flashNextPlanFits(plan);
+  const wanted = a.gb == null ? plan.poolBytes : a.gb * 1e9;
+  const poolBytes = Math.max(wanted, FLASH_NEXT.poolFloorBytes);
+  return {
+    poolBytes,
+    tps: flashNextChipTps(poolBytes, a.pack),
+    fits: planFits && (a.gb == null || wanted <= plan.poolBytes + 1),
+    maxFitGb: Math.floor(plan.poolBytes / 1e8) / 10,
+  };
+}
+
+/** What a prompt chip shows: the pool `auto` leaves with that longest prompt. Under the floor the
+ *  model does not fit with it. */
+export function flashNextPromptChip(a: { usableBytes: number; chunk: number; tokens: number }): {
+  poolBytes: number;
+  fits: boolean;
+} {
+  const plan = flashNextPlan(a.usableBytes, a.chunk, a.tokens);
+  return { poolBytes: plan.poolBytes, fits: flashNextPlanFits(plan) };
+}
+
+/** A choice read from an override: trimmed, case-insensitive, the default when unset or not one of
+ *  `allowed`. */
+export function envChoice<T extends string>(
+  raw: string | undefined,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  const v = raw?.trim().toLowerCase();
+  return (allowed as readonly string[]).includes(v ?? "") ? (v as T) : fallback;
+}
+
+/** `LUMEN_QWEN4_MTP` as the server reads it: `1`/`true` mean on, `0`/`false` off. */
+export function mtpMode(raw: string | undefined): "auto" | "on" | "off" {
+  const v = raw?.trim().toLowerCase();
+  if (v === "on" || v === "1" || v === "true") return "on";
+  if (v === "off" || v === "0" || v === "false") return "off";
+  return "auto";
+}
+
+/** Reader threads from `LUMEN_MOE_IO_LANES`: the server's default (32) when unset or invalid. */
+export function lanesValue(raw: string | undefined): number {
+  const t = raw?.trim();
+  const n = t && /^\d+$/.test(t) ? Number(t) : NaN;
+  return n >= 1 && n <= 64 ? n : FLASH_NEXT_LANES_DEFAULT;
+}
+
+export type FlashNextModelStatus = {
+  installed: boolean;
+  /** `absent`, `incomplete` or `complete` */
+  pack: string;
+  mtp_present: boolean;
+} | null;
+
+/** Whether decode will read the expert pack: `auto` uses it when it is complete, `build` makes it
+ *  first, `off` never does. */
+export function packInUse(
+  mode: "auto" | "off" | "build",
+  status: FlashNextModelStatus,
+): boolean {
+  if (mode === "off") return false;
+  if (mode === "build") return true;
+  return status?.pack === "complete";
+}
+
+/** Whether the draft head will be loaded: needs the file, and not switched off. */
+export function mtpInUse(mode: "auto" | "on" | "off", status: FlashNextModelStatus): boolean {
+  return mode !== "off" && status?.mtp_present === true;
+}
+
+/** What the settings run with, for the summary line: the plan's pool and prompt, whether the
+ *  pack and the draft head are in use, and the decode speed that estimates. */
+export function flashNextEffective(a: {
+  env: Record<string, string>;
+  contextMax?: number;
+  usableBytes: number;
+  status: FlashNextModelStatus;
+}) {
+  const poolGb = parseGbInput(a.env.LUMEN_MOE_EXPERT_CACHE_GB ?? "");
+  const poolExplicit = poolGb != null && a.env.LUMEN_MOE_EXPERT_CACHE_GB?.trim().toLowerCase() !== "auto";
+  const chunkEnv = positiveInt(a.env.LUMEN_QWEN35_PREFILL_CHUNK);
+  const defaults = flashNextPlan(a.usableBytes);
+  const chunk = chunkEnv ?? defaults.chunk;
+  const launch = flashNextLaunchContext(a.env, a.contextMax, a.usableBytes);
+  const pack = packInUse(envChoice(a.env.LUMEN_MOE_PACK, ["auto", "off", "build"] as const, "auto"), a.status);
+  const head = mtpInUse(mtpMode(a.env.LUMEN_QWEN4_MTP), a.status);
+  const estimate = flashNextEstimate({
+    usableBytes: a.usableBytes,
+    poolBytes: poolExplicit ? poolGb! * 1e9 : null,
+    chunk,
+    ctxTokens: launch.planned,
+  });
+  return {
+    poolExplicit,
+    chunk,
+    promptTokens: launch.planned,
+    promptExplicit: launch.explicit,
+    estimate,
+    pack,
+    head,
+    tps: flashNextChipTps(estimate.poolBytes, pack),
+    machineDefaultPrompt: defaults.ctxTokens,
+    launch,
+  };
+}
+
+// ── The settings the Flash-Next card stores ────────────────────────────────
+//
+// They live in the app's config (`[flash_next]`, `FlashNextConfig` in `src/config.rs`) as typed
+// fields and reach a Flash-Next server as the variables below, only when set away from the
+// server's default (`FlashNextConfig::env`, which this mirrors; `memory-estimate.test.ts` checks
+// the two agree). The env overrides stay as the escape hatch: applied last, they win.
+
+/** The variables the settings stand for. */
+export const FLASH_NEXT_ENV_KEYS = [
+  "LUMEN_MOE_EXPERT_CACHE_GB",
+  "LUMEN_MAX_PROMPT_TOKENS",
+  "LUMEN_QWEN35_PREFILL_CHUNK",
+  "LUMEN_MOE_PACK",
+  "LUMEN_QWEN4_MTP",
+  "LUMEN_MOE_IO_MODE",
+  "LUMEN_MOE_IO_LANES",
+] as const;
+
+/** The settings of a config that never saw the card: every option left to the server. */
+export const FLASH_NEXT_DEFAULTS: Readonly<FlashNextSettings> = {
+  expert_cache_gb: null,
+  max_prompt_tokens: null,
+  prefill_chunk: null,
+  pack: "auto",
+  draft_head: "auto",
+  io_mode: "auto",
+  io_lanes: null,
+};
+
+/** The settings are operable only while the Flash-Next model is the selected one. */
+export function flashNextSettingsEnabled(selectedModelId: string | null | undefined): boolean {
+  return isFlashNextModelId(selectedModelId);
+}
+
+const positiveNumber = (n: number | null | undefined): n is number =>
+  n != null && Number.isFinite(n) && n > 0;
+
+/** The variables a Flash-Next launch carries for `s`: only options chosen away from the server's
+ *  default, as plain values (`8`, not `8g`). A value that could not be one counts as unset. */
+export function flashNextSettingsEnv(s: FlashNextSettings): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (positiveNumber(s.expert_cache_gb)) env.LUMEN_MOE_EXPERT_CACHE_GB = formatGbValue(s.expert_cache_gb);
+  if (positiveNumber(s.max_prompt_tokens)) env.LUMEN_MAX_PROMPT_TOKENS = String(s.max_prompt_tokens);
+  if (positiveNumber(s.prefill_chunk)) env.LUMEN_QWEN35_PREFILL_CHUNK = String(s.prefill_chunk);
+  if (s.pack !== "auto") env.LUMEN_MOE_PACK = s.pack;
+  if (s.draft_head !== "auto") env.LUMEN_QWEN4_MTP = s.draft_head;
+  if (s.io_mode !== "auto") env.LUMEN_MOE_IO_MODE = s.io_mode;
+  if (
+    s.io_lanes != null &&
+    Number.isInteger(s.io_lanes) &&
+    s.io_lanes >= 1 &&
+    s.io_lanes <= 64 &&
+    s.io_lanes !== FLASH_NEXT_LANES_DEFAULT
+  ) {
+    env.LUMEN_MOE_IO_LANES = String(s.io_lanes);
+  }
+  return env;
+}
+
+/** What a launch carries: the settings, replaced by an env override of the same name. */
+export function flashNextEnv(
+  s: FlashNextSettings,
+  overrides: Record<string, string>,
+): Record<string, string> {
+  return { ...flashNextSettingsEnv(s), ...overrides };
+}
+
+/** The env overrides that replace what the card says (applied last, they win). */
+export function flashNextShadowedKeys(overrides: Record<string, string>): string[] {
+  return FLASH_NEXT_ENV_KEYS.filter((k) => k in overrides);
+}
+
+/** Every option is at the server's default: nothing to reset. */
+export function flashNextIsDefault(s: FlashNextSettings): boolean {
+  return Object.keys(flashNextSettingsEnv(s)).length === 0;
+}
+
+/** Whether an env-panel entry of this name shadows a typed setting. The Flash-Next names are
+ *  typed only while Flash-Next is the selected model; for any other model they are plain entries
+ *  (`LUMEN_MAX_PROMPT_TOKENS` and the prefill chunk are rows of the panel for every family). */
+export function envShadowsTypedKey(
+  key: string,
+  typedKeys: ReadonlySet<string>,
+  flashNextActive: boolean,
+): boolean {
+  if (!typedKeys.has(key)) return false;
+  return flashNextActive || !(FLASH_NEXT_ENV_KEYS as readonly string[]).includes(key);
+}

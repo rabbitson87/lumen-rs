@@ -37,6 +37,10 @@ pub struct PersistentConfig {
     pub quant: QuantConfig,
     pub context: ContextConfig,
     pub advanced: AdvancedConfig,
+    /// Settings only the Flash-Next model (the SSD-streamed MoE) reads. `#[serde(default)]`
+    /// keeps configs written before the section existed loadable, so no schema bump.
+    #[serde(default)]
+    pub flash_next: FlashNextConfig,
     /// Free-form `KEY=VALUE` overrides for anything not surfaced as a typed
     /// field. Passed verbatim to the subprocess after the typed fields, so a
     /// user can use this to override even fields that have dedicated UI (last
@@ -268,6 +272,116 @@ pub enum SpecKind {
     Mtp,
 }
 
+/// Flash-Next settings: the expert pool, the longest prompt, and how the experts are read from
+/// the SSD. Every default equals the server's own, so a field left at it (`None` / `Auto`) sends
+/// nothing and the server decides; only a value the user chose reaches the server's environment
+/// (see [`FlashNextConfig::env`]), and only when the model being launched is Flash-Next.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlashNextConfig {
+    /// → `LUMEN_MOE_EXPERT_CACHE_GB`, a plain number of GB. `None` = auto: the server sizes the
+    /// pool from what the GPU's memory leaves.
+    pub expert_cache_gb: Option<f64>,
+    /// → `LUMEN_MAX_PROMPT_TOKENS`, the longest prompt the server plans its memory for. `None` =
+    /// the machine's default, which the app works out and sends itself (see `server.rs`).
+    pub max_prompt_tokens: Option<u32>,
+    /// → `LUMEN_QWEN35_PREFILL_CHUNK`, tokens per prefill step. `None` = the machine's default.
+    pub prefill_chunk: Option<u32>,
+    /// → `LUMEN_MOE_PACK`.
+    pub pack: FlashNextPack,
+    /// → `LUMEN_QWEN4_MTP`.
+    pub draft_head: FlashNextDraftHead,
+    /// → `LUMEN_MOE_IO_MODE`.
+    pub io_mode: FlashNextIoMode,
+    /// → `LUMEN_MOE_IO_LANES`, reader threads (1 to 64). `None` = the server's 32.
+    pub io_lanes: Option<u32>,
+}
+
+/// The expert pack: one contiguous file of the routed experts, built once from the weights.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashNextPack {
+    /// Read the pack when it is complete.
+    #[default]
+    Auto,
+    /// Never read it.
+    Off,
+    /// Build it when the server starts and it is missing.
+    Build,
+}
+
+/// The draft head (`mtp.safetensors`) that lets the server guess a second token per step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashNextDraftHead {
+    /// Use it when the file is there.
+    #[default]
+    Auto,
+    /// Use it; the server refuses to start without the file.
+    On,
+    Off,
+}
+
+/// How expert reads go to the SSD.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashNextIoMode {
+    /// The page cache while the Mac has memory to spare, direct reads otherwise.
+    #[default]
+    Auto,
+    Direct,
+    Buffered,
+}
+
+/// The server's own number of reader threads.
+pub const FLASH_NEXT_IO_LANES_DEFAULT: u32 = 32;
+/// The most reader threads the server accepts.
+const FLASH_NEXT_IO_LANES_MAX: u32 = 64;
+
+impl FlashNextConfig {
+    /// The environment variables the typed fields stand for: only those set to something other
+    /// than the server's own default, with the values as the server reads them (a plain number of
+    /// GB, not `8g`). A value that could not be one (not a positive number, threads outside 1 to
+    /// 64) counts as unset. The launch sends these to a Flash-Next server and to no other model.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(gb) = self.expert_cache_gb.filter(|g| g.is_finite() && *g > 0.0) {
+            // Two decimals, as the app's pickers write them; `{}` prints `8`, not `8.0`.
+            out.push((
+                "LUMEN_MOE_EXPERT_CACHE_GB",
+                format!("{}", (gb * 100.0).round() / 100.0),
+            ));
+        }
+        if let Some(n) = self.max_prompt_tokens.filter(|n| *n > 0) {
+            out.push(("LUMEN_MAX_PROMPT_TOKENS", n.to_string()));
+        }
+        if let Some(n) = self.prefill_chunk.filter(|n| *n > 0) {
+            out.push(("LUMEN_QWEN35_PREFILL_CHUNK", n.to_string()));
+        }
+        match self.pack {
+            FlashNextPack::Auto => {}
+            FlashNextPack::Off => out.push(("LUMEN_MOE_PACK", "off".into())),
+            FlashNextPack::Build => out.push(("LUMEN_MOE_PACK", "build".into())),
+        }
+        match self.draft_head {
+            FlashNextDraftHead::Auto => {}
+            FlashNextDraftHead::On => out.push(("LUMEN_QWEN4_MTP", "on".into())),
+            FlashNextDraftHead::Off => out.push(("LUMEN_QWEN4_MTP", "off".into())),
+        }
+        match self.io_mode {
+            FlashNextIoMode::Auto => {}
+            FlashNextIoMode::Direct => out.push(("LUMEN_MOE_IO_MODE", "direct".into())),
+            FlashNextIoMode::Buffered => out.push(("LUMEN_MOE_IO_MODE", "buffered".into())),
+        }
+        if let Some(n) = self.io_lanes.filter(|n| {
+            (1..=FLASH_NEXT_IO_LANES_MAX).contains(n) && *n != FLASH_NEXT_IO_LANES_DEFAULT
+        }) {
+            out.push(("LUMEN_MOE_IO_LANES", n.to_string()));
+        }
+        out
+    }
+}
+
 impl Default for PersistentConfig {
     fn default() -> Self {
         // Use `~/models/` as default — matches the README convention for
@@ -323,6 +437,7 @@ impl Default for PersistentConfig {
                 mlx_batch_max: None,
                 paged_attention: None,
             },
+            flash_next: FlashNextConfig::default(),
             env_overrides: BTreeMap::new(),
             active_model: None,
             active_image_model: None,
@@ -695,5 +810,152 @@ max_batch = 6
             cfg.schema_version, CURRENT_SCHEMA_VERSION,
             "migrate_in_place must land exactly on CURRENT_SCHEMA_VERSION"
         );
+    }
+
+    // ── Flash-Next ─────────────────────────────────────────────────────
+
+    fn every_flash_next_field_set() -> FlashNextConfig {
+        FlashNextConfig {
+            expert_cache_gb: Some(12.5),
+            max_prompt_tokens: Some(32_768),
+            prefill_chunk: Some(512),
+            pack: FlashNextPack::Build,
+            draft_head: FlashNextDraftHead::On,
+            io_mode: FlashNextIoMode::Direct,
+            io_lanes: Some(16),
+        }
+    }
+
+    /// A config written before the Flash-Next section existed (every older file) loads with
+    /// every option at its default, so nothing is sent and the server decides.
+    #[test]
+    fn an_old_config_without_the_flash_next_section_loads_with_defaults() {
+        let cfg: PersistentConfig =
+            toml::from_str(V8_TOML).expect("a config without [flash_next] must still deserialize");
+        assert_eq!(cfg.flash_next, FlashNextConfig::default());
+        assert!(cfg.flash_next.env().is_empty());
+        // The same file with the section present but empty, or with a few keys.
+        let partial = format!("{V8_TOML}\n[flash_next]\npack = \"off\"\n");
+        let cfg: PersistentConfig = toml::from_str(&partial).expect("a partial section loads");
+        assert_eq!(cfg.flash_next.pack, FlashNextPack::Off);
+        assert_eq!(cfg.flash_next.expert_cache_gb, None);
+        assert_eq!(cfg.flash_next.draft_head, FlashNextDraftHead::Auto);
+    }
+
+    /// What the settings card saves is what comes back after a restart, and the file keeps
+    /// the readable lowercase names.
+    #[test]
+    fn the_flash_next_section_round_trips_through_the_config_file() {
+        let cfg = PersistentConfig {
+            flash_next: every_flash_next_field_set(),
+            ..PersistentConfig::default()
+        };
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(raw.contains("[flash_next]"), "{raw}");
+        assert!(raw.contains("pack = \"build\""), "{raw}");
+        assert!(raw.contains("draft_head = \"on\""), "{raw}");
+        assert!(raw.contains("io_mode = \"direct\""), "{raw}");
+        assert!(raw.contains("expert_cache_gb = 12.5"), "{raw}");
+        let back: PersistentConfig = toml::from_str(&raw).expect("parse");
+        assert_eq!(back.flash_next, cfg.flash_next);
+        // The defaults round trip too: nothing set stays nothing set.
+        let raw = toml::to_string_pretty(&PersistentConfig::default()).expect("serialize");
+        let back: PersistentConfig = toml::from_str(&raw).expect("parse");
+        assert_eq!(back.flash_next, FlashNextConfig::default());
+    }
+
+    /// The same shape the frontend sends and receives (`null` for an unset option).
+    #[test]
+    fn the_flash_next_section_speaks_the_json_the_frontend_does() {
+        let json = serde_json::to_value(FlashNextConfig::default()).expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "expert_cache_gb": null,
+                "max_prompt_tokens": null,
+                "prefill_chunk": null,
+                "pack": "auto",
+                "draft_head": "auto",
+                "io_mode": "auto",
+                "io_lanes": null,
+            })
+        );
+        let back: FlashNextConfig = serde_json::from_value(serde_json::json!({
+            "expert_cache_gb": 8, "max_prompt_tokens": 16384, "prefill_chunk": null,
+            "pack": "off", "draft_head": "auto", "io_mode": "buffered", "io_lanes": 64,
+        }))
+        .expect("from json");
+        assert_eq!(back.expert_cache_gb, Some(8.0));
+        assert_eq!(back.pack, FlashNextPack::Off);
+        assert_eq!(back.io_lanes, Some(64));
+    }
+
+    #[test]
+    fn nothing_set_sends_nothing() {
+        assert!(FlashNextConfig::default().env().is_empty());
+        // Choosing the server's own default is the same as not choosing: nothing is sent.
+        let at_defaults = FlashNextConfig {
+            io_lanes: Some(FLASH_NEXT_IO_LANES_DEFAULT),
+            ..FlashNextConfig::default()
+        };
+        assert!(at_defaults.env().is_empty());
+    }
+
+    #[test]
+    fn every_set_option_maps_to_its_variable_as_a_plain_value() {
+        assert_eq!(
+            every_flash_next_field_set().env(),
+            vec![
+                ("LUMEN_MOE_EXPERT_CACHE_GB", "12.5".to_string()),
+                ("LUMEN_MAX_PROMPT_TOKENS", "32768".to_string()),
+                ("LUMEN_QWEN35_PREFILL_CHUNK", "512".to_string()),
+                ("LUMEN_MOE_PACK", "build".to_string()),
+                ("LUMEN_QWEN4_MTP", "on".to_string()),
+                ("LUMEN_MOE_IO_MODE", "direct".to_string()),
+                ("LUMEN_MOE_IO_LANES", "16".to_string()),
+            ]
+        );
+        let whole = FlashNextConfig {
+            expert_cache_gb: Some(8.0),
+            pack: FlashNextPack::Off,
+            draft_head: FlashNextDraftHead::Off,
+            io_mode: FlashNextIoMode::Buffered,
+            ..FlashNextConfig::default()
+        };
+        let env: std::collections::BTreeMap<_, _> = whole.env().into_iter().collect();
+        // `8`, never `8.0` or `8g`; `off` and `buffered` as the server spells them.
+        assert_eq!(env["LUMEN_MOE_EXPERT_CACHE_GB"], "8");
+        assert_eq!(env["LUMEN_MOE_PACK"], "off");
+        assert_eq!(env["LUMEN_QWEN4_MTP"], "off");
+        assert_eq!(env["LUMEN_MOE_IO_MODE"], "buffered");
+        assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn a_pool_is_written_to_two_decimals_and_a_value_that_cannot_be_one_is_dropped() {
+        let pool = |gb: f64| FlashNextConfig {
+            expert_cache_gb: Some(gb),
+            ..FlashNextConfig::default()
+        };
+        assert_eq!(
+            pool(6.349).env(),
+            vec![("LUMEN_MOE_EXPERT_CACHE_GB", "6.35".into())]
+        );
+        for bad in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert!(pool(bad).env().is_empty(), "{bad}");
+        }
+        for lanes in [0, 65, 1000] {
+            let c = FlashNextConfig {
+                io_lanes: Some(lanes),
+                ..FlashNextConfig::default()
+            };
+            assert!(c.env().is_empty(), "{lanes} threads");
+        }
+        let one = FlashNextConfig {
+            max_prompt_tokens: Some(0),
+            prefill_chunk: Some(0),
+            ..FlashNextConfig::default()
+        };
+        assert!(one.env().is_empty());
     }
 }

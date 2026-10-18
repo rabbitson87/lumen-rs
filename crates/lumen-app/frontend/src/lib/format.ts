@@ -17,3 +17,14 @@ export function duration(secs: number): string {
   const m = Math.floor((secs % 3600) / 60);
   return `${h}h ${m}m`;
 }
+
+/** `s` with each `{name}` replaced by its value from `vars` (translated strings carry the
+ *  placeholders, so word order stays the translator's). */
+export function fill(s: string, vars: Record<string, string | number>): string {
+  return Object.entries(vars).reduce((acc, [k, v]) => acc.replaceAll(`{${k}}`, String(v)), s);
+}
+
+/** Tokens per second as a short number: one decimal under 10, none above. */
+export function fmtTps(x: number): string {
+  return x >= 10 ? x.toFixed(0) : x.toFixed(1);
+}

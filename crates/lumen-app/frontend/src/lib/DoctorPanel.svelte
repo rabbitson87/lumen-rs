@@ -1,6 +1,19 @@
 <script lang="ts">
-  import { api, type DoctorReport, type CheckResult } from "./api";
+  import {
+    api,
+    type DoctorReport,
+    type CheckResult,
+    type OverallHealth,
+    type FlashNextStatus,
+    type PackProgress,
+  } from "./api";
+  import PackBuildControl from "./PackBuildControl.svelte";
   import { t } from "./i18n.svelte";
+
+  /** `t(key)` with `{name}` placeholders filled in. */
+  function fill(key: string, vars: Record<string, string>): string {
+    return Object.entries(vars).reduce((acc, [k, v]) => acc.replace(`{${k}}`, v), t(key));
+  }
 
   /**
    * Translate a doctor check's user-facing strings. The backend ships
@@ -86,6 +99,59 @@
         if (unexpected) return t("doctor.msg.huggingface.unexpected").replace("{code}", unexpected[1]);
         return m;
       }
+      case "flash_next_ram": {
+        // "16 GB RAM: expert pool ~4.6 GB at 8192 tokens" / "16 GB RAM: a 81920-token context does
+        // not fit, up to 34879 do" / "8 GB RAM, Flash-Next needs ~14 GB"
+        const ok = m.match(/^(\d+) GB RAM: expert pool ~([\d.]+) GB at (\d+) tokens$/);
+        if (ok) return fill("doctor.msg.flash_next_ram.ok", { ram: ok[1], pool: ok[2], ctx: ok[3] });
+        const ctx = m.match(/^(\d+) GB RAM: a (\d+)-token context does not fit, up to (\d+) do$/);
+        if (ctx) return fill("doctor.msg.flash_next_ram.context", { ram: ctx[1], ctx: ctx[2], max: ctx[3] });
+        const short = m.match(/^(\d+) GB RAM, Flash-Next needs ~(\d+) GB$/);
+        if (short) return fill("doctor.msg.flash_next_ram.short", { ram: short[1], need: short[2] });
+        return m;
+      }
+      case "flash_next_disk": {
+        if (m === "free space unknown") return t("doctor.msg.flash_next_disk.unknown");
+        const built = m.match(/^(\d+) GB free, expert pack already built$/);
+        if (built) return fill("doctor.msg.flash_next_disk.built", { free: built[1] });
+        const room = m.match(/^(\d+) GB free, room for the (\d+) GB expert pack$/);
+        if (room) return fill("doctor.msg.flash_next_disk.room", { free: room[1], pack: room[2] });
+        const none = m.match(/^(\d+) GB free, not enough for the (\d+) GB expert pack$/);
+        if (none) return fill("doctor.msg.flash_next_disk.noRoom", { free: none[1], pack: none[2] });
+        return m;
+      }
+      case "flash_next_pack": {
+        if (m === "no expert pack (optional)") return t("doctor.msg.flash_next_pack.absent");
+        const present = m.match(/^experts\.lpack present \((\d+) GB\)$/);
+        if (present) return fill("doctor.msg.flash_next_pack.present", { gb: present[1] });
+        const cut = m.match(/^experts\.lpack incomplete \((\d+) GB of (\d+) GB\)$/);
+        if (cut) return fill("doctor.msg.flash_next_pack.incomplete", { gb: cut[1], full: cut[2] });
+        return m;
+      }
+      case "flash_next_mtp":
+        if (m === "draft head present (mtp.safetensors)") return t("doctor.msg.flash_next_mtp.present");
+        if (m.startsWith("draft head present, switched off")) return t("doctor.msg.flash_next_mtp.off");
+        if (m === "no draft head (optional)") return t("doctor.msg.flash_next_mtp.absent");
+        if (m.startsWith("LUMEN_QWEN4_MTP=on but")) return t("doctor.msg.flash_next_mtp.required");
+        return m;
+      case "flash_next_ssd": {
+        if (m === "Flash-Next is not installed") return t("doctor.msg.flash_next_ssd.notInstalled");
+        if (m === "no weight shard to read") return t("doctor.msg.flash_next_ssd.noShard");
+        if (m === "read failed") return t("doctor.msg.flash_next_ssd.readFailed");
+        if (m === "could not measure random reads") return t("doctor.msg.flash_next_ssd.noRandom");
+        if (m === "the volume did not answer in time") return t("doctor.msg.flash_next_ssd.stalled");
+        // "random 4.8 GB/s (sequential 5.9 GB/s): fast enough for ~12 tok/s" / "...: slow, ~3.1 tok/s"
+        const speed = m.match(
+          /^random ([\d.]+) GB\/s \(sequential ([\d.]+) GB\/s\): (?:(fast enough for)|slow,) ~([\d.]+) tok\/s$/,
+        );
+        if (speed)
+          return fill(speed[3] ? "doctor.msg.flash_next_ssd.fast" : "doctor.msg.flash_next_ssd.slow", {
+            rand: speed[1],
+            seq: speed[2],
+            tps: speed[4],
+          });
+        return m;
+      }
     }
     return m;
   }
@@ -119,6 +185,15 @@
     if (h.includes("Download the model from the MODELS")) return t("doctor.hint.active_model.missing");
     if (h.includes("not with 2xx/3xx")) return t("doctor.hint.huggingface.unexpected");
     if (h.includes("Check your internet connection")) return t("doctor.hint.huggingface.unreachable");
+    if (h.includes("Flash-Next needs its 3.6 GB")) return t("doctor.hint.flash_next_ram.short");
+    if (h.includes("comes out of the GPU's share of RAM")) return t("doctor.hint.flash_next_ram.context");
+    if (h.includes("An expert pack makes decode")) return t("doctor.hint.flash_next_disk.room");
+    if (h.includes("The expert pack is optional")) return t("doctor.hint.flash_next_disk.noRoom");
+    if (h.includes("ignores an unfinished pack")) return t("doctor.hint.flash_next_pack.incomplete");
+    if (h.includes("refuses to start with")) return t("doctor.hint.flash_next_mtp.required");
+    if (h.includes("The draft head (1.5 GB")) return t("doctor.hint.flash_next_mtp.absent");
+    if (h.includes("Decode speed is set by how fast")) return t("doctor.hint.flash_next_ssd.slow");
+    if (h.includes("A read took longer")) return t("doctor.hint.flash_next_ssd.stalled");
     return h;
   }
 
@@ -127,19 +202,100 @@
     if (c.id === "active_model" && c.detail.includes("Required files (config.json")) {
       return t("doctor.detail.active_model.incomplete");
     }
+    const d = c.detail;
+    if (d.includes("The expert pool is what the GPU's share of RAM leaves"))
+      return (
+        t("doctor.detail.flash_next_ram") +
+        (d.includes("one staging region only") ? " " + t("doctor.detail.flash_next_ram.oneRegion") : "")
+      );
+    if (d.includes("Without the pack the server reads each expert"))
+      return t("doctor.detail.flash_next_pack.absent");
+    if (c.id === "flash_next_ssd") {
+      // "Read 1074 MB of model-00006.safetensors with the page cache bypassed: 537 MB front to
+      // back, then 537 MB as 194 random 2.8 MB reads on 4 threads, the way the server fetches
+      // experts. Decode speed scales a table measured on a 36 GB M3 Max (SSD reading 6.5 GB/s)
+      // by this volume's speed, for an expert pool of ~18.4 GB, what the memory plan leaves on this
+      // Mac." (+ " The table measured with the expert pack is used.") (+ " The test hit its time limit ...")
+      const x = d.match(
+        /^Read (\d+) MB of (.+?) with the page cache bypassed: (\d+) MB front to back, then (\d+) MB as (\d+) random ([\d.]+) MB reads on 4 threads, .*?\(SSD reading ([\d.]+) GB\/s\).*?~([\d.]+) GB,/,
+      );
+      if (x) {
+        const pack = d.includes("measured with the expert pack") ? " " + t("doctor.detail.flash_next_ssd.pack") : "";
+        const early = d.includes("stopped early") ? " " + t("doctor.detail.flash_next_ssd.early") : "";
+        return (
+          fill("doctor.detail.flash_next_ssd", {
+            total: x[1],
+            shard: x[2],
+            seq: x[3],
+            rand: x[4],
+            reads: x[5],
+            rec: x[6],
+            ref: x[7],
+            pool: x[8],
+          }) +
+          pack +
+          early
+        );
+      }
+    }
     return c.detail;
   }
 
   interface Props {
     report: DoctorReport | null;
     onReport: (r: DoctorReport) => void;
+    /** Flash-Next's pack state and build, for the pack row's Build button. */
+    flashStatus?: FlashNextStatus | null;
+    packBuild?: PackProgress | null;
+    onBuildPack?: () => Promise<void>;
+    onCancelPackBuild?: () => Promise<void>;
   }
-  let { report, onReport }: Props = $props();
+  let {
+    report,
+    onReport,
+    flashStatus = null,
+    packBuild = null,
+    onBuildPack,
+    onCancelPackBuild,
+  }: Props = $props();
 
   let running = $state(false);
   let busyAction = $state<string | null>(null);
   let expanded = $state<Set<string>>(new Set());
   let fixMessage = $state<string | null>(null);
+
+  // The Flash-Next rows exist only while the model is installed; the SSD test belongs to them.
+  // It reads ~1 GB, so it never runs with the other checks — only on this button.
+  let hasFlashNext = $derived(!!report?.checks.some((c) => c.id.startsWith("flash_next_")));
+  let probing = $state(false);
+
+  function overallOf(checks: CheckResult[]): OverallHealth {
+    if (checks.some((c) => c.status === "fail")) return "blocked";
+    if (checks.some((c) => c.status === "warn")) return "degraded";
+    return "healthy";
+  }
+
+  async function runProbe() {
+    if (!report || probing) return;
+    probing = true;
+    fixMessage = null;
+    try {
+      const row = await api.doctorProbeSsd();
+      if (row == null) {
+        fixMessage = t("doctor.ssd.cancelled");
+        return;
+      }
+      // Next to the other Flash-Next rows. A re-check drops it again.
+      const checks = report.checks.filter((c) => c.id !== row.id);
+      checks.splice(checks.map((c) => c.id.startsWith("flash_next_")).lastIndexOf(true) + 1, 0, row);
+      onReport({ overall: overallOf(checks), checks });
+      expanded = new Set([...expanded, row.id]);
+    } catch (e) {
+      fixMessage = `${t("doctor.failed")} ${e}`;
+    } finally {
+      probing = false;
+    }
+  }
 
   async function recheck() {
     running = true;
@@ -196,9 +352,17 @@
 
 <div class="px-4 pt-2 pb-3 text-xs">
   <div class="flex items-center gap-2.5 mb-2.5">
-    <button onclick={recheck} disabled={running} class="primary">
+    <button onclick={recheck} disabled={running || probing} class="primary">
       {running ? t("doctor.checking") : t("doctor.recheck")}
     </button>
+    {#if hasFlashNext}
+      <button
+        onclick={probing ? () => api.doctorProbeCancel() : runProbe}
+        disabled={running}
+      >
+        {probing ? t("doctor.ssd.cancel") : t("doctor.ssd.run")}
+      </button>
+    {/if}
     {#if fixMessage}
       <span class="dim mono text-[11px]">{fixMessage}</span>
     {/if}
@@ -206,6 +370,9 @@
       {t("doctor.intro")}
     </span>
   </div>
+  {#if hasFlashNext}
+    <div class="dim mb-2.5 text-[11px] leading-normal">{t("doctor.ssd.note")}</div>
+  {/if}
 
   {#if report}
     <div class="flex flex-col gap-1">
@@ -233,6 +400,16 @@
               {/if}
               {#if c.fix_command}
                 <div class="mono px-2 py-1 bg-bg rounded text-accent mb-2 select-text overflow-x-auto">$ {c.fix_command}</div>
+              {/if}
+              {#if c.id === "flash_next_pack" && onBuildPack && onCancelPackBuild}
+                <div class="mb-2">
+                  <PackBuildControl
+                    status={flashStatus}
+                    build={packBuild}
+                    onBuild={onBuildPack}
+                    onCancel={onCancelPackBuild}
+                  />
+                </div>
               {/if}
               {#if c.fix_action}
                 <div class="flex gap-1.5">

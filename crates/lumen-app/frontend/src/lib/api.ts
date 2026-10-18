@@ -65,11 +65,36 @@ export interface AdvancedConfig {
   mlx_batch_max: number | null;
 }
 
+export type FlashNextPack = "auto" | "off" | "build";
+export type FlashNextDraftHead = "auto" | "on" | "off";
+export type FlashNextIoMode = "auto" | "direct" | "buffered";
+
+/** The Flash-Next card's settings (`[flash_next]`). `null` / `"auto"` leave the option to the
+ *  server: only a value chosen away from its default reaches the server, and only for a
+ *  Flash-Next launch. */
+export interface FlashNextSettings {
+  /** → LUMEN_MOE_EXPERT_CACHE_GB (a plain number of GB); null = auto. */
+  expert_cache_gb: number | null;
+  /** → LUMEN_MAX_PROMPT_TOKENS; null = this Mac's default, which the app sends itself. */
+  max_prompt_tokens: number | null;
+  /** → LUMEN_QWEN35_PREFILL_CHUNK; null = this Mac's default. */
+  prefill_chunk: number | null;
+  /** → LUMEN_MOE_PACK */
+  pack: FlashNextPack;
+  /** → LUMEN_QWEN4_MTP */
+  draft_head: FlashNextDraftHead;
+  /** → LUMEN_MOE_IO_MODE */
+  io_mode: FlashNextIoMode;
+  /** → LUMEN_MOE_IO_LANES (1-64); null = the server's 32. */
+  io_lanes: number | null;
+}
+
 export interface PersistentConfig {
   server: ServerConfig;
   quant: QuantConfig;
   context: ContextConfig;
   advanced: AdvancedConfig;
+  flash_next: FlashNextSettings;
   env_overrides: Record<string, string>;
   active_model: string | null;
   /** Active diffusion image model id; independent of `active_model` so a chat
@@ -223,6 +248,39 @@ export interface DoctorReport {
   checks: CheckResult[];
 }
 
+/** Why the expert-pack build button is refused. */
+export type BuildBlock =
+  | "not_installed"
+  | "building"
+  | "already_built"
+  | "server_running"
+  | "not_enough_disk";
+
+/** What the Flash-Next settings show about the model on disk (`flash_next_status`). */
+export interface FlashNextStatus {
+  installed: boolean;
+  dir: string | null;
+  pack: "absent" | "incomplete" | "complete";
+  pack_bytes: number;
+  mtp_present: boolean;
+  free_bytes: number | null;
+  /** Free space the pack build needs. */
+  need_bytes: number;
+  server_running: boolean;
+  building: boolean;
+  build_block: BuildBlock | null;
+}
+
+export type PackBuildState = "running" | "done" | "failed" | "cancelled";
+
+/** One report of the expert-pack build (`lumen://pack`). `layers` is 0 until the server says. */
+export interface PackProgress {
+  state: PackBuildState;
+  layer: number;
+  layers: number;
+  error: string | null;
+}
+
 export interface UpdateInfo {
   available: boolean;
   current_version: string;
@@ -249,6 +307,8 @@ export const api = {
     invoke<PersistentConfig>("update_context_config", { context }),
   updateAdvancedConfig: (advanced: AdvancedConfig) =>
     invoke<PersistentConfig>("update_advanced_config", { advanced }),
+  updateFlashNextConfig: (flashNext: FlashNextSettings) =>
+    invoke<PersistentConfig>("update_flash_next_config", { flashNext }),
   updateEnvOverrides: (env_overrides: Record<string, string>) =>
     invoke<PersistentConfig>("update_env_overrides", { envOverrides: env_overrides }),
   typedEnvKeys: () => invoke<string[]>("typed_env_keys"),
@@ -290,6 +350,14 @@ export const api = {
 
   doctorRun: () => invoke<DoctorReport>("doctor_run"),
   doctorFix: (action: string) => invoke<string>("doctor_fix", { action }),
+  /** Flash-Next's SSD read test (~1 GB, a few seconds). `null` = cancelled. */
+  doctorProbeSsd: () => invoke<CheckResult | null>("doctor_probe_ssd"),
+  doctorProbeCancel: () => invoke<void>("doctor_probe_cancel"),
+
+  flashNextStatus: () => invoke<FlashNextStatus>("flash_next_status"),
+  /** Start `lumen-server --pack-experts` in the background; progress arrives as `lumen://pack`. */
+  startPackBuild: () => invoke<void>("start_pack_build"),
+  cancelPackBuild: () => invoke<boolean>("cancel_pack_build"),
 
   currentVersion: () => invoke<string>("current_version"),
   checkForUpdates: () => invoke<UpdateInfo>("check_for_updates"),
@@ -310,6 +378,10 @@ export function onLog(cb: (lines: LogLine[]) => void): Promise<UnlistenFn> {
 
 export function onStatus(cb: (s: ServerStatus) => void): Promise<UnlistenFn> {
   return listen<ServerStatus>("lumen://status", (e) => cb(e.payload));
+}
+
+export function onPack(cb: (p: PackProgress) => void): Promise<UnlistenFn> {
+  return listen<PackProgress>("lumen://pack", (e) => cb(e.payload));
 }
 
 export function onDownload(cb: (p: DownloadProgress) => void): Promise<UnlistenFn> {

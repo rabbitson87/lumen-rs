@@ -424,10 +424,10 @@ export const en: Record<string, string> = {
 
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill chunk size",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
-    "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048.",
+    "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048. For Flash-Next use the Flash-Next card (Tuning tab): its default is 1024, and its chunk comes out of the expert pool.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "Max prompt tokens (reject cap)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash.",
+    "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash. For Flash-Next set it in the Flash-Next card (Tuning tab): the model plans its expert pool around it, since the KV cache for the longest prompt (60 KB per token) comes out of the pool. Without a choice there the app sends this Mac's default (16,384; 8,192 under 11 GB of GPU memory), and an entry here replaces it.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",
@@ -480,10 +480,13 @@ export const en: Record<string, string> = {
   "env.entry.LUMEN_MLX_DRAFT_PMIN.help":
     "Minimum draft top-1 probability to keep extending a proposal (0-1, default 0 = disabled). Currently a no-op placeholder: the draft proposes via argmax-only steps with no probability readout, so probability gating is pending hardware verification. Leave at 0.",
 
+
   // Memory calculator (predict peak memory vs context / chunk / KV mode).
   "memcalc.title": "Memory calculator",
   "memcalc.noGeometry":
     "No memory profile for model '{model}'. The calculator supports the catalog's native MLX models (e.g. Qwen3.6-35B, Gemma 4 26B-A4B).",
+  "memcalc.flashNext":
+    "Flash-Next streams its experts from the SSD, so its memory plan and settings are in the Flash-Next card above.",
   "memcalc.active": "Weights / active",
   "memcalc.active.hint":
     "Resident weight memory at a small prefill — the estimate's anchor. Pre-filled from the model's measured value; correct it to your own startup log line [mlx-mem] ... active=N GB for an exact, machine-specific estimate.",
@@ -530,6 +533,161 @@ export const en: Record<string, string> = {
   "memcalc.applyBudget.hint":
     "Also write this budget to the server's MLX memory_limit_gb (the hard cap). Off = budget is a planning input only.",
 
+  // Flash-Next memory calculator (expert pool vs the longest prompt; the experts stream from the SSD).
+  "flashnext.geometry":
+    "Qwen 3.8 Flash-Next · 48 layers × 512 experts · {kb} KB of f32 KV per token of context",
+  "flashnext.thisMac": "This Mac: {ram} GB RAM, so the GPU may fill ~{usable} GB.",
+  "flashnext.thisMac.limit": "(Capped by the Memory GB setting at {n} GB.)",
+  "flashnext.tight":
+    "That is a tight machine: the plan takes {chunk}-token chunks and {ctx}-token prompts unless told otherwise.",
+  "flashnext.fits":
+    "It fits: the trunk, the smallest pool and the reserve for a {ctx}-token prompt need {need} GB.",
+  "flashnext.noFit":
+    "Does not fit: the trunk, the smallest pool and the reserve for a {ctx}-token prompt need {need} GB. Up to {max} tokens fit at a {chunk}-token chunk; lower the longest prompt or the chunk.",
+  "flashnext.noFitAny":
+    "Does not fit even with an empty prompt: this Mac needs at least {min} GB of RAM.",
+  "flashnext.pool": "Expert pool",
+  "flashnext.pool.auto": "auto",
+  "flashnext.pool.hint":
+    "Experts kept in memory; the rest come from the SSD, so a bigger pool decodes faster. auto is what is left after the trunk and the reserve for the longest prompt: a longer prompt shrinks it.",
+  "flashnext.pool.floor": "Raised to the {floor} GB minimum the server runs with.",
+  "flashnext.pool.oneRegion":
+    "Under {gb} GB the pool lends one staging region only, so prefill cannot read the next layer while it computes the current one (slower prefill, nothing fails).",
+  "flashnext.chunk": "Chunk",
+  "flashnext.chunk.default": "default",
+  "flashnext.card.title":
+    "FLASH-NEXT",
+  "flashnext.card.titleHint":
+    "(experts streamed from the SSD)",
+  "flashnext.disabled":
+    "Select the Flash-Next model to change these settings.",
+  "flashnext.shadowed":
+    "An env override replaces the setting here: {keys}. It is applied last, so it wins.",
+  "flashnext.shadowed.clear":
+    "Remove the override",
+  "flashnext.chunk.hint":
+    "Tokens per prefill step. Its activations (about 1.1 MB per token) come out of the pool; the default follows this Mac.",
+  "flashnext.plan.title":
+    "Memory plan",
+  "flashnext.context.hint":
+    "The server's prompt cap (LUMEN_MAX_PROMPT_TOKENS): its KV cache (60 KB per token) comes out of the pool. Picking a chip saves it; this Mac's default is what the app sends when none is set.",
+  "flashnext.peak": "resident / usable",
+  "flashnext.row.trunk": "resident weights",
+  "flashnext.row.pool": "expert pool",
+  "flashnext.row.buffers": "prefill buffers",
+  "flashnext.row.kv": "KV @ prompt",
+  "flashnext.row.scores": "attention scores",
+  "flashnext.overBy":
+    "{over} GB over what the GPU may fill: lower the pool to {pool} GB or less (that is what auto gives), or the longest prompt.",
+  "flashnext.autoPool": "Auto pool at this prompt:",
+  "flashnext.maxCtx.auto": "Longest prompt before auto reaches the {floor} GB floor:",
+  "flashnext.maxCtx.manual": "Longest prompt that fits beside this pool:",
+  "flashnext.speed.title": "Decode speed by pool size",
+  "flashnext.speed.estimate": "At a {pool} GB pool: ≈ {tps} tok/s",
+  "flashnext.speed.withPack": "with the pack ≈ {tps}",
+  "flashnext.speed.below": "(extrapolated below the measured range)",
+  "flashnext.speed.above": "(the largest measured pool; nothing is measured beyond it)",
+  "flashnext.speed.col.pool": "pool",
+  "flashnext.speed.col.shards": "tok/s",
+  "flashnext.speed.col.pack": "with pack",
+  "flashnext.speed.note":
+    "Measured on a 36 GB M3 Max with a fast internal SSD (~6.5 GB/s random reads). * Run on that Mac with its memory limited to a 16 / 24 GB Mac's working set: a real small Mac adds its own memory pressure. A slower disk decodes slower: the Doctor's SSD test measures yours. Prefill (~230 tok/s) does not depend on the pool.",
+  "flashnext.disk": "Disk needed",
+  "flashnext.disk.detail": "{model} GB weights",
+  "flashnext.disk.pack": "GB expert pack",
+  "flashnext.disk.mtp": "GB draft head",
+  "flashnext.active": "Active:",
+  "flashnext.default": "default",
+  "flashnext.on": "on",
+  "flashnext.off": "off",
+  "flashnext.choice.auto": "Auto",
+  "flashnext.choice.off": "Off",
+  "flashnext.choice.on": "On",
+  "flashnext.choice.build": "Build",
+  "flashnext.choice.direct": "Direct",
+  "flashnext.choice.buffered": "Buffered",
+  "flashnext.opt.pack": "Expert pack",
+  "flashnext.opt.mtp": "Draft head",
+  "flashnext.opt.io": "Expert reads",
+  "flashnext.opt.lanes": "Reader threads",
+  "flashnext.prompt": "Longest prompt",
+  "flashnext.summary":
+    "Runs with: pool {pool} GB ({how}), prompts up to {prompt} tokens, expert pack {pack}, draft head {head}, about {tps} tok/s",
+  "flashnext.summary.auto": "auto",
+  "flashnext.summary.set": "set by you",
+  "flashnext.summary.noFit": "this does not fit the GPU's memory",
+  "flashnext.reset": "Reset to recommended",
+  "flashnext.reset.hint":
+    "Puts every option in this card back to the server's own default (nothing is sent for it). Env overrides are left alone.",
+  "flashnext.pool.custom": "Custom…",
+  "flashnext.pool.custom.hint": "GB: 8, 8g, 8GB, 12.5g",
+  "flashnext.pool.custom.invalid": "Not a size: try 8, 8g or 12.5g.",
+  "flashnext.pool.chip.auto":
+    "What is left after the trunk and the reserve for the longest prompt: the server sizes it itself.",
+  "flashnext.pool.chip.noFit":
+    "A {gb} GB pool does not fit beside prompts up to {ctx} tokens on this Mac: up to {max} GB does. A shorter longest prompt makes room (otherwise the server lowers the pool and logs it).",
+  "flashnext.pool.active.auto": "auto = {pool} GB on this Mac",
+  "flashnext.pool.active.set": "{pool} GB",
+  "flashnext.pool.lowered":
+    "Does not fit with prompts up to {ctx} tokens: the server lowers it to about {max} GB and logs it. A shorter longest prompt makes room.",
+  "flashnext.pool.noFitAuto": "Not even the smallest pool fits with this prompt length.",
+  "flashnext.pool.legend":
+    "~ estimated tok/s. * measured with the memory limited to emulate a smaller Mac. † extrapolated below the measured range.",
+  "flashnext.prompt.custom.hint": "tokens or K: 48k, 50000",
+  "flashnext.prompt.chip.default":
+    "{n} tokens: this Mac's default, which the app sends unless you set one.",
+  "flashnext.prompt.chip.pool": "Prompts up to {n} tokens leave an auto pool of {gb} GB.",
+  "flashnext.prompt.chip.noFit":
+    "Prompts up to {n} tokens leave no room for the pool on this Mac: it would drop below its {floor} GB floor.",
+  "flashnext.prompt.active": "{n} tokens",
+  "flashnext.prompt.set": "set by you",
+  "flashnext.prompt.default": "this Mac's default",
+  "flashnext.prompt.pool": "auto pool {gb} GB",
+  "flashnext.prompt.noFitActive": "Does not fit.",
+  "flashnext.prompt.maxCtx": "Max context ({n}) caps it; a longer choice raises Max context.",
+  "flashnext.pack.mode.auto": "Use the pack when it sits next to the weights.",
+  "flashnext.pack.mode.off": "Never use the pack: read the shipped shards.",
+  "flashnext.pack.mode.build": "Build the pack when the server starts, if there is none.",
+  "flashnext.pack.status.complete": "Pack present: experts.lpack ({gb} GB), decode ~10-20% faster.",
+  "flashnext.pack.inUse": "in use",
+  "flashnext.pack.unused": "not used while Off",
+  "flashnext.pack.status.incomplete":
+    "An unfinished pack ({gb} GB) is on disk; the server ignores it. Building makes a new one.",
+  "flashnext.pack.status.absent": "No pack yet. It needs {need} GB of disk; {free} GB is free.",
+  "flashnext.pack.status.absentNoFree": "No pack yet. It needs {need} GB of disk.",
+  "flashnext.pack.status.notInstalled": "Flash-Next is not installed.",
+  "flashnext.pack.build": "Build expert pack",
+  "flashnext.pack.build.hint":
+    "Runs lumen-server --pack-experts on the model in the background; about a minute on an internal SSD.",
+  "flashnext.pack.starting": "Starting the build…",
+  "flashnext.pack.building": "Building the pack: layer {n} of {total}",
+  "flashnext.pack.cancel": "Cancel",
+  "flashnext.pack.cancelled": "Build cancelled. Nothing was left on disk.",
+  "flashnext.pack.failed": "The build failed:",
+  "flashnext.pack.built": "The pack is built.",
+  "flashnext.pack.block.not_installed": "Flash-Next is not installed.",
+  "flashnext.pack.block.building": "A build is already running.",
+  "flashnext.pack.block.already_built": "The pack is already built.",
+  "flashnext.pack.block.server_running":
+    "Stop the server first: the build reads the whole model from the same disk.",
+  "flashnext.pack.block.not_enough_disk": "Needs {need} GB free; this volume has {free} GB.",
+  "flashnext.mtp.mode.auto": "Use the draft head when mtp.safetensors is there.",
+  "flashnext.mtp.mode.on": "Require the draft head: the server refuses to start without it.",
+  "flashnext.mtp.mode.off": "Never use the draft head: exact plain-decode text.",
+  "flashnext.mtp.status.present": "mtp.safetensors is present.",
+  "flashnext.mtp.status.missing": "mtp.safetensors is missing.",
+  "flashnext.mtp.status.missingOn":
+    "mtp.safetensors is missing, and On makes the server refuse to start.",
+  "flashnext.mtp.fetch": "Downloads the head once (1.5 GB) into the model directory.",
+  "flashnext.mtp.note":
+    "The gain is small (0-3%) and the text is not bit-identical to plain decoding.",
+  "flashnext.io.mode.auto": "Auto: uses the page cache while the Mac has more than ~12 GB to spare.",
+  "flashnext.io.mode.direct": "Direct: bypasses the page cache; every miss reads the SSD.",
+  "flashnext.io.mode.buffered": "Buffered: reads go through the page cache.",
+  "flashnext.lanes.hint": "Threads that read experts from the SSD; 32 is the default.",
+  "flashnext.settings.hint":
+    "These are saved as you pick them; a restart applies them.",
+
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
   // server needs a restart for env-derived knobs (cache mode/bits, ctx
@@ -566,6 +724,11 @@ export const en: Record<string, string> = {
   "doctor.working": "Working…",
   "doctor.fixIt": "Fix it",
   "doctor.failed": "failed:",
+  "doctor.ssd.run": "Test SSD speed",
+  "doctor.ssd.cancel": "Cancel",
+  "doctor.ssd.cancelled": "SSD test cancelled.",
+  "doctor.ssd.note":
+    "Flash-Next reads its experts from the SSD all the time. 'Test SSD speed' reads ~1 GB of its weights for a few seconds the way the server does. Stop the server first: it uses the same disk.",
 
   // ── UpdatePanel ─────────────────────────────────────────────────
   "update.title": "Lumen update",
@@ -599,6 +762,11 @@ export const en: Record<string, string> = {
   "doctor.check.port_free.name": "Server port",
   "doctor.check.active_model.name": "Active model",
   "doctor.check.huggingface.name": "Hugging Face network",
+  "doctor.check.flash_next_ram.name": "Flash-Next memory",
+  "doctor.check.flash_next_disk.name": "Flash-Next disk",
+  "doctor.check.flash_next_pack.name": "Flash-Next expert pack",
+  "doctor.check.flash_next_mtp.name": "Flash-Next draft head",
+  "doctor.check.flash_next_ssd.name": "Flash-Next SSD",
 
   // ── Doctor message templates (id + status hint) ─────────────────
   "doctor.msg.os_version.ok": "macOS",
@@ -626,6 +794,29 @@ export const en: Record<string, string> = {
   "doctor.msg.huggingface.unexpected": "unexpected status {code}",
   "doctor.msg.huggingface.unreachable": "unreachable",
   "doctor.msg.huggingface.clientInitFailed": "http client init failed",
+  "doctor.msg.flash_next_ram.ok": "{ram} GB RAM: expert pool ~{pool} GB at {ctx} tokens",
+  "doctor.msg.flash_next_ram.context":
+    "{ram} GB RAM: a {ctx}-token context does not fit, up to {max} do",
+  "doctor.msg.flash_next_ram.short": "{ram} GB RAM, Flash-Next needs ~{need} GB",
+  "doctor.msg.flash_next_disk.built": "{free} GB free, expert pack already built",
+  "doctor.msg.flash_next_disk.room": "{free} GB free, room for the {pack} GB expert pack",
+  "doctor.msg.flash_next_disk.noRoom": "{free} GB free, not enough for the {pack} GB expert pack",
+  "doctor.msg.flash_next_disk.unknown": "free space unknown",
+  "doctor.msg.flash_next_pack.present": "experts.lpack present ({gb} GB)",
+  "doctor.msg.flash_next_pack.absent": "no expert pack (optional)",
+  "doctor.msg.flash_next_pack.incomplete": "experts.lpack incomplete ({gb} GB of {full} GB)",
+  "doctor.msg.flash_next_mtp.present": "draft head present (mtp.safetensors)",
+  "doctor.msg.flash_next_mtp.off": "draft head present, switched off (LUMEN_QWEN4_MTP=off)",
+  "doctor.msg.flash_next_mtp.absent": "no draft head (optional)",
+  "doctor.msg.flash_next_mtp.required": "LUMEN_QWEN4_MTP=on but mtp.safetensors is missing",
+  "doctor.msg.flash_next_ssd.fast":
+    "random {rand} GB/s (sequential {seq} GB/s): fast enough for ~{tps} tok/s",
+  "doctor.msg.flash_next_ssd.slow": "random {rand} GB/s (sequential {seq} GB/s): slow, ~{tps} tok/s",
+  "doctor.msg.flash_next_ssd.notInstalled": "Flash-Next is not installed",
+  "doctor.msg.flash_next_ssd.noShard": "no weight shard to read",
+  "doctor.msg.flash_next_ssd.readFailed": "read failed",
+  "doctor.msg.flash_next_ssd.noRandom": "could not measure random reads",
+  "doctor.msg.flash_next_ssd.stalled": "the volume did not answer in time",
 
   // ── Doctor fix hints (matched against backend English text) ─────
   "doctor.hint.os_version.warn":
@@ -667,10 +858,39 @@ export const en: Record<string, string> = {
     "huggingface.co responded but not with 2xx/3xx. Service may be degraded — downloads may fail.",
   "doctor.hint.huggingface.unreachable":
     "Model downloads via HF Hub will fail. Check your internet connection, VPN, or proxy.",
+  "doctor.hint.flash_next_ram.short":
+    "Flash-Next needs its 3.6 GB of resident weights, an expert pool of at least 2.8 GB and a prefill reserve inside the GPU's share of RAM (two thirds up to 32 GB, three quarters above; the memory limit lowers it). Below that the model cannot load.",
+  "doctor.hint.flash_next_ram.context":
+    "The KV cache of the longest prompt (60 KB per token) comes out of the GPU's share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next memory calculator's Apply writes it) or the prefill chunk, or raise the memory limit if it is below your RAM.",
+  "doctor.hint.flash_next_disk.room":
+    "An expert pack makes decode 10-20% faster. Build it once with the command below, or set LUMEN_MOE_PACK=build and the server builds it on its next start.",
+  "doctor.hint.flash_next_disk.noRoom":
+    "The expert pack is optional. To use it, free about 70 GB on this volume, then build it with the command below.",
+  "doctor.hint.flash_next_pack.incomplete":
+    "The server ignores an unfinished pack and reads the shards instead. Delete it and build it again.",
+  "doctor.hint.flash_next_mtp.required":
+    "The server refuses to start with LUMEN_QWEN4_MTP=on and no draft head. Download the head (1.5 GB) with the command below, or remove the override.",
+  "doctor.hint.flash_next_mtp.absent":
+    "The draft head (1.5 GB, downloaded once) lets the server guess a second token per step. It gains 0-3% here and changes the text slightly compared with plain decoding.",
+  "doctor.hint.flash_next_ssd.slow":
+    "Decode speed is set by how fast the SSD serves expert reads. Keep the model on the Mac's internal SSD (external and network drives are usually below 2 GB/s), or give the expert pool more memory.",
+  "doctor.hint.flash_next_ssd.stalled":
+    "A read took longer than the test's time limit. The weights may sit on a network or sleeping external drive; decoding reads from them constantly, so keep the model on the Mac's internal SSD.",
 
   // ── Doctor detail (incomplete-shard explainer) ─────────────────
   "doctor.detail.active_model.incomplete":
     "Required files (config.json + at least one safetensors/gguf shard) are missing.",
+  "doctor.detail.flash_next_ram":
+    "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of the longest prompt (60 KB per token) and attention scores. A longer prompt cap shrinks it; a bigger pool means fewer SSD reads per token.",
+  "doctor.detail.flash_next_ram.oneRegion":
+    "With less than 4.2 GB the pool has room for one staging region only, so prefill cannot read the next layer while it computes the current one.",
+  "doctor.detail.flash_next_pack.absent":
+    "Without the pack the server reads each expert as nine scattered ranges of the weight shards. The pack stores the same bytes as one record per expert.",
+  "doctor.detail.flash_next_ssd":
+    "Read {total} MB of {shard} with the page cache bypassed: {seq} MB front to back, then {rand} MB as {reads} random {rec} MB reads on 4 threads, the way the server fetches experts. Decode speed scales a table measured on a 36 GB M3 Max (SSD reading {ref} GB/s) by this volume's speed, for an expert pool of ~{pool} GB, what the memory plan leaves on this Mac.",
+  "doctor.detail.flash_next_ssd.pack": "The table measured with the expert pack is used.",
+  "doctor.detail.flash_next_ssd.early":
+    "The test hit its time limit and stopped early; the speeds come from what it had read.",
 
   // ── Prompt-too-large / OOM-guard modal ─────────────────────────
   "oom.title": "Prompt too large for this model",

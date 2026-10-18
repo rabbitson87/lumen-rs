@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use tauri::AppHandle;
@@ -7,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::catalog::Catalog;
 use crate::config::PersistentConfig;
+use crate::pack_build::PackBuilder;
 use crate::server::{self, ServerSupervisor};
 
 /// Tauri-managed shared state. Mutex-guarded config; the supervisor owns its
@@ -26,6 +28,13 @@ pub struct AppState {
     /// "Update" flow so the engine never loads stale weights against the new
     /// tokenizer / config / catalog label.
     pub outdated_models: Mutex<HashSet<String>>,
+    /// Cancel flag of the Flash-Next SSD read test while one is running (`None`
+    /// otherwise), so a second press cannot start a second 1 GB read and the
+    /// Cancel button has something to set. A plain mutex: it is never held
+    /// across an await.
+    pub ssd_probe: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// The Flash-Next expert-pack build, when one runs (`lumen-server --pack-experts`).
+    pub pack_builder: Arc<PackBuilder>,
 }
 
 impl AppState {
@@ -42,6 +51,8 @@ impl AppState {
             supervisor: ServerSupervisor::new(),
             catalog: Mutex::new(catalog),
             outdated_models: Mutex::new(HashSet::new()),
+            ssd_probe: std::sync::Mutex::new(None),
+            pack_builder: PackBuilder::new(),
         })
     }
 }

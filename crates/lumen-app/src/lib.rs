@@ -6,6 +6,8 @@
 pub mod catalog;
 pub mod config;
 pub mod doctor;
+pub mod flash_next;
 pub mod models;
+pub mod pack_build;
 pub mod server;
 pub mod sysinfo;

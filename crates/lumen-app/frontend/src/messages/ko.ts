@@ -414,10 +414,10 @@ export const ko: Record<string, string> = {
 
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.label": "Qwen prefill 청크 크기",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK.help":
-    "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048.",
+    "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048. Flash-Next는 튜닝 탭의 Flash-Next 카드에서 설정하세요(기본 1024, 청크가 전문가 풀에서 빠집니다).",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "최대 프롬프트 토큰 (거부 상한)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다.",
+    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다. Flash-Next는 튜닝 탭의 Flash-Next 카드에서 설정하세요: 가장 긴 프롬프트의 KV 캐시(토큰당 60 KB)가 전문가 풀에서 빠지므로 이 값을 기준으로 풀을 계획합니다. 거기서 고르지 않으면 앱이 이 Mac의 기본값(16,384, GPU 메모리 11 GB 미만이면 8,192)을 보내며, 여기에 항목을 두면 그 값이 대신 쓰입니다.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
@@ -470,10 +470,13 @@ export const ko: Record<string, string> = {
   "env.entry.LUMEN_MLX_DRAFT_PMIN.help":
     "제안을 계속 확장하기 위한 드래프트 top-1 최소 확률(0-1, 기본 0 = 비활성). 현재는 no-op 플레이스홀더: 드래프트가 확률 출력 없는 argmax-only 스텝으로 제안하므로 확률 게이팅은 하드웨어 검증 대기 중. 0으로 두세요.",
 
+
   // 메모리 계산기 (context / chunk / KV 모드별 peak 메모리 예측).
   "memcalc.title": "메모리 계산기",
   "memcalc.noGeometry":
     "모델 '{model}'의 메모리 프로파일이 없습니다. 카탈로그의 네이티브 MLX 모델(예: Qwen3.6-35B, Gemma 4 26B-A4B)을 지원합니다.",
+  "memcalc.flashNext":
+    "Flash-Next는 전문가를 SSD에서 스트리밍하므로 메모리 계획과 설정은 위의 Flash-Next 카드에 있습니다.",
   "memcalc.active": "가중치 / active",
   "memcalc.active.hint":
     "작은 prefill 시 상주 가중치 메모리 — 추정의 기준점. 모델 실측값으로 미리 채워짐. 시작 로그 [mlx-mem] ... active=N GB 값으로 고치면 기기·양자화별 정확한 추정.",
@@ -520,6 +523,159 @@ export const ko: Record<string, string> = {
   "memcalc.applyBudget.hint":
     "이 예산을 서버 MLX memory_limit_gb(하드 한도)에도 기록. 끄면 예산은 계획용 입력값으로만 사용.",
 
+  // Flash-Next 메모리 계산기 (전문가 풀 vs 가장 긴 프롬프트; 전문가는 SSD에서 스트리밍).
+  "flashnext.geometry":
+    "Qwen 3.8 Flash-Next · 48 레이어 × 전문가 512 · 컨텍스트 토큰당 f32 KV {kb} KB",
+  "flashnext.thisMac": "이 Mac: RAM {ram} GB, GPU가 채울 수 있는 양은 약 {usable} GB.",
+  "flashnext.thisMac.limit": "(메모리 GB 설정 {n} GB로 제한됨.)",
+  "flashnext.tight":
+    "빠듯한 기기입니다: 따로 지정하지 않으면 {chunk}토큰 청크와 {ctx}토큰 프롬프트로 계획합니다.",
+  "flashnext.fits":
+    "들어갑니다: 상주 가중치 + 최소 풀 + {ctx}토큰 프롬프트의 예비분에 {need} GB가 필요합니다.",
+  "flashnext.noFit":
+    "들어가지 않습니다: 상주 가중치 + 최소 풀 + {ctx}토큰 프롬프트의 예비분에 {need} GB가 필요합니다. {chunk}토큰 청크 기준 {max} 토큰까지 들어가니 가장 긴 프롬프트나 청크를 줄이세요.",
+  "flashnext.noFitAny":
+    "빈 프롬프트로도 들어가지 않습니다: 이 Mac에는 RAM이 최소 {min} GB 필요합니다.",
+  "flashnext.pool": "전문가 풀",
+  "flashnext.pool.auto": "auto",
+  "flashnext.pool.hint":
+    "메모리에 상주시킬 전문가이며 나머지는 SSD에서 읽으므로 풀이 클수록 디코드가 빠릅니다. auto는 상주 가중치와 가장 긴 프롬프트의 예비분을 뺀 나머지라서, 프롬프트가 길수록 줄어듭니다.",
+  "flashnext.pool.floor": "서버가 실행되는 최소값 {floor} GB로 올려졌습니다.",
+  "flashnext.pool.oneRegion":
+    "{gb} GB 미만이면 풀이 스테이징 영역을 하나만 빌려주므로, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다(prefill이 느려질 뿐 실패하지 않음).",
+  "flashnext.chunk": "청크",
+  "flashnext.chunk.default": "기본",
+  "flashnext.card.title":
+    "FLASH-NEXT",
+  "flashnext.card.titleHint":
+    "(SSD에서 스트리밍하는 전문가)",
+  "flashnext.disabled":
+    "이 설정을 바꾸려면 Flash-Next 모델을 선택하세요.",
+  "flashnext.shadowed":
+    "환경 변수 오버라이드가 여기 설정을 대체합니다: {keys}. 오버라이드는 마지막에 적용되어 우선합니다.",
+  "flashnext.shadowed.clear":
+    "오버라이드 제거",
+  "flashnext.chunk.hint":
+    "prefill 한 단계의 토큰 수입니다. 그 활성값(토큰당 약 1.1 MB)이 풀에서 빠지며, 기본값은 이 Mac에 맞춰집니다.",
+  "flashnext.plan.title":
+    "메모리 계획",
+  "flashnext.context.hint":
+    "서버의 프롬프트 상한(LUMEN_MAX_PROMPT_TOKENS)입니다. 그 KV 캐시(토큰당 60 KB)가 풀에서 빠집니다. 칩을 고르면 저장되며, 지정하지 않으면 앱이 이 Mac의 기본값을 보냅니다.",
+  "flashnext.peak": "상주 / 사용 가능",
+  "flashnext.row.trunk": "상주 가중치",
+  "flashnext.row.pool": "전문가 풀",
+  "flashnext.row.buffers": "prefill 버퍼",
+  "flashnext.row.kv": "KV @ 프롬프트",
+  "flashnext.row.scores": "attention score",
+  "flashnext.overBy":
+    "GPU가 채울 수 있는 양을 {over} GB 초과: 풀을 {pool} GB 이하(auto가 주는 값)로 낮추거나 가장 긴 프롬프트를 줄이세요.",
+  "flashnext.autoPool": "이 프롬프트에서의 auto 풀:",
+  "flashnext.maxCtx.auto": "auto가 {floor} GB 하한에 닿기 전 가장 긴 프롬프트:",
+  "flashnext.maxCtx.manual": "이 풀 옆에 들어가는 가장 긴 프롬프트:",
+  "flashnext.speed.title": "풀 크기별 디코드 속도",
+  "flashnext.speed.estimate": "풀 {pool} GB에서: ≈ {tps} tok/s",
+  "flashnext.speed.withPack": "팩 사용 시 ≈ {tps}",
+  "flashnext.speed.below": "(실측 범위 아래는 외삽)",
+  "flashnext.speed.above": "(실측한 가장 큰 풀; 그 이상은 측정값 없음)",
+  "flashnext.speed.col.pool": "풀",
+  "flashnext.speed.col.shards": "tok/s",
+  "flashnext.speed.col.pack": "팩 사용",
+  "flashnext.speed.note":
+    "빠른 내장 SSD(무작위 읽기 약 6.5 GB/s)를 쓰는 36 GB M3 Max에서 측정. * 그 Mac의 메모리를 16 / 24 GB Mac의 워킹셋으로 제한해 실행한 값이며, 실제 작은 Mac은 자체 메모리 압박이 더해집니다. 디스크가 느리면 디코드도 느립니다. 진단의 SSD 테스트로 내 디스크를 측정하세요. Prefill(약 230 tok/s)은 풀 크기와 무관합니다.",
+  "flashnext.disk": "필요한 디스크",
+  "flashnext.disk.detail": "가중치 {model} GB",
+  "flashnext.disk.pack": "GB 전문가 팩",
+  "flashnext.disk.mtp": "GB 드래프트 헤드",
+  "flashnext.active": "현재:",
+  "flashnext.default": "기본",
+  "flashnext.on": "켬",
+  "flashnext.off": "끔",
+  "flashnext.choice.auto": "자동",
+  "flashnext.choice.off": "끔",
+  "flashnext.choice.on": "켬",
+  "flashnext.choice.build": "빌드",
+  "flashnext.choice.direct": "직접",
+  "flashnext.choice.buffered": "버퍼",
+  "flashnext.opt.pack": "전문가 팩",
+  "flashnext.opt.mtp": "드래프트 헤드",
+  "flashnext.opt.io": "전문가 읽기",
+  "flashnext.opt.lanes": "리더 스레드",
+  "flashnext.prompt": "가장 긴 프롬프트",
+  "flashnext.summary":
+    "실행 설정: 풀 {pool} GB ({how}), 프롬프트 최대 {prompt} 토큰, 전문가 팩 {pack}, 드래프트 헤드 {head}, 약 {tps} tok/s",
+  "flashnext.summary.auto": "자동",
+  "flashnext.summary.set": "직접 지정",
+  "flashnext.summary.noFit": "GPU 메모리에 들어가지 않습니다",
+  "flashnext.reset": "권장값으로 되돌리기",
+  "flashnext.reset.hint":
+    "이 카드의 모든 옵션을 서버 기본값으로 되돌립니다(해당 옵션은 아무것도 보내지 않음). 환경 변수 오버라이드는 건드리지 않습니다.",
+  "flashnext.pool.custom": "직접 입력…",
+  "flashnext.pool.custom.hint": "GB: 8, 8g, 8GB, 12.5g",
+  "flashnext.pool.custom.invalid": "크기가 아닙니다: 8, 8g, 12.5g처럼 입력하세요.",
+  "flashnext.pool.chip.auto":
+    "상주 가중치와 가장 긴 프롬프트의 예비분을 뺀 나머지로, 서버가 직접 정합니다.",
+  "flashnext.pool.chip.noFit":
+    "이 Mac에서는 {ctx} 토큰까지의 프롬프트와 함께 {gb} GB 풀이 들어가지 않습니다: {max} GB까지는 들어갑니다. 가장 긴 프롬프트를 줄이면 자리가 생깁니다(그렇지 않으면 서버가 풀을 낮추고 로그를 남깁니다).",
+  "flashnext.pool.active.auto": "자동 = 이 Mac에서 {pool} GB",
+  "flashnext.pool.active.set": "{pool} GB",
+  "flashnext.pool.lowered":
+    "{ctx} 토큰까지의 프롬프트와는 들어가지 않습니다: 서버가 약 {max} GB로 낮추고 로그를 남깁니다. 가장 긴 프롬프트를 줄이면 자리가 생깁니다.",
+  "flashnext.pool.noFitAuto": "이 프롬프트 길이에서는 가장 작은 풀조차 들어가지 않습니다.",
+  "flashnext.pool.legend":
+    "~ 추정 tok/s. * 더 작은 Mac을 흉내 내도록 메모리를 제한해 측정. † 실측 범위 아래는 외삽.",
+  "flashnext.prompt.custom.hint": "토큰 또는 K: 48k, 50000",
+  "flashnext.prompt.chip.default":
+    "{n} 토큰: 이 Mac의 기본값이며, 직접 지정하지 않으면 앱이 이 값을 보냅니다.",
+  "flashnext.prompt.chip.pool": "{n} 토큰까지의 프롬프트를 두면 자동 풀은 {gb} GB가 됩니다.",
+  "flashnext.prompt.chip.noFit":
+    "{n} 토큰까지의 프롬프트는 이 Mac에서 풀 자리를 남기지 않습니다: 풀이 하한 {floor} GB 아래로 떨어집니다.",
+  "flashnext.prompt.active": "{n} 토큰",
+  "flashnext.prompt.set": "직접 지정",
+  "flashnext.prompt.default": "이 Mac의 기본값",
+  "flashnext.prompt.pool": "자동 풀 {gb} GB",
+  "flashnext.prompt.noFitActive": "들어가지 않습니다.",
+  "flashnext.prompt.maxCtx": "최대 컨텍스트({n})가 상한이며, 더 길게 고르면 최대 컨텍스트를 올립니다.",
+  "flashnext.pack.mode.auto": "가중치 옆에 팩이 있으면 사용합니다.",
+  "flashnext.pack.mode.off": "팩을 쓰지 않고 배포된 샤드를 읽습니다.",
+  "flashnext.pack.mode.build": "팩이 없으면 서버 시작 시 만듭니다.",
+  "flashnext.pack.status.complete": "팩 있음: experts.lpack ({gb} GB), 디코드 약 10-20% 빠름.",
+  "flashnext.pack.inUse": "사용 중",
+  "flashnext.pack.unused": "끔 상태에서는 사용 안 함",
+  "flashnext.pack.status.incomplete":
+    "미완성 팩({gb} GB)이 디스크에 있고 서버는 이를 무시합니다. 빌드하면 새로 만듭니다.",
+  "flashnext.pack.status.absent": "아직 팩이 없습니다. 디스크 {need} GB가 필요하며 {free} GB가 비어 있습니다.",
+  "flashnext.pack.status.absentNoFree": "아직 팩이 없습니다. 디스크 {need} GB가 필요합니다.",
+  "flashnext.pack.status.notInstalled": "Flash-Next가 설치되어 있지 않습니다.",
+  "flashnext.pack.build": "전문가 팩 빌드",
+  "flashnext.pack.build.hint":
+    "백그라운드에서 모델에 lumen-server --pack-experts를 실행합니다. 내장 SSD에서 약 1분.",
+  "flashnext.pack.starting": "빌드를 시작하는 중…",
+  "flashnext.pack.building": "팩 빌드 중: {total}개 레이어 중 {n}번째",
+  "flashnext.pack.cancel": "취소",
+  "flashnext.pack.cancelled": "빌드가 취소되었습니다. 디스크에 남은 것은 없습니다.",
+  "flashnext.pack.failed": "빌드 실패:",
+  "flashnext.pack.built": "팩을 만들었습니다.",
+  "flashnext.pack.block.not_installed": "Flash-Next가 설치되어 있지 않습니다.",
+  "flashnext.pack.block.building": "이미 빌드가 실행 중입니다.",
+  "flashnext.pack.block.already_built": "팩이 이미 만들어져 있습니다.",
+  "flashnext.pack.block.server_running":
+    "먼저 서버를 중지하세요: 빌드는 같은 디스크에서 모델 전체를 읽습니다.",
+  "flashnext.pack.block.not_enough_disk": "여유 공간 {need} GB가 필요한데 이 볼륨에는 {free} GB뿐입니다.",
+  "flashnext.mtp.mode.auto": "mtp.safetensors가 있으면 드래프트 헤드를 사용합니다.",
+  "flashnext.mtp.mode.on": "드래프트 헤드를 필수로 합니다: 없으면 서버가 시작을 거부합니다.",
+  "flashnext.mtp.mode.off": "드래프트 헤드를 쓰지 않습니다: 일반 디코딩과 똑같은 텍스트.",
+  "flashnext.mtp.status.present": "mtp.safetensors가 있습니다.",
+  "flashnext.mtp.status.missing": "mtp.safetensors가 없습니다.",
+  "flashnext.mtp.status.missingOn": "mtp.safetensors가 없는데 켬으로 두면 서버가 시작을 거부합니다.",
+  "flashnext.mtp.fetch": "헤드(1.5 GB)를 모델 디렉터리에 한 번 내려받습니다.",
+  "flashnext.mtp.note": "이득은 작고(0-3%) 텍스트가 일반 디코딩과 비트 단위로 같지 않습니다.",
+  "flashnext.io.mode.auto": "자동: Mac의 여유 메모리가 약 12 GB를 넘는 동안 페이지 캐시를 사용합니다.",
+  "flashnext.io.mode.direct": "직접: 페이지 캐시를 우회하며 미스마다 SSD를 읽습니다.",
+  "flashnext.io.mode.buffered": "버퍼: 읽기가 페이지 캐시를 거칩니다.",
+  "flashnext.lanes.hint": "SSD에서 전문가를 읽는 스레드 수이며 기본값은 32입니다.",
+  "flashnext.settings.hint":
+    "고르는 즉시 저장됩니다. 재시작하면 반영됩니다.",
+
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
   // (캐시 모드/비트, ctx caps 등) 는 재시작 시점에만 반영됨.
@@ -555,6 +711,11 @@ export const ko: Record<string, string> = {
   "doctor.working": "처리 중…",
   "doctor.fixIt": "자동 해결",
   "doctor.failed": "실패:",
+  "doctor.ssd.run": "SSD 속도 테스트",
+  "doctor.ssd.cancel": "취소",
+  "doctor.ssd.cancelled": "SSD 테스트가 취소되었습니다.",
+  "doctor.ssd.note":
+    "Flash-Next는 전문가를 계속 SSD에서 읽습니다. 'SSD 속도 테스트'는 서버와 같은 방식으로 가중치 약 1 GB를 몇 초 동안 읽습니다. 같은 디스크를 쓰므로 서버를 먼저 중지하세요.",
 
   // ── 업데이트 패널 ───────────────────────────────────────────────
   "update.title": "Lumen 업데이트",
@@ -588,6 +749,11 @@ export const ko: Record<string, string> = {
   "doctor.check.port_free.name": "서버 포트",
   "doctor.check.active_model.name": "활성 모델",
   "doctor.check.huggingface.name": "Hugging Face 네트워크",
+  "doctor.check.flash_next_ram.name": "Flash-Next 메모리",
+  "doctor.check.flash_next_disk.name": "Flash-Next 디스크",
+  "doctor.check.flash_next_pack.name": "Flash-Next 전문가 팩",
+  "doctor.check.flash_next_mtp.name": "Flash-Next 드래프트 헤드",
+  "doctor.check.flash_next_ssd.name": "Flash-Next SSD",
 
   // ── 진단 메시지 템플릿 ──────────────────────────────────────────
   "doctor.msg.os_version.ok": "macOS",
@@ -615,6 +781,29 @@ export const ko: Record<string, string> = {
   "doctor.msg.huggingface.unexpected": "예상치 못한 상태 {code}",
   "doctor.msg.huggingface.unreachable": "연결 불가",
   "doctor.msg.huggingface.clientInitFailed": "HTTP 클라이언트 초기화 실패",
+  "doctor.msg.flash_next_ram.ok": "RAM {ram} GB: {ctx}토큰에서 전문가 풀 약 {pool} GB",
+  "doctor.msg.flash_next_ram.context":
+    "RAM {ram} GB: {ctx}토큰 컨텍스트는 들어가지 않음, {max}까지는 가능",
+  "doctor.msg.flash_next_ram.short": "RAM {ram} GB, Flash-Next는 약 {need} GB 필요",
+  "doctor.msg.flash_next_disk.built": "{free} GB 여유, 전문가 팩 이미 있음",
+  "doctor.msg.flash_next_disk.room": "{free} GB 여유, {pack} GB 전문가 팩을 만들 공간 있음",
+  "doctor.msg.flash_next_disk.noRoom": "{free} GB 여유, {pack} GB 전문가 팩에는 부족",
+  "doctor.msg.flash_next_disk.unknown": "여유 공간 확인 불가",
+  "doctor.msg.flash_next_pack.present": "experts.lpack 있음 ({gb} GB)",
+  "doctor.msg.flash_next_pack.absent": "전문가 팩 없음 (선택)",
+  "doctor.msg.flash_next_pack.incomplete": "experts.lpack 불완전 ({full} GB 중 {gb} GB)",
+  "doctor.msg.flash_next_mtp.present": "드래프트 헤드 있음 (mtp.safetensors)",
+  "doctor.msg.flash_next_mtp.off": "드래프트 헤드 있으나 꺼짐 (LUMEN_QWEN4_MTP=off)",
+  "doctor.msg.flash_next_mtp.absent": "드래프트 헤드 없음 (선택)",
+  "doctor.msg.flash_next_mtp.required": "LUMEN_QWEN4_MTP=on 인데 mtp.safetensors가 없음",
+  "doctor.msg.flash_next_ssd.fast":
+    "무작위 {rand} GB/s (순차 {seq} GB/s): 약 {tps} tok/s까지 충분히 빠름",
+  "doctor.msg.flash_next_ssd.slow": "무작위 {rand} GB/s (순차 {seq} GB/s): 느림, 약 {tps} tok/s",
+  "doctor.msg.flash_next_ssd.notInstalled": "Flash-Next가 설치되어 있지 않음",
+  "doctor.msg.flash_next_ssd.noShard": "읽을 가중치 샤드가 없음",
+  "doctor.msg.flash_next_ssd.readFailed": "읽기 실패",
+  "doctor.msg.flash_next_ssd.noRandom": "무작위 읽기를 측정하지 못함",
+  "doctor.msg.flash_next_ssd.stalled": "볼륨이 제때 응답하지 않음",
 
   // ── 진단 해결 안내 ──────────────────────────────────────────────
   "doctor.hint.os_version.warn":
@@ -656,10 +845,39 @@ export const ko: Record<string, string> = {
     "huggingface.co가 응답했지만 2xx/3xx가 아닙니다. 서비스가 저하되었을 수 있으며 다운로드가 실패할 수 있습니다.",
   "doctor.hint.huggingface.unreachable":
     "HF Hub를 통한 모델 다운로드가 실패합니다. 인터넷 연결, VPN, 프록시를 확인하세요.",
+  "doctor.hint.flash_next_ram.short":
+    "Flash-Next는 상주 가중치 3.6 GB, 최소 2.8 GB의 전문가 풀, prefill 예비분을 GPU가 쓸 수 있는 RAM 몫(32 GB까지 2/3, 그 위는 3/4이며 메모리 한도가 더 낮출 수 있음) 안에 둬야 합니다. 그보다 작으면 모델을 로드할 수 없습니다.",
+  "doctor.hint.flash_next_ram.context":
+    "가장 긴 프롬프트의 KV 캐시(토큰당 60 KB)가 GPU가 쓸 수 있는 RAM 몫에서 빠집니다. 앱은 직접 설정하지 않으면 LUMEN_MAX_PROMPT_TOKENS(16,384 토큰, 빠듯한 Mac은 8,192)를 보내며, 이는 최대 컨텍스트로 낮춰집니다. 이를 줄이거나(Flash-Next 메모리 계산기의 적용이 기록합니다) prefill 청크를 줄이고, 메모리 한도가 RAM보다 낮다면 올리세요.",
+  "doctor.hint.flash_next_disk.room":
+    "전문가 팩은 디코드를 10-20% 빠르게 합니다. 아래 명령으로 한 번 만들거나, LUMEN_MOE_PACK=build 로 설정하면 서버가 다음 시작 때 만듭니다.",
+  "doctor.hint.flash_next_disk.noRoom":
+    "전문가 팩은 선택 사항입니다. 사용하려면 이 볼륨에 약 70 GB를 확보한 뒤 아래 명령으로 만드세요.",
+  "doctor.hint.flash_next_pack.incomplete":
+    "서버는 미완성 팩을 무시하고 샤드에서 읽습니다. 삭제하고 다시 만드세요.",
+  "doctor.hint.flash_next_mtp.required":
+    "드래프트 헤드가 없으면 서버는 LUMEN_QWEN4_MTP=on 으로 시작하지 않습니다. 아래 명령으로 헤드(1.5 GB)를 받거나 오버라이드를 제거하세요.",
+  "doctor.hint.flash_next_mtp.absent":
+    "드래프트 헤드(1.5 GB, 한 번만 다운로드)는 서버가 스텝마다 두 번째 토큰을 추측하게 합니다. 여기서는 이득이 0-3%이고 일반 디코딩과 텍스트가 조금 달라집니다.",
+  "doctor.hint.flash_next_ssd.slow":
+    "디코드 속도는 SSD가 전문가 읽기를 얼마나 빨리 처리하느냐로 정해집니다. 모델을 Mac 내장 SSD에 두거나(외장·네트워크 드라이브는 보통 2 GB/s 미만), 전문가 풀에 메모리를 더 주세요.",
+  "doctor.hint.flash_next_ssd.stalled":
+    "읽기가 테스트 제한 시간보다 오래 걸렸습니다. 가중치가 네트워크나 절전 중인 외장 드라이브에 있을 수 있습니다. 디코드는 계속 읽으므로 모델을 Mac 내장 SSD에 두세요.",
 
   // ── 진단 상세 ───────────────────────────────────────────────────
   "doctor.detail.active_model.incomplete":
     "필수 파일 (config.json + safetensors/gguf 샤드 1개 이상)이 누락되었습니다.",
+  "doctor.detail.flash_next_ram":
+    "전문가 풀은 GPU가 쓸 수 있는 RAM 몫에서 상주 가중치 3.6 GB와 prefill 예비분(버퍼, 청크 활성값, 가장 긴 프롬프트의 KV 캐시(토큰당 60 KB), attention score)을 뺀 나머지입니다. 프롬프트 상한이 길수록 줄고, 풀이 클수록 토큰당 SSD 읽기가 줄어듭니다.",
+  "doctor.detail.flash_next_ram.oneRegion":
+    "4.2 GB 미만이면 풀이 스테이징 영역을 하나만 둘 수 있어, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다.",
+  "doctor.detail.flash_next_pack.absent":
+    "팩이 없으면 서버는 전문가 하나를 가중치 샤드의 흩어진 9개 범위로 읽습니다. 팩은 같은 바이트를 전문가당 레코드 하나로 저장합니다.",
+  "doctor.detail.flash_next_ssd":
+    "페이지 캐시를 우회해 {shard}에서 {total} MB 읽음: 앞에서부터 {seq} MB, 이어서 서버가 전문가를 가져오는 방식 그대로 스레드 4개로 {rec} MB 무작위 읽기 {reads}회({rand} MB). 디코드 속도는 36 GB M3 Max(SSD {ref} GB/s)에서 측정한 표를 이 볼륨의 속도로 환산한 값이며, 메모리 계획이 이 Mac에 남기는 약 {pool} GB 전문가 풀 기준입니다.",
+  "doctor.detail.flash_next_ssd.pack": "전문가 팩으로 측정한 표를 사용했습니다.",
+  "doctor.detail.flash_next_ssd.early":
+    "테스트가 제한 시간에 도달해 일찍 멈췄습니다. 속도는 그때까지 읽은 양으로 계산했습니다.",
 
   // ── 프롬프트 과대 / OOM 가드 모달 ──────────────────────────────
   "oom.title": "이 모델에 비해 프롬프트가 너무 큽니다",

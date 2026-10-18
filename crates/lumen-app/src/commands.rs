@@ -2,13 +2,18 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::catalog::Catalog;
 use crate::config::{
-    AdvancedConfig, ContextConfig, PersistentConfig, QuantConfig, ServerConfig, config_dir,
+    AdvancedConfig, ContextConfig, FlashNextConfig, PersistentConfig, QuantConfig, ServerConfig,
+    config_dir,
 };
-use crate::doctor::{self, DoctorReport};
+use crate::doctor::{self, CheckResult, DoctorReport};
 use crate::models::{self, DownloadProgress, ModelEntry};
+use crate::pack_build::{self, EVENT_PACK, FlashNextStatus};
 use crate::server::{self, ServerStatus, TYPED_ENV_KEYS};
 use crate::state::AppState;
 use crate::sysinfo::{self, MemoryUsage, SystemInfo};
@@ -69,6 +74,16 @@ pub async fn update_advanced_config(
     advanced: AdvancedConfig,
 ) -> CmdResult<PersistentConfig> {
     update_with(&state, |c| c.advanced = advanced).await
+}
+
+/// Saves the Flash-Next card's settings. The values are only ever sent to a Flash-Next server
+/// (`server.rs`), so storing them while another model is selected changes nothing there.
+#[tauri::command]
+pub async fn update_flash_next_config(
+    state: State<'_, AppState>,
+    flash_next: FlashNextConfig,
+) -> CmdResult<PersistentConfig> {
+    update_with(&state, |c| c.flash_next = flash_next).await
 }
 
 #[tauri::command]
@@ -578,4 +593,114 @@ pub async fn doctor_fix(state: State<'_, AppState>, action: String) -> CmdResult
     let cfg = g.clone();
     drop(g);
     doctor::try_fix(&action, &cfg).await
+}
+
+/// How long the SSD read test may take before the app stops waiting for it. The
+/// test's own budget is shorter (`ProbePlan::DEFAULT`); this is for a volume
+/// that stalls inside a single read, which no between-reads check can interrupt.
+const SSD_PROBE_HARD_LIMIT: Duration = Duration::from_secs(9);
+
+/// Flash-Next's SSD read test (~1 GB). Separate from `doctor_run` because it is
+/// slow and heavy on the disk: it runs only when the user asks. `None` means it
+/// was cancelled; the panel then leaves the report alone.
+#[tauri::command]
+pub async fn doctor_probe_ssd(state: State<'_, AppState>) -> CmdResult<Option<CheckResult>> {
+    let cfg = state.config.lock().await.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut slot = state.ssd_probe.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return Err("the SSD speed test is already running".to_string());
+        }
+        *slot = Some(Arc::clone(&cancel));
+    }
+    let worker = {
+        let cancel = Arc::clone(&cancel);
+        tokio::task::spawn_blocking(move || doctor::probe_flash_next_ssd(&cfg, &cancel))
+    };
+    let out = match tokio::time::timeout(SSD_PROBE_HARD_LIMIT, worker).await {
+        Ok(joined) => joined.map_err(err),
+        Err(_) => {
+            // The read cannot be interrupted, but the thread stops at its next check.
+            cancel.store(true, Ordering::Relaxed);
+            Ok(Some(doctor::flash_next_ssd_stalled()))
+        }
+    };
+    *state.ssd_probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    out
+}
+
+#[tauri::command]
+pub async fn doctor_probe_cancel(state: State<'_, AppState>) -> CmdResult<()> {
+    if let Some(cancel) = state
+        .ssd_probe
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+// ── Flash-Next expert pack ─────────────────────────────────────────────
+
+/// Whether the server is up (or coming up): a pack build reads the whole model from the same
+/// disk and is refused then.
+async fn server_busy(state: &AppState) -> bool {
+    matches!(
+        state.supervisor.status().await.state,
+        server::LifecycleState::Running | server::LifecycleState::Starting
+    )
+}
+
+/// What the Flash-Next settings show about the model on disk: the pack, the draft head, the
+/// space the pack needs, and whether a build may start.
+#[tauri::command]
+pub async fn flash_next_status(state: State<'_, AppState>) -> CmdResult<FlashNextStatus> {
+    let cfg = state.config.lock().await.clone();
+    let busy = server_busy(&state).await;
+    let building = state.pack_builder.is_running().await;
+    tokio::task::spawn_blocking(move || pack_build::status(&cfg, busy, building))
+        .await
+        .map_err(err)
+}
+
+/// Start building the expert pack in the background (`lumen-server --pack-experts <model dir>`,
+/// the same binary `start_server` resolves). Progress and the outcome arrive as `lumen://pack`
+/// events; the refusals (server running, under 70 GB free, already built) come back as errors.
+#[tauri::command]
+pub async fn start_pack_build(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let cfg = state.config.lock().await.clone();
+    let busy = server_busy(&state).await;
+    let building = state.pack_builder.is_running().await;
+    let (status, bin) = tokio::task::spawn_blocking(move || {
+        let status = pack_build::status(&cfg, busy, building);
+        let bin = server::resolve_binary_public(cfg.server_binary_path.as_deref());
+        (status, bin)
+    })
+    .await
+    .map_err(err)?;
+    if let Some(block) = status.build_block {
+        return Err(pack_build::block_message(block, status.free_bytes));
+    }
+    let dir = status
+        .dir
+        .ok_or_else(|| "Flash-Next is not installed".to_string())?;
+    let bin = bin.map_err(err)?;
+    let emitter = app.clone();
+    let emit: pack_build::Emit = Arc::new(move |progress| {
+        let _ = emitter.emit(EVENT_PACK, progress);
+    });
+    state
+        .pack_builder
+        .start(bin, std::path::PathBuf::from(dir), emit)
+        .await
+        .map_err(err)
+}
+
+/// Stop the running pack build; it removes its partial file. `false` when none runs.
+#[tauri::command]
+pub async fn cancel_pack_build(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.pack_builder.cancel().await)
 }

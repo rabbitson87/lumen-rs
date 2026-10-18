@@ -12,7 +12,8 @@ pub struct ModelEntry {
     pub id: String,
     /// Absolute path to the model directory.
     pub path: PathBuf,
-    /// Total size of weight files in bytes.
+    /// Total size of weight files in bytes. The expert pack and draft head a Flash-Next
+    /// directory gains later are not weights and are left out (see `DERIVED_FILES`).
     pub size_bytes: u64,
     /// `true` if this directory looks like a complete HF snapshot
     /// (`config.json` + at least one `.safetensors`).
@@ -35,6 +36,31 @@ pub struct ModelEntry {
     /// model directory.
     #[serde(default)]
     pub local_sha: Option<String>,
+}
+
+/// Files a model directory gains after download that are not part of its weights: the expert
+/// pack the server builds from the shards (68 GB for Flash-Next) and the draft head fetched
+/// alongside them. They count against the disk, not against what the model is: this size
+/// becomes `LUMEN_WIRED_LIMIT_BYTES`, and a pack would put ~70 GB on a 97 GB model.
+const DERIVED_FILES: &[&str] = &["experts.lpack", "mtp.safetensors", "mtp.json"];
+
+/// Total size of the model's weight files under `path` (the first four levels), without the
+/// derived files above. `follow_links` stays off, so symlinks in HF snapshots aren't counted
+/// twice.
+fn weights_size_bytes(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            !DERIVED_FILES
+                .iter()
+                .any(|d| e.file_name().to_str() == Some(*d))
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// File where we persist the HF Hub commit SHA at download time. Sits next
@@ -175,14 +201,7 @@ fn scan_hf_hub_cache(catalog: &Catalog) -> Result<Vec<ModelEntry>> {
                     .unwrap_or(false)
             });
         let shards_complete = verify_shards_complete(&snap);
-        let size_bytes: u64 = WalkDir::new(&path)
-            .max_depth(4)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum();
+        let size_bytes = weights_size_bytes(&path);
         let rec = catalog.find_recommended(&id);
         let local_sha = read_sha_marker(&snap);
         out.push(ModelEntry {
@@ -280,16 +299,8 @@ pub fn scan_local(models_dir: &Path, catalog: &Catalog) -> Result<Vec<ModelEntry
         // closes the app before all shards finish.
         let shards_complete = verify_shards_complete(&scan_dir);
         // Size is summed from the original entry path (covers both HF blobs/
-        // and flat layout). `follow_links=false` (the default) so symlinks
-        // in HF snapshots aren't double-counted.
-        let size_bytes: u64 = WalkDir::new(&path)
-            .max_depth(4)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum();
+        // and flat layout), derived files (expert pack, draft head) excluded.
+        let size_bytes = weights_size_bytes(&path);
         let rec = catalog.find_recommended(&id);
         let local_sha = read_sha_marker(&scan_dir);
         out.push(ModelEntry {
@@ -531,7 +542,7 @@ fn verify_shard_filename_completeness(scan_dir: &Path) -> Option<bool> {
 /// Locate the active snapshot directory inside an `models--<org>--<repo>/`
 /// HF cache entry. Tries `refs/main` first (the canonical pointer), then
 /// falls back to the first available `snapshots/*` directory.
-fn resolve_hf_snapshot(hf_dir: &Path) -> Option<PathBuf> {
+pub fn resolve_hf_snapshot(hf_dir: &Path) -> Option<PathBuf> {
     let refs_main = hf_dir.join("refs").join("main");
     if let Ok(sha) = std::fs::read_to_string(&refs_main) {
         let sha = sha.trim();
@@ -1054,5 +1065,90 @@ mod tests {
         let actual = std::fs::metadata(&path).unwrap().len();
         assert_ne!(expected, actual);
         assert!(!safetensors_size_matches(&path));
+    }
+    /// A Flash-Next directory with its shipped weights, and optionally the two files added later.
+    fn flash_next_dir(models: &Path, derived: bool) -> PathBuf {
+        let dir = models.join("pipenetwork--Qwen3.8-Flash-Next-MLX-4bit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        std::fs::write(dir.join("model-00001.safetensors"), vec![1u8; 4000]).unwrap();
+        std::fs::write(dir.join("model-00002.safetensors"), vec![1u8; 6000]).unwrap();
+        if derived {
+            std::fs::write(dir.join("experts.lpack"), vec![2u8; 70_000]).unwrap();
+            std::fs::write(dir.join("mtp.safetensors"), vec![3u8; 1500]).unwrap();
+            std::fs::write(dir.join("mtp.json"), b"{}").unwrap();
+        }
+        dir
+    }
+
+    /// `size_bytes` becomes `LUMEN_WIRED_LIMIT_BYTES`, and the SERVER card prints it. With the
+    /// pack built the directory is 165 GB, ~70 GB of it a layout of bytes already counted.
+    #[test]
+    fn the_expert_pack_and_draft_head_are_not_part_of_the_models_size() {
+        let models = tmpdir("size-derived");
+        let dir = flash_next_dir(&models, true);
+        // config.json is 2 bytes; the pack, head and its json are left out.
+        assert_eq!(weights_size_bytes(&dir), 2 + 4000 + 6000);
+        std::fs::remove_dir_all(&models).ok();
+    }
+
+    #[test]
+    fn building_the_pack_does_not_change_the_size_the_scan_reports() {
+        let without = tmpdir("size-before");
+        flash_next_dir(&without, false);
+        let with = tmpdir("size-after");
+        flash_next_dir(&with, true);
+        let size = |dir: &Path| {
+            let entries = scan_local(dir, &Catalog::default()).unwrap();
+            let e = entries
+                .iter()
+                .find(|e| e.id.contains("Flash-Next"))
+                .unwrap();
+            (e.ready, e.size_bytes)
+        };
+        assert_eq!(size(&without), (true, 10_002));
+        assert_eq!(size(&with), size(&without));
+        std::fs::remove_dir_all(&without).ok();
+        std::fs::remove_dir_all(&with).ok();
+    }
+
+    /// Only the derived names are skipped: a weights file that merely resembles one still counts.
+    #[test]
+    fn a_file_with_a_similar_name_still_counts() {
+        let models = tmpdir("size-similar");
+        let dir = flash_next_dir(&models, false);
+        std::fs::write(dir.join("experts.lpack.part"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("mtp-extra.safetensors"), vec![0u8; 50]).unwrap();
+        assert_eq!(weights_size_bytes(&dir), 2 + 4000 + 6000 + 100 + 50);
+        std::fs::remove_dir_all(&models).ok();
+    }
+
+    /// The path the SERVER card's "(exact)" wired limit takes: scan -> `start_server` -> env.
+    #[test]
+    fn the_wired_limit_a_launch_asks_for_excludes_the_pack() {
+        use crate::config::PersistentConfig;
+        use crate::server::{ServeKind, launch_env};
+        let models = tmpdir("wired");
+        flash_next_dir(&models, true);
+        let entries = scan_local(&models, &Catalog::default()).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.id.contains("Flash-Next"))
+            .unwrap();
+        let mut cfg = PersistentConfig::default();
+        cfg.server.wired_limit_gb = None;
+        cfg.server.disable_wired_limit = false;
+        let env = launch_env(
+            &cfg,
+            &entry.path.to_string_lossy(),
+            Some(entry.size_bytes),
+            None,
+            ServeKind::Chat,
+        );
+        assert_eq!(
+            env.get("LUMEN_WIRED_LIMIT_BYTES").map(String::as_str),
+            Some("10002")
+        );
+        std::fs::remove_dir_all(&models).ok();
     }
 }

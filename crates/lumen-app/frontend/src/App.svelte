@@ -6,6 +6,7 @@
     onLog,
     onStatus,
     onDownload,
+    onPack,
     type PersistentConfig,
     type ModelEntry,
     type ServerStatus,
@@ -16,12 +17,25 @@
     type Catalog,
     type RecommendedModel,
     type SystemInfo,
+    type FlashNextSettings,
+    type FlashNextStatus,
+    type PackProgress,
     type MemoryUsage,
     type CorsMode,
   } from "./lib/api";
   import EnvOverrides from "./lib/EnvOverrides.svelte";
+  import FlashNextCard from "./lib/FlashNextCard.svelte";
   import MemoryCalculator from "./lib/MemoryCalculator.svelte";
-  import type { ModelFamily } from "./lib/memory-estimate";
+  import {
+    FLASH_NEXT_DEFAULTS,
+    flashNextEnv,
+    flashNextFits,
+    flashNextMaxContext,
+    flashNextSettingsEnabled,
+    flashNextUsableBytes,
+    isFlashNextModelId,
+    type ModelFamily,
+  } from "./lib/memory-estimate";
   import DoctorPanel from "./lib/DoctorPanel.svelte";
   import UpdatePanel from "./lib/UpdatePanel.svelte";
   import ApiTabs from "./lib/ApiTabs.svelte";
@@ -142,6 +156,9 @@
   let typedEnvKeys = $state<Set<string>>(new Set());
   let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
   let systemInfo = $state<SystemInfo | null>(null);
+  // The Flash-Next model on disk (pack, draft head, free space) and the latest pack build report.
+  let flashStatus = $state<FlashNextStatus | null>(null);
+  let packBuild = $state<PackProgress | null>(null);
   let memoryUsage = $state<MemoryUsage | null>(null);
   let selectedRecommend = $state<string>("");
 
@@ -224,6 +241,21 @@
       console.warn("check_model_updates failed:", e);
     }
   }
+
+  // Family of the model that is selected or being served, when it is one with settings of its own.
+  // `null` = none.
+  let activeFamily = $derived(
+    isFlashNextModelId(config?.active_model) ||
+      ((status.state === "running" || status.state === "starting") &&
+        isFlashNextModelId(status.model_id))
+      ? "qwen4-exp"
+      : null,
+  );
+
+  // The Flash-Next card works only while the Flash-Next model is the selected one (the model
+  // picker's choice, so it can be set up before the server starts). Its stored values are
+  // kept either way.
+  let flashNextEnabled = $derived(flashNextSettingsEnabled(config?.active_model));
 
   // Active model + derived hints (bits, recommended memory caps).
   let activeModel = $derived.by(() => {
@@ -314,11 +346,28 @@
     return `${stage}${suffix}`;
   });
 
+  // The memory cap (GiB) a launch hands the server (`LUMEN_MEMORY_LIMIT_GB`): an override
+  // wins, then the SERVER card's value, then the server's own 32. `null` when the caps are off.
+  let flashNextMemoryLimitGb = $derived.by(() => {
+    if (!config) return null;
+    const over = Number(config.env_overrides.LUMEN_MEMORY_LIMIT_GB);
+    if (over > 0) return over;
+    return config.server.disable_wired_limit ? null : (config.server.memory_limit_gb ?? 32);
+  });
+
   // Realistic max-context budget. Assumes ~2 GB free for KV after model +
   // overhead on the host Mac, scaled by the TurboQuant compression ratio.
   // Returns rounded K-tokens (e.g. 32 for 32 768 tokens).
   let realisticMaxCtxK = $derived.by(() => {
     if (!systemInfo || !activeModel) return null;
+    if (isFlashNextModelId(activeModel.id)) {
+      // The 97 GB on disk is not what has to fit — the experts stream from the SSD. The longest
+      // prompt this Mac can hold is what the smallest expert pool leaves (f32 KV, no quant).
+      const launchEnv = flashNextEnv(config?.flash_next ?? FLASH_NEXT_DEFAULTS, config?.env_overrides ?? {});
+      const chunk = Number(launchEnv.LUMEN_QWEN35_PREFILL_CHUNK) || null;
+      const usable = flashNextUsableBytes(systemInfo.ram_gb, flashNextMemoryLimitGb);
+      return Math.round(flashNextMaxContext(usable, chunk) / 1024);
+    }
     const modelGb = activeModel.size_bytes / 1024 ** 3;
     const overheadGb = 3; // server + tokenizer + activations
     const freeForKv = Math.max(0.5, systemInfo.ram_gb - modelGb - overheadGb);
@@ -330,6 +379,10 @@
   // `memory_limit_gb` ServerConfig field is still usize so we ceil() at save.
   let recommendedMemoryGbExact = $derived.by(() => {
     if (!activeModel || !config) return null;
+    // Flash-Next is not resident, so "model + 2 + KV" would ask for 100+ GB. The server lowers
+    // any limit to its share of the GPU working set anyway; 85% of RAM is the app's usual
+    // ceiling (`ram_defaults`) and leaves that clamp to decide.
+    if (isFlashNextModelId(activeModel.id) && systemInfo) return systemInfo.ram_gb * 0.85;
     const modelGb = activeModel.size_bytes / 1024 ** 3;
     const ctx = config.context.max ?? 81920;
     return modelGb + 2 + kvEstimateGb(ctx);
@@ -351,16 +404,25 @@
   // Apple Silicon machine we've measured.
   let recommendedCacheGb = $derived.by(() => (recommendedMemoryGb ? 2 : null));
 
+  // Whether this Mac can run a catalog entry. Flash-Next's 97 GB is mostly streamed from the
+  // SSD, so it is the trunk + smallest pool + one prefill chunk that must fit the GPU's share
+  // of RAM, not the file size (the catalog's `min_ram_gb` stays the other families' rule).
+  function recFits(r: RecommendedModel): boolean {
+    if (!systemInfo) return true;
+    return r.family === "qwen4-exp"
+      ? flashNextFits(systemInfo.ram_gb)
+      : r.min_ram_gb <= systemInfo.ram_gb;
+  }
+
   let availableRecommended = $derived.by(() => {
     const have = new Set(models.map((m) => m.id));
-    const ram = systemInfo?.ram_gb ?? Infinity;
     // Sort: fits-in-RAM first (ascending min_ram_gb), then over-budget last.
     return catalog.recommended
       .filter((r) => !have.has(r.id))
       .slice()
       .sort((a, b) => {
-        const aOk = a.min_ram_gb <= ram ? 0 : 1;
-        const bOk = b.min_ram_gb <= ram ? 0 : 1;
+        const aOk = recFits(a) ? 0 : 1;
+        const bOk = recFits(b) ? 0 : 1;
         if (aOk !== bOk) return aOk - bOk;
         return a.min_ram_gb - b.min_ram_gb;
       });
@@ -381,6 +443,7 @@
   let unlistenLog: (() => void) | undefined;
   let unlistenStatus: (() => void) | undefined;
   let unlistenDownload: (() => void) | undefined;
+  let unlistenPack: (() => void) | undefined;
   let pollHandle: ReturnType<typeof setInterval> | undefined;
 
   onMount(async () => {
@@ -500,6 +563,19 @@
       }
     });
 
+    // The expert-pack build reports per layer. Its end changes what is on disk, so the status
+    // and the Doctor's rows are read again.
+    unlistenPack = await onPack((p) => {
+      packBuild = p;
+      if (p.state !== "running") {
+        refreshFlashStatus();
+        api.doctorRun().then((r) => (doctorReport = r)).catch(() => {});
+      } else if (flashStatus && !flashStatus.building) {
+        flashStatus = { ...flashStatus, building: true };
+      }
+    });
+    refreshFlashStatus();
+
     try {
       memoryUsage = await api.getMemoryUsage();
     } catch (e) {
@@ -520,6 +596,7 @@
     unlistenLog?.();
     unlistenStatus?.();
     unlistenDownload?.();
+    unlistenPack?.();
     if (pollHandle) clearInterval(pollHandle);
   });
 
@@ -775,6 +852,82 @@
     next = await api.updateEnvOverrides({ ...next.env_overrides, ...envPatch });
     config = next;
     savedToast();
+  }
+
+  async function refreshFlashStatus() {
+    try {
+      flashStatus = await api.flashNextStatus();
+    } catch (e) {
+      console.warn("flash_next_status failed:", e);
+    }
+  }
+
+  // Whether the server is up changes whether the pack can be built, and a model that finished
+  // downloading may be the Flash-Next one.
+  $effect(() => {
+    void status.state;
+    void models.length;
+    refreshFlashStatus();
+  });
+
+  async function startPackBuild() {
+    packBuild = null;
+    await api.startPackBuild();
+    await refreshFlashStatus();
+  }
+
+  async function cancelPackBuild() {
+    await api.cancelPackBuild();
+  }
+
+  // The Flash-Next card: each choice is stored as a typed setting (`[flash_next]`), saved straight
+  // away; an option's default is stored as unset, which sends nothing to the server. The longest
+  // prompt is the server's prompt cap, which its memory plan reads, lowered to Max context. Max
+  // context is the model's own cap, so it is left alone unless it is below the chosen prompt,
+  // which the server would then reject.
+  //
+  // Writes are queued: each one starts from the config the one before it saved, so two choices
+  // made in quick succession both land.
+  let flashNextWrites: Promise<void> = Promise.resolve();
+  function queueFlashNextWrite(write: () => Promise<void>): void {
+    flashNextWrites = flashNextWrites.then(write).catch((e) => {
+      statusMessage = String(e);
+    });
+  }
+
+  function setFlashNext(patch: Partial<FlashNextSettings>): void {
+    queueFlashNextWrite(() => writeFlashNext(patch));
+  }
+
+  function resetFlashNext(): void {
+    queueFlashNextWrite(() => writeFlashNext({ ...FLASH_NEXT_DEFAULTS }));
+  }
+
+  async function writeFlashNext(patch: Partial<FlashNextSettings>) {
+    if (!config || !flashNextEnabled) return;
+    const tokens = patch.max_prompt_tokens ?? null;
+    if (tokens != null && config.context.max < tokens) {
+      config = await api.updateContextConfig({ ...config.context, max: tokens });
+    }
+    // An override of Max context below the prompt would lower the plan to it.
+    const maxCtx = config.env_overrides.LUMEN_MAX_CTX;
+    if (tokens != null && maxCtx != null && !(Number(maxCtx) >= tokens)) {
+      config = await api.updateEnvOverrides({ ...config.env_overrides, LUMEN_MAX_CTX: String(tokens) });
+    }
+    config = await api.updateFlashNextConfig({ ...(config.flash_next ?? FLASH_NEXT_DEFAULTS), ...patch });
+    await syncTunedMemoryCaps();
+    savedToast();
+  }
+
+  // Remove env overrides that replace the card's settings (they are applied last, so they win).
+  function clearFlashNextOverrides(keys: string[]): void {
+    queueFlashNextWrite(async () => {
+      if (!config) return;
+      const next = { ...config.env_overrides };
+      for (const key of keys) delete next[key];
+      config = await api.updateEnvOverrides(next);
+      savedToast();
+    });
   }
 
   async function saveEnvOverrides(next: Record<string, string>) {
@@ -1172,6 +1325,28 @@
     </div>
   </section>
 
+  <!-- FLASH-NEXT: always listed, operable only while the Flash-Next model is the selected one -->
+  {#if config}
+  <section class="{cardBase} col-span-6">
+    <h2 class={cardH2}>{t("flashnext.card.title")} <span class="dim">{t("flashnext.card.titleHint")}</span></h2>
+    <FlashNextCard
+      settings={config.flash_next ?? FLASH_NEXT_DEFAULTS}
+      overrides={config.env_overrides}
+      enabled={flashNextEnabled}
+      ramGb={systemInfo?.ram_gb}
+      memoryLimitGb={flashNextMemoryLimitGb}
+      contextMax={config.context.max}
+      status={flashStatus}
+      build={packBuild}
+      onChange={setFlashNext}
+      onReset={resetFlashNext}
+      onClearOverrides={clearFlashNextOverrides}
+      onBuild={startPackBuild}
+      onCancelBuild={cancelPackBuild}
+    />
+  </section>
+  {/if}
+
   <!-- CONTEXT -->
   <section class="{cardBase} col-span-6">
     <h2 class={cardH2}>{t("context.title")} <span class="dim">{t("context.titleHint")}</span></h2>
@@ -1218,7 +1393,7 @@
           <div class="dim">
             {t("context.recommended")} ({systemInfo?.ram_gb} GB):
             <b class="text-text">~{realisticMaxCtxK}K {t("context.recommended.suffix")}</b>
-            {#if config.quant.kv_mode === "off"}
+            {#if config.quant.kv_mode === "off" && activeFamily !== "qwen4-exp"}
               <span class="text-warn">{t("context.warn.turnOnKvQuant")}</span>
             {/if}
           </div>
@@ -1529,7 +1704,7 @@
       <select bind:value={selectedRecommend}>
         <option value="" disabled>{t("models.picker.placeholder")}</option>
         {#each availableRecommended as r}
-          {@const fits = !systemInfo || r.min_ram_gb <= systemInfo.ram_gb}
+          {@const fits = recFits(r)}
           <option value={r.id}>
             {fits ? "" : "⚠ "}{r.label} · {r.approx_size_gb}GB · ≥{r.min_ram_gb}GB RAM
           </option>
@@ -2009,6 +2184,7 @@
         value={config.env_overrides}
         typedKeys={typedEnvKeys}
         onSave={saveEnvOverrides}
+        flashNextActive={flashNextEnabled}
       />
     </div>
   {/if}
@@ -2017,6 +2193,10 @@
       <DoctorPanel
         report={doctorReport}
         onReport={(r) => (doctorReport = r)}
+        flashStatus={flashStatus}
+        packBuild={packBuild}
+        onBuildPack={startPackBuild}
+        onCancelPackBuild={cancelPackBuild}
       />
     </div>
   {/if}
