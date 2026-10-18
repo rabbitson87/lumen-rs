@@ -385,6 +385,20 @@ impl Qwen4ExpConfig {
     }
 
     /// Rotated dimensions of each head (`head_dim * partial_rotary_factor`).
+    /// Bytes of cache one token of context takes: K and V (f32) of every full-attention layer
+    /// and the indexer's key, plus the same for the draft head's one layer.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let full_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::FullAttention)
+            .count() as u64
+            + 1;
+        let per_layer =
+            (2 * self.num_key_value_heads * self.head_dim * 4 + self.indexer_head_dim * 4) as u64;
+        full_layers * per_layer
+    }
+
     pub fn rotary_dim(&self) -> usize {
         (self.head_dim as f32 * self.partial_rotary_factor) as usize
     }

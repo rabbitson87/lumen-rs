@@ -70,6 +70,14 @@ pub mod metal_memory {
         set_memory_limit, set_wired_limit,
     };
 
+    /// The MLX memory limit in force (what the server or an embedder last set), read by setting
+    /// it and putting it back: the bindings expose no getter.
+    pub fn memory_limit() -> Option<usize> {
+        let prev = set_memory_limit(usize::MAX).ok()?;
+        set_memory_limit(prev).ok()?;
+        Some(prev)
+    }
+
     /// Starts a new peak window: the next [`get_peak_memory`] reports the
     /// high-water mark since this call. mlx-rs wraps the getter but not this.
     pub fn reset_peak_memory() {
@@ -1966,7 +1974,7 @@ impl MlxBackend {
     /// not env-capped here, so only the operator prompt cap applies).
     pub fn max_context(&self) -> Option<usize> {
         match self {
-            Self::Qwen35Family(_) => None,
+            Self::Qwen35Family(m) => m.max_context(),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(m) => Some(m.max_context()),
         }
@@ -4486,6 +4494,16 @@ impl MlxQwen35Backend {
 
     pub fn alloc_seq_id(&self) -> u64 {
         self.next_seq_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The longest prompt the loaded runner's memory is planned for, when it plans for one
+    /// (Flash-Next sizes its expert pool around it); `None` leaves only the operator's cap.
+    pub fn max_context(&self) -> Option<usize> {
+        #[cfg(feature = "mlx-native")]
+        if let RunnerImpl::Qwen4Exp(r) = &self.runner {
+            return Some(r.max_context());
+        }
+        None
     }
 
     pub fn eos_tokens(&self) -> &[u32] {

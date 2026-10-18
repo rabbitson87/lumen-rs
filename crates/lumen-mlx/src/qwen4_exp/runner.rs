@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Array;
 
+use super::config::Qwen4ExpConfig;
 use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpCache, Qwen4ExpModel};
 use crate::kv_disk::{DiskKvStore, KvManifest};
 use crate::session_feed::PrefillGrid;
@@ -203,6 +204,8 @@ pub(crate) struct Qwen4ExpRunner {
     snapshots: HashMap<u64, (Qwen4ExpCache, usize)>,
     next_snapshot: u64,
     chunk: usize,
+    /// Longest prompt the memory is planned for (`LUMEN_MAX_PROMPT_TOKENS`).
+    ctx_tokens: usize,
     /// L2 tier (`LUMEN_KV_DISK`): session states at prefill-grid points, so a
     /// restarted server resumes a conversation without reading the model again.
     disk: Option<DiskKvStore>,
@@ -218,8 +221,20 @@ pub(crate) struct Qwen4ExpRunner {
 /// (measured on an 18K-token prompt, 6.7 GB pool: 234 / 232-241 / 227 tok/s at chunks of 512 /
 /// 2,048 / 4,096, where feeding chunk by chunk gave 73 / 153 / 145). The chunk only sets the
 /// activation memory (and how close to a conversation's end a persisted state can sit), so it
-/// is small: a chunk's memory is what the pool gives up.
+/// is small: a chunk's memory is what the pool gives up. A Mac that can hardly hold the model
+/// takes half of it.
 const PREFILL_CHUNK: usize = 1024;
+const TIGHT_PREFILL_CHUNK: usize = 512;
+
+/// Longest prompt the memory is planned for. The server rejects longer ones (it reads the same
+/// `LUMEN_MAX_PROMPT_TOKENS`), and raising it takes the KV cache's share out of the pool.
+const CONTEXT_TOKENS: usize = 16_384;
+const TIGHT_CONTEXT_TOKENS: usize = 8_192;
+
+/// A GPU that may use less than this is "tight" (a 16 GB Mac: ~9.4 GB): the model barely fits
+/// and every reserve is trimmed (smaller chunk and context, a smaller scores budget). A 24 GB
+/// Mac (~14 GB) is not.
+const TIGHT_BELOW: u64 = 11_000_000_000;
 
 /// What the resident trunk (embeddings, attention, DeltaNet, hyper-connections,
 /// routers, shared experts) occupies.
@@ -238,19 +253,80 @@ fn chunk_cuts(start: usize, len: usize, chunk: usize) -> Vec<usize> {
     cuts
 }
 
-/// Memory a prefill chunk needs beyond the trunk and the expert pool: ~1.1 MB
-/// per token (measured: a 2,460-token chunk peaked 2.5 GB above trunk + pool, a
-/// 1,024-token one 1.3 GB) plus slack for MLX's buffer cache.
-fn prefill_reserve(chunk: usize) -> u64 {
-    2_000_000_000 + chunk as u64 * 1_100_000
+/// What the memory is spent on, for a GPU that may use `usable` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryPlan {
+    chunk: usize,
+    /// Longest prompt in tokens the plan holds the KV cache and attention scores for.
+    ctx_tokens: usize,
+    /// Most bytes of attention scores a chunk holds at once (longer contexts attend in blocks).
+    scores_budget: u64,
+    /// Memory a prefill needs beyond the trunk and the expert pool.
+    reserve: u64,
+    /// What is left for the expert pool.
+    pool: u64,
 }
 
-/// The chunk and the expert pool for a Mac whose GPU may use `usable` bytes: what the working
-/// set leaves after the trunk and one chunk's activations.
-fn plan_memory(usable: u64, chunk_override: Option<usize>) -> (usize, u64) {
-    let chunk = chunk_override.unwrap_or(PREFILL_CHUNK);
-    let pool = usable.saturating_sub(TRUNK_BYTES + prefill_reserve(chunk));
-    (chunk, pool)
+/// Memory a prefill needs beyond the trunk and the pool: ~0.6 GB of fixed buffers, ~1.1 MB per
+/// chunk token of activations (measured: a 2,460-token chunk peaked 2.5 GB above trunk + pool, a
+/// 1,024-token one 1.3 GB), the KV cache of the longest prompt, and half the attention scores
+/// (the measured peak at an 18K-token context was 2.56 GB all told, scores included).
+fn prefill_reserve(chunk: usize, ctx_tokens: usize, kv_per_token: u64, scores: u64) -> u64 {
+    600_000_000 + chunk as u64 * 1_100_000 + ctx_tokens as u64 * kv_per_token + scores / 2
+}
+
+/// The chunk, the context and the expert pool for a Mac whose GPU may use `usable` bytes: what
+/// the working set leaves after the trunk and a prefill's reserve.
+fn plan_memory(
+    usable: u64,
+    cfg: &Qwen4ExpConfig,
+    chunk_override: Option<usize>,
+    ctx_override: Option<usize>,
+) -> MemoryPlan {
+    let tight = usable < TIGHT_BELOW;
+    let chunk = chunk_override.unwrap_or(if tight {
+        TIGHT_PREFILL_CHUNK
+    } else {
+        PREFILL_CHUNK
+    });
+    let ctx_tokens = ctx_override.unwrap_or(if tight {
+        TIGHT_CONTEXT_TOKENS
+    } else {
+        CONTEXT_TOKENS
+    });
+    let scores_budget: u64 = if tight { 800_000_000 } else { 2_000_000_000 };
+    // What a chunk against the whole context would hold, capped by the budget it is blocked to.
+    let scores =
+        (cfg.num_attention_heads as u64 * chunk as u64 * ctx_tokens as u64 * 4).min(scores_budget);
+    let reserve = prefill_reserve(chunk, ctx_tokens, cfg.kv_bytes_per_token(), scores);
+    MemoryPlan {
+        chunk,
+        ctx_tokens,
+        scores_budget,
+        reserve,
+        pool: usable.saturating_sub(TRUNK_BYTES + reserve),
+    }
+}
+
+/// The longest prompt the server will accept, which the memory is planned for: its prompt cap
+/// (`LUMEN_MAX_PROMPT_TOKENS`, else the legacy `LUMEN_PREFILL_CHUNK`; the same order its prompt
+/// guard reads them in), lowered to `LUMEN_MAX_CTX` when that is smaller. `LUMEN_MAX_CTX` alone
+/// does not raise it: the guard would still reject a prompt over the cap, and the desktop app
+/// always sets it (to 81,920), which must not turn a 16K plan into an 80K one.
+fn context_override() -> Option<usize> {
+    let number = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&c| c > 0)
+    };
+    let cap = number("LUMEN_MAX_PROMPT_TOKENS").or_else(|| number("LUMEN_PREFILL_CHUNK"));
+    match (cap, number("LUMEN_MAX_CTX")) {
+        (Some(cap), Some(ctx)) => Some(cap.min(ctx)),
+        (Some(cap), None) => Some(cap),
+        (None, Some(ctx)) => Some(ctx.min(CONTEXT_TOKENS)),
+        (None, None) => None,
+    }
 }
 
 /// The rows of `[1, N, vocab]` f32 logits on the host.
@@ -306,45 +382,96 @@ fn chunk_override() -> Option<usize> {
         .filter(|&c| c > 0)
 }
 
-/// Bytes of expert pool: `LUMEN_MOE_EXPERT_CACHE_GB` (a number of GB, or `auto`),
-/// and when unset what the GPU working set leaves after the trunk and a prefill
-/// chunk's activations. Holding all experts in memory is not an option on a Mac
-/// (they are 68 GB).
-fn expert_budget_bytes(usable: u64, chunk: usize, auto: u64) -> Result<u64> {
-    if let Ok(raw) = std::env::var("LUMEN_MOE_EXPERT_CACHE_GB") {
-        let raw = raw.trim();
-        if !raw.is_empty() && !raw.eq_ignore_ascii_case("auto") {
-            let gb: f64 = raw
-                .parse()
-                .ok()
-                .filter(|g: &f64| g.is_finite() && *g > 0.0)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "LUMEN_MOE_EXPERT_CACHE_GB={raw:?} is not a positive number of GB or `auto`"
-                    )
-                })?;
-            let bytes = (gb * 1e9) as u64;
-            if bytes + TRUNK_BYTES + prefill_reserve(chunk) > usable {
-                eprintln!(
-                    "[qwen4_exp] WARNING: a {gb} GB pool plus the trunk and a {chunk}-token prefill \
-                     chunk needs {:.1} GB; this GPU allows {:.1} GB, so a long prompt may fail with \
-                     `Insufficient Memory`. Lower the pool or LUMEN_QWEN35_PREFILL_CHUNK.",
-                    (bytes + TRUNK_BYTES + prefill_reserve(chunk)) as f64 / 1e9,
-                    usable as f64 / 1e9
-                );
-            }
-            return Ok(bytes);
-        }
+/// A pool size as an operator writes it: `auto` (or nothing) for the planned one, else a number
+/// of GB with an optional unit: `8`, `8g`, `8GB`, `12.5 g`, `512m`, `512MB` (decimal units, like
+/// the rest of the sizes printed here).
+fn parse_pool_size(raw: &str) -> Result<Option<u64>> {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        return Ok(None);
     }
-    Ok(auto)
+    let lower = t.to_ascii_lowercase();
+    let (number, per_unit) =
+        if let Some(n) = lower.strip_suffix("gb").or_else(|| lower.strip_suffix('g')) {
+            (n, 1e9)
+        } else if let Some(n) = lower.strip_suffix("mb").or_else(|| lower.strip_suffix('m')) {
+            (n, 1e6)
+        } else {
+            (lower.as_str(), 1e9)
+        };
+    let value: f64 = number
+        .trim()
+        .parse()
+        .ok()
+        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| {
+            anyhow!(
+                "LUMEN_MOE_EXPERT_CACHE_GB={raw:?} is not a size like `8`, `8g`, `12GB` or `512m`, or `auto`"
+            )
+        })?;
+    Ok(Some((value * per_unit) as u64))
+}
+
+/// Slack allowed over the planned pool before an explicit request is lowered: the plan's own
+/// reserve is conservative, and the sizes people write are round.
+const POOL_OVERSHOOT_OK: u64 = 500_000_000;
+
+/// The pool an operator asked for, lowered to what fits beside the trunk and a prefill's
+/// reserve. A request that does not fit would not fail at load but halfway through a long prompt,
+/// when the GPU runs out of memory, so it is lowered here (and said so), never run.
+fn fit_pool(requested: u64, usable: u64, plan: &MemoryPlan) -> u64 {
+    let fits = usable.saturating_sub(TRUNK_BYTES + plan.reserve);
+    if requested <= fits + POOL_OVERSHOOT_OK {
+        return requested;
+    }
+    eprintln!(
+        "[qwen4_exp] a {:.1} GB expert pool does not fit: this GPU may use {:.1} GB, the trunk \
+         takes {:.1} and a {}-token prompt (chunk {}) {:.1}, which leaves {:.1} GB. Using that. \
+         A smaller LUMEN_MAX_PROMPT_TOKENS leaves more for the pool.",
+        requested as f64 / 1e9,
+        usable as f64 / 1e9,
+        TRUNK_BYTES as f64 / 1e9,
+        plan.ctx_tokens,
+        plan.chunk,
+        plan.reserve as f64 / 1e9,
+        fits as f64 / 1e9
+    );
+    fits
+}
+
+/// Bytes of expert pool: `LUMEN_MOE_EXPERT_CACHE_GB` (a size, or `auto`), and when unset what the
+/// GPU working set leaves after the trunk and a prefill's reserve. Holding all experts in memory
+/// is not an option on a Mac (they are 68 GB).
+fn expert_budget_bytes(usable: u64, plan: &MemoryPlan) -> Result<u64> {
+    let raw = std::env::var("LUMEN_MOE_EXPERT_CACHE_GB").unwrap_or_default();
+    Ok(match parse_pool_size(&raw)? {
+        Some(requested) => fit_pool(requested, usable, plan),
+        None => plan.pool,
+    })
 }
 
 impl Qwen4ExpRunner {
     pub(crate) fn load(dir: &Path) -> Result<(Self, LoadInfo)> {
         let ws = crate::metal_memory::working_set_limit().unwrap_or(16_000_000_000) as f64;
-        let usable = (ws * crate::metal_memory::WORKING_SET_SHARE) as u64;
-        let (chunk, auto_pool) = plan_memory(usable, chunk_override());
-        let budget = expert_budget_bytes(usable, chunk, auto_pool)?;
+        let mut usable = (ws * crate::metal_memory::WORKING_SET_SHARE) as u64;
+        // An operator who capped MLX's memory plans within it. The server applies
+        // `LUMEN_MEMORY_LIMIT_GB` (GiB) after the model is loaded, so read it here as well.
+        let capped = std::env::var("LUMEN_MEMORY_LIMIT_GB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|gib| gib << 30)
+            .into_iter()
+            .chain(crate::metal_memory::memory_limit().map(|l| l as u64))
+            .min();
+        if let Some(limit) = capped
+            && limit < usable
+        {
+            usable = limit;
+        }
+        let cfg = Qwen4ExpConfig::load(dir)?;
+        let plan = plan_memory(usable, &cfg, chunk_override(), context_override());
+        let (chunk, ctx_tokens) = (plan.chunk, plan.ctx_tokens);
+        let budget = expert_budget_bytes(usable, &plan)?;
         // The draft head's experts go through the pool, so the head costs next to no memory; the
         // governor measures whether drafts pay and stops them when they do not.
         let mode = mtp_mode_from_env()?;
@@ -357,8 +484,9 @@ impl Qwen4ExpRunner {
         }
         let use_head = head_there && mode != MtpMode::Off;
         eprintln!(
-            "[qwen4_exp] GPU may use {:.1} GB: expert pool {:.2} GB, prefill chunk {chunk} tokens \
-             (LUMEN_MOE_EXPERT_CACHE_GB / LUMEN_QWEN35_PREFILL_CHUNK override){}",
+            "[qwen4_exp] GPU may use {:.1} GB: expert pool {:.2} GB, prefill chunk {chunk} tokens, \
+             prompts up to {ctx_tokens} tokens (LUMEN_MOE_EXPERT_CACHE_GB / LUMEN_QWEN35_PREFILL_CHUNK / \
+             LUMEN_MAX_PROMPT_TOKENS override){}",
             usable as f64 / 1e9,
             budget as f64 / 1e9,
             if use_head { ", MTP draft head on" } else { "" }
@@ -369,6 +497,7 @@ impl Qwen4ExpRunner {
                 mtp: if use_head { MtpMode::On } else { MtpMode::Off },
                 expert_budget_bytes: Some(budget),
                 ngram: NgramSource::Auto,
+                scores_budget_bytes: 0,
             },
         )
         .with_context(|| format!("qwen4_exp: load `{}`", dir.display()))?;
@@ -400,6 +529,7 @@ impl Qwen4ExpRunner {
                 snapshots: HashMap::new(),
                 next_snapshot: 1,
                 chunk,
+                ctx_tokens,
                 disk,
                 fingerprint,
                 spec,
@@ -438,6 +568,7 @@ impl Qwen4ExpRunner {
         } else {
             self.seq(seq_id, "feed")?.position
         };
+        self.check_context(start, tokens.len())?;
         let cuts = chunk_cuts(start, tokens.len(), self.chunk);
         if tokens.is_empty() || !cuts.contains(&mark) {
             return Ok(None);
@@ -476,6 +607,26 @@ impl Qwen4ExpRunner {
             }
         }
         Ok(Some((next, position)))
+    }
+
+    /// Refuse to take a prompt the memory was not planned for, before any of it is computed: the
+    /// KV cache and attention scores would not fit, and the failure would come as a GPU abort.
+    fn check_context(&self, have: usize, adding: usize) -> Result<()> {
+        if have + adding > self.ctx_tokens {
+            bail!(
+                "qwen4_exp: a context of {} tokens is more than the {} this machine's memory is \
+                 planned for; shorten the conversation, or raise LUMEN_MAX_PROMPT_TOKENS (the \
+                 expert pool shrinks to make room)",
+                have + adding,
+                self.ctx_tokens
+            );
+        }
+        Ok(())
+    }
+
+    /// Longest prompt, in tokens, the memory is planned for.
+    pub(crate) fn max_context(&self) -> usize {
+        self.ctx_tokens
     }
 
     fn argmax(logits: &Array) -> Result<u32> {
@@ -779,6 +930,7 @@ impl Runner for Qwen4ExpRunner {
     }
 
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.check_context(0, tokens.len())?;
         let mut cache = self.model.make_cache();
         let logits = self.forward_chunked(tokens, &mut cache)?;
         let next = Self::argmax(&logits)?;
@@ -825,6 +977,8 @@ impl Runner for Qwen4ExpRunner {
 
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         // Feed a clone: a failed forward leaves the sequence exactly as it was.
+        let have = self.seq(seq_id, "extend")?.position;
+        self.check_context(have, tokens.len())?;
         let seq = self.seq(seq_id, "extend")?;
         seq.pending = None;
         let mut cache = seq.cache.clone();
@@ -921,23 +1075,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pool_is_what_the_working_set_leaves_after_the_trunk_and_a_chunk() {
-        // 36 GB Mac: 30.2 GB working set x 0.88. trunk + chunk reserve (3.6 + 2 + 1.1 GB).
-        let (chunk, pool) = plan_memory(26_600_000_000, None);
-        assert_eq!(chunk, 1024);
-        assert!((19_500_000_000..20_500_000_000).contains(&pool), "{pool}");
-        // 24 GB Mac: ~16 GB working set x 0.88.
-        let (_, pool) = plan_memory(14_100_000_000, None);
-        assert!(pool > 6_000_000_000, "{pool}");
-        // Too little memory: the pool is zero and the slot floor takes over.
-        assert_eq!(plan_memory(4_000_000_000, None).1, 0);
+    fn a_pool_size_is_a_number_with_an_optional_unit() {
+        let gb = |s: &str| parse_pool_size(s).unwrap();
+        assert_eq!(gb("auto"), None);
+        assert_eq!(gb(""), None);
+        assert_eq!(gb("  AUTO "), None);
+        assert_eq!(gb("8"), Some(8_000_000_000));
+        assert_eq!(gb("8g"), Some(8_000_000_000));
+        assert_eq!(gb("8GB"), Some(8_000_000_000));
+        assert_eq!(gb("12.5 g"), Some(12_500_000_000));
+        assert_eq!(gb("512m"), Some(512_000_000));
+        assert_eq!(gb("512 MB"), Some(512_000_000));
+        for bad in ["0", "-4g", "eight", "4 terabytes", "g", "NaN", "inf"] {
+            assert!(parse_pool_size(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
-    fn an_explicit_chunk_is_honoured_and_changes_the_pool() {
-        let (chunk, smaller) = plan_memory(26_600_000_000, Some(4096));
-        assert_eq!(chunk, 4096);
-        assert!(smaller < plan_memory(26_600_000_000, None).1);
+    fn a_pool_that_does_not_fit_is_lowered_to_what_does() {
+        let cfg = real_config();
+        // The 24 GB-class plan: ~6.9 GB left after the trunk and the reserve.
+        let plan = plan_memory(14_100_000_000, &cfg, None, None);
+        let fits = plan.pool;
+        assert_eq!(
+            fit_pool(4_000_000_000, 14_100_000_000, &plan),
+            4_000_000_000
+        );
+        assert_eq!(fit_pool(fits, 14_100_000_000, &plan), fits);
+        // Round numbers a little over the plan are taken as written.
+        assert_eq!(
+            fit_pool(fits + 400_000_000, 14_100_000_000, &plan),
+            fits + 400_000_000
+        );
+        // 12 GB on a 24 GB Mac is not.
+        assert_eq!(fit_pool(12_000_000_000, 14_100_000_000, &plan), fits);
+        // A shorter longest prompt leaves more room for the same request.
+        let short = plan_memory(14_100_000_000, &cfg, None, Some(4_096));
+        assert!(fit_pool(12_000_000_000, 14_100_000_000, &short) > fits);
+    }
+
+    fn real_config() -> Qwen4ExpConfig {
+        // Flash-Next's shapes: 48 layers, every fourth full attention, 2 KV heads of 256, an
+        // indexer key of 128, 24 heads.
+        let mut cfg = Qwen4ExpConfig::load(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/qwen4exp_tiny"),
+        )
+        .unwrap();
+        cfg.layer_kinds = (0..48)
+            .map(|i| {
+                if i % 4 == 3 {
+                    super::super::config::LayerKind::FullAttention
+                } else {
+                    super::super::config::LayerKind::LinearAttention
+                }
+            })
+            .collect();
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 256;
+        cfg.indexer_head_dim = 128;
+        cfg.num_attention_heads = 24;
+        cfg
+    }
+
+    #[test]
+    fn the_pool_is_what_the_working_set_leaves_after_the_trunk_and_the_reserve() {
+        let cfg = real_config();
+        assert_eq!(
+            cfg.kv_bytes_per_token(),
+            13 * (2 * 2 * 256 * 4 + 128 * 4) as u64
+        );
+        // 36 GB Mac: 30.2 GB working set x 0.88.
+        let plan = plan_memory(26_600_000_000, &cfg, None, None);
+        assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
+        assert!(
+            (19_000_000_000..20_100_000_000).contains(&plan.pool),
+            "{plan:?}"
+        );
+        // 24 GB Mac: ~16 GB working set x 0.88.
+        let plan = plan_memory(14_100_000_000, &cfg, None, None);
+        assert_eq!(plan.chunk, 1024);
+        assert!(plan.pool > 6_500_000_000, "{plan:?}");
+        // A 16 GB Mac takes the tight settings and still has a pool that holds a staging region
+        // and a layer (2 x 512 experts x 2.76 MB).
+        let plan = plan_memory(9_400_000_000, &cfg, None, None);
+        assert_eq!(
+            (plan.chunk, plan.ctx_tokens, plan.scores_budget),
+            (512, 8_192, 800_000_000)
+        );
+        assert!(plan.pool > 2_850_000_000, "{plan:?}");
+        // Too little memory: the pool is zero and the slot floor takes over.
+        assert_eq!(plan_memory(4_000_000_000, &cfg, None, None).pool, 0);
+    }
+
+    #[test]
+    fn a_longer_context_or_a_bigger_chunk_takes_its_memory_out_of_the_pool() {
+        let cfg = real_config();
+        let base = plan_memory(26_600_000_000, &cfg, None, None);
+        let longer = plan_memory(26_600_000_000, &cfg, None, Some(65_536));
+        // 48K more tokens of 60 KB each: ~2.9 GB of KV, and the scores stay at their budget.
+        assert!(
+            base.pool - longer.pool > 2_800_000_000,
+            "{base:?} {longer:?}"
+        );
+        assert!(base.pool - longer.pool < 4_200_000_000);
+        let bigger = plan_memory(26_600_000_000, &cfg, Some(4096), None);
+        assert!(bigger.pool < base.pool);
     }
 
     fn tiny_runner(chunk: usize) -> Qwen4ExpRunner {
@@ -953,6 +1196,7 @@ mod tests {
                 expert_budget_bytes: budget,
                 ngram: NgramSource::Auto,
                 mtp,
+                scores_budget_bytes: 0,
             },
         )
         .expect("tiny replica");
@@ -971,6 +1215,7 @@ mod tests {
             snapshots: HashMap::new(),
             next_snapshot: 0,
             chunk,
+            ctx_tokens: 1_000_000,
             disk: None,
             fingerprint: String::new(),
             spec,

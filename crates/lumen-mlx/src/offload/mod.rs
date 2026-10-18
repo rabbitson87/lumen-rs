@@ -111,13 +111,12 @@ impl IoTuning {
     }
 }
 
-/// How many slots a pool of `budget_bytes` has, never fewer than the two staging regions plus
-/// one layer's worth beside them: a call that touches most of a layer's experts but not enough
-/// to take the staging path must still fit, and below `MIN_SLOTS` not even decode does.
+/// How many slots a pool of `budget_bytes` has, never fewer than one staging region plus one
+/// layer's worth beside it: a call that touches most of a layer's experts but not enough to take
+/// the staging path must still fit, and below `MIN_SLOTS` not even decode does. A pool with room
+/// for a second region (three layers' worth) gets it, and with it prefetching of the next layer.
 fn pool_slot_count(budget_bytes: u64, per_expert: u64, total: usize, widest_layer: usize) -> usize {
-    let floor = ((STAGING_REGIONS + 1) * widest_layer)
-        .max(MIN_SLOTS)
-        .min(total);
+    let floor = (2 * widest_layer).max(MIN_SLOTS).min(total);
     ((budget_bytes / per_expert.max(1)) as usize).clamp(floor, total)
 }
 
@@ -137,9 +136,17 @@ mod slot_count_tests {
     }
 
     #[test]
-    fn a_tiny_budget_still_holds_two_staging_regions_and_a_layer() {
-        assert_eq!(pool_slot_count(0, 100, 10_240, 256), 768);
-        assert_eq!(pool_slot_count(5_000, 100, 10_240, 256), 768);
+    fn a_tiny_budget_still_holds_a_staging_region_and_a_layer() {
+        assert_eq!(pool_slot_count(0, 100, 10_240, 256), 512);
+        assert_eq!(pool_slot_count(5_000, 100, 10_240, 256), 512);
+    }
+
+    #[test]
+    fn a_second_region_needs_three_layers_of_slots() {
+        use super::expert_bank::{STAGING_REGIONS, regions_for};
+        assert_eq!(regions_for(512, 256), 1);
+        assert_eq!(regions_for(767, 256), 1);
+        assert_eq!(regions_for(768, 256), STAGING_REGIONS);
     }
 
     #[test]
@@ -336,7 +343,7 @@ impl MoeOffload {
         if n_slots as u64 * per > budget_bytes && n_slots < total {
             eprintln!(
                 "[offload] the {:.2} GB budget is below the {:.2} GB the smallest pool needs \
-                 ({STAGING_REGIONS} staging regions of {widest} experts plus one layer); using that.",
+                 (a staging region of {widest} experts plus one layer); using that.",
                 budget_bytes as f64 / 1e9,
                 n_slots as f64 * per as f64 / 1e9,
             );
@@ -472,14 +479,20 @@ impl MoeOffload {
             Self::settle_inflight(&mut st, bank)?;
         }
         let mut cold = false;
-        let region = match st.loaded.iter().position(|l| *l == Some(layer)) {
+        let region = match st.loaded[..bank.regions()]
+            .iter()
+            .position(|l| *l == Some(layer))
+        {
             Some(r) => r,
             None => {
                 // Nothing staged for this layer (the first of a pass, or an earlier call
                 // died mid-way): read it now, into a region not holding a layer still needed.
                 cold = true;
                 Self::settle_inflight(&mut st, bank)?;
-                let r = st.loaded.iter().position(|l| l.is_none()).unwrap_or(0);
+                let r = st.loaded[..bank.regions()]
+                    .iter()
+                    .position(|l| l.is_none())
+                    .unwrap_or(0);
                 st.loaded[r] = None;
                 let load = bank.begin_region_load(r, layer)?;
                 bank.finish_region_load(load)?;
@@ -491,8 +504,12 @@ impl MoeOffload {
         // Read the next layer into the other region now, unless an earlier call of this layer
         // already did (a prefill feeds several chunks through one layer). That region held the
         // previous layer, whose gathers finished before this call's routing readback returned.
-        let other = 1 - region;
-        if let Some(next) = bank.layer_after(layer) {
+        // With a single region there is nothing to prefetch into: the next layer's first call
+        // reads it on the spot.
+        if bank.regions() > 1
+            && let Some(next) = bank.layer_after(layer)
+        {
+            let other = 1 - region;
             let queued = st.loaded[other] == Some(next)
                 || st.inflight.as_ref().is_some_and(|l| l.layer == next);
             if !queued {

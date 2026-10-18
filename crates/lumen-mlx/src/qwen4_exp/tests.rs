@@ -276,6 +276,7 @@ fn serving_the_ngram_table_from_disk_matches_holding_it_in_memory() {
         expert_budget_bytes: None,
         ngram,
         mtp: MtpMode::Off,
+        scores_budget_bytes: 0,
     };
     let run = |model: &Qwen4ExpModel| -> Vec<f32> {
         let mut cache = model.make_cache();
@@ -591,6 +592,7 @@ fn load_with_head(dir: &std::path::Path, budget: Option<u64>) -> Qwen4ExpModel {
             expert_budget_bytes: budget,
             ngram: NgramSource::Auto,
             mtp: MtpMode::On,
+            scores_budget_bytes: 0,
         },
     )
     .expect("load the replica with its draft head")

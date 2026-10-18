@@ -549,6 +549,8 @@ pub struct Qwen4ExpModel {
     /// The MTP draft head, when its weights are next to the checkpoint and `LoadOptions::mtp`
     /// allows it.
     mtp: Option<MtpHead>,
+    /// See [`LoadOptions::scores_budget_bytes`].
+    scores_budget: u64,
     /// `ones(hidden)`, the weight of a group norm whose scale is applied afterwards.
     ones_hidden: Array,
 }
@@ -766,7 +768,18 @@ pub struct LoadOptions {
     pub ngram: NgramSource,
     /// Load the MTP draft head (`mtp.safetensors`) when present.
     pub mtp: MtpMode,
+    /// Most bytes of attention scores a prefill chunk may hold at once (0 = the default,
+    /// [`DEFAULT_SCORES_BUDGET`]): a chunk against a long context is attended in blocks of query
+    /// rows so the scores (`heads x rows x context x 4 B`) stay under it.
+    pub scores_budget_bytes: u64,
 }
+
+/// Fewest query rows attended together: a block this small is all kernel launches.
+const MIN_ATTENTION_ROWS: i64 = 64;
+
+/// Scores a chunk may hold at once when nothing says otherwise: an 18K-token context against a
+/// 1,024-token chunk is 1.8 GB and runs in one piece.
+const DEFAULT_SCORES_BUDGET: u64 = 2_000_000_000;
 
 impl Qwen4ExpModel {
     /// Load a checkpoint directory. `expert_budget_bytes` serves the routed
@@ -779,6 +792,7 @@ impl Qwen4ExpModel {
                 expert_budget_bytes,
                 ngram: NgramSource::Auto,
                 mtp: MtpMode::Off,
+                scores_budget_bytes: 0,
             },
         )
     }
@@ -919,6 +933,11 @@ impl Qwen4ExpModel {
             lm_head,
             offload,
             mtp,
+            scores_budget: if options.scores_budget_bytes == 0 {
+                DEFAULT_SCORES_BUDGET
+            } else {
+                options.scores_budget_bytes
+            },
             ones_hidden,
         })
     }
@@ -1117,6 +1136,39 @@ fn load_ple(
         table,
         dilation: cfg.ngram_size as i32,
     })
+}
+
+/// `sdpa_with_mask`, `rows` query rows at a time. A row's attention does not depend on the
+/// other rows, so blocks are the same attention in pieces; each block's scores are freed before
+/// the next block's are made, which bounds them by `heads x rows x kv_len x 4` bytes.
+fn sdpa_with_mask_in_blocks(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: &Array,
+    rows: i64,
+) -> Result<Array> {
+    let s = i64::from(q.shape()[2]);
+    if rows >= s {
+        return sdpa_with_mask(q, k, v, scale, mask);
+    }
+    let mut blocks = Vec::with_capacity((s / rows + 1) as usize);
+    let mut r0 = 0i64;
+    while r0 < s {
+        let r1 = (r0 + rows).min(s);
+        let range = (r0 as i32)..(r1 as i32);
+        blocks.push(sdpa_with_mask(
+            &q.try_index((.., .., range.clone(), ..))?,
+            k,
+            v,
+            scale,
+            &mask.try_index((.., .., range, ..))?,
+        )?);
+        r0 = r1;
+    }
+    let refs: Vec<&Array> = blocks.iter().collect();
+    Ok(mlx_rs::ops::concatenate_axis(&refs, 2)?)
 }
 
 // ---- forward -------------------------------------------------------------------------------
@@ -1766,7 +1818,13 @@ impl Qwen4ExpModel {
         let scale = (hd as f32).powf(-0.5);
         let attn = match &sparse {
             // The mask is boolean and already causal.
-            Some(mask) => sdpa_with_mask(&q, &k_all, &v_all, scale, mask)?,
+            Some(mask) => {
+                let kv_len = k_all.shape()[2] as i64;
+                // Query rows attended together: the scores are `heads x rows x kv_len` f32.
+                let rows = (self.scores_budget as i64 / (i64::from(nh) * kv_len * 4).max(1))
+                    .max(MIN_ATTENTION_ROWS);
+                sdpa_with_mask_in_blocks(&q, &k_all, &v_all, scale, mask, rows)?
+            }
             None => sdpa(&q, &k_all, &v_all, scale, s > 1)?,
         };
         let attn = mlx_rs::ops::transpose_axes(&attn, &[0, 2, 1, 3])?;
@@ -1959,5 +2017,40 @@ mod convention_tests {
         assert!(norms_are_centered(0.2833), "HF-centered build");
         assert!(!norms_are_centered(1.2833), "folded build");
         assert!(!norms_are_centered(1.0), "random replica around one");
+    }
+}
+
+#[cfg(test)]
+mod attention_block_tests {
+    use super::*;
+
+    /// Attending 200 query rows in blocks gives the attention of all of them at once (to the
+    /// rounding of a differently shaped matmul), for a causal-ish boolean mask.
+    #[test]
+    fn query_blocks_are_the_same_attention_in_pieces() {
+        mlx_rs::random::seed(3).unwrap();
+        let (h, kvh, s, kv, d) = (4, 2, 200, 300, 32);
+        let q = mlx_rs::random::normal::<f32>(&[1, h, s, d], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, kvh, kv, d], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, kvh, kv, d], None, None, None).unwrap();
+        // Query i sees the first 100 + i keys.
+        let pos = Array::from_slice(&(0..kv).collect::<Vec<i32>>(), &[1, 1, kv]);
+        let lim = Array::from_slice(&(0..s).map(|i| 100 + i).collect::<Vec<i32>>(), &[1, s, 1]);
+        let mask = mlx_rs::ops::expand_dims(mlx_rs::ops::lt(&pos, &lim).unwrap(), 1).unwrap();
+        let whole = sdpa_with_mask_in_blocks(&q, &k, &v, 0.25, &mask, 1_000).unwrap();
+        for rows in [64, 70, 199] {
+            let pieces = sdpa_with_mask_in_blocks(&q, &k, &v, 0.25, &mask, rows).unwrap();
+            assert_eq!(pieces.shape(), whole.shape());
+            let diff = mlx_rs::ops::abs(mlx_rs::ops::subtract(&pieces, &whole).unwrap())
+                .unwrap()
+                .max(None)
+                .unwrap();
+            diff.eval().unwrap();
+            assert!(
+                diff.item::<f32>() < 1e-5,
+                "rows {rows}: {}",
+                diff.item::<f32>()
+            );
+        }
     }
 }

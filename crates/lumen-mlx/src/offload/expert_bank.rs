@@ -52,6 +52,8 @@ pub(crate) struct ExpertBank {
     /// Slots in a staging region: the widest layer's expert count. The two regions are the
     /// last `2 * width` slots of the pool.
     width: usize,
+    /// How many staging regions the pool lends (1 or [`STAGING_REGIONS`]).
+    regions: usize,
     /// Whether the staging blocks are borrowed from the map right now.
     staging: bool,
     /// Experts a staging load copied from the pool instead of reading from the SSD.
@@ -64,6 +66,17 @@ pub(crate) struct ExpertBank {
 /// prefill runs and handed back (empty) when decoding resumes, so they cost no memory of their
 /// own and the experts outside them keep their place through a prefill.
 pub(crate) const STAGING_REGIONS: usize = 2;
+
+/// Regions a pool of `n_slots` can lend: two when there is room for them and a layer's worth of
+/// slots beside them, else one (a layer is then read only after the previous one is done with,
+/// so the reads are not hidden behind compute, but the pool can be a third smaller).
+pub(crate) fn regions_for(n_slots: usize, width: usize) -> usize {
+    if n_slots >= (STAGING_REGIONS + 1) * width {
+        STAGING_REGIONS
+    } else {
+        1
+    }
+}
 
 fn mlx_dtype(safetensors: &str) -> Result<Dtype> {
     Ok(match safetensors {
@@ -103,9 +116,10 @@ impl ExpertBank {
             .map(|l| l.n_experts)
             .max()
             .unwrap_or(0);
-        if n_slots < STAGING_REGIONS * width {
+        // One staging region and a layer's worth of slots beside it is the least that works.
+        if n_slots < 2 * width {
             bail!(
-                "expert bank: {n_slots} slots cannot hold {STAGING_REGIONS} staging regions of {width}"
+                "expert bank: {n_slots} slots cannot hold a staging region of {width} and a layer beside it"
             );
         }
         let mut pools = BTreeMap::new();
@@ -125,6 +139,7 @@ impl ExpertBank {
             map: SlotMap::new(n_slots),
             n_slots,
             width,
+            regions: regions_for(n_slots, width),
             staging: false,
             copied: 0,
         })
@@ -176,7 +191,13 @@ impl ExpertBank {
     }
 
     fn region_base(&self, region: usize) -> usize {
-        self.n_slots - (STAGING_REGIONS - region) * self.width
+        self.n_slots - (self.regions - region) * self.width
+    }
+
+    /// How many staging regions this pool lends: with one, a layer's reads cannot start before
+    /// the layer before it is done, so nothing is prefetched.
+    pub(crate) fn regions(&self) -> usize {
+        self.regions
     }
 
     /// Borrow the staging blocks from the slot map: whoever lives there is evicted. Idempotent.
@@ -205,7 +226,7 @@ impl ExpertBank {
     /// The routing readback that precedes every layer call completes all earlier GPU work,
     /// which includes the gather that last used this region.
     pub(crate) fn begin_region_load(&mut self, region: usize, layer: u16) -> Result<RegionLoad> {
-        assert!(region < STAGING_REGIONS, "no staging region {region}");
+        assert!(region < self.regions, "no staging region {region}");
         assert!(self.staging, "staging regions are not borrowed");
         let ranges = self
             .store

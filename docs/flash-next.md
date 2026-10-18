@@ -18,12 +18,38 @@ computes, except speculative decoding, which is marked.
 - A turn with a few hundred new tokens still needs nearly every expert of every layer, so its first
   token costs one pass over the SSD (6–13 s) however short the turn is.
 
+## How the memory is planned
+
+The GPU's working set (the part of RAM the OS lets one process keep resident, about 75% of it,
+times 0.88 for the headroom other apps need; `LUMEN_MEMORY_LIMIT_GB` lowers it) is split into the
+3.6 GB of resident weights, a reserve for prefilling, and the expert pool, which gets the rest. The
+reserve is 0.6 GB of buffers, about 1.1 MB per token of the prefill chunk, the KV cache of the
+longest prompt the plan allows (60 KB per token), and half the attention scores. So the longest prompt
+and the pool trade against each other: `LUMEN_MAX_PROMPT_TOKENS` (the server's prompt cap, which the
+plan also reads; `LUMEN_MAX_CTX` can only lower it) is 16,384 by default, and 65,536 takes about 3 GB out of the pool. The server rejects a
+longer prompt with the usual "prompt too large" error instead of running out of memory halfway. A
+chunk attends to a long context in blocks of query rows so its scores never exceed 2 GB.
+
+| GPU working set | Machine | Chunk | Longest prompt | Pool (auto) | Decode |
+|---|---|---|---|---|---|
+| 26.5 GB | 36 GB Mac | 1,024 | 16,384 | 19.4 GB | 13 tok/s |
+| 14 GB (emulated) | 24 GB Mac | 1,024 | 16,384 | 6.85 GB | 6.7 tok/s |
+| 9.7 GB (emulated; a real 16 GB Mac reports ~10 GB) | 16 GB Mac | 512 | 8,192 | 4.2 GB | 5.6 tok/s |
+
+Decode figures are with the expert pack, on this machine's fast SSD; the two smaller rows were run on a
+36 GB M3 Max with `LUMEN_MEMORY_LIMIT_GB` set to 13 and 9, so they show what the plan does, not how a
+real 16 or 24 GB Mac's own memory pressure behaves. On a 16 GB Mac (under 11 GB of working set) the
+pool has room for only one staging region, so prefill cannot read the next layer while computing the
+current one; a 5.8K-token prompt prefilled at 209 tok/s there, with a peak resident size of 7.2 GB.
+
 ## Options
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool in GB. `auto` takes what the GPU's working set leaves after the 3.6 GB of resident weights and one prefill chunk. |
-| `LUMEN_QWEN35_PREFILL_CHUNK` | 1024 | Tokens per prefill chunk. Prefill speed does not depend on it; its activations come out of the pool. |
+| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool: `auto`, or a size such as `4g`, `8GB`, `12.5g`, `512m` (a plain number is GB). `auto` takes what the GPU's working set leaves after the 3.6 GB of resident weights and the prefill reserve. A size that does not fit beside them (at the longest prompt the plan allows) is lowered to what does, and the log says so; a shorter `LUMEN_MAX_PROMPT_TOKENS` makes room. Measured on a 36 GB M3 Max, 200 tokens: 4g 5.6 tok/s, 8g 7.1, 12g 7.4. |
+| `LUMEN_QWEN35_PREFILL_CHUNK` | 1024 (512 under 11 GB) | Tokens per prefill chunk. Prefill speed does not depend on it; its activations come out of the pool. |
+| `LUMEN_MAX_PROMPT_TOKENS` | 16384 (8192 under 11 GB) | Longest prompt; the KV cache for it is planned out of the pool. |
+| `LUMEN_MEMORY_LIMIT_GB` | 32 | Cap on MLX's memory in GiB; the pool is planned within it. |
 | `LUMEN_MOE_IO_MODE` | `auto` | `direct` bypasses the page cache for expert reads, `buffered` uses it, `auto` uses it while the machine has more than 12 GB of memory to spare. |
 | `LUMEN_MOE_IO_LANES` | 32 | Reader threads (1–64). |
 | `LUMEN_MOE_PACK` | `auto` | The contiguous expert pack: `auto` uses `experts.lpack` when it is next to the weights, `off` never does, `build` makes it first. See below. |
