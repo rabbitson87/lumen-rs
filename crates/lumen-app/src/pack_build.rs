@@ -1,7 +1,7 @@
 //! Building Flash-Next's expert pack from the app: `lumen-server --pack-experts <model dir>`,
 //! run in the background with its stderr progress turned into events.
 //!
-//! The pack is 68 GB of extra disk that makes decode 10-20% faster (`docs/flash-next.md`). The
+//! The pack is 68 GB of extra disk that makes decode about 7-15% faster (`docs/flash-next.md`). The
 //! server writes `experts.lpack.tmp` and renames it at the end, so a stopped build leaves no pack
 //! that looks complete, only a partial temp file, which this module deletes. Progress follows the
 //! download's pattern: a long task whose lines become `lumen://pack` events, with a command to
@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::config::PersistentConfig;
 use crate::doctor;
 use crate::flash_next::{self, PackState};
+use crate::hardware::HardwareView;
 
 /// Tauri event name for build progress.
 pub const EVENT_PACK: &str = "lumen://pack";
@@ -138,6 +139,9 @@ pub struct FlashNextStatus {
     pub server_running: bool,
     pub building: bool,
     pub build_block: Option<BuildBlock>,
+    /// What this Mac measured of itself (decode speed rests on it), with the SSD number
+    /// counted only if it was read from this model folder.
+    pub hardware: HardwareView,
 }
 
 pub fn status(cfg: &PersistentConfig, server_running: bool, building: bool) -> FlashNextStatus {
@@ -153,6 +157,7 @@ pub fn status(cfg: &PersistentConfig, server_running: bool, building: bool) -> F
             server_running,
             building,
             build_block: Some(BuildBlock::NotInstalled),
+            hardware: cfg.measured_hardware.view(None),
         };
     };
     let pack = flash_next::pack_state(&dir);
@@ -173,6 +178,7 @@ pub fn status(cfg: &PersistentConfig, server_running: bool, building: bool) -> F
         server_running,
         building,
         build_block: build_block(true, pack, server_running, building, free),
+        hardware: cfg.measured_hardware.view(Some(&dir.display().to_string())),
     }
 }
 
@@ -630,5 +636,51 @@ mod tests {
         std::fs::write(dir.join("mtp.safetensors"), b"x").unwrap();
         assert!(status(&cfg, false, false).mtp_present);
         std::fs::remove_dir_all(&models).ok();
+    }
+
+    /// The status carries what this Mac measured, and the SSD number counts only for the model
+    /// folder it was read from: moved or deleted, it is stale and the memory number is kept.
+    #[test]
+    fn the_status_carries_the_measurements_and_marks_an_ssd_number_from_another_folder_stale() {
+        let models = std::env::temp_dir().join(format!("lumen-pack-hw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&models);
+        let dir = models.join("pipenetwork--Qwen3.8-Flash-Next-MLX-4bit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        std::fs::write(dir.join("model-00001.safetensors"), vec![0u8; 100]).unwrap();
+        let mut cfg = PersistentConfig {
+            models_dir: models.clone(),
+            ..PersistentConfig::default()
+        };
+        // Nothing measured yet.
+        let h = status(&cfg, false, false).hardware;
+        assert_eq!(
+            (h.memory_gbps, h.ssd_random_gbps, h.ssd_stale),
+            (None, None, false)
+        );
+        // Measured on this folder.
+        cfg.measured_hardware.record_memory(231.0, 10);
+        cfg.measured_hardware
+            .record_ssd(3.1, Some(5.0), &dir.display().to_string(), 20);
+        let h = status(&cfg, false, false).hardware;
+        assert_eq!(
+            (h.memory_gbps, h.ssd_random_gbps, h.ssd_stale),
+            (Some(231.0), Some(3.1), false)
+        );
+        // The SSD number was read from some other folder: stale, memory unaffected.
+        cfg.measured_hardware
+            .record_ssd(3.1, Some(5.0), "/Volumes/Elsewhere/Flash-Next", 20);
+        let h = status(&cfg, false, false).hardware;
+        assert_eq!(
+            (h.memory_gbps, h.ssd_random_gbps, h.ssd_stale),
+            (Some(231.0), None, true)
+        );
+        // The model is gone altogether: no folder to match, so the SSD is not measured.
+        std::fs::remove_dir_all(&models).ok();
+        let h = status(&cfg, false, false).hardware;
+        assert_eq!(
+            (h.memory_gbps, h.ssd_random_gbps, h.ssd_stale),
+            (Some(231.0), None, true)
+        );
     }
 }

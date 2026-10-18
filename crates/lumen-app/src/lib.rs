@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod config;
 pub mod doctor;
 pub mod flash_next;
+pub mod hardware;
 pub mod models;
 pub mod pack_build;
 pub mod server;

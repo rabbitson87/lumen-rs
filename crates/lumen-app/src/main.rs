@@ -9,7 +9,9 @@ mod updater;
 
 // The library half of the crate, imported under the same names so the
 // bin-only modules reach it as `crate::config` and friends.
-use lumen_app::{catalog, config, doctor, models, pack_build, server, sysinfo};
+use lumen_app::{
+    catalog, config, doctor, flash_next, hardware, models, pack_build, server, sysinfo,
+};
 use state::AppState;
 use tauri::Manager;
 
@@ -87,6 +89,8 @@ fn main() {
             commands::doctor_fix,
             commands::doctor_probe_ssd,
             commands::doctor_probe_cancel,
+            commands::measure_hardware,
+            commands::cancel_measure,
             commands::flash_next_status,
             commands::start_pack_build,
             commands::cancel_pack_build,

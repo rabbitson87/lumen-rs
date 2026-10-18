@@ -7,6 +7,8 @@
     onStatus,
     onDownload,
     onPack,
+    onMeasure,
+    type MeasureProgress,
     type PersistentConfig,
     type ModelEntry,
     type ServerStatus,
@@ -159,6 +161,17 @@
   // The Flash-Next model on disk (pack, draft head, free space) and the latest pack build report.
   let flashStatus = $state<FlashNextStatus | null>(null);
   let packBuild = $state<PackProgress | null>(null);
+  // The latest Measure (memory bandwidth + SSD read speed) report of this session.
+  let measureReport = $state<MeasureProgress | null>(null);
+  const MEASURE_STARTING: MeasureProgress = {
+    state: "running",
+    stage: "memory",
+    memory_gbps: null,
+    ssd_random_gbps: null,
+    ssd_skipped: false,
+    memory_error: null,
+    ssd_error: null,
+  };
   let memoryUsage = $state<MemoryUsage | null>(null);
   let selectedRecommend = $state<string>("");
 
@@ -444,6 +457,7 @@
   let unlistenStatus: (() => void) | undefined;
   let unlistenDownload: (() => void) | undefined;
   let unlistenPack: (() => void) | undefined;
+  let unlistenMeasure: (() => void) | undefined;
   let pollHandle: ReturnType<typeof setInterval> | undefined;
 
   onMount(async () => {
@@ -574,6 +588,13 @@
         flashStatus = { ...flashStatus, building: true };
       }
     });
+
+    // The Measure action reports as it goes; its end changes what the speed estimate rests on,
+    // so the status (which carries the stored numbers) is read again.
+    unlistenMeasure = await onMeasure((p) => {
+      measureReport = p;
+      if (p.state !== "running") refreshFlashStatus();
+    });
     refreshFlashStatus();
 
     try {
@@ -597,6 +618,7 @@
     unlistenStatus?.();
     unlistenDownload?.();
     unlistenPack?.();
+    unlistenMeasure?.();
     if (pollHandle) clearInterval(pollHandle);
   });
 
@@ -878,6 +900,27 @@
 
   async function cancelPackBuild() {
     await api.cancelPackBuild();
+  }
+
+  // Measure this Mac: memory bandwidth, then the SSD (the model's own folder). The events carry
+  // the progress; the result also comes back here so a run whose events were missed still ends
+  // with its report, and the stored numbers are read again either way.
+  async function startMeasure() {
+    if (!flashNextEnabled) return;
+    measureReport = { ...MEASURE_STARTING };
+    try {
+      measureReport = await api.measureHardware();
+    } catch (e) {
+      // Refused (another SSD test is running) or failed outright: no run to show progress for.
+      measureReport = null;
+      throw e;
+    } finally {
+      await refreshFlashStatus();
+    }
+  }
+
+  async function cancelMeasure() {
+    await api.cancelMeasure();
   }
 
   // The Flash-Next card: each choice is stored as a typed setting (`[flash_next]`), saved straight
@@ -1338,11 +1381,14 @@
       contextMax={config.context.max}
       status={flashStatus}
       build={packBuild}
+      measure={measureReport}
       onChange={setFlashNext}
       onReset={resetFlashNext}
       onClearOverrides={clearFlashNextOverrides}
       onBuild={startPackBuild}
       onCancelBuild={cancelPackBuild}
+      onMeasure={startMeasure}
+      onCancelMeasure={cancelMeasure}
     />
   </section>
   {/if}
@@ -2197,6 +2243,7 @@
         packBuild={packBuild}
         onBuildPack={startPackBuild}
         onCancelPackBuild={cancelPackBuild}
+        onProbed={refreshFlashStatus}
       />
     </div>
   {/if}

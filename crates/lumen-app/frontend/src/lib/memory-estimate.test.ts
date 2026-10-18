@@ -28,10 +28,14 @@ registerHooks({
 const {
   FLASH_NEXT,
   FLASH_NEXT_DECODE_TPS,
+  FLASH_NEXT_SPEED_MODEL,
   attnScoreBytes,
   envKeysForFamily,
   estimateAt,
   flashNextDecodeTps,
+  flashNextHardware,
+  flashNextHitRate,
+  flashNextSlowSsd,
   FLASH_NEXT_LANE_PRESETS,
   FLASH_NEXT_LANES_DEFAULT,
   FLASH_NEXT_DEFAULTS,
@@ -274,45 +278,233 @@ test("a hand-typed pool is bounded by RAM, never below the floor", () => {
   assert.equal(flashNextMaxPoolGb(4), 2.82624);
 });
 
-// ── Decode speed ────────────────────────────────────────────────────────────
+// ── Decode speed: the bandwidth/SSD model ───────────────────────────────────
 
-test("the speed table is reproduced at its measured pools", () => {
-  for (const p of FLASH_NEXT_DECODE_TPS) {
-    if (p.shards != null) {
-      const r = flashNextDecodeTps(p.poolGb * 1e9)!;
-      near(r.tps, p.shards);
-      assert.equal(r.basis, "measured");
+const M = FLASH_NEXT_SPEED_MODEL;
+const hitPoints = M.hitRatePoints as readonly (readonly [number, number])[];
+const REF = { memoryGbps: M.referenceMemoryGbps, ssdRandomGbps: M.referenceSsdGbps };
+
+/** The model written out step by step from a set of constants, the way `by_hand` in
+ *  `flash_next.rs` does: what the model is, so changing the constants moves both sides together. */
+function byHand(
+  c: { streamGb: number; otherMs: number; expertGbPerToken: number; points: readonly (readonly [number, number])[]; effShards: number; effPack: number },
+  pool: number,
+  mem: number,
+  ssd: number,
+  pack: boolean,
+): number {
+  // The engine runs no pool under its floor.
+  pool = Math.max(pool, FLASH_NEXT.poolFloorBytes / 1e9);
+  const p = c.points;
+  let hit: number;
+  if (pool >= p[p.length - 1][0]) hit = p[p.length - 1][1];
+  else {
+    let i = 1;
+    while (i < p.length - 1 && pool >= p[i][0]) i++;
+    const [a, b] = [p[i - 1], p[i]];
+    hit = Math.max(0, a[1] + ((pool - a[0]) * (b[1] - a[1])) / (b[0] - a[0]));
+  }
+  const ms =
+    (c.streamGb / mem) * 1000 + c.otherMs + (((1 - hit) * c.expertGbPerToken) / (ssd * (pack ? c.effPack : c.effShards))) * 1000;
+  return 1000 / ms;
+}
+
+const tsConstants = {
+  streamGb: M.streamGb,
+  otherMs: M.otherMs,
+  expertGbPerToken: M.expertGbPerToken,
+  points: hitPoints,
+  effShards: M.ssdEfficiencyShards,
+  effPack: M.ssdEfficiencyPack,
+};
+
+test("the model is the formula over its constants", () => {
+  for (const pool of [0.5, 2.3, 4.2, 6.7, 8, 12.5, 19.8, 40]) {
+    for (const mem of [100, 281, 400]) {
+      for (const ssd of [0.5, 3.1, 6.57, 14]) {
+        for (const pack of [false, true]) {
+          near(flashNextDecodeTps(pool, mem, ssd, pack)!, byHand(tsConstants, pool, mem, ssd, pack), 1e-9);
+        }
+      }
     }
-    if (p.pack != null) near(flashNextDecodeTps(p.poolGb * 1e9, true)!.tps, p.pack);
   }
 });
 
-test("the emulated 16 and 24 GB points are marked as such", () => {
-  const emulated = FLASH_NEXT_DECODE_TPS.filter((p) => p.emulated).map((p) => p.poolGb);
-  assert.deepEqual(emulated, [4.2, 6.85]);
+test("the model's constants, hit-rate points and reference table match src/flash_next.rs", () => {
+  const rs = readFileSync(new URL("../../../src/flash_next.rs", import.meta.url), "utf8");
+  const num = (name: string): number => {
+    const m = rs.match(new RegExp(`const ${name}: f64 = ([^;]+);`));
+    assert.ok(m, `${name} not found in flash_next.rs`);
+    return Number(m[1].replaceAll("_", "").trim());
+  };
+  assert.equal(num("STREAM_GB"), M.streamGb);
+  assert.equal(num("OTHER_MS"), M.otherMs);
+  assert.equal(num("EXPERT_GB_PER_TOKEN"), M.expertGbPerToken);
+  assert.equal(num("SSD_EFFICIENCY_SHARDS"), M.ssdEfficiencyShards);
+  assert.equal(num("SSD_EFFICIENCY_PACK"), M.ssdEfficiencyPack);
+  assert.equal(num("REFERENCE_MEMORY_GBPS"), M.referenceMemoryGbps);
+  assert.equal(num("REFERENCE_READ_GBPS"), M.referenceSsdGbps);
+  assert.equal(num("SLOW_READ_GBPS"), M.slowSsdGbps);
+  const m = rs.match(/HIT_RATE_POINTS: \[\(f64, f64\); \d\] =\s*\[([^;]+)\];/);
+  assert.ok(m, "HIT_RATE_POINTS not found");
+  const rsPoints = [...m[1].matchAll(/\(([0-9.]+), ([0-9.]+)\)/g)].map((x) => [Number(x[1]), Number(x[2])]);
+  assert.deepEqual(rsPoints, hitPoints.map((p) => [...p]));
+
+  // The same numbers out of both sides: the Rust constants run through the same formula.
+  const rsConstants = {
+    streamGb: num("STREAM_GB"),
+    otherMs: num("OTHER_MS"),
+    expertGbPerToken: num("EXPERT_GB_PER_TOKEN"),
+    points: rsPoints as [number, number][],
+    effShards: num("SSD_EFFICIENCY_SHARDS"),
+    effPack: num("SSD_EFFICIENCY_PACK"),
+  };
+  for (const pool of [2.9, 4.2, 8, 15, 19.8, 30]) {
+    for (const [mem, ssd] of [[281, 6.57], [150, 2], [500, 12]]) {
+      for (const pack of [false, true]) {
+        near(flashNextDecodeTps(pool, mem, ssd, pack)!, byHand(rsConstants, pool, mem, ssd, pack), 1e-9);
+      }
+    }
+  }
+  // The constants describe what a token streams, as the Rust test checks too.
+  near(M.expertGbPerToken, (48 * 10 * FLASH_NEXT.expertBytes) / 1e9, 1e-3);
+  near(M.streamGb, M.expertGbPerToken + FLASH_NEXT.trunkBytes / 1e9, 1e-9);
 });
 
-test("between measured pools the speed is a straight line", () => {
-  near(flashNextDecodeTps(12.5e9)!.tps, 8.63);
-  near(flashNextDecodeTps(12.5e9, true)!.tps, 9.54);
-  // Inside the pack's new low range: halfway between 4.2 (5.6) and 6.7 (6.83).
-  near(flashNextDecodeTps(5.45e9, true)!.tps, 6.215);
+test("at the reference hardware the model reproduces every measured point (12 cells) within 4%", () => {
+  for (const p of FLASH_NEXT_DECODE_TPS) {
+    for (const [col, pack] of [["shards", false], ["pack", true]] as const) {
+      const measured = p[col];
+      if (measured == null) continue;
+      const got = flashNextDecodeTps(p.poolGb, REF.memoryGbps, REF.ssdRandomGbps, pack)!;
+      assert.ok(Math.abs(got - measured) / measured <= 0.04, `${p.poolGb} GB ${col}: model ${got.toFixed(2)} vs measured ${measured}`);
+    }
+  }
 });
 
-test("outside the measured range the table is held above and extrapolated below", () => {
-  const above = flashNextDecodeTps(60e9)!;
-  assert.deepEqual([above.tps, above.basis], [13, "above"]);
-  const below = flashNextDecodeTps(5e9)!;
-  assert.equal(below.basis, "below");
-  near(below.tps, 5.75 - 1.7 * ((7.53 - 5.75) / 3.3), 1e-9);
-  assert.equal(flashNextDecodeTps(-50e9)!.tps, 0);
+test("the hit rate follows its points, holds past the last, and continues the first slope below (never under 0)", () => {
+  for (const [pool, hit] of hitPoints) near(flashNextHitRate(pool), hit, 1e-12);
+  const [a, b] = [hitPoints[0], hitPoints[1]];
+  near(flashNextHitRate((a[0] + b[0]) / 2), (a[1] + b[1]) / 2, 1e-12);
+  const last = hitPoints[hitPoints.length - 1];
+  assert.equal(flashNextHitRate(last[0] + 50), last[1]);
+  near(flashNextHitRate(a[0] - 1), a[1] - (b[1] - a[1]) / (b[0] - a[0]), 1e-12);
+  assert.ok(flashNextHitRate(0) >= 0 && flashNextHitRate(-100) >= 0);
 });
 
-test("the pack speed is not claimed where it was not measured (under 4.2 or over 15 GB)", () => {
-  assert.equal(flashNextDecodeTps(19.8e9, true), null);
-  assert.equal(flashNextDecodeTps(4.0e9, true), null);
-  assert.ok(flashNextDecodeTps(4.2e9, true) !== null);
-  assert.ok(flashNextDecodeTps(15e9, true) !== null);
+test("a bigger pool, faster memory or a faster disk is never slower, and the pack beats the shards", () => {
+  const tps = (pool: number, mem: number, ssd: number, pack: boolean) => flashNextDecodeTps(pool, mem, ssd, pack)!;
+  for (const pack of [false, true]) {
+    const pools = [3, 4.2, 6.7, 8, 10, 15, 19.8];
+    for (let i = 1; i < pools.length; i++) assert.ok(tps(pools[i], 281, 6.57, pack) > tps(pools[i - 1], 281, 6.57, pack), `pool ${pools[i]}`);
+    // Past the last hit-rate point the pool buys nothing more.
+    assert.equal(tps(30, 281, 6.57, pack), tps(19.8, 281, 6.57, pack));
+    const mems = [100, 200, 281, 400, 800];
+    for (let i = 1; i < mems.length; i++) assert.ok(tps(8, mems[i], 6.57, pack) > tps(8, mems[i - 1], 6.57, pack), `memory ${mems[i]}`);
+    const ssds = [0.5, 1, 3.1, 6.57, 12, 25];
+    for (let i = 1; i < ssds.length; i++) assert.ok(tps(8, 281, ssds[i], pack) > tps(8, 281, ssds[i - 1], pack), `ssd ${ssds[i]}`);
+  }
+  for (const pool of [2.9, 4.2, 8, 15]) {
+    for (const [mem, ssd] of [[281, 6.57], [150, 2], [500, 12]]) {
+      assert.ok(tps(pool, mem, ssd, true) > tps(pool, mem, ssd, false), `${pool} ${mem} ${ssd}`);
+    }
+  }
+});
+
+test("a faster machine than the reference one is promised more, not clamped", () => {
+  const at = flashNextDecodeTps(10, REF.memoryGbps, REF.ssdRandomGbps, false)!;
+  assert.ok(flashNextDecodeTps(10, 2 * REF.memoryGbps, REF.ssdRandomGbps, false)! > at);
+  assert.ok(flashNextDecodeTps(10, REF.memoryGbps, 3 * REF.ssdRandomGbps, false)! > at);
+  assert.ok(flashNextDecodeTps(10, REF.memoryGbps, 0.5, false)! < 1);
+});
+
+test("a missing or non-positive input gives no estimate, never zero or infinity", () => {
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, null, undefined]) {
+    assert.equal(flashNextDecodeTps(bad as number, 281, 6.57, false), null, `pool ${bad}`);
+    assert.equal(flashNextDecodeTps(8, bad, 6.57, false), null, `memory ${bad}`);
+    assert.equal(flashNextDecodeTps(8, 281, bad, true), null, `ssd ${bad}`);
+  }
+  const crawl = flashNextDecodeTps(2.9, 1e-3, 1e-3, false)!;
+  assert.ok(Number.isFinite(crawl) && crawl > 0);
+});
+
+test("the reference table is the measured one, with no emulated points", () => {
+  assert.deepEqual(
+    FLASH_NEXT_DECODE_TPS.map((p) => [p.poolGb, p.shards, p.pack]),
+    [
+      [2.83, 4.72, 5.44],
+      [4.2, 5.58, 6.14],
+      [6.7, 6.69, 7.15],
+      [10, 8.06, 8.96],
+      [15, 10.39, 11.15],
+      [19.8, 11.96, 12.95],
+    ],
+  );
+  assert.ok(FLASH_NEXT_DECODE_TPS.every((p) => !("emulated" in p)));
+  // The reference Mac is the one the model was calibrated on.
+  assert.deepEqual([REF.memoryGbps, REF.ssdRandomGbps], [281, 6.57]);
+});
+
+test("a pool under the engine's floor is estimated at the floor", () => {
+  const floorGb = FLASH_NEXT.poolFloorBytes / 1e9;
+  for (const pack of [false, true]) {
+    const at = flashNextDecodeTps(floorGb, REF.memoryGbps, REF.ssdRandomGbps, pack)!;
+    for (const pool of [0.1, 1, 2.5, floorGb - 1e-6]) {
+      assert.equal(flashNextDecodeTps(pool, REF.memoryGbps, REF.ssdRandomGbps, pack), at, `${pool} GB`);
+    }
+    assert.ok(flashNextDecodeTps(floorGb + 0.5, REF.memoryGbps, REF.ssdRandomGbps, pack)! > at);
+  }
+});
+
+// ── What is measured on this Mac ────────────────────────────────────────────
+
+const hwView = (over: Partial<NonNullable<Parameters<typeof flashNextHardware>[0]>> = {}) => ({
+  memory_gbps: 231 as number | null,
+  memory_measured_at: 1_000 as number | null,
+  ssd_random_gbps: 3.1 as number | null,
+  ssd_sequential_gbps: 5 as number | null,
+  ssd_measured_at: 2_000 as number | null,
+  ssd_stale: false,
+  ...over,
+});
+
+test("an estimate needs both numbers, and says which are missing", () => {
+  const both = flashNextHardware(hwView());
+  assert.deepEqual(both.hw, { memoryGbps: 231, ssdRandomGbps: 3.1 });
+  assert.deepEqual(both.missing, []);
+  // The older of the two times is what the card dates the estimate by.
+  assert.equal(both.measuredAt, 1_000);
+  const none = flashNextHardware(hwView({ memory_gbps: null, memory_measured_at: null, ssd_random_gbps: null, ssd_measured_at: null }));
+  assert.deepEqual([none.hw, none.missing, none.measuredAt], [null, ["memory", "ssd"], null]);
+  const memoryOnly = flashNextHardware(hwView({ ssd_random_gbps: null, ssd_measured_at: null }));
+  assert.deepEqual([memoryOnly.hw, memoryOnly.missing], [null, ["ssd"]]);
+  const ssdOnly = flashNextHardware(hwView({ memory_gbps: null, memory_measured_at: null }));
+  assert.deepEqual([ssdOnly.hw, ssdOnly.missing], [null, ["memory"]]);
+  // Nothing loaded yet.
+  assert.deepEqual(flashNextHardware(undefined).missing, ["memory", "ssd"]);
+  assert.equal(flashNextHardware(null).hw, null);
+});
+
+test("an SSD number from another model folder counts as not measured", () => {
+  const stale = flashNextHardware(hwView({ ssd_random_gbps: null, ssd_measured_at: null, ssd_stale: true }));
+  assert.equal(stale.hw, null);
+  assert.deepEqual(stale.missing, ["ssd"]);
+  assert.ok(stale.ssdStale);
+  // Even if a number came along with the flag, the stale one is never used.
+  assert.equal(flashNextHardware(hwView({ ssd_stale: true })).hw, null);
+});
+
+test("a number that is not a positive speed does not count", () => {
+  for (const bad of [0, -3, Number.NaN]) {
+    assert.deepEqual(flashNextHardware(hwView({ memory_gbps: bad })).missing, ["memory"], String(bad));
+    assert.deepEqual(flashNextHardware(hwView({ ssd_random_gbps: bad })).missing, ["ssd"], String(bad));
+  }
+});
+
+test("the slow-disk warning follows the measured random speed", () => {
+  assert.ok(flashNextSlowSsd({ memoryGbps: 281, ssdRandomGbps: 1.99 }));
+  assert.ok(!flashNextSlowSsd({ memoryGbps: 281, ssdRandomGbps: 2 }));
+  assert.ok(!flashNextSlowSsd(null), "no warning without a measurement");
 });
 
 test("the disk the model needs adds the optional pack and draft head", () => {
@@ -410,6 +602,15 @@ test("switching models neither resets nor depends on the stored settings", () =>
   assert.ok(!flashNextIsDefault(stored));
 });
 
+test("the draft head is off by default and sent only when chosen (auto / on)", () => {
+  assert.equal(FLASH_NEXT_DEFAULTS.draft_head, "off");
+  assert.equal(flashNextSettingsEnv(settings({ draft_head: "off" })).LUMEN_QWEN4_MTP, undefined);
+  assert.equal(flashNextSettingsEnv(settings({ draft_head: "auto" })).LUMEN_QWEN4_MTP, "auto");
+  assert.equal(flashNextSettingsEnv(settings({ draft_head: "on" })).LUMEN_QWEN4_MTP, "on");
+  assert.ok(flashNextIsDefault(settings({ draft_head: "off" })));
+  assert.ok(!flashNextIsDefault(settings({ draft_head: "auto" })));
+});
+
 test("the defaults send nothing: an unset option is the server's own default", () => {
   assert.deepEqual(flashNextSettingsEnv(FLASH_NEXT_DEFAULTS), {});
   assert.ok(flashNextIsDefault(FLASH_NEXT_DEFAULTS));
@@ -429,11 +630,11 @@ test("every chosen option maps to its variable as a plain value (as FlashNextCon
     LUMEN_MOE_IO_LANES: "16",
   });
   assert.deepEqual(Object.keys(flashNextSettingsEnv(everyOptionChosen)), [...FLASH_NEXT_ENV_KEYS]);
-  const env = flashNextSettingsEnv(settings({ expert_cache_gb: 8, pack: "off", draft_head: "off", io_mode: "buffered" }));
+  const env = flashNextSettingsEnv(settings({ expert_cache_gb: 8, pack: "off", draft_head: "auto", io_mode: "buffered" }));
   assert.deepEqual(env, {
     LUMEN_MOE_EXPERT_CACHE_GB: "8",
     LUMEN_MOE_PACK: "off",
-    LUMEN_QWEN4_MTP: "off",
+    LUMEN_QWEN4_MTP: "auto",
     LUMEN_MOE_IO_MODE: "buffered",
   });
   assert.equal(flashNextSettingsEnv(settings({ expert_cache_gb: 6.349 })).LUMEN_MOE_EXPERT_CACHE_GB, "6.35");
@@ -494,7 +695,7 @@ test("the settings, their variables and the defaults match the Rust side", () =>
   const variants = (name: string) =>
     [...(cfg.match(new RegExp(`pub enum ${name} \\{([^}]+)\\}`))?.[1] ?? "").matchAll(/^\s{4}([A-Z]\w*),/gm)].map((m) => m[1].toLowerCase());
   assert.deepEqual(variants("FlashNextPack"), ["auto", "off", "build"]);
-  assert.deepEqual(variants("FlashNextDraftHead"), ["auto", "on", "off"]);
+  assert.deepEqual(variants("FlashNextDraftHead"), ["off", "auto", "on"]);
   assert.deepEqual(variants("FlashNextIoMode"), ["auto", "direct", "buffered"]);
   assert.equal(Number(cfg.match(/FLASH_NEXT_IO_LANES_DEFAULT: u32 = (\d+);/)?.[1]), FLASH_NEXT_LANES_DEFAULT);
   assert.equal(Number(cfg.match(/FLASH_NEXT_IO_LANES_MAX: u32 = (\d+);/)?.[1]), 64);
@@ -540,7 +741,7 @@ test("the presets are the ones the pickers promise, none under the floor", () =>
 test("a pool chip is disabled when the pool does not fit beside the current longest prompt", () => {
   const usable = flashNextUsableBytes(36);
   const at = (gb: number | null, ctxTokens: number) =>
-    flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens, gb, pack: false });
+    flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens, gb, pack: false, hw: null });
   // At 16K a 36 GB Mac leaves an ~18.4 GB pool: 16 GB fits, 20 GB does not.
   assert.ok(at(16, 16_384).fits);
   assert.ok(!at(20, 16_384).fits);
@@ -550,38 +751,30 @@ test("a pool chip is disabled when the pool does not fit beside the current long
   assert.ok(at(8, 131_072).fits);
   assert.ok(!at(12, 131_072).fits);
   assert.ok(at(null, 131_072).fits);
-  // Auto is what the plan leaves; the chips share the table's speeds.
+  // Auto is what the plan leaves.
   near(at(null, 16_384).poolBytes, flashNextPlan(usable, 1024, 16_384).poolBytes, 1);
   // Nothing fits when the model does not run at this prompt at all.
-  const none = flashNextPoolChip({ usableBytes: flashNextUsableBytes(16), chunk: 512, ctxTokens: 131_072, gb: null, pack: false });
+  const none = flashNextPoolChip({ usableBytes: flashNextUsableBytes(16), chunk: 512, ctxTokens: 131_072, gb: null, pack: false, hw: null });
   assert.ok(!none.fits);
 });
 
-test("a pool chip's speed follows the pack's table when the pack is in use, and says where it is shaky", () => {
-  const eight = flashNextChipTps(8e9, true)!;
-  assert.ok(eight.withPack);
-  // Between the emulated 6.85 GB point and 10 GB: interpolated, resting on an emulated point.
-  near(eight.tps, 6.7 + ((8 - 6.85) / (10 - 6.85)) * (8.22 - 6.7), 1e-9);
-  assert.ok(eight.emulated);
-  // 10 GB is a real measurement; the segment above it is real too.
-  assert.ok(!flashNextChipTps(12e9, true)!.emulated);
-  // Without the pack, the shipped weights' table; no emulated points there.
-  const plain = flashNextChipTps(8e9, false)!;
-  assert.ok(!plain.withPack && !plain.emulated);
-  near(plain.tps, 5.75 + ((8 - 6.7) / (10 - 6.7)) * (7.53 - 5.75), 1e-9);
-  // Under the pack table's range the shard table answers, extrapolated.
-  const low = flashNextChipTps(3.5e9, true)!;
-  assert.ok(!low.withPack && low.basis === "below");
-  // Past 15 GB the pack was not measured: the shard table's last value is held.
-  assert.deepEqual([flashNextChipTps(19e9, true)!.withPack, flashNextChipTps(19e9, true)!.basis], [false, "measured"]);
-});
-
-test("the emulated flag follows the points the estimate rests on", () => {
-  assert.ok(flashNextDecodeTps(4.2e9, true)!.emulated);
-  assert.ok(flashNextDecodeTps(5e9, true)!.emulated);
-  assert.ok(flashNextDecodeTps(6.85e9, true)!.emulated);
-  assert.ok(!flashNextDecodeTps(10e9, true)!.emulated);
-  assert.ok(!flashNextDecodeTps(10e9)!.emulated);
+test("a pool chip shows no speed until this Mac is measured, then the model's", () => {
+  const usable = flashNextUsableBytes(36);
+  const chip = (gb: number | null, pack: boolean, hw: typeof REF | null) =>
+    flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens: 16_384, gb, pack, hw });
+  // Not measured: no speed on any chip, and none from the reference table.
+  assert.equal(chip(8, false, null).tps, null);
+  assert.equal(chip(null, true, null).tps, null);
+  assert.equal(flashNextChipTps(8e9, true, null), null);
+  // Measured: the model at this Mac's numbers, the pack's efficiency when the pack is in use.
+  const mine = { memoryGbps: 231, ssdRandomGbps: 3.1 };
+  near(chip(8, false, mine).tps!.tps, flashNextDecodeTps(8, 231, 3.1, false)!, 1e-12);
+  near(chip(8, true, mine).tps!.tps, flashNextDecodeTps(8, 231, 3.1, true)!, 1e-12);
+  assert.deepEqual([chip(8, true, mine).tps!.withPack, chip(8, false, mine).tps!.withPack], [true, false]);
+  // Auto is the pool the plan leaves.
+  near(chip(null, false, mine).tps!.tps, flashNextDecodeTps(chip(null, false, mine).poolBytes / 1e9, 231, 3.1, false)!, 1e-12);
+  // A bigger pool on the same Mac is faster.
+  assert.ok(chip(12, false, mine).tps!.tps > chip(6, false, mine).tps!.tps);
 });
 
 test("a prompt chip shows the pool auto would leave, and is disabled under the floor", () => {
@@ -605,7 +798,11 @@ test("choices are read like the server reads them", () => {
   assert.equal(mtpMode("off"), "off");
   assert.equal(mtpMode("0"), "off");
   assert.equal(mtpMode("TRUE"), "on");
-  assert.equal(mtpMode(undefined), "auto");
+  assert.equal(mtpMode("on"), "on");
+  assert.equal(mtpMode(" Auto "), "auto");
+  // Unset is off: the server's own default.
+  assert.equal(mtpMode(undefined), "off");
+  assert.equal(mtpMode("nope"), "off");
   assert.equal(lanesValue("16"), 16);
   assert.equal(lanesValue(undefined), 32);
   assert.equal(lanesValue("0"), 32);
@@ -621,10 +818,11 @@ test("the pack is in use when it is complete (auto), asked for (build) or not sw
   assert.ok(!packInUse("auto", null));
   assert.ok(packInUse("build", absent));
   assert.ok(!packInUse("off", complete));
+  // The head is used only when chosen (auto / on) and installed; off is never used.
   assert.ok(mtpInUse("auto", absent));
   assert.ok(mtpInUse("on", absent));
   assert.ok(!mtpInUse("off", absent));
-  assert.ok(!mtpInUse("auto", complete));
+  assert.ok(!mtpInUse("auto", complete), "no head installed");
   assert.ok(!mtpInUse("auto", null));
 });
 
@@ -634,7 +832,11 @@ test("the summary follows the saved settings", () => {
   const dflt = flashNextEffective({ env: {}, contextMax: 81_920, usableBytes: usable, status });
   assert.deepEqual(
     [dflt.poolExplicit, dflt.promptTokens, dflt.promptExplicit, dflt.pack, dflt.head],
-    [false, 16_384, false, false, true],
+    [false, 16_384, false, false, false],
+  );
+  // The head is off by default even with the file installed; choosing auto uses it.
+  assert.ok(
+    flashNextEffective({ env: { LUMEN_QWEN4_MTP: "auto" }, contextMax: 81_920, usableBytes: usable, status }).head,
   );
   near(dflt.estimate.poolBytes, flashNextPlan(usable, 1024, 16_384).poolBytes, 1);
   const set = flashNextEffective({
@@ -642,7 +844,7 @@ test("the summary follows the saved settings", () => {
       LUMEN_MOE_EXPERT_CACHE_GB: "8",
       LUMEN_MAX_PROMPT_TOKENS: "32768",
       LUMEN_MOE_PACK: "build",
-      LUMEN_QWEN4_MTP: "off",
+      LUMEN_QWEN4_MTP: "on",
     },
     contextMax: 81_920,
     usableBytes: usable,
@@ -650,10 +852,20 @@ test("the summary follows the saved settings", () => {
   });
   assert.deepEqual(
     [set.poolExplicit, set.promptTokens, set.promptExplicit, set.pack, set.head],
-    [true, 32_768, true, true, false],
+    [true, 32_768, true, true, true],
   );
   assert.equal(set.estimate.poolBytes, 8e9);
-  assert.ok(set.tps!.withPack);
+  // No measurement, no speed: the summary never quotes a reference machine.
+  assert.equal(set.tps, null);
+  assert.equal(dflt.tps, null);
+  const measured = flashNextEffective({
+    env: { LUMEN_MOE_EXPERT_CACHE_GB: "8", LUMEN_MOE_PACK: "build" },
+    usableBytes: usable,
+    status,
+    hw: { memoryGbps: 231, ssdRandomGbps: 3.1 },
+  });
+  assert.ok(measured.tps!.withPack);
+  near(measured.tps!.tps, flashNextDecodeTps(8, 231, 3.1, true)!, 1e-12);
   // The server reads 8g as 8 GB too.
   assert.equal(
     flashNextEffective({ env: { LUMEN_MOE_EXPERT_CACHE_GB: "8g" }, usableBytes: usable, status }).estimate.poolBytes,

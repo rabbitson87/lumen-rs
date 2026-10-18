@@ -24,7 +24,7 @@
 //   C≈50135, H=2048 → 16·2048·50135·4 = 6.56 GB  (observed ≈ 8.4 GB, +snapshot/MoE)
 // The fixed OVERHEAD term absorbs MoE intermediates / softmax / mask (~1.5 GB).
 
-import type { FlashNextSettings } from "./api";
+import type { FlashNextSettings, HardwareView } from "./api";
 
 const GB = 1024 * 1024 * 1024;
 
@@ -699,58 +699,142 @@ export function flashNextEstimate(cfg: FlashNextConfig): FlashNextEstimate {
   };
 }
 
+// ── Decode speed: what this Mac's memory and SSD buy ─────────────────────────
+//
+// Decode runs a token at a time. For each, the GPU streams the resident trunk and the ~1.3 GB of
+// experts the router picked through memory, and every expert that is not in the pool is read from
+// the SSD first. So the speed is set by two numbers of the Mac itself, its memory bandwidth and
+// its SSD's random-read speed, and by how often the pool already holds the expert:
+//
+//   time_per_token_ms = fixed_ms + miss_gb / ssd_effective_gbps * 1000
+//   fixed_ms          = streamGb / memory_gbps * 1000 + otherMs
+//   miss_gb           = (1 - hitRate(pool_gb)) * expertGbPerToken
+//   ssd_effective     = ssd_random_gbps * ssdEfficiency (shards, or the expert pack)
+//   tokens/s          = 1000 / time_per_token_ms
+//
+// The constants mirror `flash_next.rs` (`memory-estimate.test.ts` reads that file), and were
+// calibrated on one machine, the reference below. Until this Mac is measured the card shows that
+// machine's table as reference material and promises nothing for this Mac.
+
+export const FLASH_NEXT_SPEED_MODEL = {
+  /** GB streamed through memory per token: the 1.325 GB of experts a token routes to + the trunk. */
+  streamGb: 4.925,
+  /** Per-token ms that do not scale with memory bandwidth (dispatch, synchronisation). */
+  otherMs: 23.7,
+  expertGbPerToken: 1.325,
+  /** [pool GB, hit rate] as the engine measured it (300-token window, direct reads); 2.83 GB is
+   *  the engine's floor. Linear between points, the first slope continues below the first (never
+   *  under 0), held above the last. */
+  hitRatePoints: [
+    [2.83, 0.477],
+    [4.2, 0.554],
+    [6.7, 0.664],
+    [10.0, 0.75],
+    [15.0, 0.826],
+    [19.8, 0.867],
+  ],
+  /** Share of the measured random-read speed decode gets, reading the shards / the pack. */
+  ssdEfficiencyShards: 0.63,
+  ssdEfficiencyPack: 0.72,
+  /** The machine the constants were calibrated on: an M3 Max with 36 GB. */
+  referenceMemoryGbps: 281,
+  referenceSsdGbps: 6.57,
+  /** Below this random-read speed the SSD is the problem worth warning about. */
+  slowSsdGbps: 2,
+} as const;
+
 /**
- * Decode speed (tokens/s) by expert-pool size, measured on a 36 GB M3 Max with a fast
- * internal SSD (~6.5 GB/s random reads). `shards` reads the shipped weights, `pack` the
- * contiguous expert pack. The `emulated` points were run on that Mac with its memory limited to
- * a 16 and a 24 GB Mac's working set: they show what the plan does, not how a real small Mac's
- * own memory pressure behaves. Prefill (~230 tokens/s) does not depend on the pool.
+ * Decode speed (tokens/s) by expert-pool size on the reference Mac (36 GB M3 Max, memory 281 GB/s,
+ * SSD 6.57 GB/s): the pool set explicitly, direct reads (the page cache is not counted), the
+ * engine's default eviction, no draft head, 300 tokens of prose, medians of three runs. `shards`
+ * reads the shipped weights, `pack` the contiguous expert pack. Shown as reference material until
+ * this Mac is measured, and the anchors the model is tested against. A real 16 or 24 GB Mac's own
+ * memory pressure is not measured here. Prefill (~230 tokens/s) does not depend on the pool.
  */
 export const FLASH_NEXT_DECODE_TPS: readonly {
   poolGb: number;
-  shards: number | null;
-  pack: number | null;
-  emulated?: boolean;
+  shards: number;
+  pack: number;
 }[] = [
-  { poolGb: 4.2, shards: null, pack: 5.6, emulated: true },
-  { poolGb: 6.7, shards: 5.75, pack: 6.83 },
-  { poolGb: 6.85, shards: null, pack: 6.7, emulated: true },
-  { poolGb: 10, shards: 7.53, pack: 8.22 },
-  { poolGb: 15, shards: 9.73, pack: 10.86 },
-  { poolGb: 19.8, shards: 13, pack: null },
+  { poolGb: 2.83, shards: 4.72, pack: 5.44 },
+  { poolGb: 4.2, shards: 5.58, pack: 6.14 },
+  { poolGb: 6.7, shards: 6.69, pack: 7.15 },
+  { poolGb: 10, shards: 8.06, pack: 8.96 },
+  { poolGb: 15, shards: 10.39, pack: 11.15 },
+  { poolGb: 19.8, shards: 11.96, pack: 12.95 },
 ];
 
-export type FlashNextTps = {
-  tps: number;
-  /** "measured": between two measured pools (interpolated). "below": under the first, the
-   *  first segment's slope continued. "above": over the last, held at its value. */
-  basis: "measured" | "below" | "above";
-  /** The value rests on a point measured with the memory limited to emulate a smaller Mac. */
-  emulated: boolean;
-};
-
-/** Decode speed at `poolBytes`, linearly interpolated from the measurements. `withPack` is
- *  `null` outside the pack's measured range (4.2–15 GB). */
-export function flashNextDecodeTps(poolBytes: number, withPack = false): FlashNextTps | null {
-  const pts = FLASH_NEXT_DECODE_TPS.flatMap((p) => {
-    const y = withPack ? p.pack : p.shards;
-    return y == null ? [] : [{ x: p.poolGb, y, emulated: p.emulated === true }];
-  });
-  const x = poolBytes / 1e9;
-  const first = pts[0];
+/** Share of a token's experts a pool of `poolGb` already holds. */
+export function flashNextHitRate(poolGb: number): number {
+  const pts = FLASH_NEXT_SPEED_MODEL.hitRatePoints;
   const last = pts[pts.length - 1];
-  if (x >= last.x) {
-    // The pack was not measured past 15 GB, so nothing is said there.
-    if (withPack && x > last.x) return null;
-    return { tps: last.y, basis: x > last.x ? "above" : "measured", emulated: last.emulated };
-  }
-  if (x < first.x && withPack) return null;
-  let i = pts.findIndex((p, k) => k > 0 && x < p.x);
+  if (poolGb >= last[0]) return last[1];
+  let i = pts.findIndex((p, k) => k > 0 && poolGb < p[0]);
   if (i < 1) i = 1;
-  const lo = pts[i - 1];
-  const hi = pts[i];
-  const tps = Math.max(0, lo.y + ((x - lo.x) * (hi.y - lo.y)) / (hi.x - lo.x));
-  return { tps, basis: x < first.x ? "below" : "measured", emulated: lo.emulated || hi.emulated };
+  const [x0, y0] = pts[i - 1];
+  const [x1, y1] = pts[i];
+  return Math.min(1, Math.max(0, y0 + ((poolGb - x0) * (y1 - y0)) / (x1 - x0)));
+}
+
+const positive = (x: number | null | undefined): x is number =>
+  x != null && Number.isFinite(x) && x > 0;
+
+/**
+ * Decode speed (tokens/s) for a pool of `poolGb` on a Mac whose memory streams at `memoryGbps` and
+ * whose SSD serves random expert-sized reads at `ssdRandomGbps`; `pack` reads the expert pack
+ * instead of the shipped shards. A pool under the engine's floor counts as the floor. A faster Mac
+ * is not clamped to the reference one. `null` when an input is missing, zero or negative, never a
+ * 0 or an infinity.
+ */
+export function flashNextDecodeTps(
+  poolGb: number,
+  memoryGbps: number | null | undefined,
+  ssdRandomGbps: number | null | undefined,
+  pack: boolean,
+): number | null {
+  if (!positive(poolGb) || !positive(memoryGbps) || !positive(ssdRandomGbps)) return null;
+  const M = FLASH_NEXT_SPEED_MODEL;
+  // The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
+  const pool = Math.max(poolGb, FLASH_NEXT.poolFloorBytes / 1e9);
+  const efficiency = pack ? M.ssdEfficiencyPack : M.ssdEfficiencyShards;
+  const fixedMs = (M.streamGb / memoryGbps) * 1000 + M.otherMs;
+  const missGb = (1 - flashNextHitRate(pool)) * M.expertGbPerToken;
+  const ms = fixedMs + (missGb / (ssdRandomGbps * efficiency)) * 1000;
+  return Number.isFinite(ms) && ms > 0 ? 1000 / ms : null;
+}
+
+/** The two numbers an estimate for this Mac needs. */
+export type FlashNextHardware = { memoryGbps: number; ssdRandomGbps: number };
+
+/** What is measured: both numbers when the estimate can be made, else which are missing. An SSD
+ *  number measured on another model folder (`ssd_stale`) counts as missing. */
+export function flashNextHardware(hw: HardwareView | null | undefined): {
+  hw: FlashNextHardware | null;
+  missing: ("memory" | "ssd")[];
+  /** The SSD was measured, but on another model folder. */
+  ssdStale: boolean;
+  /** The older of the two measurement times (unix seconds), when both exist. */
+  measuredAt: number | null;
+} {
+  const memory = positive(hw?.memory_gbps) ? hw.memory_gbps : null;
+  const ssd = positive(hw?.ssd_random_gbps) && !hw?.ssd_stale ? hw.ssd_random_gbps : null;
+  const missing: ("memory" | "ssd")[] = [];
+  if (memory == null) missing.push("memory");
+  if (ssd == null) missing.push("ssd");
+  const times = [hw?.memory_measured_at, hw?.ssd_measured_at].filter(
+    (x): x is number => typeof x === "number",
+  );
+  return {
+    hw: memory != null && ssd != null ? { memoryGbps: memory, ssdRandomGbps: ssd } : null,
+    missing,
+    ssdStale: hw?.ssd_stale === true,
+    measuredAt: memory != null && ssd != null && times.length === 2 ? Math.min(...times) : null,
+  };
+}
+
+/** Whether the measured SSD is slow enough to warn about. */
+export function flashNextSlowSsd(hw: FlashNextHardware | null): boolean {
+  return hw != null && hw.ssdRandomGbps < FLASH_NEXT_SPEED_MODEL.slowSsdGbps;
 }
 
 /** Disk the model needs, bytes: the shipped weights plus the optional pack and draft head. */
@@ -801,22 +885,22 @@ export function formatPromptShort(tokens: number): string {
   return tokens % 1024 === 0 ? `${tokens / 1024}K` : tokens.toLocaleString("en-US");
 }
 
-/** Estimated decode speed of a pool, from the pack's table when the pack is in use and the pool is
- *  inside its measured range, else from the shipped weights'. */
+/** Estimated decode speed of a pool on this Mac (`null` until both numbers are measured), from the
+ *  pack's efficiency when the pack is in use, else the shards'. */
 export function flashNextChipTps(
   poolBytes: number,
   pack: boolean,
-): (FlashNextTps & { withPack: boolean }) | null {
-  const packed = pack ? flashNextDecodeTps(poolBytes, true) : null;
-  if (packed) return { ...packed, withPack: true };
-  const plain = flashNextDecodeTps(poolBytes);
-  return plain ? { ...plain, withPack: false } : null;
+  hw: FlashNextHardware | null,
+): { tps: number; withPack: boolean } | null {
+  if (hw == null) return null;
+  const tps = flashNextDecodeTps(poolBytes / 1e9, hw.memoryGbps, hw.ssdRandomGbps, pack);
+  return tps == null ? null : { tps, withPack: pack };
 }
 
 export type FlashNextPoolChip = {
   /** The pool the chip means in bytes (`auto`: what the plan leaves, never below the floor). */
   poolBytes: number;
-  tps: (FlashNextTps & { withPack: boolean }) | null;
+  tps: { tps: number; withPack: boolean } | null;
   /** The pool fits beside the trunk and the reserve for the current longest prompt. */
   fits: boolean;
   /** The largest pool (GB, to 0.1) that fits at this prompt. */
@@ -831,6 +915,8 @@ export function flashNextPoolChip(a: {
   ctxTokens: number;
   gb: number | null;
   pack: boolean;
+  /** This Mac's measured numbers; without them a chip shows no speed. */
+  hw: FlashNextHardware | null;
 }): FlashNextPoolChip {
   const plan = flashNextPlan(a.usableBytes, a.chunk, a.ctxTokens);
   const planFits = flashNextPlanFits(plan);
@@ -838,7 +924,7 @@ export function flashNextPoolChip(a: {
   const poolBytes = Math.max(wanted, FLASH_NEXT.poolFloorBytes);
   return {
     poolBytes,
-    tps: flashNextChipTps(poolBytes, a.pack),
+    tps: flashNextChipTps(poolBytes, a.pack, a.hw),
     fits: planFits && (a.gb == null || wanted <= plan.poolBytes + 1),
     maxFitGb: Math.floor(plan.poolBytes / 1e8) / 10,
   };
@@ -865,12 +951,13 @@ export function envChoice<T extends string>(
   return (allowed as readonly string[]).includes(v ?? "") ? (v as T) : fallback;
 }
 
-/** `LUMEN_QWEN4_MTP` as the server reads it: `1`/`true` mean on, `0`/`false` off. */
-export function mtpMode(raw: string | undefined): "auto" | "on" | "off" {
+/** `LUMEN_QWEN4_MTP` as the server reads it: unset is `off`; `auto` uses the draft head when it is
+ *  installed; `1`/`true`/`on` do too but refuse to start without it. */
+export function mtpMode(raw: string | undefined): "off" | "auto" | "on" {
   const v = raw?.trim().toLowerCase();
+  if (v === "auto") return "auto";
   if (v === "on" || v === "1" || v === "true") return "on";
-  if (v === "off" || v === "0" || v === "false") return "off";
-  return "auto";
+  return "off";
 }
 
 /** Reader threads from `LUMEN_MOE_IO_LANES`: the server's default (32) when unset or invalid. */
@@ -898,8 +985,8 @@ export function packInUse(
   return status?.pack === "complete";
 }
 
-/** Whether the draft head will be loaded: needs the file, and not switched off. */
-export function mtpInUse(mode: "auto" | "on" | "off", status: FlashNextModelStatus): boolean {
+/** Whether the draft head will be loaded: only when chosen (`auto` / `on`), and needs the file. */
+export function mtpInUse(mode: "off" | "auto" | "on", status: FlashNextModelStatus): boolean {
   return mode !== "off" && status?.mtp_present === true;
 }
 
@@ -910,6 +997,8 @@ export function flashNextEffective(a: {
   contextMax?: number;
   usableBytes: number;
   status: FlashNextModelStatus;
+  /** This Mac's measured numbers; without them there is no speed. */
+  hw?: FlashNextHardware | null;
 }) {
   const poolGb = parseGbInput(a.env.LUMEN_MOE_EXPERT_CACHE_GB ?? "");
   const poolExplicit = poolGb != null && a.env.LUMEN_MOE_EXPERT_CACHE_GB?.trim().toLowerCase() !== "auto";
@@ -933,7 +1022,7 @@ export function flashNextEffective(a: {
     estimate,
     pack,
     head,
-    tps: flashNextChipTps(estimate.poolBytes, pack),
+    tps: flashNextChipTps(estimate.poolBytes, pack, a.hw ?? null),
     machineDefaultPrompt: defaults.ctxTokens,
     launch,
   };
@@ -963,7 +1052,7 @@ export const FLASH_NEXT_DEFAULTS: Readonly<FlashNextSettings> = {
   max_prompt_tokens: null,
   prefill_chunk: null,
   pack: "auto",
-  draft_head: "auto",
+  draft_head: "off",
   io_mode: "auto",
   io_lanes: null,
 };
@@ -984,7 +1073,8 @@ export function flashNextSettingsEnv(s: FlashNextSettings): Record<string, strin
   if (positiveNumber(s.max_prompt_tokens)) env.LUMEN_MAX_PROMPT_TOKENS = String(s.max_prompt_tokens);
   if (positiveNumber(s.prefill_chunk)) env.LUMEN_QWEN35_PREFILL_CHUNK = String(s.prefill_chunk);
   if (s.pack !== "auto") env.LUMEN_MOE_PACK = s.pack;
-  if (s.draft_head !== "auto") env.LUMEN_QWEN4_MTP = s.draft_head;
+  // Off is the server's own default; `auto` and `on` are the opt-ins.
+  if (s.draft_head !== "off") env.LUMEN_QWEN4_MTP = s.draft_head;
   if (s.io_mode !== "auto") env.LUMEN_MOE_IO_MODE = s.io_mode;
   if (
     s.io_lanes != null &&

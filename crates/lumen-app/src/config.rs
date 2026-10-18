@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
+// 10 -> 11 with the Flash-Next draft head's default flipping from `auto` to `off`: a stored
+// `auto` meant "the default", which is now `off`, so the migration rewrites it (see
+// `migrate_in_place`).
+//
 // 8 -> 9 with the PagedAttention removal: `[advanced.paged_attention]` is gone
 // and its one live field became `advanced.mlx_batch_max`.
 //
@@ -17,7 +21,7 @@ use serde::{Deserialize, Serialize};
 // carried a `v7 -> v8` step, and migration only runs when `schema_version <
 // CURRENT`, so a config sitting at exactly 7 never received that step. Bumping
 // the constant is not optional bookkeeping; it is what makes the step run.
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -41,6 +45,11 @@ pub struct PersistentConfig {
     /// keeps configs written before the section existed loadable, so no schema bump.
     #[serde(default)]
     pub flash_next: FlashNextConfig,
+    /// What this Mac measured of itself (memory bandwidth, SSD read speed), which the decode
+    /// speed estimate needs. `#[serde(default)]`: older configs have none, so nothing is
+    /// estimated until the first measurement.
+    #[serde(default)]
+    pub measured_hardware: MeasuredHardware,
     /// Free-form `KEY=VALUE` overrides for anything not surfaced as a typed
     /// field. Passed verbatim to the subprocess after the typed fields, so a
     /// user can use this to override even fields that have dedicated UI (last
@@ -310,16 +319,19 @@ pub enum FlashNextPack {
     Build,
 }
 
-/// The draft head (`mtp.safetensors`) that lets the server guess a second token per step.
+/// The draft head (`mtp.safetensors`) that lets the server guess a second token per step. Off
+/// by default: measured, it gained at most 4% and often lost 1-4%, and its text is not
+/// bit-identical to plain decoding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlashNextDraftHead {
-    /// Use it when the file is there.
+    /// Never use it. The server's own default, so nothing is sent.
     #[default]
-    Auto,
-    /// Use it; the server refuses to start without the file.
-    On,
     Off,
+    /// Use it when the file is installed, under the server's speed governor.
+    Auto,
+    /// Like `Auto`, but the server refuses to start without the file.
+    On,
 }
 
 /// How expert reads go to the SSD.
@@ -364,9 +376,9 @@ impl FlashNextConfig {
             FlashNextPack::Build => out.push(("LUMEN_MOE_PACK", "build".into())),
         }
         match self.draft_head {
-            FlashNextDraftHead::Auto => {}
+            FlashNextDraftHead::Off => {}
+            FlashNextDraftHead::Auto => out.push(("LUMEN_QWEN4_MTP", "auto".into())),
             FlashNextDraftHead::On => out.push(("LUMEN_QWEN4_MTP", "on".into())),
-            FlashNextDraftHead::Off => out.push(("LUMEN_QWEN4_MTP", "off".into())),
         }
         match self.io_mode {
             FlashNextIoMode::Auto => {}
@@ -380,6 +392,25 @@ impl FlashNextConfig {
         }
         out
     }
+}
+
+/// The numbers a decode-speed estimate for this Mac rests on, as last measured. Written by the
+/// Flash-Next card's Measure action and by the Doctor's SSD test; logic in `hardware.rs`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeasuredHardware {
+    /// GPU memory read bandwidth in GB/s (`lumen-server --measure-memory-bandwidth`).
+    pub memory_gbps: Option<f64>,
+    /// When it was measured, in unix seconds.
+    pub memory_measured_at: Option<u64>,
+    /// Random-read speed of the SSD in GB/s (four threads, 1 MB and up, page cache bypassed).
+    pub ssd_random_gbps: Option<f64>,
+    /// Front-to-back read speed of the same test, when it reported one.
+    pub ssd_sequential_gbps: Option<f64>,
+    /// The Flash-Next model directory the SSD test read. A different or moved model folder is
+    /// another volume as far as the number goes: it no longer counts.
+    pub ssd_volume: Option<String>,
+    pub ssd_measured_at: Option<u64>,
 }
 
 impl Default for PersistentConfig {
@@ -438,6 +469,7 @@ impl Default for PersistentConfig {
                 paged_attention: None,
             },
             flash_next: FlashNextConfig::default(),
+            measured_hardware: MeasuredHardware::default(),
             env_overrides: BTreeMap::new(),
             active_model: None,
             active_image_model: None,
@@ -618,6 +650,18 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
     // stored value on parse; this step stamps the version.
     if cfg.schema_version < 10 {
         cfg.schema_version = 10;
+    }
+    // v10 -> v11: the Flash-Next draft head's default flipped from `auto` to `off` (measured: it
+    // gained at most 4% and lost up to 4.4%, and its text is not bit-identical to plain decoding).
+    // Before, `auto` was the default and the card's first chip, which sent nothing; the same word
+    // now means the opt-in "use it when installed". A config written before this step that says
+    // `auto` meant "the default", so it becomes `off`, the new default, rather than silently
+    // turning the head on. `on` and `off` were explicit choices and stay.
+    if cfg.schema_version < 11 {
+        if cfg.flash_next.draft_head == FlashNextDraftHead::Auto {
+            cfg.flash_next.draft_head = FlashNextDraftHead::Off;
+        }
+        cfg.schema_version = 11;
     }
     // Future migrations append here.
 }
@@ -839,7 +883,7 @@ max_batch = 6
         let cfg: PersistentConfig = toml::from_str(&partial).expect("a partial section loads");
         assert_eq!(cfg.flash_next.pack, FlashNextPack::Off);
         assert_eq!(cfg.flash_next.expert_cache_gb, None);
-        assert_eq!(cfg.flash_next.draft_head, FlashNextDraftHead::Auto);
+        assert_eq!(cfg.flash_next.draft_head, FlashNextDraftHead::Off);
     }
 
     /// What the settings card saves is what comes back after a restart, and the file keeps
@@ -875,7 +919,7 @@ max_batch = 6
                 "max_prompt_tokens": null,
                 "prefill_chunk": null,
                 "pack": "auto",
-                "draft_head": "auto",
+                "draft_head": "off",
                 "io_mode": "auto",
                 "io_lanes": null,
             })
@@ -918,17 +962,87 @@ max_batch = 6
         let whole = FlashNextConfig {
             expert_cache_gb: Some(8.0),
             pack: FlashNextPack::Off,
-            draft_head: FlashNextDraftHead::Off,
+            draft_head: FlashNextDraftHead::Auto,
             io_mode: FlashNextIoMode::Buffered,
             ..FlashNextConfig::default()
         };
         let env: std::collections::BTreeMap<_, _> = whole.env().into_iter().collect();
-        // `8`, never `8.0` or `8g`; `off` and `buffered` as the server spells them.
+        // `8`, never `8.0` or `8g`; `off`, `auto` and `buffered` as the server spells them.
         assert_eq!(env["LUMEN_MOE_EXPERT_CACHE_GB"], "8");
         assert_eq!(env["LUMEN_MOE_PACK"], "off");
-        assert_eq!(env["LUMEN_QWEN4_MTP"], "off");
+        assert_eq!(env["LUMEN_QWEN4_MTP"], "auto");
         assert_eq!(env["LUMEN_MOE_IO_MODE"], "buffered");
         assert_eq!(env.len(), 4);
+    }
+
+    /// The draft head is off unless chosen: the default sends nothing (the server's own default
+    /// is off), and `auto` and `on` are the two ways to opt in.
+    #[test]
+    fn the_draft_head_is_off_by_default_and_sent_only_when_chosen() {
+        assert_eq!(
+            FlashNextConfig::default().draft_head,
+            FlashNextDraftHead::Off
+        );
+        let head = |h: FlashNextDraftHead| {
+            FlashNextConfig {
+                draft_head: h,
+                ..FlashNextConfig::default()
+            }
+            .env()
+        };
+        assert!(head(FlashNextDraftHead::Off).is_empty());
+        assert_eq!(
+            head(FlashNextDraftHead::Auto),
+            vec![("LUMEN_QWEN4_MTP", "auto".to_string())]
+        );
+        assert_eq!(
+            head(FlashNextDraftHead::On),
+            vec![("LUMEN_QWEN4_MTP", "on".to_string())]
+        );
+    }
+
+    /// A config saved before the default flipped says `draft_head = "auto"` for "the default"
+    /// (the old card's first chip sent nothing). The migration turns that into `off`, the new
+    /// default, instead of silently turning the head on; a config already on the new version keeps
+    /// an `auto` it chose, and explicit `on` / `off` are never touched.
+    #[test]
+    fn the_v11_migration_turns_the_old_default_auto_into_off_and_leaves_choices_alone() {
+        let stored = |version: u32, head: &str| {
+            let raw = toml::to_string_pretty(&PersistentConfig::default())
+                .expect("serialize")
+                .replace(
+                    &format!("schema_version = {CURRENT_SCHEMA_VERSION}"),
+                    &format!("schema_version = {version}"),
+                )
+                .replace("draft_head = \"off\"", &format!("draft_head = \"{head}\""));
+            assert!(raw.contains(&format!("draft_head = \"{head}\"")), "{raw}");
+            let mut cfg: PersistentConfig = toml::from_str(&raw).expect("parse");
+            migrate_in_place(&mut cfg);
+            cfg
+        };
+        // Written by a build whose default was `auto`.
+        let old_default = stored(10, "auto");
+        assert_eq!(old_default.flash_next.draft_head, FlashNextDraftHead::Off);
+        assert_eq!(old_default.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(old_default.flash_next.env().is_empty());
+        // Explicit choices of that build survive.
+        assert_eq!(
+            stored(10, "on").flash_next.draft_head,
+            FlashNextDraftHead::On
+        );
+        assert_eq!(
+            stored(10, "off").flash_next.draft_head,
+            FlashNextDraftHead::Off
+        );
+        // From the new version on, `auto` is the opt-in and stays.
+        assert_eq!(
+            stored(CURRENT_SCHEMA_VERSION, "auto").flash_next.draft_head,
+            FlashNextDraftHead::Auto
+        );
+        // Re-running the chain changes nothing more.
+        let mut again = stored(10, "auto");
+        migrate_in_place(&mut again);
+        assert_eq!(again.flash_next.draft_head, FlashNextDraftHead::Off);
     }
 
     #[test]
@@ -957,5 +1071,42 @@ max_batch = 6
             ..FlashNextConfig::default()
         };
         assert!(one.env().is_empty());
+    }
+
+    // ── What this Mac measured ─────────────────────────────────────────
+
+    /// Every config written before the measurements existed loads with none, so nothing is
+    /// estimated until the first measurement.
+    #[test]
+    fn an_old_config_without_measurements_loads_with_none() {
+        let cfg: PersistentConfig =
+            toml::from_str(V8_TOML).expect("a config without [measured_hardware] must load");
+        assert_eq!(cfg.measured_hardware, MeasuredHardware::default());
+        // And with only some of the fields (a partial measurement).
+        let partial = format!("{V8_TOML}\n[measured_hardware]\nmemory_gbps = 231.5\n");
+        let cfg: PersistentConfig = toml::from_str(&partial).expect("a partial table loads");
+        assert_eq!(cfg.measured_hardware.memory_gbps, Some(231.5));
+        assert_eq!(cfg.measured_hardware.ssd_random_gbps, None);
+        assert_eq!(cfg.measured_hardware.ssd_volume, None);
+    }
+
+    #[test]
+    fn the_measurements_round_trip_through_the_config_file() {
+        let mut cfg = PersistentConfig::default();
+        cfg.measured_hardware.record_memory(231.5, 1_790_000_000);
+        cfg.measured_hardware.record_ssd(
+            3.1,
+            Some(5.2),
+            "/Volumes/Fast/models/Flash-Next",
+            1_790_000_100,
+        );
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(raw.contains("[measured_hardware]"), "{raw}");
+        let back: PersistentConfig = toml::from_str(&raw).expect("parse");
+        assert_eq!(back.measured_hardware, cfg.measured_hardware);
+        // Nothing measured stays nothing measured.
+        let raw = toml::to_string_pretty(&PersistentConfig::default()).expect("serialize");
+        let back: PersistentConfig = toml::from_str(&raw).expect("parse");
+        assert_eq!(back.measured_hardware, MeasuredHardware::default());
     }
 }

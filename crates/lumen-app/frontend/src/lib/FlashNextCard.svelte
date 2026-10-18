@@ -13,15 +13,16 @@
   import PackBuildControl from "./PackBuildControl.svelte";
   import PoolPicker from "./PoolPicker.svelte";
   import PromptPicker from "./PromptPicker.svelte";
-  import type { FlashNextSettings, FlashNextStatus, PackProgress } from "./api";
+  import type { FlashNextSettings, FlashNextStatus, MeasureProgress, PackProgress } from "./api";
   import type { Chip } from "./chips";
-  import { fill, fmtTps } from "./format";
+  import { fill } from "./format";
   import {
     FLASH_NEXT_LANE_PRESETS,
     FLASH_NEXT_LANES_DEFAULT,
     envChoice,
     flashNextEffective,
     flashNextEnv,
+    flashNextHardware,
     flashNextIsDefault,
     flashNextPlan,
     flashNextShadowedKeys,
@@ -46,6 +47,8 @@
     status: FlashNextStatus | null;
     /** The latest expert-pack build report of this session. */
     build: PackProgress | null;
+    /** The latest Measure report of this session. */
+    measure: MeasureProgress | null;
     /** Store some settings (`null` = back to the server's default). */
     onChange: (patch: Partial<FlashNextSettings>) => void;
     onReset: () => void;
@@ -53,6 +56,8 @@
     onClearOverrides: (keys: string[]) => void;
     onBuild: () => Promise<void>;
     onCancelBuild: () => Promise<void>;
+    onMeasure: () => Promise<void>;
+    onCancelMeasure: () => Promise<void>;
   }
   let {
     settings,
@@ -63,18 +68,23 @@
     contextMax,
     status,
     build,
+    measure,
     onChange,
     onReset,
     onClearOverrides,
     onBuild,
     onCancelBuild,
+    onMeasure,
+    onCancelMeasure,
   }: Props = $props();
 
   const ram = $derived(ramGb && ramGb > 0 ? ramGb : 16);
   const usable = $derived(flashNextUsableBytes(ram, memoryLimitGb));
   // What a launch carries: the settings, replaced by overrides of the same name.
   const env = $derived(flashNextEnv(settings, overrides));
-  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status }));
+  // This Mac's measured memory and SSD speeds; the card shows no speed for it until both exist.
+  const hw = $derived(flashNextHardware(status?.hardware).hw);
+  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status, hw }));
   const defaults = $derived(flashNextPlan(usable));
   const shadowed = $derived(flashNextShadowedKeys(overrides));
   const off = $derived(!enabled);
@@ -103,10 +113,11 @@
     { value: "off", label: t("flashnext.choice.off"), title: t("flashnext.pack.mode.off") },
     { value: "build", label: t("flashnext.choice.build"), title: t("flashnext.pack.mode.build") },
   ]);
+  // Off is the default (nothing is sent); Auto and On are the opt-ins.
   const headChips = $derived<Chip[]>([
+    { value: "off", label: t("flashnext.choice.off"), sub: t("flashnext.default"), title: t("flashnext.mtp.mode.off") },
     { value: "auto", label: t("flashnext.choice.auto"), title: t("flashnext.mtp.mode.auto") },
     { value: "on", label: t("flashnext.choice.on"), title: t("flashnext.mtp.mode.on") },
-    { value: "off", label: t("flashnext.choice.off"), title: t("flashnext.mtp.mode.off") },
   ]);
   const ioChips = $derived<Chip[]>([
     { value: "auto", label: t("flashnext.choice.auto"), title: t("flashnext.io.mode.auto") },
@@ -130,8 +141,12 @@
       prompt: eff.promptTokens.toLocaleString("en-US"),
       pack: eff.pack ? t("flashnext.on") : t("flashnext.off"),
       head: eff.head ? t("flashnext.on") : t("flashnext.off"),
-      tps: eff.tps ? `${fmtTps(eff.tps.tps)}${eff.tps.emulated ? "*" : ""}` : "—",
-    }),
+    }) +
+      ", " +
+      // A speed only for this Mac: with both numbers measured, never a reference machine's.
+      (eff.tps
+        ? fill(t("flashnext.summary.speed"), { tps: eff.tps.tps.toFixed(1) })
+        : t("flashnext.summary.speedUnknown")),
   );
   const fits = $derived(eff.estimate.fits);
 </script>
@@ -184,6 +199,7 @@
           chunk={eff.chunk}
           ctxTokens={eff.promptTokens}
           pack={eff.pack}
+          {hw}
           disabled={off}
           onSelect={(v) => onChange({ expert_cache_gb: v })}
         />
@@ -290,6 +306,11 @@
           <div class="text-[10.5px] leading-snug">
             {#if !status || !status.installed}
               <span class="dim">{t("flashnext.pack.status.notInstalled")}</span>
+            {:else if head === "off"}
+              <!-- Off is the default: an installed head that is not used is not a problem. -->
+              <span class="dim">
+                {status.mtp_present ? t("flashnext.mtp.status.presentOff") : t("flashnext.mtp.status.missingOff")}
+              </span>
             {:else if status.mtp_present}
               <span class="text-ok">{t("flashnext.mtp.status.present")}</span>
             {:else}
@@ -298,7 +319,7 @@
               </span>
             {/if}
           </div>
-          {#if status?.installed && !status.mtp_present}
+          {#if status?.installed && !status.mtp_present && head !== "off"}
             <div class="mono text-[10px] px-2 py-1 bg-bg rounded text-accent select-text overflow-x-auto">
               $ python3 scripts/qwen4_mtp_fetch.py {status.dir ?? "<model dir>"}
             </div>
@@ -348,7 +369,17 @@
     <!-- What the choices come to: the memory plan, the speed table, the disk -->
     <div class="min-w-0 lg:border-l lg:border-border lg:pl-6">
       <div class="text-[10px] text-text-dim uppercase tracking-wider mb-1.5">{t("flashnext.plan.title")}</div>
-      <FlashNextCalculator {ramGb} {memoryLimitGb} {env} {contextMax} {status} />
+      <FlashNextCalculator
+        {ramGb}
+        {memoryLimitGb}
+        {env}
+        {contextMax}
+        {status}
+        {measure}
+        enabled={enabled}
+        onMeasure={onMeasure}
+        onCancelMeasure={onCancelMeasure}
+      />
     </div>
   </div>
 </div>

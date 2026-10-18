@@ -1190,7 +1190,7 @@ mod launch_env_tests {
             max_prompt_tokens: Some(32_768),
             prefill_chunk: Some(512),
             pack: FlashNextPack::Build,
-            draft_head: FlashNextDraftHead::Off,
+            draft_head: FlashNextDraftHead::Auto,
             io_mode: FlashNextIoMode::Direct,
             io_lanes: Some(16),
         };
@@ -1206,14 +1206,17 @@ mod launch_env_tests {
             ("LUMEN_MAX_PROMPT_TOKENS", "32768"),
             ("LUMEN_QWEN35_PREFILL_CHUNK", "512"),
             ("LUMEN_MOE_PACK", "build"),
-            ("LUMEN_QWEN4_MTP", "off"),
+            ("LUMEN_QWEN4_MTP", "auto"),
             ("LUMEN_MOE_IO_MODE", "direct"),
             ("LUMEN_MOE_IO_LANES", "16"),
         ] {
             assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
         }
+        // `auto` is a value only where the setting is the draft head's opt-in; no other option
+        // gets its "automatic" default written down.
         assert!(
-            env.values().all(|v| v != "auto"),
+            env.iter()
+                .all(|(k, v)| v != "auto" || k == "LUMEN_QWEN4_MTP"),
             "an `auto` default was sent: {env:?}"
         );
         // A fractional pool and the other spellings of the choices.
@@ -1250,6 +1253,40 @@ mod launch_env_tests {
         // Choosing the default (32 reader threads) is not choosing: still nothing sent.
         let env = launch_on(FLASH_NEXT_ID, 36, |c| c.flash_next.io_lanes = Some(32));
         assert!(!env.contains_key("LUMEN_MOE_IO_LANES"));
+    }
+
+    /// The draft head is off unless chosen: off (the default) sends nothing, `auto` and `on` are
+    /// sent as such, and no other model ever gets the variable.
+    #[test]
+    fn the_draft_head_is_sent_only_when_chosen_and_only_to_flash_next() {
+        let mtp = |model: &str, head: FlashNextDraftHead| {
+            launch_on(model, 36, |c| c.flash_next.draft_head = head)
+                .get("LUMEN_QWEN4_MTP")
+                .cloned()
+        };
+        assert_eq!(mtp(FLASH_NEXT_ID, FlashNextDraftHead::Off), None);
+        assert_eq!(
+            mtp(FLASH_NEXT_ID, FlashNextDraftHead::Auto).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            mtp(FLASH_NEXT_ID, FlashNextDraftHead::On).as_deref(),
+            Some("on")
+        );
+        // A fresh config sends nothing for it.
+        assert!(
+            !launch_on(FLASH_NEXT_ID, 36, |_| {}).contains_key("LUMEN_QWEN4_MTP"),
+            "the default is off, and off is the server's own default"
+        );
+        for model in [
+            "/models/Qwen3.8-27B-MTPLX-Speed",
+            "/models/gemma-4-26b-a4b-4bit",
+            "mlx-community/Qwen3.6-35B-A3B-mxfp4",
+        ] {
+            for head in [FlashNextDraftHead::Auto, FlashNextDraftHead::On] {
+                assert_eq!(mtp(model, head), None, "{model} {head:?}");
+            }
+        }
     }
 
     /// A longest prompt chosen in the card replaces the machine's default; clearing it brings the

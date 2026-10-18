@@ -130,7 +130,7 @@
       }
       case "flash_next_mtp":
         if (m === "draft head present (mtp.safetensors)") return t("doctor.msg.flash_next_mtp.present");
-        if (m.startsWith("draft head present, switched off")) return t("doctor.msg.flash_next_mtp.off");
+        if (m.startsWith("draft head installed, not used")) return t("doctor.msg.flash_next_mtp.off");
         if (m === "no draft head (optional)") return t("doctor.msg.flash_next_mtp.absent");
         if (m.startsWith("LUMEN_QWEN4_MTP=on but")) return t("doctor.msg.flash_next_mtp.required");
         return m;
@@ -140,16 +140,23 @@
         if (m === "read failed") return t("doctor.msg.flash_next_ssd.readFailed");
         if (m === "could not measure random reads") return t("doctor.msg.flash_next_ssd.noRandom");
         if (m === "the volume did not answer in time") return t("doctor.msg.flash_next_ssd.stalled");
-        // "random 4.8 GB/s (sequential 5.9 GB/s): fast enough for ~12 tok/s" / "...: slow, ~3.1 tok/s"
+        // "random 4.8 GB/s (sequential 5.9 GB/s): fast enough for ~12 tok/s" / "...: slow, ~3.1 tok/s",
+        // or without the tok/s while this Mac's memory bandwidth is not measured: "...: fast enough" /
+        // "...: slow".
         const speed = m.match(
-          /^random ([\d.]+) GB\/s \(sequential ([\d.]+) GB\/s\): (?:(fast enough for)|slow,) ~([\d.]+) tok\/s$/,
+          /^random ([\d.]+) GB\/s \(sequential ([\d.]+) GB\/s\): (?:(fast enough)|slow)(?:(?: for)?,? ~([\d.]+) tok\/s)?$/,
         );
-        if (speed)
-          return fill(speed[3] ? "doctor.msg.flash_next_ssd.fast" : "doctor.msg.flash_next_ssd.slow", {
-            rand: speed[1],
-            seq: speed[2],
-            tps: speed[4],
-          });
+        if (speed) {
+          const fast = !!speed[3];
+          const key = speed[4]
+            ? fast
+              ? "doctor.msg.flash_next_ssd.fast"
+              : "doctor.msg.flash_next_ssd.slow"
+            : fast
+              ? "doctor.msg.flash_next_ssd.fastNoEstimate"
+              : "doctor.msg.flash_next_ssd.slowNoEstimate";
+          return fill(key, { rand: speed[1], seq: speed[2], tps: speed[4] ?? "" });
+        }
         return m;
       }
     }
@@ -213,14 +220,17 @@
     if (c.id === "flash_next_ssd") {
       // "Read 1074 MB of model-00006.safetensors with the page cache bypassed: 537 MB front to
       // back, then 537 MB as 194 random 2.8 MB reads on 4 threads, the way the server fetches
-      // experts. Decode speed scales a table measured on a 36 GB M3 Max (SSD reading 6.5 GB/s)
-      // by this volume's speed, for an expert pool of ~18.4 GB, what the memory plan leaves on this
-      // Mac." (+ " The table measured with the expert pack is used.") (+ " The test hit its time limit ...")
+      // experts." followed by either " Decode speed is estimated from this volume's random reads
+      // and this Mac's memory bandwidth (277 GB/s, measured), for an expert pool of ~18.4 GB,
+      // what the memory plan leaves on this Mac." (+ " The expert pack's read efficiency is
+      // used.") or " Measure this Mac's memory bandwidth in the Flash-Next card (Tuning tab) to
+      // get a decode-speed estimate.", then (+ " The test hit its time limit ...").
       const x = d.match(
-        /^Read (\d+) MB of (.+?) with the page cache bypassed: (\d+) MB front to back, then (\d+) MB as (\d+) random ([\d.]+) MB reads on 4 threads, .*?\(SSD reading ([\d.]+) GB\/s\).*?~([\d.]+) GB,/,
+        /^Read (\d+) MB of (.+?) with the page cache bypassed: (\d+) MB front to back, then (\d+) MB as (\d+) random ([\d.]+) MB reads on 4 threads, the way the server fetches experts\./,
       );
       if (x) {
-        const pack = d.includes("measured with the expert pack") ? " " + t("doctor.detail.flash_next_ssd.pack") : "";
+        const est = d.match(/memory bandwidth \(([\d.]+) GB\/s, measured\), for an expert pool of ~([\d.]+) GB/);
+        const pack = d.includes("The expert pack's read efficiency") ? " " + t("doctor.detail.flash_next_ssd.pack") : "";
         const early = d.includes("stopped early") ? " " + t("doctor.detail.flash_next_ssd.early") : "";
         return (
           fill("doctor.detail.flash_next_ssd", {
@@ -230,9 +240,11 @@
             rand: x[4],
             reads: x[5],
             rec: x[6],
-            ref: x[7],
-            pool: x[8],
           }) +
+          " " +
+          (est
+            ? fill("doctor.detail.flash_next_ssd.estimate", { mem: est[1], pool: est[2] })
+            : t("doctor.detail.flash_next_ssd.measure")) +
           pack +
           early
         );
@@ -249,6 +261,8 @@
     packBuild?: PackProgress | null;
     onBuildPack?: () => Promise<void>;
     onCancelPackBuild?: () => Promise<void>;
+    /** The SSD test finished and its numbers were stored: the card's estimate may have changed. */
+    onProbed?: () => void;
   }
   let {
     report,
@@ -257,6 +271,7 @@
     packBuild = null,
     onBuildPack,
     onCancelPackBuild,
+    onProbed,
   }: Props = $props();
 
   let running = $state(false);
@@ -290,6 +305,7 @@
       checks.splice(checks.map((c) => c.id.startsWith("flash_next_")).lastIndexOf(true) + 1, 0, row);
       onReport({ overall: overallOf(checks), checks });
       expanded = new Set([...expanded, row.id]);
+      onProbed?.();
     } catch (e) {
       fixMessage = `${t("doctor.failed")} ${e}`;
     } finally {

@@ -1,6 +1,7 @@
 <script lang="ts">
   // The expert cache size: `Auto | 4 GB | … | 20 GB | Custom`. Each chip shows the decode speed
-  // that pool buys and is disabled when it does not fit beside the current longest prompt.
+  // that pool buys on this Mac (once its memory and SSD are measured; no speed before) and is
+  // disabled when it does not fit beside the current longest prompt.
   // Writes a plain number of GB (`8`), or null for Auto: the parent stores it as
   // `flash_next.expert_cache_gb` (→ `LUMEN_MOE_EXPERT_CACHE_GB`).
   import { t } from "./i18n.svelte";
@@ -12,6 +13,7 @@
     FLASH_NEXT_POOL_MIN_GB,
     FLASH_NEXT_POOL_PRESETS_GB,
     flashNextPoolChip,
+    type FlashNextHardware,
     formatGbValue,
     parseGbInput,
   } from "./memory-estimate";
@@ -23,13 +25,15 @@
     chunk: number;
     /** The longest prompt the plan holds KV for. */
     ctxTokens: number;
-    /** Whether the expert pack is in use (the speed estimate follows its table). */
+    /** Whether the expert pack is in use (the speed estimate follows its efficiency). */
     pack: boolean;
+    /** This Mac's measured memory and SSD speeds; `null` until both are known. */
+    hw: FlashNextHardware | null;
     onSelect: (gb: number | null) => void;
     /** Read-only: the chips and the custom box cannot be used. */
     disabled?: boolean;
   }
-  let { gb, usableBytes, chunk, ctxTokens, pack, onSelect, disabled = false }: Props = $props();
+  let { gb, usableBytes, chunk, ctxTokens, pack, hw, onSelect, disabled = false }: Props = $props();
 
   const presets: readonly number[] = FLASH_NEXT_POOL_PRESETS_GB;
   const fmtTok = (n: number) => n.toLocaleString("en-US");
@@ -42,25 +46,21 @@
   const selected = $derived(
     gb == null ? "auto" : customOpen || !presets.includes(gb) ? "custom" : String(gb),
   );
-  const auto = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: null, pack }));
+  const auto = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: null, pack, hw }));
 
-  // `*`: rests on a point measured with the memory limited to emulate a smaller Mac.
-  // `†`: extrapolated below the measured range.
-  const marks = (c: { tps: { emulated: boolean; basis: string } | null }) =>
-    c.tps ? `${c.tps.emulated ? "*" : ""}${c.tps.basis === "below" ? "†" : ""}` : "";
   const speed = (c: ReturnType<typeof flashNextPoolChip>) =>
-    c.tps ? `~${fmtTps(c.tps.tps)}${marks(c)}` : undefined;
+    c.tps ? `~${fmtTps(c.tps.tps)}` : undefined;
 
   const chips = $derived.by((): Chip[] => [
     {
       value: "auto",
       label: t("flashnext.pool.auto"),
-      sub: `${gbText(auto.poolBytes)} GB · ${speed(auto) ?? "—"}`,
+      sub: `${gbText(auto.poolBytes)} GB${speed(auto) ? ` · ${speed(auto)}` : ""}`,
       title: t("flashnext.pool.chip.auto"),
       warn: !auto.fits,
     },
     ...presets.map((p) => {
-      const c = flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: p, pack });
+      const c = flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb: p, pack, hw });
       return {
         value: String(p),
         label: `${p} GB`,
@@ -78,11 +78,7 @@
     { value: "custom", label: t("flashnext.pool.custom") },
   ]);
 
-  const active = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb, pack }));
-  const anyMark = $derived(
-    chips.some((c) => c.sub?.includes("*")) || chips.some((c) => c.sub?.includes("†")),
-  );
-
+  const active = $derived(flashNextPoolChip({ usableBytes, chunk, ctxTokens, gb, pack, hw }));
   function choose(value: string) {
     invalid = false;
     if (value === "auto") {
@@ -138,7 +134,7 @@
       <b class="text-text">{fill(t("flashnext.pool.active.set"), { pool: formatGbValue(gb) })}</b>
     {/if}
     {#if active.tps}
-      <span class="dim">· ≈ {fmtTps(active.tps.tps)} tok/s{marks(active)}</span>
+      <span class="dim">· ≈ {fmtTps(active.tps.tps)} tok/s</span>
     {/if}
     {#if gb != null && gb < FLASH_NEXT_POOL_MIN_GB}
       <span class="text-warn">{fill(t("flashnext.pool.floor"), { floor: (FLASH_NEXT.poolFloorBytes / 1e9).toFixed(2) })}</span>
@@ -153,7 +149,7 @@
       <span class="text-err">{t("flashnext.pool.noFitAuto")}</span>
     {/if}
   </div>
-  {#if anyMark}
+  {#if hw}
     <div class="dim text-[9.5px] leading-snug">{t("flashnext.pool.legend")}</div>
   {/if}
 </div>

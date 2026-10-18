@@ -279,31 +279,82 @@ pub fn launch_plan(cfg: &PersistentConfig, ram_bytes: u64) -> LaunchPlan {
 }
 
 // ── What speed that buys ─────────────────────────────────────────────
+//
+// Decode runs a token at a time. For each, the GPU streams the resident trunk and the ~1.3 GB of
+// experts the router picked through memory, and every expert that is not in the pool is read from
+// the SSD first. So the speed is set by two numbers of the Mac itself, its memory bandwidth and
+// its SSD's random-read speed, and by how often the pool already holds the expert:
+//
+//   time_per_token_ms = fixed_ms + miss_gb / ssd_effective_gbps * 1000
+//   fixed_ms          = STREAM_GB / memory_gbps * 1000 + OTHER_MS
+//   miss_gb           = (1 - hit_rate(pool_gb)) * EXPERT_GB_PER_TOKEN
+//   ssd_effective     = ssd_random_gbps * SSD_EFFICIENCY_SHARDS (or _PACK)
+//   tokens/s          = 1000 / time_per_token_ms
+//
+// `memory_gbps` and `ssd_random_gbps` are what this Mac measured (`hardware.rs`; the SSD one by
+// [`probe_read_speed`]). The constants were calibrated on one machine, the reference below, and
+// `frontend/src/lib/memory-estimate.ts` mirrors them (its test reads this file).
 
-/// Decode speed (tokens/s) by expert-pool size (GB), measured on a 36 GB M3 Max whose SSD reads
-/// at [`REFERENCE_READ_GBPS`], reading the shipped shards. Prefill (~230 tokens/s) does not
-/// depend on the pool.
-pub const DECODE_TPS_SHARDS: [(f64, f64); 4] =
-    [(6.7, 5.75), (10.0, 7.53), (15.0, 9.73), (19.8, 13.0)];
-/// The same with the expert pack. The 4.2 and 6.85 GB points were run on that Mac with its
-/// memory limited to emulate a 16 and a 24 GB one, so they show what the plan does, not how a
-/// real small Mac's own memory pressure behaves.
-pub const DECODE_TPS_PACK: [(f64, f64); 5] = [
-    (4.2, 5.6),
-    (6.7, 6.83),
-    (6.85, 6.7),
-    (10.0, 8.22),
-    (15.0, 10.86),
+/// Bytes the GPU streams per token: the 1.325 GB of experts a token routes to (48 layers x 10
+/// experts x 2.76 MB) plus the 3.6 GB trunk.
+pub const STREAM_GB: f64 = 4.925;
+/// Per-token time that does not scale with memory bandwidth: dispatch and synchronisation.
+/// Calibrated on the reference Mac at [`REFERENCE_MEMORY_GBPS`], where `fixed_ms` is 41.2 ms.
+pub const OTHER_MS: f64 = 23.7;
+/// Expert bytes one token touches (GB), all of which come from the SSD when the pool misses.
+pub const EXPERT_GB_PER_TOKEN: f64 = 1.325;
+/// Share of the experts a token routes to that the pool already holds, by pool size (GB, then
+/// hit rate), as the engine measured it over a 300-token window with direct reads. 2.83 GB is the
+/// engine's floor (1,024 slots): it runs no smaller pool. Between points it is linear, below the
+/// first the first segment's slope continues (never under 0), past the last it is held.
+pub const HIT_RATE_POINTS: [(f64, f64); 6] = [
+    (2.83, 0.477),
+    (4.2, 0.554),
+    (6.7, 0.664),
+    (10.0, 0.750),
+    (15.0, 0.826),
+    (19.8, 0.867),
 ];
-/// Random-read speed of the SSD behind those tables: four threads, `F_NOCACHE`, reads of 1 MB
-/// and up (`lumen-mlx/src/offload/io.rs`).
-pub const REFERENCE_READ_GBPS: f64 = 6.5;
+/// How much of the measured random-read speed decode actually gets when it reads the shipped
+/// shards, and with the expert pack (one contiguous file).
+pub const SSD_EFFICIENCY_SHARDS: f64 = 0.63;
+pub const SSD_EFFICIENCY_PACK: f64 = 0.72;
+
+/// The machine the constants and the reference table below were measured on: an M3 Max with 36
+/// GB, memory reading at 281 GB/s and an SSD at [`REFERENCE_READ_GBPS`].
+pub const REFERENCE_MEMORY_GBPS: f64 = 281.0;
+/// Random-read speed of that SSD: four threads, `F_NOCACHE`, reads of 1 MB and up
+/// (`lumen-mlx/src/offload/io.rs`).
+pub const REFERENCE_READ_GBPS: f64 = 6.57;
+/// Decode speed (tokens/s) by expert-pool size (GB) on that Mac, reading the shipped shards:
+/// the pool set explicitly, direct reads (the page cache is not counted), the engine's default
+/// eviction, no draft head, 300 tokens of prose, medians of three runs. Shown as reference
+/// material until this Mac is measured, and the anchors the model is tested against. A real 16
+/// or 24 GB Mac's own memory pressure is not measured here. Prefill (~230 tokens/s) does not
+/// depend on the pool.
+pub const DECODE_TPS_SHARDS: [(f64, f64); 6] = [
+    (2.83, 4.72),
+    (4.2, 5.58),
+    (6.7, 6.69),
+    (10.0, 8.06),
+    (15.0, 10.39),
+    (19.8, 11.96),
+];
+/// The same with the expert pack.
+pub const DECODE_TPS_PACK: [(f64, f64); 6] = [
+    (2.83, 5.44),
+    (4.2, 6.14),
+    (6.7, 7.15),
+    (10.0, 8.96),
+    (15.0, 11.15),
+    (19.8, 12.95),
+];
 /// Below this the SSD, not the GPU, sets a decode speed worth warning about.
 pub const SLOW_READ_GBPS: f64 = 2.0;
 
 /// Linear interpolation over `points` (sorted by x). Above the last point the value is held
 /// (nothing is measured past it); below the first the first segment's slope continues, which
-/// is an extrapolation.
+/// is an extrapolation. Never negative.
 fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
     let last = points[points.len() - 1];
     if x >= last.0 {
@@ -317,25 +368,32 @@ fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
     (lo.1 + (x - lo.0) * slope).max(0.0)
 }
 
-/// Decode speed for a pool of `pool_gb`. With `pack` and a pool inside the pack's measured range
-/// (4.2 to 15 GB) it follows the pack table; otherwise the shard table.
-pub fn decode_tps_for_pool(pool_gb: f64, pack: bool) -> f64 {
-    let (lo, hi) = (
-        DECODE_TPS_PACK[0].0,
-        DECODE_TPS_PACK[DECODE_TPS_PACK.len() - 1].0,
-    );
-    if pack && (lo..=hi).contains(&pool_gb) {
-        interpolate(&DECODE_TPS_PACK, pool_gb)
-    } else {
-        interpolate(&DECODE_TPS_SHARDS, pool_gb)
-    }
+/// Share of a token's experts a pool of `pool_gb` already holds ([`HIT_RATE_POINTS`]).
+pub fn hit_rate(pool_gb: f64) -> f64 {
+    interpolate(&HIT_RATE_POINTS, pool_gb).min(1.0)
 }
 
-/// Decode speed for a pool of `pool_gb` on a disk that serves random reads at `read_gbps`:
-/// the table scaled down by how much slower the disk is than the one it was measured on. A
-/// faster disk is not promised more.
-pub fn decode_tps_estimate(pool_gb: f64, read_gbps: f64, pack: bool) -> f64 {
-    decode_tps_for_pool(pool_gb, pack) * (read_gbps / REFERENCE_READ_GBPS).clamp(0.0, 1.0)
+/// Decode speed (tokens/s) for a pool of `pool_gb` on a Mac whose memory streams at `memory_gbps`
+/// and whose SSD serves random expert-sized reads at `ssd_random_gbps`; `pack` reads the expert
+/// pack instead of the shipped shards. A pool under the engine's floor counts as the floor. A
+/// faster Mac is not clamped to the reference one. `None`
+/// when an input is missing, zero or negative, never a 0 or an infinity.
+pub fn decode_tps(pool_gb: f64, memory_gbps: f64, ssd_random_gbps: f64, pack: bool) -> Option<f64> {
+    let positive = |x: f64| x.is_finite() && x > 0.0;
+    if !(positive(pool_gb) && positive(memory_gbps) && positive(ssd_random_gbps)) {
+        return None;
+    }
+    // The engine runs no pool under its floor (1,024 slots): a smaller one is that floor.
+    let pool_gb = pool_gb.max(POOL_FLOOR_BYTES as f64 / 1e9);
+    let efficiency = if pack {
+        SSD_EFFICIENCY_PACK
+    } else {
+        SSD_EFFICIENCY_SHARDS
+    };
+    let fixed_ms = STREAM_GB / memory_gbps * 1000.0 + OTHER_MS;
+    let miss_gb = (1.0 - hit_rate(pool_gb)) * EXPERT_GB_PER_TOKEN;
+    let ms = fixed_ms + miss_gb / (ssd_random_gbps * efficiency) * 1000.0;
+    (ms.is_finite() && ms > 0.0).then(|| 1000.0 / ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,55 +913,229 @@ mod tests {
         assert_eq!(p.threads, 4);
     }
 
+    /// The same number written out step by step from the constants, without `decode_tps`'s
+    /// helpers: what the model is, so a change to the constants moves both sides together.
+    fn by_hand(pool: f64, memory: f64, ssd: f64, pack: bool) -> f64 {
+        let pool = pool.max(POOL_FLOOR_BYTES as f64 / 1e9);
+        let p = HIT_RATE_POINTS;
+        let hit = if pool >= p[p.len() - 1].0 {
+            p[p.len() - 1].1
+        } else {
+            let i = (1..p.len()).find(|&i| pool < p[i].0).unwrap_or(1);
+            let (a, b) = (p[i - 1], p[i]);
+            (a.1 + (pool - a.0) * (b.1 - a.1) / (b.0 - a.0)).max(0.0)
+        };
+        let eff = if pack {
+            SSD_EFFICIENCY_PACK
+        } else {
+            SSD_EFFICIENCY_SHARDS
+        };
+        let ms = STREAM_GB / memory * 1000.0
+            + OTHER_MS
+            + (1.0 - hit) * EXPERT_GB_PER_TOKEN / (ssd * eff) * 1000.0;
+        1000.0 / ms
+    }
+
     #[test]
-    fn the_tables_are_reproduced_at_their_measured_points() {
-        for (pool, tps) in DECODE_TPS_SHARDS {
+    fn the_model_is_the_formula_over_the_constants() {
+        for pool in [0.5, 2.3, 4.2, 6.7, 8.0, 12.5, 19.8, 40.0] {
+            for memory in [100.0, REFERENCE_MEMORY_GBPS, 400.0] {
+                for ssd in [0.5, 3.1, REFERENCE_READ_GBPS, 14.0] {
+                    for pack in [false, true] {
+                        let got = decode_tps(pool, memory, ssd, pack).expect("an estimate");
+                        let want = by_hand(pool, memory, ssd, pack);
+                        assert!(
+                            (got - want).abs() < 1e-9,
+                            "{pool} GB {memory} GB/s {ssd} GB/s pack={pack}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The constants describe what a token streams: 48 layers x 10 experts x 2.76 MB of experts,
+    /// plus the trunk; and the fixed time at the reference memory speed is the calibrated 41.2 ms.
+    #[test]
+    fn the_constants_agree_with_the_geometry_and_the_calibration_machine() {
+        assert!((EXPERT_GB_PER_TOKEN - 48.0 * 10.0 * EXPERT_BYTES as f64 / 1e9).abs() < 1e-3);
+        assert!((STREAM_GB - (EXPERT_GB_PER_TOKEN + TRUNK_BYTES as f64 / 1e9)).abs() < 1e-9);
+        let fixed = STREAM_GB / REFERENCE_MEMORY_GBPS * 1000.0 + OTHER_MS;
+        assert!((fixed - 41.2).abs() < 0.1, "{fixed}");
+        assert!(
+            HIT_RATE_POINTS
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1)
+        );
+        // The pack is one contiguous file: it keeps more of the SSD's speed than the shards.
+        const { assert!(SSD_EFFICIENCY_PACK > SSD_EFFICIENCY_SHARDS) };
+    }
+
+    /// On the machine it was calibrated on, the model lands on every measured point (the
+    /// reference tables, twelve cells) within 4%.
+    #[test]
+    fn at_the_reference_hardware_the_model_reproduces_the_measured_points() {
+        for (table, pack) in [
+            (&DECODE_TPS_SHARDS[..], false),
+            (&DECODE_TPS_PACK[..], true),
+        ] {
+            for &(pool, measured) in table {
+                let got = decode_tps(pool, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack)
+                    .expect("an estimate");
+                let off = (got - measured).abs() / measured;
+                assert!(
+                    off <= 0.04,
+                    "{pool} GB pack={pack}: model {got:.2} vs measured {measured} ({:.1}%)",
+                    off * 100.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hit_rate_follows_its_points_holds_past_the_last_and_never_goes_below_zero() {
+        for (pool, hit) in HIT_RATE_POINTS {
+            assert!((hit_rate(pool) - hit).abs() < 1e-12, "{pool}");
+        }
+        // Halfway between the first two points.
+        let (a, b) = (HIT_RATE_POINTS[0], HIT_RATE_POINTS[1]);
+        assert!((hit_rate((a.0 + b.0) / 2.0) - (a.1 + b.1) / 2.0).abs() < 1e-12);
+        // Held, not extrapolated, past the last point.
+        let last = HIT_RATE_POINTS[HIT_RATE_POINTS.len() - 1];
+        assert_eq!(hit_rate(last.0 + 50.0), last.1);
+        // Below the first point the first segment's slope continues, and 0 is the floor.
+        let slope = (b.1 - a.1) / (b.0 - a.0);
+        assert!((hit_rate(a.0 - 1.0) - (a.1 - slope)).abs() < 1e-12);
+        assert!(hit_rate(0.0) >= 0.0 && hit_rate(-100.0) >= 0.0);
+    }
+
+    /// The engine clamps a smaller pool to its 1,024-slot floor, so that is what is estimated.
+    #[test]
+    fn a_pool_under_the_engines_floor_is_estimated_at_the_floor() {
+        let floor = POOL_FLOOR_BYTES as f64 / 1e9;
+        for pack in [false, true] {
+            let at_floor = decode_tps(floor, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack);
+            assert!(at_floor.is_some());
+            for pool in [0.1, 1.0, 2.5, floor - 1e-6] {
+                assert_eq!(
+                    decode_tps(pool, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack),
+                    at_floor,
+                    "{pool} GB"
+                );
+            }
             assert!(
-                (decode_tps_for_pool(pool, false) - tps).abs() < 1e-9,
-                "{pool}"
+                decode_tps(
+                    floor + 0.5,
+                    REFERENCE_MEMORY_GBPS,
+                    REFERENCE_READ_GBPS,
+                    pack
+                ) > at_floor
             );
         }
-        for (pool, tps) in DECODE_TPS_PACK {
-            assert!(
-                (decode_tps_for_pool(pool, true) - tps).abs() < 1e-9,
-                "{pool}"
+    }
+
+    #[test]
+    fn a_bigger_pool_a_faster_memory_or_a_faster_disk_is_never_slower() {
+        let tps =
+            |pool: f64, mem: f64, ssd: f64, pack: bool| decode_tps(pool, mem, ssd, pack).unwrap();
+        for pack in [false, true] {
+            let pools = [3.0, 4.2, 6.7, 8.0, 10.0, 15.0, 19.8];
+            for w in pools.windows(2) {
+                assert!(
+                    tps(w[1], REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack)
+                        > tps(w[0], REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack),
+                    "{w:?}"
+                );
+            }
+            // Past the last hit-rate point the pool buys nothing more.
+            assert_eq!(
+                tps(30.0, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack),
+                tps(19.8, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, pack)
             );
+            for w in [100.0, 200.0, REFERENCE_MEMORY_GBPS, 400.0, 800.0].windows(2) {
+                assert!(
+                    tps(8.0, w[1], 6.5, pack) > tps(8.0, w[0], 6.5, pack),
+                    "{w:?}"
+                );
+            }
+            for w in [0.5, 1.0, 3.1, REFERENCE_READ_GBPS, 12.0, 25.0].windows(2) {
+                assert!(
+                    tps(8.0, REFERENCE_MEMORY_GBPS, w[1], pack)
+                        > tps(8.0, REFERENCE_MEMORY_GBPS, w[0], pack),
+                    "{w:?}"
+                );
+            }
+        }
+    }
+
+    /// The reference Mac is where the model was calibrated, not a ceiling.
+    #[test]
+    fn a_faster_machine_is_promised_more_than_the_reference_one() {
+        let at_ref = decode_tps(10.0, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, false).unwrap();
+        assert!(
+            decode_tps(
+                10.0,
+                2.0 * REFERENCE_MEMORY_GBPS,
+                REFERENCE_READ_GBPS,
+                false
+            )
+            .unwrap()
+                > at_ref
+        );
+        assert!(
+            decode_tps(
+                10.0,
+                REFERENCE_MEMORY_GBPS,
+                3.0 * REFERENCE_READ_GBPS,
+                false
+            )
+            .unwrap()
+                > at_ref
+        );
+        // And a slower SSD is slower in proportion to what it reads, not by a fixed factor.
+        assert!(decode_tps(10.0, REFERENCE_MEMORY_GBPS, 0.5, false).unwrap() < 1.0);
+    }
+
+    #[test]
+    fn the_pack_is_faster_than_the_shards_at_the_same_inputs() {
+        for pool in [2.9, 4.2, 8.0, 15.0] {
+            for (mem, ssd) in [
+                (REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS),
+                (150.0, 2.0),
+                (500.0, 12.0),
+            ] {
+                assert!(
+                    decode_tps(pool, mem, ssd, true).unwrap()
+                        > decode_tps(pool, mem, ssd, false).unwrap(),
+                    "{pool} {mem} {ssd}"
+                );
+            }
         }
     }
 
     #[test]
-    fn between_points_the_speed_is_a_straight_line() {
-        // Halfway between 10 GB (7.53) and 15 GB (9.73), and (8.22) and (10.86) with the pack.
-        assert!((decode_tps_for_pool(12.5, false) - 8.63).abs() < 1e-9);
-        assert!((decode_tps_for_pool(12.5, true) - 9.54).abs() < 1e-9);
-    }
-
-    #[test]
-    fn past_the_last_point_the_speed_is_held_not_extrapolated() {
-        assert_eq!(decode_tps_for_pool(60.0, false), 13.0);
-        // The pack table ends at 15 GB; past it the shard table answers.
-        assert_eq!(decode_tps_for_pool(19.8, true), 13.0);
-    }
-
-    #[test]
-    fn below_the_first_point_the_first_slope_is_continued_and_never_negative() {
-        let below = decode_tps_for_pool(5.0, false);
-        let slope = (7.53 - 5.75) / (10.0 - 6.7);
-        assert!((below - (5.75 - 1.7 * slope)).abs() < 1e-9);
-        assert_eq!(decode_tps_for_pool(-50.0, false), 0.0);
-        // The pack table reaches down to 4.2 GB; under it the shard table is extrapolated.
-        assert!(decode_tps_for_pool(3.0, true) < 5.6);
-    }
-
-    #[test]
-    fn a_slower_disk_scales_the_table_down_and_a_faster_one_does_not_scale_it_up() {
-        let at_ref = decode_tps_estimate(10.0, REFERENCE_READ_GBPS, false);
-        assert!((at_ref - 7.53).abs() < 1e-9);
-        let half = decode_tps_estimate(10.0, REFERENCE_READ_GBPS / 2.0, false);
-        assert!((half - 7.53 / 2.0).abs() < 1e-9);
-        assert_eq!(decode_tps_estimate(10.0, 25.0, false), at_ref);
-        assert_eq!(decode_tps_estimate(10.0, 0.0, false), 0.0);
-        assert!((decode_tps_estimate(10.0, 6.5, true) - 8.22).abs() < 1e-9);
+    fn a_missing_or_non_positive_input_gives_no_estimate_never_zero_or_infinity() {
+        let bad = [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for b in bad {
+            assert_eq!(
+                decode_tps(b, REFERENCE_MEMORY_GBPS, REFERENCE_READ_GBPS, false),
+                None,
+                "pool {b}"
+            );
+            assert_eq!(
+                decode_tps(8.0, b, REFERENCE_READ_GBPS, false),
+                None,
+                "memory {b}"
+            );
+            assert_eq!(
+                decode_tps(8.0, REFERENCE_MEMORY_GBPS, b, true),
+                None,
+                "ssd {b}"
+            );
+        }
+        // A crawl is still a finite positive number.
+        let crawl = decode_tps(2.9, 1e-3, 1e-3, false).unwrap();
+        assert!(crawl.is_finite() && crawl > 0.0);
     }
 
     #[test]

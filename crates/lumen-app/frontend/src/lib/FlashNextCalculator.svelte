@@ -7,18 +7,22 @@
   // It shows what a launch carries, from the Flash-Next card's settings (and any env override of
   // theirs, passed as `env`); the choices themselves are made in that card, above it.
   import { t } from "./i18n.svelte";
-  import type { FlashNextStatus } from "./api";
-  import { fill, fmtTps } from "./format";
+  import MeasureControl from "./MeasureControl.svelte";
+  import type { FlashNextStatus, MeasureProgress } from "./api";
+  import { fill } from "./format";
   import {
     FLASH_NEXT,
     FLASH_NEXT_DECODE_TPS,
-    flashNextDecodeTps,
+    FLASH_NEXT_SPEED_MODEL,
+    flashNextChipTps,
     flashNextDiskBytes,
     flashNextEffective,
+    flashNextHardware,
     flashNextMaxContext,
     flashNextMinRamGb,
     flashNextPlan,
     flashNextPlanFits,
+    flashNextSlowSsd,
     flashNextUsableBytes,
   } from "./memory-estimate";
 
@@ -32,15 +36,34 @@
     /** Current structured `context.max` (reaches the server as `LUMEN_MAX_CTX`). */
     contextMax?: number;
     status?: FlashNextStatus | null;
+    /** The latest Measure report of this session. */
+    measure?: MeasureProgress | null;
+    /** The Flash-Next model is selected: the Measure button works. */
+    enabled?: boolean;
+    onMeasure?: () => Promise<void>;
+    onCancelMeasure?: () => Promise<void>;
   }
-  let { ramGb, memoryLimitGb = null, env, contextMax, status = null }: Props = $props();
+  let {
+    ramGb,
+    memoryLimitGb = null,
+    env,
+    contextMax,
+    status = null,
+    measure = null,
+    enabled = false,
+    onMeasure = async () => {},
+    onCancelMeasure = async () => {},
+  }: Props = $props();
 
   // The system probe falls back to 16 GB when it cannot read the RAM; so does this.
   const ram = $derived(ramGb && ramGb > 0 ? ramGb : 16);
   const usable = $derived(flashNextUsableBytes(ram, memoryLimitGb));
   // What the server does on this Mac when nothing is overridden.
   const defaults = $derived(flashNextPlan(usable));
-  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status }));
+  // This Mac's measured memory and SSD speeds; without both there is no estimate for it.
+  const measured = $derived(flashNextHardware(status?.hardware));
+  const hw = $derived(measured.hw);
+  const eff = $derived(flashNextEffective({ env, contextMax, usableBytes: usable, status, hw }));
 
   const chunk = $derived(eff.chunk);
 
@@ -54,8 +77,11 @@
   // Longest prompt: beside the chosen pool, or with `auto` before the pool is squeezed to its floor.
   const maxCtx = $derived(flashNextMaxContext(usable, chunk, eff.poolExplicit ? est.poolBytes : null));
   const minRam = $derived(flashNextMinRamGb());
-  const tps = $derived(flashNextDecodeTps(est.poolBytes));
-  const tpsPack = $derived(flashNextDecodeTps(est.poolBytes, true));
+  // What the pool decodes at here, and with the expert pack when it is not what is read now.
+  const tpsPack = $derived(eff.pack ? null : flashNextChipTps(est.poolBytes, true, hw));
+  const measuredDate = $derived(
+    measured.measuredAt == null ? "" : new Date(measured.measuredAt * 1000).toLocaleDateString(),
+  );
   const buildsPack = $derived(
     env.LUMEN_MOE_PACK?.trim().toLowerCase() === "build" && status?.pack !== "complete",
   );
@@ -155,42 +181,84 @@
     <span class="mono font-semibold whitespace-nowrap {maxCtx > 0 ? 'text-ok' : 'text-err'}">{fmtTok(maxCtx)} tok</span>
   </div>
 
-  <!-- Decode speed -->
+  <!-- Decode speed: this Mac's estimate once it is measured, else the reference table -->
   <div class="text-[10px] text-text-dim uppercase tracking-wider mb-1">{t("flashnext.speed.title")}</div>
-  {#if tps}
-    <div class="text-[11px] mb-1">
-      {fill(t("flashnext.speed.estimate"), { pool: gb(est.poolBytes), tps: fmtTps(tps.tps) })}
-      {#if tpsPack}
-        <span class="dim">· {fill(t("flashnext.speed.withPack"), { tps: fmtTps(tpsPack.tps) })}</span>
-      {/if}
-      {#if tps.basis === "below"}
-        <span class="text-warn">{t("flashnext.speed.below")}</span>
-      {:else if tps.basis === "above"}
-        <span class="dim">{t("flashnext.speed.above")}</span>
+  {#if hw}
+    {#if eff.tps}
+      <div class="text-[11px] mb-0.5">
+        <b class="text-text">
+          {fill(t("flashnext.speed.estimated"), { tps: eff.tps.tps.toFixed(1), pool: gb(est.poolBytes) })}
+        </b>
+        {#if eff.pack}<span class="dim">· {t("flashnext.speed.usingPack")}</span>{/if}
+      </div>
+      <div class="dim text-[10px] mb-0.5">{t("flashnext.speed.accuracy")}</div>
+    {/if}
+    {#if tpsPack}
+      <div class="dim text-[10.5px] mb-0.5">{fill(t("flashnext.speed.withPack"), { tps: tpsPack.tps.toFixed(1) })}</div>
+    {/if}
+    <div class="dim text-[10px] mono mb-1">
+      {fill(t("flashnext.speed.inputs"), {
+        mem: hw.memoryGbps.toFixed(0),
+        ssd: hw.ssdRandomGbps.toFixed(1),
+        date: measuredDate,
+      })}
+    </div>
+    {#if flashNextSlowSsd(hw)}
+      <div class="text-warn text-[10.5px] mb-1 leading-snug">
+        {fill(t("flashnext.speed.slowDisk"), { ssd: hw.ssdRandomGbps.toFixed(1) })}
+      </div>
+    {/if}
+  {:else}
+    <div class="text-[10.5px] mb-1 leading-snug">{t("flashnext.speed.intro")}</div>
+    <div class="text-warn text-[10.5px] mb-2 leading-snug">
+      {#if measured.missing.length === 2}
+        {t("flashnext.speed.missing.both")}
+      {:else if measured.missing[0] === "memory"}
+        {t("flashnext.speed.missing.memory")}
+      {:else if measured.ssdStale}
+        {t("flashnext.speed.missing.ssdStale")}
+      {:else}
+        {t("flashnext.speed.missing.ssd")}
       {/if}
     </div>
-  {/if}
-  <div class="overflow-x-auto">
-    <table class="text-[10.5px] mono border-collapse">
-      <thead>
-        <tr class="text-text-dim">
-          <th class="text-left font-normal pr-3 pb-0.5">{t("flashnext.speed.col.pool")}</th>
-          <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.shards")}</th>
-          <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.pack")}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each FLASH_NEXT_DECODE_TPS as p}
-          <tr>
-            <td class="text-left pr-3 text-text-dim">{p.poolGb} GB{p.emulated ? " *" : ""}</td>
-            <td class="text-right px-2">{p.shards ?? "—"}</td>
-            <td class="text-right px-2">{p.pack ?? "—"}</td>
+    <div class="dim text-[10.5px] mb-1 leading-snug">
+      {fill(t("flashnext.speed.reference"), {
+        mem: FLASH_NEXT_SPEED_MODEL.referenceMemoryGbps.toFixed(0),
+        ssd: FLASH_NEXT_SPEED_MODEL.referenceSsdGbps.toFixed(1),
+      })}
+    </div>
+    <div class="overflow-x-auto">
+      <table class="text-[10.5px] mono border-collapse">
+        <thead>
+          <tr class="text-text-dim">
+            <th class="text-left font-normal pr-3 pb-0.5">{t("flashnext.speed.col.pool")}</th>
+            <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.shards")}</th>
+            <th class="text-right font-normal px-2 pb-0.5">{t("flashnext.speed.col.pack")}</th>
           </tr>
-        {/each}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {#each FLASH_NEXT_DECODE_TPS as p}
+            <tr>
+              <td class="text-left pr-3 text-text-dim">{p.poolGb} GB</td>
+              <td class="text-right px-2">{p.shards}</td>
+              <td class="text-right px-2">{p.pack}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+    <div class="dim text-[10px] mt-1 leading-snug">{t("flashnext.speed.note")}</div>
+  {/if}
+  <div class="mt-2 mb-2.5">
+    <MeasureControl
+      measured={hw != null}
+      {status}
+      {measure}
+      {enabled}
+      onMeasure={onMeasure}
+      onCancel={onCancelMeasure}
+    />
   </div>
-  <div class="dim text-[10px] mt-1 mb-2 leading-snug">{t("flashnext.speed.note")}</div>
 
   <!-- Disk -->
   <div class="flex items-baseline justify-between gap-2 mb-0.5">

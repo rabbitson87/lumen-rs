@@ -66,7 +66,7 @@ export interface AdvancedConfig {
 }
 
 export type FlashNextPack = "auto" | "off" | "build";
-export type FlashNextDraftHead = "auto" | "on" | "off";
+export type FlashNextDraftHead = "off" | "auto" | "on";
 export type FlashNextIoMode = "auto" | "direct" | "buffered";
 
 /** The Flash-Next card's settings (`[flash_next]`). `null` / `"auto"` leave the option to the
@@ -81,12 +81,24 @@ export interface FlashNextSettings {
   prefill_chunk: number | null;
   /** → LUMEN_MOE_PACK */
   pack: FlashNextPack;
-  /** → LUMEN_QWEN4_MTP */
+  /** → LUMEN_QWEN4_MTP: `off` (the default) sends nothing; `auto` uses the head when installed,
+   *  `on` refuses to start without it. */
   draft_head: FlashNextDraftHead;
   /** → LUMEN_MOE_IO_MODE */
   io_mode: FlashNextIoMode;
   /** → LUMEN_MOE_IO_LANES (1-64); null = the server's 32. */
   io_lanes: number | null;
+}
+
+/** What this Mac measured of itself (`[measured_hardware]`); the card reads it through
+ *  `FlashNextStatus.hardware`, which knows which SSD number still counts. */
+export interface MeasuredHardware {
+  memory_gbps: number | null;
+  memory_measured_at: number | null;
+  ssd_random_gbps: number | null;
+  ssd_sequential_gbps: number | null;
+  ssd_volume: string | null;
+  ssd_measured_at: number | null;
 }
 
 export interface PersistentConfig {
@@ -95,6 +107,7 @@ export interface PersistentConfig {
   context: ContextConfig;
   advanced: AdvancedConfig;
   flash_next: FlashNextSettings;
+  measured_hardware: MeasuredHardware;
   env_overrides: Record<string, string>;
   active_model: string | null;
   /** Active diffusion image model id; independent of `active_model` so a chat
@@ -256,6 +269,19 @@ export type BuildBlock =
   | "server_running"
   | "not_enough_disk";
 
+/** What this Mac measured, as the card uses it (`flash_next_status`). Times are unix seconds. */
+export interface HardwareView {
+  /** GPU memory read bandwidth, GB/s. */
+  memory_gbps: number | null;
+  memory_measured_at: number | null;
+  /** The SSD's random-read speed, GB/s: null when never measured, or when it was measured on
+   *  another model folder (`ssd_stale`). */
+  ssd_random_gbps: number | null;
+  ssd_sequential_gbps: number | null;
+  ssd_measured_at: number | null;
+  ssd_stale: boolean;
+}
+
 /** What the Flash-Next settings show about the model on disk (`flash_next_status`). */
 export interface FlashNextStatus {
   installed: boolean;
@@ -269,6 +295,24 @@ export interface FlashNextStatus {
   server_running: boolean;
   building: boolean;
   build_block: BuildBlock | null;
+  hardware: HardwareView;
+}
+
+export type MeasureState = "running" | "done" | "failed" | "cancelled";
+export type MeasureStage = "memory" | "ssd";
+
+/** One report of the Measure action (`lumen://measure`; the last one is also the command's
+ *  result). */
+export interface MeasureProgress {
+  state: MeasureState;
+  /** What is being measured now (while running). */
+  stage: MeasureStage | null;
+  memory_gbps: number | null;
+  ssd_random_gbps: number | null;
+  /** The SSD part did not run: the model is not installed. */
+  ssd_skipped: boolean;
+  memory_error: string | null;
+  ssd_error: string | null;
 }
 
 export type PackBuildState = "running" | "done" | "failed" | "cancelled";
@@ -353,6 +397,8 @@ export const api = {
   /** Flash-Next's SSD read test (~1 GB, a few seconds). `null` = cancelled. */
   doctorProbeSsd: () => invoke<CheckResult | null>("doctor_probe_ssd"),
   doctorProbeCancel: () => invoke<void>("doctor_probe_cancel"),
+  measureHardware: () => invoke<MeasureProgress>("measure_hardware"),
+  cancelMeasure: () => invoke<void>("cancel_measure"),
 
   flashNextStatus: () => invoke<FlashNextStatus>("flash_next_status"),
   /** Start `lumen-server --pack-experts` in the background; progress arrives as `lumen://pack`. */
@@ -386,4 +432,8 @@ export function onPack(cb: (p: PackProgress) => void): Promise<UnlistenFn> {
 
 export function onDownload(cb: (p: DownloadProgress) => void): Promise<UnlistenFn> {
   return listen<DownloadProgress>("lumen://download", (e) => cb(e.payload));
+}
+
+export function onMeasure(cb: (p: MeasureProgress) => void): Promise<UnlistenFn> {
+  return listen<MeasureProgress>("lumen://measure", (e) => cb(e.payload));
 }

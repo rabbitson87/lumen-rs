@@ -12,6 +12,8 @@ use crate::config::{
     config_dir,
 };
 use crate::doctor::{self, CheckResult, DoctorReport};
+use crate::flash_next;
+use crate::hardware::{self, MeasureProgress, MeasureStage, SsdOutcome};
 use crate::models::{self, DownloadProgress, ModelEntry};
 use crate::pack_build::{self, EVENT_PACK, FlashNextStatus};
 use crate::server::{self, ServerStatus, TYPED_ENV_KEYS};
@@ -600,38 +602,83 @@ pub async fn doctor_fix(state: State<'_, AppState>, action: String) -> CmdResult
 /// that stalls inside a single read, which no between-reads check can interrupt.
 const SSD_PROBE_HARD_LIMIT: Duration = Duration::from_secs(9);
 
-/// Flash-Next's SSD read test (~1 GB). Separate from `doctor_run` because it is
-/// slow and heavy on the disk: it runs only when the user asks. `None` means it
-/// was cancelled; the panel then leaves the report alone.
-#[tauri::command]
-pub async fn doctor_probe_ssd(state: State<'_, AppState>) -> CmdResult<Option<CheckResult>> {
-    let cfg = state.config.lock().await.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut slot = state.ssd_probe.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.is_some() {
-            return Err("the SSD speed test is already running".to_string());
-        }
-        *slot = Some(Arc::clone(&cancel));
-    }
+/// Runs the SSD read test on a worker thread and stops waiting for it after
+/// [`SSD_PROBE_HARD_LIMIT`]. `None`: cancelled. Besides the row it returns what was measured, for
+/// the caller to store.
+async fn run_ssd_probe(
+    cfg: PersistentConfig,
+    cancel: Arc<AtomicBool>,
+) -> CmdResult<Option<(CheckResult, Option<doctor::SsdReading>)>> {
     let worker = {
         let cancel = Arc::clone(&cancel);
         tokio::task::spawn_blocking(move || doctor::probe_flash_next_ssd(&cfg, &cancel))
     };
-    let out = match tokio::time::timeout(SSD_PROBE_HARD_LIMIT, worker).await {
+    match tokio::time::timeout(SSD_PROBE_HARD_LIMIT, worker).await {
         Ok(joined) => joined.map_err(err),
         Err(_) => {
             // The read cannot be interrupted, but the thread stops at its next check.
             cancel.store(true, Ordering::Relaxed);
-            Ok(Some(doctor::flash_next_ssd_stalled()))
+            Ok(Some((doctor::flash_next_ssd_stalled(), None)))
         }
-    };
+    }
+}
+
+/// Takes the slot that says an SSD test (the Doctor's or the Measure action) is running, and
+/// hands back its cancel flag. A second test while one runs is refused.
+fn begin_ssd_test(state: &AppState) -> CmdResult<Arc<AtomicBool>> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut slot = state.ssd_probe.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_some() {
+        return Err("the SSD speed test is already running".to_string());
+    }
+    *slot = Some(Arc::clone(&cancel));
+    Ok(cancel)
+}
+
+fn end_ssd_test(state: &AppState) {
     *state.ssd_probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    out
+}
+
+/// Stores what the SSD test measured (and when), next to the folder it read.
+async fn store_ssd_reading(state: &AppState, reading: &doctor::SsdReading) -> CmdResult<()> {
+    let mut g = state.config.lock().await;
+    g.measured_hardware.record_ssd(
+        reading.random_gbps,
+        reading.sequential_gbps,
+        &reading.volume,
+        hardware::now_secs(),
+    );
+    g.save().map_err(err)
+}
+
+/// Flash-Next's SSD read test (~1 GB). Separate from `doctor_run` because it is
+/// slow and heavy on the disk: it runs only when the user asks. `None` means it
+/// was cancelled; the panel then leaves the report alone. What it measured is stored,
+/// as the Flash-Next card's Measure action does, for the decode-speed estimate.
+#[tauri::command]
+pub async fn doctor_probe_ssd(state: State<'_, AppState>) -> CmdResult<Option<CheckResult>> {
+    let cfg = state.config.lock().await.clone();
+    let cancel = begin_ssd_test(&state)?;
+    let out = run_ssd_probe(cfg, cancel).await;
+    end_ssd_test(&state);
+    match out? {
+        Some((row, reading)) => {
+            if let Some(reading) = reading {
+                store_ssd_reading(&state, &reading).await?;
+            }
+            Ok(Some(row))
+        }
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]
 pub async fn doctor_probe_cancel(state: State<'_, AppState>) -> CmdResult<()> {
+    cancel_ssd_test(&state);
+    Ok(())
+}
+
+fn cancel_ssd_test(state: &AppState) {
     if let Some(cancel) = state
         .ssd_probe
         .lock()
@@ -640,6 +687,81 @@ pub async fn doctor_probe_cancel(state: State<'_, AppState>) -> CmdResult<()> {
     {
         cancel.store(true, Ordering::Relaxed);
     }
+}
+
+// ── Measuring this Mac ─────────────────────────────────────────────────
+
+fn emit_measure(app: &AppHandle, progress: &MeasureProgress) {
+    let _ = app.emit(hardware::EVENT_MEASURE, progress);
+}
+
+/// Measures this Mac for the decode-speed estimate: its memory bandwidth (`lumen-server
+/// --measure-memory-bandwidth`, a second or two), then the SSD's random-read speed on the
+/// Flash-Next model's own folder (the Doctor's test; skipped when the model is not installed).
+/// Each number is stored as soon as it is known, so a failure or a cancel in the second part
+/// keeps the first, and a failing memory test keeps the numbers measured before. Progress goes out
+/// as `lumen://measure` events and the final report is the return value.
+#[tauri::command]
+pub async fn measure_hardware(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<MeasureProgress> {
+    let cancel = begin_ssd_test(&state)?;
+    let report = measure(&app, &state, &cancel).await;
+    end_ssd_test(&state);
+    emit_measure(&app, &report);
+    Ok(report)
+}
+
+async fn measure(app: &AppHandle, state: &AppState, cancel: &Arc<AtomicBool>) -> MeasureProgress {
+    let cfg = state.config.lock().await.clone();
+
+    emit_measure(app, &MeasureProgress::running(MeasureStage::Memory));
+    let explicit = cfg.server_binary_path.clone();
+    let memory: Result<f64, String> = match server::resolve_binary_public(explicit.as_deref()) {
+        Ok(bin) => hardware::run_memory_probe(&bin, hardware::MEMORY_PROBE_TIMEOUT)
+            .await
+            .map(|p| p.gpu_read_gbps)
+            .map_err(|e| format!("{e:#}")),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    let memory = match memory {
+        Ok(gbps) => {
+            let mut g = state.config.lock().await;
+            g.measured_hardware
+                .record_memory(gbps, hardware::now_secs());
+            g.save()
+                .map(|()| gbps)
+                .map_err(|e| format!("could not save the result: {e:#}"))
+        }
+        Err(e) => Err(e),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return hardware::finish(memory, SsdOutcome::Cancelled, true);
+    }
+
+    let ssd = if flash_next::find_model_dir(&cfg).is_none() {
+        SsdOutcome::NotInstalled
+    } else {
+        emit_measure(app, &MeasureProgress::running(MeasureStage::Ssd));
+        match run_ssd_probe(cfg, Arc::clone(cancel)).await {
+            Ok(Some((_, Some(reading)))) => match store_ssd_reading(state, &reading).await {
+                Ok(()) => SsdOutcome::Measured(reading.random_gbps),
+                Err(e) => SsdOutcome::Failed(e),
+            },
+            Ok(Some((row, None))) => SsdOutcome::Failed(row.message),
+            Ok(None) => SsdOutcome::Cancelled,
+            Err(e) => SsdOutcome::Failed(e),
+        }
+    };
+    hardware::finish(memory, ssd, cancel.load(Ordering::Relaxed))
+}
+
+/// Stops the Measure action: the SSD part ends at its next read, and the memory part (a second or
+/// two) is let finish.
+#[tauri::command]
+pub async fn cancel_measure(state: State<'_, AppState>) -> CmdResult<()> {
+    cancel_ssd_test(&state);
     Ok(())
 }
 

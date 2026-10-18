@@ -572,16 +572,39 @@ export const ko: Record<string, string> = {
   "flashnext.autoPool": "이 프롬프트에서의 auto 풀:",
   "flashnext.maxCtx.auto": "auto가 {floor} GB 하한에 닿기 전 가장 긴 프롬프트:",
   "flashnext.maxCtx.manual": "이 풀 옆에 들어가는 가장 긴 프롬프트:",
-  "flashnext.speed.title": "풀 크기별 디코드 속도",
-  "flashnext.speed.estimate": "풀 {pool} GB에서: ≈ {tps} tok/s",
-  "flashnext.speed.withPack": "팩 사용 시 ≈ {tps}",
-  "flashnext.speed.below": "(실측 범위 아래는 외삽)",
-  "flashnext.speed.above": "(실측한 가장 큰 풀; 그 이상은 측정값 없음)",
+  "flashnext.speed.title":
+    "디코드 속도",
+  "flashnext.speed.withPack":
+    "전문가 팩 사용 시: 약 {tps} tok/s",
   "flashnext.speed.col.pool": "풀",
-  "flashnext.speed.col.shards": "tok/s",
-  "flashnext.speed.col.pack": "팩 사용",
+  "flashnext.speed.col.shards":
+    "배포 샤드 (tok/s)",
+  "flashnext.speed.col.pack":
+    "전문가 팩 (tok/s)",
+  "flashnext.speed.intro":
+    "디코드 속도는 주로 이 Mac의 메모리 대역폭과 SSD 읽기 속도로 정해집니다. 둘을 측정하면 이 Mac의 추정치를 볼 수 있습니다.",
+  "flashnext.speed.missing.both":
+    "아직 측정하지 않음: 메모리 대역폭, SSD 읽기 속도.",
+  "flashnext.speed.missing.memory":
+    "아직 측정하지 않음: 메모리 대역폭.",
+  "flashnext.speed.missing.ssd":
+    "아직 측정하지 않음: SSD 읽기 속도.",
+  "flashnext.speed.missing.ssdStale":
+    "SSD 속도는 모델이 다른 폴더에 있을 때 측정한 값입니다. 다시 측정하세요.",
+  "flashnext.speed.reference":
+    "참고: 36 GB M3 Max에서 측정한 값(메모리 {mem} GB/s, SSD {ssd} GB/s), 전문가 풀을 직접 지정하고 direct 읽기로 측정(페이지 캐시는 계산에 넣지 않음)했으며, 이 Mac의 값이 아닙니다.",
+  "flashnext.speed.estimated":
+    "이 Mac의 추정: 풀 {pool} GB에서 {tps} tok/s",
+  "flashnext.speed.accuracy":
+    "추정치이며 오차는 약 ±10%입니다.",
+  "flashnext.speed.usingPack":
+    "전문가 팩 사용",
+  "flashnext.speed.inputs":
+    "메모리 {mem} GB/s · SSD {ssd} GB/s · 측정일 {date}",
+  "flashnext.speed.slowDisk":
+    "이 SSD는 읽기가 느립니다(무작위 {ssd} GB/s). 디코드 속도가 여기에 좌우됩니다. 모델을 Mac 내장 SSD에 두세요.",
   "flashnext.speed.note":
-    "빠른 내장 SSD(무작위 읽기 약 6.5 GB/s)를 쓰는 36 GB M3 Max에서 측정. * 그 Mac의 메모리를 16 / 24 GB Mac의 워킹셋으로 제한해 실행한 값이며, 실제 작은 Mac은 자체 메모리 압박이 더해집니다. 디스크가 느리면 디코드도 느립니다. 진단의 SSD 테스트로 내 디스크를 측정하세요. Prefill(약 230 tok/s)은 풀 크기와 무관합니다.",
+    "실제 16 / 24 GB Mac의 자체 메모리 압박은 여기서 측정하지 않았습니다. Prefill(약 230 tok/s)은 풀 크기와 무관합니다.",
   "flashnext.disk": "필요한 디스크",
   "flashnext.disk.detail": "가중치 {model} GB",
   "flashnext.disk.pack": "GB 전문가 팩",
@@ -602,7 +625,11 @@ export const ko: Record<string, string> = {
   "flashnext.opt.lanes": "리더 스레드",
   "flashnext.prompt": "가장 긴 프롬프트",
   "flashnext.summary":
-    "실행 설정: 풀 {pool} GB ({how}), 프롬프트 최대 {prompt} 토큰, 전문가 팩 {pack}, 드래프트 헤드 {head}, 약 {tps} tok/s",
+    "실행 설정: 풀 {pool} GB ({how}), 프롬프트 최대 {prompt} 토큰, 전문가 팩 {pack}, 드래프트 헤드 {head}",
+  "flashnext.summary.speed":
+    "이 Mac에서 약 {tps} tok/s",
+  "flashnext.summary.speedUnknown":
+    "속도는 아직 측정 전",
   "flashnext.summary.auto": "자동",
   "flashnext.summary.set": "직접 지정",
   "flashnext.summary.noFit": "GPU 메모리에 들어가지 않습니다",
@@ -622,7 +649,7 @@ export const ko: Record<string, string> = {
     "{ctx} 토큰까지의 프롬프트와는 들어가지 않습니다: 서버가 약 {max} GB로 낮추고 로그를 남깁니다. 가장 긴 프롬프트를 줄이면 자리가 생깁니다.",
   "flashnext.pool.noFitAuto": "이 프롬프트 길이에서는 가장 작은 풀조차 들어가지 않습니다.",
   "flashnext.pool.legend":
-    "~ 추정 tok/s. * 더 작은 Mac을 흉내 내도록 메모리를 제한해 측정. † 실측 범위 아래는 외삽.",
+    "~ 이 Mac에서의 추정 tok/s (추정치, 약 ±10%).",
   "flashnext.prompt.custom.hint": "토큰 또는 K: 48k, 50000",
   "flashnext.prompt.chip.default":
     "{n} 토큰: 이 Mac의 기본값이며, 직접 지정하지 않으면 앱이 이 값을 보냅니다.",
@@ -638,7 +665,8 @@ export const ko: Record<string, string> = {
   "flashnext.pack.mode.auto": "가중치 옆에 팩이 있으면 사용합니다.",
   "flashnext.pack.mode.off": "팩을 쓰지 않고 배포된 샤드를 읽습니다.",
   "flashnext.pack.mode.build": "팩이 없으면 서버 시작 시 만듭니다.",
-  "flashnext.pack.status.complete": "팩 있음: experts.lpack ({gb} GB), 디코드 약 10-20% 빠름.",
+  "flashnext.pack.status.complete":
+    "팩 있음: experts.lpack ({gb} GB), 디코드 약 7-15% 빠름.",
   "flashnext.pack.inUse": "사용 중",
   "flashnext.pack.unused": "끔 상태에서는 사용 안 함",
   "flashnext.pack.status.incomplete":
@@ -661,20 +689,54 @@ export const ko: Record<string, string> = {
   "flashnext.pack.block.server_running":
     "먼저 서버를 중지하세요: 빌드는 같은 디스크에서 모델 전체를 읽습니다.",
   "flashnext.pack.block.not_enough_disk": "여유 공간 {need} GB가 필요한데 이 볼륨에는 {free} GB뿐입니다.",
-  "flashnext.mtp.mode.auto": "mtp.safetensors가 있으면 드래프트 헤드를 사용합니다.",
-  "flashnext.mtp.mode.on": "드래프트 헤드를 필수로 합니다: 없으면 서버가 시작을 거부합니다.",
-  "flashnext.mtp.mode.off": "드래프트 헤드를 쓰지 않습니다: 일반 디코딩과 똑같은 텍스트.",
+  "flashnext.mtp.mode.auto":
+    "mtp.safetensors가 설치되어 있으면 서버의 속도 거버너 아래에서 드래프트 헤드를 사용합니다.",
+  "flashnext.mtp.mode.on":
+    "자동과 같지만, 헤드가 없으면 서버가 시작을 거부합니다.",
+  "flashnext.mtp.mode.off":
+    "드래프트 헤드를 쓰지 않습니다(기본값): 텍스트가 일반 디코딩과 같습니다.",
   "flashnext.mtp.status.present": "mtp.safetensors가 있습니다.",
+  "flashnext.mtp.status.presentOff":
+    "설치됨, 사용 안 함 (기본값은 꺼짐).",
+  "flashnext.mtp.status.missingOff":
+    "설치되지 않음. 드래프트 헤드가 꺼져 있는 동안은 필요하지 않습니다.",
   "flashnext.mtp.status.missing": "mtp.safetensors가 없습니다.",
   "flashnext.mtp.status.missingOn": "mtp.safetensors가 없는데 켬으로 두면 서버가 시작을 거부합니다.",
   "flashnext.mtp.fetch": "헤드(1.5 GB)를 모델 디렉터리에 한 번 내려받습니다.",
-  "flashnext.mtp.note": "이득은 작고(0-3%) 텍스트가 일반 디코딩과 비트 단위로 같지 않습니다.",
+  "flashnext.mtp.note":
+    "추측 디코딩입니다. 기준 Mac(M3 Max, 36 GB)에서 이득은 최대 4%이고 1-4% 느려지는 경우가 많으며, 텍스트가 일반 디코딩과 비트 단위로 같지 않아 직접 고르지 않으면 꺼져 있습니다. 1.5 GB 헤드가 필요합니다: python3 scripts/qwen4_mtp_fetch.py <모델 폴더>",
   "flashnext.io.mode.auto": "자동: Mac의 여유 메모리가 약 12 GB를 넘는 동안 페이지 캐시를 사용합니다.",
   "flashnext.io.mode.direct": "직접: 페이지 캐시를 우회하며 미스마다 SSD를 읽습니다.",
   "flashnext.io.mode.buffered": "버퍼: 읽기가 페이지 캐시를 거칩니다.",
   "flashnext.lanes.hint": "SSD에서 전문가를 읽는 스레드 수이며 기본값은 32입니다.",
   "flashnext.settings.hint":
     "고르는 즉시 저장됩니다. 재시작하면 반영됩니다.",
+  "flashnext.measure.button":
+    "이 Mac 측정",
+  "flashnext.measure.again":
+    "다시 측정",
+  "flashnext.measure.hint":
+    "메모리를 약 2초 읽은 뒤, SSD에서 모델을 약 1 GB 몇 초간 읽습니다. 서버를 멈춘 상태가 가장 좋습니다.",
+  "flashnext.measure.needsModel":
+    "SSD 측정에는 디스크에 Flash-Next 모델이 필요합니다. 메모리만 측정합니다.",
+  "flashnext.measure.memory":
+    "메모리 대역폭 측정 중…",
+  "flashnext.measure.ssd":
+    "SSD 읽기 속도 측정 중…",
+  "flashnext.measure.cancel":
+    "취소",
+  "flashnext.measure.cancelled":
+    "측정을 취소했습니다. 이미 측정한 값은 유지됩니다.",
+  "flashnext.measure.failed":
+    "측정하지 못했습니다.",
+  "flashnext.measure.done":
+    "측정했습니다.",
+  "flashnext.measure.memoryError":
+    "메모리 테스트 실패: {error}",
+  "flashnext.measure.ssdError":
+    "SSD 테스트 실패: {error}",
+  "flashnext.measure.ssdSkipped":
+    "SSD 측정은 건너뛰었습니다. 디스크에 Flash-Next 모델이 필요합니다.",
 
   // QUANT / CONTEXT / SERVER 카드 저장 시 공통 토스트. 서버 실행 중이면
   // 재시작 안내, 정지 상태면 단순 "저장됨" 만 표시. env-derived 노브
@@ -793,12 +855,17 @@ export const ko: Record<string, string> = {
   "doctor.msg.flash_next_pack.absent": "전문가 팩 없음 (선택)",
   "doctor.msg.flash_next_pack.incomplete": "experts.lpack 불완전 ({full} GB 중 {gb} GB)",
   "doctor.msg.flash_next_mtp.present": "드래프트 헤드 있음 (mtp.safetensors)",
-  "doctor.msg.flash_next_mtp.off": "드래프트 헤드 있으나 꺼짐 (LUMEN_QWEN4_MTP=off)",
+  "doctor.msg.flash_next_mtp.off":
+    "드래프트 헤드 설치됨, 사용 안 함 (기본값은 꺼짐)",
   "doctor.msg.flash_next_mtp.absent": "드래프트 헤드 없음 (선택)",
   "doctor.msg.flash_next_mtp.required": "LUMEN_QWEN4_MTP=on 인데 mtp.safetensors가 없음",
   "doctor.msg.flash_next_ssd.fast":
     "무작위 {rand} GB/s (순차 {seq} GB/s): 약 {tps} tok/s까지 충분히 빠름",
   "doctor.msg.flash_next_ssd.slow": "무작위 {rand} GB/s (순차 {seq} GB/s): 느림, 약 {tps} tok/s",
+  "doctor.msg.flash_next_ssd.fastNoEstimate":
+    "무작위 {rand} GB/s (순차 {seq} GB/s): 충분히 빠름",
+  "doctor.msg.flash_next_ssd.slowNoEstimate":
+    "무작위 {rand} GB/s (순차 {seq} GB/s): 느림",
   "doctor.msg.flash_next_ssd.notInstalled": "Flash-Next가 설치되어 있지 않음",
   "doctor.msg.flash_next_ssd.noShard": "읽을 가중치 샤드가 없음",
   "doctor.msg.flash_next_ssd.readFailed": "읽기 실패",
@@ -850,7 +917,7 @@ export const ko: Record<string, string> = {
   "doctor.hint.flash_next_ram.context":
     "가장 긴 프롬프트의 KV 캐시(토큰당 60 KB)가 GPU가 쓸 수 있는 RAM 몫에서 빠집니다. 앱은 직접 설정하지 않으면 LUMEN_MAX_PROMPT_TOKENS(16,384 토큰, 빠듯한 Mac은 8,192)를 보내며, 이는 최대 컨텍스트로 낮춰집니다. 이를 줄이거나(Flash-Next 메모리 계산기의 적용이 기록합니다) prefill 청크를 줄이고, 메모리 한도가 RAM보다 낮다면 올리세요.",
   "doctor.hint.flash_next_disk.room":
-    "전문가 팩은 디코드를 10-20% 빠르게 합니다. 아래 명령으로 한 번 만들거나, LUMEN_MOE_PACK=build 로 설정하면 서버가 다음 시작 때 만듭니다.",
+    "전문가 팩은 디코드를 약 7-15% 빠르게 합니다. 아래 명령으로 한 번 만들거나, LUMEN_MOE_PACK=build 로 설정하면 서버가 다음 시작 때 만듭니다.",
   "doctor.hint.flash_next_disk.noRoom":
     "전문가 팩은 선택 사항입니다. 사용하려면 이 볼륨에 약 70 GB를 확보한 뒤 아래 명령으로 만드세요.",
   "doctor.hint.flash_next_pack.incomplete":
@@ -858,7 +925,7 @@ export const ko: Record<string, string> = {
   "doctor.hint.flash_next_mtp.required":
     "드래프트 헤드가 없으면 서버는 LUMEN_QWEN4_MTP=on 으로 시작하지 않습니다. 아래 명령으로 헤드(1.5 GB)를 받거나 오버라이드를 제거하세요.",
   "doctor.hint.flash_next_mtp.absent":
-    "드래프트 헤드(1.5 GB, 한 번만 다운로드)는 서버가 스텝마다 두 번째 토큰을 추측하게 합니다. 여기서는 이득이 0-3%이고 일반 디코딩과 텍스트가 조금 달라집니다.",
+    "드래프트 헤드(1.5 GB, 한 번만 다운로드)는 기본적으로 꺼져 있습니다. 기준 Mac에서 이득은 최대 4%이고 1-4% 느려지는 경우가 많으며, 텍스트가 일반 디코딩과 비트 단위로 같지 않습니다. 써 보려면 아래 명령으로 헤드를 받고 Flash-Next 카드에서 드래프트 헤드를 '자동'으로 두세요.",
   "doctor.hint.flash_next_ssd.slow":
     "디코드 속도는 SSD가 전문가 읽기를 얼마나 빨리 처리하느냐로 정해집니다. 모델을 Mac 내장 SSD에 두거나(외장·네트워크 드라이브는 보통 2 GB/s 미만), 전문가 풀에 메모리를 더 주세요.",
   "doctor.hint.flash_next_ssd.stalled":
@@ -874,8 +941,13 @@ export const ko: Record<string, string> = {
   "doctor.detail.flash_next_pack.absent":
     "팩이 없으면 서버는 전문가 하나를 가중치 샤드의 흩어진 9개 범위로 읽습니다. 팩은 같은 바이트를 전문가당 레코드 하나로 저장합니다.",
   "doctor.detail.flash_next_ssd":
-    "페이지 캐시를 우회해 {shard}에서 {total} MB 읽음: 앞에서부터 {seq} MB, 이어서 서버가 전문가를 가져오는 방식 그대로 스레드 4개로 {rec} MB 무작위 읽기 {reads}회({rand} MB). 디코드 속도는 36 GB M3 Max(SSD {ref} GB/s)에서 측정한 표를 이 볼륨의 속도로 환산한 값이며, 메모리 계획이 이 Mac에 남기는 약 {pool} GB 전문가 풀 기준입니다.",
-  "doctor.detail.flash_next_ssd.pack": "전문가 팩으로 측정한 표를 사용했습니다.",
+    "페이지 캐시를 우회해 {shard}에서 {total} MB 읽음: 앞에서부터 {seq} MB, 이어서 서버가 전문가를 가져오는 방식 그대로 스레드 4개로 {rec} MB 무작위 읽기 {reads}회({rand} MB).",
+  "doctor.detail.flash_next_ssd.pack":
+    "추정에는 전문가 팩의 읽기 효율을 사용했습니다.",
+  "doctor.detail.flash_next_ssd.estimate":
+    "디코드 속도는 이 볼륨의 무작위 읽기와 이 Mac의 메모리 대역폭(측정값 {mem} GB/s)으로 추정한 값이며, 메모리 계획이 이 Mac에 남기는 약 {pool} GB 전문가 풀 기준입니다.",
+  "doctor.detail.flash_next_ssd.measure":
+    "디코드 속도 추정을 보려면 튜닝 탭의 Flash-Next 카드에서 이 Mac의 메모리 대역폭을 측정하세요.",
   "doctor.detail.flash_next_ssd.early":
     "테스트가 제한 시간에 도달해 일찍 멈췄습니다. 속도는 그때까지 읽은 양으로 계산했습니다.",
 

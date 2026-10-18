@@ -582,16 +582,39 @@ export const en: Record<string, string> = {
   "flashnext.autoPool": "Auto pool at this prompt:",
   "flashnext.maxCtx.auto": "Longest prompt before auto reaches the {floor} GB floor:",
   "flashnext.maxCtx.manual": "Longest prompt that fits beside this pool:",
-  "flashnext.speed.title": "Decode speed by pool size",
-  "flashnext.speed.estimate": "At a {pool} GB pool: ≈ {tps} tok/s",
-  "flashnext.speed.withPack": "with the pack ≈ {tps}",
-  "flashnext.speed.below": "(extrapolated below the measured range)",
-  "flashnext.speed.above": "(the largest measured pool; nothing is measured beyond it)",
+  "flashnext.speed.title":
+    "Decode speed",
+  "flashnext.speed.withPack":
+    "With the expert pack: about {tps} tok/s",
   "flashnext.speed.col.pool": "pool",
-  "flashnext.speed.col.shards": "tok/s",
-  "flashnext.speed.col.pack": "with pack",
+  "flashnext.speed.col.shards":
+    "shipped shards (tok/s)",
+  "flashnext.speed.col.pack":
+    "expert pack (tok/s)",
+  "flashnext.speed.intro":
+    "Decode speed depends mostly on this Mac's memory bandwidth and SSD read speed. Measure both to get an estimate for this Mac.",
+  "flashnext.speed.missing.both":
+    "Not measured yet: memory bandwidth and SSD read speed.",
+  "flashnext.speed.missing.memory":
+    "Not measured yet: memory bandwidth.",
+  "flashnext.speed.missing.ssd":
+    "Not measured yet: SSD read speed.",
+  "flashnext.speed.missing.ssdStale":
+    "The SSD speed was measured with the model in another folder. Measure again.",
+  "flashnext.speed.reference":
+    "Reference: measured on an M3 Max with 36 GB (memory {mem} GB/s, SSD {ssd} GB/s), expert pool set explicitly, direct reads (the page cache is not counted). Not this Mac.",
+  "flashnext.speed.estimated":
+    "Estimated on this Mac: {tps} tok/s at a {pool} GB pool",
+  "flashnext.speed.accuracy":
+    "An estimate, about ±10%.",
+  "flashnext.speed.usingPack":
+    "using the expert pack",
+  "flashnext.speed.inputs":
+    "memory {mem} GB/s · SSD {ssd} GB/s · measured {date}",
+  "flashnext.speed.slowDisk":
+    "This SSD reads slowly ({ssd} GB/s random), and decode speed depends on it. Keep the model on the Mac's internal SSD.",
   "flashnext.speed.note":
-    "Measured on a 36 GB M3 Max with a fast internal SSD (~6.5 GB/s random reads). * Run on that Mac with its memory limited to a 16 / 24 GB Mac's working set: a real small Mac adds its own memory pressure. A slower disk decodes slower: the Doctor's SSD test measures yours. Prefill (~230 tok/s) does not depend on the pool.",
+    "A real 16 / 24 GB Mac's own memory pressure is not measured here. Prefill (~230 tok/s) does not depend on the pool.",
   "flashnext.disk": "Disk needed",
   "flashnext.disk.detail": "{model} GB weights",
   "flashnext.disk.pack": "GB expert pack",
@@ -612,7 +635,11 @@ export const en: Record<string, string> = {
   "flashnext.opt.lanes": "Reader threads",
   "flashnext.prompt": "Longest prompt",
   "flashnext.summary":
-    "Runs with: pool {pool} GB ({how}), prompts up to {prompt} tokens, expert pack {pack}, draft head {head}, about {tps} tok/s",
+    "Runs with: pool {pool} GB ({how}), prompts up to {prompt} tokens, expert pack {pack}, draft head {head}",
+  "flashnext.summary.speed":
+    "about {tps} tok/s on this Mac",
+  "flashnext.summary.speedUnknown":
+    "speed not measured yet",
   "flashnext.summary.auto": "auto",
   "flashnext.summary.set": "set by you",
   "flashnext.summary.noFit": "this does not fit the GPU's memory",
@@ -632,7 +659,7 @@ export const en: Record<string, string> = {
     "Does not fit with prompts up to {ctx} tokens: the server lowers it to about {max} GB and logs it. A shorter longest prompt makes room.",
   "flashnext.pool.noFitAuto": "Not even the smallest pool fits with this prompt length.",
   "flashnext.pool.legend":
-    "~ estimated tok/s. * measured with the memory limited to emulate a smaller Mac. † extrapolated below the measured range.",
+    "~ estimated tok/s on this Mac (an estimate, about ±10%).",
   "flashnext.prompt.custom.hint": "tokens or K: 48k, 50000",
   "flashnext.prompt.chip.default":
     "{n} tokens: this Mac's default, which the app sends unless you set one.",
@@ -648,7 +675,8 @@ export const en: Record<string, string> = {
   "flashnext.pack.mode.auto": "Use the pack when it sits next to the weights.",
   "flashnext.pack.mode.off": "Never use the pack: read the shipped shards.",
   "flashnext.pack.mode.build": "Build the pack when the server starts, if there is none.",
-  "flashnext.pack.status.complete": "Pack present: experts.lpack ({gb} GB), decode ~10-20% faster.",
+  "flashnext.pack.status.complete":
+    "Pack present: experts.lpack ({gb} GB), decode about 7-15% faster.",
   "flashnext.pack.inUse": "in use",
   "flashnext.pack.unused": "not used while Off",
   "flashnext.pack.status.incomplete":
@@ -671,22 +699,55 @@ export const en: Record<string, string> = {
   "flashnext.pack.block.server_running":
     "Stop the server first: the build reads the whole model from the same disk.",
   "flashnext.pack.block.not_enough_disk": "Needs {need} GB free; this volume has {free} GB.",
-  "flashnext.mtp.mode.auto": "Use the draft head when mtp.safetensors is there.",
-  "flashnext.mtp.mode.on": "Require the draft head: the server refuses to start without it.",
-  "flashnext.mtp.mode.off": "Never use the draft head: exact plain-decode text.",
+  "flashnext.mtp.mode.auto":
+    "Use the draft head when mtp.safetensors is installed, under the server's speed governor.",
+  "flashnext.mtp.mode.on":
+    "Like Auto, but the server refuses to start without the head.",
+  "flashnext.mtp.mode.off":
+    "Never use the draft head (the default): the text is the same as plain decoding.",
   "flashnext.mtp.status.present": "mtp.safetensors is present.",
+  "flashnext.mtp.status.presentOff":
+    "Installed, not used (off by default).",
+  "flashnext.mtp.status.missingOff":
+    "Not installed. Not needed while the draft head is off.",
   "flashnext.mtp.status.missing": "mtp.safetensors is missing.",
   "flashnext.mtp.status.missingOn":
     "mtp.safetensors is missing, and On makes the server refuse to start.",
   "flashnext.mtp.fetch": "Downloads the head once (1.5 GB) into the model directory.",
   "flashnext.mtp.note":
-    "The gain is small (0-3%) and the text is not bit-identical to plain decoding.",
+    "Speculative decoding. Measured on the reference Mac (M3 Max, 36 GB), it gained at most 4% and often lost 1-4%, and its text is not bit-identical to plain decoding, so it is off unless you choose it. Needs the 1.5 GB head: python3 scripts/qwen4_mtp_fetch.py <model dir>",
   "flashnext.io.mode.auto": "Auto: uses the page cache while the Mac has more than ~12 GB to spare.",
   "flashnext.io.mode.direct": "Direct: bypasses the page cache; every miss reads the SSD.",
   "flashnext.io.mode.buffered": "Buffered: reads go through the page cache.",
   "flashnext.lanes.hint": "Threads that read experts from the SSD; 32 is the default.",
   "flashnext.settings.hint":
     "These are saved as you pick them; a restart applies them.",
+  "flashnext.measure.button":
+    "Measure this Mac",
+  "flashnext.measure.again":
+    "Measure again",
+  "flashnext.measure.hint":
+    "Reads memory for about 2 s, then ~1 GB of the model from the SSD for a few seconds. Best with the server stopped.",
+  "flashnext.measure.needsModel":
+    "The SSD part needs the Flash-Next model on disk; only memory will be measured.",
+  "flashnext.measure.memory":
+    "Measuring memory bandwidth…",
+  "flashnext.measure.ssd":
+    "Measuring SSD read speed…",
+  "flashnext.measure.cancel":
+    "Cancel",
+  "flashnext.measure.cancelled":
+    "Measurement cancelled. What was already measured is kept.",
+  "flashnext.measure.failed":
+    "Nothing could be measured.",
+  "flashnext.measure.done":
+    "Measured.",
+  "flashnext.measure.memoryError":
+    "Memory test failed: {error}",
+  "flashnext.measure.ssdError":
+    "SSD test failed: {error}",
+  "flashnext.measure.ssdSkipped":
+    "The SSD part was skipped: it needs the Flash-Next model on disk.",
 
   // Shared toast for QUANT / CONTEXT / SERVER card saves. The variant shown
   // depends on whether the inference server is currently running — running
@@ -806,12 +867,17 @@ export const en: Record<string, string> = {
   "doctor.msg.flash_next_pack.absent": "no expert pack (optional)",
   "doctor.msg.flash_next_pack.incomplete": "experts.lpack incomplete ({gb} GB of {full} GB)",
   "doctor.msg.flash_next_mtp.present": "draft head present (mtp.safetensors)",
-  "doctor.msg.flash_next_mtp.off": "draft head present, switched off (LUMEN_QWEN4_MTP=off)",
+  "doctor.msg.flash_next_mtp.off":
+    "draft head installed, not used (off by default)",
   "doctor.msg.flash_next_mtp.absent": "no draft head (optional)",
   "doctor.msg.flash_next_mtp.required": "LUMEN_QWEN4_MTP=on but mtp.safetensors is missing",
   "doctor.msg.flash_next_ssd.fast":
     "random {rand} GB/s (sequential {seq} GB/s): fast enough for ~{tps} tok/s",
   "doctor.msg.flash_next_ssd.slow": "random {rand} GB/s (sequential {seq} GB/s): slow, ~{tps} tok/s",
+  "doctor.msg.flash_next_ssd.fastNoEstimate":
+    "random {rand} GB/s (sequential {seq} GB/s): fast enough",
+  "doctor.msg.flash_next_ssd.slowNoEstimate":
+    "random {rand} GB/s (sequential {seq} GB/s): slow",
   "doctor.msg.flash_next_ssd.notInstalled": "Flash-Next is not installed",
   "doctor.msg.flash_next_ssd.noShard": "no weight shard to read",
   "doctor.msg.flash_next_ssd.readFailed": "read failed",
@@ -863,7 +929,7 @@ export const en: Record<string, string> = {
   "doctor.hint.flash_next_ram.context":
     "The KV cache of the longest prompt (60 KB per token) comes out of the GPU's share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next memory calculator's Apply writes it) or the prefill chunk, or raise the memory limit if it is below your RAM.",
   "doctor.hint.flash_next_disk.room":
-    "An expert pack makes decode 10-20% faster. Build it once with the command below, or set LUMEN_MOE_PACK=build and the server builds it on its next start.",
+    "An expert pack makes decode about 7-15% faster. Build it once with the command below, or set LUMEN_MOE_PACK=build and the server builds it on its next start.",
   "doctor.hint.flash_next_disk.noRoom":
     "The expert pack is optional. To use it, free about 70 GB on this volume, then build it with the command below.",
   "doctor.hint.flash_next_pack.incomplete":
@@ -871,7 +937,7 @@ export const en: Record<string, string> = {
   "doctor.hint.flash_next_mtp.required":
     "The server refuses to start with LUMEN_QWEN4_MTP=on and no draft head. Download the head (1.5 GB) with the command below, or remove the override.",
   "doctor.hint.flash_next_mtp.absent":
-    "The draft head (1.5 GB, downloaded once) lets the server guess a second token per step. It gains 0-3% here and changes the text slightly compared with plain decoding.",
+    "The draft head (1.5 GB, downloaded once) is off by default: measured on the reference Mac it gained at most 4% and often lost 1-4%, and its text is not bit-identical to plain decoding. To try it, download the head with the command below and set the draft head to Auto in the Flash-Next card.",
   "doctor.hint.flash_next_ssd.slow":
     "Decode speed is set by how fast the SSD serves expert reads. Keep the model on the Mac's internal SSD (external and network drives are usually below 2 GB/s), or give the expert pool more memory.",
   "doctor.hint.flash_next_ssd.stalled":
@@ -887,8 +953,13 @@ export const en: Record<string, string> = {
   "doctor.detail.flash_next_pack.absent":
     "Without the pack the server reads each expert as nine scattered ranges of the weight shards. The pack stores the same bytes as one record per expert.",
   "doctor.detail.flash_next_ssd":
-    "Read {total} MB of {shard} with the page cache bypassed: {seq} MB front to back, then {rand} MB as {reads} random {rec} MB reads on 4 threads, the way the server fetches experts. Decode speed scales a table measured on a 36 GB M3 Max (SSD reading {ref} GB/s) by this volume's speed, for an expert pool of ~{pool} GB, what the memory plan leaves on this Mac.",
-  "doctor.detail.flash_next_ssd.pack": "The table measured with the expert pack is used.",
+    "Read {total} MB of {shard} with the page cache bypassed: {seq} MB front to back, then {rand} MB as {reads} random {rec} MB reads on 4 threads, the way the server fetches experts.",
+  "doctor.detail.flash_next_ssd.pack":
+    "The estimate uses the expert pack's read efficiency.",
+  "doctor.detail.flash_next_ssd.estimate":
+    "Decode speed is estimated from this volume's random reads and this Mac's memory bandwidth ({mem} GB/s, measured), for an expert pool of ~{pool} GB, what the memory plan leaves on this Mac.",
+  "doctor.detail.flash_next_ssd.measure":
+    "Measure this Mac's memory bandwidth in the Flash-Next card (Tuning tab) to get a decode-speed estimate.",
   "doctor.detail.flash_next_ssd.early":
     "The test hit its time limit and stopped early; the speeds come from what it had read.",
 

@@ -729,7 +729,7 @@ fn flash_next_disk_check(
     };
     CheckResult {
         fix_hint: Some(if room {
-            "An expert pack makes decode 10-20% faster. Build it once with the command below, or \
+            "An expert pack makes decode about 7-15% faster. Build it once with the command below, or \
              set LUMEN_MOE_PACK=build and the server builds it on its next start."
                 .into()
         } else {
@@ -789,20 +789,23 @@ fn flash_next_pack_check(dir: &Path, pack: PackState) -> CheckResult {
     }
 }
 
-/// `mode` is the lower-cased `LUMEN_QWEN4_MTP` a launch carries (the setting or an override), if any.
+/// `mode` is the lower-cased `LUMEN_QWEN4_MTP` a launch carries (the setting or an override), if
+/// any. The draft head is off unless chosen (`auto`: use it when installed; `on`: the server
+/// refuses to start without it), so an installed head that is not in use is the normal state, not
+/// a warning.
 fn flash_next_mtp_check(dir: &Path, present: bool, mode: Option<&str>) -> CheckResult {
     const NAME: &str = "Flash-Next draft head";
-    let off = matches!(mode, Some("off" | "0" | "false"));
     let required = matches!(mode, Some("on" | "1" | "true"));
+    let in_use = required || matches!(mode, Some("auto"));
     let fetch = format!("python3 scripts/qwen4_mtp_fetch.py {}", sh_quote(dir));
-    match (present, off, required) {
-        (true, true, _) => row(
+    match (present, in_use, required) {
+        (true, false, _) => row(
             "flash_next_mtp",
             NAME,
             CheckStatus::Pass,
-            "draft head present, switched off (LUMEN_QWEN4_MTP=off)".into(),
+            "draft head installed, not used (off by default)".into(),
         ),
-        (true, false, _) => row(
+        (true, true, _) => row(
             "flash_next_mtp",
             NAME,
             CheckStatus::Pass,
@@ -824,9 +827,10 @@ fn flash_next_mtp_check(dir: &Path, present: bool, mode: Option<&str>) -> CheckR
         },
         (false, _, false) => CheckResult {
             fix_hint: Some(
-                "The draft head (1.5 GB, downloaded once) lets the server guess a second token \
-                 per step. It gains 0-3% here and changes the text slightly compared with plain \
-                 decoding."
+                "The draft head (1.5 GB, downloaded once) is off by default: measured on this \
+                 Mac it gained at most 4% and often lost 1-4%, and its text is not bit-identical \
+                 to plain decoding. To try it, download the head with the command below and set \
+                 the draft head to Auto in the Flash-Next card."
                     .into(),
             ),
             fix_command: Some(fetch),
@@ -840,16 +844,33 @@ fn flash_next_mtp_check(dir: &Path, present: bool, mode: Option<&str>) -> CheckR
     }
 }
 
+/// What the SSD read test measured, in the form the app stores (`MeasuredHardware`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SsdReading {
+    pub random_gbps: f64,
+    pub sequential_gbps: Option<f64>,
+    /// The model folder the shard was read from.
+    pub volume: String,
+}
+
 /// Flash-Next's SSD read test: ~1 GB read from one weight shard the way the server reads
 /// experts, ending after a few seconds at the latest. Run only when the user asks. `None`
-/// when `cancel` was set.
-pub fn probe_flash_next_ssd(cfg: &PersistentConfig, cancel: &AtomicBool) -> Option<CheckResult> {
+/// when `cancel` was set. Besides the row, it returns the numbers it measured (when it got a
+/// random-read speed), for the caller to store. With this Mac's memory bandwidth measured, the
+/// row also says what decode speed that buys.
+pub fn probe_flash_next_ssd(
+    cfg: &PersistentConfig,
+    cancel: &AtomicBool,
+) -> Option<(CheckResult, Option<SsdReading>)> {
     const NAME: &str = "Flash-Next SSD";
     let failed = |message: &str, detail: Option<String>| {
-        Some(CheckResult {
-            detail,
-            ..row("flash_next_ssd", NAME, CheckStatus::Warn, message.into())
-        })
+        Some((
+            CheckResult {
+                detail,
+                ..row("flash_next_ssd", NAME, CheckStatus::Warn, message.into())
+            },
+            None,
+        ))
     };
     let Some(dir) = flash_next::find_model_dir(cfg) else {
         return failed("Flash-Next is not installed", None);
@@ -877,7 +898,19 @@ pub fn probe_flash_next_ssd(cfg: &PersistentConfig, cancel: &AtomicBool) -> Opti
         .get("LUMEN_MOE_PACK")
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
     let pack = matches!(flash_next::pack_state(&dir), PackState::Complete(_)) && !pack_off;
-    Some(flash_next_ssd_check(&shard_name, &res, pool_gb, pack))
+    let check = flash_next_ssd_check(
+        &shard_name,
+        &res,
+        pool_gb,
+        pack,
+        cfg.measured_hardware.memory(),
+    );
+    let reading = res.rand_gbps().map(|random_gbps| SsdReading {
+        random_gbps,
+        sequential_gbps: res.seq_gbps(),
+        volume: dir.display().to_string(),
+    });
+    Some((check, reading))
 }
 
 /// What the test reports when the volume did not answer within the hard time limit.
@@ -898,7 +931,16 @@ pub fn flash_next_ssd_stalled() -> CheckResult {
     }
 }
 
-fn flash_next_ssd_check(shard: &str, res: &ProbeResult, pool_gb: f64, pack: bool) -> CheckResult {
+/// The SSD row. The verdict is the disk's alone (`slow` under 2 GB/s of random reads); a decode
+/// speed is promised only with this Mac's measured memory bandwidth (`memory_gbps`), because
+/// the speed depends on both.
+fn flash_next_ssd_check(
+    shard: &str,
+    res: &ProbeResult,
+    pool_gb: f64,
+    pack: bool,
+    memory_gbps: Option<f64>,
+) -> CheckResult {
     const NAME: &str = "Flash-Next SSD";
     let Some(random) = res.rand_gbps() else {
         return row(
@@ -909,17 +951,30 @@ fn flash_next_ssd_check(shard: &str, res: &ProbeResult, pool_gb: f64, pack: bool
         );
     };
     let sequential = res.seq_gbps().unwrap_or(0.0);
-    let tps = fmt_tps(flash_next::decode_tps_estimate(pool_gb, random, pack));
+    let tps = memory_gbps
+        .and_then(|memory| flash_next::decode_tps(pool_gb, memory, random, pack))
+        .map(fmt_tps);
     let slow = flash_next::read_verdict(random) == ReadVerdict::Slow;
-    let verdict = if slow {
-        format!("slow, ~{tps} tok/s")
-    } else {
-        format!("fast enough for ~{tps} tok/s")
+    let verdict = match (slow, &tps) {
+        (true, Some(tps)) => format!("slow, ~{tps} tok/s"),
+        (true, None) => "slow".to_string(),
+        (false, Some(tps)) => format!("fast enough for ~{tps} tok/s"),
+        (false, None) => "fast enough".to_string(),
     };
-    let with_pack = if pack {
-        " The table measured with the expert pack is used."
-    } else {
-        ""
+    let speed = match (memory_gbps, &tps) {
+        (Some(memory), Some(_)) => format!(
+            " Decode speed is estimated from this volume's random reads and this Mac's memory \
+             bandwidth ({memory:.0} GB/s, measured), for an expert pool of ~{pool_gb:.1} GB, \
+             what the memory plan leaves on this Mac.{}",
+            if pack {
+                " The expert pack's read efficiency is used."
+            } else {
+                ""
+            }
+        ),
+        _ => " Measure this Mac's memory bandwidth in the Flash-Next card (Tuning tab) to get a \
+               decode-speed estimate."
+            .to_string(),
     };
     let early = if res.end == ProbeEnd::TimedOut {
         " The test hit its time limit and stopped early; the speeds come from what it had read."
@@ -930,15 +985,12 @@ fn flash_next_ssd_check(shard: &str, res: &ProbeResult, pool_gb: f64, pack: bool
         detail: Some(format!(
             "Read {:.0} MB of {shard} with the page cache bypassed: {:.0} MB front to back, then \
              {:.0} MB as {} random {:.1} MB reads on 4 threads, the way the server fetches \
-             experts. Decode speed scales a table measured on a 36 GB M3 Max (SSD reading {} \
-             GB/s) by this volume's speed, for an expert pool of ~{pool_gb:.1} GB, what the \
-             memory plan leaves on this Mac.{with_pack}{early}",
+             experts.{speed}{early}",
             (res.seq_bytes + res.rand_bytes) as f64 / 1e6,
             res.seq_bytes as f64 / 1e6,
             res.rand_bytes as f64 / 1e6,
             res.rand_reads,
             flash_next::EXPERT_BYTES as f64 / 1e6,
-            flash_next::REFERENCE_READ_GBPS,
         )),
         fix_hint: slow.then(|| {
             "Decode speed is set by how fast the SSD serves expert reads. Keep the model on the \
@@ -1220,8 +1272,10 @@ mod flash_next_tests {
     fn a_draft_head_is_optional_unless_the_user_demanded_it() {
         let dir = Path::new("/m");
         let status = |present, mode| flash_next_mtp_check(dir, present, mode).status;
+        // Off by default: an installed head that is not used is no warning.
         assert_eq!(status(true, None), CheckStatus::Pass);
         assert_eq!(status(true, Some("off")), CheckStatus::Pass);
+        assert_eq!(status(true, Some("auto")), CheckStatus::Pass);
         assert_eq!(status(false, None), CheckStatus::Pass);
         assert_eq!(status(false, Some("auto")), CheckStatus::Pass);
         assert_eq!(status(false, Some("off")), CheckStatus::Pass);
@@ -1233,70 +1287,165 @@ mod flash_next_tests {
             Some("python3 scripts/qwen4_mtp_fetch.py /m")
         );
         assert_eq!(status(false, Some("1")), CheckStatus::Fail);
-        assert!(
-            flash_next_mtp_check(dir, true, Some("off"))
-                .message
-                .contains("switched off")
-        );
+    }
+
+    /// The row's text is a contract with `DoctorPanel.svelte` (it matches the English). An
+    /// installed head the default leaves unused reads as "not used", and the used cases keep the
+    /// present/missing wording.
+    #[test]
+    fn the_draft_head_row_says_not_used_by_default_and_present_when_it_is() {
+        let dir = Path::new("/m");
+        let msg = |present, mode| flash_next_mtp_check(dir, present, mode).message;
+        for mode in [None, Some("off"), Some("0")] {
+            assert_eq!(
+                msg(true, mode),
+                "draft head installed, not used (off by default)",
+                "{mode:?}"
+            );
+        }
+        for mode in [Some("auto"), Some("on")] {
+            assert_eq!(msg(true, mode), "draft head present (mtp.safetensors)");
+        }
+        assert_eq!(msg(false, None), "no draft head (optional)");
+        let hint = flash_next_mtp_check(dir, false, None).fix_hint.unwrap();
+        assert!(hint.starts_with("The draft head (1.5 GB"), "{hint}");
+        assert!(hint.contains("off by default"), "{hint}");
+    }
+
+    const SHARD_6: &str = "model-00006.safetensors";
+
+    /// The speed the row quotes for a 5.0 GB/s disk on a Mac that streams memory at 277 GB/s,
+    /// for the pool the memory plan leaves on a 36 GB Mac.
+    fn quoted(pack: bool) -> String {
+        fmt_tps(flash_next::decode_tps(18.4, 277.0, 5.0, pack).unwrap())
     }
 
     #[test]
-    fn a_fast_disk_passes_with_the_speed_it_can_promise() {
-        let c = flash_next_ssd_check(
+    fn a_fast_disk_passes_and_a_speed_is_promised_only_with_the_memory_measured() {
+        let measured = flash_next_ssd_check(
             "model-00001.safetensors",
             &result(6.0, 5.0, ProbeEnd::Finished),
             18.4,
             false,
+            Some(277.0),
         );
-        assert_eq!(c.status, CheckStatus::Pass);
-        // 36 GB Mac: pool ~18.4 GB is ~12.0 tok/s in the table, and this disk reads
-        // 5.0 of the table's 6.5 GB/s.
+        assert_eq!(measured.status, CheckStatus::Pass);
         assert_eq!(
-            c.message,
-            "random 5.0 GB/s (sequential 6.0 GB/s): fast enough for ~9.3 tok/s"
+            measured.message,
+            format!(
+                "random 5.0 GB/s (sequential 6.0 GB/s): fast enough for ~{} tok/s",
+                quoted(false)
+            )
         );
-        assert!(c.fix_hint.is_none());
+        assert!(measured.fix_hint.is_none());
         assert!(
-            c.detail
+            measured
+                .detail
                 .as_deref()
                 .unwrap()
                 .contains("model-00001.safetensors")
         );
+        // Memory not measured: the disk's verdict alone, no tok/s.
+        let unmeasured = flash_next_ssd_check(
+            "s",
+            &result(6.0, 5.0, ProbeEnd::Finished),
+            18.4,
+            false,
+            None,
+        );
+        assert_eq!(unmeasured.status, CheckStatus::Pass);
+        assert_eq!(
+            unmeasured.message,
+            "random 5.0 GB/s (sequential 6.0 GB/s): fast enough"
+        );
+        assert!(!unmeasured.detail.unwrap().contains("tok/s"));
+    }
+
+    /// The same disk quotes more on a Mac with faster memory and the pack: the number is this
+    /// Mac's, not a table's.
+    #[test]
+    fn the_quoted_speed_follows_this_macs_memory_and_the_pack() {
+        let msg = |memory: f64, pack: bool| {
+            flash_next_ssd_check(
+                "s",
+                &result(6.0, 5.0, ProbeEnd::Finished),
+                18.4,
+                pack,
+                Some(memory),
+            )
+            .message
+        };
+        assert_ne!(msg(150.0, false), msg(400.0, false));
+        assert_ne!(msg(277.0, false), msg(277.0, true));
+        assert!(msg(277.0, true).ends_with(&format!("~{} tok/s", quoted(true))));
     }
 
     /// The panel translates the row by matching this text, so its shape is a contract with
     /// `DoctorPanel.svelte` (`translatedDetail`). Change both together.
     #[test]
     fn the_ssd_detail_keeps_the_shape_the_panel_translates() {
+        let base = "Read 11000 MB of model-00006.safetensors with the page cache bypassed: 6000 MB \
+                    front to back, then 5000 MB as 100 random 2.8 MB reads on 4 threads, the way \
+                    the server fetches experts.";
         let c = flash_next_ssd_check(
-            "model-00006.safetensors",
+            SHARD_6,
             &result(6.0, 5.0, ProbeEnd::Finished),
             18.4,
             false,
+            Some(277.0),
         );
         assert_eq!(
             c.detail.as_deref(),
             Some(
-                "Read 11000 MB of model-00006.safetensors with the page cache bypassed: 6000 MB \
-                 front to back, then 5000 MB as 100 random 2.8 MB reads on 4 threads, the way \
-                 the server fetches experts. Decode speed scales a table measured on a 36 GB M3 \
-                 Max (SSD reading 6.5 GB/s) by this volume's speed, for an expert pool of \
-                 ~18.4 GB, what the memory plan leaves on this Mac."
+                format!(
+                    "{base} Decode speed is estimated from this volume's random reads and this \
+                     Mac's memory bandwidth (277 GB/s, measured), for an expert pool of ~18.4 GB, \
+                     what the memory plan leaves on this Mac."
+                )
+                .as_str()
             )
         );
-        let with_pack =
-            flash_next_ssd_check("s", &result(6.0, 5.0, ProbeEnd::Finished), 10.0, true);
+        let none = flash_next_ssd_check(
+            SHARD_6,
+            &result(6.0, 5.0, ProbeEnd::Finished),
+            18.4,
+            false,
+            None,
+        );
+        assert_eq!(
+            none.detail.as_deref(),
+            Some(
+                format!(
+                    "{base} Measure this Mac's memory bandwidth in the Flash-Next card (Tuning \
+                     tab) to get a decode-speed estimate."
+                )
+                .as_str()
+            )
+        );
+        let with_pack = flash_next_ssd_check(
+            "s",
+            &result(6.0, 5.0, ProbeEnd::Finished),
+            10.0,
+            true,
+            Some(277.0),
+        );
         assert!(
             with_pack
                 .detail
                 .unwrap()
-                .ends_with("The table measured with the expert pack is used.")
+                .ends_with("The expert pack's read efficiency is used.")
         );
     }
 
     #[test]
     fn under_two_gb_per_second_the_row_warns_that_decode_will_be_slow() {
-        let c = flash_next_ssd_check("s", &result(2.5, 1.5, ProbeEnd::Finished), 18.4, false);
+        let c = flash_next_ssd_check(
+            "s",
+            &result(2.5, 1.5, ProbeEnd::Finished),
+            18.4,
+            false,
+            Some(277.0),
+        );
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(
             c.message
@@ -1305,8 +1454,24 @@ mod flash_next_tests {
             c.message
         );
         assert!(c.fix_hint.is_some());
+        // Without the memory number the warning stands without a tok/s.
+        let c = flash_next_ssd_check(
+            "s",
+            &result(2.5, 1.5, ProbeEnd::Finished),
+            18.4,
+            false,
+            None,
+        );
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert_eq!(c.message, "random 1.5 GB/s (sequential 2.5 GB/s): slow");
         // Exactly 2 GB/s is not slow.
-        let edge = flash_next_ssd_check("s", &result(3.0, 2.0, ProbeEnd::Finished), 18.4, false);
+        let edge = flash_next_ssd_check(
+            "s",
+            &result(3.0, 2.0, ProbeEnd::Finished),
+            18.4,
+            false,
+            None,
+        );
         assert_eq!(edge.status, CheckStatus::Pass);
     }
 
@@ -1317,6 +1482,7 @@ mod flash_next_tests {
             &result(0.1, 0.1, ProbeEnd::TimedOut),
             FALLBACK_POOL_GB,
             false,
+            None,
         );
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.detail.unwrap().contains("stopped early"));
@@ -1324,7 +1490,7 @@ mod flash_next_tests {
         let mut none = result(1.0, 0.0, ProbeEnd::Finished);
         none.rand_bytes = 0;
         assert_eq!(
-            flash_next_ssd_check("s", &none, FALLBACK_POOL_GB, false).message,
+            flash_next_ssd_check("s", &none, FALLBACK_POOL_GB, false, Some(277.0)).message,
             "could not measure random reads"
         );
         assert_eq!(flash_next_ssd_stalled().status, CheckStatus::Warn);
@@ -1337,8 +1503,9 @@ mod flash_next_tests {
             ..PersistentConfig::default()
         };
         assert!(flash_next_checks(&cfg).is_empty());
-        let c = probe_flash_next_ssd(&cfg, &AtomicBool::new(false)).unwrap();
+        let (c, reading) = probe_flash_next_ssd(&cfg, &AtomicBool::new(false)).unwrap();
         assert_eq!(c.message, "Flash-Next is not installed");
+        assert_eq!(reading, None, "nothing was read, so nothing is stored");
         std::fs::remove_dir_all(&cfg.models_dir).ok();
     }
 
@@ -1357,9 +1524,16 @@ mod flash_next_tests {
     #[test]
     fn the_probe_reads_a_real_shard_and_a_cancel_returns_nothing() {
         let (cfg, dir) = config_with_model("probe", 12 << 20);
-        let c = probe_flash_next_ssd(&cfg, &AtomicBool::new(false)).unwrap();
+        let (c, reading) = probe_flash_next_ssd(&cfg, &AtomicBool::new(false)).unwrap();
         assert_eq!(c.id, "flash_next_ssd");
         assert!(c.message.starts_with("random "), "{}", c.message);
+        // The numbers come back for the app to store, with the folder they were read from.
+        let reading = reading.expect("a reading");
+        assert!(reading.random_gbps > 0.0);
+        assert!(reading.sequential_gbps.is_some_and(|g| g > 0.0));
+        assert_eq!(reading.volume, dir.display().to_string());
+        // The memory is not measured yet, so the row promises no tok/s.
+        assert!(!c.message.contains("tok/s"), "{}", c.message);
         assert!(probe_flash_next_ssd(&cfg, &AtomicBool::new(true)).is_none());
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
