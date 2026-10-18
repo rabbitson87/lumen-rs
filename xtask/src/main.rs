@@ -10,6 +10,8 @@
 //! cargo xtask fuzz tool_body_parse --minutes 10
 //! cargo xtask flags --list         # env-flag registry (kind, default, docs)
 //! cargo xtask flags                # suite with every Optimization flag flipped
+//! cargo xtask offload-check        # is SSD expert offload bit-identical to resident?
+//! cargo xtask offload-check --real <model dir>
 //! ```
 
 mod coverage;
@@ -17,6 +19,7 @@ mod faults;
 mod flags;
 mod fuzz;
 mod gate;
+mod offload_check;
 mod red_green;
 mod test_all;
 mod tiers;
@@ -24,7 +27,7 @@ mod tiers;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const USAGE: &str = "usage: cargo xtask <test [--validate] [CARGO ARGS…] | red-green [--list] [NAME…] | fuzz <TARGET…|--all|--list> [--minutes N] | flags [--list|--docs|--check|--one-at-a-time] | coverage [--mcdc] [--html] | gate [--quick] | tiers | faults [--cancel]>";
+const USAGE: &str = "usage: cargo xtask <test [--validate] [CARGO ARGS…] | red-green [--list] [NAME…] | fuzz <TARGET…|--all|--list> [--minutes N] | flags [--list|--docs|--check|--one-at-a-time] | coverage [--mcdc] [--html] | gate [--quick] | tiers | faults [--cancel] | offload-check [--real DIR]>";
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
@@ -37,6 +40,7 @@ fn main() -> std::process::ExitCode {
         Some("gate") => gate::main(args.collect()),
         Some("tiers") => tiers::main(args.collect()),
         Some("faults") => faults::main(args.collect()),
+        Some("offload-check") => offload_check::main(args.collect()),
         Some(other) => {
             eprintln!("unknown task {other:?}\n\n{USAGE}");
             std::process::ExitCode::from(2)
