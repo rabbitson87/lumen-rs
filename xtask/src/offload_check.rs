@@ -6,7 +6,8 @@
 //!
 //! 1. the replica tests (`qwen4_exp`, `offload`): logits bit-identical to the resident model at
 //!    every pool size and region count, through the staging path, a layer-major prefill, a
-//!    warmed pool and the expert pack;
+//!    warmed pool and the expert pack, and for prefill calls of every size (MLX's gather kernel
+//!    changes with the call size, so the path a call takes must not depend on the pool);
 //! 2. with `--real`: the same greedy continuation generated at several pool sizes and with the
 //!    pack on and off must give the same token ids (each configuration is one process, so no
 //!    run inherits another's cache).

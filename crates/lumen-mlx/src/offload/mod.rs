@@ -23,6 +23,9 @@ pub(crate) mod pack;
 pub(crate) mod slot_map;
 pub(crate) mod slot_pool;
 
+#[cfg(test)]
+mod exactness_tests;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -317,6 +320,26 @@ impl Timing {
 /// reading a whole layer for those would be waste.
 const BULK_MIN_PERCENT: usize = 60;
 
+/// MLX's sorted `gather_qmm` (the prefill's) runs its tiled matrix-matrix kernel instead of the
+/// per-row one once the call has at least this many index entries per expert **of the stacked
+/// tensor it is given** (`B / E >= 4` in `GatherQMM::eval_gpu`). The two kernels accumulate and
+/// round differently, so the output moves in its last bits with `E`. The resident model gathers
+/// over one layer (`E` = 512), the staging path over a view of exactly one layer, and so do the
+/// same bits; the pool path gathers over the whole pool (`E` = its slot count), which flips the
+/// kernel at a pool-size-dependent number of rows. A call this large therefore always takes the
+/// staging path, so its output is the resident model's whatever the pool size.
+const TILED_GATHER_MIN_PER_EXPERT: usize = 4;
+
+/// Whether a layer call takes the staging path instead of the pool path: a prefill feeding
+/// several chunks through the layer (`hinted`), a call routing to most of the layer's experts
+/// (`BULK_MIN_PERCENT`), or one big enough to change the gather kernel (see
+/// `TILED_GATHER_MIN_PER_EXPERT`). `indices` is the call's `rows x top_k`.
+fn takes_staging_path(hinted: bool, distinct: usize, indices: usize, experts: usize) -> bool {
+    hinted
+        || distinct * 100 >= experts * BULK_MIN_PERCENT
+        || indices >= TILED_GATHER_MIN_PER_EXPERT * experts
+}
+
 /// A stats line every this many layer calls (about 125 decoded tokens of a
 /// 40-layer model), so a long run shows how the hit rate settles.
 const STATS_EVERY_CALLS: u64 = 5_000;
@@ -584,9 +607,8 @@ impl MoeOffload {
                 distinct.push(e);
             }
         }
-        if self.bulk_hint.load(Ordering::Relaxed)
-            || distinct.len() * 100 >= bank.experts_in(layer) * BULK_MIN_PERCENT
-        {
+        let hinted = self.bulk_hint.load(Ordering::Relaxed);
+        if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
             return self.route_bulk(&mut bank, layer, inds, entered, evaluated);
         }
         self.leave_staging(&mut bank)?;

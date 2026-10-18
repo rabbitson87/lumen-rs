@@ -200,16 +200,17 @@ fn chunked_prefill_matches_a_single_prefill() {
     assert!(min_cos > 0.9999 && max_abs < 5e-3);
 }
 
-/// The offload engine in front of the replica's experts.
+/// The offload engine in front of the replica's experts: logits bit-identical to the resident
+/// model at every pool size, from the smallest pool (a region and a layer) to one holding every
+/// expert.
 ///
-/// While the pool has fewer than ~41 slots, as many as the replica's 16
-/// experts per layer or a little more, logits are bit-identical to the resident
-/// model. With more slots MLX's sorted `gather_qmm` picks a different tiling for
-/// the prefill rows (measured in plain MLX, no offload: 16 vs 41+ experts give
-/// logits that differ by ~1e-5), so the last bits move and only closeness can be
-/// asserted. The shipped models are far above the threshold on both sides (256
-/// and 512 experts per layer, and a pool is never narrower than one layer), where
-/// the identity tests on the real checkpoint hold bit for bit.
+/// MLX's sorted `gather_qmm` picks its kernel from the call's rows and the number of experts in
+/// the stacked tensor it is given. The resident model gathers over one layer, the staging path
+/// over a view of exactly one, so they pick alike; a pool-path call used to gather over the
+/// whole pool and could pick the other kernel, whose last bits differ (logits ~1e-5 apart).
+/// A call big enough to change kernels now takes the staging path whatever the pool size
+/// (`offload::takes_staging_path`, with its own test on the real kernels in
+/// `offload::exactness_tests`).
 #[test]
 fn offloaded_experts_match_the_resident_model() {
     let dir = fixture_dir();
@@ -234,29 +235,80 @@ fn offloaded_experts_match_the_resident_model() {
     };
     let baseline = run(&resident);
     drop(resident);
-    // (budget in bytes, must be bit-identical). An expert of the replica is ~9.9 KB.
-    for (budget, exact) in [
-        (1u64, true),
-        (20 * 9_900, true),
-        (34 * 9_900, true),
-        (u64::MAX / 2, false),
-    ] {
+    // An expert of the replica is ~9.9 KB; a budget of 1 byte gives the smallest pool, 32 slots.
+    for budget in [1u64, 20 * 9_900, 34 * 9_900, 100 * 9_900, u64::MAX / 2] {
         let model = Qwen4ExpModel::load(&dir, Some(budget)).expect("load with offload");
         let got = run(&model);
         let (hits, misses) = model.offload_stats().expect("offload on");
-        let (max_abs, min_cos) = compare(&got, &baseline, vocab);
+        let (max_abs, _) = compare(&got, &baseline, vocab);
         eprintln!("budget {budget}: hits {hits} misses {misses}, max |diff| {max_abs:e}");
-        if exact {
-            assert!(
-                got == baseline,
-                "budget {budget}: logits differ from the resident model"
-            );
-        } else {
-            assert!(
-                max_abs < 5e-5 && min_cos > 0.999_999,
-                "budget {budget}: {max_abs:e} / {min_cos}"
-            );
-            assert_eq!(argmax_rows(&got, vocab), argmax_rows(&baseline, vocab));
+        assert!(
+            got == baseline,
+            "budget {budget}: logits differ from the resident model (max |diff| {max_abs:e})"
+        );
+    }
+}
+
+/// Token streams cut into prefill pieces of many sizes: each piece is one layer call of
+/// `rows x 4` index entries, and the sorted gather's kernel depends on that count against the
+/// number of experts in what it gathers over, so a pool of any size must still give the
+/// resident model's logits. The reference prompt routes to nearly every expert of a layer, so
+/// every call is staged; a stream of one repeated token, or two alternating, routes to a few,
+/// which is what sends a big call down the pool path.
+#[test]
+fn offloaded_experts_match_the_resident_model_for_every_call_size() {
+    let dir = fixture_dir();
+    let resident = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
+    let want = reference(&dir);
+    let prompt: Vec<u32> = want["ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let streams: [(&str, Vec<u32>); 3] = [
+        ("reference prompt", prompt.clone()),
+        ("one repeated token", vec![prompt[3]; prompt.len()]),
+        (
+            "two alternating tokens",
+            (0..prompt.len()).map(|i| prompt[i % 2]).collect(),
+        ),
+    ];
+    let cuttings: [&[usize]; 6] = [
+        &[48],
+        &[16, 16, 16],
+        &[24, 24],
+        &[32, 16],
+        &[20, 1, 7, 20],
+        &[31, 1, 15, 1],
+    ];
+    let run = |model: &Qwen4ExpModel, ids: &[u32], pieces: &[usize]| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        let mut out = Vec::new();
+        let mut at = 0;
+        for &n in pieces {
+            out.extend(host_f32(
+                &model.forward(&ids[at..at + n], &mut cache, false).unwrap(),
+            ));
+            at += n;
+        }
+        assert_eq!(at, ids.len());
+        out
+    };
+    let baselines: Vec<Vec<Vec<f32>>> = streams
+        .iter()
+        .map(|(_, ids)| cuttings.iter().map(|p| run(&resident, ids, p)).collect())
+        .collect();
+    drop(resident);
+    for budget in [1u64, 40 * 9_900, 100 * 9_900, u64::MAX / 2] {
+        for ((name, ids), baselines) in streams.iter().zip(&baselines) {
+            for (pieces, baseline) in cuttings.iter().zip(baselines) {
+                // A fresh model per run: no run inherits another's pool.
+                let model = Qwen4ExpModel::load(&dir, Some(budget)).expect("load with offload");
+                assert!(
+                    run(&model, ids, pieces) == *baseline,
+                    "budget {budget}, {name}, pieces {pieces:?}: logits differ from the resident model"
+                );
+            }
         }
     }
 }
