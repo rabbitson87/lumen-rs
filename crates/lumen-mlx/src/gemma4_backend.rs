@@ -650,54 +650,14 @@ pub(crate) mod imp {
         disk: Option<DiskKvStore>,
     }
 
-    /// Open the opt-in L2 disk persistence tier from env (shared `LUMEN_KV_DISK`
-    /// gate + `LUMEN_KV_DISK_MAX_GB` budget), namespaced by `model_id`. Returns
-    /// `None` when off or on open failure (never fatal).
-    fn open_kv_disk(model_id: &str) -> Option<DiskKvStore> {
-        let enabled = matches!(
-            std::env::var("LUMEN_KV_DISK")
-                .ok()
-                .map(|s| s.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        );
-        if !enabled {
-            return None;
-        }
-        let fp: String = model_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|gb| gb * 1024 * 1024 * 1024)
-            .unwrap_or(0);
-        // Last-access TTL, default 1 day; 0 disables expiry.
-        let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(86_400);
-        match DiskKvStore::open(DiskKvStore::default_root(), &fp, max_bytes, ttl_secs) {
-            Ok(s) => {
-                eprintln!(
-                    "[gemma4] kv-disk tier ON: fingerprint={fp:?} entries={} max_gb={}",
-                    s.len(),
-                    max_bytes / (1024 * 1024 * 1024),
-                );
-                Some(s)
-            }
-            Err(e) => {
-                eprintln!("[gemma4] kv-disk tier disabled (open failed): {e:#}");
-                None
-            }
-        }
+    /// Open the opt-in L2 disk tier for this model (see
+    /// [`kv_disk::open_store_from_env`]), namespaced by everything the
+    /// snapshots' bytes depend on ([`kv_disk::kv_identity`]).
+    fn open_kv_disk(model_id: &str, dir: &Path) -> Option<DiskKvStore> {
+        let mut settings = crate::kv_disk::identity_settings_from_env();
+        settings.push(("mlx".into(), crate::kv_disk::mlx_version()));
+        let identity = crate::kv_disk::kv_identity(model_id, dir, &settings);
+        crate::kv_disk::open_store_from_env(&identity, "gemma4")
     }
 
     impl Gemma4Backend {
@@ -731,7 +691,7 @@ pub(crate) mod imp {
                 None
             };
             let model_id: String = model_id.into();
-            let disk = open_kv_disk(&model_id);
+            let disk = open_kv_disk(&model_id, dir);
             Ok(Self {
                 model,
                 seqs: HashMap::new(),

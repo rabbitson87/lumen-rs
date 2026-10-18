@@ -2738,10 +2738,12 @@ name = "lumen-mlx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "fastokens",
  "hf-hub",
  "icu_normalizer",
  "image",
+ "libc",
  "llguidance",
  "lumen-core",
  "lumen-flags",
@@ -2755,6 +2757,7 @@ dependencies = [
  "objc2-metal",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers",
  "tokio",

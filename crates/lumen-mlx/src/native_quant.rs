@@ -103,15 +103,21 @@ mod imp {
     /// hypothesis falsified — wrapper alloc/free overlaps with GPU dispatch
     /// and is off the critical path. Singleton path retained as **opt-IN**
     /// (`LUMEN_NATIVE_CACHED_STREAM=1`); per-call remains default.
-    struct SharedRaw(mlx_sys::mlx_stream);
-    unsafe impl Send for SharedRaw {}
-    unsafe impl Sync for SharedRaw {}
-
+    ///
+    /// **One per thread, not one per process.** MLX's default stream is per thread
+    /// (a stream made on thread A does not exist on thread B: "There is no
+    /// Stream(gpu, N) in current thread"), and the server loads the model on one
+    /// thread and runs it on another. The process-wide `OnceLock` this replaced
+    /// handed the first thread's stream to every thread; it only worked because
+    /// the flag is off by default and the single-threaded suites never noticed.
     fn cached_gpu_stream_raw() -> mlx_sys::mlx_stream {
-        static CACHED: std::sync::OnceLock<SharedRaw> = std::sync::OnceLock::new();
-        CACHED
-            .get_or_init(|| SharedRaw(unsafe { mlx_sys::mlx_default_gpu_stream_new() }))
-            .0
+        thread_local! {
+            // Leaked on purpose, like the process-wide one was: MLX's scheduler holds a
+            // reference to the stream too.
+            static CACHED: mlx_sys::mlx_stream =
+                unsafe { mlx_sys::mlx_default_gpu_stream_new() };
+        }
+        CACHED.with(|s| *s)
     }
 
     fn cached_empty_sentinel_raw() -> mlx_sys::mlx_array {

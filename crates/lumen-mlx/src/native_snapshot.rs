@@ -150,6 +150,64 @@ mod imp {
             Self::capture(cache, position, true)
         }
 
+        /// The state `point` stands for, read out of `cache` — the cache the
+        /// point was captured from, any number of appends later. Full layers
+        /// are sliced back to the point's offset (a cache only appends, so
+        /// that prefix is intact); linear layers take the state the point
+        /// kept. Shallow: nothing is copied until [`Self::to_records`] reads
+        /// it out, and nothing holds the live KV buffer past that.
+        ///
+        /// `None` when a layer cannot be read back this way: TurboQuant and
+        /// quantized KV (a point keeps only their offset, and they have no
+        /// prefix view), or a shared-prefix buffer missing the first tokens.
+        pub fn from_rollback_point(
+            point: &RollbackPoint,
+            cache: &NativePromptCache,
+        ) -> Result<Option<Self>> {
+            if cache.len() != point.layers.len() {
+                bail!(
+                    "PromptCacheSnapshot::from_rollback_point: layer count mismatch (cache={}, point={})",
+                    cache.len(),
+                    point.layers.len()
+                );
+            }
+            let mut layers = Vec::with_capacity(cache.len());
+            for (layer, kept) in cache.layers().iter().zip(&point.layers) {
+                layers.push(match (layer, kept) {
+                    (NativeLayerCache::Full(c), RollbackLayer::Truncate(offset)) => {
+                        let Ok((keys, values)) = c.prefix_views(*offset) else {
+                            return Ok(None);
+                        };
+                        LayerSnapshot::Full {
+                            keys,
+                            values,
+                            offset: *offset,
+                        }
+                    }
+                    (
+                        NativeLayerCache::Linear(_),
+                        RollbackLayer::Recurrent {
+                            slots,
+                            offset,
+                            lengths,
+                            left_padding,
+                        },
+                    ) => LayerSnapshot::Linear {
+                        slots: slots.clone(),
+                        offset: *offset,
+                        lengths: lengths.clone(),
+                        left_padding: left_padding.clone(),
+                    },
+                    _ => return Ok(None),
+                });
+            }
+            Ok(Some(Self {
+                layers,
+                position: point.position,
+                is_deep: false,
+            }))
+        }
+
         fn capture(cache: &NativePromptCache, position: usize, deep: bool) -> Result<Self> {
             // Deep: an independent buffer per array. Shallow: the array itself
             // (a refcount bump).
@@ -253,15 +311,13 @@ mod imp {
         /// Serialize this snapshot into disk-persistable form: a per-layer
         /// metadata vector plus a flat blob of `ArrayRecord`s. The store layer
         /// wraps these in a `KvManifest` (adding fingerprint / prefix tokens /
-        /// last token) before writing the `LKV1` file.
+        /// last token) before writing the `LKV2` file.
         ///
-        /// Each present `Array` is read back to host bytes via
-        /// `record_from_array` (float dtypes normalized to f32 — lossless for
-        /// bf16/f16). Absent Arrays are recorded as `None` index slots.
+        /// Each present `Array` is read back to host bytes in its own dtype via
+        /// `record_from_array`. Absent Arrays are recorded as `None` index slots.
         ///
-        /// `FullTurboquant` layers are not yet supported here and return an
-        /// error; the dense `Full` + `Linear` path (Qwen3.6 default KV) lands
-        /// first and is verified bit-identical before compression is layered on.
+        /// `Full`, `Linear` and `FullTurboquant` layers serialize;
+        /// `FullQuantized` (`LUMEN_QWEN35_QUANT_KV`) returns an error.
         pub fn to_records(&self) -> Result<(Vec<LayerMeta>, Vec<ArrayRecord>)> {
             let mut records: Vec<ArrayRecord> = Vec::new();
             let mut metas: Vec<LayerMeta> = Vec::with_capacity(self.layers.len());

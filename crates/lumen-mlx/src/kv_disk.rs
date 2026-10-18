@@ -4,23 +4,27 @@
 //! snapshots to disk (Phase 1: persistence across restart/idle/evict; Phase 3:
 //! spill under memory pressure). It is intentionally split into two layers:
 //!
-//! * **Pure layer** (no MLX) — the on-disk binary format (`LKV1`), the
+//! * **Pure layer** (no MLX) — the on-disk binary format (`LKV2`), the
 //!   `KvManifest`/`LayerMeta` metadata, the `ArrayRecord` byte container, and
 //!   the `DiskKvStore` (directory + LRU budget + `index.json`). These compile
 //!   and unit-test under the crate's default features (no Metal device needed),
 //!   mirroring the `lloyd_max.rs` / `rotation.rs` TQCB/TQRM save-load pattern.
 //!
 //! * **MLX layer** (`#[cfg(feature = "mlx-native")]`) — conversion between an
-//!   mlx-rs `Array` and an `ArrayRecord`. Float dtypes (bf16/f16/f32) are
-//!   stored as little-endian f32; because bf16/f16 are exact subsets of f32,
-//!   the round trip is bit-identical. Integer dtypes are stored in their
-//!   native little-endian width. These paths require a live Metal device, so
-//!   their tests are `#[ignore]` like the rest of the native suite.
+//!   mlx-rs `Array` and an `ArrayRecord`. Every dtype is stored in its native
+//!   little-endian width, so a bf16 KV cache costs 2 bytes per element on disk
+//!   and in the read, not 4. These paths require a live Metal device, so their
+//!   tests are `#[ignore]` like the rest of the native suite.
+//!
+//! The manifest and every record carry a CRC-32, and the reader rejects
+//! trailing bytes, so any single corrupted byte is a typed error rather than a
+//! silently different snapshot. A file in the older `LKV1` layout (f32-widened
+//! floats, no checksums) fails the magic check and is dropped by the store like
+//! any other unreadable entry; this is a cache, so that only costs a re-prefill.
 //!
 //! Snapshot coupling (turning a `PromptCacheSnapshot` into a `(KvManifest,
-//! Vec<ArrayRecord>)` and back) and the `PrefixCacheStore` disk tier are
-//! deliberately NOT here yet — that is Phase 1. P0 only provides the proven,
-//! independently-testable primitives those phases build on.
+//! Vec<ArrayRecord>)` and back) lives in `native_snapshot.rs` (Qwen) and
+//! `gemma4_moe.rs` (Gemma).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -29,18 +33,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-/// File magic — `b"LKV1"` (Lumen KV, format generation 1).
-pub const LKV_MAGIC: [u8; 4] = *b"LKV1";
+/// File magic — `b"LKV2"` (Lumen KV, format generation 2: native dtypes and
+/// CRC-32 per manifest and record).
+pub const LKV_MAGIC: [u8; 4] = *b"LKV2";
 /// Format version, bumped on incompatible layout changes.
-pub const LKV_VERSION: u32 = 1;
+pub const LKV_VERSION: u32 = 2;
+
+// Records are raw little-endian bytes copied straight from (and into) native
+// memory; a big-endian host would need a byte swap on every element.
+const _: () = assert!(cfg!(target_endian = "little"));
 
 // ---------------------------------------------------------------------------
 // Dtype tagging
 // ---------------------------------------------------------------------------
 
-/// Logical element dtype recorded for an array. This is the dtype the array is
-/// *reconstructed* as; the physical on-disk encoding may differ (float dtypes
-/// are stored as f32 — see `stored_elem_size`).
+/// Element dtype recorded for an array: both the dtype it is reconstructed as
+/// and its on-disk encoding (native width, little-endian).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DtypeTag {
     Bool,
@@ -59,25 +67,13 @@ pub enum DtypeTag {
 }
 
 impl DtypeTag {
-    /// Whether the logical dtype is a floating-point type stored via f32.
-    #[inline]
-    pub fn is_float(self) -> bool {
-        matches!(
-            self,
-            DtypeTag::F16 | DtypeTag::F32 | DtypeTag::F64 | DtypeTag::BF16
-        )
-    }
-
-    /// Physical bytes-per-element on disk. Float dtypes ≤ f32 are normalized to
-    /// f32 (4 bytes) — bf16/f16 are exact subsets of f32, so this is lossless.
-    /// f64 keeps its native width (not used by KV caches; encoder bails). All
-    /// integers/bool use their native width.
+    /// Bytes per element on disk: the dtype's native width.
     #[inline]
     pub fn stored_elem_size(self) -> usize {
         match self {
             DtypeTag::Bool | DtypeTag::U8 | DtypeTag::I8 => 1,
-            DtypeTag::U16 | DtypeTag::I16 => 2,
-            DtypeTag::F16 | DtypeTag::BF16 | DtypeTag::F32 | DtypeTag::U32 | DtypeTag::I32 => 4,
+            DtypeTag::U16 | DtypeTag::I16 | DtypeTag::F16 | DtypeTag::BF16 => 2,
+            DtypeTag::F32 | DtypeTag::U32 | DtypeTag::I32 => 4,
             DtypeTag::U64 | DtypeTag::I64 | DtypeTag::F64 => 8,
         }
     }
@@ -124,9 +120,8 @@ impl DtypeTag {
 // ArrayRecord — a single tensor's physical bytes + shape + logical dtype
 // ---------------------------------------------------------------------------
 
-/// One serialized tensor. `data` holds the physical little-endian bytes in the
-/// encoding implied by `dtype` (float dtypes ⇒ f32 words; integer dtypes ⇒
-/// native width). `shape` is the logical mlx shape (row-major).
+/// One serialized tensor. `data` holds the elements in `dtype`'s native width,
+/// little-endian, in logical row-major order of `shape`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayRecord {
     pub dtype: DtypeTag,
@@ -158,8 +153,10 @@ impl ArrayRecord {
         Ok(())
     }
 
+    /// `[dtype][ndim][shape][data_len][data]` followed by a CRC-32 of all of it.
     fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         self.validate_len()?;
+        let mut w = CrcWriter::new(w);
         w.write_all(&[self.dtype.to_u8()])?;
         w.write_all(&(self.shape.len() as u32).to_le_bytes())?;
         for &d in &self.shape {
@@ -167,10 +164,17 @@ impl ArrayRecord {
         }
         w.write_all(&(self.data.len() as u64).to_le_bytes())?;
         w.write_all(&self.data)?;
-        Ok(())
+        w.finish()
     }
 
     fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+        let mut r = CrcReader::new(r);
+        let rec = Self::read_body(&mut r)?;
+        r.verify("record")?;
+        Ok(rec)
+    }
+
+    fn read_body<R: Read>(r: &mut R) -> Result<Self> {
         let mut b1 = [0u8; 1];
         r.read_exact(&mut b1)?;
         let dtype = DtypeTag::from_u8(b1[0])?;
@@ -347,17 +351,20 @@ pub struct KvManifest {
 // File format: header + manifest(JSON) + record blob
 // ---------------------------------------------------------------------------
 
-/// Serialize a `(KvManifest, records)` pair to the `LKV1` binary layout.
+/// Serialize a `(KvManifest, records)` pair to the `LKV2` binary layout.
 ///
 /// Layout:
 /// ```text
-/// [4]  magic "LKV1"
+/// [4]  magic "LKV2"
 /// [4]  version  u32 LE
 /// [4]  manifest_json_len  u32 LE
 /// [N]  manifest JSON (utf-8)
+/// [4]  manifest CRC-32 (over the JSON bytes)
 /// [4]  record_count  u32 LE
 /// records[]: [1] dtype | [4] ndim | [ndim*4] shape i32 | [8] data_len u64 | [data_len] bytes
+///            | [4] CRC-32 (over the record's preceding bytes)
 /// ```
+/// Nothing follows the last record; the reader rejects trailing bytes.
 pub fn write_lkv<W: Write>(
     w: &mut W,
     manifest: &KvManifest,
@@ -369,6 +376,7 @@ pub fn write_lkv<W: Write>(
     let json = serde_json::to_vec(manifest).context("kv_disk: serialize manifest")?;
     w.write_all(&(json.len() as u32).to_le_bytes())?;
     w.write_all(&json)?;
+    w.write_all(&crc32fast::hash(&json).to_le_bytes())?;
 
     w.write_all(&(records.len() as u32).to_le_bytes())?;
     for rec in records {
@@ -377,7 +385,7 @@ pub fn write_lkv<W: Write>(
     Ok(())
 }
 
-/// Deserialize the `LKV1` binary layout back into `(KvManifest, records)`.
+/// Deserialize the `LKV2` binary layout back into `(KvManifest, records)`.
 pub fn read_lkv<R: Read>(r: &mut R) -> Result<(KvManifest, Vec<ArrayRecord>)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).context("kv_disk: read magic")?;
@@ -392,15 +400,87 @@ pub fn read_lkv<R: Read>(r: &mut R) -> Result<(KvManifest, Vec<ArrayRecord>)> {
     let json_len = read_u32(r)? as usize;
     let mut json = vec![0u8; json_len];
     r.read_exact(&mut json).context("kv_disk: read manifest")?;
+    if read_u32(r)? != crc32fast::hash(&json) {
+        bail!("kv_disk: manifest CRC mismatch (corrupt file)");
+    }
     let manifest: KvManifest =
         serde_json::from_slice(&json).context("kv_disk: deserialize manifest")?;
 
     let n = read_u32(r)? as usize;
-    let mut records = Vec::with_capacity(n);
+    let mut records = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
         records.push(ArrayRecord::read_from(r)?);
     }
+    let mut extra = [0u8; 1];
+    if r.read(&mut extra).context("kv_disk: check end of file")? != 0 {
+        bail!("kv_disk: trailing bytes after {n} records (corrupt record count)");
+    }
     Ok((manifest, records))
+}
+
+/// Forwards writes and keeps a CRC-32 of everything written; `finish` appends it.
+struct CrcWriter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: crc32fast::Hasher,
+}
+
+impl<'a, W: Write> CrcWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        self.inner
+            .write_all(&self.hasher.finalize().to_le_bytes())?;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for CrcWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Forwards reads and keeps a CRC-32 of everything read; `verify` reads the
+/// stored CRC that follows and compares.
+struct CrcReader<'a, R: Read> {
+    inner: &'a mut R,
+    hasher: crc32fast::Hasher,
+}
+
+impl<'a, R: Read> CrcReader<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    fn verify(self, what: &str) -> Result<()> {
+        let computed = self.hasher.finalize();
+        if read_u32(self.inner)? != computed {
+            bail!("kv_disk: {what} CRC mismatch (corrupt file)");
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for CrcReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
 }
 
 #[inline]
@@ -450,6 +530,11 @@ pub struct DiskKvStore {
     ttl_secs: u64,
     fingerprint: String,
     index: DiskIndex,
+    /// Where file writes and deletes run: `None` performs them inline (the
+    /// default, and what tests rely on); `Some` hands them to a background
+    /// thread so a request never waits on the disk (see
+    /// [`Self::write_in_background`]).
+    writer: Option<FileWriter>,
 }
 
 impl DiskKvStore {
@@ -473,12 +558,61 @@ impl DiskKvStore {
             ttl_secs,
             fingerprint,
             index,
+            writer: None,
         };
-        // Drop entries that expired while the process was down.
-        if store.prune_ttl() {
+        // Drop entries that expired while the process was down, and whatever a
+        // process that died mid-write left behind: half-written temp files,
+        // and index rows whose file never landed.
+        let mut changed = store.prune_ttl();
+        if let Ok(dir) = fs::read_dir(&store.dir) {
+            for e in dir.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".lkv.tmp") {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+        let before = store.index.entries.len();
+        let dir = store.dir.clone();
+        store.index.entries.retain(|e| dir.join(&e.file).exists());
+        changed |= store.index.entries.len() != before;
+        if changed {
             let _ = store.save_index();
         }
         Ok(store)
+    }
+
+    /// From now on, write and delete files on a background thread, in the
+    /// order they were requested. A `get` for an entry whose file has not
+    /// landed yet is a miss, as for any missing file. Dropping the store
+    /// finishes the queued writes first.
+    pub fn write_in_background(&mut self) -> Result<()> {
+        if self.writer.is_none() {
+            self.writer = Some(FileWriter::spawn()?);
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` to `path` through a temp file and a rename, so a reader
+    /// never sees a partial file — inline, or queued on the background thread.
+    fn write_file(&self, path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+        match &self.writer {
+            Some(w) => {
+                w.submit(FileJob::Write { path, bytes });
+                Ok(())
+            }
+            None => write_via_tmp(&path, &bytes),
+        }
+    }
+
+    /// Delete `path` (a missing file is fine) — inline, or queued behind any
+    /// write of the same file so the delete cannot overtake it.
+    fn delete_file(&self, path: PathBuf) {
+        match &self.writer {
+            Some(w) => w.submit(FileJob::Remove(path)),
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     /// Remove entries whose last access is older than `ttl_secs` (deletes the
@@ -500,7 +634,7 @@ impl DiskKvStore {
             !expired
         });
         for f in &removed_files {
-            let _ = fs::remove_file(self.dir.join(f));
+            self.delete_file(self.dir.join(f));
         }
         self.index.entries.len() != before
     }
@@ -582,9 +716,7 @@ impl DiskKvStore {
         write_lkv(&mut buf, manifest, records)?;
         let bytes = buf.len() as u64;
 
-        let tmp = path.with_extension("lkv.tmp");
-        fs::write(&tmp, &buf).with_context(|| format!("kv_disk: write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("kv_disk: rename {}", path.display()))?;
+        self.write_file(path, buf)?;
 
         let now = now_unix();
         self.prune_ttl();
@@ -600,6 +732,12 @@ impl DiskKvStore {
         self.evict_to_fit()?;
         self.save_index()?;
         Ok(())
+    }
+
+    /// Whether `key` is in the index. Reads no file, so probing many
+    /// candidate keys (see [`point_key`]) costs nothing per miss.
+    pub fn contains(&self, key: &str) -> bool {
+        self.index.entries.iter().any(|e| e.key == key)
     }
 
     /// Load a snapshot by `key`. Returns `None` on miss, on fingerprint
@@ -650,7 +788,7 @@ impl DiskKvStore {
     pub fn remove(&mut self, key: &str) -> Result<()> {
         if let Some(pos) = self.index.entries.iter().position(|e| e.key == key) {
             let path = self.dir.join(&self.index.entries[pos].file);
-            let _ = fs::remove_file(&path);
+            self.delete_file(path);
             self.index.entries.remove(pos);
             self.save_index()?;
         }
@@ -660,7 +798,7 @@ impl DiskKvStore {
     /// Drop all entries and their files.
     pub fn clear(&mut self) -> Result<()> {
         for e in std::mem::take(&mut self.index.entries) {
-            let _ = fs::remove_file(self.dir.join(&e.file));
+            self.delete_file(self.dir.join(&e.file));
         }
         self.save_index()?;
         Ok(())
@@ -687,9 +825,284 @@ impl DiskKvStore {
                 break;
             };
             let e = self.index.entries.remove(victim);
-            let _ = fs::remove_file(self.dir.join(&e.file));
+            self.delete_file(self.dir.join(&e.file));
         }
         Ok(())
+    }
+}
+
+/// Write `bytes` to `<path>.tmp`, then rename it onto `path`.
+fn write_via_tmp(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("lkv.tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("kv_disk: write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("kv_disk: rename {}", path.display()))?;
+    Ok(())
+}
+
+/// File jobs submitted to any store's writer thread and not finished yet.
+static IN_FLIGHT: std::sync::LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()));
+
+fn in_flight_add(n: usize) {
+    let (count, _) = &*IN_FLIGHT;
+    *count.lock().unwrap_or_else(|e| e.into_inner()) += n;
+}
+
+fn in_flight_done() {
+    let (count, cv) = &*IN_FLIGHT;
+    let mut c = count.lock().unwrap_or_else(|e| e.into_inner());
+    *c = c.saturating_sub(1);
+    if *c == 0 {
+        cv.notify_all();
+    }
+}
+
+/// Block until every file write and delete queued by any [`DiskKvStore`] has
+/// finished, or `timeout` passes. Returns whether the queue drained.
+///
+/// A process that is told to stop calls this first: the writer threads are
+/// detached from its exit path, so a termination signal otherwise kills a
+/// write halfway through its temp file and the newest state never lands (the
+/// previous one stays valid, which is why this is a courtesy, not a repair).
+pub fn drain_writes(timeout: std::time::Duration) -> bool {
+    let (count, cv) = &*IN_FLIGHT;
+    let guard = count.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, result) = cv
+        .wait_timeout_while(guard, timeout, |c| *c > 0)
+        .unwrap_or_else(|e| e.into_inner());
+    *guard == 0 && !result.timed_out()
+}
+
+/// A file mutation queued for a store's writer thread.
+enum FileJob {
+    Write { path: PathBuf, bytes: Vec<u8> },
+    Remove(PathBuf),
+}
+
+/// One thread that performs a store's file writes and deletes in submission
+/// order: a request never waits on the disk, and a delete can never overtake
+/// the write of the same file. Dropping it finishes the queue.
+struct FileWriter {
+    tx: Option<std::sync::mpsc::Sender<FileJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FileWriter {
+    fn spawn() -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<FileJob>();
+        let handle = std::thread::Builder::new()
+            .name("lumen-kv-disk-writer".into())
+            .spawn(move || {
+                for job in rx {
+                    match job {
+                        FileJob::Write { path, bytes } => {
+                            if let Err(e) = write_via_tmp(&path, &bytes) {
+                                // The index already lists the entry; a missing
+                                // file reads as a miss and is dropped on the
+                                // next open.
+                                eprintln!("[kv-disk] background write failed: {e:#}");
+                                let _ = fs::remove_file(path.with_extension("lkv.tmp"));
+                            }
+                        }
+                        FileJob::Remove(path) => {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                    in_flight_done();
+                }
+            })
+            .context("kv_disk: spawn writer thread")?;
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    fn submit(&self, job: FileJob) {
+        if let Some(tx) = &self.tx {
+            in_flight_add(1);
+            if tx.send(job).is_err() {
+                in_flight_done();
+            }
+        }
+    }
+}
+
+impl Drop for FileWriter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The store key of a session state persisted after `tokens` on a prefill
+/// grid of `chunk`: a content hash, so it is the same in every process (unlike
+/// session ids, which reset on restart) and a lookup needs only the prompt.
+/// The chunk is part of it because a state is only exact to resume on the grid
+/// it was computed on (see `session_feed`).
+pub fn point_key(chunk: usize, tokens: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((chunk as u64).to_le_bytes());
+    for t in tokens {
+        h.update(t.to_le_bytes());
+    }
+    let hex: String = h.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("pt-{hex}")
+}
+
+// ---------------------------------------------------------------------------
+// Identity + opening the store from env
+// ---------------------------------------------------------------------------
+
+/// Env-var name prefixes whose values can change a persisted snapshot's bytes
+/// or the numerics of the forward that extends it: KV dtype and compression,
+/// weight requantization, the prefill pass grid, shared-prefix dedup, routing
+/// and sparse attention. Over-inclusion only costs extra misses; leaving one
+/// out lets a snapshot built under one setting be extended under another.
+const IDENTITY_ENV_PREFIXES: &[&str] = &[
+    "LUMEN_MLX_KV_",
+    "LUMEN_QWEN35_TQ_",
+    "LUMEN_QWEN35_QUANT_KV",
+    "LUMEN_QWEN35_PREFILL_CHUNK",
+    "LUMEN_QWEN35_PREFILL_SCORES_GB",
+    "LUMEN_NATIVE_REQUANT_",
+    "LUMEN_MLX_SHARED_PREFIX",
+    "LUMEN_GEMMA4_TQ_",
+    "LUMEN_GEMMA4_QUANT_KV_",
+    "LUMEN_GEMMA4_PREFILL_CHUNK",
+    "LUMEN_GEMMA4_PREFILL_SCORES_GB",
+    "LUMEN_GEMMA4_TOP_K",
+    "LUMEN_SPARSE_DECODE",
+];
+
+/// Env names that match a prefix above but only steer logging.
+const IDENTITY_ENV_IGNORED_SUFFIXES: &[&str] = &["_LOG", "_TIMING"];
+
+/// The settings a snapshot's identity covers, as sorted `(name, value)` pairs:
+/// every env var under [`IDENTITY_ENV_PREFIXES`], plus every flag registered as
+/// `Behavior` (it changes output by definition) at its effective value.
+pub fn identity_settings_from_env() -> Vec<(String, String)> {
+    let mut out: std::collections::BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| {
+            IDENTITY_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+                && !IDENTITY_ENV_IGNORED_SUFFIXES.iter().any(|s| k.ends_with(s))
+        })
+        .collect();
+    for f in lumen_flags::registry_sorted() {
+        if f.kind == lumen_flags::FlagKind::Behavior {
+            let v = std::env::var(f.env).unwrap_or_else(|_| format!("default={}", f.default));
+            out.insert(f.env.to_string(), v);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The namespace persisted snapshots live under: a readable model name plus a
+/// hash of everything their bytes depend on — this format's version, the
+/// weights (shard names and sizes, `config.json`, the shard index) and
+/// `settings` (see [`identity_settings_from_env`]; the MLX build goes here
+/// too). A snapshot is only ever served to a process whose identity matches;
+/// any change is a different directory, i.e. a miss, never a request error.
+pub fn kv_identity(model_id: &str, model_dir: &Path, settings: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |name: &str, value: &[u8]| {
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((value.len() as u64).to_le_bytes());
+        h.update(value);
+    };
+    field(
+        "format",
+        &[LKV_MAGIC.as_slice(), &LKV_VERSION.to_le_bytes()].concat(),
+    );
+    field("model_id", model_id.as_bytes());
+
+    let mut shards: Vec<(String, u64)> = fs::read_dir(model_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let len = e.metadata().ok()?.len();
+            name.ends_with(".safetensors").then_some((name, len))
+        })
+        .collect();
+    shards.sort();
+    for (name, len) in &shards {
+        field(name, &len.to_le_bytes());
+    }
+    for file in ["config.json", "model.safetensors.index.json"] {
+        if let Ok(bytes) = fs::read(model_dir.join(file)) {
+            field(file, &bytes);
+        }
+    }
+    for (k, v) in settings {
+        field(k, v.as_bytes());
+    }
+
+    let digest = h.finalize();
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let name: String = model_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    format!("{name}-{hex}")
+}
+
+/// The opt-in L2 disk tier, opened from env under `identity`. Off unless
+/// `LUMEN_KV_DISK` is truthy; `LUMEN_KV_DISK_MAX_GB` bounds the LRU budget
+/// (0 / unset = unbounded) and `LUMEN_KV_DISK_TTL_SECS` the last-access TTL
+/// (default 1 day, 0 = never). Open failure is logged and yields `None`: the
+/// disk tier is an accelerator, never a reason to fail a load.
+pub fn open_store_from_env(identity: &str, log_tag: &str) -> Option<DiskKvStore> {
+    let enabled = matches!(
+        std::env::var("LUMEN_KV_DISK")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+    if !enabled {
+        return None;
+    }
+    let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|gb| gb * 1024 * 1024 * 1024)
+        .unwrap_or(0);
+    let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(86_400);
+    match DiskKvStore::open(DiskKvStore::default_root(), identity, max_bytes, ttl_secs)
+        .and_then(|mut store| store.write_in_background().map(|()| store))
+    {
+        Ok(store) => {
+            eprintln!(
+                "[{log_tag}] kv-disk tier ON: identity={identity:?} entries={} max_gb={}",
+                store.len(),
+                max_bytes / (1024 * 1024 * 1024),
+            );
+            Some(store)
+        }
+        Err(e) => {
+            eprintln!("[{log_tag}] kv-disk tier disabled (open failed): {e:#}");
+            None
+        }
     }
 }
 
@@ -779,12 +1192,66 @@ mod mlx_conv {
         }
     }
 
-    /// Read an mlx `Array` into an `ArrayRecord`.
+    /// The linked MLX build's version string (part of the snapshot identity:
+    /// kernels, and so the numerics a restored cache is extended with, change
+    /// between MLX releases).
+    pub fn mlx_version() -> String {
+        // SAFETY: mlx-c owns the string; we copy it out before freeing it, and
+        // a null data pointer (only on failure) is handled.
+        unsafe {
+            let mut s = mlx_sys::mlx_string_new();
+            let rc = mlx_sys::mlx_version(&mut s);
+            let data = mlx_sys::mlx_string_data(s);
+            let out = if rc == 0 && !data.is_null() {
+                std::ffi::CStr::from_ptr(data)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "unknown".to_string()
+            };
+            mlx_sys::mlx_string_free(s);
+            out
+        }
+    }
+
+    /// The elements of an evaluated, contiguous array, as raw bytes.
+    fn raw_bytes<T: mlx_rs::ArrayElement>(a: &Array) -> Result<Vec<u8>> {
+        let s = a
+            .try_as_slice::<T>()
+            .map_err(|e| anyhow!("kv_disk: as_slice {:?}: {e:?}", T::DTYPE))?;
+        // SAFETY: `T` is a plain numeric element type (no padding, every bit
+        // pattern valid), so viewing its storage as bytes is sound; the slice
+        // stays borrowed from `a` for the duration of the copy.
+        let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), size_of_val(s)) };
+        Ok(bytes.to_vec())
+    }
+
+    /// Raw little-endian element bytes copied into an aligned `Vec<T>`.
+    fn elems_from_raw<T: Copy + Default>(bytes: &[u8]) -> Vec<T> {
+        let mut v = vec![T::default(); bytes.len() / size_of::<T>()];
+        // SAFETY: `v` owns exactly `bytes.len()` bytes of plain numeric `T`
+        // (checked by `validate_len` against the dtype width), the regions do
+        // not overlap, and copying through `u8` sidesteps the alignment `bytes`
+        // may not have.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr().cast::<u8>(), bytes.len())
+        };
+        v
+    }
+
+    /// An mlx array of `$t` built from raw little-endian element bytes.
+    /// (A macro because mlx-rs keeps `from_slice`'s element bound private.)
+    macro_rules! from_raw_bytes {
+        ($t:ty, $bytes:expr, $shape:expr) => {
+            Array::from_slice(&elems_from_raw::<$t>($bytes), $shape)
+        };
+    }
+
+    /// Read an mlx `Array` into an `ArrayRecord`, in the array's own dtype.
     ///
-    /// Float dtypes (bf16/f16/f32) are materialized through f32 and stored as
-    /// little-endian f32 words — lossless because bf16/f16 are exact subsets of
-    /// f32. Integer dtypes are read in their native width. The array is `eval`'d
-    /// before readback so lazy graphs are materialized contiguously.
+    /// bf16 and f16 are read through a `u16` bit view, which keeps them 2 bytes
+    /// on disk and makes the round trip bit-exact by construction. The array is
+    /// `eval`'d before readback so lazy graphs are materialized contiguously.
     pub fn record_from_array(a: &Array) -> Result<ArrayRecord> {
         let tag = DtypeTag::from_mlx(a.dtype())?;
         if tag == DtypeTag::F64 {
@@ -806,49 +1273,27 @@ mod mlx_conv {
         let a_flat = mlx_rs::ops::reshape(a, &[numel])
             .context("kv_disk: reshape to flat for contiguous logical readback")?;
 
-        let data = if tag.is_float() {
-            let f = a_flat
-                .as_dtype(Dtype::Float32)
-                .context("kv_disk: cast array to f32 for readback")?;
-            f.eval().context("kv_disk: eval f32 array")?;
-            let s = f
-                .try_as_slice::<f32>()
-                .map_err(|e| anyhow!("kv_disk: as_slice f32: {e:?}"))?;
-            let mut data = Vec::with_capacity(s.len() * 4);
-            for v in s {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-            data
-        } else {
-            let e = a_flat;
-            e.eval().context("kv_disk: eval int array")?;
-            match tag {
-                DtypeTag::U8 | DtypeTag::Bool => e
-                    .try_as_slice::<u8>()
-                    .map_err(|e| anyhow!("kv_disk: as_slice u8: {e:?}"))?
-                    .to_vec(),
-                DtypeTag::U32 => {
-                    let s = e
-                        .try_as_slice::<u32>()
-                        .map_err(|e| anyhow!("kv_disk: as_slice u32: {e:?}"))?;
-                    let mut d = Vec::with_capacity(s.len() * 4);
-                    for v in s {
-                        d.extend_from_slice(&v.to_le_bytes());
-                    }
-                    d
-                }
-                DtypeTag::I32 => {
-                    let s = e
-                        .try_as_slice::<i32>()
-                        .map_err(|e| anyhow!("kv_disk: as_slice i32: {e:?}"))?;
-                    let mut d = Vec::with_capacity(s.len() * 4);
-                    for v in s {
-                        d.extend_from_slice(&v.to_le_bytes());
-                    }
-                    d
-                }
-                other => bail!("kv_disk: int readback for {other:?} not implemented in P0"),
-            }
+        let flat = match tag {
+            DtypeTag::BF16 | DtypeTag::F16 => a_flat
+                .view::<u16>()
+                .context("kv_disk: u16 bit view of a 16-bit float array")?,
+            DtypeTag::Bool => a_flat
+                .as_dtype(Dtype::Uint8)
+                .context("kv_disk: bool → u8 for readback")?,
+            _ => a_flat,
+        };
+        flat.eval().context("kv_disk: eval array for readback")?;
+        let data = match tag {
+            DtypeTag::Bool | DtypeTag::U8 => raw_bytes::<u8>(&flat)?,
+            DtypeTag::I8 => raw_bytes::<i8>(&flat)?,
+            DtypeTag::U16 | DtypeTag::BF16 | DtypeTag::F16 => raw_bytes::<u16>(&flat)?,
+            DtypeTag::I16 => raw_bytes::<i16>(&flat)?,
+            DtypeTag::U32 => raw_bytes::<u32>(&flat)?,
+            DtypeTag::I32 => raw_bytes::<i32>(&flat)?,
+            DtypeTag::F32 => raw_bytes::<f32>(&flat)?,
+            DtypeTag::U64 => raw_bytes::<u64>(&flat)?,
+            DtypeTag::I64 => raw_bytes::<i64>(&flat)?,
+            DtypeTag::F64 => unreachable!("rejected above"),
         };
 
         let rec = ArrayRecord {
@@ -860,51 +1305,34 @@ mod mlx_conv {
         Ok(rec)
     }
 
-    /// Reconstruct an mlx `Array` from an `ArrayRecord`. Float records are read
-    /// as f32 then cast back to the recorded dtype (bit-identical for bf16/f16).
+    /// Reconstruct an mlx `Array` from an `ArrayRecord`, bit-exact in its own
+    /// dtype (bf16/f16 come back through a `u16` bit view).
     pub fn record_to_array(rec: &ArrayRecord) -> Result<Array> {
         rec.validate_len()?;
-        let arr = if rec.dtype.is_float() {
-            let n = rec.data.len() / 4;
-            let mut v = Vec::with_capacity(n);
-            for c in rec.data.chunks_exact(4) {
-                v.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-            }
-            let a = Array::from_slice(&v, &rec.shape);
-            if rec.dtype == DtypeTag::F32 {
-                a
-            } else {
-                a.as_dtype(rec.dtype.to_mlx())
-                    .context("kv_disk: cast f32 record back to target dtype")?
-            }
-        } else {
-            match rec.dtype {
-                DtypeTag::U8 | DtypeTag::Bool => Array::from_slice(&rec.data, &rec.shape),
-                DtypeTag::U32 => {
-                    let n = rec.data.len() / 4;
-                    let mut v = Vec::with_capacity(n);
-                    for c in rec.data.chunks_exact(4) {
-                        v.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                    }
-                    Array::from_slice(&v, &rec.shape)
-                }
-                DtypeTag::I32 => {
-                    let n = rec.data.len() / 4;
-                    let mut v = Vec::with_capacity(n);
-                    for c in rec.data.chunks_exact(4) {
-                        v.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                    }
-                    Array::from_slice(&v, &rec.shape)
-                }
-                other => bail!("kv_disk: int reconstruct for {other:?} not implemented in P0"),
-            }
+        let (d, s) = (rec.data.as_slice(), rec.shape.as_slice());
+        let arr = match rec.dtype {
+            DtypeTag::U8 => from_raw_bytes!(u8, d, s),
+            DtypeTag::Bool => from_raw_bytes!(u8, d, s)
+                .as_dtype(Dtype::Bool)
+                .context("kv_disk: u8 → bool")?,
+            DtypeTag::I8 => from_raw_bytes!(i8, d, s),
+            DtypeTag::U16 => from_raw_bytes!(u16, d, s),
+            DtypeTag::BF16 | DtypeTag::F16 => from_raw_bytes!(u16, d, s)
+                .view_dtype(rec.dtype.to_mlx())
+                .context("kv_disk: 16-bit float from its u16 bit view")?,
+            DtypeTag::I16 => from_raw_bytes!(i16, d, s),
+            DtypeTag::U32 => from_raw_bytes!(u32, d, s),
+            DtypeTag::I32 => from_raw_bytes!(i32, d, s),
+            DtypeTag::F32 => from_raw_bytes!(f32, d, s),
+            DtypeTag::U64 => from_raw_bytes!(u64, d, s),
+            DtypeTag::I64 => from_raw_bytes!(i64, d, s),
+            DtypeTag::F64 => bail!("kv_disk: f64 arrays are not supported"),
         };
-        // Materialize before returning. The float path ends in a lazy `as_dtype`
-        // node over a fresh `from_slice` buffer; a rotating KV cache's in-place
-        // `slice_update` fast path (Gemma4 sliding decode) misbehaves when its
-        // backing buffer is an unevaluated graph node rather than a concrete
-        // array. Forcing eval here makes reconstructed caches behave like cloned
-        // (already-evaluated) ones. Cheap — this is the cold reload path.
+        // Materialize before returning. The 16-bit float and bool paths end in a
+        // lazy view/cast node; a rotating KV cache's in-place `slice_update` fast
+        // path (Gemma4 sliding decode) misbehaves when its backing buffer is an
+        // unevaluated graph node rather than a concrete array. Forcing eval here
+        // makes reconstructed caches behave like cloned (already-evaluated) ones.
         arr.eval().context("kv_disk: eval reconstructed array")?;
         Ok(arr)
     }
@@ -1002,7 +1430,7 @@ mod mlx_conv {
 
 #[cfg(feature = "mlx-native")]
 pub use mlx_conv::{
-    array_at, push_record, record_from_array, record_to_array, turboquant_from_meta,
+    array_at, mlx_version, push_record, record_from_array, record_to_array, turboquant_from_meta,
     turboquant_meta,
 };
 
@@ -1146,6 +1574,182 @@ mod tests {
         assert!(store.get("auto-missing").unwrap().is_none());
     }
 
+    /// A fake model directory: two shards of the given sizes plus a config.
+    fn fake_model_dir(shard_sizes: [usize; 2], config: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (i, n) in shard_sizes.iter().enumerate() {
+            fs::write(
+                tmp.path().join(format!("model-0000{i}.safetensors")),
+                vec![0u8; *n],
+            )
+            .unwrap();
+        }
+        fs::write(tmp.path().join("config.json"), config).unwrap();
+        fs::write(tmp.path().join("tokenizer.json"), "{}").unwrap();
+        tmp
+    }
+
+    /// The identity must be a pure function of the weights and the settings,
+    /// and must move when any one of them does — a snapshot served across a
+    /// change it depends on is restored KV that silently disagrees with the
+    /// forward that extends it.
+    #[test]
+    fn kv_identity_tracks_weights_and_settings_and_nothing_else() {
+        let settings = vec![("LUMEN_MLX_KV_BF16".to_string(), "1".to_string())];
+        let a = fake_model_dir([10, 20], r#"{"hidden_size": 8}"#);
+        let id = kv_identity("org/Model-4bit", a.path(), &settings);
+
+        // Deterministic, and a valid single path component with a readable name.
+        assert_eq!(id, kv_identity("org/Model-4bit", a.path(), &settings));
+        assert!(id.starts_with("org_Model-4bit-"), "got {id}");
+        assert!(!id.contains('/') && id.len() <= 64 + 1 + 16, "got {id}");
+
+        // Same content in another directory: same identity (a copied or
+        // re-downloaded model keeps its cache).
+        let b = fake_model_dir([10, 20], r#"{"hidden_size": 8}"#);
+        assert_eq!(id, kv_identity("org/Model-4bit", b.path(), &settings));
+
+        // A file the weights don't depend on doesn't move it.
+        fs::write(b.path().join("tokenizer.json"), r#"{"x": 1}"#).unwrap();
+        assert_eq!(id, kv_identity("org/Model-4bit", b.path(), &settings));
+
+        // Each dependency moves it.
+        let shard = fake_model_dir([10, 21], r#"{"hidden_size": 8}"#);
+        let config = fake_model_dir([10, 20], r#"{"hidden_size": 9}"#);
+        let mut setting = settings.clone();
+        setting[0].1 = "0".into();
+        let mut added = settings.clone();
+        added.push(("mlx".into(), "0.32.3".into()));
+        for (what, other) in [
+            (
+                "shard size",
+                kv_identity("org/Model-4bit", shard.path(), &settings),
+            ),
+            (
+                "config",
+                kv_identity("org/Model-4bit", config.path(), &settings),
+            ),
+            (
+                "setting value",
+                kv_identity("org/Model-4bit", a.path(), &setting),
+            ),
+            (
+                "added setting",
+                kv_identity("org/Model-4bit", a.path(), &added),
+            ),
+            (
+                "model id",
+                kv_identity("org/Model-8bit", a.path(), &settings),
+            ),
+        ] {
+            assert_ne!(id, other, "{what} must change the identity");
+        }
+    }
+
+    /// With the background writer on, everything queued must be on disk once
+    /// the store is dropped — in order, so a key written, deleted and written
+    /// again ends up present — and a reopen must read it all back.
+    #[test]
+    fn background_writes_land_in_order_and_survive_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample_manifest();
+        let rec = |v: f32| vec![f32_record(&[1, 2, 2, 4], v)];
+        {
+            let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+            store.write_in_background().unwrap();
+            store.put("a", &m, &rec(1.0)).unwrap();
+            store.put("b", &m, &rec(2.0)).unwrap();
+            store.remove("a").unwrap();
+            store.put("a", &m, &rec(3.0)).unwrap();
+            assert_eq!(store.len(), 2);
+        } // drop joins the writer
+
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get("a").unwrap().unwrap().1, rec(3.0));
+        assert_eq!(store.get("b").unwrap().unwrap().1, rec(2.0));
+        let leftovers = fs::read_dir(tmp.path().join("fp-abc123"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "no temp file may survive a clean shutdown");
+    }
+
+    /// `drain_writes` must not return until the queued work is on disk, with
+    /// the store still alive (a signal handler has no way to drop it first).
+    #[test]
+    fn drain_writes_waits_for_the_queue_without_dropping_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample_manifest();
+        // Several multi-MB records so the writer thread is genuinely behind.
+        let big = vec![f32_record(&[1, 1024, 1024, 2], 1.0)];
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.write_in_background().unwrap();
+        for i in 0..4 {
+            store.put(&format!("k{i}"), &m, &big).unwrap();
+        }
+        assert!(
+            drain_writes(std::time::Duration::from_secs(30)),
+            "queue did not drain"
+        );
+        let dir = tmp.path().join("fp-abc123");
+        for i in 0..4 {
+            assert!(
+                dir.join(DiskKvStore::file_for(&format!("k{i}"))).exists(),
+                "k{i} not on disk after drain"
+            );
+        }
+        assert!(
+            !fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".tmp")),
+            "a temp file survived the drain"
+        );
+        // Nothing of ours is queued any more (the counter is process-wide, so
+        // allow parallel tests' writes to finish too).
+        assert!(drain_writes(std::time::Duration::from_secs(10)));
+        drop(store);
+    }
+
+    /// A process that died mid-write leaves a half-written temp file and,
+    /// possibly, an index row whose file never landed. Opening the store
+    /// sweeps both, and the survivors still load.
+    #[test]
+    fn open_sweeps_temp_files_and_rows_without_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample_manifest();
+        let records = vec![f32_record(&[1, 2, 2, 4], 1.0)];
+        let dir = tmp.path().join("fp-abc123");
+        {
+            let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+            store.put("kept", &m, &records).unwrap();
+            store.put("lost", &m, &records).unwrap();
+        }
+        fs::remove_file(dir.join(DiskKvStore::file_for("lost"))).unwrap();
+        fs::write(dir.join("half.lkv.tmp"), b"LKV2 partial").unwrap();
+
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert!(
+            !dir.join("half.lkv.tmp").exists(),
+            "temp file must be swept"
+        );
+        assert!(
+            !store.contains("lost"),
+            "a row without its file must be dropped"
+        );
+        assert_eq!(store.get("kept").unwrap().unwrap().1, records);
+        // The sweep was persisted: a second open sees the same.
+        drop(store);
+        assert_eq!(
+            DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn disk_store_index_persists_across_reopen() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1197,17 +1801,54 @@ mod tests {
         #[test]
         #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
         fn bf16_array_record_roundtrip_is_bit_identical() {
-            // Values exactly representable in bf16 so the cast chain is lossless.
-            let data: Vec<f32> = vec![0.0, 1.0, -2.0, 0.5, -0.25, 128.0, -1.5, 3.0];
-            let a32 = Array::from_slice(&data, &[1, 1, 2, 4]);
-            let a = a32.as_dtype(Dtype::Bfloat16).unwrap();
+            // Arbitrary bit patterns, not just "nice" values: zeros of both
+            // signs, a subnormal, ±inf, a NaN with a payload, extremes. With
+            // no cast in the path, every one must come back bit for bit.
+            let bits: Vec<u16> = vec![
+                0x0000, 0x8000, 0x0001, 0x3f80, 0xc000, 0x7f80, 0xff80, 0x7fc1, 0x7f7f, 0x1234,
+                0xabcd, 0x0080,
+            ];
+            for (dtype, tag) in [
+                (Dtype::Bfloat16, DtypeTag::BF16),
+                (Dtype::Float16, DtypeTag::F16),
+            ] {
+                let a = Array::from_slice(&bits, &[1, 1, 3, 4])
+                    .view_dtype(dtype)
+                    .unwrap();
+                let rec = record_from_array(&a).unwrap();
+                assert_eq!(rec.dtype, tag);
+                assert_eq!(
+                    rec.data.len(),
+                    bits.len() * 2,
+                    "{tag:?} must stay 2 bytes per element"
+                );
+                let b = record_to_array(&rec).unwrap();
+                assert_eq!(b.dtype(), dtype);
+                assert_eq!(b.shape(), &[1, 1, 3, 4]);
+                let back = b.view::<u16>().unwrap();
+                back.eval().unwrap();
+                assert_eq!(
+                    back.try_as_slice::<u16>().unwrap(),
+                    bits.as_slice(),
+                    "{tag:?}"
+                );
+            }
+        }
+
+        #[test]
+        #[ignore = "MLX FFI requires non-sandbox host with Metal device"]
+        fn bool_array_record_roundtrip() {
+            let data: Vec<u8> = vec![1, 0, 0, 1, 1, 1, 0, 0];
+            let a = Array::from_slice(&data, &[2, 4])
+                .as_dtype(Dtype::Bool)
+                .unwrap();
             let rec = record_from_array(&a).unwrap();
-            assert_eq!(rec.dtype, DtypeTag::BF16);
+            assert_eq!(rec.dtype, DtypeTag::Bool);
             let b = record_to_array(&rec).unwrap();
-            assert_eq!(b.dtype(), Dtype::Bfloat16);
-            let b32 = b.as_dtype(Dtype::Float32).unwrap();
-            b32.eval().unwrap();
-            assert_eq!(b32.try_as_slice::<f32>().unwrap(), data.as_slice());
+            assert_eq!(b.dtype(), Dtype::Bool);
+            let b8 = b.as_dtype(Dtype::Uint8).unwrap();
+            b8.eval().unwrap();
+            assert_eq!(b8.try_as_slice::<u8>().unwrap(), data.as_slice());
         }
 
         #[test]

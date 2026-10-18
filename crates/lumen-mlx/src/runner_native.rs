@@ -49,6 +49,12 @@ mod imp {
         /// Where [`NativeMlxRunner::rollback`] returns this seq to; set by
         /// [`NativeMlxRunner::mark_rollback`]. Dies with the seq.
         rollback: Option<RollbackPoint>,
+        /// The disk-tier key this seq's state was last written to, or was
+        /// restored from. A newer state of the same conversation replaces that
+        /// entry (see [`NativeMlxRunner::persist_point`]) instead of piling up
+        /// beside it: each state holds the whole prefix, so a conversation
+        /// would otherwise leave one file per prefill chunk it grew by.
+        persisted_key: Option<String>,
     }
 
     /// process-wide background worker that runs
@@ -699,14 +705,16 @@ mod imp {
             if let Some(t0) = t0 {
                 let active = crate::metal_memory::get_active_memory().unwrap_or(0);
                 let peak = crate::metal_memory::get_peak_memory().unwrap_or(0);
+                let cache_mem = crate::metal_memory::get_cache_memory().unwrap_or(0);
                 eprintln!(
-                    "[{label}] chunk {}/{} ({} tok) {:.0}ms  mlx-mem active={:.1}GB peak={:.1}GB",
+                    "[{label}] chunk {}/{} ({} tok) {:.0}ms  mlx-mem active={:.1}GB peak={:.1}GB cache={:.1}GB",
                     idx + 1,
                     n_chunks,
                     end - start,
                     t0.elapsed().as_secs_f64() * 1000.0,
                     active as f64 / 1e9,
                     peak as f64 / 1e9,
+                    cache_mem as f64 / 1e9,
                 );
             }
             if is_last {
@@ -791,67 +799,20 @@ mod imp {
             self.seqs.clear();
             self.snapshots.clear();
             self.next_snapshot_id = 1;
-            self.init_disk_tier(model_id);
+            self.init_disk_tier(model_id, &resolved);
             Ok(info)
         }
 
-        /// Construct the opt-in L2 disk persistence tier from env. Off unless
-        /// `LUMEN_KV_DISK` is truthy. `LUMEN_KV_DISK_MAX_GB` bounds the on-disk
-        /// LRU budget (0 / unset = unbounded). `fingerprint` namespaces the
-        /// cache directory by model identity so a different model can't load a
-        /// stale snapshot. Failures degrade to "no disk tier" — never fatal.
-        fn init_disk_tier(&mut self, model_id: &str) {
-            self.fingerprint = model_id
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let enabled = matches!(
-                std::env::var("LUMEN_KV_DISK")
-                    .ok()
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .as_deref(),
-                Some("1" | "true" | "yes" | "on")
-            );
-            if !enabled {
-                self.disk = None;
-                return;
-            }
-            let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|gb| gb * 1024 * 1024 * 1024)
-                .unwrap_or(0);
-            // Last-access TTL, default 1 day; 0 disables expiry.
-            let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(86_400);
-            match DiskKvStore::open(
-                DiskKvStore::default_root(),
-                &self.fingerprint,
-                max_bytes,
-                ttl_secs,
-            ) {
-                Ok(store) => {
-                    eprintln!(
-                        "[mlx] kv-disk tier ON: fingerprint={:?} entries={} max_gb={}",
-                        self.fingerprint,
-                        store.len(),
-                        max_bytes / (1024 * 1024 * 1024),
-                    );
-                    self.disk = Some(store);
-                }
-                Err(e) => {
-                    eprintln!("[mlx] kv-disk tier disabled (open failed): {e:#}");
-                    self.disk = None;
-                }
-            }
+        /// Open the opt-in L2 disk tier (see [`kv_disk::open_store_from_env`]).
+        /// `fingerprint` is [`kv_disk::kv_identity`]: it namespaces the cache
+        /// directory and is stamped into every manifest, so a snapshot is only
+        /// served to a process with the same weights, KV settings, prefill grid
+        /// and MLX build. Failures degrade to "no disk tier" — never fatal.
+        fn init_disk_tier(&mut self, model_id: &str, model_dir: &Path) {
+            let mut settings = crate::kv_disk::identity_settings_from_env();
+            settings.push(("mlx".into(), crate::kv_disk::mlx_version()));
+            self.fingerprint = crate::kv_disk::kv_identity(model_id, model_dir, &settings);
+            self.disk = crate::kv_disk::open_store_from_env(&self.fingerprint, "mlx");
         }
 
         pub(crate) fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
@@ -995,6 +956,7 @@ mod imp {
                     prompt: tokens.to_vec(),
                     mrope_delta,
                     rollback: None,
+                    persisted_key: None,
                 },
             );
             Ok((next_tok, position))
@@ -1074,6 +1036,7 @@ mod imp {
                     prompt: tokens.to_vec(),
                     mrope_delta: 0,
                     rollback: None,
+                    persisted_key: None,
                 },
             );
             Ok((next_tok, position, captured))
@@ -1761,6 +1724,174 @@ mod imp {
             Ok(seq.position)
         }
 
+        /// Write `seq_id`'s rollback point to the disk tier under the content
+        /// key of `prefix` — the tokens it holds — on prefill grid `chunk`, so
+        /// a later process (or this one, after the session was evicted) can
+        /// resume the conversation from there instead of prefilling it again.
+        ///
+        /// The entry this seq last wrote or was restored from is removed once the
+        /// new one is queued, so a conversation keeps one state on disk, the
+        /// latest, not one per chunk it grew by.
+        ///
+        /// Returns whether anything was written: nothing when the tier is off,
+        /// the key is already stored, the seq has no point at `prefix.len()`,
+        /// or its layers cannot be read back from a point (see
+        /// [`PromptCacheSnapshot::from_rollback_point`]). Runs after the turn's
+        /// reply is out, so the readback never delays a token.
+        pub(crate) fn persist_point(
+            &mut self,
+            seq_id: u64,
+            prefix: &[u32],
+            chunk: usize,
+        ) -> Result<bool> {
+            let Some(disk) = self.disk.as_ref() else {
+                return Ok(false);
+            };
+            let key = crate::kv_disk::point_key(chunk, prefix);
+            if disk.contains(&key) {
+                return Ok(false);
+            }
+            let Some(seq) = self.seqs.get(&seq_id) else {
+                return Ok(false);
+            };
+            let Some(point) = seq
+                .rollback
+                .as_ref()
+                .filter(|p| p.position() == prefix.len())
+            else {
+                return Ok(false);
+            };
+            let Some(snap) = PromptCacheSnapshot::from_rollback_point(point, &seq.cache)? else {
+                eprintln!(
+                    "[mlx] kv-disk: seq {seq_id} point at {} not persisted (layer kind has no prefix readback)",
+                    prefix.len()
+                );
+                return Ok(false);
+            };
+            let t_read = std::time::Instant::now();
+            let (layers, records) = snap.to_records()?;
+            let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+            let manifest = KvManifest {
+                model_fingerprint: self.fingerprint.clone(),
+                created_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                position: prefix.len(),
+                prefix_tokens: prefix.to_vec(),
+                last_token: None,
+                is_deep: true,
+                layers,
+            };
+            let disk = self
+                .disk
+                .as_mut()
+                .expect("disk tier present (checked above)");
+            let t_write = std::time::Instant::now();
+            disk.put(&key, &manifest, &records)?;
+            // This state holds everything the one this seq wrote (or was
+            // restored from) before it did, so that entry is now dead weight.
+            // The writer thread runs the delete after the write above.
+            let superseded = self
+                .seqs
+                .get_mut(&seq_id)
+                .and_then(|s| s.persisted_key.replace(key.clone()))
+                .filter(|old| *old != key);
+            if let Some(old) = superseded {
+                disk.remove(&old)?;
+            }
+            eprintln!(
+                "[mlx] kv-disk: point at {} = {:.0} MB (readback {read_ms:.0} ms, write {:.0} ms)",
+                prefix.len(),
+                records.iter().map(|r| r.data.len()).sum::<usize>() as f64 / 1e6,
+                t_write.elapsed().as_secs_f64() * 1000.0
+            );
+            Ok(true)
+        }
+
+        /// Tests: attach a disk tier rooted at `root` under this runner's own
+        /// identity (`None` detaches it), regardless of `LUMEN_KV_DISK`.
+        #[cfg(test)]
+        pub(crate) fn set_disk_root_for_test(&mut self, root: Option<&Path>) {
+            self.disk = root.map(|r| {
+                DiskKvStore::open(r, &self.fingerprint, 0, 0).expect("open test disk tier")
+            });
+        }
+
+        /// Tests: how many states the disk tier holds.
+        #[cfg(test)]
+        pub(crate) fn disk_entries_for_test(&self) -> usize {
+            self.disk.as_ref().map_or(0, DiskKvStore::len)
+        }
+
+        /// Start `seq_id` from the longest session state on disk that `prompt`
+        /// continues, and leave a rollback point there. Only states on this
+        /// prompt's own prefill grid are candidates — each grid point's content
+        /// key is probed from the latest back — so feeding the rest of the
+        /// prompt from there is exactly a cold prefill's computation.
+        ///
+        /// Returns the restored length, or `None` when the tier is off or
+        /// nothing matches. A state that fails to load is logged and skipped.
+        pub(crate) fn restore_point(
+            &mut self,
+            seq_id: u64,
+            prompt: &[u32],
+        ) -> Result<Option<usize>> {
+            if self.disk.is_none() || self.seqs.contains_key(&seq_id) {
+                return Ok(None);
+            }
+            let Some(chunk) = self.prefill_grid(prompt.len()).map(|g| g.chunk.max(1)) else {
+                return Ok(None);
+            };
+            let last = prompt.len().saturating_sub(1) / chunk * chunk;
+            for at in (chunk..=last).rev().step_by(chunk) {
+                let key = crate::kv_disk::point_key(chunk, &prompt[..at]);
+                let disk = self
+                    .disk
+                    .as_mut()
+                    .expect("disk tier present (checked above)");
+                if !disk.contains(&key) {
+                    continue;
+                }
+                let Some((manifest, records)) = disk.get(&key)? else {
+                    continue;
+                };
+                if manifest.position != at || manifest.prefix_tokens != prompt[..at] {
+                    continue;
+                }
+                let restored =
+                    PromptCacheSnapshot::from_records(&manifest.layers, &records, at, true)
+                        .and_then(|snap| {
+                            let mut cache = self.require_model()?.make_cache();
+                            snap.restore_into(&mut cache)?;
+                            let rollback = RollbackPoint::capture(&cache, at)?;
+                            Ok((cache, rollback))
+                        });
+                let (cache, rollback) = match restored {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[mlx] kv-disk: state at {at} failed to load ({e:#}); skipping");
+                        continue;
+                    }
+                };
+                self.seqs.insert(
+                    seq_id,
+                    NativeSeqState {
+                        cache,
+                        position: at,
+                        mtp_kv: NativeKvCache::new(),
+                        mtp_carried: None,
+                        prompt: Vec::new(),
+                        mrope_delta: 0,
+                        rollback: Some(rollback),
+                        persisted_key: Some(key),
+                    },
+                );
+                return Ok(Some(at));
+            }
+            Ok(None)
+        }
+
         /// L2 disk tier: serialize the deep snapshot `snapshot_id` to disk under
         /// `key` so a future process can fork it instead of cold-prefilling.
         /// No-op when the disk tier is off. Dense `Full` + `Linear` layers only
@@ -1906,6 +2037,7 @@ mod imp {
                     // bypass the prefix cache), so there is no shift to carry.
                     mrope_delta: 0,
                     rollback: None,
+                    persisted_key: None,
                 },
             );
             Ok(position)
@@ -2824,6 +2956,31 @@ mod imp {
             Err(anyhow!(
                 "native mlx-rs runner requested, but lumen-mlx was built without the `mlx-native` feature"
             ))
+        }
+
+        pub(crate) fn persist_point(
+            &mut self,
+            _seq_id: u64,
+            _prefix: &[u32],
+            _chunk: usize,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn set_disk_root_for_test(&mut self, _root: Option<&std::path::Path>) {}
+
+        #[cfg(test)]
+        pub(crate) fn disk_entries_for_test(&self) -> usize {
+            0
+        }
+
+        pub(crate) fn restore_point(
+            &mut self,
+            _seq_id: u64,
+            _prompt: &[u32],
+        ) -> Result<Option<usize>> {
+            Ok(None)
         }
 
         pub(crate) fn snapshot_state_deep(&mut self, _seq_id: u64) -> Result<(u64, usize)> {

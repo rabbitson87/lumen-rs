@@ -1,4 +1,4 @@
-//! Fault sweep over the LKV1 KV-disk format (005 Phase 3).
+//! Fault sweep over the LKV2 KV-disk format (005 Phase 3; LKV2 in task 023).
 //!
 //! `read_lkv` parses attacker-adjacent bytes: a KV snapshot is written by a
 //! previous run and read by this one, so a partial write (power loss mid-flush,
@@ -45,11 +45,9 @@ fn sample() -> (KvManifest, Vec<ArrayRecord>) {
         },
         ArrayRecord {
             dtype: DtypeTag::BF16,
-            // BF16 records are stored as f32 words on disk, so the payload is
-            // 4 bytes per element — deriving it from the dtype rather than
-            // hard-coding 2 keeps the fixture honest about the format.
+            // BF16 records are stored in their native 2 bytes per element.
             shape: vec![3],
-            data: (0..3u32).flat_map(|i| (i as f32).to_le_bytes()).collect(),
+            data: (0..3u16).flat_map(|i| (0x3f80 + i).to_le_bytes()).collect(),
         },
     ];
     (manifest, records)
@@ -84,11 +82,11 @@ fn every_truncation_errors_without_panicking() {
     let (m, r) = sample();
     let bytes = encode(&m, &r);
 
-    // Structural boundaries of LKV1: magic(4) version(4) json_len(4) json
-    // record_count(4) then records. ±1 around each is where length checks
-    // actually go wrong.
+    // Structural boundaries of LKV2: magic(4) version(4) json_len(4) json
+    // json_crc(4) record_count(4) then records. ±1 around each is where length
+    // checks actually go wrong.
     let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let boundaries = [4, 8, 12, 12 + json_len, 12 + json_len + 4];
+    let boundaries = [4, 8, 12, 12 + json_len, 16 + json_len, 20 + json_len];
     let offsets = truncation_offsets(bytes.len(), 1, &boundaries);
     assert!(
         offsets.len() > 100,
@@ -115,28 +113,39 @@ fn every_truncation_errors_without_panicking() {
     }
 }
 
-/// A single flipped byte must be caught or tolerated — never panic. Tolerated
-/// is legitimate: a flip inside a manifest string yields a different but valid
-/// name, and LKV1 carries no checksum. The assertion is that the outcome is one
-/// of those two, for every byte position.
+/// Every single flipped byte must be a typed error. LKV1 had no checksum, so a
+/// flip inside a manifest string or a payload read back as a different but
+/// "valid" snapshot — restored KV that silently disagrees with the prompt. LKV2
+/// covers the manifest and every record with a CRC-32 and rejects trailing
+/// bytes, which leaves no position where a flip is benign.
 #[test]
-fn every_single_byte_flip_is_err_or_benign_never_panic() {
+fn every_single_byte_flip_is_rejected() {
     let (m, r) = sample();
     let bytes = encode(&m, &r);
     lumen_testkit::cases(bytes.len(), "kv-disk single-byte-flip sweep");
-    let mut errs = 0usize;
     for at in 0..bytes.len() {
         let bad = corrupt(&bytes, Corruption::FlipByte(at));
-        // The point is that this call returns at all.
-        if read_lkv(&mut bad.as_slice()).is_err() {
-            errs += 1;
-        }
+        assert!(
+            read_lkv(&mut bad.as_slice()).is_err(),
+            "a flip at byte {at}/{} read back as a valid snapshot",
+            bytes.len()
+        );
     }
-    assert!(
-        errs > bytes.len() / 10,
-        "only {errs}/{} flips were rejected — the format is barely validating anything",
-        bytes.len()
+}
+
+/// Bytes after the last record mean the record count was corrupted downward
+/// (or two writes interleaved); either way the file is not the snapshot its
+/// header describes.
+#[test]
+fn trailing_bytes_are_rejected() {
+    let (m, r) = sample();
+    let mut bytes = encode(&m, &r);
+    bytes.push(0);
+    let msg = format!(
+        "{:#}",
+        read_lkv(&mut bytes.as_slice()).expect_err("trailing bytes must error")
     );
+    assert!(msg.contains("trailing"), "got: {msg}");
 }
 
 /// A garbage manifest region must be a clean deserialize error.
@@ -144,7 +153,7 @@ fn every_single_byte_flip_is_err_or_benign_never_panic() {
 fn garbage_manifest_errors() {
     let (m, r) = sample();
     let bytes = encode(&m, &r);
-    // LKV1's json_len is at offset 8, not 0, so drive the corruption manually
+    // LKV2's json_len is at offset 8, not 0, so drive the corruption manually
     // rather than through the safetensors-shaped `GarbageHeader` helper.
     let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let mut bad = bytes.clone();
@@ -196,9 +205,10 @@ fn implausible_record_length_is_rejected_not_allocated() {
     let bytes = encode(&m, &r);
     let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
-    // First record starts after: magic(4) version(4) json_len(4) json record_count(4).
-    // Layout within a record: dtype(1) ndim(4) shape(ndim*4) data_len(8).
-    let rec0 = 12 + json_len + 4;
+    // First record starts after: magic(4) version(4) json_len(4) json json_crc(4)
+    // record_count(4). Layout within a record: dtype(1) ndim(4) shape(ndim*4)
+    // data_len(8) data crc(4).
+    let rec0 = 12 + json_len + 8;
     let ndim = u32::from_le_bytes(bytes[rec0 + 1..rec0 + 5].try_into().unwrap()) as usize;
     let data_len_at = rec0 + 1 + 4 + ndim * 4;
 

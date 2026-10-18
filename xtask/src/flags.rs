@@ -393,7 +393,14 @@ fn source_mentions(var: &str) -> Result<bool, String> {
 /// `LUMEN_MLX_VENV` and the golden recorder's `LUMEN_MLX_GOLDEN_OUT`.
 /// 187 -> 185 with the MTP adapter experiments: `LUMEN_C4_HIDDEN` and
 /// `LUMEN_C4_WD`.
-const UNMANAGED_BASELINE: usize = 185;
+/// 185 -> 186, deliberately, with `LUMEN_MOE_EXPERT_CACHE_GB` (task 023): a size
+/// in GB, not a boolean, so `flag!` cannot hold it, and it selects a serving
+/// mode rather than gating an optimization (the output is identical either way).
+/// 186 -> 188 with `LUMEN_MOE_IO_LANES` and `LUMEN_MOE_IO_MODE` (task 023): a
+/// reader-thread count and a direct/buffered choice for the same offload, speed
+/// knobs that never change the output. `git grep` only sees tracked files, so
+/// they start counting once `crates/lumen-mlx/src/offload/` is committed.
+const UNMANAGED_BASELINE: usize = 188;
 
 /// Every `LUMEN_*` read via `env::var` in library source, and whether the
 /// registry knows about it.

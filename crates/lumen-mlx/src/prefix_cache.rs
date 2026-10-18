@@ -144,6 +144,18 @@ pub struct PrefixCacheStore {
     /// prefix-sharing-but-divergent prompt forks the head instead of cold-
     /// prefilling. Default ON — see [`DEFAULT_INCREMENTAL`].
     incremental: bool,
+    /// The snapshot the latest prefill produced and the disk tier has not seen
+    /// yet. Written by [`Self::flush_persist`] once the request's reply is out,
+    /// so a disk write never delays the first token.
+    pending_persist: Option<PendingPersist>,
+}
+
+/// A snapshot waiting for [`PrefixCacheStore::flush_persist`].
+struct PendingPersist {
+    snapshot_id: u64,
+    key: String,
+    prefix_tokens: Vec<u32>,
+    last_token: Option<u32>,
 }
 
 impl PrefixCacheStore {
@@ -157,6 +169,7 @@ impl PrefixCacheStore {
             max,
             branches,
             incremental,
+            pending_persist: None,
         }
     }
 
@@ -171,6 +184,7 @@ impl PrefixCacheStore {
             max,
             branches: DEFAULT_BRANCHES,
             incremental: false,
+            pending_persist: None,
         }
     }
 
@@ -189,6 +203,7 @@ impl PrefixCacheStore {
             max,
             branches: branches.max(1),
             incremental: false,
+            pending_persist: None,
         }
     }
 
@@ -202,6 +217,7 @@ impl PrefixCacheStore {
             max: None,
             branches: branches.max(1),
             incremental,
+            pending_persist: None,
         }
     }
 
@@ -268,6 +284,9 @@ impl PrefixCacheStore {
         key: Option<&str>,
         boundary: impl FnOnce() -> Option<usize>,
     ) -> Result<(u32, usize)> {
+        // Whatever an earlier request left pending but never flushed (it failed
+        // mid-decode) is older than anything this call or the disk holds.
+        self.pending_persist = None;
         let key = match key.filter(|_| self.enabled) {
             Some(k) => k,
             None => return runner.prefill(seq_id, prompt_ids),
@@ -399,6 +418,12 @@ impl PrefixCacheStore {
                         );
                         self.evict_stale(runner);
                         advanced_to = prompt_ids.len();
+                        self.pending_persist = Some(PendingPersist {
+                            snapshot_id: snap_id,
+                            key: key.to_string(),
+                            prefix_tokens: prompt_ids.to_vec(),
+                            last_token: Some(last),
+                        });
                     }
                     Ok((snap_id, _)) => {
                         // Replace the matched candidate in place with the advanced
@@ -422,6 +447,12 @@ impl PrefixCacheStore {
                         let _ = runner.release_snapshot(old);
                         self.evict_stale(runner);
                         advanced_to = prompt_ids.len();
+                        self.pending_persist = Some(PendingPersist {
+                            snapshot_id: snap_id,
+                            key: key.to_string(),
+                            prefix_tokens: prompt_ids.to_vec(),
+                            last_token: Some(last),
+                        });
                     }
                     Err(e) => {
                         self.set_in_use(key, idx, false);
@@ -507,12 +538,15 @@ impl PrefixCacheStore {
                     },
                 );
                 self.evict_stale(runner);
-                // L2 disk tier (opt-in): durably persist the freshly-prefilled
-                // snapshot so a future process can fork it instead of paying the
-                // cold prefill again. No-op when the disk tier is off.
-                if let Err(e) = runner.persist_snapshot(snap_id, key, prompt_ids, Some(last)) {
-                    eprintln!("[mlx] prefix-cache: disk persist skipped (key={key:?}): {e:#}");
-                }
+                // L2 disk tier (opt-in): the freshly-prefilled snapshot goes to
+                // disk once the reply is out (see `flush_persist`), so a future
+                // process can fork it instead of paying the cold prefill again.
+                self.pending_persist = Some(PendingPersist {
+                    snapshot_id: snap_id,
+                    key: key.to_string(),
+                    prefix_tokens: prompt_ids.to_vec(),
+                    last_token: Some(last),
+                });
                 eprintln!(
                     "[mlx] prefix-cache MISS (tools) key={key:?} stored snapshot={snap_id} \
                      prefix_len={} branches={}",
@@ -525,6 +559,28 @@ impl PrefixCacheStore {
             }
         }
         Ok((last, pos))
+    }
+
+    /// Write the snapshot the latest prefill left pending to the runner's disk
+    /// tier (a no-op when the tier is off or nothing is pending).
+    ///
+    /// Call it after the reply has been generated. The disk keeps one snapshot
+    /// per key and a write replaces it, so what a restart finds is the most
+    /// recent prompt of that key, not the first one it ever saw. A failure is
+    /// logged, never returned: the reply is already out, and a missing disk
+    /// copy only costs a later prefill.
+    pub fn flush_persist<R: SnapshotRunner>(&mut self, runner: &mut R) {
+        let Some(p) = self.pending_persist.take() else {
+            return;
+        };
+        if let Err(e) =
+            runner.persist_snapshot(p.snapshot_id, &p.key, &p.prefix_tokens, p.last_token)
+        {
+            eprintln!(
+                "[mlx] prefix-cache: disk persist skipped (key={:?}): {e:#}",
+                p.key
+            );
+        }
     }
 
     /// Select the index of the candidate under `key` whose `prefix_tokens` is the
@@ -1639,14 +1695,76 @@ mod tests {
             .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
             .unwrap();
         assert_eq!((tok, pos), (PREFILL_TOK, 3));
+        // Nothing is written before the reply: a disk write must not sit
+        // between the prompt and the first token.
         assert_eq!(
             m.log,
             vec![
                 "load->miss".to_string(),
                 "prefill(3)".to_string(),
                 "snapshot->0".to_string(),
-                "persist(0,3,Some(100))".to_string(),
             ]
+        );
+        store.flush_persist(&mut m);
+        assert_eq!(m.log.last().unwrap(), "persist(0,3,Some(100))");
+        // One flush, one write.
+        store.flush_persist(&mut m);
+        assert_eq!(
+            m.log.iter().filter(|l| l.starts_with("persist(")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_advancing_hit_persists_the_newer_prompt_not_the_first_one() {
+        // Turn 1 is a cold miss; turn 2 extends it and advances the snapshot.
+        // What a restart should find is turn 2's prompt, so the flush after
+        // turn 2 must write the advanced snapshot (5 tokens), not repeat turn 1.
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = PersistMockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
+            .unwrap();
+        store.flush_persist(&mut m);
+        store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4, 5], Some("k"), None)
+            .unwrap();
+        store.flush_persist(&mut m);
+        let persists: Vec<&String> = m.log.iter().filter(|l| l.starts_with("persist(")).collect();
+        assert_eq!(persists.len(), 2, "log={:?}", m.log);
+        assert_eq!(persists[0], "persist(0,3,Some(100))");
+        assert_eq!(
+            *persists[1],
+            format!("persist(1,5,Some({EXTEND_TOK}))"),
+            "log={:?}",
+            m.log
+        );
+    }
+
+    #[test]
+    fn a_pending_persist_that_was_never_flushed_does_not_outlive_the_next_request() {
+        // Request A prefills and fails before its reply (no flush). Request B
+        // is an exact retry of an earlier prompt: no new snapshot, nothing to
+        // persist. B's flush must not write A's stale snapshot over the disk.
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut m = PersistMockRunner::default();
+        store
+            .prefill_optionally_cached(&mut m, 1, &[1, 2, 3], Some("k"), None)
+            .unwrap();
+        store.flush_persist(&mut m); // turn 1 done and persisted
+        store
+            .prefill_optionally_cached(&mut m, 2, &[1, 2, 3, 4], Some("k"), None)
+            .unwrap(); // A: advances to 4 tokens, then the request dies — no flush
+        store
+            .prefill_optionally_cached(&mut m, 3, &[1, 2, 3, 4], Some("k"), None)
+            .unwrap(); // B: exact retry, empty suffix, no new snapshot
+        let before = m.log.iter().filter(|l| l.starts_with("persist(")).count();
+        store.flush_persist(&mut m);
+        let after = m.log.iter().filter(|l| l.starts_with("persist(")).count();
+        assert_eq!(
+            before, after,
+            "stale pending snapshot was written; log={:?}",
+            m.log
         );
     }
 

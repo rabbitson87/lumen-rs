@@ -242,7 +242,11 @@ async fn main() -> Result<(), SendableError> {
     //                  grows monotonically until the OS kills the process.
     //   memory_limit — soft total cap. MLX starts evicting cache more
     //                  aggressively above this. Acts as a guard rail before
-    //                  the hard wired ceiling.
+    //                  the hard wired ceiling. Whatever is asked for, it is
+    //                  lowered to 88% of the GPU's working set (see
+    //                  `metal_memory::WORKING_SET_SHARE`): above that, a long
+    //                  prefill fills the buffer cache past what the device can
+    //                  hold and dies with `Insufficient Memory`.
     //
     // Defaults assume 36 GB M3 Max dev box. For 24 GB Mac Mini, set
     // `LUMEN_WIRED_LIMIT_GB=12 LUMEN_CACHE_LIMIT_GB=4 LUMEN_MEMORY_LIMIT_GB=14`.
@@ -308,10 +312,27 @@ async fn main() -> Result<(), SendableError> {
                     wired_bytes / (1024 * 1024),
                 ),
             }
-            match lumen_mlx::metal_memory::set_memory_limit(gb_to_bytes(memory_gb)) {
+            // Never above what the GPU can actually keep resident: past that,
+            // MLX does not free its buffer cache in time and a long prefill
+            // dies with `Insufficient Memory` (measured: 21 GB of weights plus a
+            // cache that grew to 5 GB in 6 chunks, on a 28.1 GiB working set).
+            let want_bytes = gb_to_bytes(memory_gb);
+            let ws = lumen_mlx::metal_memory::working_set_limit();
+            let memory_bytes = lumen_mlx::metal_memory::clamp_memory_limit(want_bytes, ws);
+            match lumen_mlx::metal_memory::set_memory_limit(memory_bytes) {
                 Ok(prev) => eprintln!(
-                    "[mlx-mem] memory_limit set to {memory_gb} GB (prev {} GB)",
-                    prev / (1024 * 1024 * 1024)
+                    "[mlx-mem] memory_limit set to {:.1} GB (prev {} GB){}",
+                    memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    prev / (1024 * 1024 * 1024),
+                    if memory_bytes < want_bytes {
+                        format!(
+                            ", lowered from {memory_gb} GB to {:.0}% of the {:.1} GB GPU working set",
+                            lumen_mlx::metal_memory::WORKING_SET_SHARE * 100.0,
+                            ws.unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0),
+                        )
+                    } else {
+                        String::new()
+                    },
                 ),
                 Err(e) => eprintln!("[mlx-mem] WARN set_memory_limit={memory_gb} GB: {e}"),
             }
@@ -469,6 +490,35 @@ async fn main() -> Result<(), SendableError> {
     eprintln!("  DELETE /v1/sessions/{{id}}     (drop MLX prompt cache)");
     eprintln!("  DELETE /v1/prefix-cache/{{key}} (drop one A1 master snapshot)");
     eprintln!("  DELETE /v1/prefix-cache        (clear all A1 master snapshots)");
+
+    // SIGTERM/SIGINT used to end the process on the spot, in the middle of a
+    // queued disk-cache write: the newest conversation state was lost and left
+    // a half-written temp file behind. Give the writer thread its moment first.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            eprintln!("[serve] could not install the shutdown signal handlers");
+            return;
+        };
+        let code = tokio::select! {
+            _ = term.recv() => 128 + 15,
+            _ = int.recv() => 128 + 2,
+        };
+        eprintln!("[serve] shutting down: finishing queued disk-cache writes");
+        let drained = tokio::task::spawn_blocking(|| {
+            lumen_mlx::kv_disk::drain_writes(std::time::Duration::from_secs(15))
+        })
+        .await
+        .unwrap_or(false);
+        if !drained {
+            eprintln!("[serve] disk-cache writes still pending after 15 s; exiting anyway");
+        }
+        std::process::exit(code);
+    });
 
     loop {
         let accept = server.accept().await?;

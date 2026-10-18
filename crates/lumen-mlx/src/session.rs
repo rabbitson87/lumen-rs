@@ -65,6 +65,33 @@ pub(crate) trait SessionRunner {
     fn rollback(&mut self, _seq_id: u64) -> Result<usize> {
         Err(anyhow!("this runner has no rollback points"))
     }
+    /// Feed `tokens` (the start of `seq_id` when `fresh`, else its continuation) in one call,
+    /// cutting the prefill on the runner's grid and leaving the rollback point `mark` tokens in:
+    /// what feeding grid chunk by grid chunk and calling [`Self::mark_rollback`] at `mark` would
+    /// do, for a runner that does better with the whole run at once (it reads each layer's
+    /// weights once for all the chunks). `None` — the default — means it does not, and the caller
+    /// feeds cut by cut.
+    fn feed_marked(
+        &mut self,
+        _seq_id: u64,
+        _fresh: bool,
+        _tokens: &[u32],
+        _mark: usize,
+    ) -> Result<Option<(u32, usize)>> {
+        Ok(None)
+    }
+    /// Write `seq_id`'s rollback point — the state after `prefix`, placed on
+    /// a prefill grid of `chunk` — to the runner's disk tier. Returns whether
+    /// anything was written. Default: the runner has no disk tier.
+    fn persist_point(&mut self, _seq_id: u64, _prefix: &[u32], _chunk: usize) -> Result<bool> {
+        Ok(false)
+    }
+    /// Start the new `seq_id` from the longest persisted state `prompt`
+    /// continues, with a rollback point there; returns its length. Default:
+    /// the runner has no disk tier, so never.
+    fn restore_point(&mut self, _seq_id: u64, _prompt: &[u32]) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 /// Per-session prompt-cache state. Holds the running token sequence (prompt +
@@ -135,6 +162,10 @@ pub(crate) enum SessionReuse {
     /// The prompt continues the session only up to its rollback point, and
     /// the sequence was wound back there.
     Resume,
+    /// No live session, but a state persisted by an earlier turn (or an
+    /// earlier process) that the prompt continues; a new sequence restored
+    /// from it.
+    Restored,
     /// Nothing reusable; a new, empty sequence.
     Fresh,
 }
@@ -280,16 +311,24 @@ pub(crate) fn feed<R: SessionRunner + ?Sized>(
     };
     let t = Instant::now();
     let (mut last, mut pos, mut at) = (0, 0, from);
-    for &to in &plan.cuts {
-        (last, pos) = if at == 0 {
-            runner.prefill(seq_id, &prompt[at..to])?
-        } else {
-            runner.extend(seq_id, &prompt[at..to])?
-        };
-        if plan.mark == Some(to) {
-            runner.mark_rollback(seq_id)?;
+    let whole = match plan.mark {
+        Some(mark) => runner.feed_marked(seq_id, from == 0, &prompt[from..], mark - from)?,
+        None => None,
+    };
+    if let Some((l, p)) = whole {
+        (last, pos) = (l, p);
+    } else {
+        for &to in &plan.cuts {
+            (last, pos) = if at == 0 {
+                runner.prefill(seq_id, &prompt[at..to])?
+            } else {
+                runner.extend(seq_id, &prompt[at..to])?
+            };
+            if plan.mark == Some(to) {
+                runner.mark_rollback(seq_id)?;
+            }
+            at = to;
         }
-        at = to;
     }
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     let marked = plan
@@ -306,12 +345,47 @@ pub(crate) fn feed<R: SessionRunner + ?Sized>(
             "[mlx] seq {seq_id} session={key:?}{label} resume: rolled back to {from} \
              suffix={fed} in {ms:.0}ms{marked}"
         ),
+        SessionReuse::Restored => eprintln!(
+            "[mlx] seq {seq_id} session={key:?}{label} restored from disk at {from} \
+             suffix={fed} in {ms:.0}ms{marked}"
+        ),
         SessionReuse::Fresh => eprintln!(
             "[mlx] seq {seq_id} session={key:?}{label} fresh prefill: {fed} tokens \
              in {ms:.0}ms{marked}"
         ),
     }
     Ok((last, pos, plan.mark.or(start.point)))
+}
+
+/// Write a turn's rollback point to the runner's disk tier, after the turn.
+///
+/// `prompt` is the turn's prompt and `point` the rollback point its sequence
+/// holds (what [`feed`] returned). The point is keyed on the grid this prompt
+/// was fed on, so a later prompt restores it only on that same grid. Errors
+/// are logged, never returned: the reply is already out, and a missing disk
+/// copy only costs a later prefill.
+pub(crate) fn persist_point<R: SessionRunner + ?Sized>(
+    runner: &mut R,
+    key: &str,
+    seq_id: u64,
+    prompt: &[u32],
+    point: Option<usize>,
+) {
+    let (Some(at), Some(grid)) = (point, runner.prefill_grid(prompt.len())) else {
+        return;
+    };
+    if at == 0 || at > prompt.len() {
+        return;
+    }
+    let t = Instant::now();
+    match runner.persist_point(seq_id, &prompt[..at], grid.chunk) {
+        Ok(true) => eprintln!(
+            "[mlx] seq {seq_id} session={key:?} persisted state at {at} to disk in {:.0}ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[mlx] seq {seq_id} session={key:?} disk persist failed: {e:#}"),
+    }
 }
 
 /// The live sessions of one backend, and the policy for keying and evicting
@@ -451,8 +525,23 @@ impl Sessions {
                 old.tokens.len()
             );
         }
+        let seq_id = alloc_seq();
+        match runner.restore_point(seq_id, prompt_ids) {
+            Ok(Some(at)) => {
+                return Ok(SessionStart {
+                    seq_id,
+                    from: at,
+                    how: SessionReuse::Restored,
+                    point: Some(at),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "[mlx] session={key:?}{label} disk restore failed ({e:#}); prefilling fresh"
+            ),
+        }
         Ok(SessionStart {
-            seq_id: alloc_seq(),
+            seq_id,
             from: 0,
             how: SessionReuse::Fresh,
             point: None,

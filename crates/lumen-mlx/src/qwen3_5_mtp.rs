@@ -527,17 +527,17 @@ impl Qwen35MtpBlock {
     /// resolved weights. Matches the trunk's middle-layer MoE dispatch.
     fn moe_mlp_forward(&self, x: &Array, w: &Qwen35MtpMoeMlp) -> Result<Array> {
         use crate::native_moe::{
-            AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
+            AffineGateWeights, GateProj, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
             SwitchGluWeights, moe_block_forward,
         };
         let view = MoeBlockWeights {
-            gate: AffineGateWeights {
+            gate: GateProj::Affine(AffineGateWeights {
                 weight: &w.gate_w,
                 scales: &w.gate_s,
                 biases: &w.gate_b,
                 group_size: w.gate_gs,
                 bits: w.gate_bits,
-            },
+            }),
             switch_glu: SwitchGluWeights {
                 gate_proj: SwitchExpertWeights {
                     weight: &w.sw_gate_w,
@@ -561,23 +561,28 @@ impl Qwen35MtpBlock {
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &w.se_gate_w,
                 gate_proj_s: &w.se_gate_s,
+                gate_proj_b: None,
                 up_proj_w: &w.se_up_w,
                 up_proj_s: &w.se_up_s,
+                up_proj_b: None,
                 down_proj_w: &w.se_down_w,
                 down_proj_s: &w.se_down_s,
+                down_proj_b: None,
                 group_size: w.se_gs,
                 bits: w.se_bits,
                 mode: w.se_mode,
             },
-            shared_gate: AffineGateWeights {
+            shared_gate: GateProj::Affine(AffineGateWeights {
                 weight: &w.sg_w,
                 scales: &w.sg_s,
                 biases: &w.sg_b,
                 group_size: w.sg_gs,
                 bits: w.sg_bits,
-            },
+            }),
             top_k: w.top_k,
             norm_topk_prob: w.norm_topk_prob,
+            experts_in_scale_dtype: false,
+            offload: None,
         };
         moe_block_forward(x, &view)
     }

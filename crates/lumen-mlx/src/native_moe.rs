@@ -132,6 +132,18 @@ mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Task 023 Phase 0 probe: read the routed expert ids back to the CPU at
+        /// every MoE layer while every expert stays resident. An exact SSD
+        /// expert cache needs exactly this readback, so the decode-time delta
+        /// against the default is the sync tax on its own. Output unchanged.
+        pub(crate) moe_layer_sync_probe {
+            env: "LUMEN_MOE_PROBE_LAYER_SYNC",
+            default: false,
+            kind: Diagnostic,
+        }
+    }
+
     pub fn swiglu_fuse_enabled() -> bool {
         swiglu_fuse::get()
     }
@@ -420,14 +432,60 @@ mod imp {
         mlx_rs::ops::squeeze_axes(&recombined, &[-2]).context("switch_glu: squeeze(-2) failed")
     }
 
+    fn run_experts(
+        x: &Array,
+        indices: &Array,
+        glu: &SwitchGluWeights<'_>,
+        in_scale_dtype: bool,
+    ) -> Result<Array> {
+        if in_scale_dtype {
+            switch_glu_in_scale_dtype(x, indices, glu)
+        } else {
+            switch_glu(x, indices, glu)
+        }
+    }
+
+    /// [`switch_glu`] with the activations in the dtype of the experts' float
+    /// scales, results back in `x`'s dtype.
+    ///
+    /// MLX gives `gather_qmm` the common dtype of `x` and the scales, casting
+    /// whichever differs. An f32 `x` against bf16 scales therefore widens the
+    /// scales and biases of **every stacked expert** on every call (for the
+    /// 512-expert checkpoint, ~1 GB written and read per layer: measured at
+    /// 11 ms of a 14 ms MoE block). Casting the one-row activation instead is
+    /// what the bf16 reference does anyway. MXFP4 scales are integers and
+    /// float-scale checkpoints in f32 need no cast, so those paths are untouched.
+    fn switch_glu_in_scale_dtype(
+        x: &Array,
+        indices: &Array,
+        weights: &SwitchGluWeights<'_>,
+    ) -> Result<Array> {
+        use mlx_rs::Dtype::{Bfloat16, Float16, Float32};
+        let scale_dtype = weights.up_proj.scales.dtype();
+        let is_float = matches!(scale_dtype, Bfloat16 | Float16 | Float32);
+        if !is_float || scale_dtype == x.dtype() {
+            return switch_glu(x, indices, weights);
+        }
+        let x_cast = x
+            .as_dtype(scale_dtype)
+            .context("switch_glu: cast activations to the scale dtype")?;
+        let y = switch_glu(&x_cast, indices, weights)?;
+        y.as_dtype(x.dtype())
+            .context("switch_glu: cast experts' output back")
+    }
+
     /// Resolved tensors for the dense `Qwen3NextMLP` shared expert.
     pub struct SharedMlpWeights<'a> {
         pub gate_proj_w: &'a Array,
         pub gate_proj_s: &'a Array,
+        /// Affine checkpoints carry biases next to the scales; MXFP4 has none.
+        pub gate_proj_b: Option<&'a Array>,
         pub up_proj_w: &'a Array,
         pub up_proj_s: &'a Array,
+        pub up_proj_b: Option<&'a Array>,
         pub down_proj_w: &'a Array,
         pub down_proj_s: &'a Array,
+        pub down_proj_b: Option<&'a Array>,
         pub group_size: i32,
         pub bits: i32,
         pub mode: &'a CStr,
@@ -439,7 +497,7 @@ mod imp {
             x,
             w.gate_proj_w,
             w.gate_proj_s,
-            None,
+            w.gate_proj_b,
             w.group_size,
             w.bits,
             w.mode,
@@ -449,7 +507,7 @@ mod imp {
             x,
             w.up_proj_w,
             w.up_proj_s,
-            None,
+            w.up_proj_b,
             w.group_size,
             w.bits,
             w.mode,
@@ -465,7 +523,7 @@ mod imp {
             &activated,
             w.down_proj_w,
             w.down_proj_s,
-            None,
+            w.down_proj_b,
             w.group_size,
             w.bits,
             w.mode,
@@ -483,16 +541,85 @@ mod imp {
         pub bits: i32,
     }
 
+    /// A gate projection to one or a few logits: quantized (the Qwen3.5 and
+    /// mlx-community Flash-Next builds) or left in float (the router and shared-expert
+    /// gate of the gs64 build).
+    pub enum GateProj<'a> {
+        Affine(AffineGateWeights<'a>),
+        /// `[in, out]` float32: the checkpoint's `[out, in]` weight, transposed
+        /// and widened once at load so the matmul runs in f32 like the rest.
+        Dense(&'a Array),
+    }
+
+    fn project_gate(x: &Array, gate: &GateProj<'_>) -> Result<Array> {
+        match gate {
+            GateProj::Affine(g) => linear_with_mode(
+                x,
+                g.weight,
+                g.scales,
+                Some(g.biases),
+                g.group_size,
+                g.bits,
+                MODE_AFFINE,
+            ),
+            GateProj::Dense(w_t) => mlx_rs::ops::matmul(x, w_t).map_err(Into::into),
+        }
+    }
+
     /// `MoeBlockWeights` bundles the inputs `moe_block_forward` needs. The
     /// caller resolves all tensor handles + per-tensor quant params from the
     /// safetensors map up front so the hot path is purely compute.
     pub struct MoeBlockWeights<'a> {
-        pub gate: AffineGateWeights<'a>,
+        pub gate: GateProj<'a>,
         pub switch_glu: SwitchGluWeights<'a>,
         pub shared_expert: SharedMlpWeights<'a>,
-        pub shared_gate: AffineGateWeights<'a>,
+        pub shared_gate: GateProj<'a>,
         pub top_k: i32,
         pub norm_topk_prob: bool,
+        /// Run the routed experts on activations in the dtype of their float
+        /// scales (see [`switch_glu_in_scale_dtype`]). Off for the families
+        /// whose outputs are pinned to the f32 path.
+        pub experts_in_scale_dtype: bool,
+        /// `Some` when this layer's routed experts are served from the expert
+        /// bank (task 023) instead of `switch_glu`, whose stacked tensors are
+        /// then never touched and so never loaded into memory.
+        pub offload: Option<OffloadLayer<'a>>,
+    }
+
+    /// A layer whose routed experts come from the slot pool.
+    pub struct OffloadLayer<'a> {
+        pub offload: &'a crate::offload::MoeOffload,
+        /// The layer's index in the checkpoint (the `layers.<n>` of its tensors).
+        pub layer: u16,
+    }
+
+    /// The gather weights over the pool arrays of `routed`: same quantization
+    /// parameters as the resident weights `like`, but the stacked tensors are
+    /// the bank's slots.
+    fn offloaded_glu<'b>(
+        routed: &'b crate::offload::Routed,
+        like: &SwitchGluWeights<'b>,
+    ) -> Result<SwitchGluWeights<'b>> {
+        let need = |role: &str| {
+            routed
+                .array(role)
+                .ok_or_else(|| anyhow!("expert bank has no `{role}` pool"))
+        };
+        let proj = |p: &str| -> Result<SwitchExpertWeights<'b>> {
+            Ok(SwitchExpertWeights {
+                weight: need(&format!("{p}.weight"))?,
+                scales: need(&format!("{p}.scales"))?,
+                biases: routed.array(&format!("{p}.biases")),
+            })
+        };
+        Ok(SwitchGluWeights {
+            gate_proj: proj("gate_proj")?,
+            up_proj: proj("up_proj")?,
+            down_proj: proj("down_proj")?,
+            group_size: like.group_size,
+            bits: like.bits,
+            mode: like.mode,
+        })
     }
 
     /// Run a full sparse-MoE block on `x` (shape `[B, S, hidden]`).
@@ -511,16 +638,7 @@ mod imp {
         // affine quantized linear returns f32 when x is f32, so the cast was
         // a no-op graph node breaking softmax fusion.
         let t_routing = timing_on.then(Instant::now);
-        let gate_logits = linear_with_mode(
-            x,
-            w.gate.weight,
-            w.gate.scales,
-            Some(w.gate.biases),
-            w.gate.group_size,
-            w.gate.bits,
-            MODE_AFFINE,
-        )
-        .context("moe_block_forward: gate(x) failed")?;
+        let gate_logits = project_gate(x, &w.gate).context("moe_block_forward: gate(x) failed")?;
         let last_logits_axis = (gate_logits.ndim() as i32) - 1;
         let num_experts = gate_logits.shape()[last_logits_axis as usize];
 
@@ -570,6 +688,14 @@ mod imp {
                 .context("moe_block_forward: batched eval(routing) failed")?;
             bump_moe_routing_ms(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        if moe_layer_sync_probe::get() {
+            mlx_rs::transforms::eval([&inds])
+                .context("moe_block_forward: layer-sync probe eval(inds) failed")?;
+            let ids = inds
+                .try_as_slice::<u32>()
+                .context("moe_block_forward: layer-sync probe read(inds) failed")?;
+            std::hint::black_box(ids.first().copied());
+        }
 
         // (S: switch_glu) per-expert gate_up + silu_mul + down_proj +
         //                 (y * scores).sum(axis=-2) reduction.
@@ -577,8 +703,25 @@ mod imp {
         // returns f32 when x is f32; the cast was breaking
         // multiply/sum fusion across the wsum reduction.
         let t_glu = timing_on.then(Instant::now);
-        let y =
-            switch_glu(x, &inds, &w.switch_glu).context("moe_block_forward: switch_glu failed")?;
+        // Offloaded layer: read the routing back (this completes all earlier GPU
+        // work), make those experts resident, and gather over the bank's pool
+        // with slot numbers where the expert ids were. Scores are unchanged.
+        let routed = match &w.offload {
+            Some(o) => Some(
+                o.offload
+                    .route(o.layer, &inds)
+                    .context("moe_block_forward: expert offload routing failed")?,
+            ),
+            None => None,
+        };
+        let y = match &routed {
+            Some(r) => {
+                let glu = offloaded_glu(r, &w.switch_glu)?;
+                run_experts(x, &r.slot_inds, &glu, w.experts_in_scale_dtype)
+            }
+            None => run_experts(x, &inds, &w.switch_glu, w.experts_in_scale_dtype),
+        }
+        .context("moe_block_forward: switch_glu failed")?;
         let scores_exp = mlx_rs::ops::expand_dims(&scores, -1)
             .context("moe_block_forward: expand_dims(scores) failed")?;
         let weighted = mlx_rs::ops::multiply(&y, &scores_exp)
@@ -597,16 +740,8 @@ mod imp {
         // Lever B: dropped 2× redundant `as_dtype(f32)` casts (shared_gate +
         // shared_mlp output) — both quantized matmuls return f32 already.
         let t_shared = timing_on.then(Instant::now);
-        let shared_gate_logits = linear_with_mode(
-            x,
-            w.shared_gate.weight,
-            w.shared_gate.scales,
-            Some(w.shared_gate.biases),
-            w.shared_gate.group_size,
-            w.shared_gate.bits,
-            MODE_AFFINE,
-        )
-        .context("moe_block_forward: shared_expert_gate(x) failed")?;
+        let shared_gate_logits = project_gate(x, &w.shared_gate)
+            .context("moe_block_forward: shared_expert_gate(x) failed")?;
         let shared_y_raw = shared_mlp(x, &w.shared_expert)
             .context("moe_block_forward: shared_expert(x) failed")?;
         let shared_y = if sigmoid_mul_fuse_enabled() {
@@ -645,7 +780,7 @@ mod imp {
 #[cfg(feature = "mlx-native")]
 #[allow(unused_imports)] // Consumed by Phase 3d.4 wiring in native_model.rs.
 pub(crate) use imp::{
-    AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights, SwitchGluWeights,
-    dense_mlp_forward, gelu_mul_fuse_enabled, gelu_mul_fused, moe_block_forward,
-    swiglu_fuse_enabled, swiglu_fused, switch_glu,
+    AffineGateWeights, GateProj, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
+    SwitchExpertWeights, SwitchGluWeights, dense_mlp_forward, gelu_mul_fuse_enabled,
+    gelu_mul_fused, moe_block_forward, swiglu_fuse_enabled, swiglu_fused, switch_glu,
 };

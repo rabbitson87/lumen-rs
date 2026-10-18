@@ -25,6 +25,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session::session_rollback_enabled` |
+| `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -40,6 +41,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_QWEN4_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen4_exp::model::widen_scales` |
 | `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
@@ -249,6 +251,15 @@ Leave a rollback point at each chat turn's conversation boundary, so
  prefill of the longer prompt does — `extend` reproduces a bulk prefill
  bit-identically (`session_reuse_reproduces_a_cold_prefill`).
 
+### `LUMEN_MOE_PROBE_LAYER_SYNC`
+
+*Diagnostic, default off.*
+
+Task 023 Phase 0 probe: read the routed expert ids back to the CPU at
+ every MoE layer while every expert stays resident. An exact SSD
+ expert cache needs exactly this readback, so the decode-time delta
+ against the default is the sync tax on its own. Output unchanged.
+
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 
 *Optimization, default on.*
@@ -408,6 +419,13 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  A/B hatch. The equivalence matrix must never flip this expecting
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
+
+### `LUMEN_QWEN4_WIDEN_SCALES`
+
+*Optimization, default on.*
+
+Keep the resident quantized projections' scales and biases in f32 so the activations'
+ matmul stops re-casting them on every call. Bit-identical (bf16 -> f32 is exact).
 
 ### `LUMEN_SPARSE_DECODE`
 

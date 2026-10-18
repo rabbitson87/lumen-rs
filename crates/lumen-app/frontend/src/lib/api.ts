@@ -102,7 +102,7 @@ export interface UpdateStatus {
   needs_update: boolean;
 }
 
-export type ModelFamily = "qwen25" | "qwen35-dense" | "qwen35-moe" | "gemma4";
+export type ModelFamily = "qwen25" | "qwen35-dense" | "qwen35-moe" | "gemma4" | "qwen4-exp";
 
 export interface FamilyInfo {
   family: ModelFamily;

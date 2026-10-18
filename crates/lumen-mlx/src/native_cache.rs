@@ -558,6 +558,26 @@ mod imp {
                 .transpose()
         }
 
+        /// `(keys, values)` for the first `len` tokens — what this cache held
+        /// when it was `len` long, since it only ever appends. Errors when
+        /// `len` is past the end or the buffer starts later (a shared-prefix
+        /// suffix buffer does not hold the first tokens).
+        pub fn prefix_views(&self, len: usize) -> Result<(Option<Array>, Option<Array>)> {
+            if self.base_offset != 0 || len > self.offset {
+                return Err(anyhow!(
+                    "NativeKvCache::prefix_views: {len} tokens not held (base_offset={}, offset={})",
+                    self.base_offset,
+                    self.offset
+                ));
+            }
+            let cut = |a: &Option<Array>| {
+                a.as_ref()
+                    .map(|a| slice_axis2(a, 0, len as i32))
+                    .transpose()
+            };
+            Ok((cut(&self.keys)?, cut(&self.values)?))
+        }
+
         /// Append `keys` / `values` (shape `[B, n_kv_heads, S, head_dim]`) and
         /// return the resulting full `(keys, values)` logical view covering
         /// `0..offset`.

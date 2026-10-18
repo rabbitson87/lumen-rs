@@ -27,6 +27,9 @@ pub enum ModelFamily {
     Qwen35Moe,
     /// Gemma 4 (26B-A4B / E4B). mlx-native backend.
     Gemma4,
+    /// Qwen 3.8 Flash-Next (`qwen4_exp`, 125B-A6B): its routed experts and n-gram
+    /// table are served from the SSD. mlx-native backend.
+    Qwen4Exp,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +98,12 @@ pub const FAMILIES: &[FamilyInfo] = &[
         notes: "Mixture-of-Experts with ~A3B activation. Best quality-per-token on M-series.",
     },
     FamilyInfo {
+        family: ModelFamily::Qwen4Exp,
+        label: "Qwen 3.8 Flash-Next",
+        backend: "mlx-native",
+        notes: "125B-A6B hybrid MoE streamed from the SSD (experts and a 32 GB n-gram table stay on disk): runs on 16-36 GB Macs at SSD-bound speed.",
+    },
+    FamilyInfo {
         family: ModelFamily::Gemma4,
         label: "Gemma 4",
         backend: "mlx-native",
@@ -109,6 +118,23 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
     // multimodal models ship.  Qwen 2.5's flat config fails parsing at load
     // time, so surfacing them as "recommended" misleads users into a broken
     // download.  Re-add once the native runner gains a Qwen 2.5 config path.
+    RecommendedModel {
+        // 125B total / 6B active. Only ~3.6 GB of the 104 GB has to be in memory; the
+        // routed experts (68 GB) are read from the SSD through a slot pool sized to the
+        // GPU's memory (`LUMEN_MOE_EXPERT_CACHE_GB` overrides it) and the n-gram table
+        // (32 GB) row by row. Output is identical to holding everything in memory.
+        // Measured on an M3 Max 36 GB with a 6.7 / 10 / 15 GB pool: 4.8 / 6.3 / 8.3 tok/s
+        // (Slotstream, a Swift engine for the same model, measures 6.4 / 7.2 at the first
+        // two); the SSD is the limit, so a 16 GB Mac with a base-model SSD will see ~1.5.
+        // The gs64 build is used because its experts are 10% smaller to read than the
+        // mlx-community group-32 build (97 GB vs 104 GB on disk), which also loads.
+        id: "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit",
+        family: ModelFamily::Qwen4Exp,
+        label: "Qwen 3.8 — Flash-Next 125B-A6B (SSD-streamed)",
+        approx_size_gb: 97,
+        min_ram_gb: 16,
+        notes: "**Newest Qwen MoE, run from the SSD.** 125B parameters, ~6B active, 4-bit (group-64). Needs ~97 GB of free disk but only 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand, bit-identical to a run with everything in memory. Speed is set by the SSD and by how much RAM the expert cache can use: about 8 tok/s with 15 GB of cache on a 36 GB Mac, ~5-6 tok/s on 24 GB, 1.5-3 on a 16 GB Mac. Reuses a conversation's state across turns and restarts (enable the disk KV cache in settings). Text only; no thinking-budget or MTP support yet.",
+    },
     RecommendedModel {
         id: "mlx-community/Qwen3.6-35B-A3B-mxfp4",
         family: ModelFamily::Qwen35Moe,
@@ -267,6 +293,12 @@ pub const IMAGE_MODELS: &[RecommendedImageModel] = &[
 pub fn family_of(model_id: &str) -> Option<ModelFamily> {
     let lower = model_id.to_lowercase();
 
+    // Flash-Next is its own architecture (`qwen4_exp`) that happens to carry a 3.8
+    // version marker; it must be told apart before the Qwen 3.5 family test claims it.
+    if lower.contains("flash-next") || lower.contains("qwen4_exp") || lower.contains("qwen4-exp") {
+        return Some(ModelFamily::Qwen4Exp);
+    }
+
     if is_qwen3_5_dense(&lower) {
         return Some(ModelFamily::Qwen35Dense);
     }
@@ -377,6 +409,41 @@ mod tests {
             family_of("mlx-community/Qwen3.8-27B-4bit"),
             Some(ModelFamily::Qwen35Dense)
         );
+    }
+
+    #[test]
+    fn flash_next_is_its_own_family_and_the_neighbours_keep_theirs() {
+        for id in [
+            "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit",
+            "mlx-community/Qwen3.8-Flash-Next-4bit",
+            "qwen38-flash-next-gs64",
+        ] {
+            assert_eq!(family_of(id), Some(ModelFamily::Qwen4Exp), "{id}");
+        }
+        assert_eq!(
+            family_of("Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"),
+            Some(ModelFamily::Qwen35Dense)
+        );
+        assert_eq!(
+            family_of("mlx-community/Qwen3.6-35B-A3B-mxfp4"),
+            Some(ModelFamily::Qwen35Moe)
+        );
+        let Catalog {
+            recommended,
+            families,
+            ..
+        } = catalog();
+        let row = recommended
+            .iter()
+            .find(|r| r.id == "pipenetwork/Qwen3.8-Flash-Next-MLX-4bit")
+            .expect("the Flash-Next row is recommended");
+        assert!(matches!(row.family, ModelFamily::Qwen4Exp));
+        assert!(
+            families
+                .iter()
+                .any(|f| matches!(f.family, ModelFamily::Qwen4Exp))
+        );
+        assert_eq!(family_of(row.id), Some(row.family));
     }
 
     #[test]

@@ -78,6 +78,80 @@ pub mod metal_memory {
             mlx_sys::mlx_reset_peak_memory();
         }
     }
+
+    /// The GPU's `max_recommended_working_set_size` in bytes: the most memory
+    /// the device will keep resident for a process before command buffers start
+    /// failing with `Insufficient Memory`. `None` if the query fails.
+    pub fn working_set_limit() -> Option<usize> {
+        let key = std::ffi::CString::new("max_recommended_working_set_size").ok()?;
+        // SAFETY: every handle is created by its `_new`/`_get` call here and
+        // freed before returning; `key` outlives the calls that read it.
+        unsafe {
+            let mut dev = mlx_sys::mlx_device_new();
+            let mut info = mlx_sys::mlx_device_info_new();
+            let mut size: usize = 0;
+            let ok = mlx_sys::mlx_get_default_device(&mut dev) == 0
+                && mlx_sys::mlx_device_info_get(&mut info, dev) == 0
+                && mlx_sys::mlx_device_info_get_size(&mut size, info, key.as_ptr()) == 0;
+            mlx_sys::mlx_device_info_free(info);
+            mlx_sys::mlx_device_free(dev);
+            (ok && size > 0).then_some(size)
+        }
+    }
+
+    /// Share of the device's working set that MLX may fill, live buffers plus
+    /// its buffer cache, before it starts freeing cached buffers.
+    ///
+    /// MLX's own trigger is 98% of the working set in lumen's fork. That
+    /// assumes this process owns the GPU: the real ceiling is lower by whatever
+    /// other apps hold (about 2 GB with a browser and an editor open), and a
+    /// prefill whose temporary buffers differ in size from one chunk to the next
+    /// fills the cache up to the trigger and then fails with `Insufficient
+    /// Memory` instead of recycling it.
+    pub const WORKING_SET_SHARE: f64 = 0.88;
+
+    /// `configured` lowered to [`WORKING_SET_SHARE`] of `working_set`; unchanged
+    /// when the working set is unknown.
+    pub fn clamp_memory_limit(configured: usize, working_set: Option<usize>) -> usize {
+        match working_set {
+            Some(ws) if ws > 0 => configured.min((ws as f64 * WORKING_SET_SHARE) as usize),
+            _ => configured,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        const GIB: usize = 1 << 30;
+
+        #[test]
+        fn a_limit_above_the_device_is_pulled_down_to_its_share() {
+            // The 36 GB Mac this was found on: 28.1 GiB working set, 32 GiB asked for.
+            let ws = (28.1 * GIB as f64) as usize;
+            let got = clamp_memory_limit(32 * GIB, Some(ws));
+            assert_eq!(got, (ws as f64 * 0.88) as usize);
+            assert!(got < ws, "must leave room for other apps");
+        }
+
+        #[test]
+        fn a_limit_already_below_the_share_is_left_alone() {
+            let ws = 100 * GIB;
+            assert_eq!(clamp_memory_limit(32 * GIB, Some(ws)), 32 * GIB);
+        }
+
+        #[test]
+        fn an_unknown_or_zero_working_set_changes_nothing() {
+            assert_eq!(clamp_memory_limit(32 * GIB, None), 32 * GIB);
+            assert_eq!(clamp_memory_limit(32 * GIB, Some(0)), 32 * GIB);
+        }
+
+        #[test]
+        #[ignore = "needs a Metal device"]
+        fn the_device_reports_a_plausible_working_set() {
+            let ws = working_set_limit().expect("Metal device reports a working set");
+            assert!(ws > GIB && ws < 1024 * GIB, "got {ws}");
+        }
+    }
 }
 
 /// Public surface for the Gemma 4 26B-A4B MoE port (Phase 1 W4 (c) onwards).
@@ -148,8 +222,12 @@ mod native_rope;
 mod native_runtime;
 mod native_snapshot;
 pub mod native_ssm;
+#[cfg(feature = "mlx-native")]
+mod offload;
 mod prefix_cache;
 mod qwen3_5_moe;
+#[cfg(feature = "mlx-native")]
+pub mod qwen4_exp;
 // Unlike its `qwen3_5_moe` sibling — which keeps a `#[cfg]`'d `mod imp` inside
 // an ungated file — every item here takes or returns `mlx_rs::Array`, so the
 // whole module is gated at the declaration (same shape as
@@ -504,6 +582,9 @@ fn resolve_tokenizer_json_path(model_id: &str) -> Result<PathBuf> {
 
 enum RunnerImpl {
     Native(NativeMlxRunner),
+    /// Qwen3.8-Flash-Next: a different architecture behind the same chat layer.
+    #[cfg(feature = "mlx-native")]
+    Qwen4Exp(Box<crate::qwen4_exp::runner::Qwen4ExpRunner>),
     /// Test-only: replays a fixed token script so the decode loops can be
     /// driven with no model, no weights and no GPU. See [`TokenScriptRunner`].
     #[cfg(test)]
@@ -667,6 +748,8 @@ impl RunnerImpl {
     fn as_runner(&self) -> &dyn Runner {
         match self {
             Self::Native(r) => r,
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen4Exp(r) => r.as_ref(),
             #[cfg(test)]
             Self::Scripted(r) => r,
         }
@@ -675,6 +758,8 @@ impl RunnerImpl {
     fn as_runner_mut(&mut self) -> &mut dyn Runner {
         match self {
             Self::Native(r) => r,
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen4Exp(r) => r.as_mut(),
             #[cfg(test)]
             Self::Scripted(r) => r,
         }
@@ -688,6 +773,7 @@ impl RunnerImpl {
     fn native(&self) -> Option<&NativeMlxRunner> {
         match self {
             Self::Native(r) => Some(r),
+            Self::Qwen4Exp(_) => None,
             #[cfg(test)]
             Self::Scripted(_) => None,
         }
@@ -698,6 +784,8 @@ impl RunnerImpl {
     fn native_mut(&mut self) -> Option<&mut NativeMlxRunner> {
         match self {
             Self::Native(r) => Some(r),
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen4Exp(_) => None,
             #[cfg(test)]
             Self::Scripted(_) => None,
         }
@@ -863,6 +951,9 @@ impl RunnerImpl {
         last_token: u32,
         mask: &mut dyn FnMut(&mut [f32]) -> Result<()>,
     ) -> Result<(u32, usize)> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.decode_step_masked(seq_id, last_token, mask);
+        }
         self.native_mut()
             .ok_or_else(|| {
                 anyhow!(
@@ -882,6 +973,9 @@ impl RunnerImpl {
         last_token: u32,
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
     ) -> Result<(u32, usize)> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.decode_step_pick(seq_id, last_token, pick);
+        }
         self.native_mut()
             .ok_or_else(|| anyhow!("sampling is only supported on the native (mlx-rs) backend"))?
             .decode_step_pick(seq_id, last_token, pick)
@@ -939,6 +1033,36 @@ impl session::SessionRunner for RunnerImpl {
     }
     fn rollback(&mut self, seq_id: u64) -> Result<usize> {
         self.as_runner_mut().rollback(seq_id)
+    }
+    fn feed_marked(
+        &mut self,
+        seq_id: u64,
+        fresh: bool,
+        tokens: &[u32],
+        mark: usize,
+    ) -> Result<Option<(u32, usize)>> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return r.feed_with_mark(seq_id, fresh, tokens, mark);
+        }
+        let _ = (seq_id, fresh, tokens, mark);
+        Ok(None)
+    }
+    fn persist_point(&mut self, seq_id: u64, prefix: &[u32], chunk: usize) -> Result<bool> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return r.persist_point(seq_id, prefix, chunk);
+        }
+        self.native_mut()
+            .map_or(Ok(false), |r| r.persist_point(seq_id, prefix, chunk))
+    }
+    fn restore_point(&mut self, seq_id: u64, prompt: &[u32]) -> Result<Option<usize>> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return r.restore_point(seq_id, prompt);
+        }
+        self.native_mut()
+            .map_or(Ok(None), |r| r.restore_point(seq_id, prompt))
     }
 }
 
@@ -3154,13 +3278,30 @@ impl MlxQwen35Backend {
     /// (containing `config.json` plus `*.safetensors` shards) and a
     /// HuggingFace Hub repo id (e.g. `mlx-community/Qwen3.6-35B-A3B-mxfp4`);
     /// the latter is downloaded into the standard HF cache on first use.
+    /// The runner for `model_id`: Flash-Next when the checkpoint's `model_type` says
+    /// so, the Qwen3.5/3.6 native runner otherwise.
+    fn load_runner(model_id: &str) -> Result<(RunnerImpl, Vec<u32>, usize)> {
+        #[cfg(feature = "mlx-native")]
+        if let Ok(dir) = crate::runner_native::resolve_model_dir(model_id)
+            && crate::qwen4_exp::is_qwen4_exp(&dir)
+        {
+            eprintln!("[mlx] runner=qwen4_exp (Qwen3.8-Flash-Next)");
+            let (r, info) = crate::qwen4_exp::runner::Qwen4ExpRunner::load(&dir)?;
+            return Ok((
+                RunnerImpl::Qwen4Exp(Box::new(r)),
+                info.eos_tokens,
+                info.vocab_size,
+            ));
+        }
+        let mut r = NativeMlxRunner::new()?;
+        let info = r.load(model_id)?;
+        Ok((RunnerImpl::Native(r), info.eos_tokens, info.vocab_size))
+    }
+
     pub fn load(model_id: &str) -> Result<Self> {
         check_backend_env(std::env::var("LUMEN_MLX_BACKEND").ok().as_deref())?;
         eprintln!("[mlx] runner=native (mlx-rs Phase 3d.5; parity gate via LUMEN_MLX_GOLDEN_IN)");
-        let mut r = NativeMlxRunner::new()?;
-        let info = r.load(model_id)?;
-        let (runner, eos_tokens, vocab_size) =
-            (RunnerImpl::Native(r), info.eos_tokens, info.vocab_size);
+        let (runner, eos_tokens, vocab_size) = Self::load_runner(model_id)?;
 
         let tokenizer = match load_tokenizer_via_hub(model_id) {
             Ok(tok) => Some(tok),
@@ -5634,6 +5775,10 @@ impl MlxQwen35Backend {
                 n_gen
             );
         }
+        // The reply is out: write this prompt's snapshot to the disk tier (a
+        // no-op when it is off), so a restart resumes from this turn, not from
+        // the first one the key ever saw.
+        self.prefix_store.flush_persist(&mut self.runner);
         self.remove_seq(seq_id).ok();
         Ok(parser.finish())
     }
@@ -6488,8 +6633,16 @@ impl MlxQwen35Backend {
 
         // Persist session: prompt + all generated tokens. Don't remove_seq —
         // the cache state is needed for the next turn.
+        let prompt_len = prompt_ids.len();
         let mut new_tokens = prompt_ids;
         new_tokens.extend_from_slice(&generated);
+        session::persist_point(
+            &mut self.runner,
+            session_id,
+            seq_id,
+            &new_tokens[..prompt_len],
+            point,
+        );
         self.sessions
             .store(&mut self.runner, session_id, seq_id, new_tokens, point);
 
@@ -6550,8 +6703,16 @@ impl MlxQwen35Backend {
             }
         }
 
+        let prompt_len = prompt_ids.len();
         let mut new_tokens = prompt_ids;
         new_tokens.extend_from_slice(&generated);
+        session::persist_point(
+            &mut self.runner,
+            session_id,
+            seq_id,
+            &new_tokens[..prompt_len],
+            point,
+        );
         self.sessions
             .store(&mut self.runner, session_id, seq_id, new_tokens, point);
 
@@ -7722,6 +7883,109 @@ mod tests {
                 m.drop_session(sid);
             }
         }
+    }
+
+    /// A conversation state restored from disk must not change a single token.
+    ///
+    /// The disk tier stores a turn's rollback point — a state on the prefill
+    /// chunk grid — and a later process restores it into a fresh sequence and
+    /// feeds the rest on the same grid. That is the in-RAM resume, with a
+    /// write and a read in between, so the reply must equal a cold prefill of
+    /// the same prompt token for token. The RAM copy is dropped before the
+    /// second turn, so the only way to reuse anything is the disk.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_disk_restored_state_changes_no_token() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let n_gen = 48;
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("the session disk tier concerns the Qwen path");
+        };
+        let run = |m: &mut MlxQwen35Backend, msgs: &[(String, String)], sid: &str| {
+            session_rollback_enabled::with(true, || {
+                m.chat_streaming_session(msgs, n_gen, false, Some(sid), |_| {}, None)
+                    .expect("chat turn")
+            })
+        };
+        fn native(m: &mut MlxQwen35Backend) -> &mut NativeMlxRunner {
+            m.runner.native_mut().expect("native runner")
+        }
+
+        // A system prompt two chunks and a bit long, so the point lands on the
+        // second grid boundary and the restored state spans more than one chunk.
+        let chunk = m.runner.prefill_grid(4096).expect("grid").chunk;
+        let mut system = String::from("The printing press changed how ideas spread across Europe.");
+        let user = "Summarize the text above in two sentences.";
+        while m
+            .build_chat_input(
+                &[
+                    ("system".into(), system.clone()),
+                    ("user".into(), user.into()),
+                ],
+                false,
+                None,
+            )
+            .expect("prompt")
+            .len()
+            < 2 * chunk + 50
+        {
+            system.push_str(" The press spread ideas.");
+        }
+        let turn1 = vec![
+            ("system".to_string(), system),
+            ("user".to_string(), user.to_string()),
+        ];
+
+        // Reference: both turns with no disk tier.
+        native(m).set_disk_root_for_test(None);
+        let reply1 = run(m, &turn1, "cold1");
+        let mut turn2 = turn1.clone();
+        turn2.push(("assistant".into(), reply1.clone()));
+        turn2.push(("user".into(), "Now say it in one sentence.".into()));
+        let cold2 = run(m, &turn2, "cold2");
+        m.drop_session("cold1");
+        m.drop_session("cold2");
+
+        // Turn one with the tier on persists its point.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        native(m).set_disk_root_for_test(Some(tmp.path()));
+        assert_eq!(
+            run(m, &turn1, "a"),
+            reply1,
+            "turn one changed with the disk tier on"
+        );
+        let point = m
+            .sessions
+            .get("a")
+            .and_then(|s| s.rollback_len)
+            .expect("a rollback point");
+        assert_eq!(
+            native(m).disk_entries_for_test(),
+            1,
+            "the point was not persisted"
+        );
+        m.drop_session("a");
+
+        // Nothing in RAM: turn two can only reuse through the disk.
+        let p2 = m.build_chat_input(&turn2, false, None).expect("prompt 2");
+        let probe = 1_000_000;
+        let restored = native(m).restore_point(probe, &p2).expect("restore");
+        assert_eq!(
+            restored,
+            Some(point),
+            "turn two must restore the persisted point"
+        );
+        native(m).remove_seq(probe).expect("drop probe");
+        let resumed2 = run(m, &turn2, "b");
+        assert_eq!(
+            resumed2, cold2,
+            "a turn restored from disk must equal a cold prefill (point {point})"
+        );
+        m.drop_session("b");
+        native(m).set_disk_root_for_test(None);
     }
 
     /// The same property, for a turn that was generated with thinking ON.

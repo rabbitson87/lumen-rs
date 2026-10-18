@@ -71,7 +71,7 @@ mod imp {
     use crate::native_embedding::quantized_embedding_lookup_with_mode;
     use crate::native_kernels::{sigmoid_mul_fuse_enabled, sigmoid_mul_fused};
     use crate::native_moe::{
-        AffineGateWeights, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
+        AffineGateWeights, GateProj, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
         SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled, swiglu_fused,
     };
     use crate::native_norm::rms_norm;
@@ -548,13 +548,13 @@ mod imp {
     impl ResolvedMoeWeights {
         pub fn view(&self) -> MoeBlockWeights<'_> {
             MoeBlockWeights {
-                gate: AffineGateWeights {
+                gate: GateProj::Affine(AffineGateWeights {
                     weight: &self.gate_w,
                     scales: &self.gate_s,
                     biases: &self.gate_b,
                     group_size: self.gate_gs,
                     bits: self.gate_bits,
-                },
+                }),
                 switch_glu: SwitchGluWeights {
                     gate_proj: SwitchExpertWeights {
                         weight: &self.sw_gate_w,
@@ -578,23 +578,28 @@ mod imp {
                 shared_expert: SharedMlpWeights {
                     gate_proj_w: &self.se_gate_w,
                     gate_proj_s: &self.se_gate_s,
+                    gate_proj_b: None,
                     up_proj_w: &self.se_up_w,
                     up_proj_s: &self.se_up_s,
+                    up_proj_b: None,
                     down_proj_w: &self.se_down_w,
                     down_proj_s: &self.se_down_s,
+                    down_proj_b: None,
                     group_size: self.se_gs,
                     bits: self.se_bits,
                     mode: self.se_mode,
                 },
-                shared_gate: AffineGateWeights {
+                shared_gate: GateProj::Affine(AffineGateWeights {
                     weight: &self.sg_w,
                     scales: &self.sg_s,
                     biases: &self.sg_b,
                     group_size: self.sg_gs,
                     bits: self.sg_bits,
-                },
+                }),
                 top_k: self.top_k,
                 norm_topk_prob: self.norm_topk_prob,
+                experts_in_scale_dtype: false,
+                offload: None,
             }
         }
     }
@@ -1218,6 +1223,9 @@ mod imp {
         // Forwarded to MLX's `fast::rope(freqs=...)` when
         // `LUMEN_QWEN35_ROPE_PRECOMPUTE_FREQS=1` is set. Default-off opt-in.
         const_rope_freqs: Array,
+        // Routed experts served from a slot pool read off SSD instead of held
+        // in memory (task 023). `None` is the resident model, unchanged.
+        offload: Option<crate::offload::MoeOffload>,
         // MTP (Multi-Token Prediction) speculative-decode head. `None` until
         // `try_enable_mtp(block)` is called post-load. The block exposes
         // `forward()` consuming (embeds, h_pre, mtp_kv, ...) — see
@@ -1288,10 +1296,42 @@ mod imp {
         base_theta: f32,
     }
 
+    /// `LUMEN_MOE_EXPERT_CACHE_GB`: unset, empty or `0` keeps every routed
+    /// expert in memory (the resident model). A positive number serves them from
+    /// an SSD-backed slot pool holding about that many GB (task 023). Anything
+    /// else is an error, not a silent fallback to the resident model: a typo
+    /// there would load 17 GB the user meant to avoid.
+    fn expert_cache_bytes_from_env() -> Result<Option<u64>> {
+        let Ok(raw) = std::env::var("LUMEN_MOE_EXPERT_CACHE_GB") else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let gb: f64 = raw
+            .parse()
+            .ok()
+            .filter(|g: &f64| g.is_finite() && *g >= 0.0)
+            .ok_or_else(|| anyhow!("LUMEN_MOE_EXPERT_CACHE_GB={raw:?} is not a number of GB"))?;
+        Ok((gb > 0.0).then_some((gb * 1e9) as u64))
+    }
+
     impl NativeQwen3_5MoeModel {
         /// Load + validate a checkpoint laid out as a directory containing
         /// `config.json` and one or more `*.safetensors` shards.
         pub fn load(model_dir: &Path) -> Result<Self> {
+            Self::load_with_offload(model_dir, expert_cache_bytes_from_env()?)
+        }
+
+        /// [`Self::load`] with the routed experts served from an SSD-backed slot
+        /// pool of about `expert_budget_bytes` instead of held in memory
+        /// (`None`: the resident model). Output is the same either way; only
+        /// memory and speed differ.
+        pub fn load_with_offload(
+            model_dir: &Path,
+            expert_budget_bytes: Option<u64>,
+        ) -> Result<Self> {
             if !model_dir.is_dir() {
                 return Err(anyhow!(
                     "model dir {} does not exist or is not a directory",
@@ -1303,6 +1343,12 @@ mod imp {
             // Family validator: accepts MoE (35B-A3B) and Dense (9B/27B), and
             // affine/mxfp4/nvfp4 quant. Returns which per-layer MLP to build.
             let mlp_kind = config.validate_qwen3_5_family()?;
+            if expert_budget_bytes.is_some() && mlp_kind != MlpKind::Moe {
+                return Err(anyhow!(
+                    "expert offload needs a mixture-of-experts checkpoint; {} is dense",
+                    model_dir.display()
+                ));
+            }
 
             let mut weights = NativeWeights::load_dir(model_dir)?;
 
@@ -1385,6 +1431,19 @@ mod imp {
             let const_rope_freqs = precompute_rope_freqs(rope_dim, config.text_config.rope_theta)
                 .context("qwen3_5_moe: precompute rope freqs")?;
 
+            let offload = match expert_budget_bytes {
+                Some(bytes) => Some(
+                    crate::offload::MoeOffload::open(
+                        model_dir,
+                        bytes,
+                        config.text_config.num_experts_per_tok,
+                        crate::offload::IoTuning::from_env()?,
+                    )
+                    .context("qwen3_5_moe: expert offload")?,
+                ),
+                None => None,
+            };
+
             Ok(Self {
                 config,
                 weights,
@@ -1392,6 +1451,7 @@ mod imp {
                 layer_weights,
                 linear_attn_constants,
                 vision,
+                offload,
                 mtp: None,
                 mtp_capture_slot: Mutex::new(None),
                 mtp_capture_enabled: AtomicBool::new(false),
@@ -1411,6 +1471,12 @@ mod imp {
 
         pub fn config(&self) -> &NativeModelConfig {
             &self.config
+        }
+
+        /// Hit/miss counts of the expert bank, when routed experts are offloaded.
+        #[allow(dead_code)] // read by the offload equivalence test and diagnostics
+        pub(crate) fn offload_stats(&self) -> Option<crate::offload::slot_map::Stats> {
+            self.offload.as_ref().map(|o| o.stats())
         }
 
         pub fn text_config(&self) -> &NativeTextConfig {
@@ -2448,7 +2514,13 @@ mod imp {
         pub(crate) fn layer_moe_forward(&self, x: &Array, layer_idx: usize) -> Result<Array> {
             match &self.layer_weights[layer_idx].mlp {
                 MlpWeights::Moe(m) => {
-                    let weights = m.view();
+                    let mut weights = m.view();
+                    if let Some(off) = &self.offload {
+                        weights.offload = Some(crate::native_moe::OffloadLayer {
+                            offload: off,
+                            layer: layer_idx as u16,
+                        });
+                    }
                     let raw = moe_block_forward(x, &weights)
                         .with_context(|| format!("layer_moe_forward({layer_idx}) failed"))?;
                     Self::to_f32(raw, &format!("layer{layer_idx}.mlp"))
@@ -3298,6 +3370,12 @@ mod imp {
         /// block's static dims line up with the trunk's `text_config`. Idempotent
         /// in spirit — re-enabling replaces the prior block.
         pub fn try_enable_mtp(&mut self, block: Qwen35MtpBlock) -> Result<()> {
+            if self.offload.is_some() {
+                return Err(anyhow!(
+                    "MTP is not available while routed experts are offloaded to SSD: \
+                     verifying several tokens at once multiplies the expert reads"
+                ));
+            }
             let cfg = self.text_config();
             if block.dims.hidden_size != cfg.hidden_size {
                 return Err(anyhow!(
@@ -4771,5 +4849,125 @@ mod config_tests {
         let cfg: NativeModelConfig = serde_json::from_str(dense).unwrap();
         let err = cfg.validate_qwen3_5_moe().unwrap_err();
         assert!(err.to_string().contains("qwen3_5_moe"));
+    }
+}
+
+/// Serving the routed experts from an SSD-backed slot pool must not change a
+/// single bit of the model's output (task 023).
+#[cfg(all(test, feature = "mlx-native"))]
+mod offload_tests {
+    use super::imp::NativeQwen3_5MoeModel;
+    use mlx_rs::Dtype;
+
+    /// Prefill `prompt`, then `steps` greedy decode steps. Returns each step's
+    /// next token and the exact bytes of its logits.
+    fn run(
+        dir: &std::path::Path,
+        budget: Option<u64>,
+        prompt: &[u32],
+        steps: usize,
+    ) -> (Vec<u32>, Vec<Vec<u8>>, Option<(u64, u64)>) {
+        let model = NativeQwen3_5MoeModel::load_with_offload(dir, budget).expect("load model");
+        let mut cache = model.make_cache();
+        let mut input: Vec<u32> = prompt.to_vec();
+        let (mut tokens, mut logits) = (Vec::new(), Vec::new());
+        for _ in 0..=steps {
+            let out = model
+                .forward_with_opts(&input, &mut cache, /* last_only */ true)
+                .expect("forward");
+            let f32s = out.as_dtype(Dtype::Float32).expect("f32");
+            f32s.eval().expect("eval");
+            let v = f32s.as_slice::<f32>();
+            let next = v
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            logits.push(v.iter().flat_map(|x| x.to_le_bytes()).collect());
+            tokens.push(next);
+            input = vec![next];
+        }
+        let stats = model.offload_stats().map(|s| (s.hits, s.misses));
+        (tokens, logits, stats)
+    }
+
+    #[test]
+    #[ignore = "needs the Qwen3.6-35B-A3B-mxfp4 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn offloaded_experts_give_bit_identical_logits_at_every_budget() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // Real token ids: routing behaves differently on a synthetic ramp. Twelve
+        // tokens make the prefill 12 x 8 = 96 routed rows, past the 64 at which
+        // the gather sorts by expert, so the sorted path is exercised too.
+        let prompt: Vec<u32> = vec![
+            9707, 11, 4340, 653, 498, 1936, 264, 4285, 1815, 304, 22775, 30,
+        ];
+        let steps = 24;
+
+        // The resident model first and then dropped: two copies do not fit.
+        let (want_tok, want_logits, none) = run(&dir, None, &prompt, steps);
+        assert!(none.is_none());
+        let _ = crate::metal_memory::clear_cache();
+
+        // 17 GB: every expert fits. 8 GB: about half. 3 GB: about a sixth, with
+        // constant eviction. 0.17 GB: ~100 slots, barely above one prefill
+        // layer's needs, so the decode steps evict and reload all the time.
+        for budget_gb in [17.5f64, 8.0, 3.0, 0.17] {
+            let (tok, logits, stats) = run(&dir, Some((budget_gb * 1e9) as u64), &prompt, steps);
+            let (hits, misses) = stats.expect("offload was on");
+            eprintln!("budget {budget_gb} GB: hits={hits} misses={misses}");
+            assert_eq!(tok, want_tok, "{budget_gb} GB: the generated tokens differ");
+            for (i, (a, b)) in logits.iter().zip(&want_logits).enumerate() {
+                assert!(a == b, "{budget_gb} GB: logits differ at step {i}");
+            }
+            assert!(misses > 0, "the bank was never used");
+            let _ = crate::metal_memory::clear_cache();
+        }
+    }
+
+    /// A prompt longer than one prefill chunk: the pool's state changes between
+    /// chunks (experts loaded, evicted, reloaded), and every chunk's gather must
+    /// still see exactly the weights the resident model would use.
+    #[test]
+    #[ignore = "needs the Qwen3.6-35B-A3B-mxfp4 checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_prompt_spanning_several_prefill_chunks_is_bit_identical_too() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skipping: set LUMEN_QWEN35_MODEL_DIR");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+        let text = include_str!("../../../docs/maintainer-workflow.md");
+        let ids: Vec<u32> = tok
+            .encode(&text[..text.len().min(14_000)], false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert!(
+            ids.len() > 3_000,
+            "need more than one 2048-token chunk, got {}",
+            ids.len()
+        );
+        let prompt = &ids[..ids.len().min(4_200)];
+
+        let (want_tok, want_logits, _) = run(&dir, None, prompt, 4);
+        let _ = crate::metal_memory::clear_cache();
+        for budget_gb in [8.0f64, 1.0] {
+            let (tok, logits, stats) = run(&dir, Some((budget_gb * 1e9) as u64), prompt, 4);
+            let (hits, misses) = stats.expect("offload was on");
+            eprintln!(
+                "{} tokens, budget {budget_gb} GB: hits={hits} misses={misses}",
+                prompt.len()
+            );
+            assert_eq!(tok, want_tok, "{budget_gb} GB: the generated tokens differ");
+            for (i, (a, b)) in logits.iter().zip(&want_logits).enumerate() {
+                assert!(a == b, "{budget_gb} GB: logits differ at step {i}");
+            }
+            let _ = crate::metal_memory::clear_cache();
+        }
     }
 }

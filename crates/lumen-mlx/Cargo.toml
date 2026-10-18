@@ -10,6 +10,13 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
+# Per-manifest and per-record CRC-32 in the LKV2 KV-disk format (`kv_disk.rs`).
+crc32fast = "1.5"
+# The KV-disk identity hash (`kv_disk::kv_identity`): stable across Rust
+# releases, unlike `DefaultHasher`.
+sha2 = "0.10"
+# `F_NOCACHE` / `F_RDAHEAD` on the expert shards (`offload/io.rs`); already in the lock.
+libc = "0.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 # Vision input decoding for the Gemma 4 image tower (PNG/JPEG/WebP in,
@@ -180,6 +187,10 @@ required-features = ["mlx-native"]
 
 [[example]]
 name = "kv_bf16_ab"
+required-features = ["mlx-native"]
+
+[[example]]
+name = "qwen4_exp_generate"
 required-features = ["mlx-native"]
 
 [[example]]
