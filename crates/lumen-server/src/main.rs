@@ -162,6 +162,23 @@ async fn main() -> Result<(), SendableError> {
             )));
         }
     }
+    // `--measure-memory-bandwidth`: print one JSON line with how fast this GPU streams memory
+    // (about a second). The app combines it with the SSD speed to estimate Flash-Next decode.
+    if args.iter().any(|a| a == "--measure-memory-bandwidth") {
+        #[cfg(feature = "mlx-native")]
+        {
+            let m = lumen_mlx::measure_memory_bandwidth()
+                .map_err(|e| SendableError::from(format!("--measure-memory-bandwidth: {e:#}")))?;
+            println!("{}", m.to_json());
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx-native"))]
+        {
+            return Err(SendableError::from(
+                "--measure-memory-bandwidth: built without mlx-native",
+            ));
+        }
+    }
     // `--write-metallib <path>`: write the embedded kernel library out, so the
     // release build can ship this binary's exact copy in the app bundle's
     // `Contents/Resources` (see `lumen_server::metallib`).

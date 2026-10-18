@@ -217,6 +217,9 @@ pub mod native_quant_attention;
 /// reason about allocation rounding — see `examples/kv_concurrency_ab.rs`.
 #[cfg(feature = "mlx-native")]
 pub use native_cache::KV_CACHE_STEP;
+/// The GPU's streaming read bandwidth (`lumen-server --measure-memory-bandwidth`).
+#[cfg(feature = "mlx-native")]
+mod bandwidth;
 mod native_compile_cache;
 mod native_conv1d;
 mod native_embedding;
@@ -230,6 +233,8 @@ mod native_rope;
 mod native_runtime;
 mod native_snapshot;
 pub mod native_ssm;
+#[cfg(feature = "mlx-native")]
+pub use bandwidth::{MemoryBandwidth, measure_memory_bandwidth};
 #[cfg(feature = "mlx-native")]
 mod offload;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
