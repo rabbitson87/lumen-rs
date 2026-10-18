@@ -347,17 +347,22 @@ fn argmax_host(logits: &[f32]) -> Result<u32> {
         .ok_or_else(|| anyhow!("qwen4_exp: empty logits"))
 }
 
-/// `LUMEN_QWEN4_MTP`: `auto` (the default), `on` or `off`.
+/// `LUMEN_QWEN4_MTP`: `off` (the default), `auto` or `on`.
+///
+/// Off by default: speculative decoding is not bit-identical to plain decoding, and on a 36 GB
+/// M3 Max it gained at most 4% and lost up to 4.4% (a verify pass reads about twice the experts
+/// of a plain step, and expert reads are what limit decode). `auto` and `on` run the same
+/// governor; `on` refuses to start when the head's weights are missing.
 fn mtp_mode_from_env() -> Result<MtpMode> {
-    match std::env::var("LUMEN_QWEN4_MTP")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") | Some("auto") => Ok(MtpMode::Auto),
+    parse_mtp_mode(std::env::var("LUMEN_QWEN4_MTP").ok().as_deref())
+}
+
+fn parse_mtp_mode(raw: Option<&str>) -> Result<MtpMode> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("off") | Some("0") | Some("false") => Ok(MtpMode::Off),
+        Some("auto") => Ok(MtpMode::Auto),
         Some("on") | Some("1") | Some("true") => Ok(MtpMode::On),
-        Some("off") | Some("0") | Some("false") => Ok(MtpMode::Off),
-        Some(other) => bail!("LUMEN_QWEN4_MTP={other:?} is not `auto`, `on` or `off`"),
+        Some(other) => bail!("LUMEN_QWEN4_MTP={other:?} is not `off`, `auto` or `on`"),
     }
 }
 
@@ -1073,6 +1078,26 @@ impl Runner for Qwen4ExpRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_draft_head_is_off_unless_asked_for() {
+        let mode = |raw: Option<&str>| parse_mtp_mode(raw).unwrap();
+        for off in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("0"),
+            Some("false"),
+            Some(" off "),
+        ] {
+            assert_eq!(mode(off), MtpMode::Off, "{off:?}");
+        }
+        assert_eq!(mode(Some("auto")), MtpMode::Auto);
+        for on in [Some("on"), Some("1"), Some("true")] {
+            assert_eq!(mode(on), MtpMode::On, "{on:?}");
+        }
+        assert!(parse_mtp_mode(Some("maybe")).is_err());
+    }
 
     #[test]
     fn a_pool_size_is_a_number_with_an_optional_unit() {
