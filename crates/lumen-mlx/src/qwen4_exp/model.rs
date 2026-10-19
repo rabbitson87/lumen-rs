@@ -738,6 +738,12 @@ impl Qwen4ExpCache {
         out
     }
 
+    /// Bytes of the buffers this state references. Two states cloned from one share the buffers
+    /// neither has appended to, so the sum over several states can count a buffer twice.
+    pub(crate) fn nbytes(&self) -> u64 {
+        self.arrays().iter().map(|a| a.nbytes() as u64).sum()
+    }
+
     /// Tokens consumed so far.
     pub fn len(&self) -> usize {
         self.tokens

@@ -206,6 +206,9 @@ pub(crate) struct Qwen4ExpRunner {
     chunk: usize,
     /// Longest prompt the memory is planned for (`LUMEN_MAX_PROMPT_TOKENS`).
     ctx_tokens: usize,
+    /// Bytes MLX may hold (live buffers plus its buffer cache) before it stops recycling the
+    /// cache: the GPU memory the plan was made for.
+    memory_budget: u64,
     /// L2 tier (`LUMEN_KV_DISK`): session states at prefill-grid points, so a
     /// restarted server resumes a conversation without reading the model again.
     disk: Option<DiskKvStore>,
@@ -226,6 +229,28 @@ pub(crate) struct Qwen4ExpRunner {
 const PREFILL_CHUNK: usize = 1024;
 const TIGHT_PREFILL_CHUNK: usize = 512;
 
+lumen_flags::flag! {
+    /// Log MLX's memory (active, cache, peak) and what each sequence holds: after every prefill,
+    /// when a sequence is dropped, and every 32 decode steps with the speed of those steps. For
+    /// finding out where a memory limit is being hit; it adds one allocator query per line.
+    pub(crate) mem_log {
+        env: "LUMEN_QWEN4_MEM_LOG",
+        default: false,
+        kind: Diagnostic,
+    }
+}
+
+/// Decode steps between two `mem_log` lines.
+const MEM_LOG_EVERY: u64 = 32;
+
+/// Decode steps counted since the last `mem_log` line, and when that line was written.
+static MEM_LOG_DECODE: std::sync::Mutex<(u64, Option<std::time::Instant>)> =
+    std::sync::Mutex::new((0, None));
+
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
 /// Longest prompt the memory is planned for. The server rejects longer ones (it reads the same
 /// `LUMEN_MAX_PROMPT_TOKENS`), and raising it takes the KV cache's share out of the pool.
 const CONTEXT_TOKENS: usize = 16_384;
@@ -239,6 +264,33 @@ const TIGHT_BELOW: u64 = 11_000_000_000;
 /// What the resident trunk (embeddings, attention, DeltaNet, hyper-connections,
 /// routers, shared experts) occupies.
 const TRUNK_BYTES: u64 = 3_600_000_000;
+
+/// Memory MLX's buffer cache needs beside the live buffers for decode to run at full speed.
+/// Past the memory limit MLX gives the cache back on every allocation, and each of the thousands
+/// of buffers a decode step makes becomes a new Metal buffer. Measured with a 14 GB budget and
+/// two 16K-token conversations live: 0.18 to 0.64 GB of cache room decoded at 8.4 to 9.3 tok/s
+/// (the speed with no limit), none (0.01 GB) at 4.3. Half a GB, then.
+const CACHE_ROOM: u64 = 500_000_000;
+
+/// A feed that leaves less than this behind (a title request, a short chat turn) is not made to
+/// leave the cache its room: it cannot be what overloads the machine, and the session it would
+/// drop to make that room is worth a long prefill. It still may not take the live memory past
+/// the budget itself, where MLX stops caching altogether.
+const SMALL_FEED: u64 = 500_000_000;
+
+/// Bytes a feed leaves behind when it leaves `kv_tokens` tokens of KV (every copy counted: a
+/// session holds its own and its rollback point's, a prefix snapshot is another) and `states`
+/// sequence states.
+fn feed_growth(cfg: &Qwen4ExpConfig, kv_tokens: usize, states: usize) -> u64 {
+    kv_tokens as u64 * cfg.kv_bytes_per_token() + states as u64 * cfg.state_bytes()
+}
+
+/// Bytes by which `live` bytes in use plus a feed that adds `growth` would go past `budget`,
+/// less the cache room decode needs unless the feed is [`SMALL_FEED`].
+fn shortfall(live: u64, growth: u64, budget: u64) -> u64 {
+    let room = if growth < SMALL_FEED { 0 } else { CACHE_ROOM };
+    (live + growth + room).saturating_sub(budget)
+}
 
 /// The offsets, within `len` tokens that start at absolute position `start`, where chunks of
 /// `chunk` end when chunk boundaries sit on multiples of `chunk` counted from position 0 (the
@@ -535,6 +587,7 @@ impl Qwen4ExpRunner {
                 next_snapshot: 1,
                 chunk,
                 ctx_tokens,
+                memory_budget: usable,
                 disk,
                 fingerprint,
                 spec,
@@ -543,6 +596,93 @@ impl Qwen4ExpRunner {
             },
             info,
         ))
+    }
+
+    /// Bytes by which a feed that leaves `kv_tokens` tokens of KV and `states` states in memory
+    /// (see [`feed_growth`]) would take MLX past the memory this runner was planned for, counting
+    /// everything every sequence and snapshot holds now (and [`CACHE_ROOM`], for a feed that is
+    /// not [`SMALL_FEED`]). The plan reserves room for one prompt's KV and activations, so a
+    /// second long conversation beside it does not fit; the session and prefix-cache code drops
+    /// what is idle until this is 0.
+    pub(crate) fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
+        let Ok(live) = crate::metal_memory::get_active_memory() else {
+            return 0;
+        };
+        // A prompt past the context is refused later, not fed.
+        let kv_tokens = kv_tokens.min(3 * self.ctx_tokens);
+        shortfall(
+            live as u64,
+            feed_growth(self.model.config(), kv_tokens, states),
+            self.memory_budget,
+        )
+    }
+
+    /// One `mem_log` line: the allocator's counters and the bytes the sequences and snapshots
+    /// reference (a rollback point shares the buffers it has not outgrown, so these can overlap).
+    fn mem_report(&self, what: &str) {
+        if !mem_log::get() {
+            return;
+        }
+        let active = crate::metal_memory::get_active_memory().unwrap_or(0) as u64;
+        let cache = crate::metal_memory::get_cache_memory().unwrap_or(0) as u64;
+        let peak = crate::metal_memory::get_peak_memory().unwrap_or(0) as u64;
+        let mut ids: Vec<&u64> = self.seqs.keys().collect();
+        ids.sort();
+        let seqs: Vec<String> = ids
+            .into_iter()
+            .map(|id| {
+                let s = &self.seqs[id];
+                format!(
+                    "{id}@{} {:.2}+{:.2}+{:.2}",
+                    s.position,
+                    gb(s.cache.nbytes()),
+                    gb(s.rollback.as_ref().map_or(0, |(c, _)| c.nbytes())),
+                    gb(s.pending.as_ref().map_or(0, |p| p.state.nbytes())),
+                )
+            })
+            .collect();
+        let snaps: u64 = self.snapshots.values().map(|(c, _)| c.nbytes()).sum();
+        eprintln!(
+            "[qwen4_exp] mem {what}: active {:.2} GB, cache {:.2}, peak {:.2} | seqs [{}] (state+rollback+draft GB), {} snapshots {:.2} GB",
+            gb(active),
+            gb(cache),
+            gb(peak),
+            seqs.join(", "),
+            self.snapshots.len(),
+            gb(snaps),
+        );
+    }
+
+    /// Count a decode step of `seq_id`; every [`MEM_LOG_EVERY`] steps write a `mem_log` line.
+    fn mem_note_decode(&self, seq_id: u64) {
+        if !mem_log::get() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let (steps, since) = {
+            let mut g = MEM_LOG_DECODE.lock().unwrap_or_else(|e| e.into_inner());
+            g.0 += 1;
+            if g.0 < MEM_LOG_EVERY && g.1.is_some() {
+                return;
+            }
+            let since = g.1.replace(now);
+            let steps = std::mem::take(&mut g.0);
+            (steps, since)
+        };
+        let rate = since.map_or(String::new(), |t| {
+            format!(
+                ", {steps} steps at {:.2} tok/s",
+                steps as f64 / (now - t).as_secs_f64().max(1e-9)
+            )
+        });
+        self.mem_report(&format!("decode seq {seq_id}{rate}"));
+    }
+
+    /// Start of a prefill: forget the previous peak so the next report's peak is this prompt's.
+    fn mem_begin(&self) {
+        if mem_log::get() {
+            crate::metal_memory::reset_peak_memory();
+        }
     }
 
     /// Run `tokens` through `cache` in chunks of `self.chunk` (counted from the first token) and
@@ -568,6 +708,7 @@ impl Qwen4ExpRunner {
         tokens: &[u32],
         mark: usize,
     ) -> Result<Option<(u32, usize)>> {
+        self.mem_begin();
         let start = if fresh {
             0
         } else {
@@ -611,6 +752,7 @@ impl Qwen4ExpRunner {
                 );
             }
         }
+        self.mem_report(&format!("fed {} tokens to seq {seq_id}", tokens.len()));
         Ok(Some((next, position)))
     }
 
@@ -656,6 +798,7 @@ impl Qwen4ExpRunner {
         last_token: u32,
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
     ) -> Result<(u32, usize)> {
+        self.mem_note_decode(seq_id);
         let model = &self.model;
         let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
             anyhow!("qwen4_exp runner: decode_step_pick on unknown seq_id {seq_id}")
@@ -695,6 +838,7 @@ impl Qwen4ExpRunner {
         pick: &mut dyn FnMut(&mut [f32]) -> Result<u32>,
         greedy: bool,
     ) -> Result<(u32, usize)> {
+        self.mem_note_decode(seq_id);
         let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
             anyhow!("qwen4_exp runner: decode_step_spec on unknown seq_id {seq_id}")
         })?;
@@ -935,6 +1079,7 @@ impl Runner for Qwen4ExpRunner {
     }
 
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        self.mem_begin();
         self.check_context(0, tokens.len())?;
         let mut cache = self.model.make_cache();
         let logits = self.forward_chunked(tokens, &mut cache)?;
@@ -951,6 +1096,10 @@ impl Runner for Qwen4ExpRunner {
                 spec_off: false,
             },
         );
+        self.mem_report(&format!(
+            "prefilled {} tokens for seq {seq_id}",
+            tokens.len()
+        ));
         Ok((next, tokens.len()))
     }
 
@@ -963,6 +1112,7 @@ impl Runner for Qwen4ExpRunner {
         if self.spec.enabled {
             return self.decode_step_spec_as(seq_id, last_token, &mut |l| argmax_host(l), true);
         }
+        self.mem_note_decode(seq_id);
         let model = &self.model;
         let seq = self
             .seqs
@@ -977,11 +1127,13 @@ impl Runner for Qwen4ExpRunner {
     fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
         self.seqs.remove(&seq_id);
         let _ = crate::metal_memory::clear_cache();
+        self.mem_report(&format!("dropped seq {seq_id}"));
         Ok(())
     }
 
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         // Feed a clone: a failed forward leaves the sequence exactly as it was.
+        self.mem_begin();
         let have = self.seq(seq_id, "extend")?.position;
         self.check_context(have, tokens.len())?;
         let seq = self.seq(seq_id, "extend")?;
@@ -992,7 +1144,9 @@ impl Runner for Qwen4ExpRunner {
         let seq = self.seq(seq_id, "extend")?;
         seq.cache = cache;
         seq.position += tokens.len();
-        Ok((next, seq.position))
+        let position = seq.position;
+        self.mem_report(&format!("extended seq {seq_id} by {} tokens", tokens.len()));
+        Ok((next, position))
     }
 
     fn forward_probe(&mut self, _seq_id: u64, _tokens: &[u32]) -> Result<ProbeRows> {
@@ -1160,6 +1314,11 @@ mod tests {
         cfg.head_dim = 256;
         cfg.indexer_head_dim = 128;
         cfg.num_attention_heads = 24;
+        cfg.linear_num_key_heads = 16;
+        cfg.linear_num_value_heads = 48;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.linear_conv_kernel_dim = 4;
         cfg
     }
 
@@ -1208,6 +1367,62 @@ mod tests {
         assert!(bigger.pool < base.pool);
     }
 
+    /// A 15K-token session holds its KV twice (the sequence's and its rollback point's) and a new
+    /// sequence its DeltaNet state twice; measured on Flash-Next: 0.95 GB of state and 0.91 GB of
+    /// rollback point, and a 13-token session 0.13 GB.
+    #[test]
+    fn a_session_feed_leaves_its_kv_and_a_new_sequence_s_state_twice() {
+        let cfg = real_config();
+        let (kv, states) = crate::session::feed_cost(0, 14_978);
+        let fresh = feed_growth(&cfg, kv, states);
+        assert!(
+            (1_850_000_000..2_150_000_000).contains(&fresh),
+            "{fresh} bytes for a 15K-token prompt"
+        );
+        // 36 layers x (48 x 128 x 128 f32 + a 3-wide window of 10,240 channels) = ~118 MB.
+        assert!((115_000_000..120_000_000).contains(&cfg.state_bytes()));
+        // Continuing a session adds the new tokens' KV twice, not another state.
+        let (kv, states) = crate::session::feed_cost(14_978, 15_478);
+        assert_eq!(
+            feed_growth(&cfg, kv, states),
+            2 * 500 * cfg.kv_bytes_per_token()
+        );
+    }
+
+    /// Measured in the soak (16 GB plan): with the cache's room asked of it, a 23-token chat turn
+    /// dropped a 5.8K-token session. A short turn is not made to leave that room; one that
+    /// would take the live memory past the budget itself still is.
+    #[test]
+    fn a_small_feed_only_has_to_stay_inside_the_budget() {
+        let cfg = real_config();
+        let budget = 13_960_000_000;
+        let (kv, states) = crate::session::feed_cost(0, 23);
+        let small = feed_growth(&cfg, kv, states);
+        assert!(small < SMALL_FEED, "{small}");
+        assert!(13_300_000_000 + small + CACHE_ROOM > budget);
+        assert_eq!(shortfall(13_300_000_000, small, budget), 0);
+        assert!(shortfall(13_800_000_000, small, budget) > 0);
+        // A 4.5K-token continuation is the smallest that asks for the room.
+        let cont = |fed: usize| {
+            let (kv, states) = crate::session::feed_cost(14_978, 14_978 + fed);
+            feed_growth(&cfg, kv, states)
+        };
+        assert!(cont(4_600) >= SMALL_FEED);
+        assert!(cont(4_000) < SMALL_FEED);
+    }
+
+    #[test]
+    fn a_runner_without_a_budget_never_falls_short_and_a_tiny_one_always_does() {
+        let mut r = tiny_runner(16);
+        assert_eq!(r.memory_shortfall(200, 2), 0);
+        r.memory_budget = 1;
+        assert!(r.memory_shortfall(200, 2) > 0);
+        // A prompt past the context is not counted past it (it is refused, not fed).
+        r.ctx_tokens = 10;
+        r.memory_budget = u64::MAX;
+        assert_eq!(r.memory_shortfall(1_000_000_000, 2), 0);
+    }
+
     fn tiny_runner(chunk: usize) -> Qwen4ExpRunner {
         tiny_runner_with(chunk, MtpMode::Off, None)
     }
@@ -1241,6 +1456,7 @@ mod tests {
             next_snapshot: 0,
             chunk,
             ctx_tokens: 1_000_000,
+            memory_budget: u64::MAX,
             disk: None,
             fingerprint: String::new(),
             spec,

@@ -88,6 +88,16 @@ pub trait SnapshotRunner {
     ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
         Ok(None)
     }
+
+    /// Bytes by which a feed that leaves `kv_tokens` tokens of KV (every copy counted) and
+    /// `states` per-sequence states in memory would take the runner past the memory it is
+    /// planned to stay within, counting everything it holds now. `0` — the default — means it
+    /// fits, or that the runner keeps no such budget. [`PrefixCacheStore::plan_feed`] and
+    /// [`PrefixCacheStore::make_room_for`] answer a shortfall by releasing the snapshots they can
+    /// spare.
+    fn memory_shortfall(&self, _kv_tokens: usize, _states: usize) -> u64 {
+        0
+    }
 }
 
 /// A prefix-cache master snapshot entry. Holds a deep snapshot of the per-layer
@@ -148,6 +158,9 @@ pub struct PrefixCacheStore {
     /// yet. Written by [`Self::flush_persist`] once the request's reply is out,
     /// so a disk write never delays the first token.
     pending_persist: Option<PendingPersist>,
+    /// Set by [`Self::plan_feed`] when the cold MISS it planned cannot afford a head snapshot
+    /// beside its own: the next prefill goes without one.
+    skip_head: bool,
 }
 
 /// A snapshot waiting for [`PrefixCacheStore::flush_persist`].
@@ -156,6 +169,15 @@ struct PendingPersist {
     key: String,
     prefix_tokens: Vec<u32>,
     last_token: Option<u32>,
+}
+
+/// What a prefill leaves in memory once [`PrefixCacheStore::plan_feed`] has settled whether it keeps
+/// a head, and the snapshot it forks (which no eviction may take).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedPlan {
+    pub kv_tokens: usize,
+    pub states: usize,
+    pub fork: Option<u64>,
 }
 
 impl PrefixCacheStore {
@@ -170,6 +192,7 @@ impl PrefixCacheStore {
             branches,
             incremental,
             pending_persist: None,
+            skip_head: false,
         }
     }
 
@@ -185,6 +208,7 @@ impl PrefixCacheStore {
             branches: DEFAULT_BRANCHES,
             incremental: false,
             pending_persist: None,
+            skip_head: false,
         }
     }
 
@@ -204,6 +228,7 @@ impl PrefixCacheStore {
             branches: branches.max(1),
             incremental: false,
             pending_persist: None,
+            skip_head: false,
         }
     }
 
@@ -218,6 +243,7 @@ impl PrefixCacheStore {
             branches: branches.max(1),
             incremental,
             pending_persist: None,
+            skip_head: false,
         }
     }
 
@@ -287,6 +313,7 @@ impl PrefixCacheStore {
         // Whatever an earlier request left pending but never flushed (it failed
         // mid-decode) is older than anything this call or the disk holds.
         self.pending_persist = None;
+        let skip_head = std::mem::take(&mut self.skip_head);
         let key = match key.filter(|_| self.enabled) {
             Some(k) => k,
             None => return runner.prefill(seq_id, prompt_ids),
@@ -491,31 +518,36 @@ impl PrefixCacheStore {
         let (last, pos) = if do_incremental {
             let b = incremental_boundary.unwrap();
             let _ = runner.prefill(seq_id, &prompt_ids[..b])?;
-            match runner.snapshot_state_deep(seq_id) {
-                Ok((snap_b, _)) => {
-                    // last_token = None: an exact-prompt-==-head retry must
-                    // re-extend for fresh logits (same contract as the streaming
-                    // boundary `store_master`). `pinned_boundary` keeps it alive
-                    // when the full-prompt branch is inserted below.
-                    self.insert_branch(
-                        runner,
-                        key,
-                        PrefixCacheEntry {
-                            master_snapshot_id: snap_b,
-                            prefix_tokens: prompt_ids[..b].to_vec(),
-                            last_access: Instant::now(),
-                            hits: 0,
-                            last_token: None,
-                            in_use: 0,
-                            pinned_boundary: true,
-                        },
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[mlx] prefix-cache: incremental boundary snapshot skipped \
-                         (key={key:?}, boundary={b}): {e:#}"
-                    );
+            // Out of memory for a second snapshot (`skip_head`): the prompt is still prefilled
+            // in the same two stages, so its numbers do not change; only the head's copy is not
+            // kept.
+            if !skip_head {
+                match runner.snapshot_state_deep(seq_id) {
+                    Ok((snap_b, _)) => {
+                        // last_token = None: an exact-prompt-==-head retry must
+                        // re-extend for fresh logits (same contract as the streaming
+                        // boundary `store_master`). `pinned_boundary` keeps it alive
+                        // when the full-prompt branch is inserted below.
+                        self.insert_branch(
+                            runner,
+                            key,
+                            PrefixCacheEntry {
+                                master_snapshot_id: snap_b,
+                                prefix_tokens: prompt_ids[..b].to_vec(),
+                                last_access: Instant::now(),
+                                hits: 0,
+                                last_token: None,
+                                in_use: 0,
+                                pinned_boundary: true,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[mlx] prefix-cache: incremental boundary snapshot skipped \
+                             (key={key:?}, boundary={b}): {e:#}"
+                        );
+                    }
                 }
             }
             runner.extend(seq_id, &prompt_ids[b..])?
@@ -559,6 +591,161 @@ impl PrefixCacheStore {
             }
         }
         Ok((last, pos))
+    }
+
+    /// What [`Self::prefill_optionally_cached_with`] of `prompt_ids` under `key` leaves in memory,
+    /// as `(tokens of KV, sequence states)` with every copy counted, for
+    /// [`SnapshotRunner::memory_shortfall`].
+    ///
+    /// A HIT that advances the matched snapshot holds the working sequence and the new
+    /// snapshot (the old one goes): `prefix + 2 x suffix` tokens and one state. Advancing a
+    /// pinned head keeps it, so both prompts' worth. An exact retry forks and only copies on
+    /// its first decode step. A MISS holds the working sequence, the prompt's snapshot and, with
+    /// incremental caching and a path that takes one (`head`; the tools path does, the streaming
+    /// boundary path does not), the head's: two or three copies.
+    pub fn feed_cost(&self, key: Option<&str>, prompt_ids: &[u32], head: bool) -> (usize, usize) {
+        let n = prompt_ids.len();
+        let Some(key) = key.filter(|_| self.enabled) else {
+            return (n, 1);
+        };
+        match self
+            .longest_hit(key, prompt_ids)
+            .map(|i| &self.entries[key][i])
+        {
+            Some(e) if e.prefix_tokens.len() == n => (n, 1),
+            Some(e) if e.pinned_boundary => (2 * n, 2),
+            Some(e) => (e.prefix_tokens.len() + 2 * (n - e.prefix_tokens.len()), 1),
+            None => {
+                let copies = if head && self.incremental { 3 } else { 2 };
+                (copies * n, copies)
+            }
+        }
+    }
+
+    /// The entry that goes first when memory is short: the least recently used pinned head (the
+    /// snapshot only a prompt that diverges from its conversation's tail needs) before any other,
+    /// never the snapshot `fork`, nor one in use. `heads_only` leaves the rest alone.
+    fn coldest(&self, fork: Option<u64>, heads_only: bool) -> Option<(String, usize)> {
+        self.entries
+            .iter()
+            .flat_map(|(k, v)| {
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.in_use == 0
+                            && Some(e.master_snapshot_id) != fork
+                            && (e.pinned_boundary || !heads_only)
+                    })
+                    .map(move |(i, e)| (k.clone(), i, !e.pinned_boundary, e.last_access))
+            })
+            .min_by_key(|&(_, _, not_a_head, last_access)| (not_a_head, last_access))
+            .map(|(k, i, _, _)| (k, i))
+    }
+
+    /// Release one entry because a feed of `kv_tokens` KV tokens would go `short` bytes past the
+    /// planned memory.
+    fn release_for_memory<R: SnapshotRunner>(
+        &mut self,
+        runner: &mut R,
+        (key, idx): (String, usize),
+        kv_tokens: usize,
+        short: u64,
+    ) {
+        if let Some(cands) = self.entries.get_mut(&key) {
+            let e = cands.remove(idx);
+            let _ = runner.release_snapshot(e.master_snapshot_id);
+            eprintln!(
+                "[mlx] prefix-cache key={key:?} branch evicted (memory: a feed of {kv_tokens} KV \
+                 tokens would go {:.2} GB past what is planned); freed snapshot {} ({} tokens{})",
+                short as f64 / 1e9,
+                e.master_snapshot_id,
+                e.prefix_tokens.len(),
+                if e.pinned_boundary { ", a head" } else { "" }
+            );
+            if cands.is_empty() {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    /// Release the coldest snapshots (see [`Self::coldest`]) for as long as the runner says a feed
+    /// that leaves `kv_tokens` tokens of KV and `states` states would go past its memory (see
+    /// [`crate::session::memory_evict`]). Stops when it fits or when nothing else can go.
+    pub fn make_room_for<R: SnapshotRunner>(
+        &mut self,
+        runner: &mut R,
+        fork: Option<u64>,
+        kv_tokens: usize,
+        states: usize,
+    ) {
+        if !crate::session::memory_evict::get() || !self.enabled {
+            return;
+        }
+        loop {
+            let short = runner.memory_shortfall(kv_tokens, states);
+            if short == 0 {
+                return;
+            }
+            let Some(victim) = self.coldest(fork, false) else {
+                return;
+            };
+            self.release_for_memory(runner, victim, kv_tokens, short);
+        }
+    }
+
+    /// Before prefilling `prompt_ids` under `key` (`head`: by a path that may snapshot a head, see
+    /// [`Self::feed_cost`]): give up the snapshots that cost least to lose, and say what the
+    /// prefill will leave in memory then.
+    ///
+    /// A cold MISS with incremental caching would keep a second snapshot beside the prompt's own,
+    /// the head of its system prompt, nearly as large. While that falls short, the other heads go
+    /// (the least recently used first); if it still does, the prompt goes without its own (the
+    /// next prefill skips the snapshot, not the two-stage prefill, so its text does not change).
+    /// Nothing else is released here: the caller drops idle sessions, then calls
+    /// [`Self::make_room_for`] for whatever is still short.
+    pub fn plan_feed<R: SnapshotRunner>(
+        &mut self,
+        runner: &mut R,
+        key: Option<&str>,
+        prompt_ids: &[u32],
+        head: bool,
+    ) -> FeedPlan {
+        self.skip_head = false;
+        let (mut kv_tokens, mut states) = self.feed_cost(key, prompt_ids, head);
+        if !crate::session::memory_evict::get() || !self.enabled {
+            return FeedPlan {
+                kv_tokens,
+                states,
+                fork: None,
+            };
+        }
+        let fork = key.and_then(|k| {
+            self.longest_hit(k, prompt_ids)
+                .map(|i| self.entries[k][i].master_snapshot_id)
+        });
+        if key.is_some() && fork.is_none() && head && self.incremental {
+            loop {
+                let short = runner.memory_shortfall(kv_tokens, states);
+                if short == 0 {
+                    break;
+                }
+                let Some(other_head) = self.coldest(None, true) else {
+                    self.skip_head = true;
+                    (kv_tokens, states) = (2 * prompt_ids.len(), 2);
+                    eprintln!(
+                        "[mlx] prefix-cache key={:?}: no head snapshot for this prompt (memory)",
+                        key.unwrap_or_default()
+                    );
+                    break;
+                };
+                self.release_for_memory(runner, other_head, kv_tokens, short);
+            }
+        }
+        FeedPlan {
+            kv_tokens,
+            states,
+            fork,
+        }
     }
 
     /// Write the snapshot the latest prefill left pending to the runner's disk
@@ -1859,5 +2046,217 @@ mod tests {
             "in-use candidate must never be evicted, got {:?}",
             victims
         );
+    }
+
+    // ───────────────────────── memory-bounded retention ─────────────────────────
+
+    /// A runner with a memory budget: every snapshot holds 100 bytes and a feed adds one byte per
+    /// KV token it leaves behind.
+    struct Budgeted {
+        held: std::collections::HashSet<u64>,
+        budget: u64,
+        released: Vec<u64>,
+    }
+
+    impl SnapshotRunner for Budgeted {
+        fn prefill(&mut self, _: u64, _: &[u32]) -> Result<(u32, usize)> {
+            unreachable!("only the room made before a prefill is under test")
+        }
+        fn extend(&mut self, _: u64, _: &[u32]) -> Result<(u32, usize)> {
+            unreachable!("only the room made before a prefill is under test")
+        }
+        fn snapshot_state_deep(&mut self, _: u64) -> Result<(u64, usize)> {
+            unreachable!("only the room made before a prefill is under test")
+        }
+        fn fork_from_snapshot(&mut self, _: u64, _: u64) -> Result<usize> {
+            unreachable!("only the room made before a prefill is under test")
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            self.held.remove(&snapshot_id);
+            self.released.push(snapshot_id);
+            Ok(())
+        }
+        fn memory_shortfall(&self, kv_tokens: usize, _states: usize) -> u64 {
+            (100 * self.held.len() as u64 + kv_tokens as u64).saturating_sub(self.budget)
+        }
+    }
+
+    /// What the backend does before a tools-path prefill, without the sessions it would drop in
+    /// between: settle the head, then release what is still short.
+    fn make_room(
+        store: &mut PrefixCacheStore,
+        runner: &mut Budgeted,
+        key: Option<&str>,
+        prompt: &[u32],
+    ) {
+        let plan = store.plan_feed(runner, key, prompt, true);
+        store.make_room_for(runner, plan.fork, plan.kv_tokens, plan.states);
+    }
+
+    /// Snapshots 1 ("a", the oldest), 2 ("b") and 3 ("c"), each of `len` tokens, 100 bytes each.
+    fn three_snapshots(budget: u64, len: u32) -> (PrefixCacheStore, Budgeted) {
+        let mut store = PrefixCacheStore::with_policy(true, None, None);
+        let mut runner = Budgeted {
+            held: [1, 2, 3].into_iter().collect(),
+            budget,
+            released: Vec::new(),
+        };
+        let now = Instant::now();
+        for (i, key) in ["a", "b", "c"].into_iter().enumerate() {
+            let tokens: Vec<u32> = (0..len).map(|t| t + 100 * i as u32).collect();
+            store.store_master(&mut runner, key, i as u64 + 1, tokens, None);
+            store.entries.get_mut(key).unwrap()[0].last_access =
+                now - Duration::from_secs(30 - 10 * i as u64);
+        }
+        (store, runner)
+    }
+
+    fn cached_keys(store: &PrefixCacheStore) -> Vec<String> {
+        let mut k: Vec<String> = store.entries.keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// A prompt for a new key releases the least recently used snapshots that do not fit beside
+    /// it, oldest first, and stops as soon as it fits.
+    #[test]
+    fn a_new_prompt_releases_the_coldest_snapshots_until_it_fits() {
+        // 300 held, a MISS of 10 tokens leaves 2 x 10 (no incremental head): room for 310.
+        let prompt: Vec<u32> = vec![7; 10];
+        let (mut store, mut runner) = three_snapshots(310, 4);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert_eq!(runner.released, vec![1]);
+        assert_eq!(cached_keys(&store), vec!["b", "c"]);
+
+        let (mut store, mut runner) = three_snapshots(210, 4);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert_eq!(runner.released, vec![1, 2]);
+        assert_eq!(cached_keys(&store), vec!["c"]);
+
+        // It fits already.
+        let (mut store, mut runner) = three_snapshots(10_000, 4);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert!(runner.released.is_empty());
+    }
+
+    /// The snapshot the prompt forks is never released, nor one in use, however cold; with
+    /// nothing else to release the prefill goes ahead.
+    #[test]
+    fn the_snapshot_being_forked_and_those_in_use_stay() {
+        // "a" is the oldest and the prompt extends it: it is the fork, so "b" goes first.
+        let mut prompt: Vec<u32> = (0..4).collect();
+        prompt.extend([9, 9]);
+        let (mut store, mut runner) = three_snapshots(250, 4);
+        make_room(&mut store, &mut runner, Some("a"), &prompt);
+        assert_eq!(runner.released, vec![2]);
+        assert_eq!(cached_keys(&store), vec!["a", "c"]);
+
+        // "b" is in use: it is skipped, "c" goes.
+        let (mut store, mut runner) = three_snapshots(150, 4);
+        store.set_in_use("b", 0, true);
+        make_room(&mut store, &mut runner, Some("a"), &prompt);
+        assert_eq!(runner.released, vec![3]);
+        assert_eq!(cached_keys(&store), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_cost_of_a_prefill_follows_what_it_keeps() {
+        let (store, _) = three_snapshots(0, 4);
+        let ext: Vec<u32> = (0..4).chain([9, 9, 9]).collect();
+        // A HIT that advances the snapshot: the prefix once, the suffix twice, one state.
+        assert_eq!(store.feed_cost(Some("a"), &ext, true), (4 + 2 * 3, 1));
+        // A MISS: the working sequence and the prompt's snapshot.
+        assert_eq!(store.feed_cost(Some("z"), &ext, true), (14, 2));
+        // No key: the working sequence only.
+        assert_eq!(store.feed_cost(None, &ext, true), (7, 1));
+        // With incremental caching a MISS also keeps the head.
+        let inc = PrefixCacheStore::with_incremental(true, 4, true);
+        assert_eq!(inc.feed_cost(Some("z"), &ext, true), (21, 3));
+        // ...but not on the streaming boundary path, which takes none.
+        assert_eq!(inc.feed_cost(Some("z"), &ext, false), (14, 2));
+        // A store that is off keeps nothing.
+        let off = PrefixCacheStore::with_policy(false, None, None);
+        assert_eq!(off.feed_cost(Some("a"), &ext, true), (7, 1));
+    }
+
+    /// Three snapshots of 4 tokens: "a" (1) the oldest full prompt, "b" (2) the head of a system
+    /// prompt, newer, and "c" (3) the newest full prompt. 100 bytes each.
+    fn a_head_between_two_prompts(budget: u64) -> (PrefixCacheStore, Budgeted) {
+        let (mut store, runner) = three_snapshots(budget, 4);
+        store.incremental = true;
+        store.entries.get_mut("b").unwrap()[0].pinned_boundary = true;
+        (store, runner)
+    }
+
+    /// Heads go before any full prompt, however much older the full prompt is, and a cold MISS
+    /// that cannot afford a head beside its own goes without it rather than push a whole
+    /// conversation out.
+    #[test]
+    fn heads_go_first_and_a_prompt_that_cannot_afford_its_own_head_goes_without() {
+        let prompt: Vec<u32> = vec![7; 10];
+        // A MISS with a head leaves 3 x 10; 300 held. Room for 250: the head "b" is enough.
+        let (mut store, mut runner) = a_head_between_two_prompts(250);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert_eq!(runner.released, vec![2]);
+        assert!(!store.skip_head);
+
+        // Room for 225: with "b" gone it still falls short by 5, so the prompt goes without its
+        // own head (2 x 10) and nothing else is released.
+        let (mut store, mut runner) = a_head_between_two_prompts(225);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert_eq!(runner.released, vec![2]);
+        assert!(store.skip_head);
+        assert_eq!(cached_keys(&store), vec!["a", "c"]);
+
+        // Room for 150: that is not enough either; now the oldest full prompt goes.
+        let (mut store, mut runner) = a_head_between_two_prompts(150);
+        make_room(&mut store, &mut runner, Some("d"), &prompt);
+        assert_eq!(runner.released, vec![2, 1]);
+        assert!(store.skip_head);
+        assert_eq!(cached_keys(&store), vec!["c"]);
+
+        // Every `make_room` starts over: the flag does not outlive its prompt.
+        make_room(&mut store, &mut runner, Some("d"), &[7; 1]);
+        assert!(!store.skip_head);
+    }
+
+    /// The prefill that follows takes the flag: no head is snapshotted (it is still prefilled in
+    /// two stages), and the flag is spent.
+    #[test]
+    fn a_prompt_that_goes_without_a_head_takes_no_head_snapshot() {
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        store.skip_head = true;
+        let mut runner = MockRunner::default();
+        let prompt: Vec<u32> = (0..20).collect();
+        store
+            .prefill_optionally_cached(&mut runner, 1, &prompt, Some("k"), Some(12))
+            .unwrap();
+        // The same two stages as with a head (so the numbers do not change), but one snapshot,
+        // the prompt's own: with a head it is prefill(12), snapshot, extend(8), snapshot.
+        assert_eq!(runner.log, vec!["prefill(12)", "extend(8)", "snapshot->0"]);
+        assert!(!store.skip_head);
+        runner.log.clear();
+        store
+            .prefill_optionally_cached(
+                &mut runner,
+                2,
+                &(100..120).collect::<Vec<u32>>(),
+                Some("j"),
+                Some(12),
+            )
+            .unwrap();
+        assert_eq!(
+            runner.log,
+            vec!["prefill(12)", "snapshot->1", "extend(8)", "snapshot->2"]
+        );
+    }
+
+    #[test]
+    fn the_snapshot_eviction_can_be_switched_off() {
+        crate::session::memory_evict::with(false, || {
+            let (mut store, mut runner) = three_snapshots(10, 4);
+            make_room(&mut store, &mut runner, Some("d"), &[7; 10]);
+            assert!(runner.released.is_empty());
+        });
     }
 }

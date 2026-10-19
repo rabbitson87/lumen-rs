@@ -399,6 +399,22 @@ impl Qwen4ExpConfig {
         full_layers * per_layer
     }
 
+    /// Bytes of state a sequence holds whatever its length: each DeltaNet layer's recurrent state
+    /// (f32, a key-dim by value-dim matrix per value head) and its convolution window.
+    pub fn state_bytes(&self) -> u64 {
+        let layers = self
+            .layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::LinearAttention)
+            .count() as u64;
+        let recurrent =
+            self.linear_num_value_heads * self.linear_key_head_dim * self.linear_value_head_dim * 4;
+        let channels = 2 * self.linear_num_key_heads * self.linear_key_head_dim
+            + self.linear_num_value_heads * self.linear_value_head_dim;
+        let window = self.linear_conv_kernel_dim.saturating_sub(1) * channels * 4;
+        layers * (recurrent + window) as u64
+    }
+
     pub fn rotary_dim(&self) -> usize {
         (self.head_dim as f32 * self.partial_rotary_factor) as usize
     }

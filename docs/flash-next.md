@@ -43,6 +43,48 @@ what the plan does, not how a real 16 or 24 GB Mac's own memory pressure behaves
 pool has room for only one staging region, so prefill cannot read the next layer while computing the
 current one; a 5.8K-token prompt prefilled at 209 tok/s there, with a peak resident size of 7.2 GB.
 
+### What else is in memory
+
+The reserve is sized for one prompt, and the server keeps more than one. A chat session holds its KV
+twice (the session and its rollback point: 1.9 GB for a 15K-token prompt, plus 0.12 GB of DeltaNet
+state per copy), and a request with tools keeps a snapshot of its prompt and of its system prompt's
+head (0.4-0.8 GB each at 6K-12K tokens), without a bound. On the emulated 16 and 24 GB Macs a second
+long conversation took the live memory past `LUMEN_MEMORY_LIMIT_GB` (14.2 GB against 14.0 for the
+24 GB plan), and then MLX stops recycling its buffer cache: it frees the cache at every allocation, so
+each of the thousands of buffers a decode step makes is a new Metal buffer. From the second long prompt
+on, decode ran at half speed and prefill 15-40% slower (2.7 times, in the twelve-request run below). Nothing leaked: the live memory came back to
+10.2 GB when the sessions were dropped, and with one session at a time, or the same plan under a 20 GB
+limit, the second prompt decoded at 8.2-8.4 tok/s.
+
+Two different 15K-16K-token prompts in a row (24 GB class) and 7.5K-8K (16 GB class), the text
+identical in every run, N=4-5 per row:
+
+| Plan | Decode, first → second prompt | Second prompt's first token |
+|---|---|---|
+| 24 GB class, kept without a bound | 7.1-7.4 → 4.0-4.1 tok/s | 65-80 s |
+| 24 GB class, dropped to fit | 6.9-7.2 → 8.2-8.3 tok/s | 57-67 s |
+| 16 GB class, kept without a bound | 7.6-8.1 → 3.8 tok/s | 44 s |
+| 16 GB class, dropped to fit | 7.7-7.8 → 7.2-7.3 tok/s | 37 s |
+
+Twelve mixed requests (chat, tool rounds, long prompts), 24 GB class: the long prompts after the first
+decoded at 3.5-3.9 tok/s and prefilled 11.5K tokens in 54-99 s; now 6.5-7.7 tok/s and 37-40 s, the
+same as with memory to spare (6.1-7.0 tok/s, 36-50 s). The 16 GB class went from 3.6-3.9 to 6.7-7.6
+tok/s (control with memory to spare: 6.5-7.6).
+
+So before it feeds a prompt the server adds what the feed will leave in memory (its KV for every copy
+kept, and a sequence state) and half a GB for MLX's cache to what is live, and if that is past the
+plan it drops, until it fits: the heads of other system prompts (and if that is not enough this
+prompt's own head snapshot is not taken; it is still prefilled in the same two stages, so its text
+does not change), the least recently used other sessions, then the least recently used prefix
+snapshots. The conversation being continued, and the snapshot being forked, are never dropped, and a
+feed that leaves under 0.5 GB (a title request, a short turn) drops nothing unless it would pass the
+limit by itself. Half a GB is what the cache needs: with two 16K-token conversations kept, 0.18 to
+0.64 GB of cache room decoded at 8.4-9.3 tok/s, none at 4.3. The price is that a conversation dropped
+this way is prefilled again when it comes back; with more memory, or a shorter
+`LUMEN_MAX_PROMPT_TOKENS`, the server keeps more. `LUMEN_MLX_MEMORY_EVICT=0` switches it off, and
+`LUMEN_QWEN4_MEM_LOG=1` logs MLX's active, cache and peak memory and what each sequence holds after
+every prefill and every 32 decode steps. The plan above (pool sizes, reserve) is unchanged.
+
 ## Which expert leaves the pool
 
 When a layer needs an expert that is not in the pool, another one has to give up its slot. The default,

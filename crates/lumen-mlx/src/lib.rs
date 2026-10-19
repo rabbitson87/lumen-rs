@@ -1096,6 +1096,19 @@ impl session::SessionRunner for RunnerImpl {
         self.native_mut()
             .map_or(Ok(None), |r| r.restore_point(seq_id, prompt))
     }
+    fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
+        memory_shortfall(self, kv_tokens, states)
+    }
+}
+
+/// [`RunnerImpl::Qwen4Exp`]'s memory plan against a feed; no other runner keeps a budget.
+fn memory_shortfall(runner: &RunnerImpl, kv_tokens: usize, states: usize) -> u64 {
+    #[cfg(feature = "mlx-native")]
+    if let RunnerImpl::Qwen4Exp(r) = runner {
+        return r.memory_shortfall(kv_tokens, states);
+    }
+    let _ = (runner, kv_tokens, states);
+    0
 }
 
 /// `RunnerImpl` exposes the narrow `SnapshotRunner` surface the prefix cache
@@ -1135,6 +1148,9 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
         prompt_ids: &[u32],
     ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
         RunnerImpl::load_persisted_disk(self, key, prompt_ids)
+    }
+    fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
+        memory_shortfall(self, kv_tokens, states)
     }
 }
 
@@ -5510,6 +5526,7 @@ impl MlxQwen35Backend {
 
         #[cfg(feature = "mlx-native")]
         let (mut last, mut pos) = if prepared_images.is_empty() {
+            self.make_room_for_prefix_feed(prefix_cache_key, prefill_ids, true);
             self.prefix_store.prefill_optionally_cached_with(
                 &mut self.runner,
                 seq_id,
@@ -5896,6 +5913,7 @@ impl MlxQwen35Backend {
         };
 
         self.prefix_store.evict_stale(&mut self.runner);
+        self.make_room_for_prefix_feed(Some(prefix_cache_key), &prompt_ids, false);
 
         // Boundary snapshot to durably persist to the L2 disk tier, captured in
         // the cache-write branch and flushed AFTER the decode loop so the write
@@ -6184,6 +6202,30 @@ impl MlxQwen35Backend {
             leading_system,
             effort,
         ))
+    }
+
+    /// After a session is positioned, before its prompt is fed: the sessions made room for it
+    /// (see [`session::Sessions::position`]); the prefix snapshots give way too, if they must.
+    fn make_room_for_session_feed(&mut self, from: usize, prompt_len: usize) {
+        let (kv_tokens, states) = session::feed_cost(from, prompt_len);
+        self.prefix_store
+            .make_room_for(&mut self.runner, None, kv_tokens, states);
+    }
+
+    /// Before a prefix-cache prefill of `prompt_ids` under `key` (`head`: the path may snapshot a
+    /// system prompt's head beside the prompt's own): hold the retained state to the memory the
+    /// runner was planned for ([`session::memory_evict`]), giving up the cheapest first: the heads
+    /// (the other conversations', then this prompt's own), then idle sessions (the least recently
+    /// used), then the prefix snapshots (the least recently used), never the one the prompt forks.
+    /// A runner without a budget keeps everything.
+    fn make_room_for_prefix_feed(&mut self, key: Option<&str>, prompt_ids: &[u32], head: bool) {
+        let plan = self
+            .prefix_store
+            .plan_feed(&mut self.runner, key, prompt_ids, head);
+        self.sessions
+            .make_room(&mut self.runner, "", plan.kv_tokens, plan.states);
+        self.prefix_store
+            .make_room_for(&mut self.runner, plan.fork, plan.kv_tokens, plan.states);
     }
 
     /// Drop a prefix-cache entry by key, releasing its master snapshot.
@@ -6645,6 +6687,7 @@ impl MlxQwen35Backend {
                 .position(&mut self.runner, session_id, &prompt_ids, "", || {
                     next_seq_id.fetch_add(1, Ordering::Relaxed)
                 })?;
+        self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
         let (mut last, mut pos, point) = session::feed(
             &mut self.runner,
@@ -6735,6 +6778,7 @@ impl MlxQwen35Backend {
             " (completion)",
             || next_seq_id.fetch_add(1, Ordering::Relaxed),
         )?;
+        self.make_room_for_session_feed(start.from, prompt_ids.len());
         let seq_id = start.seq_id;
         let (mut last, mut pos, point) = session::feed(
             &mut self.runner,

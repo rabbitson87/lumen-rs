@@ -23,6 +23,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::session::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
+| `LUMEN_MLX_MEMORY_EVICT` | on | Behavior | `lumen_mlx::session::memory_evict` |
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session::session_rollback_enabled` |
 | `LUMEN_MOE_EVICTION` | off | Optimization | `lumen_mlx::offload::slot_policy::moe_eviction` |
@@ -43,6 +44,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_QWEN4_MEM_LOG` | off | Diagnostic | `lumen_mlx::qwen4_exp::runner::mem_log` |
 | `LUMEN_QWEN4_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen4_exp::model::widen_scales` |
 | `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
@@ -216,6 +218,32 @@ Store the full-attention KV cache in bf16 rather than f32.
  below the 1.5th percentile of the top1−top2 logit gap. `=0`
  restores f32. Harnesses: `examples/kv_bf16_ab.rs`,
  `examples/kv_bf16_quality.rs`.
+
+### `LUMEN_MLX_MEMORY_EVICT`
+
+*Behavior, default on.*
+
+Drop the conversations a memory-planned runner cannot hold beside a new prompt.
+
+ A runner that plans its memory (Flash-Next, whose expert pool takes what the GPU's memory
+ limit leaves after one prompt's worth of KV) has no room for a second long conversation
+ next to the one it is feeding. A session keeps its KV and a rollback point (two copies of
+ the prompt's KV, ~2 GB at 16K tokens), and the tools path keeps a snapshot or two of every
+ system prompt it has seen (~0.8 GB each at 12K tokens, without a bound). Past the memory
+ limit MLX stops recycling its buffer cache, every allocation of every decode step becomes
+ a fresh Metal buffer, and decode ran at half speed (3.8 against 7.7 tok/s, measured) for
+ the second long prompt and every one after it; the prefill ran 15-35% slower too.
+
+ ON, before a prompt is fed and only if it would not fit, drops the least recently used
+ other sessions; then the prefix snapshots, a system prompt's head before any prompt's own
+ and the least recently used first. A new prompt that cannot afford a head snapshot beside
+ its own is prefilled the same way and keeps only its own. What the prompt continues is
+ never dropped.
+
+ **`Behavior`:** a dropped session is cold-prefilled when its conversation comes back,
+ instead of reusing its KV (see `auto_session_enabled` for how those two differ), and a
+ dropped snapshot is a prefix-cache miss. A request that does not reuse what was dropped
+ gets the same text either way.
 
 ### `LUMEN_MLX_NO_OVERLAP`
 
@@ -445,6 +473,14 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  A/B hatch. The equivalence matrix must never flip this expecting
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
+
+### `LUMEN_QWEN4_MEM_LOG`
+
+*Diagnostic, default off.*
+
+Log MLX's memory (active, cache, peak) and what each sequence holds: after every prefill,
+ when a sequence is dropped, and every 32 decode steps with the speed of those steps. For
+ finding out where a memory limit is being hit; it adds one allocator query per line.
 
 ### `LUMEN_QWEN4_WIDEN_SCALES`
 

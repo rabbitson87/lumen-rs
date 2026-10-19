@@ -92,6 +92,26 @@ pub(crate) trait SessionRunner {
     fn restore_point(&mut self, _seq_id: u64, _prompt: &[u32]) -> Result<Option<usize>> {
         Ok(None)
     }
+    /// Bytes by which a feed that leaves `kv_tokens` tokens of KV (counting every copy that
+    /// will exist: a sequence's own and its rollback point's are two) and `states` per-sequence
+    /// states in memory would take the runner past the memory it is planned to stay within,
+    /// counting everything it holds now. `0` — the default — means it fits, or that the runner
+    /// keeps no such budget. [`Sessions`] answers a shortfall by dropping the sessions it can
+    /// spare before the feed starts.
+    fn memory_shortfall(&self, _kv_tokens: usize, _states: usize) -> u64 {
+        0
+    }
+}
+
+/// What feeding the last `prompt_len - from` tokens of a prompt to a session's sequence leaves
+/// in memory, for [`SessionRunner::memory_shortfall`]: the sequence and its rollback point both
+/// hold the new KV, and a new sequence (`from == 0`) holds two states.
+pub(crate) fn feed_cost(from: usize, prompt_len: usize) -> (usize, usize) {
+    if from == 0 {
+        (2 * prompt_len, 2)
+    } else {
+        (2 * prompt_len.saturating_sub(from), 0)
+    }
 }
 
 /// Per-session prompt-cache state. Holds the running token sequence (prompt +
@@ -247,6 +267,35 @@ lumen_flags::flag! {
         env: "LUMEN_MLX_SESSION_ROLLBACK",
         default: true,
         kind: Optimization,
+    }
+}
+
+lumen_flags::flag! {
+    /// Drop the conversations a memory-planned runner cannot hold beside a new prompt.
+    ///
+    /// A runner that plans its memory (Flash-Next, whose expert pool takes what the GPU's memory
+    /// limit leaves after one prompt's worth of KV) has no room for a second long conversation
+    /// next to the one it is feeding. A session keeps its KV and a rollback point (two copies of
+    /// the prompt's KV, ~2 GB at 16K tokens), and the tools path keeps a snapshot or two of every
+    /// system prompt it has seen (~0.8 GB each at 12K tokens, without a bound). Past the memory
+    /// limit MLX stops recycling its buffer cache, every allocation of every decode step becomes
+    /// a fresh Metal buffer, and decode ran at half speed (3.8 against 7.7 tok/s, measured) for
+    /// the second long prompt and every one after it; the prefill ran 15-35% slower too.
+    ///
+    /// ON, before a prompt is fed and only if it would not fit, drops the least recently used
+    /// other sessions; then the prefix snapshots, a system prompt's head before any prompt's own
+    /// and the least recently used first. A new prompt that cannot afford a head snapshot beside
+    /// its own is prefilled the same way and keeps only its own. What the prompt continues is
+    /// never dropped.
+    ///
+    /// **`Behavior`:** a dropped session is cold-prefilled when its conversation comes back,
+    /// instead of reusing its KV (see `auto_session_enabled` for how those two differ), and a
+    /// dropped snapshot is a prefix-cache miss. A request that does not reuse what was dropped
+    /// gets the same text either way.
+    pub(crate) memory_evict {
+        env: "LUMEN_MLX_MEMORY_EVICT",
+        default: true,
+        kind: Behavior,
     }
 }
 
@@ -491,6 +540,14 @@ impl Sessions {
                 s.rollback_len,
             )
         });
+        let reused = found.and_then(|(_, extends, resumes, _)| extends.or(resumes));
+        if reused.is_none() {
+            // This key's session cannot serve the prompt and goes anyway: it is the first to
+            // give its memory back.
+            self.drop_divergent(runner, key, label);
+        }
+        let (kv_tokens, states) = feed_cost(reused.unwrap_or(0), prompt_ids.len());
+        self.make_room(runner, key, kv_tokens, states);
         match found {
             Some((seq_id, Some(len), _, point)) => {
                 return Ok(SessionStart {
@@ -517,13 +574,11 @@ impl Sessions {
             _ => {}
         }
         // No usable session → drop any old one, alloc new.
-        if let Some(old) = self.map.remove(key) {
-            let _ = runner.remove_seq(old.seq_id);
-            eprintln!(
-                "[mlx] session={key:?}{label} divergent prompt; dropping old seq {} ({} tokens)",
-                old.seq_id,
-                old.tokens.len()
-            );
+        self.drop_divergent(runner, key, label);
+        if reused.is_some() {
+            // The rollback failed, so the whole prompt is fed, not the part after `reused`.
+            let (kv_tokens, states) = feed_cost(0, prompt_ids.len());
+            self.make_room(runner, key, kv_tokens, states);
         }
         let seq_id = alloc_seq();
         match runner.restore_point(seq_id, prompt_ids) {
@@ -546,6 +601,64 @@ impl Sessions {
             how: SessionReuse::Fresh,
             point: None,
         })
+    }
+
+    /// Drop `key`'s session because its prompt diverged from it.
+    fn drop_divergent<R: SessionRunner + ?Sized>(
+        &mut self,
+        runner: &mut R,
+        key: &str,
+        label: &str,
+    ) {
+        if let Some(old) = self.map.remove(key) {
+            let _ = runner.remove_seq(old.seq_id);
+            eprintln!(
+                "[mlx] session={key:?}{label} divergent prompt; dropping old seq {} ({} tokens)",
+                old.seq_id,
+                old.tokens.len()
+            );
+        }
+    }
+
+    /// Before a feed that will leave `kv_tokens` tokens of KV and `states` states in memory: drop
+    /// the least recently used sessions other than `keep` for as long as the runner says it would
+    /// go past its memory (see [`memory_evict`]). Stops when it fits, or when nothing else is
+    /// left to drop, and then feeds anyway, as it always did. `keep` is `""` to spare none.
+    pub(crate) fn make_room<R: SessionRunner + ?Sized>(
+        &mut self,
+        runner: &mut R,
+        keep: &str,
+        kv_tokens: usize,
+        states: usize,
+    ) {
+        if !memory_evict::get() {
+            return;
+        }
+        loop {
+            let short = runner.memory_shortfall(kv_tokens, states);
+            if short == 0 {
+                return;
+            }
+            let Some(victim) = self
+                .map
+                .iter()
+                .filter(|(k, _)| k.as_str() != keep)
+                .min_by_key(|(_, s)| s.last_access)
+                .map(|(k, _)| k.clone())
+            else {
+                return;
+            };
+            if let Some(state) = self.map.remove(&victim) {
+                let _ = runner.remove_seq(state.seq_id);
+                eprintln!(
+                    "[mlx] session={victim:?} evicted (memory: a feed of {kv_tokens} KV tokens \
+                     would go {:.2} GB past what is planned); freed seq {} ({} tokens)",
+                    short as f64 / 1e9,
+                    state.seq_id,
+                    state.tokens.len()
+                );
+            }
+        }
     }
 
     /// Persist the turn: `tokens` (prompt + everything generated) behind
@@ -887,6 +1000,127 @@ mod tests {
             ]
         );
         assert!(pick_auto_session_victims(&map, 8).is_empty());
+    }
+
+    /// A runner with a memory budget: every sequence holds a fixed number of bytes and a feed
+    /// adds `bytes_per_token` for each token.
+    struct Budgeted {
+        held: HashMap<u64, u64>,
+        budget: u64,
+        bytes_per_token: u64,
+        dropped: Vec<u64>,
+    }
+
+    impl SessionRunner for Budgeted {
+        fn prefill(&mut self, _: u64, _: &[u32]) -> Result<(u32, usize)> {
+            unreachable!("only positioning is under test")
+        }
+        fn extend(&mut self, _: u64, _: &[u32]) -> Result<(u32, usize)> {
+            unreachable!("only positioning is under test")
+        }
+        fn remove_seq(&mut self, seq_id: u64) -> Result<()> {
+            self.held.remove(&seq_id);
+            self.dropped.push(seq_id);
+            Ok(())
+        }
+        fn memory_shortfall(&self, kv_tokens: usize, _states: usize) -> u64 {
+            let live: u64 = self.held.values().sum();
+            (live + kv_tokens as u64 * self.bytes_per_token).saturating_sub(self.budget)
+        }
+    }
+
+    /// Sessions `a` (the oldest) to `c` (the newest) of 100 bytes each, with seq ids 1 to 3.
+    fn three_sessions(budget: u64) -> (Sessions, Budgeted) {
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let mut runner = Budgeted {
+            held: HashMap::new(),
+            budget,
+            bytes_per_token: 1,
+            dropped: Vec::new(),
+        };
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            let age = Duration::from_secs(30 - 10 * i as u64);
+            sessions
+                .map
+                .insert(name.to_string(), session_with(vec![i as u32], now - age));
+            sessions.map.get_mut(name).unwrap().seq_id = i as u64 + 1;
+            runner.held.insert(i as u64 + 1, 100);
+        }
+        (sessions, runner)
+    }
+
+    fn keys(sessions: &Sessions) -> Vec<String> {
+        let mut k: Vec<String> = sessions.map.keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// A prompt for a new conversation drops the sessions that do not fit beside it, the least
+    /// recently used first, and stops as soon as it fits.
+    #[test]
+    fn a_new_prompt_drops_the_oldest_sessions_until_it_fits() {
+        // 300 bytes held, 50 more for the prompt, room for 340: one session (the oldest) goes.
+        let (mut sessions, mut runner) = three_sessions(340);
+        sessions.make_room(&mut runner, "new", 50, 0);
+        assert_eq!(runner.dropped, vec![1]);
+        assert_eq!(keys(&sessions), vec!["b", "c"]);
+
+        // Room for 240: two go, oldest first.
+        let (mut sessions, mut runner) = three_sessions(240);
+        sessions.make_room(&mut runner, "new", 50, 0);
+        assert_eq!(runner.dropped, vec![1, 2]);
+        assert_eq!(keys(&sessions), vec!["c"]);
+
+        // It fits already: nothing is touched.
+        let (mut sessions, mut runner) = three_sessions(1_000);
+        sessions.make_room(&mut runner, "new", 50, 0);
+        assert!(runner.dropped.is_empty());
+        assert_eq!(keys(&sessions), vec!["a", "b", "c"]);
+    }
+
+    /// The conversation being continued is the one thing never dropped, however old, and a
+    /// prompt that cannot fit even alone drops the rest and is still fed.
+    #[test]
+    fn the_session_being_continued_is_kept_and_a_prompt_too_big_for_the_budget_still_runs() {
+        let (mut sessions, mut runner) = three_sessions(10);
+        sessions.make_room(&mut runner, "a", 50, 0);
+        assert_eq!(runner.dropped, vec![2, 3]);
+        assert_eq!(keys(&sessions), vec!["a"]);
+        // Nothing else left: the shortfall stays, and so does the session.
+        sessions.make_room(&mut runner, "a", 50, 0);
+        assert_eq!(keys(&sessions), vec!["a"]);
+    }
+
+    /// `position` makes the room before the sequence is allocated: a conversation that diverged
+    /// from its own session gives that session up first, then the oldest others as needed.
+    #[test]
+    fn positioning_a_new_prompt_makes_room_first() {
+        let (mut sessions, mut runner) = three_sessions(260);
+        let start = sessions
+            .position(&mut runner, "c", &[9, 9, 9], "", || 4)
+            .unwrap();
+        assert_eq!(start.how, SessionReuse::Fresh);
+        // "c" (seq 3) diverged and went at once; 200 held + 3 fits 260, so "a" and "b" stay.
+        assert_eq!(runner.dropped, vec![3]);
+        assert_eq!(keys(&sessions), vec!["a", "b"]);
+
+        let (mut sessions, mut runner) = three_sessions(120);
+        sessions
+            .position(&mut runner, "new", &[9; 30], "", || 4)
+            .unwrap();
+        assert_eq!(runner.dropped, vec![1, 2, 3]);
+        assert!(sessions.map.is_empty());
+    }
+
+    #[test]
+    fn the_memory_eviction_can_be_switched_off() {
+        memory_evict::with(false, || {
+            let (mut sessions, mut runner) = three_sessions(10);
+            sessions.make_room(&mut runner, "new", 50, 0);
+            assert!(runner.dropped.is_empty());
+            assert_eq!(keys(&sessions), vec!["a", "b", "c"]);
+        });
     }
 
     #[test]
