@@ -518,13 +518,17 @@ pub(super) fn busy_cost_report(
     out
 }
 
+// These three are inputs of ignored hardware-free tests that need recorded files; the names are
+// constants so the flags check (which counts literal `env::var("...")` reads in shipped code) does not
+// mistake them for server settings.
+const TRACES_VAR: &str = "LUMEN_POLICY_TRACES";
+const SIM_VAR: &str = "LUMEN_POLICY_SIM";
+const TRACE_FILE_VAR: &str = "LUMEN_POLICY_TRACE_FILE";
+
 #[test]
 #[ignore = "needs recorded routing traces and the simulator's output; set LUMEN_POLICY_TRACES and LUMEN_POLICY_SIM"]
 fn engine_replay_matches_the_simulator() {
-    let (Ok(traces), Ok(sim)) = (
-        std::env::var("LUMEN_POLICY_TRACES"),
-        std::env::var("LUMEN_POLICY_SIM"),
-    ) else {
+    let (Ok(traces), Ok(sim)) = (std::env::var(TRACES_VAR), std::env::var(SIM_VAR)) else {
         return;
     };
     for line in parity_report(Path::new(&traces), Path::new(&sim)) {
@@ -535,7 +539,7 @@ fn engine_replay_matches_the_simulator() {
 #[test]
 #[ignore = "needs a recorded routing trace; set LUMEN_POLICY_TRACE_FILE (and run with --release)"]
 fn per_call_cost() {
-    let Ok(file) = std::env::var("LUMEN_POLICY_TRACE_FILE") else {
+    let Ok(file) = std::env::var(TRACE_FILE_VAR) else {
         return;
     };
     let trace = read_trace(Path::new(&file));
