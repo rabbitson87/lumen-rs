@@ -785,7 +785,12 @@ fn apply_env(
         //   3. Server-side default (28 GB)
         if let Some(g) = cfg.server.wired_limit_gb {
             cmd.env("LUMEN_WIRED_LIMIT_GB", g.to_string());
-        } else if let Some(b) = active_model_bytes {
+        } else if let Some(b) =
+            active_model_bytes.filter(|_| !flash_next::is_flash_next_id(model_id))
+        {
+            // Not for Flash-Next: it streams its experts from the SSD, so its 100 GB of
+            // weight files is not what gets wired (the server would only log that the OS
+            // refused a limit larger than the machine).
             cmd.env("LUMEN_WIRED_LIMIT_BYTES", b.to_string());
         }
         if let Some(g) = cfg.server.cache_limit_gb {
@@ -1111,6 +1116,35 @@ mod launch_env_tests {
 
     fn cap(env: &BTreeMap<String, String>) -> Option<&str> {
         env.get("LUMEN_MAX_PROMPT_TOKENS").map(String::as_str)
+    }
+
+    /// With no wired limit chosen, the app wires as many bytes as the model's files hold: right for a
+    /// model loaded into memory, wrong for Flash-Next, whose 100 GB of files stay on the SSD (the OS
+    /// refuses a limit bigger than the machine and the server logs a warning).
+    #[test]
+    fn the_wired_limit_is_the_weights_size_except_for_a_streamed_model() {
+        let launch = |model: &str| {
+            let mut cfg = PersistentConfig::default();
+            cfg.server.memory_limit_gb = Some(64);
+            cfg.server.disable_wired_limit = false;
+            cfg.server.wired_limit_gb = None;
+            launch_env_on(
+                &cfg,
+                model,
+                Some(103_800_000_000),
+                None,
+                ServeKind::Chat,
+                Some(36 * GIB),
+            )
+        };
+        assert_eq!(
+            launch("/models/Qwen3.8-27B-MTPLX-Speed")
+                .get("LUMEN_WIRED_LIMIT_BYTES")
+                .map(String::as_str),
+            Some("103800000000")
+        );
+        assert!(!launch(FLASH_NEXT_ID).contains_key("LUMEN_WIRED_LIMIT_BYTES"));
+        assert!(!launch(FLASH_NEXT_ID).contains_key("LUMEN_WIRED_LIMIT_GB"));
     }
 
     /// Flash-Next reads the server's prompt cap (`LUMEN_MAX_PROMPT_TOKENS`, else the legacy

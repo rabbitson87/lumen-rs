@@ -1123,9 +1123,11 @@ mod tests {
         std::fs::remove_dir_all(&models).ok();
     }
 
-    /// The path the SERVER card's "(exact)" wired limit takes: scan -> `start_server` -> env.
+    /// The path the SERVER card's "(exact)" wired limit takes: scan -> `start_server` -> env. A
+    /// streamed Flash-Next sends none: its weight files (even without the pack) are bigger than the
+    /// machine, so a limit of their size is only refused by the OS.
     #[test]
-    fn the_wired_limit_a_launch_asks_for_excludes_the_pack() {
+    fn a_streamed_model_launch_asks_for_no_wired_limit() {
         use crate::config::PersistentConfig;
         use crate::server::{ServeKind, launch_env};
         let models = tmpdir("wired");
@@ -1145,10 +1147,9 @@ mod tests {
             None,
             ServeKind::Chat,
         );
-        assert_eq!(
-            env.get("LUMEN_WIRED_LIMIT_BYTES").map(String::as_str),
-            Some("10002")
-        );
+        assert_eq!(env.get("LUMEN_WIRED_LIMIT_BYTES"), None);
+        // The size the card shows still leaves out the pack and the draft head.
+        assert_eq!(entry.size_bytes, 10002);
         std::fs::remove_dir_all(&models).ok();
     }
 }
