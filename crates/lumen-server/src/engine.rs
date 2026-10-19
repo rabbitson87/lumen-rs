@@ -2239,8 +2239,15 @@ fn refuse_oversized_prompt(
     // Bound by max_ctx (not the operator cap) → the real fix is to shrink the
     // prompt or, only if memory allows, raise LUMEN_MAX_CTX. Bound by the
     // operator cap → raising LUMEN_MAX_PROMPT_TOKENS (memory permitting) works.
+    // Both equal → either may be the binding one (Flash-Next plans its context
+    // from the prompt cap), so name both.
     let hint = match max_ctx {
-        Some(mc) if mc <= operator_cap => format!(
+        Some(mc) if mc == operator_cap => format!(
+            " The limit is {mc} tokens: the lower of the model context (LUMEN_MAX_CTX) \
+             and the server prompt cap (LUMEN_MAX_PROMPT_TOKENS). Trim the prompt, or \
+             raise the cap(s) only if there is enough RAM for the longer prefill."
+        ),
+        Some(mc) if mc < operator_cap => format!(
             " The model context is capped at {mc} tokens (LUMEN_MAX_CTX). \
              Trim the prompt/conversation, or raise LUMEN_MAX_CTX only if there is \
              enough memory to prefill it (raising it past what the GPU can hold just \
@@ -2779,8 +2786,16 @@ fn anthropic_tools_to_defs(tools: Option<&[AnthropicTool]>) -> Vec<ToolDef<'_>> 
 /// non-alphanumeric, so `read` can't grab `thread`), remap it to the full name.
 /// Ambiguous or absent matches are left untouched. Keeps stock omp working
 /// without renaming tools.
+///
+/// This is also the gate that decides whether a parsed call reaches the client
+/// at all: a call whose name is not (after repair) one of `tools` is dropped.
+/// An EMPTY `tools` is not a reason to skip that check, it is the case where
+/// nothing may pass — the request declared no tool (or `tool_choice:"none"`
+/// withheld them), yet the backend parsers run regardless whenever the prompt
+/// carries tool history, and a model imitating the `<tool_call>` markup in that
+/// history produces a call to a function the client does not have.
 fn remap_tool_call_names(calls: &mut Vec<ParsedToolCall>, tools: &[ToolDef<'_>]) {
-    if calls.is_empty() || tools.is_empty() {
+    if calls.is_empty() {
         return;
     }
     for c in calls.iter_mut() {
@@ -3640,6 +3655,57 @@ mod tool_name_resolve_tests {
             a.is_empty(),
             "read must not become thread, and must not reach the client either"
         );
+    }
+
+    /// With NO tool declared, every parsed call is undeclared by definition.
+    ///
+    /// The Qwen history path always runs the tool-call parser (an agent
+    /// transcript with `assistant.tool_calls` / `role:"tool"` turns can only be
+    /// rendered through the tool-aware renderer), and the model imitates the
+    /// `<tool_call>` markup it sees there. Measured on Qwen3.8-Flash-Next: a
+    /// final agent-loop request sent WITHOUT `tools` got back
+    /// `finish_reason:"tool_calls"` and a call to `glob`, a function the request
+    /// never declared. The name check used to return early on an empty tool
+    /// list, which is exactly the case where nothing may pass.
+    #[test]
+    fn a_request_without_tools_never_gets_a_tool_call_back() {
+        let mut a = vec![tc("glob")];
+        remap_tool_call_names(&mut a, &[]);
+        assert!(
+            a.is_empty(),
+            "no tools declared: `glob` must not be returned"
+        );
+
+        // Parallel calls: all of them go, none is "the first one that survives".
+        let mut b = vec![tc("glob"), tc("grep")];
+        remap_tool_call_names(&mut b, &[]);
+        assert!(b.is_empty());
+    }
+
+    /// `tool_choice: "none"` withholds the definitions (`tools_visible_to_model`),
+    /// so by the time the name check runs it sees an empty list too. A promise
+    /// of "no tool call" has to hold for a model that calls anyway.
+    #[test]
+    fn a_withheld_tool_list_drops_calls_to_the_withheld_tools() {
+        use super::{ResolvedToolChoice, tools_visible_to_model};
+        let seen = tools_visible_to_model(vec![td("glob")], &ResolvedToolChoice::None);
+        let mut a = vec![tc("glob")];
+        remap_tool_call_names(&mut a, &seen);
+        assert!(a.is_empty(), "tool_choice=none must not return a tool call");
+    }
+
+    /// Declaring other tools was already enough to drop `glob`; pinned so the
+    /// empty-list fix and the non-empty rule cannot drift apart again.
+    #[test]
+    fn a_call_to_an_undeclared_name_is_dropped_whatever_else_is_declared() {
+        let tools = [td("grep"), td("read")];
+        let mut a = vec![tc("glob")];
+        remap_tool_call_names(&mut a, &tools);
+        assert!(a.is_empty());
+        let mut b = vec![tc("grep"), tc("glob")];
+        remap_tool_call_names(&mut b, &tools);
+        let kept: Vec<&str> = b.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(kept, ["grep"], "the declared call survives, the other goes");
     }
 }
 
@@ -4590,6 +4656,22 @@ mod prompt_refusal_status {
         assert_eq!(inference_error_status(&refused), 400);
         // A route that adds context keeps the classification.
         assert_eq!(inference_error_status(&refused.context("chat")), 400);
+    }
+
+    #[test]
+    fn an_equal_context_and_cap_name_both_knobs() {
+        let refused = refuse_oversized_prompt(9, 8, 8, Some(8)).expect_err("over the cap");
+        let text = refused.to_string();
+        assert!(text.contains("LUMEN_MAX_CTX") && text.contains("LUMEN_MAX_PROMPT_TOKENS"));
+        // Only one of them binds otherwise: that one is named.
+        let ctx = refuse_oversized_prompt(9, 8, 16, Some(8))
+            .unwrap_err()
+            .to_string();
+        assert!(ctx.contains("LUMEN_MAX_CTX") && !ctx.contains("LUMEN_MAX_PROMPT_TOKENS"));
+        let cap = refuse_oversized_prompt(9, 8, 8, Some(16))
+            .unwrap_err()
+            .to_string();
+        assert!(cap.contains("LUMEN_MAX_PROMPT_TOKENS") && !cap.contains("LUMEN_MAX_CTX"));
     }
 
     #[test]
