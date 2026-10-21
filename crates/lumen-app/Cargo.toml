@@ -19,6 +19,10 @@ tauri-plugin-fs = "2.5.1"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# Login item (LaunchAgent on macOS) so the app comes back after a reboot.
+# Pinned: 2.7.0 requires tauri 2.12 and re-resolves ~250 lines of Cargo.lock;
+# lift the pin together with a deliberate tauri bump.
+tauri-plugin-autostart = "=2.5.1"
 
 # Async runtime — shared with lumen-server
 tokio = { workspace = true }

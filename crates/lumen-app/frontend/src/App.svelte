@@ -158,6 +158,8 @@
   let typedEnvKeys = $state<Set<string>>(new Set());
   let catalog = $state<Catalog>({ families: [], recommended: [], embeddings: [] });
   let systemInfo = $state<SystemInfo | null>(null);
+  // Whether the OS opens the app at login (a login item, read from the OS, not config.toml).
+  let launchAtLogin = $state(false);
   // The Flash-Next model on disk (pack, draft head, free space) and the latest pack build report.
   let flashStatus = $state<FlashNextStatus | null>(null);
   let packBuild = $state<PackProgress | null>(null);
@@ -479,6 +481,11 @@
     } catch (e) {
       console.error("get_system_info failed:", e);
     }
+    try {
+      launchAtLogin = await api.getLaunchAtLogin();
+    } catch (e) {
+      console.error("get_launch_at_login failed:", e);
+    }
     // Auto-run preflight diagnostics. Open the Doctor tab automatically if
     // anything is blocking or degraded so the issue is visible without a click.
     try {
@@ -766,6 +773,33 @@
     if (!config) return;
     config = await api.updateServerConfig(config.server);
     savedToast();
+  }
+
+  // The two launch-behaviour toggles take effect at the next app launch, never on the running
+  // server, so they skip `savedToast`'s "restart to apply" hint.
+  function launchSavedToast() {
+    statusMessage = t("config.saved");
+    statusAction = null;
+    setTimeout(() => {
+      if (statusMessage === t("config.saved")) statusMessage = null;
+    }, 2000);
+  }
+
+  async function saveAutoStartServer() {
+    if (!config) return;
+    config = await api.updateServerConfig(config.server);
+    launchSavedToast();
+  }
+
+  async function toggleLaunchAtLogin(enabled: boolean) {
+    try {
+      launchAtLogin = await api.setLaunchAtLogin(enabled);
+      launchSavedToast();
+    } catch (e) {
+      statusMessage = String(e);
+      // The checkbox already flipped; put it back to what the OS says.
+      launchAtLogin = await api.getLaunchAtLogin().catch(() => !enabled);
+    }
   }
 
   async function saveQuant() {
@@ -1899,6 +1933,30 @@
       <div class={kvRow}>
         <span class="dim">{t("server.apiKey")}</span>
         <span class="dim text-[11px] italic">{t("server.apiKey.hint")}</span>
+      </div>
+      <div class={kvRow}>
+        <span class="dim">{t("server.launchAtLogin")}</span>
+        <label class={toggleLabel}>
+          <input
+            class="w-3.5 h-3.5 m-0 accent-accent"
+            type="checkbox"
+            checked={launchAtLogin}
+            onchange={(e) => toggleLaunchAtLogin((e.target as HTMLInputElement).checked)}
+          />
+          <span class="dim">{t("server.launchAtLogin.hint")}</span>
+        </label>
+      </div>
+      <div class={kvRow}>
+        <span class="dim">{t("server.autoStart")}</span>
+        <label class={toggleLabel}>
+          <input
+            class="w-3.5 h-3.5 m-0 accent-accent"
+            type="checkbox"
+            bind:checked={config.server.auto_start_server}
+            onchange={saveAutoStartServer}
+          />
+          <span class="dim">{t("server.autoStart.hint")}</span>
+        </label>
       </div>
 
       <h3 class="{cardSection} {colSpanFull}">

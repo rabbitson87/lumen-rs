@@ -116,6 +116,14 @@ pub struct ServerConfig {
     /// Default 86400 (1 day); `0` = never expire.
     #[serde(default = "default_kv_disk_ttl_secs")]
     pub kv_disk_ttl_secs: u32,
+
+    // ── Launch behaviour ─────────────────────────────────────────────
+    /// Start the server as soon as the app opens (what makes "reboot → app
+    /// back at login → server serving" work). Whether the app itself opens
+    /// at login is the OS login item, not stored here. `#[serde(default)]`
+    /// keeps older configs loadable, so no schema bump.
+    #[serde(default)]
+    pub auto_start_server: bool,
 }
 
 fn default_kv_disk_ttl_secs() -> u32 {
@@ -443,6 +451,7 @@ impl Default for PersistentConfig {
                 kv_disk_enabled: false,
                 kv_disk_max_gb: 0,
                 kv_disk_ttl_secs: 86_400,
+                auto_start_server: false,
             },
             quant: QuantConfig {
                 bits: 4,
@@ -884,6 +893,21 @@ max_batch = 6
         assert_eq!(cfg.flash_next.pack, FlashNextPack::Off);
         assert_eq!(cfg.flash_next.expert_cache_gb, None);
         assert_eq!(cfg.flash_next.draft_head, FlashNextDraftHead::Off);
+    }
+
+    /// Every config written before the auto-start option existed keeps the old behaviour (the
+    /// server waits for the Start button), and turning it on survives a restart.
+    #[test]
+    fn auto_start_server_defaults_off_for_old_configs_and_round_trips() {
+        let cfg: PersistentConfig =
+            toml::from_str(V8_TOML).expect("a config without auto_start_server must deserialize");
+        assert!(!cfg.server.auto_start_server);
+
+        let mut on = PersistentConfig::default();
+        on.server.auto_start_server = true;
+        let raw = toml::to_string_pretty(&on).expect("serialize");
+        let back: PersistentConfig = toml::from_str(&raw).expect("reload");
+        assert!(back.server.auto_start_server);
     }
 
     /// What the settings card saves is what comes back after a restart, and the file keeps

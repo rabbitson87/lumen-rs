@@ -54,9 +54,18 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // LaunchAgent (not the AppleScript login item): the latter drives System
+        // Events and so raises an Automation permission prompt on first use.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let state = AppState::load(app.handle())?;
             app.manage(state);
+            // Detached: engine start-up takes a while and must not hold the
+            // window back. No-op unless `server.auto_start_server` is set.
+            tauri::async_runtime::spawn(commands::auto_start_server(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -76,6 +85,8 @@ fn main() {
             commands::delete_model,
             commands::download_model,
             commands::check_model_updates,
+            commands::get_launch_at_login,
+            commands::set_launch_at_login,
             commands::start_server,
             commands::stop_server,
             commands::server_status,

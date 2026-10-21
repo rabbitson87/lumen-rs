@@ -1,5 +1,6 @@
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -381,6 +382,12 @@ pub async fn check_model_updates(
 
 #[tauri::command]
 pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ServerStatus> {
+    launch_server(app, &state).await
+}
+
+/// Start the server from the stored config. Shared by the Start button
+/// (`start_server`) and the launch-time auto-start (`auto_start_server`).
+async fn launch_server(app: AppHandle, state: &AppState) -> CmdResult<ServerStatus> {
     let g = state.config.lock().await;
     let cfg = g.clone();
     // Two independent slots: a chat/LLM model and an image/diffusion model.
@@ -462,6 +469,43 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> CmdResu
     )
     .await
     .map_err(err)
+}
+
+/// Launch-time hook: when the config asks for it, bring the server up
+/// without waiting for the Start button. Runs detached from `setup`, so a
+/// failure (no active model yet, binary missing, …) is logged and the
+/// dashboard still opens normally with the server stopped.
+pub async fn auto_start_server(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if !state.config.lock().await.server.auto_start_server {
+        return;
+    }
+    match launch_server(app.clone(), &state).await {
+        Ok(_) => eprintln!("[lumen-app] auto-start: server launch requested"),
+        Err(e) => eprintln!("[lumen-app] auto-start: server not started — {e}"),
+    }
+}
+
+// ── Launch at login ────────────────────────────────────────────────────
+
+/// Whether the OS will open the app at login. The login item itself is the
+/// source of truth (the user can also remove it in System Settings), so this
+/// is read from the OS rather than mirrored in `config.toml`.
+#[tauri::command]
+pub async fn get_launch_at_login(app: AppHandle) -> CmdResult<bool> {
+    app.autolaunch().is_enabled().map_err(err)
+}
+
+/// Add or remove the login item; returns the state the OS reports afterwards.
+#[tauri::command]
+pub async fn set_launch_at_login(app: AppHandle, enabled: bool) -> CmdResult<bool> {
+    let auto = app.autolaunch();
+    if enabled {
+        auto.enable().map_err(err)?;
+    } else {
+        auto.disable().map_err(err)?;
+    }
+    auto.is_enabled().map_err(err)
 }
 
 #[tauri::command]

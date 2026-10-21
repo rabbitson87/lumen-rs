@@ -23,6 +23,8 @@ export interface ServerConfig {
   kv_disk_max_gb: number;
   /** → LUMEN_KV_DISK_TTL_SECS — disk entry idle TTL in seconds, 0 = never. */
   kv_disk_ttl_secs: number;
+  /** Start the server when the app opens (e.g. after login at reboot). */
+  auto_start_server: boolean;
 }
 
 export interface QuantConfig {
@@ -380,6 +382,10 @@ export const api = {
     seed: number;
     guidance: number;
   }) => invoke<GeneratedImage>("generate_image", args),
+
+  getLaunchAtLogin: () => invoke<boolean>("get_launch_at_login"),
+  setLaunchAtLogin: (enabled: boolean) =>
+    invoke<boolean>("set_launch_at_login", { enabled }),
 
   startServer: () => invoke<ServerStatus>("start_server"),
   stopServer: () => invoke<ServerStatus>("stop_server"),
