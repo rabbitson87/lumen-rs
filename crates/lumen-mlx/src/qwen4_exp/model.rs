@@ -14,13 +14,14 @@ use mlx_rs::{Array, Dtype};
 use super::config::{LayerKind, Qwen4ExpConfig};
 use super::ngram::NgramHasher;
 use super::ngram_table::{DEFAULT_ROW_CACHE, FileTable, NgramTable, ResidentTable, ShardArrays};
+use crate::decode_probe::{self as probe, Stage};
 use crate::kv_disk::{ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record};
 use crate::native_attention::{sdpa, sdpa_with_mask};
 use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
 use crate::native_moe::{
     AffineGateWeights, GateProj, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
-    SwitchExpertWeights, SwitchGluWeights, moe_block_forward,
+    SwitchExpertWeights, SwitchGluWeights, moe_after_routing, moe_block_forward, moe_router,
 };
 use crate::native_quant::MODE_AFFINE;
 use crate::native_rope::rope;
@@ -199,6 +200,20 @@ lumen_flags::flag! {
     pub(crate) widen_scales {
         env: "LUMEN_QWEN4_WIDEN_SCALES",
         default: true,
+        kind: Optimization,
+    }
+}
+
+lumen_flags::flag! {
+    /// Decode with the offloaded layers pipelined one segment ahead: submit the GPU work that
+    /// ends in a layer's routing, then build the rest of that layer and the whole next layer's
+    /// graph while the GPU runs it, and only then read the routing back. The graph is the same
+    /// one the plain path builds (the gather reads its slot numbers from a persistent array the
+    /// CPU fills in after the readback), so the output is bit-identical; what changes is that the
+    /// host's graph building no longer sits between two GPU segments.
+    pub(crate) build_ahead {
+        env: "LUMEN_QWEN4_BUILD_AHEAD",
+        default: false,
         kind: Optimization,
     }
 }
@@ -529,6 +544,16 @@ struct Layer {
     moe: MoeLayer,
     /// Index into [`Qwen4ExpCache::ple_conv`] when this layer injects n-grams.
     ple: Option<(usize, Ple)>,
+}
+
+/// What a layer's graph holds when it reaches the MoE block.
+struct LayerFront {
+    /// The streams after the mixer's write-back (the residual the MoE output is added to).
+    h_mid: Array,
+    /// The MoE block's input.
+    x: Array,
+    /// The write-back scale for the MoE block's output.
+    inject: Array,
 }
 
 struct QuantEmbedding {
@@ -961,7 +986,10 @@ impl Qwen4ExpModel {
 
     /// Hit rate, per-call time split and read behaviour of the expert bank.
     pub fn offload_report(&self) -> Option<String> {
-        self.offload.as_ref().map(MoeOffload::report)
+        self.offload.as_ref().map(|o| match probe::report() {
+            Some(profile) => format!("{}\n{profile}", o.report()),
+            None => o.report(),
+        })
     }
 
     /// Rows requested from the file-backed n-gram table and how many of them
@@ -1237,17 +1265,28 @@ impl Qwen4ExpModel {
         let mut history = cache.ngram_tail.clone();
         history.extend_from_slice(ids);
 
+        probe::begin_step(ids.len());
         let mut h = self.embed_streams(ids)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            if let Some((k, ple)) = &layer.ple {
-                let injected = self
-                    .ple_forward(ple, &h, &history, ids.len(), &mut cache.ple_conv[*k], None)
-                    .with_context(|| format!("layer {i}: n-gram injection"))?;
-                h = mlx_rs::ops::add(&h, &injected)?;
+        probe::stage(Stage::Embed, &[&h])?;
+        let ahead = match &self.offload {
+            Some(off) if self.builds_ahead(ids.len()) => Some(off),
+            _ => None,
+        };
+        if let Some(off) = ahead {
+            h = self.layers_ahead(off, h, ids.len(), &history, cache)?;
+        } else {
+            for (i, layer) in self.layers.iter().enumerate() {
+                if let Some((k, ple)) = &layer.ple {
+                    let injected = self
+                        .ple_forward(ple, &h, &history, ids.len(), &mut cache.ple_conv[*k], None)
+                        .with_context(|| format!("layer {i}: n-gram injection"))?;
+                    h = mlx_rs::ops::add(&h, &injected)?;
+                    probe::stage(Stage::Ple, &[&h])?;
+                }
+                h = self
+                    .layer_forward(layer, &h, &mut cache.layers[i], None)
+                    .with_context(|| format!("layer {i}"))?;
             }
-            h = self
-                .layer_forward(layer, &h, &mut cache.layers[i], None)
-                .with_context(|| format!("layer {i}"))?;
         }
 
         let first = cache.tokens == 0;
@@ -1272,7 +1311,9 @@ impl Qwen4ExpModel {
         let logits = to_f32(logits)?;
         let mut pending = cache.arrays();
         pending.push(&logits);
+        probe::stage(Stage::Tail, &pending)?;
         mlx_rs::transforms::eval(pending).context("qwen4_exp: evaluate the step and its state")?;
+        probe::end_step();
         Ok(logits)
     }
 
@@ -1668,13 +1709,38 @@ impl Qwen4ExpModel {
         state: &mut LayerState,
         first_row: Option<&mut Option<GdnState>>,
     ) -> Result<Array> {
+        let front = self.layer_front(layer, h, state, first_row)?;
+        let view = layer.moe.view(self.offload.as_ref());
+        let x = moe_block_forward(&front.x, &view).context("moe block")?;
+        self.layer_back(&front.h_mid, &x, &front.inject)
+    }
+
+    /// A layer's graph up to the MoE block's input: the mixer with its hyper-connection and
+    /// write-back, then the MLP hyper-connection.
+    fn layer_front(
+        &self,
+        layer: &Layer,
+        h: &Array,
+        state: &mut LayerState,
+        first_row: Option<&mut Option<GdnState>>,
+    ) -> Result<LayerFront> {
         let (x, inject) = self.hyper_mix(&layer.attn_hc, h)?;
         let inject = inject.ok_or_else(|| anyhow!("attn hyper-connection has no inject weight"))?;
+        probe::stage(Stage::HcAttn, &[&x, &inject])?;
         let x = match (&layer.mixer, &mut *state) {
             (Mixer::Gdn(w), LayerState::Gdn(st)) => self.gdn_forward(w, &x, st, first_row)?,
             (Mixer::Qsa(w), LayerState::Qsa(st)) => self.qsa_forward(w, &x, st)?,
             _ => bail!("cache layer kind does not match the layer"),
         };
+        if probe::sync_on() {
+            let which = match layer.mixer {
+                Mixer::Gdn(_) => Stage::MixerGdn,
+                Mixer::Qsa(_) => Stage::MixerQsa,
+            };
+            let mut pending = state.arrays();
+            pending.push(&x);
+            probe::stage(which, &pending)?;
+        }
         if x.shape()[1] > DECODE_ROWS {
             // A prefill chunk: settle this layer's new state now. Nothing downstream needs
             // it, so left lazy it would keep the layer's chunk-sized convolution input alive
@@ -1685,13 +1751,96 @@ impl Qwen4ExpModel {
             pending.push(&x);
             mlx_rs::transforms::eval(pending).context("evaluate the layer's new state")?;
         }
-        let h = self.write_back(h, &x, &inject)?;
+        let h_mid = self.write_back(h, &x, &inject)?;
+        probe::stage(Stage::Wb1, &[&h_mid])?;
 
-        let (x, inject) = self.hyper_mix(&layer.mlp_hc, &h)?;
+        let (x, inject) = self.hyper_mix(&layer.mlp_hc, &h_mid)?;
         let inject = inject.ok_or_else(|| anyhow!("mlp hyper-connection has no inject weight"))?;
-        let view = layer.moe.view(self.offload.as_ref());
-        let x = moe_block_forward(&x, &view).context("moe block")?;
-        self.write_back(&h, &x, &inject)
+        probe::stage(Stage::HcMlp, &[&x, &inject])?;
+        Ok(LayerFront { h_mid, x, inject })
+    }
+
+    /// The layer's output: the MoE block's result written back into the streams.
+    fn layer_back(&self, h_mid: &Array, moe_out: &Array, inject: &Array) -> Result<Array> {
+        let out = self.write_back(h_mid, moe_out, inject)?;
+        probe::stage(Stage::Wb2, &[&out])?;
+        Ok(out)
+    }
+
+    /// Whether this pass takes the pipelined decode path ([`build_ahead`]): a single-row step
+    /// with the experts offloaded, and no stage-by-stage profile asking for its own syncs.
+    fn builds_ahead(&self, rows: usize) -> bool {
+        build_ahead::get() && rows == 1 && self.offload.is_some() && !probe::sync_on()
+    }
+
+    /// The layers of a decode step, each one's graph built while the GPU runs the one before.
+    ///
+    /// Per layer: submit the segment that ends in its routing, build the rest of the layer (the
+    /// routed experts over its persistent slot array, the shared expert, the write-back) and the
+    /// whole next layer's graph, then wait for the routing, make its experts resident and write
+    /// their slots into the array. The plain path does these in the other order, so its host
+    /// builds a layer's graph with the GPU idle. Same graph, same kernels, same bits.
+    fn layers_ahead(
+        &self,
+        off: &MoeOffload,
+        mut h: Array,
+        rows: usize,
+        history: &[u32],
+        cache: &mut Qwen4ExpCache,
+    ) -> Result<Array> {
+        let n = self.layers.len();
+        let mut front = self.front_at(0, &h, rows, history, cache)?;
+        for i in 0..n {
+            let layer = &self.layers[i];
+            let view = layer.moe.view(Some(off));
+            let (inds, scores) =
+                moe_router(&front.x, &view).with_context(|| format!("layer {i}"))?;
+            let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
+            let flat = mlx_rs::ops::reshape(&inds, &[-1])?;
+            mlx_rs::transforms::async_eval([&flat])
+                .with_context(|| format!("layer {i}: submit"))?;
+            let (routed, slots) = off.routed_ahead(layer.moe.layer, inds.shape())?;
+            let moe_out = moe_after_routing(&front.x, &view, &routed, &scores)
+                .with_context(|| format!("layer {i}: moe block"))?;
+            h = self.layer_back(&front.h_mid, &moe_out, &front.inject)?;
+            let next = if i + 1 < n {
+                Some(self.front_at(i + 1, &h, rows, history, cache)?)
+            } else {
+                None
+            };
+            off.route_ahead(layer.moe.layer, &flat, k, &slots)
+                .with_context(|| format!("layer {i}: expert offload routing failed"))?;
+            match next {
+                Some(f) => front = f,
+                None => break,
+            }
+        }
+        Ok(h)
+    }
+
+    /// Layer `i`'s front half on the streams `h`, with its n-gram injection first when it has one.
+    fn front_at(
+        &self,
+        i: usize,
+        h: &Array,
+        rows: usize,
+        history: &[u32],
+        cache: &mut Qwen4ExpCache,
+    ) -> Result<LayerFront> {
+        let layer = &self.layers[i];
+        let injected;
+        let h = match &layer.ple {
+            Some((k, ple)) => {
+                let delta = self
+                    .ple_forward(ple, h, history, rows, &mut cache.ple_conv[*k], None)
+                    .with_context(|| format!("layer {i}: n-gram injection"))?;
+                injected = mlx_rs::ops::add(h, &delta)?;
+                &injected
+            }
+            None => h,
+        };
+        self.layer_front(layer, h, &mut cache.layers[i], None)
+            .with_context(|| format!("layer {i}"))
     }
 
     /// `GatedDeltaNet.__call__`.

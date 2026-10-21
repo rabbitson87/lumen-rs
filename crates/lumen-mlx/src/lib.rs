@@ -236,6 +236,8 @@ pub mod native_ssm;
 #[cfg(feature = "mlx-native")]
 pub use bandwidth::{MemoryBandwidth, measure_memory_bandwidth};
 #[cfg(feature = "mlx-native")]
+mod decode_probe;
+#[cfg(feature = "mlx-native")]
 mod offload;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
 #[cfg(feature = "mlx-native")]

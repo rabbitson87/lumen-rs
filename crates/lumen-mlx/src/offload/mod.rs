@@ -35,8 +35,8 @@ mod exactness_tests;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Array;
@@ -252,6 +252,8 @@ pub(crate) struct MoeOffload {
     bulk_hint: AtomicBool,
     /// `LUMEN_MOE_TRACE`: records what every layer call asked for. `None` costs a check per call.
     trace: Option<trace::RouteTrace>,
+    /// The slot-index arrays of graphs built before their routing is known, by layer and size.
+    slots: Mutex<HashMap<(u16, usize), Arc<SlotIndices>>>,
 }
 
 /// Sums over the layer calls so far, split by who was working: the host
@@ -360,7 +362,7 @@ const STATS_EVERY_CALLS: u64 = 5_000;
 fn trace_call(
     trace: &trace::RouteTrace,
     layer: u16,
-    inds: &Array,
+    k: usize,
     ids: &[u32],
     index_of: &HashMap<u32, usize>,
     distinct: &[u16],
@@ -369,7 +371,6 @@ fn trace_call(
     hinted: bool,
     (entered, evaluated): (std::time::Instant, std::time::Instant),
 ) {
-    let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
     let rows = (ids.len() / k) as u32;
     let counts = (rows > trace::DECODE_ROWS).then(|| {
         let tail_from = (rows.saturating_sub(trace::TAIL_ROWS) as usize) * k;
@@ -482,6 +483,7 @@ impl MoeOffload {
             expert_bytes: per,
             bulk_hint: AtomicBool::new(false),
             trace,
+            slots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -628,6 +630,35 @@ impl MoeOffload {
         })
     }
 
+    /// The routed ids of an evaluated, flat routing array.
+    fn read_ids(flat: &Array) -> Result<Vec<u32>> {
+        Ok(match flat.dtype() {
+            mlx_rs::Dtype::Uint32 => flat
+                .try_as_slice::<u32>()
+                .map_err(|e| anyhow!("offload route: read routing: {e:?}"))?
+                .to_vec(),
+            mlx_rs::Dtype::Int32 => flat
+                .try_as_slice::<i32>()
+                .map_err(|e| anyhow!("offload route: read routing: {e:?}"))?
+                .iter()
+                .map(|&v| v as u32)
+                .collect(),
+            other => bail!("offload route: routing ids have dtype {other:?}"),
+        })
+    }
+
+    /// The pool arrays by role, as the gather takes them (cheap handle clones).
+    fn pool_arrays(bank: &ExpertBank) -> Vec<(String, Array)> {
+        bank.roles()
+            .map(|role| {
+                (
+                    role.to_string(),
+                    bank.pool(role).expect("role has a pool").array().clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Make the experts `inds` routes to resident and return the routing in
     /// slot numbers plus the pool arrays to gather over.
     ///
@@ -642,36 +673,15 @@ impl MoeOffload {
         let flat = mlx_rs::ops::reshape(inds, &[-1]).context("offload route: flatten routing")?;
         flat.eval().context("offload route: evaluate routing")?;
         let evaluated = std::time::Instant::now();
-        let ids: Vec<u32> = match flat.dtype() {
-            mlx_rs::Dtype::Uint32 => flat
-                .try_as_slice::<u32>()
-                .map_err(|e| anyhow!("offload route: read routing: {e:?}"))?
-                .to_vec(),
-            mlx_rs::Dtype::Int32 => flat
-                .try_as_slice::<i32>()
-                .map_err(|e| anyhow!("offload route: read routing: {e:?}"))?
-                .iter()
-                .map(|&v| v as u32)
-                .collect(),
-            other => bail!("offload route: routing ids have dtype {other:?}"),
-        };
+        let ids = Self::read_ids(&flat)?;
+        let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
 
         let mut bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(prev) = pending.take() {
             bank.release(prev);
         }
-        // Distinct experts, in first-seen order.
-        let mut distinct: Vec<u16> = Vec::with_capacity(ids.len());
-        let mut index_of: HashMap<u32, usize> = HashMap::with_capacity(ids.len());
-        for &id in &ids {
-            if let std::collections::hash_map::Entry::Vacant(v) = index_of.entry(id) {
-                let e = u16::try_from(id)
-                    .map_err(|_| anyhow!("offload route: expert id {id} out of range"))?;
-                v.insert(distinct.len());
-                distinct.push(e);
-            }
-        }
+        let (distinct, index_of) = distinct_in_order(&ids)?;
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
         if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
             let routed = self.route_bulk(&mut bank, layer, inds, entered, evaluated)?;
@@ -685,7 +695,7 @@ impl MoeOffload {
                 trace_call(
                     trace,
                     layer,
-                    inds,
+                    k,
                     &ids,
                     &index_of,
                     &distinct,
@@ -697,44 +707,144 @@ impl MoeOffload {
             }
             return Ok(routed);
         }
-        self.leave_staging(&mut bank)?;
+        let call = PoolCall {
+            layer,
+            k,
+            ids: &ids,
+            index_of: &index_of,
+            distinct: &distinct,
+            hinted,
+            entered,
+            evaluated,
+        };
+        let slot_ids = self.place_on_pool(&mut bank, &mut pending, &call)?;
+        let slot_inds = Array::from_slice(&slot_ids, inds.shape());
+        let arrays = Self::pool_arrays(&bank);
+        Ok(Routed { slot_inds, arrays })
+    }
+
+    /// The slot-index array a layer's gather reads when its graph is built before the routing
+    /// is known, and the pool arrays to gather over. The graph holds the array; the CPU fills
+    /// it in with [`Self::route_ahead`] once the routing has been read back, before the
+    /// graph is evaluated. One array per layer and call shape, made on first use.
+    pub(crate) fn routed_ahead(
+        &self,
+        layer: u16,
+        shape: &[i32],
+    ) -> Result<(Routed, Arc<SlotIndices>)> {
+        let len = shape.iter().map(|&d| d.max(0) as usize).product::<usize>();
+        let slots = {
+            let mut table = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+            match table.get(&(layer, len)) {
+                Some(s) => Arc::clone(s),
+                None => {
+                    let s = Arc::new(SlotIndices::new(shape)?);
+                    table.insert((layer, len), Arc::clone(&s));
+                    s
+                }
+            }
+        };
+        let bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
+        let routed = Routed {
+            slot_inds: slots.array().clone(),
+            arrays: Self::pool_arrays(&bank),
+        };
+        Ok((routed, slots))
+    }
+
+    /// The second half of [`Self::route`] for a graph built ahead (see [`Self::routed_ahead`]):
+    /// wait for the routing `flat` (the flattened `[.., k]` expert ids), make those experts
+    /// resident and write their slots into `slots`. Pool path only: a call that would take
+    /// the staging path has a different graph and is an error here.
+    pub(crate) fn route_ahead(
+        &self,
+        layer: u16,
+        flat: &Array,
+        k: usize,
+        slots: &SlotIndices,
+    ) -> Result<()> {
+        let entered = std::time::Instant::now();
+        flat.eval().context("offload route: evaluate routing")?;
+        let evaluated = std::time::Instant::now();
+        let ids = Self::read_ids(flat)?;
+
+        let mut bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(prev) = pending.take() {
+            bank.release(prev);
+        }
+        let (distinct, index_of) = distinct_in_order(&ids)?;
+        let hinted = self.bulk_hint.load(Ordering::Relaxed);
+        if takes_staging_path(hinted, distinct.len(), ids.len(), bank.experts_in(layer)) {
+            bail!("offload route: a call built ahead cannot take the staging path");
+        }
+        let call = PoolCall {
+            layer,
+            k,
+            ids: &ids,
+            index_of: &index_of,
+            distinct: &distinct,
+            hinted,
+            entered,
+            evaluated,
+        };
+        let slot_ids = self.place_on_pool(&mut bank, &mut pending, &call)?;
+        // SAFETY: the readback above returned, so the segment that ended in this routing has
+        // finished, and with it the previous gather over these slot numbers; the next graph
+        // that reads them is submitted after this returns.
+        unsafe { slots.write(&slot_ids) }
+    }
+
+    /// The pool path of a layer call: leave staging, make the call's distinct experts resident
+    /// (reading the missing ones), hold their pins until the next call, account the time, and
+    /// return the slot of every routed entry.
+    fn place_on_pool(
+        &self,
+        bank: &mut ExpertBank,
+        pending: &mut Option<Acquired>,
+        call: &PoolCall<'_>,
+    ) -> Result<Vec<u32>> {
+        self.leave_staging(bank)?;
         // Rows, not experts: a decode step or a short verify is a few rows, a prompt chunk many.
-        let k = inds.shape().last().copied().unwrap_or(1).max(1) as usize;
-        let kind = if ids.len() / k <= trace::DECODE_ROWS as usize {
+        let kind = if call.ids.len() / call.k <= trace::DECODE_ROWS as usize {
             slot_map::CallKind::Decode
         } else {
             slot_map::CallKind::Prefill
         };
-        let acquired = bank.acquire_as(layer, &distinct, kind)?;
+        let acquired = bank.acquire_as(call.layer, call.distinct, kind)?;
         if let Some(trace) = &self.trace {
             let missed: Vec<u16> = acquired.missed().collect();
-            let hits: Vec<bool> = distinct.iter().map(|e| !missed.contains(e)).collect();
+            let hits: Vec<bool> = call.distinct.iter().map(|e| !missed.contains(e)).collect();
             trace_call(
                 trace,
-                layer,
-                inds,
-                &ids,
-                &index_of,
-                &distinct,
+                call.layer,
+                call.k,
+                call.ids,
+                call.index_of,
+                call.distinct,
                 &hits,
                 false,
-                hinted,
-                (entered, evaluated),
+                call.hinted,
+                (call.entered, call.evaluated),
             );
         }
         let loaded = acquired.loaded_experts();
-        let slot_ids: Vec<u32> = ids.iter().map(|id| acquired.slots[index_of[id]]).collect();
+        let slot_ids: Vec<u32> = call
+            .ids
+            .iter()
+            .map(|id| acquired.slots[call.index_of[id]])
+            .collect();
         *pending = Some(acquired);
         {
             let now = std::time::Instant::now();
             let mut t = self.timing.lock().unwrap_or_else(|p| p.into_inner());
             t.calls += 1;
             if let Some(prev) = t.last_return {
-                t.build_ns += entered.duration_since(prev).as_nanos() as u64;
+                t.build_ns += call.entered.duration_since(prev).as_nanos() as u64;
             }
-            t.wait_ns += evaluated.duration_since(entered).as_nanos() as u64;
+            t.wait_ns += call.evaluated.duration_since(call.entered).as_nanos() as u64;
             if loaded > 0 {
-                t.load_ns += now.duration_since(evaluated).as_nanos() as u64;
+                t.load_ns += now.duration_since(call.evaluated).as_nanos() as u64;
                 t.loading_calls += 1;
                 t.loaded_experts += loaded as u64;
             }
@@ -747,17 +857,116 @@ impl MoeOffload {
             }
             t.last_return = Some(std::time::Instant::now());
         }
+        Ok(slot_ids)
+    }
+}
 
-        let slot_inds = Array::from_slice(&slot_ids, inds.shape());
-        let arrays = bank
-            .roles()
-            .map(|role| {
-                (
-                    role.to_string(),
-                    bank.pool(role).expect("role has a pool").array().clone(),
-                )
-            })
-            .collect();
-        Ok(Routed { slot_inds, arrays })
+/// What a pool-path layer call knows once the routing is read back.
+struct PoolCall<'a> {
+    layer: u16,
+    /// Experts routed per row.
+    k: usize,
+    ids: &'a [u32],
+    index_of: &'a HashMap<u32, usize>,
+    distinct: &'a [u16],
+    hinted: bool,
+    entered: std::time::Instant,
+    evaluated: std::time::Instant,
+}
+
+/// The distinct experts of `ids` in first-seen order, and each id's position among them.
+fn distinct_in_order(ids: &[u32]) -> Result<(Vec<u16>, HashMap<u32, usize>)> {
+    let mut distinct: Vec<u16> = Vec::with_capacity(ids.len());
+    let mut index_of: HashMap<u32, usize> = HashMap::with_capacity(ids.len());
+    for &id in ids {
+        if let std::collections::hash_map::Entry::Vacant(v) = index_of.entry(id) {
+            let e = u16::try_from(id)
+                .map_err(|_| anyhow!("offload route: expert id {id} out of range"))?;
+            v.insert(distinct.len());
+            distinct.push(e);
+        }
+    }
+    Ok((distinct, index_of))
+}
+
+/// A small `u32` array whose bytes the CPU rewrites between layer calls: the slot numbers one
+/// layer's gather reads. A graph that holds it can be built before the routing it depends on
+/// is known (see [`MoeOffload::routed_ahead`]).
+///
+/// Like [`slot_pool::PoolTensor`], the array is only ever an op *input* while this type holds
+/// its own handle to it, so MLX never sees the buffer as donatable.
+pub(crate) struct SlotIndices {
+    array: Array,
+    base: *mut u32,
+    len: usize,
+}
+
+// SAFETY: `base` points into the buffer owned by `array`, which lives as long as the value;
+// writes are serialized against GPU reads by the caller (see `write`).
+unsafe impl Send for SlotIndices {}
+unsafe impl Sync for SlotIndices {}
+
+impl SlotIndices {
+    fn new(shape: &[i32]) -> Result<Self> {
+        let len = shape.iter().map(|&d| d.max(0) as usize).product::<usize>();
+        if len == 0 {
+            bail!("SlotIndices::new: empty shape {shape:?}");
+        }
+        let array = Array::from_slice(&vec![0u32; len], shape);
+        array
+            .eval()
+            .map_err(|e| anyhow!("SlotIndices::new: eval: {e}"))?;
+        // SAFETY: the array is evaluated, so its buffer exists.
+        let base = unsafe { mlx_sys::mlx_array_data_uint8(array.as_ptr()) } as *mut u32;
+        if base.is_null() {
+            bail!("SlotIndices::new: evaluated array has no data pointer");
+        }
+        Ok(Self { array, base, len })
+    }
+
+    pub(crate) fn array(&self) -> &Array {
+        &self.array
+    }
+
+    /// Overwrite the indices.
+    ///
+    /// # Safety
+    /// No GPU work that reads this array may be running.
+    unsafe fn write(&self, ids: &[u32]) -> Result<()> {
+        if ids.len() != self.len {
+            bail!(
+                "SlotIndices::write: {} ids for an array of {}",
+                ids.len(),
+                self.len
+            );
+        }
+        // SAFETY: in bounds by the length check; exclusive by the caller's promise.
+        unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr(), self.base, ids.len()) };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod slot_indices_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_graph_built_before_the_write_reads_what_was_written_after() {
+        let slots = SlotIndices::new(&[1, 1, 4]).unwrap();
+        let table = Array::from_slice(&[10u32, 11, 12, 13, 14, 15, 16, 17], &[8]);
+        // The graph exists (lazily) before the indices do.
+        let picked = mlx_rs::ops::indexing::take_axis(&table, slots.array(), 0).unwrap();
+        // SAFETY: nothing has evaluated a graph over the array yet.
+        unsafe { slots.write(&[7, 0, 3, 3]) }.unwrap();
+        picked.eval().unwrap();
+        assert_eq!(picked.as_slice::<u32>(), &[17, 10, 13, 13]);
+        // Rewritten for the next call; a new graph over the same array sees the new values.
+        // SAFETY: the previous graph has been evaluated and dropped.
+        unsafe { slots.write(&[1, 2, 5, 6]) }.unwrap();
+        let again = mlx_rs::ops::indexing::take_axis(&table, slots.array(), 0).unwrap();
+        again.eval().unwrap();
+        assert_eq!(again.as_slice::<u32>(), &[11, 12, 15, 16]);
+        assert!(unsafe { slots.write(&[1, 2, 3]) }.is_err(), "wrong length");
     }
 }

@@ -622,22 +622,9 @@ mod imp {
         })
     }
 
-    /// Run a full sparse-MoE block on `x` (shape `[B, S, hidden]`).
-    pub fn moe_block_forward(x: &Array, w: &MoeBlockWeights<'_>) -> Result<Array> {
-        if x.ndim() != 3 {
-            return Err(anyhow!(
-                "moe_block_forward: expected x of rank 3 [B, S, hidden], got ndim={}",
-                x.ndim()
-            ));
-        }
-        let last_axis = (x.ndim() as i32) - 1;
-        let timing_on = fine_timing_active();
-
-        // (R: routing) gate matmul + softmax + argpartition + take_along + scores norm.
-        // Lever B: dropped explicit `as_dtype(f32)` after gate matmul — the
-        // affine quantized linear returns f32 when x is f32, so the cast was
-        // a no-op graph node breaking softmax fusion.
-        let t_routing = timing_on.then(Instant::now);
+    /// The routing graph: gate matmul, softmax, top-k, the selected scores renormalized.
+    /// Returns `(inds, scores)`.
+    fn routing_graph(x: &Array, w: &MoeBlockWeights<'_>) -> Result<(Array, Array)> {
         let gate_logits = project_gate(x, &w.gate).context("moe_block_forward: gate(x) failed")?;
         let last_logits_axis = (gate_logits.ndim() as i32) - 1;
         let num_experts = gate_logits.shape()[last_logits_axis as usize];
@@ -683,11 +670,92 @@ mod imp {
             };
             (inds, scores)
         };
+        Ok((inds, scores))
+    }
+
+    /// The routed experts' graph over `indices` (expert ids, or slot numbers of a pool):
+    /// gather gate/up/down, the weighted sum over the selected experts.
+    fn routed_graph(
+        x: &Array,
+        w: &MoeBlockWeights<'_>,
+        glu: &SwitchGluWeights<'_>,
+        indices: &Array,
+        scores: &Array,
+    ) -> Result<Array> {
+        let y = run_experts(x, indices, glu, w.experts_in_scale_dtype)
+            .context("moe_block_forward: switch_glu failed")?;
+        let scores_exp = mlx_rs::ops::expand_dims(scores, -1)
+            .context("moe_block_forward: expand_dims(scores) failed")?;
+        let weighted = mlx_rs::ops::multiply(&y, &scores_exp)
+            .context("moe_block_forward: y * scores failed")?;
+        weighted
+            .sum_axis(-2, /* keep_dims */ false)
+            .context("moe_block_forward: sum_axis(-2) failed")
+    }
+
+    /// The shared expert's graph: `sigmoid(shared_gate(x)) * shared_expert(x)`.
+    fn shared_graph(x: &Array, w: &MoeBlockWeights<'_>) -> Result<Array> {
+        let shared_gate_logits = project_gate(x, &w.shared_gate)
+            .context("moe_block_forward: shared_expert_gate(x) failed")?;
+        let shared_y_raw = shared_mlp(x, &w.shared_expert)
+            .context("moe_block_forward: shared_expert(x) failed")?;
+        let shared_y = if sigmoid_mul_fuse_enabled() {
+            sigmoid_mul_fused(&shared_gate_logits, &shared_y_raw)
+                .context("moe_block_forward: fused sigmoid_mul(shared_gate, y) failed")?
+        } else {
+            let shared_gate_sig = mlx_rs::ops::sigmoid(&shared_gate_logits)
+                .context("moe_block_forward: sigmoid(shared_gate) failed")?;
+            mlx_rs::ops::multiply(&shared_gate_sig, &shared_y_raw)
+                .context("moe_block_forward: gate * shared_y failed")?
+        };
+        Ok(shared_y)
+    }
+
+    /// The first half of an offloaded layer's MoE block: its routing graph, `(inds, scores)`.
+    /// With [`moe_after_routing`] this is [`moe_block_forward`] split at the readback, so a
+    /// caller can build the second half (and more) before the routing is known.
+    pub fn moe_router(x: &Array, w: &MoeBlockWeights<'_>) -> Result<(Array, Array)> {
+        routing_graph(x, w)
+    }
+
+    /// The second half of an offloaded layer's MoE block, over the routing handles of
+    /// [`crate::offload::MoeOffload::routed_ahead`]: routed experts, shared expert, their sum.
+    pub(crate) fn moe_after_routing(
+        x: &Array,
+        w: &MoeBlockWeights<'_>,
+        routed: &crate::offload::Routed,
+        scores: &Array,
+    ) -> Result<Array> {
+        let glu = offloaded_glu(routed, &w.switch_glu)?;
+        let combined = routed_graph(x, w, &glu, &routed.slot_inds, scores)?;
+        let shared_y = shared_graph(x, w)?;
+        mlx_rs::ops::add(&combined, &shared_y)
+            .context("moe_block_forward: combined + shared_y failed")
+    }
+
+    /// Run a full sparse-MoE block on `x` (shape `[B, S, hidden]`).
+    pub fn moe_block_forward(x: &Array, w: &MoeBlockWeights<'_>) -> Result<Array> {
+        if x.ndim() != 3 {
+            return Err(anyhow!(
+                "moe_block_forward: expected x of rank 3 [B, S, hidden], got ndim={}",
+                x.ndim()
+            ));
+        }
+        let last_axis = (x.ndim() as i32) - 1;
+        let timing_on = fine_timing_active();
+
+        // (R: routing) gate matmul + softmax + argpartition + take_along + scores norm.
+        // Lever B: dropped explicit `as_dtype(f32)` after gate matmul — the
+        // affine quantized linear returns f32 when x is f32, so the cast was
+        // a no-op graph node breaking softmax fusion.
+        let t_routing = timing_on.then(Instant::now);
+        let (inds, scores) = routing_graph(x, w)?;
         if let Some(t0) = t_routing {
             mlx_rs::transforms::eval([&inds, &scores])
                 .context("moe_block_forward: batched eval(routing) failed")?;
             bump_moe_routing_ms(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        crate::decode_probe::stage(crate::decode_probe::Stage::Router, &[&inds, &scores])?;
         if moe_layer_sync_probe::get() {
             mlx_rs::transforms::eval([&inds])
                 .context("moe_block_forward: layer-sync probe eval(inds) failed")?;
@@ -706,6 +774,7 @@ mod imp {
         // Offloaded layer: read the routing back (this completes all earlier GPU
         // work), make those experts resident, and gather over the bank's pool
         // with slot numbers where the expert ids were. Scores are unchanged.
+        let route_started = crate::decode_probe::sync_on().then(Instant::now);
         let routed = match &w.offload {
             Some(o) => Some(
                 o.offload
@@ -714,51 +783,36 @@ mod imp {
             ),
             None => None,
         };
-        let y = match &routed {
+        if let Some(started) = route_started {
+            crate::decode_probe::timed(crate::decode_probe::Stage::Route, started);
+        }
+        let combined = match &routed {
             Some(r) => {
                 let glu = offloaded_glu(r, &w.switch_glu)?;
-                run_experts(x, &r.slot_inds, &glu, w.experts_in_scale_dtype)
+                routed_graph(x, w, &glu, &r.slot_inds, &scores)?
             }
-            None => run_experts(x, &inds, &w.switch_glu, w.experts_in_scale_dtype),
-        }
-        .context("moe_block_forward: switch_glu failed")?;
-        let scores_exp = mlx_rs::ops::expand_dims(&scores, -1)
-            .context("moe_block_forward: expand_dims(scores) failed")?;
-        let weighted = mlx_rs::ops::multiply(&y, &scores_exp)
-            .context("moe_block_forward: y * scores failed")?;
-        let combined = weighted
-            .sum_axis(-2, /* keep_dims */ false)
-            .context("moe_block_forward: sum_axis(-2) failed")?;
+            None => routed_graph(x, w, &w.switch_glu, &inds, &scores)?,
+        };
         if let Some(t0) = t_glu {
             combined
                 .eval()
                 .context("moe_block_forward: timing eval(switch_glu.combined) failed")?;
             bump_moe_switch_glu_ms(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        crate::decode_probe::stage(crate::decode_probe::Stage::Experts, &[&combined])?;
 
         // (X: shared_expert) sigmoid(shared_gate(x)) * shared_expert(x).
         // Lever B: dropped 2× redundant `as_dtype(f32)` casts (shared_gate +
         // shared_mlp output) — both quantized matmuls return f32 already.
         let t_shared = timing_on.then(Instant::now);
-        let shared_gate_logits = project_gate(x, &w.shared_gate)
-            .context("moe_block_forward: shared_expert_gate(x) failed")?;
-        let shared_y_raw = shared_mlp(x, &w.shared_expert)
-            .context("moe_block_forward: shared_expert(x) failed")?;
-        let shared_y = if sigmoid_mul_fuse_enabled() {
-            sigmoid_mul_fused(&shared_gate_logits, &shared_y_raw)
-                .context("moe_block_forward: fused sigmoid_mul(shared_gate, y) failed")?
-        } else {
-            let shared_gate_sig = mlx_rs::ops::sigmoid(&shared_gate_logits)
-                .context("moe_block_forward: sigmoid(shared_gate) failed")?;
-            mlx_rs::ops::multiply(&shared_gate_sig, &shared_y_raw)
-                .context("moe_block_forward: gate * shared_y failed")?
-        };
+        let shared_y = shared_graph(x, w)?;
         if let Some(t0) = t_shared {
             shared_y
                 .eval()
                 .context("moe_block_forward: timing eval(shared.shared_y) failed")?;
             bump_moe_shared_expert_ms(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        crate::decode_probe::stage(crate::decode_probe::Stage::Shared, &[&shared_y])?;
 
         // Final residual sum.
         let _ = last_axis; // last_axis was only documentation for axis algebra.
@@ -782,5 +836,6 @@ mod imp {
 pub(crate) use imp::{
     AffineGateWeights, GateProj, MoeBlockWeights, OffloadLayer, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, dense_mlp_forward, gelu_mul_fuse_enabled,
-    gelu_mul_fused, moe_block_forward, swiglu_fuse_enabled, swiglu_fused, switch_glu,
+    gelu_mul_fused, moe_after_routing, moe_block_forward, moe_router, swiglu_fuse_enabled,
+    swiglu_fused, switch_glu,
 };

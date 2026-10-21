@@ -44,7 +44,10 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
+| `LUMEN_QWEN4_BUILD_AHEAD` | off | Optimization | `lumen_mlx::qwen4_exp::model::build_ahead` |
 | `LUMEN_QWEN4_MEM_LOG` | off | Diagnostic | `lumen_mlx::qwen4_exp::runner::mem_log` |
+| `LUMEN_QWEN4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::decode_probe::stage_sync` |
+| `LUMEN_QWEN4_TOKEN_COUNTERS` | off | Diagnostic | `lumen_mlx::decode_probe::token_counters` |
 | `LUMEN_QWEN4_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen4_exp::model::widen_scales` |
 | `LUMEN_SPARSE_DECODE` | off | Behavior | `lumen_mlx::native_attention::imp::sparse_decode` |
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
@@ -474,6 +477,17 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
  identical output: on a 3.8 checkpoint the two settings render different
  system blocks by design.
 
+### `LUMEN_QWEN4_BUILD_AHEAD`
+
+*Optimization, default off.*
+
+Decode with the offloaded layers pipelined one segment ahead: submit the GPU work that
+ ends in a layer's routing, then build the rest of that layer and the whole next layer's
+ graph while the GPU runs it, and only then read the routing back. The graph is the same
+ one the plain path builds (the gather reads its slot numbers from a persistent array the
+ CPU fills in after the readback), so the output is bit-identical; what changes is that the
+ host's graph building no longer sits between two GPU segments.
+
 ### `LUMEN_QWEN4_MEM_LOG`
 
 *Diagnostic, default off.*
@@ -481,6 +495,21 @@ Honour a checkpoint's own `reasoning_effort` declaration (Qwen 3.8).
 Log MLX's memory (active, cache, peak) and what each sequence holds: after every prefill,
  when a sequence is dropped, and every 32 decode steps with the speed of those steps. For
  finding out where a memory limit is being hit; it adds one allocator query per line.
+
+### `LUMEN_QWEN4_STAGE_SYNC`
+
+*Diagnostic, default off.*
+
+Evaluate every decode step stage by stage (hyper-connection, mixer, router, route, experts,
+ shared expert, write-back) and print each stage's build time, evaluation time and
+ dispatch counts. Costs a sync per stage; for diagnosis only.
+
+### `LUMEN_QWEN4_TOKEN_COUNTERS`
+
+*Diagnostic, default off.*
+
+Count the Metal command buffers, kernel dispatches and encoded primitives of every decode
+ step, plus the CPU time spent encoding, and print them every 100 steps. Adds no sync.
 
 ### `LUMEN_QWEN4_WIDEN_SCALES`
 

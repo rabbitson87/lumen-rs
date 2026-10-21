@@ -249,6 +249,45 @@ fn offloaded_experts_match_the_resident_model() {
     }
 }
 
+/// The pipelined decode path (`LUMEN_QWEN4_BUILD_AHEAD`) builds each layer's second half and the
+/// next layer's graph before the routing is read back, with the gather reading its slot numbers
+/// from a persistent array the CPU fills in afterwards. It must give the plain path's logits bit
+/// for bit, whatever the pool holds: the smallest pool (every call evicts), a few layers' worth,
+/// and every expert resident. A prefill piece in the same stream takes the plain path.
+#[test]
+fn building_decode_layers_ahead_gives_the_plain_paths_logits() {
+    let dir = fixture_dir();
+    let resident = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
+    let want = reference(&dir);
+    let ids: Vec<u32> = want["ids"]
+        .as_slice::<i32>()
+        .iter()
+        .map(|&t| t as u32)
+        .collect();
+    let run = |model: &Qwen4ExpModel| -> Vec<f32> {
+        let mut cache = model.make_cache();
+        let mut out = host_f32(&model.forward(&ids[..40], &mut cache, false).unwrap());
+        for t in 40..ids.len() {
+            out.extend(host_f32(
+                &model.forward(&ids[t..t + 1], &mut cache, false).unwrap(),
+            ));
+        }
+        out
+    };
+    let baseline = run(&resident);
+    drop(resident);
+    for budget in [1u64, 20 * 9_900, 34 * 9_900, 100 * 9_900, u64::MAX / 2] {
+        let model = Qwen4ExpModel::load(&dir, Some(budget)).expect("load with offload");
+        let got = super::model::build_ahead::with(true, || run(&model));
+        let (hits, misses) = model.offload_stats().expect("offload on");
+        eprintln!("budget {budget}: hits {hits} misses {misses}");
+        assert!(
+            got == baseline,
+            "budget {budget}: the pipelined decode path changed the logits"
+        );
+    }
+}
+
 /// Token streams cut into prefill pieces of many sizes: each piece is one layer call of
 /// `rows x 4` index entries, and the sorted gather's kernel depends on that count against the
 /// number of experts in what it gathers over, so a pool of any size must still give the
