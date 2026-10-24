@@ -123,6 +123,29 @@ the head and the rest in one pass, so each layer's experts are read once instead
 42.5 s in two calls). A conversation that continues after a restart resumes from the head and feeds its
 later turns again; a prompt the memory plan sends without a head writes none.
 
+### An agent's later rounds (`LUMEN_PREFIX_EXACT_REUSE`, on by default)
+
+A tool round resumes only from the head or a point a whole number of chunks past it (kept instead of the
+previous round's full-prompt snapshot) and re-feeds the rest on that grid, so every round is exactly its
+cold prefill. `LUMEN_PREFIX_EXACT_REUSE=0` goes back to extending the previous round's full-prompt
+snapshot, which is cut where the previous prompt ended, a place the round's own cold prefill (the head,
+then a chunk at a time from there) does not cut, so its reply can differ. Measured on three 6-round agent tasks (12.3K-token head, real tool
+results, the conversation fixed so every variant got the same inputs; 6.7 GB pool, greedy):
+
+| | Replies that differ from the round's cold prefill | Prefill of rounds 2-6, mean / p90 | 3 sessions |
+|---|---|---|---|
+| Snapshot (`=0`) | 4 of 18 (each a different tool call or arguments) | 10.8 s / 15.9 s | 505 s |
+| Exact (default) | 0 of 18 | 10.8 s / 11.6 s | 486 s |
+| Every round cold | (the reference) | 51.5 s / 66.9 s | 1,138 s |
+
+Exact re-feeds 58-979 more tokens than the snapshot path (mean 389). That costs nothing when the round feeds a
+few hundred tokens anyway (both read every layer's experts once), but a round with under ~100 new tokens
+goes from 2.7-4 s to 10.4 s, since re-feeding from the head reads them all. The snapshot path loses its
+snapshot when a reply's text before its tool call is only a newline (that turn re-renders as different
+tokens) and re-feeds from the head, up to 6,099 tokens and 24 s, where exact keeps its point. Note that the
+cold prefill with the cache on (cut at the head) is not the cache-off prefill (one cut per chunk from the
+start): those two differed in 10 of the 18 rounds, so exact matches the former, not the latter.
+
 ## Which expert leaves the pool
 
 When a layer needs an expert that is not in the pool, another one has to give up its slot. The default,

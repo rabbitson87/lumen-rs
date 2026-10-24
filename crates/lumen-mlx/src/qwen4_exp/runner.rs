@@ -233,6 +233,8 @@ lumen_flags::flag! {
     /// Log MLX's memory (active, cache, peak) and what each sequence holds: after every prefill,
     /// when a sequence is dropped, and every 32 decode steps with the speed of those steps. For
     /// finding out where a memory limit is being hit; it adds one allocator query per line.
+    /// After each prefill it also prints the expert bank's account of that feed alone (layer
+    /// calls, reads, layer calls that took the staging path), restarting the bank's counters.
     pub(crate) mem_log {
         env: "LUMEN_QWEN4_MEM_LOG",
         default: false,
@@ -678,10 +680,24 @@ impl Qwen4ExpRunner {
         self.mem_report(&format!("decode seq {seq_id}{rate}"));
     }
 
-    /// Start of a prefill: forget the previous peak so the next report's peak is this prompt's.
+    /// Start of a prefill: forget the previous peak so the next report's peak is this prompt's,
+    /// and the expert bank's per-call split so the next feed report covers this feed alone.
     fn mem_begin(&self) {
         if mem_log::get() {
             crate::metal_memory::reset_peak_memory();
+            self.model.offload_reset_timing();
+        }
+    }
+
+    /// [`Self::mem_report`] after a feed, followed by the expert bank's account of that feed
+    /// (layer calls, reads, and how many layer calls took the staging path).
+    fn feed_report(&self, what: &str) {
+        self.mem_report(what);
+        if mem_log::get()
+            && let Some(report) = self.model.offload_report()
+        {
+            let line = report.lines().next().unwrap_or_default();
+            eprintln!("[qwen4_exp] mem {what}: {line}");
         }
     }
 
@@ -752,7 +768,7 @@ impl Qwen4ExpRunner {
                 );
             }
         }
-        self.mem_report(&format!("fed {} tokens to seq {seq_id}", tokens.len()));
+        self.feed_report(&format!("fed {} tokens to seq {seq_id}", tokens.len()));
         Ok(Some((next, position)))
     }
 
@@ -1085,6 +1101,22 @@ impl Qwen4ExpRunner {
         at: usize,
         keep: bool,
     ) -> Result<(u32, usize, Option<u64>)> {
+        let (next, position, head, _) =
+            self.prefill_split_marked(seq_id, tokens, at, keep, None)?;
+        Ok((next, position, head))
+    }
+
+    /// [`Self::prefill_split`] that also keeps the state at `mark` (a cut of the split feed: `at`
+    /// plus a whole number of chunks) as a snapshot: `(next token, position, head snapshot, mark
+    /// snapshot)`, still in one pass.
+    pub(crate) fn prefill_split_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>, Option<u64>)> {
         if at == 0 || at >= tokens.len() {
             bail!(
                 "qwen4_exp: split at {at} is not inside {} tokens",
@@ -1094,12 +1126,16 @@ impl Qwen4ExpRunner {
         self.mem_begin();
         self.check_context(0, tokens.len())?;
         let cuts = split_cuts(tokens.len(), at, self.chunk);
+        let mark = mark.filter(|&m| m != at);
+        let marks: Vec<usize> = keep.then_some(at).into_iter().chain(mark).collect();
         let mut cache = self.model.make_cache();
-        let (logits, point) =
-            self.model
-                .forward_pieces(tokens, &mut cache, &cuts, keep.then_some(at))?;
+        let (logits, mut points) = self
+            .model
+            .forward_pieces_marked(tokens, &mut cache, &cuts, &marks)?;
         logits.eval().context("qwen4_exp: evaluate prefill")?;
         let next = Self::argmax(&logits)?;
+        let mark_point = mark.and_then(|m| points.pop().map(|p| (p, m)));
+        let point = points.pop();
         self.seqs.insert(
             seq_id,
             Seq {
@@ -1112,17 +1148,68 @@ impl Qwen4ExpRunner {
                 spec_off: false,
             },
         );
-        let snapshot = point.map(|p| {
-            let id = self.next_snapshot;
-            self.next_snapshot += 1;
-            self.snapshots.insert(id, (p, at));
-            id
-        });
-        self.mem_report(&format!(
+        let snapshot = point.map(|p| self.keep_snapshot(p, at));
+        let mark_snapshot = mark_point.map(|(p, m)| self.keep_snapshot(p, m));
+        self.feed_report(&format!(
             "prefilled {} tokens for seq {seq_id} (head at {at})",
             tokens.len()
         ));
-        Ok((next, tokens.len(), snapshot))
+        Ok((next, tokens.len(), snapshot, mark_snapshot))
+    }
+
+    /// File `state` (standing at `position`) as a snapshot and return its id.
+    fn keep_snapshot(&mut self, state: Qwen4ExpCache, position: usize) -> u64 {
+        let id = self.next_snapshot;
+        self.next_snapshot += 1;
+        self.snapshots.insert(id, (state, position));
+        id
+    }
+
+    /// [`Runner::extend`] (chunks counted from the sequence's position) that also keeps the state
+    /// `mark` tokens in as a snapshot when `mark` is one of those chunk ends: `(next token,
+    /// position, snapshot id)`. A mark between chunk ends is an error, not a guess.
+    pub(crate) fn extend_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        let Some(mark) = mark else {
+            let (next, position) = Runner::extend(self, seq_id, tokens)?;
+            return Ok((next, position, None));
+        };
+        self.mem_begin();
+        let have = self.seq(seq_id, "extend")?.position;
+        self.check_context(have, tokens.len())?;
+        if tokens.is_empty() {
+            bail!("qwen4_exp: no tokens to feed");
+        }
+        let cuts = chunk_cuts(0, tokens.len(), self.chunk);
+        if !cuts.contains(&mark) {
+            bail!(
+                "qwen4_exp: mark {mark} is not a chunk end of a {}-token extend",
+                tokens.len()
+            );
+        }
+        let seq = self.seq(seq_id, "extend")?;
+        seq.pending = None;
+        let mut cache = seq.cache.clone();
+        let (logits, point) = self
+            .model
+            .forward_pieces(tokens, &mut cache, &cuts, Some(mark))?;
+        logits.eval().context("qwen4_exp: evaluate prefill")?;
+        let next = Self::argmax(&logits)?;
+        let seq = self.seq(seq_id, "extend")?;
+        seq.cache = cache;
+        seq.position += tokens.len();
+        let position = seq.position;
+        let snapshot = point.map(|p| self.keep_snapshot(p, have + mark));
+        self.feed_report(&format!(
+            "extended seq {seq_id} by {} tokens (point at {})",
+            tokens.len(),
+            have + mark
+        ));
+        Ok((next, position, snapshot))
     }
 
     /// Write prefix-cache snapshot `snapshot_id`, the state after `prefix`, to the disk tier
@@ -1295,6 +1382,27 @@ impl crate::prefix_cache::SnapshotRunner for Qwen4ExpRunner {
     ) -> Result<(u32, usize, Option<u64>)> {
         Qwen4ExpRunner::prefill_split(self, seq_id, tokens, at, keep)
     }
+    fn resume_chunk(&self) -> Option<usize> {
+        Some(self.chunk.max(1))
+    }
+    fn prefill_split_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>, Option<u64>)> {
+        Qwen4ExpRunner::prefill_split_marked(self, seq_id, tokens, at, keep, mark)
+    }
+    fn extend_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        Qwen4ExpRunner::extend_marked(self, seq_id, tokens, mark)
+    }
 }
 
 impl Runner for Qwen4ExpRunner {
@@ -1320,7 +1428,7 @@ impl Runner for Qwen4ExpRunner {
                 spec_off: false,
             },
         );
-        self.mem_report(&format!(
+        self.feed_report(&format!(
             "prefilled {} tokens for seq {seq_id}",
             tokens.len()
         ));
@@ -1369,7 +1477,7 @@ impl Runner for Qwen4ExpRunner {
         seq.cache = cache;
         seq.position += tokens.len();
         let position = seq.position;
-        self.mem_report(&format!("extended seq {seq_id} by {} tokens", tokens.len()));
+        self.feed_report(&format!("extended seq {seq_id} by {} tokens", tokens.len()));
         Ok((next, position))
     }
 
@@ -1914,7 +2022,17 @@ mod tests {
         prompt: &[u32],
         at: usize,
     ) -> (u32, Vec<Vec<u8>>, Vec<u32>) {
-        let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+        cold_in_two_calls_with(MtpMode::Off, budget, prompt, at)
+    }
+
+    /// [`cold_in_two_calls`] with or without the draft head (whose state the bytes include).
+    fn cold_in_two_calls_with(
+        mtp: MtpMode,
+        budget: Option<u64>,
+        prompt: &[u32],
+        at: usize,
+    ) -> (u32, Vec<Vec<u8>>, Vec<u32>) {
+        let mut r = tiny_runner_with(16, mtp, budget);
         let (next, _, _) =
             crate::prefix_cache::prefill_split_in_two_calls(&mut r, 1, prompt, at, false).unwrap();
         let state = state_bytes(&r, 1);
@@ -2017,6 +2135,96 @@ mod tests {
             &cold_b,
             "head restored after a restart",
         );
+    }
+
+    /// `LUMEN_PREFIX_EXACT_REUSE`: the rounds of an agent's conversation through the prefix cache
+    /// (each prompt the previous one plus more tokens; head at 21, chunks of 16) come out exactly
+    /// as each round's own cold MISS: next token, state byte for byte, greedy steps. Rounds that
+    /// end short of, on, and past grid points, the identical prompt retried, a round that reaches
+    /// no new grid point, and a first prompt long enough to leave a point past its head. Without
+    /// the flag, extending the previous round's full prompt does not (shown on the pool, where the
+    /// replica's numbers depend on the cut).
+    #[test]
+    fn exact_reuse_rounds_continue_exactly_like_their_cold_prompts() {
+        for budget in [None, Some(1u64)] {
+            exact_rounds(MtpMode::Off, budget);
+        }
+        // With the draft head, whose cache the kept points carry too.
+        exact_rounds(MtpMode::On, Some(1));
+    }
+
+    fn exact_rounds(mtp: MtpMode, budget: Option<u64>) {
+        use crate::prefix_cache::{PrefixCacheStore, exact_reuse};
+        let ids = fixture_ids();
+        let at = 21;
+        // Longer than the fixture: its ids, then the same ids shifted.
+        let convo: Vec<u32> = (0..100)
+            .map(|i| (ids[i % ids.len()] + 7 * (i / ids.len()) as u32) % 128)
+            .collect();
+        let run = |exact: bool, ends: &[usize]| -> Vec<(Vec<(usize, u64, bool)>, bool)> {
+            let mut r = tiny_runner_with(16, mtp, budget);
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let mut out = Vec::new();
+            for (i, &n) in ends.iter().enumerate() {
+                let seq = i as u64 + 1;
+                let cold = cold_in_two_calls_with(mtp, budget, &convo[..n], at);
+                let (next, _) = exact_reuse::with(exact, || {
+                    store.prefill_optionally_cached(&mut r, seq, &convo[..n], Some("k"), Some(at))
+                })
+                .unwrap();
+                if exact {
+                    assert_continues_like(&mut r, seq, next, &cold, &format!("round {seq} ({n})"));
+                } else {
+                    let same = next == cold.0 && state_bytes(&r, seq) == cold.1;
+                    Runner::remove_seq(&mut r, seq).unwrap();
+                    out.push((store.branches_for_test("k"), same));
+                    continue;
+                }
+                out.push((store.branches_for_test("k"), true));
+            }
+            out
+        };
+        let pinned = |v: &[(usize, u64, bool)]| -> Vec<(usize, bool)> {
+            v.iter().map(|&(n, _, p)| (n, p)).collect()
+        };
+
+        // 30: under a chunk past the head (the head is the point); 45, 60: points 37, 53; 69: on
+        // the grid; 69 again: the retry; 74: no new point; 100: point 85.
+        let ends = [30, 45, 60, 69, 69, 74, 100];
+        let exact = run(true, &ends);
+        let layout: Vec<_> = exact.iter().map(|(b, _)| pinned(b)).collect();
+        assert_eq!(
+            layout[0],
+            vec![(21, true)],
+            "a MISS under a chunk keeps the head only"
+        );
+        assert_eq!(layout[1], vec![(21, true), (37, false)]);
+        assert_eq!(
+            layout[2],
+            vec![(21, true), (53, false)],
+            "a newer point replaces the older"
+        );
+        assert_eq!(layout[3], vec![(21, true), (69, false)]);
+        assert_eq!(
+            layout[5],
+            vec![(21, true), (69, false)],
+            "no grid point reached"
+        );
+        assert_eq!(layout[6], vec![(21, true), (85, false)]);
+
+        // A first prompt that leaves a point past its head in the same pass.
+        let exact = run(true, &[60, 75]);
+        assert_eq!(pinned(&exact[0].0), vec![(21, true), (53, false)]);
+
+        // The behaviour this replaces: on the pool some round comes out differently.
+        let plain = run(false, &ends);
+        assert!(plain[0].1, "a cold MISS is the cold MISS");
+        if budget.is_some() {
+            assert!(
+                plain.iter().any(|(_, same)| !same),
+                "extending full prompts matched the cold rounds: the test shows nothing"
+            );
+        }
     }
 
     /// Where the feed is cut changes the numbers even on the replica: the prompt fed in one call

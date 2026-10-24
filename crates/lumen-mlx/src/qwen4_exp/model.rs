@@ -1467,6 +1467,18 @@ impl Qwen4ExpModel {
         self.forward_pieces_in_groups(ids, cache, cuts, mark, PREFILL_GROUP_TOKENS)
     }
 
+    /// [`Self::forward_pieces`] with a copy of the state at each of several cuts, in the order
+    /// of `marks`.
+    pub fn forward_pieces_marked(
+        &self,
+        ids: &[u32],
+        cache: &mut Qwen4ExpCache,
+        cuts: &[usize],
+        marks: &[usize],
+    ) -> Result<(Array, Vec<Qwen4ExpCache>)> {
+        self.forward_pieces_grouped(ids, cache, cuts, marks, PREFILL_GROUP_TOKENS)
+    }
+
     /// [`Self::forward_pieces`] with the group size spelled out (a group always holds at least
     /// one chunk).
     pub(crate) fn forward_pieces_in_groups(
@@ -1477,6 +1489,20 @@ impl Qwen4ExpModel {
         mark: Option<usize>,
         group_tokens: usize,
     ) -> Result<(Array, Option<Qwen4ExpCache>)> {
+        let (logits, mut points) =
+            self.forward_pieces_grouped(ids, cache, cuts, mark.as_slice(), group_tokens)?;
+        Ok((logits, points.pop()))
+    }
+
+    /// [`Self::forward_pieces_marked`] with the group size spelled out.
+    fn forward_pieces_grouped(
+        &self,
+        ids: &[u32],
+        cache: &mut Qwen4ExpCache,
+        cuts: &[usize],
+        marks: &[usize],
+        group_tokens: usize,
+    ) -> Result<(Array, Vec<Qwen4ExpCache>)> {
         if ids.is_empty() {
             bail!("qwen4_exp forward: no tokens");
         }
@@ -1499,12 +1525,11 @@ impl Qwen4ExpModel {
                 ids.len()
             );
         }
-        if let Some(m) = mark
-            && !cuts.contains(&m)
-        {
+        if let Some(m) = marks.iter().find(|m| !cuts.contains(m)) {
             bail!("qwen4_exp forward: mark {m} is not one of the cuts {cuts:?}");
         }
-        let (mut logits, mut snapshot) = (None, None);
+        let mut logits = None;
+        let mut points: Vec<Option<Qwen4ExpCache>> = vec![None; marks.len()];
         let (mut group_start, mut next_cut) = (0, 0);
         while next_cut < cuts.len() {
             let mut end_cut = next_cut + 1;
@@ -1516,18 +1541,24 @@ impl Qwen4ExpModel {
                 .iter()
                 .map(|c| c - group_start)
                 .collect();
-            let rel_mark = mark
-                .filter(|m| *m > group_start && *m <= group_end)
-                .map(|m| m - group_start);
+            // The marks inside this group, as (index into `marks`, offset in the group).
+            let (mark_at, rel_marks): (Vec<usize>, Vec<usize>) = marks
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| **m > group_start && **m <= group_end)
+                .map(|(j, m)| (j, m - group_start))
+                .unzip();
             let last = end_cut == cuts.len();
-            let (group_logits, group_snapshot) = self.forward_group(
+            let (group_logits, group_points) = self.forward_group(
                 &ids[group_start..group_end],
                 cache,
                 &rel_cuts,
-                rel_mark,
+                &rel_marks,
                 last,
             )?;
-            snapshot = group_snapshot.or(snapshot);
+            for (j, point) in mark_at.into_iter().zip(group_points) {
+                points[j] = Some(point);
+            }
             if last {
                 logits = group_logits;
             }
@@ -1535,18 +1566,23 @@ impl Qwen4ExpModel {
             next_cut = end_cut;
         }
         let logits = logits.ok_or_else(|| anyhow!("qwen4_exp forward: no logits produced"))?;
-        Ok((logits, snapshot))
+        let points = points
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("qwen4_exp forward: a mark fell in no group"))?;
+        Ok((logits, points))
     }
 
-    /// One layer-major group of [`Self::forward_pieces`].
+    /// One layer-major group of [`Self::forward_pieces`]: the logits when `want_logits`, and the
+    /// state at each of `marks` (cuts of this group), in their order.
     fn forward_group(
         &self,
         ids: &[u32],
         cache: &mut Qwen4ExpCache,
         cuts: &[usize],
-        mark: Option<usize>,
+        marks: &[usize],
         want_logits: bool,
-    ) -> Result<(Option<Array>, Option<Qwen4ExpCache>)> {
+    ) -> Result<(Option<Array>, Vec<Qwen4ExpCache>)> {
         let keep = self.cfg.ngram_size - 1;
         let base_tokens = cache.tokens;
         let mut history = cache.ngram_tail.clone();
@@ -1572,9 +1608,14 @@ impl Qwen4ExpModel {
         let _bulk = layer_major
             .then(|| self.offload.as_ref().map(BulkHint::on))
             .flatten();
-        let mark_piece = mark.and_then(|m| cuts.iter().position(|&c| c == m));
-        let mut snap_layers: Vec<LayerState> = Vec::new();
-        let mut snap_ple: Vec<Option<Array>> = vec![None; cache.ple_conv.len()];
+        // The chunk each mark ends (the callers only mark cuts).
+        let mark_pieces: Vec<Option<usize>> = marks
+            .iter()
+            .map(|m| cuts.iter().position(|c| c == m))
+            .collect();
+        let mut snap_layers: Vec<Vec<LayerState>> = vec![Vec::new(); marks.len()];
+        let mut snap_ple: Vec<Vec<Option<Array>>> =
+            vec![vec![None; cache.ple_conv.len()]; marks.len()];
 
         for (i, layer) in self.layers.iter().enumerate() {
             for (p, h) in streams.iter_mut().enumerate() {
@@ -1601,10 +1642,14 @@ impl Qwen4ExpModel {
                     h.eval()
                         .with_context(|| format!("layer {i}: evaluate chunk {p}"))?;
                 }
-                if mark_piece == Some(p) {
-                    snap_layers.push(cache.layers[i].clone());
+                for (j, _) in mark_pieces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, mp)| **mp == Some(p))
+                {
+                    snap_layers[j].push(cache.layers[i].clone());
                     if let Some((k, _)) = &layer.ple {
-                        snap_ple[*k] = cache.ple_conv[*k].clone();
+                        snap_ple[j][*k] = cache.ple_conv[*k].clone();
                     }
                 }
             }
@@ -1612,14 +1657,18 @@ impl Qwen4ExpModel {
 
         // The draft head reads the final residual streams of every position: feed it the
         // group's (the state at the mark is the head's as of the marked chunk).
-        let mut mtp_snapshot = None;
+        let mut mtp_snapshots = vec![None; marks.len()];
         if let Some(st) = cache.mtp.as_mut() {
             for (p, h) in streams.iter().enumerate() {
                 let (s, e) = bounds[p];
                 self.mtp_consume(st, &ids[s..e], h, base_tokens + s == 0)
                     .context("qwen4_exp: feed the draft head")?;
-                if mark_piece == Some(p) {
-                    mtp_snapshot = Some(st.clone());
+                for (j, _) in mark_pieces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, mp)| **mp == Some(p))
+                {
+                    mtp_snapshots[j] = Some(st.clone());
                 }
             }
         }
@@ -1649,14 +1698,20 @@ impl Qwen4ExpModel {
         pending.extend(logits.iter());
         mlx_rs::transforms::eval(pending).context("qwen4_exp: evaluate the group and its state")?;
 
-        let snapshot = mark.map(|m| Qwen4ExpCache {
-            layers: snap_layers,
-            ple_conv: snap_ple,
-            ngram_tail: history[m..keep + m].to_vec(),
-            tokens: base_tokens + m,
-            mtp: mtp_snapshot,
-        });
-        Ok((logits, snapshot))
+        let points = marks
+            .iter()
+            .zip(snap_layers)
+            .zip(snap_ple)
+            .zip(mtp_snapshots)
+            .map(|(((&m, layers), ple_conv), mtp)| Qwen4ExpCache {
+                layers,
+                ple_conv,
+                ngram_tail: history[m..keep + m].to_vec(),
+                tokens: base_tokens + m,
+                mtp,
+            })
+            .collect();
+        Ok((logits, points))
     }
 
     /// `GatedResidual.__call__`: the block input and, when the layer has

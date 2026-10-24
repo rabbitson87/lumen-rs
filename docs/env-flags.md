@@ -44,6 +44,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_PREFIX_EXACT_REUSE` | on | Behavior | `lumen_mlx::prefix_cache::exact_reuse` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 | `LUMEN_QWEN4_BUILD_AHEAD` | off | Optimization | `lumen_mlx::qwen4_exp::model::build_ahead` |
@@ -479,6 +480,23 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
 
+### `LUMEN_PREFIX_EXACT_REUSE`
+
+*Behavior, default on.*
+
+Make a later round of a conversation on a cut-sensitive runner (Flash-Next, a mixture of
+ experts whose numbers depend on where a feed is cut) come out exactly as that round's cold
+ prefill would. Off, a round extends the previous round's full-prompt snapshot, so its feed
+ is cut where the previous prompt ended, a place the round's own cold prefill (cut at the
+ system/tools head, then every prefill chunk from there) does not cut, and the reply can
+ differ from a cold run's. On, a round resumes only from the head or from a point a whole
+ number of prefill chunks past it, kept instead of the full-prompt snapshot (one per
+ conversation, so no more memory), and re-feeds the rest on the cold grid: less than one
+ chunk more per round than the snapshot it replaces, and an identical prompt retried
+ re-feeds that much too. Changes no cold prefill, and nothing on other runners. On by
+ default: on three 6-round agent tasks the snapshot path changed the tool call in 4 of 15
+ later rounds and was no faster on average; `0` restores it.
+
 ### `LUMEN_QWEN35_QUANT_KV`
 
 *Behavior, default off.*
@@ -525,6 +543,8 @@ Decode with the offloaded layers pipelined one segment ahead: submit the GPU wor
 Log MLX's memory (active, cache, peak) and what each sequence holds: after every prefill,
  when a sequence is dropped, and every 32 decode steps with the speed of those steps. For
  finding out where a memory limit is being hit; it adds one allocator query per line.
+ After each prefill it also prints the expert bank's account of that feed alone (layer
+ calls, reads, layer calls that took the staging path), restarting the bank's counters.
 
 ### `LUMEN_QWEN4_STAGE_SYNC`
 

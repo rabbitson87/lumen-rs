@@ -1199,6 +1199,56 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
         }
         prefix_cache::prefill_split_in_two_calls(self, seq_id, tokens, at, keep)
     }
+    // `LUMEN_PREFIX_EXACT_REUSE` (Flash-Next only: the one cut-sensitive runner).
+    fn resume_chunk(&self) -> Option<usize> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::resume_chunk(r.as_ref());
+        }
+        None
+    }
+    fn prefill_split_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>, Option<u64>)> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::prefill_split_marked(
+                r.as_mut(),
+                seq_id,
+                tokens,
+                at,
+                keep,
+                mark,
+            );
+        }
+        if mark.is_some() {
+            anyhow::bail!("only the Flash-Next runner keeps resume points");
+        }
+        let (last, pos, head) =
+            prefix_cache::SnapshotRunner::prefill_split(self, seq_id, tokens, at, keep)?;
+        Ok((last, pos, head, None))
+    }
+    fn extend_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::extend_marked(r.as_mut(), seq_id, tokens, mark);
+        }
+        if mark.is_some() {
+            anyhow::bail!("only the Flash-Next runner keeps resume points");
+        }
+        let (last, pos) = self.as_runner_mut().extend(seq_id, tokens)?;
+        Ok((last, pos, None))
+    }
 }
 
 /// Check `LUMEN_MLX_BACKEND` against the one runner there is.

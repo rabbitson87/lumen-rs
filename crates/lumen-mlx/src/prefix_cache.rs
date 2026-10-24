@@ -49,6 +49,41 @@ use std::time::{Duration, Instant};
 /// Default per-key branch cap when `LUMEN_MLX_PREFIX_CACHE_BRANCHES` is unset.
 const DEFAULT_BRANCHES: usize = 4;
 
+lumen_flags::flag! {
+    /// Make a later round of a conversation on a cut-sensitive runner (Flash-Next, a mixture of
+    /// experts whose numbers depend on where a feed is cut) come out exactly as that round's cold
+    /// prefill would. Off, a round extends the previous round's full-prompt snapshot, so its feed
+    /// is cut where the previous prompt ended, a place the round's own cold prefill (cut at the
+    /// system/tools head, then every prefill chunk from there) does not cut, and the reply can
+    /// differ from a cold run's. On, a round resumes only from the head or from a point a whole
+    /// number of prefill chunks past it, kept instead of the full-prompt snapshot (one per
+    /// conversation, so no more memory), and re-feeds the rest on the cold grid: less than one
+    /// chunk more per round than the snapshot it replaces, and an identical prompt retried
+    /// re-feeds that much too. Changes no cold prefill, and nothing on other runners. On by
+    /// default: on three 6-round agent tasks the snapshot path changed the tool call in 4 of 15
+    /// later rounds and was no faster on average; `0` restores it.
+    pub(crate) exact_reuse {
+        env: "LUMEN_PREFIX_EXACT_REUSE",
+        default: true,
+        kind: Behavior,
+    }
+}
+
+/// The chunk of the grid a round resumes on when [`exact_reuse`] applies to `runner` (on, and
+/// the runner cut-sensitive with a [`SnapshotRunner::resume_chunk`]); `None` otherwise.
+fn exact_grid<R: SnapshotRunner + ?Sized>(runner: &R) -> Option<usize> {
+    if !runner.cut_sensitive() || !exact_reuse::get() {
+        return None;
+    }
+    runner.resume_chunk().filter(|&c| c > 0)
+}
+
+/// The resume point a prompt of `len` tokens leaves on the cold grid that starts at the head
+/// `origin` and steps by `chunk`: the last grid point at or before its end.
+fn grid_point(origin: usize, len: usize, chunk: usize) -> usize {
+    origin + len.saturating_sub(origin) / chunk * chunk
+}
+
 /// Default for incremental chunked-prefill boundary caching (Phase 0). **ON**:
 /// on a cold MISS the stable head (system + rendered tools, via the tools-aware
 /// boundary in `lib.rs::system_tools_head*`) is snapshotted as a
@@ -136,6 +171,81 @@ pub trait SnapshotRunner {
         keep: bool,
     ) -> Result<(u32, usize, Option<u64>)> {
         prefill_split_in_two_calls(self, seq_id, tokens, at, keep)
+    }
+
+    /// The prefill chunk a cut-sensitive runner's cold MISS feeds past the head in, counted from
+    /// the head: with [`exact_reuse`] a later round resumes only from the head or a whole number
+    /// of these past it. `None` (the default): no such grid, and that mode does nothing.
+    fn resume_chunk(&self) -> Option<usize> {
+        None
+    }
+
+    /// [`Self::prefill_split`] that also keeps a deep snapshot of the state at `mark` (a cut of
+    /// that feed: `at` plus a whole number of [`Self::resume_chunk`]s, up to the end): `(next
+    /// token, position, head snapshot, mark snapshot)`. The default splits the prefill at `mark`
+    /// as well, the same cuts in one more call.
+    fn prefill_split_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>, Option<u64>)> {
+        let Some(m) = mark.filter(|&m| m > at && m <= tokens.len()) else {
+            let (last, pos, head) = self.prefill_split(seq_id, tokens, at, keep)?;
+            return Ok((last, pos, head, None));
+        };
+        let (mut last, mut pos, head) = self.prefill_split(seq_id, &tokens[..m], at, keep)?;
+        let point = match self.snapshot_state_deep(seq_id) {
+            Ok((snap, _)) => snap,
+            Err(e) => {
+                if let Some(h) = head {
+                    let _ = self.release_snapshot(h);
+                }
+                return Err(e);
+            }
+        };
+        if m < tokens.len() {
+            match self.extend(seq_id, &tokens[m..]) {
+                Ok(le) => (last, pos) = le,
+                Err(e) => {
+                    for snap in head.into_iter().chain([point]) {
+                        let _ = self.release_snapshot(snap);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok((last, pos, head, Some(point)))
+    }
+
+    /// [`Self::extend`] that also keeps a deep snapshot of the state `mark` tokens in, `mark`
+    /// being one of the extend's chunk ends (a whole number of [`Self::resume_chunk`]s, or all of
+    /// `tokens`): `(next token, position, snapshot)`. The default extends in two calls split at
+    /// `mark`, the same cuts.
+    fn extend_marked(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        mark: Option<usize>,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        let Some(m) = mark.filter(|&m| m > 0 && m <= tokens.len()) else {
+            let (last, pos) = self.extend(seq_id, tokens)?;
+            return Ok((last, pos, None));
+        };
+        let (mut last, mut pos) = self.extend(seq_id, &tokens[..m])?;
+        let (point, _) = self.snapshot_state_deep(seq_id)?;
+        if m < tokens.len() {
+            match self.extend(seq_id, &tokens[m..]) {
+                Ok(le) => (last, pos) = le,
+                Err(e) => {
+                    let _ = self.release_snapshot(point);
+                    return Err(e);
+                }
+            }
+        }
+        Ok((last, pos, Some(point)))
     }
 }
 
@@ -231,6 +341,11 @@ pub struct PrefixCacheEntry {
     /// guard keeps both so a later prefix-sharing-but-divergent prompt can still
     /// fork the head. Always `false` for full-prompt / boundary-store entries.
     pub pinned_boundary: bool,
+    /// For a cut-sensitive runner, where the cold grid this entry lies on starts: a head's own
+    /// length, or, for a resume point [`exact_reuse`] keeps, the head of the conversation it was
+    /// taken in (the point sits a whole number of prefill chunks past it). `None` for every other
+    /// entry, which that mode only serves to the identical prompt.
+    pub grid_origin: Option<usize>,
 }
 
 /// Keyed store of prefix-cache master snapshots plus its TTL / LRU policy.
@@ -417,12 +532,14 @@ impl PrefixCacheStore {
         };
         self.evict_stale(runner);
         let heads_only = runner.cut_sensitive();
+        // `LUMEN_PREFIX_EXACT_REUSE`: the chunk of the cold grid a round resumes on.
+        let exact = exact_grid(runner);
 
         // LPM: among this key's candidates, pick the one whose prefix is the
         // longest prefix of `prompt_ids`. HIT requires either a strict extension
         // (suffix non-empty) or a byte-identical prompt with a stored argmax
         // (`last_token`) — the omp exact-retry case.
-        let ram_hit = self.longest_hit(key, prompt_ids);
+        let ram_hit = self.longest_hit(key, prompt_ids, exact.is_some());
         // The shared-prefix boundary costs an encode of the whole system+tools head, so it is
         // read on an in-memory miss only: by a cut-sensitive runner before its disk probe (which
         // asks for exactly that head), otherwise at the cold MISS, as it always was.
@@ -451,6 +568,7 @@ impl PrefixCacheStore {
                         prefix_tokens.len(),
                         if pinned_boundary { " (a head)" } else { "" }
                     );
+                    let grid_origin = pinned_boundary.then_some(prefix_tokens.len());
                     self.insert_branch(
                         runner,
                         key,
@@ -462,9 +580,10 @@ impl PrefixCacheStore {
                             last_token,
                             in_use: 0,
                             pinned_boundary,
+                            grid_origin,
                         },
                     );
-                    self.longest_hit(key, prompt_ids)
+                    self.longest_hit(key, prompt_ids, exact.is_some())
                 }
                 Ok(None) => None,
                 Err(e) => {
@@ -475,11 +594,24 @@ impl PrefixCacheStore {
         };
 
         if let Some(idx) = hit {
-            let (master, prefix, cached_last) = {
+            let (master, prefix, cached_last, origin) = {
                 let e = &self.entries[key][idx];
-                (e.master_snapshot_id, e.prefix_tokens.clone(), e.last_token)
+                (
+                    e.master_snapshot_id,
+                    e.prefix_tokens.clone(),
+                    e.last_token,
+                    e.grid_origin,
+                )
             };
             let suffix = &prompt_ids[prefix.len()..];
+            // Exact reuse: the matched entry lies on this prompt's cold grid (`longest_hit` serves
+            // nothing else but an identical prompt), so the suffix is fed in chunks counted from
+            // it, and the state at the last grid point is kept for the next round.
+            let resume = exact.zip(origin).map(|(chunk, o)| {
+                let g = grid_point(o, prompt_ids.len(), chunk);
+                (o, g, (g > prefix.len()).then(|| g - prefix.len()))
+            });
+            let mut point = None;
             let t = Instant::now();
             // Lock the source entry across fork+extend so a re-entrant eviction
             // cannot release `master` mid-flight.
@@ -497,8 +629,17 @@ impl PrefixCacheStore {
                             prefix.len(),
                         )
                     } else {
-                        match runner.extend(seq_id, suffix) {
-                            Ok(le) => le,
+                        let fed = match resume {
+                            Some((_, _, Some(mark))) => {
+                                runner.extend_marked(seq_id, suffix, Some(mark))
+                            }
+                            _ => runner.extend(seq_id, suffix).map(|(l, p)| (l, p, None)),
+                        };
+                        match fed {
+                            Ok((l, p, kept)) => {
+                                point = kept;
+                                (l, p)
+                            }
                             Err(e) => {
                                 self.set_in_use(key, idx, false);
                                 return Err(e);
@@ -523,11 +664,43 @@ impl PrefixCacheStore {
             // Skipped on an empty suffix: the forked state already equals the
             // stored snapshot, so re-snapshotting would only churn ~3GB of KV.
             let mut advanced_to = prefix.len();
-            if suffix.is_empty() {
+            if suffix.is_empty() || exact.is_some() {
                 self.set_in_use(key, idx, false);
                 if let Some(e) = self.entries.get_mut(key).and_then(|v| v.get_mut(idx)) {
                     e.last_access = Instant::now();
                     e.hits += 1;
+                }
+                // Exact reuse keeps the new resume point instead of the full prompt; it replaces
+                // the matched entry unless that is a head. No new point (the prompt did not reach
+                // the next grid point): the matched one stays the conversation's.
+                if let (Some(snap), Some((o, g, _))) = (point, resume) {
+                    // A head the memory plan had no room for (`skip_head`: it was just read back
+                    // from disk) goes once the point replaces it, as it would without the flag.
+                    if skip_head
+                        && let Some(v) = self.entries.get_mut(key)
+                        && let Some(i) = v
+                            .iter()
+                            .position(|e| e.master_snapshot_id == master && e.pinned_boundary)
+                    {
+                        let head = v.remove(i);
+                        let _ = runner.release_snapshot(head.master_snapshot_id);
+                    }
+                    self.insert_branch(
+                        runner,
+                        key,
+                        PrefixCacheEntry {
+                            master_snapshot_id: snap,
+                            prefix_tokens: prompt_ids[..g].to_vec(),
+                            last_access: Instant::now(),
+                            hits: 0,
+                            last_token: (g == prompt_ids.len()).then_some(last),
+                            in_use: 0,
+                            pinned_boundary: false,
+                            grid_origin: Some(o),
+                        },
+                    );
+                    self.evict_stale(runner);
+                    advanced_to = g;
                 }
             } else {
                 // A head is kept beside the advanced prompt, unless the memory plan made room for
@@ -563,6 +736,7 @@ impl PrefixCacheStore {
                                 last_token: Some(last),
                                 in_use: 0,
                                 pinned_boundary: false,
+                                grid_origin: None,
                             },
                         );
                         self.evict_stale(runner);
@@ -590,6 +764,7 @@ impl PrefixCacheStore {
                                 last_token: Some(last),
                                 in_use: 0,
                                 pinned_boundary: false,
+                                grid_origin: None,
                             };
                             prev
                         };
@@ -646,7 +821,65 @@ impl PrefixCacheStore {
             None
         };
         let do_incremental = incremental_boundary.is_some_and(|b| b > 0 && b < prompt_ids.len());
-        let (last, pos) = if do_incremental {
+        // Exact reuse with a head: the resume point this prompt leaves on its cold grid, kept in
+        // the same pass instead of the full prompt's snapshot (the head itself when the prompt
+        // ends less than a chunk past it).
+        let resume = exact
+            .zip(incremental_boundary.filter(|_| do_incremental))
+            .map(|(chunk, b)| (b, grid_point(b, prompt_ids.len(), chunk)));
+        let (last, pos) = if let Some((b, g)) = resume {
+            // The head is this conversation's resume point when `g == b`: kept whatever
+            // `skip_head` says, since it then stands in for the full-prompt snapshot.
+            let keep_head = !skip_head || g == b;
+            let (last, pos, head, point) = runner.prefill_split_marked(
+                seq_id,
+                prompt_ids,
+                b,
+                keep_head,
+                (g > b).then_some(g),
+            )?;
+            if let Some(snap_b) = head {
+                self.insert_branch(
+                    runner,
+                    key,
+                    PrefixCacheEntry {
+                        master_snapshot_id: snap_b,
+                        prefix_tokens: prompt_ids[..b].to_vec(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                        last_token: None,
+                        in_use: 0,
+                        pinned_boundary: true,
+                        grid_origin: Some(b),
+                    },
+                );
+            }
+            if let Some(snap) = point {
+                self.insert_branch(
+                    runner,
+                    key,
+                    PrefixCacheEntry {
+                        master_snapshot_id: snap,
+                        prefix_tokens: prompt_ids[..g].to_vec(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                        last_token: (g == prompt_ids.len()).then_some(last),
+                        in_use: 0,
+                        pinned_boundary: false,
+                        grid_origin: Some(b),
+                    },
+                );
+            }
+            self.evict_stale(runner);
+            eprintln!(
+                "[mlx] prefix-cache MISS (tools) key={key:?} exact: head at {b}, resume point at \
+                 {g} of {} branches={}",
+                prompt_ids.len(),
+                self.entries.get(key).map(|v| v.len()).unwrap_or(0),
+            );
+            self.pending_persist = self.head_pending(key, prompt_ids);
+            return Ok((last, pos));
+        } else if do_incremental {
             let b = incremental_boundary.unwrap();
             // Out of memory for a second snapshot (`skip_head`): the prompt is still fed in the
             // same two stages, so its numbers do not change; only the head's copy is not kept.
@@ -667,6 +900,7 @@ impl PrefixCacheStore {
                         last_token: None,
                         in_use: 0,
                         pinned_boundary: true,
+                        grid_origin: Some(b),
                     },
                 );
             }
@@ -676,6 +910,8 @@ impl PrefixCacheStore {
         };
         match runner.snapshot_state_deep(seq_id) {
             Ok((snap_id, _snap_pos)) => {
+                // Not on any later prompt's cold grid: exact reuse serves it to the identical
+                // prompt only (see `longest_hit`).
                 self.insert_branch(
                     runner,
                     key,
@@ -687,6 +923,7 @@ impl PrefixCacheStore {
                         last_token: Some(last),
                         in_use: 0,
                         pinned_boundary: false,
+                        grid_origin: None,
                     },
                 );
                 self.evict_stale(runner);
@@ -750,13 +987,30 @@ impl PrefixCacheStore {
     /// its first decode step. A MISS holds the working sequence, the prompt's snapshot and, with
     /// incremental caching and a path that takes one (`head`; the tools path does, the streaming
     /// boundary path does not), the head's: two or three copies.
-    pub fn feed_cost(&self, key: Option<&str>, prompt_ids: &[u32], head: bool) -> (usize, usize) {
+    #[cfg(test)]
+    pub(crate) fn feed_cost(
+        &self,
+        key: Option<&str>,
+        prompt_ids: &[u32],
+        head: bool,
+    ) -> (usize, usize) {
+        self.feed_cost_as(key, prompt_ids, head, false)
+    }
+
+    /// [`Self::feed_cost`] with the HIT [`exact_reuse`] would pick (`exact`).
+    fn feed_cost_as(
+        &self,
+        key: Option<&str>,
+        prompt_ids: &[u32],
+        head: bool,
+        exact: bool,
+    ) -> (usize, usize) {
         let n = prompt_ids.len();
         let Some(key) = key.filter(|_| self.enabled) else {
             return (n, 1);
         };
         match self
-            .longest_hit(key, prompt_ids)
+            .longest_hit(key, prompt_ids, exact)
             .map(|i| &self.entries[key][i])
         {
             Some(e) if e.prefix_tokens.len() == n => (n, 1),
@@ -858,7 +1112,8 @@ impl PrefixCacheStore {
         head: bool,
     ) -> FeedPlan {
         self.skip_head = false;
-        let (mut kv_tokens, mut states) = self.feed_cost(key, prompt_ids, head);
+        let exact = exact_grid(runner).is_some();
+        let (mut kv_tokens, mut states) = self.feed_cost_as(key, prompt_ids, head, exact);
         if !crate::session::memory_evict::get() || !self.enabled {
             return FeedPlan {
                 kv_tokens,
@@ -867,7 +1122,7 @@ impl PrefixCacheStore {
             };
         }
         let fork = key.and_then(|k| {
-            self.longest_hit(k, prompt_ids)
+            self.longest_hit(k, prompt_ids, exact)
                 .map(|i| self.entries[k][i].master_snapshot_id)
         });
         if key.is_some() && fork.is_none() && head && self.incremental {
@@ -923,7 +1178,10 @@ impl PrefixCacheStore {
     /// either the suffix is non-empty (strict extension) or `last_token` is set
     /// (exact-retry). Ties break toward the longer prefix; equal length keeps the
     /// first (deterministic).
-    fn longest_hit(&self, key: &str, prompt_ids: &[u32]) -> Option<usize> {
+    ///
+    /// With `exact` (see [`exact_reuse`]) an entry off the cold grid (`grid_origin` `None`) is
+    /// served to the identical prompt only: extending it would cut where no cold prefill does.
+    fn longest_hit(&self, key: &str, prompt_ids: &[u32], exact: bool) -> Option<usize> {
         let cands = self.entries.get(key)?;
         let mut best: Option<(usize, usize)> = None; // (index, prefix_len)
         for (i, e) in cands.iter().enumerate() {
@@ -932,7 +1190,8 @@ impl PrefixCacheStore {
                 continue;
             }
             let extends = prompt_ids.len() > p.len();
-            if !(extends || e.last_token.is_some()) {
+            if !(extends || e.last_token.is_some()) || (exact && extends && e.grid_origin.is_none())
+            {
                 continue;
             }
             match best {
@@ -1101,6 +1360,7 @@ impl PrefixCacheStore {
                 last_token,
                 in_use: 0,
                 pinned_boundary: false,
+                grid_origin: None,
             },
         );
         self.evict_stale(runner);
@@ -2150,6 +2410,7 @@ mod tests {
             last_token: None,
             in_use: 0,
             pinned_boundary: false,
+            grid_origin: None,
         }
     }
 
@@ -2506,6 +2767,9 @@ mod tests {
         fn cut_sensitive(&self) -> bool {
             true
         }
+        fn resume_chunk(&self) -> Option<usize> {
+            Some(4)
+        }
     }
 
     /// A 20-token prompt whose first 12 tokens are the system/tools head; `tail` picks the rest.
@@ -2555,6 +2819,126 @@ mod tests {
             .unwrap();
         store.flush_persist(&mut r);
         assert_eq!(persists(&r), ["persist(0,12,None)", "persist(0,12,None)"]);
+    }
+
+    /// `LUMEN_PREFIX_EXACT_REUSE` (head 12, chunks of 4): a round resumes from the last grid point
+    /// its conversation reached and keeps the next one, in place of the full prompt; a round that
+    /// reaches no new grid point keeps the old one; an identical prompt whose end is off the grid
+    /// re-feeds from the point before it.
+    #[test]
+    fn exact_reuse_resumes_only_from_grid_points() {
+        exact_reuse::with(true, || {
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let mut r = HeadsRunner::default();
+            let p1 = headed(1);
+            store
+                .prefill_optionally_cached(&mut r, 1, &p1, Some("k"), Some(12))
+                .unwrap();
+            // The 20-token prompt ends on the grid (12 + 2 x 4): its end is the point, kept in
+            // the cold feed's own stages, and no full-prompt snapshot beside it.
+            assert_eq!(
+                r.log,
+                [
+                    "load->miss",
+                    "prefill(12)",
+                    "snapshot->0",
+                    "extend(8)",
+                    "snapshot->1"
+                ]
+            );
+            assert_eq!(
+                store.branches_for_test("k"),
+                [(12, 0, true), (20, 0, false)]
+            );
+
+            // 23 tokens: no grid point past 20, so the point stays and nothing new is kept.
+            r.log.clear();
+            let mut p2 = p1.clone();
+            p2.extend([7, 7, 7]);
+            store
+                .prefill_optionally_cached(&mut r, 2, &p2, Some("k"), Some(12))
+                .unwrap();
+            assert_eq!(r.log, ["fork(1)", "extend(3)"]);
+            assert_eq!(
+                store.branches_for_test("k"),
+                [(12, 0, true), (20, 1, false)]
+            );
+
+            // 26 tokens: the point at 24 replaces the one at 20.
+            r.log.clear();
+            let mut p3 = p2.clone();
+            p3.extend([7, 7, 7]);
+            store
+                .prefill_optionally_cached(&mut r, 3, &p3, Some("k"), Some(12))
+                .unwrap();
+            assert_eq!(
+                r.log,
+                [
+                    "fork(1)",
+                    "extend(4)",
+                    "snapshot->2",
+                    "extend(2)",
+                    "release(1)"
+                ]
+            );
+            assert_eq!(
+                store.branches_for_test("k"),
+                [(12, 0, true), (24, 0, false)]
+            );
+
+            // The 26-token prompt again: its end is off the grid, so it re-feeds from 24.
+            r.log.clear();
+            let (tok, _) = store
+                .prefill_optionally_cached(&mut r, 4, &p3, Some("k"), Some(12))
+                .unwrap();
+            assert_eq!(tok, EXTEND_TOK);
+            assert_eq!(r.log, ["fork(2)", "extend(2)"]);
+        });
+    }
+
+    /// Exact reuse with no head to cut at (no boundary): the prompt is fed whole, as with the cache
+    /// off, and its snapshot serves the identical prompt only. A longer prompt is fed cold rather
+    /// than extended from a place its own cold prefill does not cut.
+    #[test]
+    fn exact_reuse_without_a_head_serves_only_the_identical_prompt() {
+        exact_reuse::with(true, || {
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let mut r = HeadsRunner::default();
+            let p = headed(1);
+            store
+                .prefill_optionally_cached(&mut r, 1, &p, Some("k"), None)
+                .unwrap();
+            assert_eq!(r.log, ["prefill(20)", "snapshot->0"]);
+            r.log.clear();
+            let (tok, _) = store
+                .prefill_optionally_cached(&mut r, 2, &p, Some("k"), None)
+                .unwrap();
+            assert_eq!(tok, PREFILL_TOK);
+            assert_eq!(r.log, ["fork(0)"], "the identical prompt");
+            r.log.clear();
+            let mut longer = p.clone();
+            longer.push(5);
+            store
+                .prefill_optionally_cached(&mut r, 3, &longer, Some("k"), None)
+                .unwrap();
+            assert_eq!(r.log, ["prefill(21)", "snapshot->1", "release(0)"]);
+        });
+        // Off, the same longer prompt extends the snapshot (the behaviour the flag replaces).
+        exact_reuse::with(false, || {
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let mut r = HeadsRunner::default();
+            let p = headed(1);
+            store
+                .prefill_optionally_cached(&mut r, 1, &p, Some("k"), None)
+                .unwrap();
+            r.log.clear();
+            let mut longer = p.clone();
+            longer.push(5);
+            store
+                .prefill_optionally_cached(&mut r, 3, &longer, Some("k"), None)
+                .unwrap();
+            assert_eq!(r.log[..2], ["fork(0)", "extend(1)"]);
+        });
     }
 
     /// After a restart the memory is empty: a prompt with the same head but another tail forks the
@@ -2675,19 +3059,28 @@ mod tests {
     /// is then released (it stays on disk): the prompt keeps only the copies it was planned for.
     #[test]
     fn a_head_read_back_for_a_prompt_planned_without_one_is_not_kept() {
-        let mut r = HeadsRunner::default();
-        r.disk.insert(
-            crate::kv_disk::head_key(&headed(1)[..12]),
-            headed(1)[..12].to_vec(),
-        );
-        r.next_snap = 40;
-        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
-        store.skip_head = true;
-        store
-            .prefill_optionally_cached(&mut r, 1, &headed(2), Some("k"), Some(12))
-            .unwrap();
+        let run = |exact: bool| {
+            exact_reuse::with(exact, || {
+                let mut r = HeadsRunner::default();
+                r.disk.insert(
+                    crate::kv_disk::head_key(&headed(1)[..12]),
+                    headed(1)[..12].to_vec(),
+                );
+                r.next_snap = 40;
+                let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+                store.skip_head = true;
+                store
+                    .prefill_optionally_cached(&mut r, 1, &headed(2), Some("k"), Some(12))
+                    .unwrap();
+                let branches = store.branches_for_test("k");
+                store.flush_persist(&mut r);
+                (r.log.clone(), branches, persists(&r).is_empty())
+            })
+        };
+        // Snapshot path: the full prompt is kept, the head read back for it is released.
+        let (log, branches, nothing_persisted) = run(false);
         assert_eq!(
-            r.log,
+            log,
             [
                 "load(12)->40",
                 "fork(40)",
@@ -2696,8 +3089,13 @@ mod tests {
                 "release(40)"
             ]
         );
-        assert_eq!(store.branches_for_test("k"), [(20, 1, false)]);
-        store.flush_persist(&mut r);
-        assert!(persists(&r).is_empty());
+        assert_eq!(branches, [(20, 1, false)]);
+        assert!(nothing_persisted);
+        // Exact reuse (the default) keeps a grid point instead, and still releases the head.
+        let (log, branches, nothing_persisted) = run(true);
+        assert_eq!(log[..2], ["load(12)->40", "fork(40)"]);
+        assert!(log.iter().any(|l| l == "release(40)"), "{log:?}");
+        assert!(branches.iter().all(|&(_, _, head)| !head), "{branches:?}");
+        assert!(nothing_persisted);
     }
 }
