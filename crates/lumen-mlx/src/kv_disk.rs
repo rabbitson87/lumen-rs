@@ -740,6 +740,18 @@ impl DiskKvStore {
         self.index.entries.iter().any(|e| e.key == key)
     }
 
+    /// Mark `key` as used now, so the last-access TTL and the LRU budget keep an
+    /// entry that is read from memory instead of from here. Returns whether the
+    /// key is stored. Reads no file.
+    pub fn touch(&mut self, key: &str) -> Result<bool> {
+        let Some(e) = self.index.entries.iter_mut().find(|e| e.key == key) else {
+            return Ok(false);
+        };
+        e.last_access_unix = now_unix();
+        self.save_index()?;
+        Ok(true)
+    }
+
     /// Load a snapshot by `key`. Returns `None` on miss, on fingerprint
     /// mismatch, or on a corrupt/unreadable file (treated as a miss, never a
     /// crash). Bumps the entry's access time + hit count on success.
@@ -954,6 +966,24 @@ pub fn point_key(chunk: usize, tokens: &[u32]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect();
     format!("pt-{hex}")
+}
+
+/// The store key of a prefix-cache head (the state after a system prompt and
+/// its tools) whose tokens are `tokens`: a content hash, the same in every
+/// process, so a restart finds the head of each system prompt it served. The
+/// prefill grid the head was computed on is part of the store's identity.
+pub fn head_key(tokens: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((tokens.len() as u64).to_le_bytes());
+    for t in tokens {
+        h.update(t.to_le_bytes());
+    }
+    let hex: String = h.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("hd-{hex}")
 }
 
 // ---------------------------------------------------------------------------

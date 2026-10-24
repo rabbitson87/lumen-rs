@@ -1133,8 +1133,9 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
     fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
         self.as_runner_mut().release_snapshot(snapshot_id)
     }
-    // L2 disk tier hooks (tools path). Forward to the inherent methods, which
-    // are no-ops on non-native backends / when the disk tier is off.
+    // L2 disk tier hooks (tools path). Flash-Next keeps system-prompt heads (its
+    // own `SnapshotRunner` impl); the others forward to the inherent methods,
+    // which are no-ops on non-native backends / when the tier is off.
     fn persist_snapshot(
         &mut self,
         snapshot_id: u64,
@@ -1142,6 +1143,16 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
         prefix_tokens: &[u32],
         last_token: Option<u32>,
     ) -> Result<()> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::persist_snapshot(
+                r.as_mut(),
+                snapshot_id,
+                key,
+                prefix_tokens,
+                last_token,
+            );
+        }
         RunnerImpl::persist_snapshot_disk(self, snapshot_id, key, prefix_tokens, last_token)
     }
     fn load_persisted_snapshot(
@@ -1149,10 +1160,44 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
         key: &str,
         prompt_ids: &[u32],
     ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::load_persisted_snapshot(
+                r.as_mut(),
+                key,
+                prompt_ids,
+            );
+        }
         RunnerImpl::load_persisted_disk(self, key, prompt_ids)
     }
     fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
         memory_shortfall(self, kv_tokens, states)
+    }
+    fn cut_sensitive(&self) -> bool {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::cut_sensitive(r.as_ref());
+        }
+        false
+    }
+    fn prefill_split(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return prefix_cache::SnapshotRunner::prefill_split(
+                r.as_mut(),
+                seq_id,
+                tokens,
+                at,
+                keep,
+            );
+        }
+        prefix_cache::prefill_split_in_two_calls(self, seq_id, tokens, at, keep)
     }
 }
 

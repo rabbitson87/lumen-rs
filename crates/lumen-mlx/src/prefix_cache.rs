@@ -23,6 +23,17 @@
 //! sequence — and therefore the returned token and KV state — is bit-identical
 //! to the previous single-entry implementation.
 //!
+//! **Cut-sensitive runners.** On a runner whose numbers depend on where a feed
+//! is cut (a mixture-of-experts model; see `session_feed` and
+//! [`SnapshotRunner::cut_sensitive`]) a state resumes exactly only at a cut the
+//! cold prefill makes as well. The incremental head is one: every cold MISS
+//! with that system prompt is fed in two stages split at the system/tools
+//! boundary ([`SnapshotRunner::prefill_split`]). So the disk tier keeps heads
+//! only, under a key made from their tokens ([`crate::kv_disk::head_key`]): a
+//! head forked from memory, restored after a restart, or reloaded after the
+//! memory plan dropped it continues exactly what a cold prefill computes. Other
+//! runners (the default) are unchanged.
+//!
 //! The driver is generic over [`SnapshotRunner`], so any backend whose runner
 //! can snapshot / fork / extend its KV state reuses this logic. It is currently
 //! wired into the Qwen3.6 tools path (non-rotating `NativeKvCache`). Gemma 4 —
@@ -97,6 +108,92 @@ pub trait SnapshotRunner {
     /// spare.
     fn memory_shortfall(&self, _kv_tokens: usize, _states: usize) -> u64 {
         0
+    }
+
+    /// Whether where a feed is cut changes this runner's numbers (a mixture-of-experts model: a
+    /// routed row's result depends on the other rows in its call; see `session_feed`), so that a
+    /// state resumes exactly only at a cut a cold prefill of the prompt also makes. `true` gives
+    /// the disk tier heads only: the head of a cold MISS sits at the system/tools boundary, where
+    /// the cold MISS of every prompt with that system prompt cuts too ([`Self::prefill_split`]),
+    /// so forking it — from memory, after a restart, or after the memory plan dropped the copy in
+    /// memory — and extending is the cold computation. A full prompt's snapshot (the latest turn)
+    /// is not: the next turn's cold prefill does not cut where that turn ended. `false` (the
+    /// default) persists the latest full prompt under the prefix key, as before.
+    fn cut_sensitive(&self) -> bool {
+        false
+    }
+
+    /// Feed `tokens` from position 0 as `prefill(tokens[..at])` followed by
+    /// `extend(tokens[at..])` would — the same chunks, so the same numbers — keeping a deep
+    /// snapshot of the state at `at` when `keep`: `(next token, position, snapshot id)`. The
+    /// default makes those two calls ([`prefill_split_in_two_calls`]); a runner that reads its
+    /// weights once per call overrides it to take one pass.
+    fn prefill_split(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        prefill_split_in_two_calls(self, seq_id, tokens, at, keep)
+    }
+}
+
+/// [`SnapshotRunner::prefill_split`] as two calls: prefill to `at`, snapshot (when `keep`), extend
+/// the rest. A snapshot that fails is skipped with a log line (the prompt is still fed in the same
+/// two stages); one taken is released again if the extend fails, so nothing is left unowned.
+pub(crate) fn prefill_split_in_two_calls<R: SnapshotRunner + ?Sized>(
+    runner: &mut R,
+    seq_id: u64,
+    tokens: &[u32],
+    at: usize,
+    keep: bool,
+) -> Result<(u32, usize, Option<u64>)> {
+    runner.prefill(seq_id, &tokens[..at])?;
+    let snap = if keep {
+        match runner.snapshot_state_deep(seq_id) {
+            Ok((snap, _)) => Some(snap),
+            Err(e) => {
+                eprintln!(
+                    "[mlx] prefix-cache: incremental boundary snapshot skipped (boundary={at}): {e:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    match runner.extend(seq_id, &tokens[at..]) {
+        Ok((last, pos)) => Ok((last, pos, snap)),
+        Err(e) => {
+            if let Some(snap) = snap {
+                let _ = runner.release_snapshot(snap);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The disk tier's candidate for `prompt_ids` under prefix key `key` after an in-memory miss. A
+/// cut-sensitive runner (`heads_only`) is asked for this prompt's own head, the one its cold MISS
+/// cuts at (`head`, the system/tools boundary), filed under the head's tokens; with no such cut
+/// (no boundary, or incremental caching off) it is asked for nothing. Any other runner is asked
+/// for the latest snapshot under `key`.
+fn probe_disk<R: SnapshotRunner>(
+    runner: &mut R,
+    key: &str,
+    prompt_ids: &[u32],
+    heads_only: bool,
+    head: Option<usize>,
+) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+    if !heads_only {
+        return runner.load_persisted_snapshot(key, prompt_ids);
+    }
+    match head.filter(|&b| b > 0 && b < prompt_ids.len()) {
+        Some(b) => {
+            runner.load_persisted_snapshot(&crate::kv_disk::head_key(&prompt_ids[..b]), prompt_ids)
+        }
+        None => Ok(None),
     }
 }
 
@@ -234,7 +331,7 @@ impl PrefixCacheStore {
 
     /// Construct with explicit policy + branch cap + incremental flag (test-only).
     #[cfg(test)]
-    fn with_incremental(enabled: bool, branches: usize, incremental: bool) -> Self {
+    pub(crate) fn with_incremental(enabled: bool, branches: usize, incremental: bool) -> Self {
         Self {
             entries: HashMap::new(),
             enabled,
@@ -250,7 +347,7 @@ impl PrefixCacheStore {
     /// [`Self::prefill_optionally_cached_with`] with the boundary given as a
     /// value — the shape most tests want (test-only).
     #[cfg(test)]
-    fn prefill_optionally_cached<R: SnapshotRunner>(
+    pub(crate) fn prefill_optionally_cached<R: SnapshotRunner>(
         &mut self,
         runner: &mut R,
         seq_id: u64,
@@ -319,12 +416,23 @@ impl PrefixCacheStore {
             None => return runner.prefill(seq_id, prompt_ids),
         };
         self.evict_stale(runner);
+        let heads_only = runner.cut_sensitive();
 
         // LPM: among this key's candidates, pick the one whose prefix is the
         // longest prefix of `prompt_ids`. HIT requires either a strict extension
         // (suffix non-empty) or a byte-identical prompt with a stored argmax
         // (`last_token`) — the omp exact-retry case.
-        let hit = match self.longest_hit(key, prompt_ids) {
+        let ram_hit = self.longest_hit(key, prompt_ids);
+        // The shared-prefix boundary costs an encode of the whole system+tools head, so it is
+        // read on an in-memory miss only: by a cut-sensitive runner before its disk probe (which
+        // asks for exactly that head), otherwise at the cold MISS, as it always was.
+        let mut boundary = Some(boundary);
+        let head_boundary = if ram_hit.is_none() && self.incremental && heads_only {
+            boundary.take().and_then(|f| f())
+        } else {
+            None
+        };
+        let hit = match ram_hit {
             Some(idx) => Some(idx),
             // L2 disk tier: on an in-memory miss, try to rehydrate a persisted
             // snapshot for this key (survives restart / eviction). With the disk
@@ -332,8 +440,17 @@ impl PrefixCacheStore {
             // byte-identical to the original cold-MISS path. On a disk HIT we
             // register the rehydrated snapshot as a branch and re-run LPM so the
             // standard fork+extend path below handles it uniformly.
-            None => match runner.load_persisted_snapshot(key, prompt_ids) {
+            // A cut-sensitive runner keeps heads only (see `probe_disk`).
+            None => match probe_disk(runner, key, prompt_ids, heads_only, head_boundary) {
                 Ok(Some((snap_id, prefix_tokens, last_token))) => {
+                    // A head restored from disk stays a head: the prompt that advances from it
+                    // keeps it for the next conversation instead of replacing it.
+                    let pinned_boundary = heads_only;
+                    eprintln!(
+                        "[mlx] prefix-cache key={key:?}: {} tokens restored from disk{}",
+                        prefix_tokens.len(),
+                        if pinned_boundary { " (a head)" } else { "" }
+                    );
                     self.insert_branch(
                         runner,
                         key,
@@ -344,7 +461,7 @@ impl PrefixCacheStore {
                             hits: 0,
                             last_token,
                             in_use: 0,
-                            pinned_boundary: false,
+                            pinned_boundary,
                         },
                     );
                     self.longest_hit(key, prompt_ids)
@@ -413,11 +530,16 @@ impl PrefixCacheStore {
                     e.hits += 1;
                 }
             } else {
-                let matched_pinned = self
-                    .entries
-                    .get(key)
-                    .and_then(|v| v.get(idx))
-                    .is_some_and(|e| e.pinned_boundary);
+                // A head is kept beside the advanced prompt, unless the memory plan made room for
+                // no head (`skip_head`; set only for a prompt with no HIT in memory, so this head
+                // was just read back from disk): then it is replaced like any other branch, and
+                // stays on disk for the next conversation.
+                let matched_pinned = !skip_head
+                    && self
+                        .entries
+                        .get(key)
+                        .and_then(|v| v.get(idx))
+                        .is_some_and(|e| e.pinned_boundary);
                 match runner.snapshot_state_deep(seq_id) {
                     Ok((snap_id, _)) if matched_pinned => {
                         // The match was an incremental boundary head (Phase 0).
@@ -497,6 +619,9 @@ impl PrefixCacheStore {
                 prefix.len(),
                 suffix.len()
             );
+            if heads_only {
+                self.pending_persist = self.head_pending(key, prompt_ids);
+            }
             return Ok((last, pos));
         }
 
@@ -513,44 +638,39 @@ impl PrefixCacheStore {
         // unchanged from a one-shot prefill — only an extra reusable snapshot is
         // created. With the feature off (or no/invalid boundary) this is the
         // exact original single-prefill path.
-        let incremental_boundary = if self.incremental { boundary() } else { None };
+        let incremental_boundary = if heads_only {
+            head_boundary
+        } else if self.incremental {
+            boundary.take().and_then(|f| f())
+        } else {
+            None
+        };
         let do_incremental = incremental_boundary.is_some_and(|b| b > 0 && b < prompt_ids.len());
         let (last, pos) = if do_incremental {
             let b = incremental_boundary.unwrap();
-            let _ = runner.prefill(seq_id, &prompt_ids[..b])?;
-            // Out of memory for a second snapshot (`skip_head`): the prompt is still prefilled
-            // in the same two stages, so its numbers do not change; only the head's copy is not
-            // kept.
-            if !skip_head {
-                match runner.snapshot_state_deep(seq_id) {
-                    Ok((snap_b, _)) => {
-                        // last_token = None: an exact-prompt-==-head retry must
-                        // re-extend for fresh logits (same contract as the streaming
-                        // boundary `store_master`). `pinned_boundary` keeps it alive
-                        // when the full-prompt branch is inserted below.
-                        self.insert_branch(
-                            runner,
-                            key,
-                            PrefixCacheEntry {
-                                master_snapshot_id: snap_b,
-                                prefix_tokens: prompt_ids[..b].to_vec(),
-                                last_access: Instant::now(),
-                                hits: 0,
-                                last_token: None,
-                                in_use: 0,
-                                pinned_boundary: true,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[mlx] prefix-cache: incremental boundary snapshot skipped \
-                             (key={key:?}, boundary={b}): {e:#}"
-                        );
-                    }
-                }
+            // Out of memory for a second snapshot (`skip_head`): the prompt is still fed in the
+            // same two stages, so its numbers do not change; only the head's copy is not kept.
+            let (last, pos, head) = runner.prefill_split(seq_id, prompt_ids, b, !skip_head)?;
+            if let Some(snap_b) = head {
+                // last_token = None: an exact-prompt-==-head retry must
+                // re-extend for fresh logits (same contract as the streaming
+                // boundary `store_master`). `pinned_boundary` keeps it alive
+                // when the full-prompt branch is inserted below.
+                self.insert_branch(
+                    runner,
+                    key,
+                    PrefixCacheEntry {
+                        master_snapshot_id: snap_b,
+                        prefix_tokens: prompt_ids[..b].to_vec(),
+                        last_access: Instant::now(),
+                        hits: 0,
+                        last_token: None,
+                        in_use: 0,
+                        pinned_boundary: true,
+                    },
+                );
             }
-            runner.extend(seq_id, &prompt_ids[b..])?
+            (last, pos)
         } else {
             runner.prefill(seq_id, prompt_ids)?
         };
@@ -590,7 +710,34 @@ impl PrefixCacheStore {
                 eprintln!("[mlx] prefix-cache snapshot skipped (tools, key={key:?}): {e:#}");
             }
         }
+        if heads_only {
+            self.pending_persist = self.head_pending(key, prompt_ids);
+        }
         Ok((last, pos))
+    }
+
+    /// What a cut-sensitive runner's disk tier is given after the reply: the head this prompt
+    /// continues (the longest pinned one under `key`), filed under its tokens' key
+    /// ([`crate::kv_disk::head_key`]). Heads are the snapshots at a cut every cold MISS with
+    /// their system prompt makes, so the only ones a restart or a dropped copy resumes exactly,
+    /// and the ones every other conversation with that system prompt forks. One the disk
+    /// already holds is only marked used there.
+    fn head_pending(&self, key: &str, prompt_ids: &[u32]) -> Option<PendingPersist> {
+        self.entries
+            .get(key)?
+            .iter()
+            .filter(|e| {
+                e.pinned_boundary
+                    && !e.prefix_tokens.is_empty()
+                    && prompt_ids.starts_with(&e.prefix_tokens)
+            })
+            .max_by_key(|e| e.prefix_tokens.len())
+            .map(|e| PendingPersist {
+                snapshot_id: e.master_snapshot_id,
+                key: crate::kv_disk::head_key(&e.prefix_tokens),
+                prefix_tokens: e.prefix_tokens.clone(),
+                last_token: None,
+            })
     }
 
     /// What [`Self::prefill_optionally_cached_with`] of `prompt_ids` under `key` leaves in memory,
@@ -988,6 +1135,20 @@ impl PrefixCacheStore {
     /// Total number of cached snapshots across all keys and branches.
     pub fn len(&self) -> usize {
         self.entries.values().map(|v| v.len()).sum()
+    }
+
+    /// Tests: `(prefix length, hits, pinned head)` of every branch under `key`, shortest first.
+    #[cfg(test)]
+    pub(crate) fn branches_for_test(&self, key: &str) -> Vec<(usize, u64, bool)> {
+        let mut v: Vec<_> = self
+            .entries
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|e| (e.prefix_tokens.len(), e.hits, e.pinned_boundary))
+            .collect();
+        v.sort();
+        v
     }
 }
 
@@ -2258,5 +2419,285 @@ mod tests {
             make_room(&mut store, &mut runner, Some("d"), &[7; 10]);
             assert!(runner.released.is_empty());
         });
+    }
+
+    // ───────────────────────── cut-sensitive runners: heads on disk ─────────────────────────
+
+    /// A cut-sensitive runner with a disk tier and a memory budget. Snapshots hold 100 bytes
+    /// each, a feed adds one byte per KV token; the disk maps a key to the tokens filed there.
+    #[derive(Default)]
+    struct HeadsRunner {
+        log: Vec<String>,
+        next_snap: u64,
+        held: std::collections::HashSet<u64>,
+        budget: Option<u64>,
+        disk: HashMap<String, Vec<u32>>,
+    }
+
+    impl SnapshotRunner for HeadsRunner {
+        fn prefill(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("prefill({})", tokens.len()));
+            Ok((PREFILL_TOK, tokens.len()))
+        }
+        fn extend(&mut self, _seq: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+            self.log.push(format!("extend({})", tokens.len()));
+            Ok((EXTEND_TOK, tokens.len()))
+        }
+        fn snapshot_state_deep(&mut self, _seq: u64) -> Result<(u64, usize)> {
+            let id = self.next_snap;
+            self.next_snap += 1;
+            self.held.insert(id);
+            self.log.push(format!("snapshot->{id}"));
+            Ok((id, 0))
+        }
+        fn fork_from_snapshot(&mut self, snapshot_id: u64, _dst: u64) -> Result<usize> {
+            self.log.push(format!("fork({snapshot_id})"));
+            Ok(0)
+        }
+        fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+            self.held.remove(&snapshot_id);
+            self.log.push(format!("release({snapshot_id})"));
+            Ok(())
+        }
+        fn persist_snapshot(
+            &mut self,
+            snapshot_id: u64,
+            key: &str,
+            prefix_tokens: &[u32],
+            last_token: Option<u32>,
+        ) -> Result<()> {
+            assert_eq!(
+                key,
+                crate::kv_disk::head_key(prefix_tokens),
+                "heads are filed under their tokens"
+            );
+            self.log.push(format!(
+                "persist({snapshot_id},{},{last_token:?})",
+                prefix_tokens.len()
+            ));
+            self.disk.insert(key.to_string(), prefix_tokens.to_vec());
+            Ok(())
+        }
+        fn load_persisted_snapshot(
+            &mut self,
+            key: &str,
+            prompt_ids: &[u32],
+        ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+            match self.disk.get(key) {
+                Some(t) if prompt_ids.len() > t.len() && prompt_ids.starts_with(t) => {
+                    let t = t.clone();
+                    let id = self.next_snap;
+                    self.next_snap += 1;
+                    self.held.insert(id);
+                    self.log.push(format!("load({})->{id}", t.len()));
+                    Ok(Some((id, t, None)))
+                }
+                _ => {
+                    self.log.push("load->miss".to_string());
+                    Ok(None)
+                }
+            }
+        }
+        fn memory_shortfall(&self, kv_tokens: usize, _states: usize) -> u64 {
+            self.budget.map_or(0, |b| {
+                (100 * self.held.len() as u64 + kv_tokens as u64).saturating_sub(b)
+            })
+        }
+        fn cut_sensitive(&self) -> bool {
+            true
+        }
+    }
+
+    /// A 20-token prompt whose first 12 tokens are the system/tools head; `tail` picks the rest.
+    fn headed(tail: u32) -> Vec<u32> {
+        (0..12).chain((0..8).map(|t| 1000 * tail + t)).collect()
+    }
+
+    fn persists(r: &HeadsRunner) -> Vec<&String> {
+        r.log.iter().filter(|l| l.starts_with("persist(")).collect()
+    }
+
+    /// A cold MISS is fed in the two stages split at the head and keeps the head; after the reply
+    /// the disk gets the head (filed under its tokens), never the full prompt, which no later
+    /// prompt's cold prefill would cut at.
+    #[test]
+    fn a_cut_sensitive_runner_persists_the_head_and_not_the_full_prompt() {
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut r = HeadsRunner::default();
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut r, 1, &headed(1), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(tok, EXTEND_TOK);
+        // The disk is asked for this prompt's own head first; nothing is written before the reply.
+        assert_eq!(
+            r.log,
+            [
+                "load->miss",
+                "prefill(12)",
+                "snapshot->0",
+                "extend(8)",
+                "snapshot->1"
+            ]
+        );
+        store.flush_persist(&mut r);
+        assert_eq!(persists(&r), ["persist(0,12,None)"]);
+        assert!(
+            r.disk
+                .contains_key(&crate::kv_disk::head_key(&headed(1)[..12]))
+        );
+
+        // The conversation goes on (an advancing HIT on its full prompt): the disk is given the
+        // head again (so its last use is renewed), not the advanced prompt.
+        let mut longer = headed(1);
+        longer.extend([7, 7, 7]);
+        store
+            .prefill_optionally_cached(&mut r, 2, &longer, Some("k"), Some(12))
+            .unwrap();
+        store.flush_persist(&mut r);
+        assert_eq!(persists(&r), ["persist(0,12,None)", "persist(0,12,None)"]);
+    }
+
+    /// After a restart the memory is empty: a prompt with the same head but another tail forks the
+    /// head from disk and feeds only its own tail. The restored head stays a head, so the prompt
+    /// that advances from it does not replace it.
+    #[test]
+    fn a_cut_sensitive_runner_restores_the_head_from_disk_after_a_restart() {
+        let mut r = HeadsRunner::default();
+        r.disk.insert(
+            crate::kv_disk::head_key(&headed(1)[..12]),
+            headed(1)[..12].to_vec(),
+        );
+        r.next_snap = 40;
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let (tok, _) = store
+            .prefill_optionally_cached(&mut r, 1, &headed(2), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(tok, EXTEND_TOK);
+        assert_eq!(
+            r.log,
+            ["load(12)->40", "fork(40)", "extend(8)", "snapshot->41"]
+        );
+        let head = &store.entries["k"]
+            .iter()
+            .find(|e| e.prefix_tokens.len() == 12)
+            .expect("the head is kept beside the advanced prompt");
+        assert!(head.pinned_boundary);
+        assert_eq!(store.len(), 2);
+    }
+
+    /// The memory plan drops the head (heads go first). The next conversation with that system
+    /// prompt does not prefill it again: it reloads it from disk.
+    #[test]
+    fn a_head_dropped_for_memory_is_reloaded_from_disk_instead_of_prefilled() {
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let mut r = HeadsRunner::default();
+        store
+            .prefill_optionally_cached(&mut r, 1, &headed(1), Some("k"), Some(12))
+            .unwrap();
+        store.flush_persist(&mut r);
+        // Two snapshots held (200 bytes); a feed of 20 KV tokens with room for 150: the head goes.
+        r.budget = Some(150);
+        let plan = store.plan_feed(&mut r, Some("j"), &[5; 20], false);
+        store.make_room_for(&mut r, plan.fork, plan.kv_tokens, plan.states);
+        assert!(r.log.contains(&"release(0)".to_string()), "log={:?}", r.log);
+        assert!(store.entries["k"].iter().all(|e| !e.pinned_boundary));
+        r.budget = None;
+
+        r.log.clear();
+        store
+            .prefill_optionally_cached(&mut r, 2, &headed(2), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(
+            r.log,
+            ["load(12)->2", "fork(2)", "extend(8)", "snapshot->3"]
+        );
+        assert!(!r.log.iter().any(|l| l.starts_with("prefill(")));
+    }
+
+    /// The disk is only asked for a head the cold MISS would cut at: with no boundary, or with
+    /// incremental caching off, the prompt is prefilled whole and no head is looked up or kept.
+    /// With the head in memory the disk is not asked at all.
+    #[test]
+    fn a_cut_sensitive_runner_asks_the_disk_only_for_a_head_its_cold_miss_cuts_at() {
+        let mut r = HeadsRunner::default();
+        r.disk.insert(
+            crate::kv_disk::head_key(&headed(1)[..12]),
+            headed(1)[..12].to_vec(),
+        );
+        let mut off = PrefixCacheStore::with_incremental(true, 4, false);
+        off.prefill_optionally_cached(&mut r, 1, &headed(2), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(r.log, ["prefill(20)", "snapshot->0"]);
+        off.flush_persist(&mut r);
+        assert!(persists(&r).is_empty());
+
+        r.log.clear();
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        store
+            .prefill_optionally_cached(&mut r, 2, &headed(2), Some("k"), None)
+            .unwrap();
+        assert_eq!(r.log, ["prefill(20)", "snapshot->1"]);
+
+        r.log.clear();
+        store
+            .prefill_optionally_cached(&mut r, 3, &headed(3), Some("j"), Some(12))
+            .unwrap();
+        r.log.clear();
+        store
+            .prefill_optionally_cached(&mut r, 4, &headed(4), Some("j"), Some(12))
+            .unwrap();
+        assert!(
+            !r.log.iter().any(|l| l.starts_with("load")),
+            "log={:?}",
+            r.log
+        );
+    }
+
+    /// A prompt that the memory plan sends without a head is still fed in the two stages, and
+    /// leaves nothing for the disk.
+    #[test]
+    fn a_cut_sensitive_prompt_without_a_head_persists_nothing() {
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        store.skip_head = true;
+        let mut r = HeadsRunner::default();
+        store
+            .prefill_optionally_cached(&mut r, 1, &headed(1), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(
+            r.log,
+            ["load->miss", "prefill(12)", "extend(8)", "snapshot->0"]
+        );
+        store.flush_persist(&mut r);
+        assert!(persists(&r).is_empty());
+    }
+
+    /// When the memory plan made room for no head, a head read back from disk serves the fork and
+    /// is then released (it stays on disk): the prompt keeps only the copies it was planned for.
+    #[test]
+    fn a_head_read_back_for_a_prompt_planned_without_one_is_not_kept() {
+        let mut r = HeadsRunner::default();
+        r.disk.insert(
+            crate::kv_disk::head_key(&headed(1)[..12]),
+            headed(1)[..12].to_vec(),
+        );
+        r.next_snap = 40;
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        store.skip_head = true;
+        store
+            .prefill_optionally_cached(&mut r, 1, &headed(2), Some("k"), Some(12))
+            .unwrap();
+        assert_eq!(
+            r.log,
+            [
+                "load(12)->40",
+                "fork(40)",
+                "extend(8)",
+                "snapshot->41",
+                "release(40)"
+            ]
+        );
+        assert_eq!(store.branches_for_test("k"), [(20, 1, false)]);
+        store.flush_persist(&mut r);
+        assert!(persists(&r).is_empty());
     }
 }

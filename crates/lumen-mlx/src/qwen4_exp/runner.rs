@@ -1071,6 +1071,230 @@ impl Qwen4ExpRunner {
         }
         Ok(None)
     }
+
+    /// Prefill `tokens` from position 0 in the chunks a prefill of `tokens[..at]` followed by an
+    /// extend of the rest makes (chunks counted from 0 up to `at`, then from `at`), in one
+    /// layer-major pass: each layer's experts are read once where the two calls read them twice.
+    /// With `keep`, the state after `at` tokens is kept as a snapshot: `(next token, position,
+    /// snapshot id)`. The prefix cache's cold MISS on this runner, `at` being the system/tools
+    /// boundary: a head forked from there and extended is the same computation.
+    pub(crate) fn prefill_split(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        if at == 0 || at >= tokens.len() {
+            bail!(
+                "qwen4_exp: split at {at} is not inside {} tokens",
+                tokens.len()
+            );
+        }
+        self.mem_begin();
+        self.check_context(0, tokens.len())?;
+        let cuts = split_cuts(tokens.len(), at, self.chunk);
+        let mut cache = self.model.make_cache();
+        let (logits, point) =
+            self.model
+                .forward_pieces(tokens, &mut cache, &cuts, keep.then_some(at))?;
+        logits.eval().context("qwen4_exp: evaluate prefill")?;
+        let next = Self::argmax(&logits)?;
+        self.seqs.insert(
+            seq_id,
+            Seq {
+                cache,
+                position: tokens.len(),
+                rollback: None,
+                persisted_key: None,
+                pending: None,
+                recent: Default::default(),
+                spec_off: false,
+            },
+        );
+        let snapshot = point.map(|p| {
+            let id = self.next_snapshot;
+            self.next_snapshot += 1;
+            self.snapshots.insert(id, (p, at));
+            id
+        });
+        self.mem_report(&format!(
+            "prefilled {} tokens for seq {seq_id} (head at {at})",
+            tokens.len()
+        ));
+        Ok((next, tokens.len(), snapshot))
+    }
+
+    /// Write prefix-cache snapshot `snapshot_id`, the state after `prefix`, to the disk tier
+    /// under `key` (the prefix cache gives heads only, under a key made from their tokens). An
+    /// entry the disk already holds is only marked used (its TTL counts from its last use).
+    /// Called after the reply: the readback is the only part on this thread, the file write goes
+    /// to the tier's writer thread.
+    pub(crate) fn persist_head(
+        &mut self,
+        snapshot_id: u64,
+        key: &str,
+        prefix: &[u32],
+    ) -> Result<()> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        if disk.touch(key)? {
+            return Ok(());
+        }
+        let (cache, position) = self
+            .snapshots
+            .get(&snapshot_id)
+            .ok_or_else(|| anyhow!("qwen4_exp: persist of unknown snapshot {snapshot_id}"))?;
+        if *position != prefix.len() {
+            bail!(
+                "qwen4_exp: snapshot {snapshot_id} stands at {position}, not at the {} tokens it is filed under",
+                prefix.len()
+            );
+        }
+        let t_read = std::time::Instant::now();
+        let (layers, records) = cache.to_records()?;
+        let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+        let manifest = KvManifest {
+            model_fingerprint: self.fingerprint.clone(),
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            position: prefix.len(),
+            prefix_tokens: prefix.to_vec(),
+            last_token: None,
+            is_deep: true,
+            layers,
+        };
+        let bytes: usize = records.iter().map(|r| r.data.len()).sum();
+        let t_put = std::time::Instant::now();
+        self.disk
+            .as_mut()
+            .expect("disk tier present (checked above)")
+            .put(key, &manifest, &records)?;
+        eprintln!(
+            "[qwen4_exp] kv-disk: head at {} = {:.0} MB (readback {read_ms:.0} ms, queued in {:.0} ms)",
+            prefix.len(),
+            bytes as f64 / 1e6,
+            t_put.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
+    }
+
+    /// The head stored under `key`, loaded as a snapshot when `prompt` continues it with at least
+    /// one token left to feed: `(snapshot id, its tokens, None)`. A missing, truncated or corrupt
+    /// file (CRC), one written for other weights or settings, one whose tokens are not a prefix
+    /// of `prompt`, or a state that does not fit the model is a miss, never an error.
+    pub(crate) fn load_head(
+        &mut self,
+        key: &str,
+        prompt: &[u32],
+    ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(None);
+        };
+        let t = std::time::Instant::now();
+        let Some((manifest, records)) = disk.get(key)? else {
+            return Ok(None);
+        };
+        let n = manifest.prefix_tokens.len();
+        if n == 0
+            || manifest.position != n
+            || n >= prompt.len()
+            || !prompt.starts_with(&manifest.prefix_tokens)
+        {
+            return Ok(None);
+        }
+        let cache =
+            match self
+                .model
+                .cache_from_records(&manifest.layers, &records, &manifest.prefix_tokens)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[qwen4_exp] kv-disk: head at {n} failed to load ({e:#}); not used");
+                    return Ok(None);
+                }
+            };
+        eprintln!(
+            "[qwen4_exp] kv-disk: head at {n} ({:.0} MB) read back in {:.0} ms",
+            cache.nbytes() as f64 / 1e6,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        let id = self.next_snapshot;
+        self.next_snapshot += 1;
+        self.snapshots.insert(id, (cache, n));
+        Ok(Some((id, manifest.prefix_tokens, None)))
+    }
+
+    /// Tests: attach a disk tier rooted at `root` under `fingerprint` (inline writes), or detach
+    /// it with `None`.
+    #[cfg(test)]
+    pub(crate) fn set_disk_root_for_test(&mut self, root: Option<&Path>, fingerprint: &str) {
+        self.fingerprint = fingerprint.to_string();
+        self.disk =
+            root.map(|r| DiskKvStore::open(r, fingerprint, 0, 0).expect("open test disk tier"));
+    }
+}
+
+/// The chunk ends of a feed of `len` tokens split at `at`: the chunks of a prefill of the first
+/// `at` tokens, then those of an extend of the rest (each counted from its own start).
+fn split_cuts(len: usize, at: usize, chunk: usize) -> Vec<usize> {
+    let mut cuts = chunk_cuts(0, at, chunk);
+    cuts.extend(chunk_cuts(0, len - at, chunk).into_iter().map(|c| c + at));
+    cuts
+}
+
+/// The prefix cache's view of this runner: the `Runner` methods, a one-pass split prefill, the
+/// disk tier as heads, and the memory plan.
+impl crate::prefix_cache::SnapshotRunner for Qwen4ExpRunner {
+    fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Runner::prefill(self, seq_id, tokens)
+    }
+    fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
+        Runner::extend(self, seq_id, tokens)
+    }
+    fn snapshot_state_deep(&mut self, seq_id: u64) -> Result<(u64, usize)> {
+        Runner::snapshot_state_deep(self, seq_id)
+    }
+    fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize> {
+        Runner::fork_from_snapshot(self, snapshot_id, dst_seq_id)
+    }
+    fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+        Runner::release_snapshot(self, snapshot_id)
+    }
+    fn persist_snapshot(
+        &mut self,
+        snapshot_id: u64,
+        key: &str,
+        prefix_tokens: &[u32],
+        _last_token: Option<u32>,
+    ) -> Result<()> {
+        self.persist_head(snapshot_id, key, prefix_tokens)
+    }
+    fn load_persisted_snapshot(
+        &mut self,
+        key: &str,
+        prompt_ids: &[u32],
+    ) -> Result<Option<(u64, Vec<u32>, Option<u32>)>> {
+        self.load_head(key, prompt_ids)
+    }
+    fn memory_shortfall(&self, kv_tokens: usize, states: usize) -> u64 {
+        Qwen4ExpRunner::memory_shortfall(self, kv_tokens, states)
+    }
+    fn cut_sensitive(&self) -> bool {
+        true
+    }
+    fn prefill_split(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        at: usize,
+        keep: bool,
+    ) -> Result<(u32, usize, Option<u64>)> {
+        Qwen4ExpRunner::prefill_split(self, seq_id, tokens, at, keep)
+    }
 }
 
 impl Runner for Qwen4ExpRunner {
@@ -1662,5 +1886,237 @@ mod tests {
         let (_, position) = r.decode_step(1, other, 0).unwrap();
         assert_eq!(position, prompt.len() + 2);
         assert!(r.seqs[&1].pending.is_none() || r.seqs[&1].pending.as_ref().unwrap().after != t1);
+    }
+
+    // ───────────── the prefix cache's head: from memory, from disk, after a drop ─────────────
+
+    fn fixture_ids() -> Vec<u32> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen4exp_tiny/reference/outputs.safetensors");
+        let want = Array::load_safetensors(dir).expect("reference outputs");
+        want["ids"]
+            .as_slice::<i32>()
+            .iter()
+            .map(|&t| t as u32)
+            .collect()
+    }
+
+    /// The bytes of every array of `seq`'s state.
+    fn state_bytes(r: &Qwen4ExpRunner, seq: u64) -> Vec<Vec<u8>> {
+        let (_, records) = r.seqs[&seq].cache.to_records().expect("readback");
+        records.into_iter().map(|rec| rec.data).collect()
+    }
+
+    /// A tools prompt fed as its cold MISS was before the one-pass split: a prefill to the head,
+    /// then an extend of the rest. `(next token, state bytes, six greedy steps)`.
+    fn cold_in_two_calls(
+        budget: Option<u64>,
+        prompt: &[u32],
+        at: usize,
+    ) -> (u32, Vec<Vec<u8>>, Vec<u32>) {
+        let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+        let (next, _, _) =
+            crate::prefix_cache::prefill_split_in_two_calls(&mut r, 1, prompt, at, false).unwrap();
+        let state = state_bytes(&r, 1);
+        (next, state, decode_some(&mut r, 1, next, 6))
+    }
+
+    fn assert_continues_like(
+        r: &mut Qwen4ExpRunner,
+        seq: u64,
+        next: u32,
+        cold: &(u32, Vec<Vec<u8>>, Vec<u32>),
+        what: &str,
+    ) {
+        assert_eq!(next, cold.0, "{what}: next token");
+        assert!(
+            state_bytes(r, seq) == cold.1,
+            "{what}: the state differs from the cold one"
+        );
+        assert_eq!(decode_some(r, seq, next, 6), cold.2, "{what}: greedy steps");
+        Runner::remove_seq(r, seq).unwrap();
+    }
+
+    /// The head sits at the system/tools boundary (21, off the 16-token grid on purpose: it is a
+    /// cut the cold MISS makes, not a grid point). Forked from memory, reloaded from disk after the
+    /// copy in memory is gone, or restored after a restart, it continues exactly as the prompt's
+    /// cold MISS: same next token, same state byte for byte, same greedy steps. The cold MISS
+    /// itself, now one pass, is the two calls it replaces. Resident experts and a pool.
+    #[test]
+    fn a_tools_head_from_memory_or_disk_continues_exactly_like_a_cold_prompt() {
+        for budget in [None, Some(1u64)] {
+            head_reuse_is_exact(budget);
+        }
+    }
+
+    fn head_reuse_is_exact(budget: Option<u64>) {
+        use crate::prefix_cache::PrefixCacheStore;
+        let ids = fixture_ids();
+        assert!(ids.len() >= 48);
+        let at = 21;
+        let a: Vec<u32> = ids[..40].to_vec();
+        let b: Vec<u32> = ids[..at].iter().chain(&ids[30..48]).copied().collect();
+        let (cold_a, cold_b) = (
+            cold_in_two_calls(budget, &a, at),
+            cold_in_two_calls(budget, &b, at),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+        r.set_disk_root_for_test(Some(dir.path()), "tiny");
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let (next, _) = store
+            .prefill_optionally_cached(&mut r, 1, &a, Some("k"), Some(at))
+            .unwrap();
+        assert_continues_like(&mut r, 1, next, &cold_a, "cold MISS in one pass");
+        store.flush_persist(&mut r);
+        assert_eq!(
+            r.disk.as_ref().map(DiskKvStore::len),
+            Some(1),
+            "the head, not the prompt"
+        );
+
+        let (next, _) = store
+            .prefill_optionally_cached(&mut r, 2, &b, Some("k"), Some(at))
+            .unwrap();
+        assert_eq!(
+            store.branches_for_test("k")[0],
+            (at, 1, true),
+            "a HIT on the head"
+        );
+        assert_continues_like(&mut r, 2, next, &cold_b, "head from memory");
+
+        // The copy in memory is gone (what the memory plan does to a head): reloaded from disk.
+        store.clear(&mut r);
+        let (next, _) = store
+            .prefill_optionally_cached(&mut r, 3, &b, Some("k"), Some(at))
+            .unwrap();
+        assert_eq!(
+            store.branches_for_test("k")[0],
+            (at, 1, true),
+            "a HIT on the reloaded head"
+        );
+        assert_continues_like(&mut r, 3, next, &cold_b, "head reloaded after a drop");
+
+        // A restart: a new runner, an empty store, the same disk.
+        let mut fresh = tiny_runner_with(16, MtpMode::Off, budget);
+        fresh.set_disk_root_for_test(Some(dir.path()), "tiny");
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let (next, _) = store
+            .prefill_optionally_cached(&mut fresh, 1, &b, Some("k"), Some(at))
+            .unwrap();
+        assert_eq!(
+            store.branches_for_test("k")[0],
+            (at, 1, true),
+            "a HIT on the restored head"
+        );
+        assert_continues_like(
+            &mut fresh,
+            1,
+            next,
+            &cold_b,
+            "head restored after a restart",
+        );
+    }
+
+    /// Where the feed is cut changes the numbers even on the replica: the prompt fed in one call
+    /// on the 16-token grid is not the prompt cut at the head. That is why only a head at a cut
+    /// the cold MISS makes may be reused.
+    #[test]
+    fn a_different_cut_is_a_different_computation() {
+        let ids = fixture_ids();
+        let a: Vec<u32> = ids[..40].to_vec();
+        let split = cold_in_two_calls(Some(1), &a, 21);
+        let mut r = tiny_runner_with(16, MtpMode::Off, Some(1));
+        Runner::prefill(&mut r, 1, &a).unwrap();
+        let whole = state_bytes(&r, 1);
+        assert!(
+            whole != split.1,
+            "the cut at 21 left the state bit-identical to the plain prefill"
+        );
+    }
+
+    /// A head on disk that is cut short, fails its CRC, or was written under another identity is
+    /// a miss: the prompt is fed cold and comes out exactly as a cold MISS. Never a wrong state.
+    #[test]
+    fn a_damaged_or_foreign_head_on_disk_is_a_miss_and_never_a_wrong_answer() {
+        use crate::prefix_cache::PrefixCacheStore;
+        let ids = fixture_ids();
+        let at = 21;
+        let a: Vec<u32> = ids[..40].to_vec();
+        let b: Vec<u32> = ids[..at].iter().chain(&ids[30..48]).copied().collect();
+        let cold_b = cold_in_two_calls(None, &b, at);
+        let key = crate::kv_disk::head_key(&b[..at]);
+        let dir = tempfile::tempdir().unwrap();
+        let write_head = |fingerprint: &str| {
+            let mut r = tiny_runner(16);
+            r.set_disk_root_for_test(Some(dir.path()), fingerprint);
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            store
+                .prefill_optionally_cached(&mut r, 1, &a, Some("k"), Some(at))
+                .unwrap();
+            store.flush_persist(&mut r);
+            dir.path().join(fingerprint).join(format!("{key}.lkv"))
+        };
+        let damages: [(&str, fn(&mut Vec<u8>)); 2] = [
+            ("cut short", |f| f.truncate(f.len() / 2)),
+            ("CRC mismatch", |f| {
+                let i = f.len() / 2;
+                f[i] ^= 0x40;
+            }),
+        ];
+        for (what, damage) in damages {
+            let file = write_head("tiny");
+            let mut bytes = std::fs::read(&file).unwrap();
+            damage(&mut bytes);
+            std::fs::write(&file, &bytes).unwrap();
+            let mut fresh = tiny_runner(16);
+            fresh.set_disk_root_for_test(Some(dir.path()), "tiny");
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let (next, _) = store
+                .prefill_optionally_cached(&mut fresh, 1, &b, Some("k"), Some(at))
+                .unwrap();
+            assert_eq!(
+                store.branches_for_test("k")[0],
+                (at, 0, true),
+                "{what}: a cold MISS"
+            );
+            assert_continues_like(&mut fresh, 1, next, &cold_b, what);
+        }
+
+        // Another identity's files under this one's directory: the manifest says whose they are.
+        write_head("other");
+        std::fs::create_dir_all(dir.path().join("mine")).unwrap();
+        for f in ["index.json", &format!("{key}.lkv")] {
+            std::fs::copy(
+                dir.path().join("other").join(f),
+                dir.path().join("mine").join(f),
+            )
+            .unwrap();
+        }
+        let mut fresh = tiny_runner(16);
+        fresh.set_disk_root_for_test(Some(dir.path()), "mine");
+        assert!(
+            fresh.load_head(&key, &b).unwrap().is_none(),
+            "a foreign head was served"
+        );
+        let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+        let (next, _) = store
+            .prefill_optionally_cached(&mut fresh, 1, &b, Some("k"), Some(at))
+            .unwrap();
+        assert_continues_like(&mut fresh, 1, next, &cold_b, "foreign identity");
+
+        // The head is only served to a prompt that continues it.
+        let mut fresh = tiny_runner(16);
+        fresh.set_disk_root_for_test(Some(dir.path()), "other");
+        assert!(
+            fresh.load_head(&key, &b[..at]).unwrap().is_none(),
+            "nothing left to feed"
+        );
+        assert!(
+            fresh.load_head(&key, &ids[1..40]).unwrap().is_none(),
+            "another prompt"
+        );
+        assert!(fresh.load_head(&key, &b).unwrap().is_some());
     }
 }

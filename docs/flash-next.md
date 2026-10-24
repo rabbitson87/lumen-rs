@@ -85,6 +85,44 @@ this way is prefilled again when it comes back; with more memory, or a shorter
 `LUMEN_QWEN4_MEM_LOG=1` logs MLX's active, cache and peak memory and what each sequence holds after
 every prefill and every 32 decode steps. The plan above (pool sizes, reserve) is unchanged.
 
+### An agent's system prompt on disk
+
+Requests with tools (agents) keep the head of their system prompt (the system message and the rendered
+tools) in memory, so the next conversation with the same system prompt feeds only its own turn. With
+`LUMEN_KV_DISK=1` that head is also written to disk (`LUMEN_KV_DISK_DIR`, default `~/.cache/lumen/kv`;
+`LUMEN_KV_DISK_MAX_GB` and `LUMEN_KV_DISK_TTL_SECS` bound it), once per system prompt, after the reply.
+A restart, or the memory plan above dropping the head, then reads it back instead of prefilling it again.
+
+Measured with a 12.3K-token agent prompt (instructions, two project documents, 26 tool schemas) at a
+6.7 GB pool, medians of N=3, every reply identical to the cold one:
+
+| Next conversation with the same system prompt | Before | Now |
+|---|---|---|
+| The first one (cold) | 43.7 s | 40.6 s |
+| Head in memory | 2.6 s | 3.0 s (2.9-3.0) |
+| After the head was dropped from memory | 39.1 s (prefilled again) | 2.8 s (read back in 0.25-0.4 s) |
+| After a server restart | 44.2 s (prefilled again) | 3.5 s |
+| 24 GB class (`LUMEN_MEMORY_LIMIT_GB=13`): a second agent's system prompt pushed the head out | 40.4 s | 2.8 s |
+| 24 GB class, after a restart | 43.3 s | 3.1 s |
+
+The head of 12,244 tokens is 795 MB on disk. The request that writes it spends 0.1 s reading it back
+and 0.1-0.4 s serializing it after its last token (its final chunk comes that much later); the file
+write runs on the disk tier's own thread and lands 0.3-1.4 s later. A request that starts while that
+write is still going shares the SSD with it (the in-memory hit right after the first request: 2.9-3.0 s
+against 2.6 s). Later requests only mark the file used. On a 24 GB Mac, a head read back for a prompt
+the memory plan sent without one is used for that prompt and released again (it stays on disk), so
+decode keeps its speed.
+
+The head sits where the cold request with that system prompt already cuts its prefill (the head, then
+the rest), so forking it computes exactly what the cold request computes. On this mixture-of-experts
+model that matters: the same prompt cut at a different place (the 1,024-token chunk grid instead of the
+head) gave a different greedy reply, and moving the head down to the grid would make every hit feed up to
+a chunk again (10.3 s instead of 2.6 s for a hit, measured). That is also why only heads are written: a
+conversation's latest turn is not a cut its next turn's cold prefill makes. The cold request now feeds
+the head and the rest in one pass, so each layer's experts are read once instead of twice (40.6 s against
+42.5 s in two calls). A conversation that continues after a restart resumes from the head and feeds its
+later turns again; a prompt the memory plan sends without a head writes none.
+
 ## Which expert leaves the pool
 
 When a layer needs an expert that is not in the pool, another one has to give up its slot. The default,
