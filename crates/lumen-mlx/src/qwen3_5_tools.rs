@@ -764,6 +764,8 @@ impl Qwen35ResponseParser {
             visible: self.visible,
             reasoning: self.reasoning,
             tool_calls: self.parsed_calls,
+            // Set by the decode loop that fed this parser.
+            ..Default::default()
         }
     }
 

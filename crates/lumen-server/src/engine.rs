@@ -7,7 +7,7 @@ use anyhow::Result;
 use lumen_mlx::SamplingOverrides;
 use lumen_mlx::chat_io::{
     AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
-    ResolvedToolChoice, ToolDef,
+    ResolvedToolChoice, StopCause, ToolDef,
 };
 
 /// Prints the tokenizer work one request did when it goes out of scope, so a
@@ -232,6 +232,13 @@ impl ModelBackend {
     fn max_context(&self) -> Option<u32> {
         match self {
             Self::Mlx(m) => m.max_context().map(|c| c as u32),
+        }
+    }
+
+    /// End-of-turn tokens, for deciding why a [`Self::generate`] call stopped.
+    fn eos_tokens(&self) -> &[u32] {
+        match self {
+            Self::Mlx(m) => m.eos_tokens(),
         }
     }
 
@@ -725,19 +732,9 @@ impl InferenceEngine {
         remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
         // Stop sequences: truncate the visible text at the earliest match so
         // token counts and the returned content both reflect the trim. No-op
-        // when no stops were requested. finish_reason stays "stop" (the
-        // no-tool-call default below).
-        if !ov.stop.is_empty() {
-            let mut earliest = None;
-            for s in &ov.stop {
-                if let Some(i) = parsed.visible.find(s.as_str()) {
-                    earliest = Some(earliest.map_or(i, |e: usize| e.min(i)));
-                }
-            }
-            if let Some(i) = earliest {
-                parsed.visible.truncate(i);
-            }
-        }
+        // when no stops were requested. A match makes finish_reason "stop"
+        // even if the model ran on to max_tokens (see `FinishReason::resolve`).
+        let mut trimmed = trim_at_stop(&mut parsed.visible, &ov.stop).is_some();
         // response_format: llguidance's `from_json_schema` grammar shapes the
         // JSON correctly but never reports is_stopped/is_accepting at the
         // closing brace (confirmed: both stay false through completion), so
@@ -749,6 +746,7 @@ impl InferenceEngine {
             && let Some(end) = first_json_value_end(&parsed.visible)
         {
             parsed.visible.truncate(end);
+            trimmed = true;
         }
         let completion_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
@@ -805,7 +803,8 @@ impl InferenceEngine {
         } else {
             None
         };
-        let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+        let finish_reason =
+            FinishReason::resolve(parsed.stop, has_tool_calls, trimmed).openai_str();
 
         // Observability: bump lifetime counters for `GET /v1/loads`.
         let elapsed_s = gen_started.elapsed().as_secs_f64();
@@ -861,18 +860,12 @@ impl InferenceEngine {
         let completion_tokens = output_ids.len() as u32;
         let mut text = self.backend.decode(&output_ids)?;
         // Stop sequences: truncate the decoded text at the earliest match.
-        // No-op when no stops were requested. finish_reason stays "stop".
-        if !ov.stop.is_empty() {
-            let mut earliest = None;
-            for s in &ov.stop {
-                if let Some(i) = text.find(s.as_str()) {
-                    earliest = Some(earliest.map_or(i, |e: usize| e.min(i)));
-                }
-            }
-            if let Some(i) = earliest {
-                text.truncate(i);
-            }
-        }
+        // No-op when no stops were requested.
+        let trimmed = trim_at_stop(&mut text, &ov.stop).is_some();
+        // This path returns token ids, so the cause is read off them with the
+        // same rule the chat loops use.
+        let stop = StopCause::after_decode(&output_ids, req.max_tokens, self.backend.eos_tokens());
+        let finish_reason = FinishReason::resolve(stop, false, trimmed).openai_str();
 
         Ok(CompletionResponse {
             id: format!("cmpl-{}", gen_id()),
@@ -882,7 +875,7 @@ impl InferenceEngine {
             choices: vec![CompletionChoice {
                 index: 0,
                 text,
-                finish_reason: "stop".into(),
+                finish_reason: finish_reason.into(),
             }],
             usage: Usage {
                 prompt_tokens,
@@ -1196,21 +1189,7 @@ impl InferenceEngine {
         // Stop sequences: truncate the visible text at the earliest match and
         // record which sequence fired (Anthropic reports it in `stop_sequence`
         // with stop_reason="stop_sequence"). No-op when no stops were requested.
-        let mut matched_stop: Option<String> = None;
-        if !ov.stop.is_empty() {
-            let mut earliest: Option<usize> = None;
-            for s in &ov.stop {
-                if let Some(i) = parsed.visible.find(s.as_str()) {
-                    if earliest.is_none_or(|e| i < e) {
-                        earliest = Some(i);
-                        matched_stop = Some(s.clone());
-                    }
-                }
-            }
-            if let Some(i) = earliest {
-                parsed.visible.truncate(i);
-            }
-        }
+        let matched_stop = trim_at_stop(&mut parsed.visible, &ov.stop);
         let output_tokens =
             completion_tokens_with_tools(&self.backend, &parsed.visible, &parsed.tool_calls);
 
@@ -1223,15 +1202,10 @@ impl InferenceEngine {
             || format!("toolu_{}", gen_id()),
         );
         // A matched stop sequence (only meaningful without tool calls) maps to
-        // Anthropic's stop_reason="stop_sequence" + the matched string.
-        let stop_seq_hit = if has_tool_calls { None } else { matched_stop };
-        let stop_reason = if has_tool_calls {
-            "tool_use"
-        } else if stop_seq_hit.is_some() {
-            "stop_sequence"
-        } else {
-            "end_turn"
-        };
+        // Anthropic's stop_reason="stop_sequence" + the matched string; a turn
+        // the budget cut maps to "max_tokens".
+        let finish = FinishReason::resolve(parsed.stop, has_tool_calls, matched_stop.is_some());
+        let (stop_reason, stop_seq_hit) = anthropic_stop(finish, matched_stop);
 
         Ok(AnthropicResponse {
             id: format!("msg_{}", gen_id()),
@@ -1601,11 +1575,9 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                let finish_reason = if has_tool_calls {
-                    FinishReason::ToolCalls
-                } else {
-                    FinishReason::Stop
-                };
+                // No trim here: a stop sequence or a complete JSON value ends
+                // the stream through the `stopped_by_seq` arm below instead.
+                let finish_reason = FinishReason::resolve(parsed.stop, has_tool_calls, false);
                 // Observability: bump lifetime counters for `GET /v1/loads`.
                 let elapsed_s = gen_started.elapsed().as_secs_f64();
                 let tok_per_sec = if elapsed_s > 0.0 {
@@ -2028,11 +2000,9 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                let finish_reason = if has_tool_calls {
-                    FinishReason::ToolCalls
-                } else {
-                    FinishReason::Stop
-                };
+                // This route applies no stop sequences while streaming, so
+                // nothing was trimmed.
+                let finish_reason = FinishReason::resolve(parsed.stop, has_tool_calls, false);
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -2970,6 +2940,33 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
+    /// The reason a finished generation reports. Every route decides it here.
+    ///
+    /// `stop` is the backend's account of why decoding ended. The other two
+    /// are things only the engine knows, and they outrank it:
+    /// - `has_tool_calls`: a turn that ends in tool calls reports them, even
+    ///   if the budget ran out after the last call closed.
+    /// - `trimmed`: the engine cut the text at a client stop sequence, or at
+    ///   the end of the first complete JSON value for `response_format`. The
+    ///   answer then ends where the request said it should, so it is complete
+    ///   even when the model kept going until `max_tokens`. (The `response_format`
+    ///   grammar does not force EOS after the closing brace, so the model
+    ///   usually runs on past it.)
+    ///
+    /// Only then does a [`StopCause::MaxTokens`] become `Length`.
+    pub(crate) fn resolve(stop: StopCause, has_tool_calls: bool, trimmed: bool) -> Self {
+        if has_tool_calls {
+            FinishReason::ToolCalls
+        } else if trimmed {
+            FinishReason::Stop
+        } else {
+            match stop {
+                StopCause::MaxTokens => FinishReason::Length,
+                StopCause::EndOfTurn => FinishReason::Stop,
+            }
+        }
+    }
+
     pub fn openai_str(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
@@ -2984,6 +2981,41 @@ impl FinishReason {
             FinishReason::Length => "max_tokens",
         }
     }
+}
+
+/// Anthropic's `stop_reason` and `stop_sequence` for a finished message.
+///
+/// `matched_stop` is the client stop sequence the text was cut at, if any.
+/// Anthropic reports it as its own reason (`"stop_sequence"`) together with
+/// the string. When the turn ended in tool calls, `tool_use` wins and the
+/// field stays `null`, as before.
+fn anthropic_stop(
+    finish: FinishReason,
+    matched_stop: Option<String>,
+) -> (&'static str, Option<String>) {
+    match (finish, matched_stop) {
+        (FinishReason::ToolCalls, _) => (finish.anthropic_str(), None),
+        (_, Some(s)) => ("stop_sequence", Some(s)),
+        (_, None) => (finish.anthropic_str(), None),
+    }
+}
+
+/// Cut `text` at the earliest client stop sequence and return the sequence
+/// that matched, or `None` when none occurs (the text is then unchanged).
+/// The non-streaming routes all apply stop sequences after decoding, through
+/// this one function.
+fn trim_at_stop(text: &mut String, stops: &[String]) -> Option<String> {
+    let mut earliest: Option<(usize, &String)> = None;
+    for s in stops.iter().filter(|s| !s.is_empty()) {
+        if let Some(i) = text.find(s.as_str())
+            && earliest.is_none_or(|(e, _)| i < e)
+        {
+            earliest = Some((i, s));
+        }
+    }
+    let (i, s) = earliest?;
+    text.truncate(i);
+    Some(s.clone())
 }
 
 /// Request sent through the channel to the engine thread.
@@ -3292,7 +3324,7 @@ impl InferenceEngine {
                     let _ = seq.token_tx.try_send(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: seq.generated.len() as u32,
-                        finish_reason: FinishReason::Stop,
+                        finish_reason: seq.finish_reason(),
                     });
                     if let Some(qb) = self.mlx_batched_driver() {
                         let _ = qb.remove_seq(sid);
@@ -3412,7 +3444,7 @@ impl InferenceEngine {
                     let _ = seq.token_tx.try_send(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: n_gen as u32,
-                        finish_reason: FinishReason::Stop,
+                        finish_reason: seq.finish_reason(),
                     });
                     to_remove.push(id);
                 }
@@ -3731,6 +3763,17 @@ pub(crate) struct ActiveSeqState {
     pub prompt_tokens: u32,
     /// EOS token IDs used by the batched decode loop for this sequence.
     pub eos_tokens: Vec<u32>,
+}
+
+#[cfg(feature = "mlx-native")]
+impl ActiveSeqState {
+    /// The finish reason of a sequence the scheduler is retiring. Batched
+    /// requests carry no tools and no stop strings (both route to the
+    /// sequential path), so only the budget can change it from `Stop`.
+    pub(crate) fn finish_reason(&self) -> FinishReason {
+        let stop = StopCause::after_decode(&self.generated, self.max_new, &self.eos_tokens);
+        FinishReason::resolve(stop, false, false)
+    }
 }
 
 /// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
@@ -4679,5 +4722,217 @@ mod prompt_refusal_status {
         refuse_oversized_prompt(8, 8, 8, None).expect("at the cap is admitted");
         let failed = anyhow::anyhow!("prefill forward (seq_id=3)");
         assert_eq!(inference_error_status(&failed), 500);
+    }
+}
+
+/// Every route decides `finish_reason` / `stop_reason` through
+/// [`FinishReason::resolve`] (and, for Anthropic, `anthropic_stop`), so the
+/// table below is what the four chat surfaces and `/v1/completions` report.
+/// The backend half — which `StopCause` a decode loop hands up — is tested
+/// against scripted loops in `lumen-mlx`.
+#[cfg(test)]
+mod finish_reason_mapping {
+    use super::{FinishReason, StopCause, anthropic_stop, first_json_value_end, trim_at_stop};
+
+    /// RED before the fix: nothing produced `Length`, so a cut reply said
+    /// `"stop"` / `"end_turn"`.
+    #[test]
+    fn a_turn_cut_by_the_budget_reports_length_on_both_apis() {
+        let f = FinishReason::resolve(StopCause::MaxTokens, false, false);
+        assert_eq!(f, FinishReason::Length);
+        assert_eq!(f.openai_str(), "length");
+        assert_eq!(f.anthropic_str(), "max_tokens");
+        assert_eq!(anthropic_stop(f, None), ("max_tokens", None));
+    }
+
+    #[test]
+    fn a_turn_the_model_ended_reports_stop() {
+        let f = FinishReason::resolve(StopCause::EndOfTurn, false, false);
+        assert_eq!(f, FinishReason::Stop);
+        assert_eq!(f.openai_str(), "stop");
+        assert_eq!(anthropic_stop(f, None), ("end_turn", None));
+    }
+
+    #[test]
+    fn tool_calls_outrank_everything_else() {
+        for stop in [StopCause::EndOfTurn, StopCause::MaxTokens] {
+            for trimmed in [false, true] {
+                let f = FinishReason::resolve(stop, true, trimmed);
+                assert_eq!(f, FinishReason::ToolCalls, "{stop:?} trimmed={trimmed}");
+                assert_eq!(f.openai_str(), "tool_calls");
+            }
+        }
+        // A stop sequence found in the text beside the calls is not reported.
+        assert_eq!(
+            anthropic_stop(FinishReason::ToolCalls, Some("X".into())),
+            ("tool_use", None)
+        );
+    }
+
+    /// The non-streaming routes apply stop sequences after decoding, so the
+    /// model may have run on to `max_tokens` past the match. The client asked
+    /// for the answer to end there, so what it receives is complete.
+    #[test]
+    fn a_stop_sequence_outranks_the_budget() {
+        let stops = vec!["STOP".to_string()];
+        let mut text = "one two STOP three four".to_string();
+        let matched = trim_at_stop(&mut text, &stops);
+        assert_eq!(text, "one two ");
+        let f = FinishReason::resolve(StopCause::MaxTokens, false, matched.is_some());
+        assert_eq!(f.openai_str(), "stop");
+        assert_eq!(
+            anthropic_stop(f, matched),
+            ("stop_sequence", Some("STOP".to_string()))
+        );
+    }
+
+    /// `response_format`: the grammar does not force EOS at the closing brace,
+    /// so the model usually free-runs to the budget after a complete value.
+    #[test]
+    fn a_complete_json_value_outranks_the_budget_and_a_cut_one_does_not() {
+        let ran_on = r#"{"a": 1} and then prose until the budget ran out"#;
+        let complete = first_json_value_end(ran_on).is_some();
+        assert!(complete);
+        assert_eq!(
+            FinishReason::resolve(StopCause::MaxTokens, false, complete),
+            FinishReason::Stop
+        );
+        let cut_open = first_json_value_end(r#"{"a": [1, 2"#).is_some();
+        assert!(!cut_open);
+        assert_eq!(
+            FinishReason::resolve(StopCause::MaxTokens, false, cut_open),
+            FinishReason::Length
+        );
+    }
+
+    #[test]
+    fn trim_at_stop_cuts_at_the_earliest_match_and_names_it() {
+        let stops = vec!["world".to_string(), "lo".to_string()];
+        let mut t = "hello world".to_string();
+        assert_eq!(trim_at_stop(&mut t, &stops).as_deref(), Some("lo"));
+        assert_eq!(t, "hel");
+        // A tie goes to the sequence listed first.
+        let tie = vec!["bc".to_string(), "b".to_string()];
+        let mut t = "abc".to_string();
+        assert_eq!(trim_at_stop(&mut t, &tie).as_deref(), Some("bc"));
+        assert_eq!(t, "a");
+        // No match leaves the text alone.
+        let mut t = "abc".to_string();
+        assert_eq!(trim_at_stop(&mut t, &stops), None);
+        assert_eq!(t, "abc");
+        // An empty sequence would match at 0 and blank the reply.
+        let mut t = "abc".to_string();
+        assert_eq!(trim_at_stop(&mut t, &[String::new()]), None);
+        assert_eq!(t, "abc");
+    }
+
+    /// `/v1/completions` gets token ids back and reads the cause off them with
+    /// the rule the chat loops use.
+    #[test]
+    fn completions_read_the_cause_off_the_returned_tokens() {
+        let eos = [2];
+        let reason = |ids: &[u32]| {
+            FinishReason::resolve(StopCause::after_decode(ids, 3, &eos), false, false).openai_str()
+        };
+        assert_eq!(reason(&[5, 6, 7]), "length");
+        assert_eq!(reason(&[5, 6, 2]), "stop", "EOS on the last allowed token");
+        assert_eq!(reason(&[5, 2]), "stop");
+    }
+
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn the_batched_scheduler_reports_a_budget_cut() {
+        let seq = |generated: Vec<u32>| super::ActiveSeqState {
+            token_tx: tokio::sync::mpsc::channel(1).0,
+            generated,
+            max_new: 3,
+            last_token: 0,
+            position: 0,
+            prev_text: String::new(),
+            prev_reasoning: String::new(),
+            prompt_tokens: 0,
+            eos_tokens: vec![2],
+        };
+        assert_eq!(seq(vec![5, 6, 7]).finish_reason(), FinishReason::Length);
+        assert_eq!(seq(vec![5, 6, 2]).finish_reason(), FinishReason::Stop);
+        assert_eq!(seq(vec![2]).finish_reason(), FinishReason::Stop);
+    }
+}
+
+/// The same table against a real model, for every surface at once.
+#[cfg(test)]
+mod gemma_finish_reason {
+    use super::real_checkpoint::gemma4;
+    use super::{FinishReason, StreamEvent};
+    use crate::types::{AnthropicRequest, ChatCompletionRequest};
+    use serde_json::json;
+
+    fn finish_of(rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>) -> Option<FinishReason> {
+        let mut finish = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                StreamEvent::Error(e) => panic!("stream error: {e}"),
+                _ => {}
+            }
+        }
+        finish
+    }
+
+    #[test]
+    #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
+    fn a_reply_cut_by_max_tokens_says_so_on_every_surface() {
+        let Some(mut engine) = gemma4(false) else {
+            return;
+        };
+        let long = "Count from 1 to 200, separated by spaces.";
+        let openai = |content: &str, max_tokens: usize, stream: bool| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "gemma-4",
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "stream": stream,
+                "chat_template_kwargs": {"enable_thinking": false},
+            }))
+            .expect("a valid chat request")
+        };
+        let anthropic = |max_tokens: usize, stream: bool| -> AnthropicRequest {
+            serde_json::from_value(json!({
+                "model": "gemma-4",
+                "messages": [{"role": "user", "content": long}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "stream": stream,
+            }))
+            .expect("a valid messages request")
+        };
+
+        let resp = engine
+            .chat_completion(&openai(long, 8, false))
+            .expect("chat");
+        assert_eq!(resp.choices[0].finish_reason, "length");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        engine.chat_completion_streaming(&openai(long, 8, true), &tx);
+        drop(tx);
+        assert_eq!(finish_of(&mut rx), Some(FinishReason::Length));
+
+        let resp = engine
+            .anthropic_messages(&anthropic(8, false))
+            .expect("messages");
+        assert_eq!(resp.stop_reason, "max_tokens");
+        assert_eq!(resp.stop_sequence, None);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        engine.anthropic_messages_streaming(&anthropic(8, true), &tx);
+        drop(tx);
+        assert_eq!(finish_of(&mut rx), Some(FinishReason::Length));
+
+        // A reply that fits its budget still says stop.
+        let resp = engine
+            .chat_completion(&openai("Reply with the single word OK.", 64, false))
+            .expect("chat");
+        assert_eq!(resp.choices[0].finish_reason, "stop");
     }
 }

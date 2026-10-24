@@ -31,6 +31,67 @@ pub struct ParsedResponse {
     pub visible: String,
     pub reasoning: String,
     pub tool_calls: Vec<ParsedToolCall>,
+    /// Why decoding stopped. The parsers that build a response cannot know, so
+    /// they leave the default; the decode loop that fed them sets it through
+    /// [`Self::stopped`].
+    pub stop: StopCause,
+}
+
+impl ParsedResponse {
+    /// `self` with its [`StopCause`] filled in. For the decode loops: a loop
+    /// learns why it stopped only after the parser has built the response.
+    pub fn stopped(self, stop: StopCause) -> Self {
+        Self { stop, ..self }
+    }
+}
+
+/// Why a decode loop stopped producing tokens.
+///
+/// The HTTP layer needs this to tell a finished answer (OpenAI
+/// `finish_reason: "stop"`, Anthropic `stop_reason: "end_turn"`) from one the
+/// token budget cut off (`"length"` / `"max_tokens"`). Agent clients use the
+/// second to ask for the rest of an answer; without it a truncated reply looks
+/// complete.
+///
+/// It records only what the decode loop knows. A tool call, a client stop
+/// sequence and a `response_format` trim are all decided above the backend and
+/// take precedence there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StopCause {
+    /// The model ended its turn: it produced an end-of-turn token, or the loop
+    /// ended the turn on its behalf before the budget ran out (one completed
+    /// call under `parallel_tool_calls: false`, a runaway or thinking-budget
+    /// guard). This is the default, so a path that does not report a cause
+    /// answers exactly as every response did before the field existed.
+    #[default]
+    EndOfTurn,
+    /// The loop used its whole `max_new_tokens` budget and the model never
+    /// ended its turn. Reasoning tokens count against the same budget, so a cut
+    /// inside the thinking block is this too.
+    MaxTokens,
+}
+
+impl StopCause {
+    /// Why a loop that produced `generated` under a budget of `max_new_tokens`
+    /// stopped. `ends_turn` is the model's end-of-turn (EOS) token set: the
+    /// tokens the loop stops on.
+    ///
+    /// Every decode loop goes through this one rule. It reads the tokens
+    /// rather than which `break` fired, so a loop with several exits cannot
+    /// report them inconsistently. Any end-of-turn token counts, not only the
+    /// last one: the n-gram speculative loop commits a verified pair before
+    /// checking either half, so an EOS can sit one token from the end. A model
+    /// that ends its turn on the last token the budget allowed has finished, so
+    /// that case is `EndOfTurn` and not a cut.
+    pub fn after_decode(generated: &[u32], max_new_tokens: usize, ends_turn: &[u32]) -> Self {
+        if generated.iter().any(|t| ends_turn.contains(t)) {
+            Self::EndOfTurn
+        } else if generated.len() >= max_new_tokens {
+            Self::MaxTokens
+        } else {
+            Self::EndOfTurn
+        }
+    }
 }
 
 /// One tool surface the model is allowed to invoke. Used by chat-template
@@ -505,6 +566,75 @@ pub fn split_reasoning_envelope(content: &str) -> (&str, &str) {
 /// two nested blocks.
 pub fn has_reasoning_envelope(content: &str) -> bool {
     !split_reasoning_envelope(content).0.is_empty()
+}
+
+#[cfg(test)]
+mod stop_cause_tests {
+    use super::StopCause;
+
+    const EOS: &[u32] = &[2, 7];
+
+    #[test]
+    fn a_turn_that_ends_inside_the_budget_is_finished() {
+        assert_eq!(
+            StopCause::after_decode(&[5, 6, 2], 8, EOS),
+            StopCause::EndOfTurn
+        );
+    }
+
+    #[test]
+    fn a_full_budget_without_an_end_token_is_a_cut() {
+        assert_eq!(
+            StopCause::after_decode(&[5, 6, 5, 6], 4, EOS),
+            StopCause::MaxTokens
+        );
+    }
+
+    #[test]
+    fn ending_the_turn_on_the_last_allowed_token_is_not_a_cut() {
+        // The edge the task statement names: EOS exactly at the
+        // max_tokens-th token is a finished answer.
+        assert_eq!(
+            StopCause::after_decode(&[5, 6, 5, 7], 4, EOS),
+            StopCause::EndOfTurn
+        );
+    }
+
+    #[test]
+    fn an_end_token_before_the_last_position_still_ends_the_turn() {
+        // The n-gram speculative loop commits a pair and then checks both
+        // halves, so an EOS can be followed by one more token.
+        assert_eq!(
+            StopCause::after_decode(&[5, 2, 6], 3, EOS),
+            StopCause::EndOfTurn
+        );
+    }
+
+    #[test]
+    fn a_loop_that_stopped_early_for_another_reason_is_not_a_cut() {
+        // `parallel_tool_calls: false` closing the turn after one call, or a
+        // runaway guard: no EOS, but the budget was not what stopped it.
+        assert_eq!(
+            StopCause::after_decode(&[5, 6], 8, EOS),
+            StopCause::EndOfTurn
+        );
+    }
+
+    #[test]
+    fn a_loop_that_overshoots_its_budget_is_a_cut() {
+        // Speculative loops commit several tokens per step and may land past
+        // the budget before they check it.
+        assert_eq!(
+            StopCause::after_decode(&[5, 6, 5, 6, 5], 4, EOS),
+            StopCause::MaxTokens
+        );
+    }
+
+    #[test]
+    fn a_response_with_no_cause_reports_the_old_answer() {
+        assert_eq!(StopCause::default(), StopCause::EndOfTurn);
+        assert_eq!(super::ParsedResponse::default().stop, StopCause::EndOfTurn);
+    }
 }
 
 #[cfg(test)]

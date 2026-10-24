@@ -2048,6 +2048,18 @@ impl MlxBackend {
         }
     }
 
+    /// The tokens every decode loop stops on. [`Self::generate`] returns bare
+    /// token ids, so the engine needs this to tell a `/v1/completions` turn
+    /// the model ended from one `max_tokens` cut
+    /// ([`crate::chat_io::StopCause::after_decode`]).
+    pub fn eos_tokens(&self) -> &[u32] {
+        match self {
+            Self::Qwen35Family(m) => m.eos_tokens(),
+            #[cfg(feature = "mlx-native")]
+            Self::Gemma4(m) => m.eos_tokens(),
+        }
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => m.encode(text),
@@ -2343,6 +2355,7 @@ impl MlxBackend {
                     visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
+                    stop: m.take_stop(),
                 })
             }
             #[cfg(feature = "mlx-native")]
@@ -2482,6 +2495,7 @@ impl MlxBackend {
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
+                    stop: m.take_stop(),
                     ..Default::default()
                 })
             }
@@ -2600,6 +2614,7 @@ impl MlxBackend {
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
                     visible,
+                    stop: m.take_stop(),
                     ..Default::default()
                 })
             }
@@ -2936,6 +2951,7 @@ impl MlxBackend {
                     visible: visible.into_owned(),
                     reasoning: reasoning.trim().to_string(),
                     tool_calls: Vec::new(),
+                    stop: m.take_stop(),
                 })
             }
             #[cfg(feature = "mlx-native")]
@@ -3289,6 +3305,14 @@ pub struct MlxQwen35Backend {
     /// speculative-decode paths run a draft sequence and the main sequence
     /// through the same wrapper, and a shared window would blend the two.
     recent: std::collections::HashMap<u64, std::collections::VecDeque<u32>>,
+    /// Why the last decode loop that returns bare text stopped. Those loops
+    /// return a `String`, so they leave the cause here, and the
+    /// [`MlxBackend`] dispatch that wraps the text into a `ParsedResponse`
+    /// collects it with [`Self::take_stop`]. A field for the same reason as
+    /// `sampling`: there are six such loops, and their `String` return is used
+    /// by tests and examples that have no use for the cause. Loops that build
+    /// a `ParsedResponse` themselves put the cause on it directly.
+    last_stop: crate::chat_io::StopCause,
 }
 
 /// Isolated draft model + its resolved config for greedy spec decode.
@@ -3346,6 +3370,7 @@ impl MlxQwen35Backend {
             sampling: None,
             rng: lumen_core::sampling::Xorshift64::new(0),
             recent: std::collections::HashMap::new(),
+            last_stop: Default::default(),
         }
     }
 
@@ -3455,6 +3480,7 @@ impl MlxQwen35Backend {
             sampling: None,
             rng: lumen_core::sampling::Xorshift64::new(0),
             recent: std::collections::HashMap::new(),
+            last_stop: Default::default(),
         };
         // Phase 2 S4 — opt-in MTP auto-enable. Honored only when running on
         // the native runner with `LUMEN_QWEN35_MTP=1`. Loader failure is
@@ -3574,6 +3600,18 @@ impl MlxQwen35Backend {
         while window.len() > keep.max(1) {
             window.pop_front();
         }
+    }
+
+    /// Record why a bare-text decode loop stopped (see `last_stop`).
+    fn note_stop(&mut self, generated: &[u32], max_new_tokens: usize) {
+        self.last_stop =
+            crate::chat_io::StopCause::after_decode(generated, max_new_tokens, &self.eos_tokens);
+    }
+
+    /// Why the last bare-text decode loop stopped, reset to the default as it
+    /// is read so a later request can never see a stale cause.
+    pub(crate) fn take_stop(&mut self) -> crate::chat_io::StopCause {
+        std::mem::take(&mut self.last_stop)
     }
 
     /// Prompt tokens one attached image adds — its merged-token run plus the
@@ -4153,6 +4191,7 @@ impl MlxQwen35Backend {
         if let Some(d) = self.draft.as_mut() {
             d.runner.remove_seq(draft_seq_id).ok();
         }
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -4882,6 +4921,7 @@ impl MlxQwen35Backend {
                 visible: out,
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                stop: crate::chat_io::StopCause::EndOfTurn,
             });
         }
 
@@ -4948,6 +4988,11 @@ impl MlxQwen35Backend {
             visible: out,
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            stop: crate::chat_io::StopCause::after_decode(
+                &generated,
+                max_new_tokens,
+                &self.eos_tokens,
+            ),
         })
     }
 
@@ -5249,6 +5294,7 @@ impl MlxQwen35Backend {
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
+            self.note_stop(&generated, max_new_tokens);
             return Ok(out);
         }
 
@@ -5328,6 +5374,7 @@ impl MlxQwen35Backend {
         }
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -5899,7 +5946,12 @@ impl MlxQwen35Backend {
         // the first one the key ever saw.
         self.prefix_store.flush_persist(&mut self.runner);
         self.remove_seq(seq_id).ok();
-        Ok(parser.finish())
+        // `generated` also holds any forced `<parameter=…>` openers. They only
+        // go into a call, and a turn that ends with a call reports
+        // `tool_calls`, which outranks this cause in the engine.
+        let stop =
+            crate::chat_io::StopCause::after_decode(&generated, max_new_tokens, &self.eos_tokens);
+        Ok(parser.finish().stopped(stop))
     }
 
     /// Prefix-cache-aware variant of `chat_streaming` (Track A1).
@@ -6104,6 +6156,7 @@ impl MlxQwen35Backend {
             self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
+            self.note_stop(&generated, max_new_tokens);
             return Ok(out);
         }
 
@@ -6137,6 +6190,7 @@ impl MlxQwen35Backend {
         self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -6545,6 +6599,7 @@ impl MlxQwen35Backend {
         );
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -6592,6 +6647,7 @@ impl MlxQwen35Backend {
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
+            self.note_stop(&generated, max_new_tokens);
             return Ok(out);
         }
 
@@ -6689,6 +6745,7 @@ impl MlxQwen35Backend {
         );
         let out = self.decode(&generated).unwrap_or_default();
         self.remove_seq(seq_id).ok();
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -6791,6 +6848,7 @@ impl MlxQwen35Backend {
         self.sessions
             .store(&mut self.runner, session_id, seq_id, new_tokens, point);
 
+        self.note_stop(&generated, max_new_tokens);
         Ok(out)
     }
 
@@ -7566,19 +7624,31 @@ mod tests {
         vec![1, 2, 3, 2, 4, 2, city, 2, 7, 2, 8, 2, 9]
     }
 
+    /// The `<eos>` id in [`SCRIPT_TOKENIZER`].
+    const SCRIPT_EOS: u32 = 10;
+
     /// Run the shared tool decode loop over a scripted two-call stream.
     /// Returns the parsed response plus how many tokens the loop consumed.
     fn run_tool_loop(calls: crate::grammar::ToolCalls) -> (crate::chat_io::ParsedResponse, usize) {
-        const EOS: u32 = 10;
         let mut script = scripted_call(5); // Seoul
         script.push(2); // the newline between calls
         script.extend(scripted_call(6)); // Tokyo
-        script.push(EOS);
-        let n_scripted = script.len();
+        script.push(SCRIPT_EOS);
+        let budget = script.len() + 8; // deliberately longer than the script
+        tool_loop(script, calls, budget)
+    }
 
+    /// The shared tool decode loop over `script` with a budget of
+    /// `max_new_tokens`, returning the parsed response and how many tokens the
+    /// loop consumed.
+    fn tool_loop(
+        script: Vec<u32>,
+        calls: crate::grammar::ToolCalls,
+        max_new_tokens: usize,
+    ) -> (crate::chat_io::ParsedResponse, usize) {
         let tokenizer =
             <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("script tokenizer");
-        let mut backend = MlxQwen35Backend::with_token_script(script, EOS, tokenizer, 11);
+        let mut backend = MlxQwen35Backend::with_token_script(script, SCRIPT_EOS, tokenizer, 11);
         let parsed = backend
             .chat_with_tools_impl(
                 vec![42],      // prompt: one arbitrary token
@@ -7586,7 +7656,7 @@ mod tests {
                 Vec::new(),
                 None, // no grammar — the case where a grammar-derived cap goes inert
                 calls,
-                n_scripted + 8, // budget deliberately longer than the script
+                max_new_tokens,
                 7,
                 None, // prefix caching off for this request
                 None,
@@ -8556,6 +8626,157 @@ mod tests {
             "ExactlyOne consumed {consumed_one} tokens and OneOrMore {consumed_many}: \
              the cap has to end the turn, not filter the output"
         );
+    }
+
+    // ───────── why a decode loop stopped (finish_reason "length") ─────────
+
+    /// A plain chat — no tools, no schema — through the real [`MlxBackend`]
+    /// dispatch that both `/v1/chat/completions` and `/v1/messages` call, with
+    /// the reply scripted token by token.
+    fn plain_chat(
+        script: Vec<u32>,
+        max_tokens: usize,
+        stream: bool,
+    ) -> crate::chat_io::ParsedResponse {
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+        let mut b = MlxBackend::Qwen35Family(MlxQwen35Backend::with_token_script(
+            script,
+            CHAT_IM_END,
+            tokenizer,
+            12,
+        ));
+        let messages = vec![("user".to_string(), "U1".to_string())];
+        let ov = SamplingOverrides::default();
+        let auto = crate::chat_io::ResolvedToolChoice::Auto;
+        let parsed = if stream {
+            b.chat_streaming(
+                &messages,
+                max_tokens,
+                0.0,
+                1.0,
+                &ov,
+                false,
+                None,
+                &[],
+                &auto,
+                None,
+                |_| Ok(()),
+            )
+        } else {
+            b.chat(
+                &messages,
+                max_tokens,
+                0.0,
+                1.0,
+                &ov,
+                false,
+                None,
+                &[],
+                &auto,
+                None,
+            )
+        };
+        parsed.expect("scripted chat")
+    }
+
+    /// RED before the cause was plumbed: every reply came back as a finished
+    /// turn, so a client could not tell this one was cut.
+    #[test]
+    fn a_plain_reply_cut_by_the_budget_reports_max_tokens() {
+        use crate::chat_io::StopCause;
+        for stream in [false, true] {
+            let parsed = plain_chat(vec![CHAT_BLUE; 8], 4, stream);
+            assert_eq!(parsed.visible, "BlueBlueBlueBlue", "stream={stream}");
+            assert_eq!(parsed.stop, StopCause::MaxTokens, "stream={stream}");
+        }
+    }
+
+    #[test]
+    fn a_plain_reply_the_model_ends_reports_end_of_turn() {
+        use crate::chat_io::StopCause;
+        for stream in [false, true] {
+            let early = plain_chat(vec![CHAT_BLUE, CHAT_IM_END], 4, stream);
+            assert_eq!(early.stop, StopCause::EndOfTurn, "stream={stream}");
+            // EOS as the max_tokens-th token is a finished answer, not a cut.
+            let on_the_last_token = plain_chat(
+                vec![CHAT_BLUE, CHAT_BLUE, CHAT_BLUE, CHAT_IM_END],
+                4,
+                stream,
+            );
+            assert_eq!(
+                on_the_last_token.stop,
+                StopCause::EndOfTurn,
+                "stream={stream}"
+            );
+        }
+    }
+
+    /// The bare-text loops hand their cause over through a field. Reading it
+    /// resets it, so a later request can never report an earlier one's cut.
+    #[test]
+    fn a_reported_stop_is_read_once() {
+        use crate::chat_io::StopCause;
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+        let mut b = MlxQwen35Backend::with_token_script(vec![], CHAT_IM_END, tokenizer, 12);
+        b.note_stop(&[CHAT_BLUE, CHAT_BLUE], 2);
+        assert_eq!(b.take_stop(), StopCause::MaxTokens);
+        assert_eq!(b.take_stop(), StopCause::EndOfTurn);
+    }
+
+    /// Tools offered, the model answers in prose and runs out of budget: the
+    /// most common "length" an agent sees.
+    #[test]
+    fn a_tool_turn_answered_in_prose_and_cut_reports_max_tokens() {
+        use crate::chat_io::StopCause;
+        // `Seoul Tokyo …` never ends; the budget does.
+        let (parsed, consumed) = tool_loop(
+            vec![5, 6, 5, 6, 5, 6, 5, 6],
+            crate::grammar::ToolCalls::OneOrMore,
+            4,
+        );
+        assert_eq!(consumed, 4);
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.stop, StopCause::MaxTokens);
+    }
+
+    #[test]
+    fn a_tool_call_cut_open_by_the_budget_reports_max_tokens() {
+        use crate::chat_io::StopCause;
+        // Six tokens into a thirteen-token call: no call parses.
+        let (parsed, _) = tool_loop(scripted_call(5), crate::grammar::ToolCalls::OneOrMore, 6);
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.stop, StopCause::MaxTokens);
+    }
+
+    #[test]
+    fn a_tool_turn_the_model_or_the_call_cap_ends_reports_end_of_turn() {
+        use crate::chat_io::StopCause;
+        // The model ends the turn with `<eos>` inside the budget.
+        let (many, _) = run_tool_loop(crate::grammar::ToolCalls::OneOrMore);
+        assert_eq!(many.stop, StopCause::EndOfTurn);
+        // `parallel_tool_calls: false` ends it after one call, no `<eos>`.
+        let (one, _) = run_tool_loop(crate::grammar::ToolCalls::ExactlyOne);
+        assert_eq!(one.tool_calls.len(), 1);
+        assert_eq!(one.stop, StopCause::EndOfTurn);
+    }
+
+    /// The `response_format` loop, which builds its own `ParsedResponse`.
+    #[test]
+    fn the_response_format_loop_reports_why_it_stopped() {
+        use crate::chat_io::StopCause;
+        let run = |script: Vec<u32>, max_tokens: usize| {
+            let tokenizer = <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER)
+                .expect("script tokenizer");
+            let mut b = MlxQwen35Backend::with_token_script(script, SCRIPT_EOS, tokenizer, 11);
+            b.chat_response_format_impl(vec![42], Vec::new(), None, max_tokens, 7, |_| {})
+                .expect("response_format loop")
+                .stop
+        };
+        assert_eq!(run(vec![5, 6, 5, 6, 5], 3), StopCause::MaxTokens);
+        assert_eq!(run(vec![5, 6, SCRIPT_EOS], 3), StopCause::EndOfTurn);
+        assert_eq!(run(vec![SCRIPT_EOS], 3), StopCause::EndOfTurn);
     }
 
     #[derive(Default)]

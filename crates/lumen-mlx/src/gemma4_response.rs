@@ -222,6 +222,8 @@ pub(crate) mod imp {
                 visible,
                 reasoning,
                 tool_calls: self.tool_calls,
+                // Set by the decode loop that fed this parser.
+                ..Default::default()
             })
         }
     }

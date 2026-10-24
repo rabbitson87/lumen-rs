@@ -1677,7 +1677,12 @@ pub(crate) mod imp {
             for token in &stats.generated_tokens {
                 parser.push(*token)?;
             }
-            parser.finalize()
+            let stop = crate::chat_io::StopCause::after_decode(
+                &stats.generated_tokens,
+                max_new_tokens,
+                self.model.eos_tokens(),
+            );
+            Ok(parser.finalize()?.stopped(stop))
         }
 
         /// Render `source`'s prompt with its images and return it alongside
@@ -2181,7 +2186,12 @@ pub(crate) mod imp {
             for token in &stats.generated_tokens {
                 parser.push(*token)?;
             }
-            parser.finalize()
+            let stop = crate::chat_io::StopCause::after_decode(
+                &stats.generated_tokens,
+                max_new_tokens,
+                self.model.eos_tokens(),
+            );
+            Ok(parser.finalize()?.stopped(stop))
         }
 
         /// Drop a prefix-cache entry by key. Returns true if it existed.
@@ -3141,7 +3151,9 @@ pub(crate) mod imp {
                          accept={accepted_total}/{attempted_total} ({accept_rate:.1}%) n_draft={n_draft}"
                     );
                     log_chat_done(prefill_prompt_tokens, prefill_total_ms, count, decode_ms);
-                    return parser.finalize();
+                    let stop =
+                        crate::chat_io::StopCause::after_decode(&all_tokens, max_new_tokens, &eos);
+                    return Ok(parser.finalize()?.stopped(stop));
                 }
 
                 // ── Sampled decode branch ──
@@ -3481,7 +3493,9 @@ pub(crate) mod imp {
                     let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
                     let count = all_tokens.len();
                     log_chat_done(prefill_prompt_tokens, prefill_total_ms, count, decode_ms);
-                    return parser.finalize();
+                    let stop =
+                        crate::chat_io::StopCause::after_decode(&all_tokens, max_new_tokens, &eos);
+                    return Ok(parser.finalize()?.stopped(stop));
                 }
 
                 // env-gated op-counter instrumentation.
@@ -3568,6 +3582,8 @@ pub(crate) mod imp {
                 let mut capture_stopped = false;
 
                 let mut count = 0usize;
+                // The other exit is the EOS break below, which ends the turn.
+                let mut stop = crate::chat_io::StopCause::EndOfTurn;
                 let t_decode = std::time::Instant::now();
                 loop {
                     if count + 1 == max_new_tokens {
@@ -3585,6 +3601,9 @@ pub(crate) mod imp {
                             state_before,
                             &mut on_event,
                         )?;
+                        // No earlier token ended the turn (the loop breaks on
+                        // one), so this last one decides.
+                        stop = crate::chat_io::StopCause::after_decode(&[token], 1, &eos);
                         break;
                     }
 
@@ -3860,7 +3879,7 @@ pub(crate) mod imp {
                     }
                 }
 
-                parser.finalize()
+                Ok(parser.finalize()?.stopped(stop))
             }) // close with_new_default_stream
         }
     }
