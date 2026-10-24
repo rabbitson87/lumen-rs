@@ -27,6 +27,8 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_MLX_NO_OVERLAP` | off | Optimization | `lumen_mlx::gemma4_backend::imp::no_overlap` |
 | `LUMEN_MLX_SESSION_ROLLBACK` | on | Optimization | `lumen_mlx::session::session_rollback_enabled` |
 | `LUMEN_MOE_EVICTION` | off | Optimization | `lumen_mlx::offload::slot_policy::moe_eviction` |
+| `LUMEN_MOE_IO_THROTTLE_GBPS` | off | Diagnostic | `lumen_mlx::offload::io::io_throttle` |
+| `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
@@ -298,6 +300,32 @@ Which resident expert the SSD expert pool evicts when it is full, for Flash-Next
  resident and so how many are read from the SSD; any other value is an error when the
  pool is built.
 
+### `LUMEN_MOE_IO_THROTTLE_GBPS`
+
+*Diagnostic, default off.*
+
+Diagnostic: pace the expert reads to the aggregate rate in this variable, in GB/s (`3`,
+ `1.5`), to see how the offload behaves on a slower SSD than this machine's. Each read
+ reserves its share of the rate across all reader threads, starts no earlier than its
+ reservation and completes no earlier than its end. Only when the bytes arrive changes,
+ never which bytes are read; `0` or unset reads at full speed.
+
+### `LUMEN_MOE_OVERLAP`
+
+*Optimization, default off.*
+
+Keep the GPU busy while a decode step's missing experts are read from the SSD: as soon as
+ the routing is known, submit the routed experts the pool already holds (and the shared
+ expert), and gather the missing ones once their reads land. Each expert's output is the
+ same per-row `gather_qmm` kernel over the same bytes either way, and the outputs are put
+ back in the routing's order before today's score-weighted sum, so the output is
+ bit-identical (`offload::exactness_tests`). Only calls of up to four rows that both hit
+ and miss, with reads expected to take at least 0.5 ms; everything else (prefill, staging,
+ `LUMEN_QWEN4_BUILD_AHEAD`) is unchanged. Measured on the real checkpoint (M3 Max, N=5,
+ identical text): +4.0% at a 4.2 GB pool and +4.6% at 15 GB on this 6.5 GB/s SSD, -0.8%
+ (noise) at 6.7 GB, and only +1.3% to +2.4% with reads paced to 3 or 1.5 GB/s, where the
+ read is 5-10 ms and the hidden GPU work 0.1-0.2 ms per layer call. Kept opt-in.
+
 ### `LUMEN_MOE_PROBE_LAYER_SYNC`
 
 *Diagnostic, default off.*
@@ -486,7 +514,9 @@ Decode with the offloaded layers pipelined one segment ahead: submit the GPU wor
  graph while the GPU runs it, and only then read the routing back. The graph is the same
  one the plain path builds (the gather reads its slot numbers from a persistent array the
  CPU fills in after the readback), so the output is bit-identical; what changes is that the
- host's graph building no longer sits between two GPU segments.
+ host's graph building no longer sits between two GPU segments. Measured on the real
+ checkpoint (M3 Max): identical text, but no end-to-end gain (15 GB pool 9.79 -> 9.81 tok/s,
+ N=10; 6.7 GB +2%, noise); only ~5.5 ms of host build per token is hideable. Kept opt-in.
 
 ### `LUMEN_QWEN4_MEM_LOG`
 

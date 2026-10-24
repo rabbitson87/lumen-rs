@@ -213,6 +213,34 @@ fn chunked_prefill_matches_a_single_prefill() {
 /// `offload::exactness_tests`).
 #[test]
 fn offloaded_experts_match_the_resident_model() {
+    offloaded_matches_resident();
+}
+
+/// `LUMEN_MOE_OVERLAP`: the experts the pool holds are computed while the missing ones are read,
+/// and put back in the routing's order before the weighted sum. The logits must stay the resident
+/// model's bit for bit at every pool size, and the overlapped path must actually be taken (the
+/// replica's reads are microseconds, so the read-time bar is lowered for the test).
+#[test]
+fn overlapping_reads_with_resident_experts_keeps_the_resident_models_logits() {
+    let overlapped = crate::offload::overlap::with(true, || {
+        crate::offload::test_overlap::with_any_read(offloaded_matches_resident)
+    });
+    assert!(overlapped > 0, "no call took the overlapped path");
+}
+
+/// How many layer calls overlapped their reads, from the offload's report.
+fn overlapped_calls(model: &Qwen4ExpModel) -> u64 {
+    let report = model.offload_report().expect("offload on");
+    report
+        .split("overlapped ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The body of `offloaded_experts_match_the_resident_model`; returns the calls that overlapped.
+fn offloaded_matches_resident() -> u64 {
     let dir = fixture_dir();
     let resident = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
     let vocab = resident.config().vocab_size;
@@ -236,17 +264,23 @@ fn offloaded_experts_match_the_resident_model() {
     let baseline = run(&resident);
     drop(resident);
     // An expert of the replica is ~9.9 KB; a budget of 1 byte gives the smallest pool, 32 slots.
+    let mut overlapped = 0;
     for budget in [1u64, 20 * 9_900, 34 * 9_900, 100 * 9_900, u64::MAX / 2] {
         let model = Qwen4ExpModel::load(&dir, Some(budget)).expect("load with offload");
         let got = run(&model);
         let (hits, misses) = model.offload_stats().expect("offload on");
         let (max_abs, _) = compare(&got, &baseline, vocab);
-        eprintln!("budget {budget}: hits {hits} misses {misses}, max |diff| {max_abs:e}");
+        let split = overlapped_calls(&model);
+        eprintln!(
+            "budget {budget}: hits {hits} misses {misses}, {split} calls overlapped, max |diff| {max_abs:e}"
+        );
+        overlapped += split;
         assert!(
             got == baseline,
             "budget {budget}: logits differ from the resident model (max |diff| {max_abs:e})"
         );
     }
+    overlapped
 }
 
 /// The pipelined decode path (`LUMEN_QWEN4_BUILD_AHEAD`) builds each layer's second half and the
@@ -296,6 +330,22 @@ fn building_decode_layers_ahead_gives_the_plain_paths_logits() {
 /// which is what sends a big call down the pool path.
 #[test]
 fn offloaded_experts_match_the_resident_model_for_every_call_size() {
+    every_call_size_matches_resident();
+}
+
+/// The same streams and cuttings with `LUMEN_MOE_OVERLAP`: the one- and few-row pieces overlap
+/// their reads, the rest take the plain path, and the logits stay the resident model's.
+#[test]
+fn overlapped_reads_match_the_resident_model_for_every_call_size() {
+    let overlapped = crate::offload::overlap::with(true, || {
+        crate::offload::test_overlap::with_any_read(every_call_size_matches_resident)
+    });
+    assert!(overlapped > 0, "no call took the overlapped path");
+}
+
+/// The body of `offloaded_experts_match_the_resident_model_for_every_call_size`; returns the
+/// calls that overlapped.
+fn every_call_size_matches_resident() -> u64 {
     let dir = fixture_dir();
     let resident = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
     let want = reference(&dir);
@@ -338,6 +388,7 @@ fn offloaded_experts_match_the_resident_model_for_every_call_size() {
         .map(|(_, ids)| cuttings.iter().map(|p| run(&resident, ids, p)).collect())
         .collect();
     drop(resident);
+    let mut overlapped = 0;
     for budget in [1u64, 40 * 9_900, 100 * 9_900, u64::MAX / 2] {
         for ((name, ids), baselines) in streams.iter().zip(&baselines) {
             for (pieces, baseline) in cuttings.iter().zip(baselines) {
@@ -347,9 +398,11 @@ fn offloaded_experts_match_the_resident_model_for_every_call_size() {
                     run(&model, ids, pieces) == *baseline,
                     "budget {budget}, {name}, pieces {pieces:?}: logits differ from the resident model"
                 );
+                overlapped += overlapped_calls(&model);
             }
         }
     }
+    overlapped
 }
 
 /// Rows read from the checkpoint's files one at a time give the logits the

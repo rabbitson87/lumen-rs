@@ -386,17 +386,7 @@ mod imp {
         )
         .context("switch_glu: gather_qmm(gate_proj) failed")?;
 
-        // swiglu(gate, x_up) = silu(gate) * x_up. LUMEN_NATIVE_FUSE_SWIGLU=1
-        // routes through compile-wrapped graph (1 dispatch, 1 fused kernel)
-        // instead of explicit silu + multiply (2 dispatches, 2 kernels).
-        let activated = if swiglu_fuse_enabled() {
-            swiglu_fused(&x_gate, &x_up).context("switch_glu: fused swiglu failed")?
-        } else {
-            let silu_gate =
-                mlx_rs::nn::silu(&x_gate).context("switch_glu: silu(gate_proj) failed")?;
-            mlx_rs::ops::multiply(&silu_gate, &x_up)
-                .context("switch_glu: silu(gate) * x_up failed")?
-        };
+        let activated = switch_activation(&x_gate, &x_up)?;
 
         let down = gather_qmm_with_mode(
             &activated,
@@ -432,7 +422,88 @@ mod imp {
         mlx_rs::ops::squeeze_axes(&recombined, &[-2]).context("switch_glu: squeeze(-2) failed")
     }
 
-    fn run_experts(
+    /// `swiglu(gate, up) = silu(gate) * up` of the routed experts. LUMEN_NATIVE_FUSE_SWIGLU=1
+    /// routes through compile-wrapped graph (1 dispatch, 1 fused kernel) instead of explicit
+    /// silu + multiply (2 dispatches, 2 kernels).
+    fn switch_activation(x_gate: &Array, x_up: &Array) -> Result<Array> {
+        if swiglu_fuse_enabled() {
+            swiglu_fused(x_gate, x_up).context("switch_glu: fused swiglu failed")
+        } else {
+            let silu_gate =
+                mlx_rs::nn::silu(x_gate).context("switch_glu: silu(gate_proj) failed")?;
+            mlx_rs::ops::multiply(&silu_gate, x_up).context("switch_glu: silu(gate) * x_up failed")
+        }
+    }
+
+    /// The routed experts' outputs for a list of entries instead of a routing: entry `i` is the
+    /// expert in slot `slots[i]` applied to row `rows[i]` of `x` (`[B, S, hidden]` flattened
+    /// over batch and sequence). Returns `[n, hidden]` in `x`'s dtype.
+    ///
+    /// This is [`run_experts`] on the routing's unsorted path, entry by entry: the same three
+    /// `gather_qmm` calls with one row per index (`M = 1`) and no sort, which MLX runs with its
+    /// per-row `gather_qmv` kernel whatever the number of entries, so each entry's output is the
+    /// bits the whole routing gives it (`offload::exactness_tests`). Only for calls the routing
+    /// would not sort (fewer than 64 entries); an overlapped layer call splits its entries into
+    /// the resident and missing ones and runs this on each.
+    pub(crate) fn expert_entries(
+        x: &Array,
+        rows: &Array,
+        slots: &Array,
+        glu: &SwitchGluWeights<'_>,
+        in_scale_dtype: bool,
+    ) -> Result<Array> {
+        use mlx_rs::Dtype::{Bfloat16, Float16, Float32};
+        // The dtype policy of `switch_glu_in_scale_dtype`.
+        let scale_dtype = glu.up_proj.scales.dtype();
+        let cast = in_scale_dtype
+            && matches!(scale_dtype, Bfloat16 | Float16 | Float32)
+            && scale_dtype != x.dtype();
+        let xc = if cast {
+            x.as_dtype(scale_dtype)
+                .context("expert_entries: cast activations to the scale dtype")?
+        } else {
+            x.clone()
+        };
+        let hidden = *xc
+            .shape()
+            .last()
+            .ok_or_else(|| anyhow!("expert_entries: x has no axes"))?;
+        let x_rows = mlx_rs::ops::reshape(&xc, &[-1, 1, hidden])
+            .context("expert_entries: flatten x to rows")?;
+        let gather = |input: &Array, p: &SwitchExpertWeights<'_>, lhs: Option<&Array>| {
+            gather_qmm_with_mode(
+                input,
+                p.weight,
+                p.scales,
+                p.biases,
+                lhs,
+                Some(slots),
+                true,
+                glu.group_size,
+                glu.bits,
+                glu.mode,
+                false,
+            )
+        };
+        let x_up = gather(&x_rows, &glu.up_proj, Some(rows))
+            .context("expert_entries: gather_qmm(up_proj) failed")?;
+        let x_gate = gather(&x_rows, &glu.gate_proj, Some(rows))
+            .context("expert_entries: gather_qmm(gate_proj) failed")?;
+        let activated = switch_activation(&x_gate, &x_up)?;
+        let down = gather(&activated, &glu.down_proj, None)
+            .context("expert_entries: gather_qmm(down_proj) failed")?;
+        let y = mlx_rs::ops::squeeze_axes(&down, &[-2]).context("expert_entries: squeeze(-2)")?;
+        if cast {
+            y.as_dtype(x.dtype())
+                .context("expert_entries: cast experts' output back")
+        } else {
+            Ok(y)
+        }
+    }
+
+    /// The routed experts' `[B, S, K, hidden]` outputs for the routing `indices`, through
+    /// [`switch_glu_in_scale_dtype`] when `in_scale_dtype` asks for it.
+    pub(crate) fn run_experts(
         x: &Array,
         indices: &Array,
         glu: &SwitchGluWeights<'_>,
@@ -684,13 +755,82 @@ mod imp {
     ) -> Result<Array> {
         let y = run_experts(x, indices, glu, w.experts_in_scale_dtype)
             .context("moe_block_forward: switch_glu failed")?;
+        weighted_sum(&y, scores)
+    }
+
+    /// `(y * scores[..., None]).sum(axis=-2)`: the selected experts' outputs `y` (`[B, S, K,
+    /// hidden]`) weighted by their routing scores and summed over `K`.
+    pub(crate) fn weighted_sum(y: &Array, scores: &Array) -> Result<Array> {
         let scores_exp = mlx_rs::ops::expand_dims(scores, -1)
             .context("moe_block_forward: expand_dims(scores) failed")?;
-        let weighted = mlx_rs::ops::multiply(&y, &scores_exp)
+        let weighted = mlx_rs::ops::multiply(y, &scores_exp)
             .context("moe_block_forward: y * scores failed")?;
         weighted
             .sum_axis(-2, /* keep_dims */ false)
             .context("moe_block_forward: sum_axis(-2) failed")
+    }
+
+    /// An offloaded layer's routed and shared experts with `LUMEN_MOE_OVERLAP`: while the experts
+    /// the pool lacks are read, the GPU computes the routed entries whose experts are resident and
+    /// the shared expert; the missing entries are gathered once their reads land. The per-entry
+    /// outputs go back into the routing's order and through the same weighted sum as
+    /// [`routed_graph`], so the result is the plain path's bit for bit. A call that does not
+    /// qualify (see `offload::overlaps`) takes the plain path.
+    fn offloaded_overlapped(
+        x: &Array,
+        w: &MoeBlockWeights<'_>,
+        o: &OffloadLayer<'_>,
+        inds: &Array,
+        scores: &Array,
+    ) -> Result<Array> {
+        use crate::offload::Routing;
+        let mut resident = |part: &crate::offload::Routed, rows: &Array| -> Result<Vec<Array>> {
+            let glu = offloaded_glu(part, &w.switch_glu)?;
+            let y = expert_entries(x, rows, &part.slot_inds, &glu, w.experts_in_scale_dtype)?;
+            Ok(vec![y, shared_graph(x, w)?])
+        };
+        let routing = o
+            .offload
+            .route_overlapping(o.layer, inds, &mut resident)
+            .context("moe_block_forward: expert offload routing failed")?;
+        let split = match routing {
+            Routing::Whole(r) => return moe_after_routing(x, w, &r, scores),
+            Routing::Split(s) => s,
+        };
+        let [y_resident, shared_y]: [Array; 2] = split
+            .resident_out
+            .try_into()
+            .map_err(|_| anyhow!("moe_block_forward: resident work came back incomplete"))?;
+        let glu = offloaded_glu(&split.missing, &w.switch_glu)?;
+        let y_missing = expert_entries(
+            x,
+            &split.missing_rows,
+            &split.missing.slot_inds,
+            &glu,
+            w.experts_in_scale_dtype,
+        )?;
+        let y = rejoin_entries(&y_resident, &y_missing, &split.order, inds.shape())?;
+        let combined = weighted_sum(&y, scores)?;
+        mlx_rs::ops::add(&combined, &shared_y)
+            .context("moe_block_forward: combined + shared_y failed")
+    }
+
+    /// The `[B, S, K, hidden]` expert outputs of a routing (`routing_shape` = `[B, S, K]`) from its
+    /// entries split in two parts (`[n_a, hidden]`, `[n_b, hidden]`): entry `i` of the routing is
+    /// row `order[i]` of the parts stacked. Pure data movement, so every value keeps its bits.
+    pub(crate) fn rejoin_entries(
+        part_a: &Array,
+        part_b: &Array,
+        order: &Array,
+        routing_shape: &[i32],
+    ) -> Result<Array> {
+        let both = mlx_rs::ops::concatenate_axis(&[part_a, part_b], 0)
+            .context("moe_block_forward: join the resident and missing experts")?;
+        let y = mlx_rs::ops::indexing::take_axis(&both, order, 0)
+            .context("moe_block_forward: restore the routing's order")?;
+        let mut shape = routing_shape.to_vec();
+        shape.push(*both.shape().last().expect("parts are [n, hidden]"));
+        mlx_rs::ops::reshape(&y, &shape).context("moe_block_forward: [B, S, K, hidden]")
     }
 
     /// The shared expert's graph: `sigmoid(shared_gate(x)) * shared_expert(x)`.
@@ -763,6 +903,16 @@ mod imp {
                 .try_as_slice::<u32>()
                 .context("moe_block_forward: layer-sync probe read(inds) failed")?;
             std::hint::black_box(ids.first().copied());
+        }
+
+        // An offloaded layer that overlaps its SSD reads with the resident experts' work. Not
+        // under the stage timers, which sync between the stages this interleaves.
+        if let Some(o) = &w.offload
+            && crate::offload::overlap::get()
+            && !timing_on
+            && !crate::decode_probe::sync_on()
+        {
+            return offloaded_overlapped(x, w, o, &inds, &scores);
         }
 
         // (S: switch_glu) per-expert gate_up + silu_mul + down_proj +
@@ -839,3 +989,5 @@ pub(crate) use imp::{
     gelu_mul_fused, moe_after_routing, moe_block_forward, moe_router, swiglu_fuse_enabled,
     swiglu_fused, switch_glu,
 };
+#[cfg(all(feature = "mlx-native", test))]
+pub(crate) use imp::{expert_entries, rejoin_entries, run_experts, weighted_sum};

@@ -17,8 +17,11 @@ use std::collections::BTreeMap;
 use mlx_rs::{Array, Dtype, random};
 
 use super::slot_pool::PoolTensor;
-use super::takes_staging_path;
-use crate::native_moe::{SwitchExpertWeights, SwitchGluWeights, switch_glu};
+use super::{distinct_in_order, split_entries, takes_staging_path};
+use crate::native_moe::{
+    SwitchExpertWeights, SwitchGluWeights, expert_entries, rejoin_entries, run_experts, switch_glu,
+    weighted_sum,
+};
 use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
 const EXPERTS: usize = 512;
@@ -282,6 +285,105 @@ fn the_path_a_call_takes_gives_the_resident_output_at_every_pool_size() {
                     distinct(&ids),
                     if stages { "staged" } else { "pool path" }
                 );
+            }
+        }
+    }
+}
+
+/// The calls `LUMEN_MOE_OVERLAP` splits: a decode step and the verify sizes (`trace::DECODE_ROWS`).
+const SPLIT_ROWS: [usize; 4] = [1, 2, 3, 4];
+
+/// Every way of marking `n` distinct experts missing that the overlap uses (at least one resident
+/// and one missing): one resident, one missing, every other, and two random shares.
+fn missing_masks(n: usize, seed: u64) -> Vec<Vec<bool>> {
+    let mut rng = Rng(seed | 1);
+    let mut random = |share_of_8: u64| -> Vec<bool> {
+        let mut m: Vec<bool> = (0..n).map(|_| rng.next_u64() % 8 < share_of_8).collect();
+        m[0] = false; // keep one resident
+        m[n - 1] = true; // and one missing
+        m
+    };
+    let (third, two_thirds) = (random(3), random(5));
+    vec![
+        (0..n).map(|i| i != 0).collect(),
+        (0..n).map(|i| i == n - 1).collect(),
+        (0..n).map(|i| i % 2 == 1).collect(),
+        third,
+        two_thirds,
+    ]
+}
+
+fn bits(a: &Array) -> Vec<u32> {
+    let a = a.as_dtype(Dtype::Float32).expect("f32");
+    a.eval().expect("eval");
+    a.try_as_slice::<f32>()
+        .expect("slice")
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// An overlapped call gathers its resident entries and its missing ones separately (one row per
+/// index, no sort) and puts the outputs back in the routing's order before the weighted sum. Each
+/// entry must come out with the bits the whole routing gives it, for every pool size, slot
+/// placement, row count and resident share, so the block's output is the plain path's. Both
+/// activation dtypes: f32 activations against bf16 scales (the shipped model, cast per call) and
+/// bf16 throughout.
+#[test]
+fn a_call_split_into_resident_and_missing_entries_gives_the_whole_calls_bits() {
+    let layer = build_layer();
+    for n_slots in [1024usize, 1449, 2423, 4340] {
+        let placement = scrambled_slots(n_slots, 31 + n_slots as u64);
+        let pool = whole_pool(&pool_with(&layer, n_slots, &[&placement]));
+        let glu = glu_of(&pool);
+        for rows in SPLIT_ROWS {
+            let ids = routing(rows, 250, 40 + rows as u64);
+            let slot_ids: Vec<u32> = ids.iter().map(|&e| placement[e as usize] as u32).collect();
+            let shape = [1, rows as i32, TOP_K as i32];
+            let inds = Array::from_slice(&slot_ids, &shape);
+            let mut rng = Rng(rows as u64 * 977 + n_slots as u64);
+            let score_vals: Vec<f32> = (0..ids.len())
+                .map(|_| (rng.next_u64() % 1000) as f32 / 1000.0)
+                .collect();
+            let scores = Array::from_slice(&score_vals, &shape);
+            let (distinct, index_of) = distinct_in_order(&ids).expect("distinct");
+            let slots: Vec<usize> = distinct.iter().map(|&e| placement[e as usize]).collect();
+            for (dtype, in_scale_dtype) in [(Dtype::Float32, true), (Dtype::Bfloat16, false)] {
+                let x = random::normal::<f32>(&[1, rows as i32, HIDDEN], None, None, None)
+                    .expect("x")
+                    .as_dtype(dtype)
+                    .expect("dtype");
+                let whole_y = run_experts(&x, &inds, &glu, in_scale_dtype).expect("whole");
+                let whole_sum = weighted_sum(&whole_y, &scores).expect("sum");
+                let (want_y, want_sum) = (bits(&whole_y), bits(&whole_sum));
+                assert!(want_y.iter().filter(|&&b| b != 0).count() > want_y.len() / 2);
+                for (m, missing) in missing_masks(distinct.len(), rows as u64)
+                    .iter()
+                    .enumerate()
+                {
+                    let parts = split_entries(&ids, TOP_K, &index_of, &slots, missing);
+                    let arr = |v: &[u32]| Array::from_slice(v, &[v.len() as i32]);
+                    let part = |r: &[u32], s: &[u32]| {
+                        expert_entries(&x, &arr(r), &arr(s), &glu, in_scale_dtype).expect("part")
+                    };
+                    let resident = part(&parts.resident_rows, &parts.resident_slots);
+                    let absent = part(&parts.missing_rows, &parts.missing_slots);
+                    let y = rejoin_entries(&resident, &absent, &arr(&parts.order), &shape)
+                        .expect("rejoin");
+                    let what = format!(
+                        "{n_slots} slots, {rows} rows, {dtype:?}, mask {m} ({} of {} experts missing)",
+                        missing.iter().filter(|&&b| b).count(),
+                        distinct.len()
+                    );
+                    assert_eq!(y.shape(), whole_y.shape(), "{what}");
+                    let got_y = bits(&y);
+                    let differing = got_y.iter().zip(&want_y).filter(|(a, b)| a != b).count();
+                    assert_eq!(differing, 0, "{what}: {differing} expert outputs differ");
+                    assert!(
+                        bits(&weighted_sum(&y, &scores).expect("sum")) == want_sum,
+                        "{what}: the weighted sum differs"
+                    );
+                }
             }
         }
     }

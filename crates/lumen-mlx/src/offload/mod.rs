@@ -7,7 +7,7 @@
 //!   safetensors shards (no repacking, no extra disk).
 //! * [`io`] — a thread pool that reads those byte ranges in parallel into
 //!   private aligned buffers and copies them into slot memory.
-//! * [`expert_bank`] — the four pieces joined: `acquire(layer, experts)` makes
+//! * [`expert_bank`] — the four pieces joined: `begin_acquire(layer, experts)` makes
 //!   experts resident and returns slot numbers for the gather.
 //! * [`slot_pool`] — stacked tensors whose slots the CPU can overwrite in place.
 //! * [`slot_map`] — which `(layer, expert)` lives in which slot: pins, the free list and the
@@ -35,17 +35,73 @@ mod exactness_tests;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::Array;
 
-pub(crate) use expert_bank::{Acquired, ExpertBank, RegionLoad, STAGING_REGIONS};
+pub(crate) use expert_bank::{Acquired, Acquiring, ExpertBank, RegionLoad, STAGING_REGIONS};
 pub(crate) use expert_store::MTP_LAYER;
 pub(crate) use expert_store::read_header;
 pub(crate) use io::{IoMode, IoPool, ReadJob};
 pub(crate) use pack::PackMode;
+
+lumen_flags::flag! {
+    /// Keep the GPU busy while a decode step's missing experts are read from the SSD: as soon as
+    /// the routing is known, submit the routed experts the pool already holds (and the shared
+    /// expert), and gather the missing ones once their reads land. Each expert's output is the
+    /// same per-row `gather_qmm` kernel over the same bytes either way, and the outputs are put
+    /// back in the routing's order before today's score-weighted sum, so the output is
+    /// bit-identical (`offload::exactness_tests`). Only calls of up to four rows that both hit
+    /// and miss, with reads expected to take at least 0.5 ms; everything else (prefill, staging,
+    /// `LUMEN_QWEN4_BUILD_AHEAD`) is unchanged. Measured on the real checkpoint (M3 Max, N=5,
+    /// identical text): +4.0% at a 4.2 GB pool and +4.6% at 15 GB on this 6.5 GB/s SSD, -0.8%
+    /// (noise) at 6.7 GB, and only +1.3% to +2.4% with reads paced to 3 or 1.5 GB/s, where the
+    /// read is 5-10 ms and the hidden GPU work 0.1-0.2 ms per layer call. Kept opt-in.
+    pub(crate) overlap {
+        env: "LUMEN_MOE_OVERLAP",
+        default: false,
+        kind: Optimization,
+    }
+}
+
+/// An overlapped call runs one more GPU submission and gathers in two parts, which costs a few
+/// tens of microseconds; reads expected to take less than this are not worth splitting for.
+const OVERLAP_MIN_READ_US: u64 = 500;
+
+/// [`OVERLAP_MIN_READ_US`] in ns, unless a test lowered it for its thread.
+fn overlap_min_read_ns() -> u64 {
+    #[cfg(test)]
+    if let Some(ns) = test_overlap::MIN_READ_NS.with(std::cell::Cell::get) {
+        return ns;
+    }
+    OVERLAP_MIN_READ_US * 1_000
+}
+
+/// The tiny replica's experts are a few KB, read in microseconds, so no call of it would reach
+/// [`OVERLAP_MIN_READ_US`]: tests that want the overlapped path exercised lower the bar.
+#[cfg(test)]
+pub(crate) mod test_overlap {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static MIN_READ_NS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with every read long enough to overlap (on this thread), restoring on unwind.
+    pub(crate) fn with_any_read<R>(f: impl FnOnce() -> R) -> R {
+        struct Reset(Option<u64>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                MIN_READ_NS.with(|c| c.set(self.0));
+            }
+        }
+        let _reset = Reset(MIN_READ_NS.with(Cell::get));
+        MIN_READ_NS.with(|c| c.set(Some(0)));
+        f()
+    }
+}
 
 /// Reader threads per bank. Four saturate the SSD for reads of 1 MB and up, but an
 /// expert is 6-9 ranges of 50 KB to 900 KB and a layer call misses several experts, so
@@ -231,6 +287,130 @@ impl Routed {
     }
 }
 
+/// What [`MoeOffload::route_overlapping`] returns.
+pub(crate) enum Routing {
+    /// As [`MoeOffload::route`]: every expert resident by now, gather over `slot_inds`.
+    Whole(Routed),
+    /// The call's reads overlapped with the resident experts' work.
+    Split(Split),
+}
+
+/// An overlapped layer call, once its reads have landed. The routed entries (row, top-k
+/// position) are in two parts: the resident ones, whose work the caller built while the reads
+/// ran and which is running on the GPU, and the missing ones, to gather now.
+pub(crate) struct Split {
+    /// What the caller's `resident` closure built, in its order, already submitted.
+    pub resident_out: Vec<Array>,
+    /// The missing entries' slots (`slot_inds`, `[n]`) and the pool arrays to gather over.
+    pub missing: Routed,
+    /// Row of the call's input (flattened over batch and sequence) of each missing entry.
+    pub missing_rows: Array,
+    /// For every routed entry in the routing's order, its index among the resident entries
+    /// followed by the missing ones: `take(concat(resident, missing), order)` restores the order.
+    pub order: Array,
+}
+
+/// The work a caller hands [`MoeOffload::route_overlapping`]: given the resident entries (their
+/// slots as a `Routed`, and their rows), build (lazily, without evaluating) the GPU work to run
+/// while the reads do. The offload submits it and keeps the slots pinned until it is done.
+pub(crate) type ResidentWork<'a> = dyn FnMut(&Routed, &Array) -> Result<Vec<Array>> + 'a;
+
+/// A layer call's slots, pinned until the GPU work that reads them is known to be done.
+struct Pinned {
+    acquired: Acquired,
+    /// Work an overlapped call submitted while its reads ran. Its result feeds the next routing,
+    /// so that readback completes it too; holding it makes the release wait for it explicitly,
+    /// including on the error paths where no readback follows. The plain path has none: its
+    /// gather is submitted with the next routing, whose readback completes it.
+    gpu: Vec<Array>,
+}
+
+impl Pinned {
+    fn release(self, bank: &mut ExpertBank) {
+        wait_for(&self.gpu);
+        bank.release(self.acquired);
+    }
+}
+
+/// Block until `arrays` are computed (or evaluate them, if they never were submitted). Errors are
+/// ignored: a failed evaluation leaves nothing running, which is all a caller about to unpin needs.
+fn wait_for(arrays: &[Array]) {
+    for a in arrays {
+        let _ = a.eval();
+    }
+}
+
+/// The routed entries of a call split by whether their expert was resident: slots and rows of
+/// each part, and where every entry of the routing lands in `resident ++ missing`.
+#[derive(Debug, PartialEq, Eq)]
+struct Parts {
+    resident_slots: Vec<u32>,
+    resident_rows: Vec<u32>,
+    missing_slots: Vec<u32>,
+    missing_rows: Vec<u32>,
+    order: Vec<u32>,
+}
+
+/// Split the call's entries (`ids`, `k` per row) into resident and missing ones, each part in the
+/// routing's order. `slots` and `missing` are per distinct expert (`index_of`).
+fn split_entries(
+    ids: &[u32],
+    k: usize,
+    index_of: &HashMap<u32, usize>,
+    slots: &[usize],
+    missing: &[bool],
+) -> Parts {
+    let n_resident = ids.iter().filter(|id| !missing[index_of[id]]).count() as u32;
+    let mut p = Parts {
+        resident_slots: Vec::with_capacity(n_resident as usize),
+        resident_rows: Vec::with_capacity(n_resident as usize),
+        missing_slots: Vec::with_capacity(ids.len() - n_resident as usize),
+        missing_rows: Vec::with_capacity(ids.len() - n_resident as usize),
+        order: Vec::with_capacity(ids.len()),
+    };
+    for (i, id) in ids.iter().enumerate() {
+        let d = index_of[id];
+        let (slot, row) = (slots[d] as u32, (i / k) as u32);
+        if missing[d] {
+            p.order.push(n_resident + p.missing_slots.len() as u32);
+            p.missing_slots.push(slot);
+            p.missing_rows.push(row);
+        } else {
+            p.order.push(p.resident_slots.len() as u32);
+            p.resident_slots.push(slot);
+            p.resident_rows.push(row);
+        }
+    }
+    p
+}
+
+/// Whether a pool-path call overlaps its reads with resident work: a decode-sized call (the sizes
+/// whose split is proven bit-identical) that both hits and misses, whose reads are expected to
+/// take at least `min_read_ns` (`ns_per_expert` 0: no estimate yet, so yes).
+fn overlaps(
+    rows: usize,
+    hits: usize,
+    misses: usize,
+    ns_per_expert: u64,
+    min_read_ns: u64,
+) -> Decision {
+    if rows > trace::DECODE_ROWS as usize || hits == 0 || misses == 0 {
+        Decision::Plain
+    } else if ns_per_expert > 0 && misses as u64 * ns_per_expert < min_read_ns {
+        Decision::Short
+    } else {
+        Decision::Overlap
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Plain,
+    /// Would overlap, but the reads are expected to be too short to be worth it.
+    Short,
+    Overlap,
+}
+
 /// A checkpoint's routed experts, served from a slot pool instead of RAM.
 ///
 /// Held by the model; every MoE layer calls [`Self::route`] between computing
@@ -238,8 +418,13 @@ impl Routed {
 pub(crate) struct MoeOffload {
     bank: Mutex<ExpertBank>,
     /// The slots of the previous layer call, still pinned: that call's gather
-    /// is only known to be finished once the next routing readback returns.
-    pending: Mutex<Option<Acquired>>,
+    /// is only known to be finished once the next routing readback returns (and
+    /// whatever it submitted itself, once that has been waited for; see [`Pinned`]).
+    pending: Mutex<Option<Pinned>>,
+    /// How long reading one missing expert takes here, in ns (a moving average over the calls
+    /// that read; 0 until one has): how `LUMEN_MOE_OVERLAP` tells a long read from a short one,
+    /// on this machine's SSD or under `LUMEN_MOE_IO_THROTTLE_GBPS`.
+    read_ns_per_expert: AtomicU64,
     /// Which layer each staging region holds (or is being loaded with), and the load in flight.
     staging: Mutex<Staging>,
     /// Where the layer calls spend their time, to log now and then.
@@ -286,6 +471,15 @@ struct Timing {
     bulk_layers: u64,
     bulk_cold_layers: u64,
     bulk_wait_ns: u64,
+    /// `LUMEN_MOE_OVERLAP`: calls whose reads overlapped with resident work, and per such call
+    /// the time from the routing readback to that work's submission, how long the reads ran
+    /// (submission to the last one finishing), and how long the host still waited for them
+    /// after submitting. Plus the calls not overlapped because their reads looked short.
+    overlap_calls: u64,
+    overlap_submit_ns: u64,
+    overlap_read_ns: u64,
+    overlap_wait_ns: u64,
+    overlap_short: u64,
     /// When the previous call returned.
     last_return: Option<std::time::Instant>,
 }
@@ -304,10 +498,26 @@ impl Timing {
                 self.bulk_wait_ns as f64 / self.bulk_layers as f64 / 1e3
             )
         };
+        let overlap = if self.overlap_calls + self.overlap_short == 0 {
+            String::new()
+        } else {
+            let per_overlap = |ns: u64| ns as f64 / self.overlap_calls.max(1) as f64 / 1e3;
+            format!(
+                "; overlapped {} calls ({:.0}% of those that read): resident work submitted \
+                 {:.0} us after the readback, reads ran {:.0} us, then waited {:.0} us; \
+                 {} calls not overlapped (reads expected under {OVERLAP_MIN_READ_US} us)",
+                self.overlap_calls,
+                100.0 * self.overlap_calls as f64 / self.loading_calls.max(1) as f64,
+                per_overlap(self.overlap_submit_ns),
+                per_overlap(self.overlap_read_ns),
+                per_overlap(self.overlap_wait_ns),
+                self.overlap_short,
+            )
+        };
         format!(
             "[offload] {} layer calls: hit rate {:.3} ({} hits, {} misses); per call: \
              host build {:.0} us, GPU wait {:.0} us, load {:.0} us; {:.0}% of calls read, \
-             {:.0} us and {:.2} MB each{prefetch}",
+             {:.0} us and {:.2} MB each{prefetch}{overlap}",
             self.calls,
             st.hit_rate(),
             st.hits,
@@ -478,6 +688,7 @@ impl MoeOffload {
         Ok(Self {
             bank: Mutex::new(bank),
             pending: Mutex::new(None),
+            read_ns_per_expert: AtomicU64::new(0),
             staging: Mutex::new(Staging::default()),
             timing: Mutex::new(Timing::default()),
             expert_bytes: per,
@@ -519,8 +730,12 @@ impl MoeOffload {
             0 => String::new(),
             n => format!("; {n} staged experts copied from the pool instead of read"),
         };
+        let paced = match bank.io_throttle_gbps() {
+            Some(gbps) => format!("; reads paced to {gbps} GB/s (LUMEN_MOE_IO_THROTTLE_GBPS)"),
+            None => String::new(),
+        };
         format!(
-            "{}\n{}{mode}{copied}",
+            "{}\n{}{mode}{copied}{paced}",
             t.line(self.expert_bytes, &bank.stats()),
             bank.io_profile().summary()
         )
@@ -667,6 +882,31 @@ impl MoeOffload {
     /// what makes it safe to rewrite slots here: the previous layer's gather has
     /// finished, so its pins are dropped first.
     pub(crate) fn route(&self, layer: u16, inds: &Array) -> Result<Routed> {
+        match self.route_with(layer, inds, None)? {
+            Routing::Whole(routed) => Ok(routed),
+            Routing::Split(_) => bail!("offload route: a call with no resident work was split"),
+        }
+    }
+
+    /// [`Self::route`] that may overlap the call's reads with GPU work (`LUMEN_MOE_OVERLAP`): when
+    /// the call qualifies (see [`overlaps`]), `resident` is called with the resident entries while
+    /// the missing experts are being read, what it builds is submitted, and the reads are waited
+    /// for only then. Otherwise `resident` is not called and the result is [`Routing::Whole`].
+    pub(crate) fn route_overlapping(
+        &self,
+        layer: u16,
+        inds: &Array,
+        resident: &mut ResidentWork<'_>,
+    ) -> Result<Routing> {
+        self.route_with(layer, inds, Some(resident))
+    }
+
+    fn route_with(
+        &self,
+        layer: u16,
+        inds: &Array,
+        resident: Option<&mut ResidentWork<'_>>,
+    ) -> Result<Routing> {
         let entered = std::time::Instant::now();
         // A strided view (`argpartition(..)[.., k..]`) reads back in physical order;
         // a flat reshape forces the logical order.
@@ -679,7 +919,7 @@ impl MoeOffload {
         let mut bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(prev) = pending.take() {
-            bank.release(prev);
+            prev.release(&mut bank);
         }
         let (distinct, index_of) = distinct_in_order(&ids)?;
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
@@ -705,7 +945,7 @@ impl MoeOffload {
                     (entered, evaluated),
                 );
             }
-            return Ok(routed);
+            return Ok(Routing::Whole(routed));
         }
         let call = PoolCall {
             layer,
@@ -717,10 +957,29 @@ impl MoeOffload {
             entered,
             evaluated,
         };
-        let slot_ids = self.place_on_pool(&mut bank, &mut pending, &call)?;
-        let slot_inds = Array::from_slice(&slot_ids, inds.shape());
+        let placed = self.place_on_pool(&mut bank, &mut pending, &call, resident)?;
         let arrays = Self::pool_arrays(&bank);
-        Ok(Routed { slot_inds, arrays })
+        Ok(match placed {
+            Placed::Whole(slot_ids) => Routing::Whole(Routed {
+                slot_inds: Array::from_slice(&slot_ids, inds.shape()),
+                arrays,
+            }),
+            Placed::Split {
+                resident_out,
+                parts,
+            } => {
+                let n = parts.missing_slots.len() as i32;
+                Routing::Split(Split {
+                    resident_out,
+                    missing: Routed {
+                        slot_inds: Array::from_slice(&parts.missing_slots, &[n]),
+                        arrays,
+                    },
+                    missing_rows: Array::from_slice(&parts.missing_rows, &[n]),
+                    order: Array::from_slice(&parts.order, &[parts.order.len() as i32]),
+                })
+            }
+        })
     }
 
     /// The slot-index array a layer's gather reads when its graph is built before the routing
@@ -771,7 +1030,7 @@ impl MoeOffload {
         let mut bank = self.bank.lock().unwrap_or_else(|p| p.into_inner());
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(prev) = pending.take() {
-            bank.release(prev);
+            prev.release(&mut bank);
         }
         let (distinct, index_of) = distinct_in_order(&ids)?;
         let hinted = self.bulk_hint.load(Ordering::Relaxed);
@@ -788,7 +1047,10 @@ impl MoeOffload {
             entered,
             evaluated,
         };
-        let slot_ids = self.place_on_pool(&mut bank, &mut pending, &call)?;
+        let Placed::Whole(slot_ids) = self.place_on_pool(&mut bank, &mut pending, &call, None)?
+        else {
+            bail!("offload route: a call built ahead was split");
+        };
         // SAFETY: the readback above returned, so the segment that ended in this routing has
         // finished, and with it the previous gather over these slot numbers; the next graph
         // that reads them is submitted after this returns.
@@ -797,21 +1059,80 @@ impl MoeOffload {
 
     /// The pool path of a layer call: leave staging, make the call's distinct experts resident
     /// (reading the missing ones), hold their pins until the next call, account the time, and
-    /// return the slot of every routed entry.
+    /// return the slot of every routed entry. With `resident` work and a call that qualifies
+    /// ([`overlaps`]), that work is built and submitted while the reads run, and the entries
+    /// come back split into resident and missing ones.
     fn place_on_pool(
         &self,
         bank: &mut ExpertBank,
-        pending: &mut Option<Acquired>,
+        pending: &mut Option<Pinned>,
         call: &PoolCall<'_>,
-    ) -> Result<Vec<u32>> {
+        resident: Option<&mut ResidentWork<'_>>,
+    ) -> Result<Placed> {
         self.leave_staging(bank)?;
         // Rows, not experts: a decode step or a short verify is a few rows, a prompt chunk many.
-        let kind = if call.ids.len() / call.k <= trace::DECODE_ROWS as usize {
+        let rows = call.ids.len() / call.k;
+        let kind = if rows <= trace::DECODE_ROWS as usize {
             slot_map::CallKind::Decode
         } else {
             slot_map::CallKind::Prefill
         };
-        let acquired = bank.acquire_as(call.layer, call.distinct, kind)?;
+        let mut acquiring = bank.begin_acquire(call.layer, call.distinct, kind)?;
+        let misses = acquiring.loaded_experts();
+        let decision = match resident {
+            Some(_) => overlaps(
+                rows,
+                call.distinct.len() - misses,
+                misses,
+                self.read_ns_per_expert.load(Ordering::Relaxed),
+                overlap_min_read_ns(),
+            ),
+            None => Decision::Plain,
+        };
+
+        // While the reads run: build the resident entries' work and submit it. It reads only
+        // slots the plan pinned as hits; the slots being written are reserved, so nothing reads
+        // them until the commit below.
+        let mut gpu: Vec<Array> = Vec::new();
+        let mut overlapped = None;
+        if let (Decision::Overlap, Some(work)) = (decision, resident) {
+            let mut missing = vec![false; call.distinct.len()];
+            for e in acquiring.missed() {
+                missing[call.index_of[&u32::from(e)]] = true;
+            }
+            let parts = split_entries(call.ids, call.k, call.index_of, acquiring.slots(), &missing);
+            let n = parts.resident_slots.len() as i32;
+            let part = Routed {
+                slot_inds: Array::from_slice(&parts.resident_slots, &[n]),
+                arrays: Self::pool_arrays(bank),
+            };
+            let part_rows = Array::from_slice(&parts.resident_rows, &[n]);
+            let submitted = work(&part, &part_rows).and_then(|out| {
+                // Held before submitting, so even a failed submission is waited for.
+                gpu = out.clone();
+                mlx_rs::transforms::async_eval(out.iter())
+                    .context("offload route: submit the resident experts")?;
+                Ok(out)
+            });
+            match submitted {
+                Ok(out) => overlapped = Some((out, parts, std::time::Instant::now())),
+                Err(e) => {
+                    Self::settle_failed(bank, pending, acquiring, gpu);
+                    return Err(e);
+                }
+            }
+        }
+        let read_time = match acquiring.wait_reads() {
+            Ok(took) => took,
+            Err(e) => {
+                // The resident work reads slots whose pins the abort drops.
+                wait_for(&gpu);
+                bank.abort(acquiring);
+                return Err(e);
+            }
+        };
+        let landed = std::time::Instant::now();
+        let acquired = bank.commit(acquiring);
         if let Some(trace) = &self.trace {
             let missed: Vec<u16> = acquired.missed().collect();
             let hits: Vec<bool> = call.distinct.iter().map(|e| !missed.contains(e)).collect();
@@ -829,12 +1150,23 @@ impl MoeOffload {
             );
         }
         let loaded = acquired.loaded_experts();
-        let slot_ids: Vec<u32> = call
-            .ids
-            .iter()
-            .map(|id| acquired.slots[call.index_of[id]])
-            .collect();
-        *pending = Some(acquired);
+        if loaded > 0 {
+            self.note_read_time(read_time, loaded);
+        }
+        let submitted_at = overlapped.as_ref().map(|(_, _, at)| *at);
+        let placed = match overlapped {
+            None => Placed::Whole(
+                call.ids
+                    .iter()
+                    .map(|id| acquired.slots[call.index_of[id]])
+                    .collect(),
+            ),
+            Some((resident_out, parts, _)) => Placed::Split {
+                resident_out,
+                parts,
+            },
+        };
+        *pending = Some(Pinned { acquired, gpu });
         {
             let now = std::time::Instant::now();
             let mut t = self.timing.lock().unwrap_or_else(|p| p.into_inner());
@@ -848,6 +1180,13 @@ impl MoeOffload {
                 t.loading_calls += 1;
                 t.loaded_experts += loaded as u64;
             }
+            if let Some(submitted) = submitted_at {
+                t.overlap_calls += 1;
+                t.overlap_submit_ns += submitted.duration_since(call.evaluated).as_nanos() as u64;
+                t.overlap_read_ns += read_time.as_nanos() as u64;
+                t.overlap_wait_ns += landed.saturating_duration_since(submitted).as_nanos() as u64;
+            }
+            t.overlap_short += u64::from(decision == Decision::Short);
             if t.calls.is_multiple_of(STATS_EVERY_CALLS) {
                 eprintln!(
                     "{}\n[offload] {}",
@@ -857,8 +1196,54 @@ impl MoeOffload {
             }
             t.last_return = Some(std::time::Instant::now());
         }
-        Ok(slot_ids)
+        Ok(placed)
     }
+
+    /// A call that fails after its reads were submitted: wait for them and keep what landed
+    /// pinned like any call's slots, or give the slots back once the GPU work reading the
+    /// resident ones is done, so no pin or reservation outlives the error.
+    fn settle_failed(
+        bank: &mut ExpertBank,
+        pending: &mut Option<Pinned>,
+        mut acquiring: Acquiring,
+        gpu: Vec<Array>,
+    ) {
+        match acquiring.wait_reads() {
+            Ok(_) => {
+                *pending = Some(Pinned {
+                    acquired: bank.commit(acquiring),
+                    gpu,
+                })
+            }
+            Err(_) => {
+                wait_for(&gpu);
+                bank.abort(acquiring);
+            }
+        }
+    }
+
+    /// Fold one call's read time into the per-expert estimate (an average over about the last
+    /// eight calls that read).
+    fn note_read_time(&self, took: std::time::Duration, experts: usize) {
+        let sample = (took.as_nanos() as u64 / experts.max(1) as u64).max(1);
+        let old = self.read_ns_per_expert.load(Ordering::Relaxed);
+        let new = if old == 0 {
+            sample
+        } else {
+            (old * 7 + sample) / 8
+        };
+        self.read_ns_per_expert.store(new, Ordering::Relaxed);
+    }
+}
+
+/// How a pool-path call's entries come back: every entry's slot in the routing's order, or
+/// split into resident and missing parts with the resident work already submitted.
+enum Placed {
+    Whole(Vec<u32>),
+    Split {
+        resident_out: Vec<Array>,
+        parts: Parts,
+    },
 }
 
 /// What a pool-path layer call knows once the routing is read back.
@@ -968,5 +1353,191 @@ mod slot_indices_tests {
         again.eval().unwrap();
         assert_eq!(again.as_slice::<u32>(), &[11, 12, 15, 16]);
         assert!(unsafe { slots.write(&[1, 2, 3]) }.is_err(), "wrong length");
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn entries_split_by_residency_and_the_order_restores_the_routing() {
+        // Two rows of three: 7 5 9 | 5 2 7, with 5 and 2 missing.
+        let ids = [7u32, 5, 9, 5, 2, 7];
+        let (distinct, index_of) = distinct_in_order(&ids).unwrap();
+        assert_eq!(distinct, [7, 5, 9, 2]);
+        let slots = [70usize, 50, 90, 20];
+        let missing = [false, true, false, true];
+        let p = split_entries(&ids, 3, &index_of, &slots, &missing);
+        assert_eq!(p.resident_slots, [70, 90, 70]);
+        assert_eq!(p.resident_rows, [0, 0, 1]);
+        assert_eq!(p.missing_slots, [50, 50, 20]);
+        assert_eq!(p.missing_rows, [0, 1, 1]);
+        assert_eq!(p.order, [0, 3, 1, 4, 5, 2]);
+        let stacked: Vec<(u32, u32)> = p
+            .resident_slots
+            .iter()
+            .zip(&p.resident_rows)
+            .chain(p.missing_slots.iter().zip(&p.missing_rows))
+            .map(|(&s, &r)| (s, r))
+            .collect();
+        for (i, &o) in p.order.iter().enumerate() {
+            let want = (slots[index_of[&ids[i]]] as u32, (i / 3) as u32);
+            assert_eq!(stacked[o as usize], want, "entry {i}");
+        }
+    }
+
+    #[test]
+    fn only_decode_sized_calls_that_hit_and_miss_with_long_reads_overlap() {
+        let min = OVERLAP_MIN_READ_US * 1_000;
+        assert_eq!(
+            overlaps(1, 6, 4, 0, min),
+            Decision::Overlap,
+            "no estimate yet"
+        );
+        assert_eq!(overlaps(1, 6, 4, 400_000, min), Decision::Overlap);
+        assert_eq!(overlaps(1, 9, 1, 400_000, min), Decision::Short);
+        assert_eq!(overlaps(4, 30, 10, 400_000, min), Decision::Overlap);
+        assert_eq!(overlaps(1, 9, 1, 400_000, 0), Decision::Overlap);
+        assert_eq!(
+            overlaps(5, 30, 10, 400_000, min),
+            Decision::Plain,
+            "prefill-sized"
+        );
+        assert_eq!(
+            overlaps(1, 10, 0, 400_000, min),
+            Decision::Plain,
+            "nothing to read"
+        );
+        assert_eq!(
+            overlaps(1, 0, 10, 400_000, min),
+            Decision::Plain,
+            "nothing resident"
+        );
+    }
+
+    fn tiny_offload() -> (MoeOffload, Vec<u16>) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4exp_tiny");
+        let io = IoTuning {
+            mode: IoMode::Direct,
+            ..IoTuning::default()
+        };
+        // A budget of one byte: the smallest pool, two layers' worth (32 slots of 16 experts).
+        let off = MoeOffload::open(&dir, 1, 4, io).expect("open the replica's experts");
+        let layers = {
+            let bank = off.bank.lock().unwrap();
+            bank.store()
+                .layers
+                .keys()
+                .copied()
+                .filter(|&l| l != MTP_LAYER)
+                .collect()
+        };
+        (off, layers)
+    }
+
+    fn routing(ids: &[u32]) -> Array {
+        Array::from_slice(ids, &[1, 1, ids.len() as i32])
+    }
+
+    fn is_available(a: &Array) -> bool {
+        let mut ready = false;
+        // SAFETY: a plain query on a live array.
+        unsafe { mlx_sys::_mlx_array_is_available(&mut ready, a.as_ptr()) };
+        ready
+    }
+
+    /// The resident work an overlapped call submits reads slots of the pool while the call has
+    /// already returned. Those slots stay pinned until the next call, which waits for that work
+    /// before unpinning: however many experts other calls load meanwhile, none of them is evicted.
+    #[test]
+    fn slots_read_by_resident_work_in_flight_stay_pinned_until_it_is_done() {
+        let (off, layers) = tiny_offload();
+        let (l0, l1, l2) = (layers[0], layers[1], layers[2]);
+        drop(off.route(l0, &routing(&[0, 1, 2, 3])).expect("first call"));
+
+        // Experts 0 and 1 are resident, 4 and 5 are read. The resident work gathers from the
+        // pool at the resident slots and then keeps the GPU busy for a while.
+        let mut seen: Vec<u32> = Vec::new();
+        let mut work = |part: &Routed, _rows: &Array| -> Result<Vec<Array>> {
+            part.slot_inds.eval()?;
+            seen.extend_from_slice(part.slot_inds.as_slice::<u32>());
+            let w = part.array("gate_proj.weight").expect("pool role");
+            let picked = mlx_rs::ops::indexing::take_axis(w, &part.slot_inds, 0)?
+                .as_dtype(mlx_rs::Dtype::Float32)?
+                .sum(None)?;
+            let m = mlx_rs::random::normal::<f32>(&[2048, 2048], None, None, None)?;
+            let mut acc = m.clone();
+            for _ in 0..48 {
+                acc = mlx_rs::ops::matmul(&acc, &m)?;
+            }
+            Ok(vec![mlx_rs::ops::add(&picked, &acc.sum(None)?)?])
+        };
+        let routed = test_overlap::with_any_read(|| {
+            off.route_overlapping(l0, &routing(&[0, 4, 1, 5]), &mut work)
+        })
+        .expect("overlapped call");
+        let Routing::Split(split) = routed else {
+            panic!("a call that hits and misses should overlap");
+        };
+        assert_eq!(seen.len(), 2, "two resident entries");
+        let in_flight = split.resident_out[0].clone();
+        eprintln!(
+            "resident work still running when the call returned: {}",
+            !is_available(&in_flight)
+        );
+        {
+            let mut bank = off.bank.lock().unwrap();
+            // 32 slots, 4 pinned by the overlapped call: other layers can take the other 28 ...
+            let a = bank
+                .acquire(l1, &(0..16).collect::<Vec<u16>>())
+                .expect("16 of l1");
+            let b = bank
+                .acquire(l2, &(0..12).collect::<Vec<u16>>())
+                .expect("12 of l2");
+            // ... and nothing more, and the in-flight call's experts are all still there.
+            assert!(bank.acquire(l2, &[12]).is_err(), "every slot is pinned now");
+            for e in [0u16, 1, 4, 5] {
+                assert!(
+                    bank.is_resident(l0, e),
+                    "expert {e} of the in-flight call was evicted"
+                );
+            }
+            bank.release(a);
+            bank.release(b);
+            // Unpin as the next call does, but with no routing readback in between (that would
+            // sync the GPU stream anyway): the release itself must wait for the work.
+            let pinned = off.pending.lock().unwrap().take().expect("the call's pins");
+            pinned.release(&mut bank);
+            assert!(
+                is_available(&in_flight),
+                "the pins went before the work reading them was done"
+            );
+        }
+        drop(off.route(l1, &routing(&[0, 1, 2, 3])).expect("next call"));
+    }
+
+    /// A call whose resident work fails to build leaves no pin and no reservation behind: once the
+    /// next call has released what it kept, every slot but that call's can be taken.
+    #[test]
+    fn a_failed_overlapped_call_leaks_no_slot() {
+        let (off, layers) = tiny_offload();
+        let (l0, l1, l2, l3) = (layers[0], layers[1], layers[2], layers[3]);
+        drop(off.route(l0, &routing(&[0, 1, 2, 3])).expect("first call"));
+        let failed = test_overlap::with_any_read(|| {
+            off.route_overlapping(l0, &routing(&[0, 6, 1, 7]), &mut |_, _| bail!("boom"))
+        });
+        assert!(failed.is_err());
+        drop(off.route(l1, &routing(&[0, 1, 2, 3])).expect("next call"));
+        let mut bank = off.bank.lock().unwrap();
+        let a = bank
+            .acquire(l2, &(0..16).collect::<Vec<u16>>())
+            .expect("16 of l2");
+        let b = bank
+            .acquire(l3, &(0..12).collect::<Vec<u16>>())
+            .expect("12 of l3");
+        bank.release(a);
+        bank.release(b);
     }
 }

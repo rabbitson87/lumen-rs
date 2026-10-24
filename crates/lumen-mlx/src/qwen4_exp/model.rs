@@ -210,7 +210,9 @@ lumen_flags::flag! {
     /// graph while the GPU runs it, and only then read the routing back. The graph is the same
     /// one the plain path builds (the gather reads its slot numbers from a persistent array the
     /// CPU fills in after the readback), so the output is bit-identical; what changes is that the
-    /// host's graph building no longer sits between two GPU segments.
+    /// host's graph building no longer sits between two GPU segments. Measured on the real
+    /// checkpoint (M3 Max): identical text, but no end-to-end gain (15 GB pool 9.79 -> 9.81 tok/s,
+    /// N=10; 6.7 GB +2%, noise); only ~5.5 ms of host build per token is hideable. Kept opt-in.
     pub(crate) build_ahead {
         env: "LUMEN_QWEN4_BUILD_AHEAD",
         default: false,

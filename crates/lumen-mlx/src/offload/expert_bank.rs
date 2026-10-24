@@ -3,8 +3,8 @@
 //! Joins the four pieces: [`ExpertStore`] knows where every expert's bytes are
 //! in the shards, [`IoPool`] reads them, [`PoolTensor`]s (one per tensor role)
 //! hold them where the GPU can read them, and [`SlotMap`] decides who lives
-//! where. One call, [`ExpertBank::acquire`], makes a layer's routed experts
-//! resident and returns their slot numbers; the gather then runs over the
+//! where. [`ExpertBank::begin_acquire`] and [`ExpertBank::commit`] make a layer's routed
+//! experts resident and return their slot numbers; the gather then runs over the
 //! pools with those slots as its indices.
 
 use std::collections::BTreeMap;
@@ -36,6 +36,52 @@ impl Acquired {
     /// The requested experts that were not resident: the misses (for the routing trace).
     pub(crate) fn missed(&self) -> impl Iterator<Item = u16> + '_ {
         self.plan.loads.iter().map(|&(key, _)| key.expert)
+    }
+}
+
+/// An [`ExpertBank::begin_acquire`] whose reads may still be running: every requested expert
+/// has its slot and is pinned, the resident ones can be read by the GPU now, the missing ones
+/// only after [`Self::wait_reads`]. Hand it back with [`ExpertBank::commit`] or
+/// [`ExpertBank::abort`].
+#[must_use = "an acquire in flight holds pins and reserved slots until it is committed or aborted"]
+pub(crate) struct Acquiring {
+    plan: Plan,
+    ticket: Option<IoTicket>,
+    layer: u16,
+    submitted: std::time::Instant,
+}
+
+impl Acquiring {
+    /// Slot of each requested expert, in request order.
+    pub(crate) fn slots(&self) -> &[usize] {
+        &self.plan.slots
+    }
+
+    pub(crate) fn loaded_experts(&self) -> usize {
+        self.plan.loads.len()
+    }
+
+    /// The requested experts being read: the misses.
+    pub(crate) fn missed(&self) -> impl Iterator<Item = u16> + '_ {
+        self.plan.loads.iter().map(|&(key, _)| key.expert)
+    }
+
+    /// Wait for the reads and return how long they ran (submission to the last one finishing;
+    /// zero when nothing was read). Call once; an error leaves the acquire to be aborted.
+    pub(crate) fn wait_reads(&mut self) -> Result<std::time::Duration> {
+        let Some(ticket) = self.ticket.take() else {
+            return Ok(std::time::Duration::ZERO);
+        };
+        let finished = ticket.wait_finished().with_context(|| {
+            format!(
+                "expert bank: loading layer {} experts {:?}",
+                self.layer,
+                self.missed().collect::<Vec<_>>()
+            )
+        })?;
+        Ok(finished.map_or(std::time::Duration::ZERO, |t| {
+            t.saturating_duration_since(self.submitted)
+        }))
     }
 }
 
@@ -137,6 +183,7 @@ impl ExpertBank {
             );
         }
         let io = IoPool::new(&store.files, lanes, mode)?;
+        io.throttle_from_env()?;
         let eviction = EvictionKind::from_env()?;
         eprintln!("[offload] eviction policy: {}", eviction.name());
         let policy = PolicyConfig::new(
@@ -182,6 +229,11 @@ impl ExpertBank {
 
     pub(crate) fn io_profile(&self) -> &IoProfile {
         self.io.profile()
+    }
+
+    /// The rate `LUMEN_MOE_IO_THROTTLE_GBPS` paces the reads to, if set.
+    pub(crate) fn io_throttle_gbps(&self) -> Option<f64> {
+        self.io.throttle_gbps()
     }
 
     pub(crate) fn stats(&self) -> Stats {
@@ -239,7 +291,7 @@ impl ExpertBank {
     /// Start reading every expert of `layer` into staging `region`, expert `e` at slot
     /// `e` of the region, and return at once.
     ///
-    /// The safety condition is [`Self::acquire`]'s: no queued GPU work may read the region.
+    /// The safety condition is [`Self::begin_acquire`]'s: no queued GPU work may read the region.
     /// The routing readback that precedes every layer call completes all earlier GPU work,
     /// which includes the gather that last used this region.
     pub(crate) fn begin_region_load(&mut self, region: usize, layer: u16) -> Result<RegionLoad> {
@@ -339,26 +391,36 @@ impl ExpertBank {
         jobs
     }
 
-    /// [`Self::acquire_as`] for a decode call.
+    /// Make `experts` of `layer` resident and pin them, for a decode call: [`Self::begin_acquire`],
+    /// wait, then [`Self::commit`] (or [`Self::abort`] on a failed read).
     #[cfg(test)]
     pub(crate) fn acquire(&mut self, layer: u16, experts: &[u16]) -> Result<Acquired> {
-        self.acquire_as(layer, experts, CallKind::Decode)
+        let mut acquiring = self.begin_acquire(layer, experts, CallKind::Decode)?;
+        match acquiring.wait_reads() {
+            Ok(_) => Ok(self.commit(acquiring)),
+            Err(e) => {
+                self.abort(acquiring);
+                Err(e)
+            }
+        }
     }
 
-    /// Make `experts` of `layer` resident and pin them. Reads the missing ones
-    /// from disk in parallel; nothing is published unless every read succeeded.
-    /// `kind` is what a learning eviction policy needs to tell the token-to-token routing of
-    /// decoding from a prompt chunk's.
+    /// Start making `experts` of `layer` resident: plan the call (pin the resident experts,
+    /// reserve a slot for each missing one) and submit the missing ones' reads in parallel
+    /// without waiting for them. Nothing is published until [`Self::commit`], which needs every
+    /// read to have succeeded. `kind` is what a learning eviction policy needs to tell the
+    /// token-to-token routing of decoding from a prompt chunk's.
     ///
-    /// The caller must not have any GPU work queued that reads a slot this call
-    /// may rewrite: in the serving loop that holds because the per-layer routing
-    /// readback has just completed everything before it.
-    pub(crate) fn acquire_as(
+    /// The caller must not have any GPU work queued that reads a slot this call may rewrite: in
+    /// the serving loop that holds because the per-layer routing readback has just completed
+    /// everything before it. The resident experts' slots are not written, so GPU work may read
+    /// them while the reads run.
+    pub(crate) fn begin_acquire(
         &mut self,
         layer: u16,
         experts: &[u16],
         kind: CallKind,
-    ) -> Result<Acquired> {
+    ) -> Result<Acquiring> {
         let ranges = self
             .store
             .layer(layer)
@@ -373,21 +435,55 @@ impl ExpertBank {
         let plan = self.map.plan_as(&keys, kind).map_err(|e| anyhow!("{e}"))?;
 
         let jobs = self.jobs_for(&plan, layer);
-        // SAFETY: each destination is a distinct slot of a live pool, reserved by
-        // the plan (unmapped and pinned), and the caller guarantees no queued
-        // GPU work reads it.
-        let io_result = unsafe { self.io.run(jobs) };
-        match io_result {
-            Ok(()) => self.map.commit(&plan),
+        let submitted = std::time::Instant::now();
+        // SAFETY: each destination is a distinct slot of a live pool, reserved by the plan
+        // (unmapped and pinned, so no lookup returns it and no GPU work is given it until the
+        // commit), and the caller guarantees no queued GPU work reads it. The ticket lives in
+        // the returned `Acquiring`, which waits for it before the slots are published or given
+        // back (and dropping a ticket waits).
+        match unsafe { self.io.submit(jobs) } {
+            Ok(ticket) => Ok(Acquiring {
+                plan,
+                ticket: Some(ticket),
+                layer,
+                submitted,
+            }),
             Err(e) => {
                 self.map.abort(&plan);
-                return Err(e.context(format!(
+                Err(e.context(format!(
                     "expert bank: loading layer {layer} experts {experts:?}"
-                )));
+                )))
             }
         }
-        let slots = plan.slots.iter().map(|&s| s as u32).collect();
-        Ok(Acquired { plan, slots })
+    }
+
+    /// Publish an acquire whose reads all succeeded ([`Acquiring::wait_reads`] returned `Ok`);
+    /// its slots stay pinned until [`Self::release`].
+    pub(crate) fn commit(&mut self, mut acquiring: Acquiring) -> Acquired {
+        debug_assert!(
+            acquiring.ticket.is_none(),
+            "committed before the reads were waited for"
+        );
+        if let Some(ticket) = acquiring.ticket.take() {
+            // Release builds: never publish bytes that may still be arriving.
+            let _ = ticket.wait();
+        }
+        self.map.commit(&acquiring.plan);
+        let slots = acquiring.plan.slots.iter().map(|&s| s as u32).collect();
+        Acquired {
+            plan: acquiring.plan,
+            slots,
+        }
+    }
+
+    /// Give an acquire's slots back without publishing anything: its reads failed, or the call
+    /// is abandoned. Waits for reads still running. The resident experts' pins go too, so the
+    /// caller must first make sure no GPU work it started still reads them.
+    pub(crate) fn abort(&mut self, mut acquiring: Acquiring) {
+        if let Some(ticket) = acquiring.ticket.take() {
+            let _ = ticket.wait();
+        }
+        self.map.abort(&acquiring.plan);
     }
 
     /// Unpin an `acquire`'s slots; call once the gather that used them is done.

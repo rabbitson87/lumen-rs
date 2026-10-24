@@ -28,7 +28,89 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+
+lumen_flags::flag! {
+    /// Diagnostic: pace the expert reads to the aggregate rate in this variable, in GB/s (`3`,
+    /// `1.5`), to see how the offload behaves on a slower SSD than this machine's. Each read
+    /// reserves its share of the rate across all reader threads, starts no earlier than its
+    /// reservation and completes no earlier than its end. Only when the bytes arrive changes,
+    /// never which bytes are read; `0` or unset reads at full speed.
+    pub(crate) io_throttle {
+        env: "LUMEN_MOE_IO_THROTTLE_GBPS",
+        default: false,
+        kind: Diagnostic,
+    }
+}
+
+/// The variable's name, for reading its value after the registry flag said it is set.
+const THROTTLE_ENV: &str = "LUMEN_MOE_IO_THROTTLE_GBPS";
+
+/// The rate `LUMEN_MOE_IO_THROTTLE_GBPS` asks for, in GB/s; `None` when unset or `0`. Anything
+/// that is not a positive number is an error: a typo that read at full speed would make a
+/// slow-storage run measure this machine's SSD.
+fn env_throttle_gbps() -> Result<Option<f64>> {
+    if !io_throttle::get() {
+        return Ok(None);
+    }
+    let raw = std::env::var(THROTTLE_ENV).unwrap_or_default();
+    match raw.trim().parse::<f64>() {
+        Ok(gbps) if gbps.is_finite() && gbps > 0.0 => Ok(Some(gbps)),
+        _ => bail!("{THROTTLE_ENV}={raw:?} is not a rate in GB/s above 0"),
+    }
+}
+
+/// Paces reads to an aggregate rate: every read reserves the next `len / rate` of time after the
+/// previous reservation (a token bucket that holds no burst), so however many lanes read at once,
+/// the bytes arrive no faster than the rate.
+struct Throttle {
+    /// Nanoseconds per byte as `f64` bits; 0 means no pacing.
+    ns_per_byte: AtomicU64,
+    /// End of the latest reservation.
+    next: Mutex<Instant>,
+}
+
+impl Throttle {
+    fn new() -> Self {
+        Self {
+            ns_per_byte: AtomicU64::new(0),
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn set(&self, gbps: Option<f64>) {
+        let bits = gbps.map_or(0, |g| (1.0 / g).to_bits()); // 1 GB/s = 1 byte per ns
+        self.ns_per_byte.store(bits, Ordering::Relaxed);
+    }
+
+    fn rate_gbps(&self) -> Option<f64> {
+        match self.ns_per_byte.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(1.0 / f64::from_bits(bits)),
+        }
+    }
+
+    /// The window a read of `len` bytes may occupy: it starts no earlier than the first instant
+    /// and completes no earlier than the second. `None` when not pacing.
+    fn reserve(&self, len: usize) -> Option<(Instant, Instant)> {
+        let bits = self.ns_per_byte.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        let span = Duration::from_nanos((len as f64 * f64::from_bits(bits)) as u64);
+        let mut next = self.next.lock().unwrap_or_else(|p| p.into_inner());
+        let start = (*next).max(Instant::now());
+        *next = start + span;
+        Some((start, *next))
+    }
+}
+
+fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+    if deadline > now {
+        std::thread::sleep(deadline - now);
+    }
+}
 
 /// Alignment of each worker's scratch buffer: the Apple silicon page size.
 const SCRATCH_ALIGN: usize = 16 * 1024;
@@ -225,6 +307,9 @@ struct Done {
     sleep: Mutex<()>,
     cv: Condvar,
     first_error: Mutex<Option<String>>,
+    /// When the last shard finished: how long the reads took, apart from how long anyone
+    /// waited for them.
+    finished_at: Mutex<Option<Instant>>,
 }
 
 impl Done {
@@ -234,6 +319,7 @@ impl Done {
             sleep: Mutex::new(()),
             cv: Condvar::new(),
             first_error: Mutex::new(None),
+            finished_at: Mutex::new(None),
         }
     }
 
@@ -241,6 +327,13 @@ impl Done {
         if let Some(e) = error {
             let mut slot = self.first_error.lock().unwrap_or_else(|p| p.into_inner());
             slot.get_or_insert(e);
+        }
+        {
+            // Every finisher stamps before its decrement, so the waiter that sees zero sees the
+            // latest stamp: the last shard's.
+            let mut at = self.finished_at.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            *at = Some(at.map_or(now, |t| t.max(now)));
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _guard = self.sleep.lock().unwrap_or_else(|p| p.into_inner());
@@ -278,12 +371,29 @@ pub(crate) struct IoPool {
     profile: Arc<IoProfile>,
     files: Arc<Vec<File>>,
     auto: Option<AutoMode>,
+    throttle: Arc<Throttle>,
     tx: Option<Sender<Batch>>,
     workers: Vec<JoinHandle<()>>,
     lanes: usize,
 }
 
 impl IoPool {
+    /// Pace every later read to `gbps` GB/s across all lanes, or stop pacing (`None`).
+    pub(crate) fn set_throttle(&self, gbps: Option<f64>) {
+        self.throttle.set(gbps);
+    }
+
+    /// Pace the reads as `LUMEN_MOE_IO_THROTTLE_GBPS` asks, if it does (the expert bank's pool).
+    pub(crate) fn throttle_from_env(&self) -> Result<()> {
+        if let Some(gbps) = env_throttle_gbps()? {
+            self.set_throttle(Some(gbps));
+            eprintln!(
+                "[offload] expert reads throttled to {gbps} GB/s ({THROTTLE_ENV}, a diagnostic)"
+            );
+        }
+        Ok(())
+    }
+
     /// Open `paths` once, shared by `lanes` worker threads.
     pub(crate) fn new(paths: &[PathBuf], lanes: usize, mode: IoMode) -> Result<Self> {
         let lanes = lanes.max(1);
@@ -300,13 +410,15 @@ impl IoPool {
         let (tx, rx) = channel::<Batch>();
         let rx: Arc<Mutex<Receiver<Batch>>> = Arc::new(Mutex::new(rx));
         let profile = Arc::new(IoProfile::default());
+        let throttle = Arc::new(Throttle::new());
         let mut workers = Vec::with_capacity(lanes);
         for i in 0..lanes {
             let (files, rx, profile) = (Arc::clone(&files), Arc::clone(&rx), Arc::clone(&profile));
+            let throttle = Arc::clone(&throttle);
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("lumen-expert-io-{i}"))
-                    .spawn(move || worker(files, rx, profile))
+                    .spawn(move || worker(files, rx, profile, throttle))
                     .context("io pool: spawn worker")?,
             );
         }
@@ -319,6 +431,7 @@ impl IoPool {
             profile,
             files: Arc::clone(&files),
             auto,
+            throttle,
             tx: Some(tx),
             workers,
             lanes,
@@ -327,6 +440,11 @@ impl IoPool {
 
     pub(crate) fn profile(&self) -> &IoProfile {
         &self.profile
+    }
+
+    /// The rate reads are paced to, if any.
+    pub(crate) fn throttle_gbps(&self) -> Option<f64> {
+        self.throttle.rate_gbps()
     }
 
     /// For `Auto`: look at free memory (at most every [`SAMPLE_EVERY`]) and move every file
@@ -427,12 +545,19 @@ pub(crate) struct IoTicket {
 impl IoTicket {
     /// Block until every read has finished and report the first error.
     pub(crate) fn wait(mut self) -> Result<()> {
+        self.collect().map(|_| ())
+    }
+
+    /// [`Self::wait`], also saying when the last read finished (`None` for a ticket with no
+    /// reads): that minus the submission is how long the reads took, however late they were
+    /// waited for.
+    pub(crate) fn wait_finished(mut self) -> Result<Option<Instant>> {
         self.collect()
     }
 
-    fn collect(&mut self) -> Result<()> {
+    fn collect(&mut self) -> Result<Option<Instant>> {
         let Some(done) = self.done.take() else {
-            return Ok(());
+            return Ok(None);
         };
         done.wait();
         match done
@@ -442,7 +567,7 @@ impl IoTicket {
             .take()
         {
             Some(e) => Err(anyhow!(e)),
-            None => Ok(()),
+            None => Ok(*done.finished_at.lock().unwrap_or_else(|p| p.into_inner())),
         }
     }
 }
@@ -527,7 +652,12 @@ impl Drop for Scratch {
     }
 }
 
-fn worker(files: Arc<Vec<File>>, rx: Arc<Mutex<Receiver<Batch>>>, profile: Arc<IoProfile>) {
+fn worker(
+    files: Arc<Vec<File>>,
+    rx: Arc<Mutex<Receiver<Batch>>>,
+    profile: Arc<IoProfile>,
+    throttle: Arc<Throttle>,
+) {
     let mut scratch = Scratch::new();
     loop {
         // Hold the lock only while waiting for the next batch.
@@ -545,7 +675,14 @@ fn worker(files: Arc<Vec<File>>, rx: Arc<Mutex<Receiver<Batch>>>, profile: Arc<I
             .fetch_add(sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for job in &jobs {
+                let window = throttle.reserve(job.len);
+                if let Some((start, _)) = window {
+                    sleep_until(start);
+                }
                 read_one(&files, &mut scratch, job, &profile)?;
+                if let Some((_, end)) = window {
+                    sleep_until(end);
+                }
             }
             Ok::<(), String>(())
         }));
@@ -786,6 +923,77 @@ mod tests {
             assert_eq!(b[..], data[o as usize..o as usize + b.len()]);
         }
         assert_eq!(pool.profile().jobs.load(Ordering::Relaxed), 2);
+    }
+
+    /// The throttle changes when the bytes arrive, never which: the same jobs read the same bytes
+    /// at full speed and at two paced rates, and the paced batch takes `bytes / rate` (the halved
+    /// rate twice as long), however many lanes share it.
+    #[test]
+    fn a_throttled_pool_reads_the_same_bytes_at_the_rate_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, data) = file_with(dir.path(), "a", 6 << 20, 11);
+        let pool = IoPool::new(&[p], 8, IoMode::Direct).unwrap();
+        // Twelve 512 KB reads scattered over the file: 6 MB in all.
+        let offs: Vec<u64> = (0..12u64).map(|i| (i * 7 % 12) * (512 << 10)).collect();
+        let read_all = |gbps: Option<f64>| -> (Vec<Vec<u8>>, Duration) {
+            pool.set_throttle(gbps);
+            let mut bufs: Vec<Vec<u8>> = offs.iter().map(|_| vec![0u8; 512 << 10]).collect();
+            let jobs: Vec<ReadJob> = bufs
+                .iter_mut()
+                .zip(&offs)
+                .map(|(b, &o)| job(0, o, b))
+                .collect();
+            let t = Instant::now();
+            // SAFETY: the destinations are distinct buffers that outlive the call.
+            unsafe { pool.run(jobs) }.unwrap();
+            (bufs, t.elapsed())
+        };
+        let (full, _) = read_all(None);
+        for (b, &o) in full.iter().zip(&offs) {
+            assert_eq!(b[..], data[o as usize..o as usize + b.len()]);
+        }
+        let bytes = (12 * (512 << 10)) as f64;
+        // 0.1 and 0.05 GB/s: 63 and 126 ms for the batch.
+        let mut took = Vec::new();
+        for gbps in [0.1, 0.05] {
+            let (paced, elapsed) = read_all(Some(gbps));
+            assert_eq!(paced, full, "pacing at {gbps} GB/s changed the bytes");
+            let want = Duration::from_secs_f64(bytes / (gbps * 1e9));
+            assert!(
+                elapsed >= want && elapsed < want + want / 2 + Duration::from_millis(30),
+                "{gbps} GB/s: {elapsed:?} for a batch the rate allows in {want:?}"
+            );
+            took.push(elapsed.as_secs_f64());
+        }
+        let ratio = took[1] / took[0];
+        assert!(
+            (1.7..2.3).contains(&ratio),
+            "half the rate took {ratio:.2}x as long"
+        );
+        assert_eq!(pool.throttle_gbps(), Some(0.05));
+        pool.set_throttle(None);
+        assert_eq!(pool.throttle_gbps(), None);
+    }
+
+    #[test]
+    fn a_tickets_finish_time_falls_between_submitting_and_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = file_with(dir.path(), "a", 1 << 20, 5);
+        let pool = IoPool::new(&[p], 2, IoMode::Direct).unwrap();
+        let mut b = vec![0u8; 256 << 10];
+        let before = Instant::now();
+        // SAFETY: `b` outlives the ticket, which is waited for below.
+        let ticket = unsafe { pool.submit(vec![job(0, 0, &mut b)]) }.unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let waited = Instant::now();
+        let finished = ticket.wait_finished().unwrap().expect("one read");
+        assert!(
+            before <= finished && finished <= waited,
+            "stamped outside the read"
+        );
+        // SAFETY: no jobs.
+        let empty = unsafe { pool.submit(Vec::new()) }.unwrap();
+        assert_eq!(empty.wait_finished().unwrap(), None);
     }
 
     #[test]
