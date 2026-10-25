@@ -155,10 +155,22 @@ every prefill and every 32 decode steps. The plan above (pool sizes, reserve) is
 ### An agent's system prompt on disk
 
 Requests with tools (agents) keep the head of their system prompt (the system message and the rendered
-tools) in memory, so the next conversation with the same system prompt feeds only its own turn. With
-`LUMEN_KV_DISK=1` that head is also written to disk (`LUMEN_KV_DISK_DIR`, default `~/.cache/lumen/kv`;
-`LUMEN_KV_DISK_MAX_GB` and `LUMEN_KV_DISK_TTL_SECS` bound it), once per system prompt, after the reply.
-A restart, or the memory plan above dropping the head, then reads it back instead of prefilling it again.
+tools) in memory, so the next conversation with the same system prompt feeds only its own turn. The
+disk KV tier also writes that head to disk (`LUMEN_KV_DISK_DIR`, default `~/.cache/lumen/kv`), once per
+system prompt, after the reply. A restart, or the memory plan above dropping the head, then reads it
+back instead of prefilling it again.
+
+The disk tier is on by default, within three limits:
+
+| Variable | Default | `0` means |
+|---|---|---|
+| `LUMEN_KV_DISK_MAX_GB` | 10: past it the least recently used entries go | unlimited |
+| `LUMEN_KV_DISK_TTL_SECS` | 2592000 (30 days since an entry was last used) | entries never expire |
+| `LUMEN_KV_DISK_MIN_FREE_GB` | 10: no writes while the store's volume has less free | no floor |
+
+Under the free-space floor nothing is deleted: what is on disk stays and is still read, and writes
+resume once there is room (one log line when they stop, one when they resume). `LUMEN_KV_DISK=0` (or
+`false`, `off`, `no`) turns the tier off; the desktop app's DISK KV CACHE card sends the same switch.
 
 Measured with a 12.3K-token agent prompt (instructions, two project documents, 26 tool schemas) at a
 6.7 GB pool, medians of N=3, every reply identical to the cold one:

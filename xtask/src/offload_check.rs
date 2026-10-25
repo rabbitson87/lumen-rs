@@ -65,6 +65,8 @@ pub fn main(args: Vec<String>) -> ExitCode {
             .env("LUMEN_MOE_PACK", pack)
             .env("LUMEN_MOE_IO_MODE", "direct")
             .env("LUMEN_QWEN4_MTP", "off")
+            // Each run must compute from scratch, not restore a state an earlier run saved.
+            .env("LUMEN_KV_DISK", "0")
             .args([
                 "run",
                 "--release",

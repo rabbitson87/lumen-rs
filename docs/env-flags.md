@@ -5,7 +5,8 @@ GENERATED — do not edit. Regenerate with `cargo xtask flags --docs`;
 
 Source of truth is the `lumen_flags::flag!` declaration next to the code
 each flag gates; this file is its projection. Parse rule for every flag:
-unset → default, `"0"` → off, any other value → on.
+unset → default, `0` / `false` / `off` / `no` (any case) → off, any other
+value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
@@ -21,6 +22,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::session::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
@@ -171,6 +173,25 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_KV_DISK`
+
+*Optimization, default on.*
+
+The disk KV tier (`kv_disk.rs`): prompt and conversation states, and
+ Flash-Next agents' system-prompt heads, written under
+ `LUMEN_KV_DISK_DIR` (default `~/.cache/lumen/kv`) and read back after a
+ restart or after memory pressure dropped them, instead of prefilling
+ them again. A state read back is the cold computation exactly, so only
+ speed changes.
+
+ On by default, within three limits: `LUMEN_KV_DISK_MAX_GB` (default
+ 10; least recently used entries go past it; `0` = unlimited),
+ `LUMEN_KV_DISK_TTL_SECS` (default 2592000, 30 days, since an entry was
+ last used; `0` = entries never expire) and `LUMEN_KV_DISK_MIN_FREE_GB`
+ (default 10: no writes while the store's volume has less than that
+ free, though stored entries stay and are still read; `0` = no floor).
+ `LUMEN_KV_DISK=0` (or `false`, `off`, `no`) turns the tier off.
 
 ### `LUMEN_MEMORY_PLAN_RECLAIMABLE`
 

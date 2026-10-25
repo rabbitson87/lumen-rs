@@ -179,7 +179,7 @@ mod imp {
         /// shared prefix KV those seqs attend against. `None` when dedup is off
         /// (`LUMEN_MLX_SHARED_PREFIX` unset) or no common prefix has formed.
         shared_prefix: Option<SharedPrefixKv>,
-        /// L2 disk persistence tier (opt-in via `LUMEN_KV_DISK`). `Some` once a
+        /// L2 disk persistence tier (on unless `LUMEN_KV_DISK=0`). `Some` once a
         /// model is loaded with the disk tier enabled — prefix-cache boundary
         /// snapshots are serialized here so they survive process restart /
         /// in-memory eviction (avoids re-paying cold prefill). `None` keeps the
@@ -803,7 +803,7 @@ mod imp {
             Ok(info)
         }
 
-        /// Open the opt-in L2 disk tier (see [`kv_disk::open_store_from_env`]).
+        /// Open the L2 disk tier (see [`kv_disk::open_store_from_env`]).
         /// `fingerprint` is [`kv_disk::kv_identity`]: it namespaces the cache
         /// directory and is stamped into every manifest, so a snapshot is only
         /// served to a process with the same weights, KV settings, prefill grid

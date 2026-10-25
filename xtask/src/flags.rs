@@ -557,7 +557,8 @@ fn render_docs(flags: &[Flag]) -> String {
          `cargo xtask flags --check` fails when this file is stale.\n\n\
          Source of truth is the `lumen_flags::flag!` declaration next to the code\n\
          each flag gates; this file is its projection. Parse rule for every flag:\n\
-         unset → default, `\"0\"` → off, any other value → on.\n\n\
+         unset → default, `0` / `false` / `off` / `no` (any case) → off, any other\n\
+         value → on.\n\n\
          | Env | Default | Kind | Declared in |\n|---|---|---|---|\n",
     );
     for f in flags {

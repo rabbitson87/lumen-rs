@@ -106,7 +106,7 @@ pub trait SnapshotRunner {
     fn fork_from_snapshot(&mut self, snapshot_id: u64, dst_seq_id: u64) -> Result<usize>;
     fn release_snapshot(&mut self, snapshot_id: u64) -> Result<()>;
 
-    /// L2 disk tier (opt-in): durably persist the deep snapshot `snapshot_id`
+    /// L2 disk tier (on by default): durably persist the deep snapshot `snapshot_id`
     /// under `key` so it survives process restart / in-memory eviction. Default
     /// is a no-op, so in-memory-only runners (and the disabled disk path) are
     /// byte-identical to before. Errors are non-fatal — the caller logs and
@@ -121,7 +121,7 @@ pub trait SnapshotRunner {
         Ok(())
     }
 
-    /// L2 disk tier (opt-in): try to rehydrate a previously persisted snapshot
+    /// L2 disk tier (on by default): try to rehydrate a previously persisted snapshot
     /// for `key` whose token prefix is a prefix of `prompt_ids`. On success the
     /// runner materializes the snapshot into its in-memory snapshot table and
     /// returns `(snapshot_id, prefix_tokens, last_token)` so the store can
@@ -927,7 +927,7 @@ impl PrefixCacheStore {
                     },
                 );
                 self.evict_stale(runner);
-                // L2 disk tier (opt-in): the freshly-prefilled snapshot goes to
+                // L2 disk tier (on by default): the freshly-prefilled snapshot goes to
                 // disk once the reply is out (see `flush_persist`), so a future
                 // process can fork it instead of paying the cold prefill again.
                 self.pending_persist = Some(PendingPersist {

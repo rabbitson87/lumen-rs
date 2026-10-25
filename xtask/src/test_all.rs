@@ -115,6 +115,12 @@ pub fn main(args: Vec<String>) -> ExitCode {
     };
     cmd.args(cargo_args);
     cmd.arg("--").arg("--test-threads=1").args(test_args);
+    // The disk KV tier is on by default; tests that load a model would otherwise write to and
+    // restore from ~/.cache/lumen/kv, so one run's states could feed the next. Keep runs
+    // independent unless the caller asked for the tier.
+    if std::env::var_os("LUMEN_KV_DISK").is_none() {
+        cmd.env("LUMEN_KV_DISK", "0");
+    }
 
     if validate {
         for (k, v) in VALIDATION_ENV {

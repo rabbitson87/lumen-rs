@@ -642,7 +642,7 @@ pub(crate) mod imp {
         /// initialized on first decode step; stays `None` when the
         /// sidecar is missing or the env gate is off.
         correction_table: OnceLock<Option<Arc<CorrectionTable>>>,
-        /// L2 disk persistence tier (opt-in via `LUMEN_KV_DISK`). `Some` once a
+        /// L2 disk persistence tier (on unless `LUMEN_KV_DISK=0`). `Some` once a
         /// model is loaded with the disk tier enabled: it holds the states of
         /// cold prefills at grid points (see [`restore_grid_head`]), so a
         /// restart or an evicted snapshot resumes from one instead of
@@ -651,7 +651,7 @@ pub(crate) mod imp {
         disk: Option<DiskKvStore>,
     }
 
-    /// Open the opt-in L2 disk tier for this model (see
+    /// Open the L2 disk tier for this model (see
     /// [`kv_disk::open_store_from_env`]), namespaced by everything the
     /// snapshots' bytes depend on ([`kv_disk::kv_identity`]).
     fn open_kv_disk(model_id: &str, dir: &Path) -> Option<DiskKvStore> {

@@ -802,7 +802,11 @@ fn apply_env(
     }
 
     // ── Disk KV cache (persistent prefix-cache tier) ───────────────
-    if cfg.server.kv_disk_enabled {
+    // The server's tier is on unless told otherwise, so "off" has to be sent. Its free-space
+    // floor (`LUMEN_KV_DISK_MIN_FREE_GB`) has no control here and keeps the server's default.
+    if !cfg.server.kv_disk_enabled {
+        cmd.env("LUMEN_KV_DISK", "0");
+    } else {
         cmd.env("LUMEN_KV_DISK", "1");
         cmd.env(
             "LUMEN_KV_DISK_MAX_GB",
@@ -1116,6 +1120,37 @@ mod launch_env_tests {
 
     fn cap(env: &BTreeMap<String, String>) -> Option<&str> {
         env.get("LUMEN_MAX_PROMPT_TOKENS").map(String::as_str)
+    }
+
+    /// The server's disk tier is on unless told otherwise, so the launch sends the switch either
+    /// way: `1` with the two limits, or `0` alone (sending nothing would leave it on).
+    #[test]
+    fn the_launch_carries_the_disk_tier_setting_either_way() {
+        let tier = |env: &BTreeMap<String, String>| {
+            [
+                "LUMEN_KV_DISK",
+                "LUMEN_KV_DISK_MAX_GB",
+                "LUMEN_KV_DISK_TTL_SECS",
+            ]
+            .map(|k| env.get(k).cloned())
+        };
+        let some = |v: [&str; 3]| v.map(|s| Some(s.to_string()));
+
+        // The default config: on, 10 GB, 30 days.
+        let default = launch_on("/models/x", 36, |_| {});
+        assert_eq!(tier(&default), some(["1", "10", "2592000"]));
+        // The owner's: on, 100 GB, never expire; an explicit unlimited goes out as 0.
+        let owner = launch_on("/models/x", 36, |c| {
+            c.server.kv_disk_enabled = true;
+            c.server.kv_disk_max_gb = 100;
+            c.server.kv_disk_ttl_secs = 0;
+        });
+        assert_eq!(tier(&owner), some(["1", "100", "0"]));
+        let unlimited = launch_on("/models/x", 36, |c| c.server.kv_disk_max_gb = 0);
+        assert_eq!(tier(&unlimited), some(["1", "0", "2592000"]));
+        // Off: the switch alone.
+        let off = launch_on("/models/x", 36, |c| c.server.kv_disk_enabled = false);
+        assert_eq!(tier(&off), [Some("0".to_string()), None, None]);
     }
 
     /// With no wired limit chosen, the app wires as many bytes as the model's files hold: right for a

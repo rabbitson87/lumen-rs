@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// chain in `migrate_in_place` is keyed by this number — incrementing it
 /// without adding a corresponding migration step is a deserialization
 /// landmine for anyone with an older config.toml.
+// 11 -> 12 with the disk KV tier going on by default (10 GB, entries idle 30 days expire): a
+// config still holding the old defaults as a whole takes the new ones (see `migrate_in_place`).
+//
 // 10 -> 11 with the Flash-Next draft head's default flipping from `auto` to `off`: a stored
 // `auto` meant "the default", which is now `off`, so the migration rewrites it (see
 // `migrate_in_place`).
@@ -21,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // carried a `v7 -> v8` step, and migration only runs when `schema_version <
 // CURRENT`, so a config sitting at exactly 7 never received that step. Bumping
 // the constant is not optional bookkeeping; it is what makes the step run.
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 /// On-disk persistent config. Lives at
 /// `~/Library/Application Support/ai.lumen.app/config.toml` on macOS.
@@ -104,16 +107,18 @@ pub struct ServerConfig {
     pub skip_warmup: bool,
 
     // ── Disk KV cache (persistent prefix-cache tier) ────────────────────
-    /// → `LUMEN_KV_DISK=1` — persist prefix-cache KV snapshots to disk so they
-    /// survive server restart / eviction (avoids re-paying cold prefill).
-    #[serde(default)]
+    /// → `LUMEN_KV_DISK` (`1` / `0`) — persist prefix-cache KV snapshots to
+    /// disk so they survive server restart / eviction (avoids re-paying cold
+    /// prefill). Default on, as in the server, which also stops writing while
+    /// the store's volume has under 10 GB free (`LUMEN_KV_DISK_MIN_FREE_GB`).
+    #[serde(default = "default_kv_disk_enabled")]
     pub kv_disk_enabled: bool,
     /// → `LUMEN_KV_DISK_MAX_GB` — max on-disk budget in GB (LRU-evicted).
-    /// `0` = unlimited (default).
-    #[serde(default)]
+    /// Default 10; `0` = unlimited.
+    #[serde(default = "default_kv_disk_max_gb")]
     pub kv_disk_max_gb: usize,
     /// → `LUMEN_KV_DISK_TTL_SECS` — drop disk entries idle longer than this.
-    /// Default 86400 (1 day); `0` = never expire.
+    /// Default 2592000 (30 days); `0` = never expire.
     #[serde(default = "default_kv_disk_ttl_secs")]
     pub kv_disk_ttl_secs: u32,
 
@@ -126,8 +131,20 @@ pub struct ServerConfig {
     pub auto_start_server: bool,
 }
 
+/// The disk tier's defaults, the same as the server's own.
+const KV_DISK_DEFAULT_MAX_GB: usize = 10;
+const KV_DISK_DEFAULT_TTL_SECS: u32 = 30 * 24 * 60 * 60;
+
+fn default_kv_disk_enabled() -> bool {
+    true
+}
+
+fn default_kv_disk_max_gb() -> usize {
+    KV_DISK_DEFAULT_MAX_GB
+}
+
 fn default_kv_disk_ttl_secs() -> u32 {
-    86_400
+    KV_DISK_DEFAULT_TTL_SECS
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -448,9 +465,9 @@ impl Default for PersistentConfig {
                 embedding_model_id: None,
                 local_model_dir: None,
                 skip_warmup: false,
-                kv_disk_enabled: false,
-                kv_disk_max_gb: 0,
-                kv_disk_ttl_secs: 86_400,
+                kv_disk_enabled: default_kv_disk_enabled(),
+                kv_disk_max_gb: KV_DISK_DEFAULT_MAX_GB,
+                kv_disk_ttl_secs: KV_DISK_DEFAULT_TTL_SECS,
                 auto_start_server: false,
             },
             quant: QuantConfig {
@@ -671,6 +688,20 @@ fn migrate_in_place(cfg: &mut PersistentConfig) {
             cfg.flash_next.draft_head = FlashNextDraftHead::Off;
         }
         cfg.schema_version = 11;
+    }
+    // v11 -> v12: the disk KV tier went on by default, bounded: 10 GB, entries idle 30 days
+    // expire, and (server-side) no writes while the volume has under 10 GB free. A config still
+    // holding the old defaults as a whole (off, unlimited, one day) never chose them, so it takes
+    // the new ones. Any other combination was a choice and stays exactly, a stored unlimited
+    // (`0`) with the tier on included.
+    if cfg.schema_version < 12 {
+        let s = &mut cfg.server;
+        if (s.kv_disk_enabled, s.kv_disk_max_gb, s.kv_disk_ttl_secs) == (false, 0, 86_400) {
+            s.kv_disk_enabled = default_kv_disk_enabled();
+            s.kv_disk_max_gb = KV_DISK_DEFAULT_MAX_GB;
+            s.kv_disk_ttl_secs = KV_DISK_DEFAULT_TTL_SECS;
+        }
+        cfg.schema_version = 12;
     }
     // Future migrations append here.
 }
@@ -1067,6 +1098,89 @@ max_batch = 6
         let mut again = stored(10, "auto");
         migrate_in_place(&mut again);
         assert_eq!(again.flash_next.draft_head, FlashNextDraftHead::Off);
+    }
+
+    // ── Disk KV tier ───────────────────────────────────────────────────
+
+    /// `(enabled, max GB, TTL seconds)` of the disk tier.
+    fn disk_tier(cfg: &PersistentConfig) -> (bool, usize, u32) {
+        (
+            cfg.server.kv_disk_enabled,
+            cfg.server.kv_disk_max_gb,
+            cfg.server.kv_disk_ttl_secs,
+        )
+    }
+
+    /// A config file at `version` holding `tier`, loaded and migrated as the app does it.
+    fn load_stored_disk_tier(version: u32, tier: (bool, usize, u32)) -> PersistentConfig {
+        let mut cfg = PersistentConfig {
+            schema_version: version,
+            ..PersistentConfig::default()
+        };
+        (
+            cfg.server.kv_disk_enabled,
+            cfg.server.kv_disk_max_gb,
+            cfg.server.kv_disk_ttl_secs,
+        ) = tier;
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        let mut cfg: PersistentConfig = toml::from_str(&raw).expect("parse");
+        migrate_in_place(&mut cfg);
+        cfg
+    }
+
+    const OLD_DISK_TIER_DEFAULTS: (bool, usize, u32) = (false, 0, 86_400);
+    const NEW_DISK_TIER_DEFAULTS: (bool, usize, u32) = (true, 10, 30 * 24 * 60 * 60);
+
+    /// A new config has the disk tier on, at 10 GB, with entries idle 30 days expiring; so does
+    /// a file written before the three fields existed.
+    #[test]
+    fn a_new_config_has_the_disk_tier_on_with_its_limits() {
+        assert_eq!(
+            disk_tier(&PersistentConfig::default()),
+            NEW_DISK_TIER_DEFAULTS
+        );
+        let mut cfg: PersistentConfig = toml::from_str(V8_TOML).expect("no disk-tier fields");
+        migrate_in_place(&mut cfg);
+        assert_eq!(disk_tier(&cfg), NEW_DISK_TIER_DEFAULTS);
+    }
+
+    /// A config still holding the old defaults as a whole (off, unlimited, one day) never chose
+    /// them, so it takes the new ones, once.
+    #[test]
+    fn the_v12_migration_moves_the_untouched_old_disk_tier_defaults_to_the_new_ones() {
+        let mut cfg = load_stored_disk_tier(11, OLD_DISK_TIER_DEFAULTS);
+        assert_eq!(disk_tier(&cfg), NEW_DISK_TIER_DEFAULTS);
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        migrate_in_place(&mut cfg);
+        assert_eq!(disk_tier(&cfg), NEW_DISK_TIER_DEFAULTS);
+    }
+
+    /// Any other combination is a choice and is kept exactly: the owner's (on, 100 GB, never
+    /// expire), an explicit unlimited with the tier on, and every partial edit of the old
+    /// defaults. From v12 on the old triple is a choice too (turned off after the flip).
+    #[test]
+    fn the_v12_migration_keeps_every_chosen_disk_tier_setting() {
+        for chosen in [
+            (true, 100, 0),
+            (true, 0, 86_400),
+            (true, 0, 0),
+            (false, 0, 3_600),
+            (false, 5, 86_400),
+            (false, 0, 0),
+        ] {
+            assert_eq!(
+                disk_tier(&load_stored_disk_tier(11, chosen)),
+                chosen,
+                "{chosen:?}"
+            );
+        }
+        assert_eq!(
+            disk_tier(&load_stored_disk_tier(
+                CURRENT_SCHEMA_VERSION,
+                OLD_DISK_TIER_DEFAULTS
+            )),
+            OLD_DISK_TIER_DEFAULTS
+        );
     }
 
     #[test]

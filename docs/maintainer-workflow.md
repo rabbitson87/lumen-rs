@@ -911,10 +911,12 @@ parity fixtures captured under f32) needs regenerating or running with the flag
 off.
 
 One hazard worth knowing: a KV cache **persisted** under one setting cannot be
-extended under the other. `LUMEN_KV_DISK` is off by default so the exposure is
-narrow, but `NativeKvCache::update_and_fetch` now rejects a dtype mismatch with
-an actionable message rather than silently promoting — the failure would
-otherwise surface far from its cause.
+extended under the other. The disk tier (`LUMEN_KV_DISK`) is on by default, but
+its store identity covers `LUMEN_MLX_KV_*` (`kv_disk::IDENTITY_ENV_PREFIXES`), so
+a snapshot written under one setting lives in another directory and is a miss
+under the other. Behind that, `NativeKvCache::update_and_fetch` rejects a dtype
+mismatch with an actionable message rather than silently promoting — the failure
+would otherwise surface far from its cause.
 
 Scope: this is the Qwen3.5/3.6 full-attention path. Gemma 4 has its own cache
 (`NativeKvCacheQuantized` and friends) and is untouched, as is the TurboQuant

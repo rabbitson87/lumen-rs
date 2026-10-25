@@ -127,9 +127,9 @@ export const en: Record<string, string> = {
   "diskkv.maxGb": "Max size (GB)",
   "diskkv.ttl": "TTL (seconds)",
   "diskkv.hint.enable":
-    "Persist the prompt-prefix KV cache to disk so a server restart reuses it instead of cold-prefilling. Sets",
-  "diskkv.hint.maxGb": "On-disk budget; oldest entries evicted past this. 0 = unlimited. Sets",
-  "diskkv.hint.ttl": "Drop disk entries idle longer than this. Default 86400 (1 day); 0 = never expire. Sets",
+    "Persist the prompt-prefix KV cache to disk so a server restart reuses it instead of cold-prefilling. On by default, within a 10 GB quota (below). Nothing new is written while the disk has less than 10 GB free (LUMEN_KV_DISK_MIN_FREE_GB); what is already saved stays and is still used. Sets",
+  "diskkv.hint.maxGb": "On-disk budget; oldest entries evicted past this. Default 10; 0 = unlimited. Sets",
+  "diskkv.hint.ttl": "Drop disk entries idle longer than this. Default 2592000 (30 days); 0 = never expire. Sets",
   "context.title": "CONTEXT",
   "context.titleHint": "(driven by QUANT state)",
   "context.max": "Max",

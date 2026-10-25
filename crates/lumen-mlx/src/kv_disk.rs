@@ -551,12 +551,20 @@ pub struct DiskKvStore {
     report: std::sync::Arc<std::sync::Mutex<WriterReport>>,
     /// Number of the last write handed to the writer thread.
     last_seq: u64,
+    /// Free space a write must leave on the store's volume, in bytes; `0`
+    /// (what [`Self::open`] sets) means no floor. See [`Self::put`].
+    min_free_bytes: u64,
+    /// How the volume's free space is read: `statvfs`, or in a test a number.
+    free_space: FreeSpace,
+    /// Writes the floor skipped, for logging once per run of them.
+    floor: FloorReport,
 }
 
 impl DiskKvStore {
     /// Open (creating if needed) a store under `root/<fingerprint>/`.
     /// `max_bytes` is the LRU budget (0 = unbounded). `ttl_secs` is the
     /// last-access TTL (0 = no expiry). Stale entries are pruned on open.
+    /// No free-space floor until [`Self::set_min_free_bytes`] sets one.
     pub fn open(
         root: impl AsRef<Path>,
         fingerprint: impl Into<String>,
@@ -578,6 +586,9 @@ impl DiskKvStore {
             create: real_files(),
             report: Default::default(),
             last_seq: 0,
+            min_free_bytes: 0,
+            free_space: std::sync::Arc::new(volume_free_bytes),
+            floor: FloorReport::default(),
         };
         // Drop entries that expired while the process was down, and whatever a
         // process that died mid-write left behind: half-written temp files,
@@ -645,6 +656,25 @@ impl DiskKvStore {
             "set the opener before the writer starts"
         );
         self.create = create;
+    }
+
+    /// Keep at least `bytes` free on the store's volume: a [`Self::put`] that
+    /// would leave less is skipped (`0` turns the floor off). Entries already
+    /// stored are never removed for it, and reads go on as before.
+    pub fn set_min_free_bytes(&mut self, bytes: u64) {
+        self.min_free_bytes = bytes;
+    }
+
+    /// Tests: read the volume's free space through `free_space` from now on.
+    #[cfg(test)]
+    fn set_free_space_for_test(&mut self, free_space: FreeSpace) {
+        self.free_space = free_space;
+    }
+
+    /// Tests: `(writes skipped since the floor last let one through, lines logged)`.
+    #[cfg(test)]
+    fn floor_report_for_test(&self) -> (u64, u64) {
+        (self.floor.skipped, self.floor.lines)
     }
 
     /// Write `bytes` to `path` through a temp file and a rename, so a reader
@@ -775,10 +805,45 @@ impl DiskKvStore {
         format!("{safe}.lkv")
     }
 
+    /// Whether writing `bytes` more leaves the store's volume at least
+    /// `min_free_bytes` free. Writes still queued for the writer thread count
+    /// as written, since their bytes are about to land. A volume whose free
+    /// space cannot be read is not held back: a write that does not fit then
+    /// fails the way a full disk does. Logs the first write of a run that is
+    /// held back, and the first that is not again.
+    fn leaves_floor_free(&mut self, bytes: u64) -> bool {
+        if self.min_free_bytes == 0 {
+            return true;
+        }
+        let Ok(free) = (self.free_space)(&self.dir) else {
+            return true;
+        };
+        let queued: u64 = self
+            .index
+            .entries
+            .iter()
+            .filter(|e| e.pending.is_some())
+            .map(|e| e.bytes)
+            .sum();
+        let fits = free.saturating_sub(queued).saturating_sub(bytes) >= self.min_free_bytes;
+        self.floor.note(fits, free, self.min_free_bytes, &self.dir);
+        fits
+    }
+
     /// Persist a snapshot under `key`, replacing any existing entry. Evicts LRU
     /// victims afterward to honor the byte budget.
+    ///
+    /// Under the free-space floor ([`Self::set_min_free_bytes`]) the write is
+    /// skipped instead, before anything is serialized, and `Ok` returned: the
+    /// store keeps what it has (an entry under `key` included) and serves it.
+    /// The check counts the records' bytes; the file adds a few KB of
+    /// manifest.
     pub fn put(&mut self, key: &str, manifest: &KvManifest, records: &[ArrayRecord]) -> Result<()> {
         self.reconcile();
+        let payload: u64 = records.iter().map(|r| r.data.len() as u64).sum();
+        if !self.leaves_floor_free(payload) {
+            return Ok(());
+        }
         let file = Self::file_for(key);
         let path = self.dir.join(&file);
 
@@ -1043,6 +1108,76 @@ fn write_via_tmp(create: &CreateFile, path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     written
+}
+
+/// Reads the bytes free on the volume holding a path: the filesystem, or in a
+/// test a disk whose free space the test sets.
+type FreeSpace = std::sync::Arc<dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync>;
+
+/// Bytes an unprivileged process may still write on the volume holding `path`
+/// (`statvfs`: `f_bavail × f_frsize`).
+#[cfg(unix)]
+fn volume_free_bytes(path: &Path) -> std::io::Result<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `c` is NUL-terminated and `st` is a valid out-pointer, zeroed
+    // because `statvfs` is plain old data.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The fields are 32-bit on some platforms and 64-bit on others.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn volume_free_bytes(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// The free-space floor's account of the writes it skipped.
+#[derive(Default)]
+struct FloorReport {
+    /// Writes skipped since the floor last let one through. A volume that
+    /// stays short skips every write, so only the first of a run is logged,
+    /// and the line that says writes resume gives the count.
+    skipped: u64,
+    /// Lines logged about the floor.
+    lines: u64,
+}
+
+impl FloorReport {
+    fn note(&mut self, fits: bool, free: u64, floor: u64, dir: &Path) {
+        let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        if fits {
+            if self.skipped > 0 {
+                eprintln!(
+                    "[kv-disk] writes resume: {:.1} GB free on the volume of {} ({} skipped \
+                     below the {:.1} GB floor)",
+                    gb(free),
+                    dir.display(),
+                    self.skipped,
+                    gb(floor),
+                );
+                self.skipped = 0;
+                self.lines += 1;
+            }
+            return;
+        }
+        if self.skipped == 0 {
+            eprintln!(
+                "[kv-disk] not writing: {:.1} GB free on the volume of {}, and a write may not \
+                 leave less than {:.1} GB (LUMEN_KV_DISK_MIN_FREE_GB). States already on disk \
+                 are kept and still read; further skips are counted, not logged, until there \
+                 is room again",
+                gb(free),
+                dir.display(),
+                gb(floor),
+            );
+            self.lines += 1;
+        }
+        self.skipped += 1;
+    }
 }
 
 /// What a store's writer thread reports back to it.
@@ -1341,39 +1476,127 @@ pub fn kv_identity(model_id: &str, model_dir: &Path, settings: &[(String, String
     format!("{name}-{hex}")
 }
 
-/// The opt-in L2 disk tier, opened from env under `identity`. Off unless
-/// `LUMEN_KV_DISK` is truthy; `LUMEN_KV_DISK_MAX_GB` bounds the LRU budget
-/// (0 / unset = unbounded) and `LUMEN_KV_DISK_TTL_SECS` the last-access TTL
-/// (default 1 day, 0 = never). Open failure is logged and yields `None`: the
-/// disk tier is an accelerator, never a reason to fail a load.
+lumen_flags::flag! {
+    /// The disk KV tier (`kv_disk.rs`): prompt and conversation states, and
+    /// Flash-Next agents' system-prompt heads, written under
+    /// `LUMEN_KV_DISK_DIR` (default `~/.cache/lumen/kv`) and read back after a
+    /// restart or after memory pressure dropped them, instead of prefilling
+    /// them again. A state read back is the cold computation exactly, so only
+    /// speed changes.
+    ///
+    /// On by default, within three limits: `LUMEN_KV_DISK_MAX_GB` (default
+    /// 10; least recently used entries go past it; `0` = unlimited),
+    /// `LUMEN_KV_DISK_TTL_SECS` (default 2592000, 30 days, since an entry was
+    /// last used; `0` = entries never expire) and `LUMEN_KV_DISK_MIN_FREE_GB`
+    /// (default 10: no writes while the store's volume has less than that
+    /// free, though stored entries stay and are still read; `0` = no floor).
+    /// `LUMEN_KV_DISK=0` (or `false`, `off`, `no`) turns the tier off.
+    pub kv_disk_tier {
+        env: "LUMEN_KV_DISK",
+        default: true,
+        kind: Optimization,
+    }
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The disk tier's limits (see [`kv_disk_tier`]), as [`open_store_from_env`]
+/// reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskTierLimits {
+    /// LRU byte budget (`LUMEN_KV_DISK_MAX_GB`); `0` = unbounded.
+    pub max_bytes: u64,
+    /// Last-access TTL in seconds (`LUMEN_KV_DISK_TTL_SECS`); `0` = entries
+    /// never expire.
+    pub ttl_secs: u64,
+    /// Free space a write must leave on the store's volume
+    /// (`LUMEN_KV_DISK_MIN_FREE_GB`); `0` = no floor.
+    pub min_free_bytes: u64,
+}
+
+impl DiskTierLimits {
+    /// `LUMEN_KV_DISK_MAX_GB` when unset.
+    pub const DEFAULT_MAX_GB: u64 = 10;
+    /// `LUMEN_KV_DISK_TTL_SECS` when unset: 30 days.
+    pub const DEFAULT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+    /// `LUMEN_KV_DISK_MIN_FREE_GB` when unset.
+    pub const DEFAULT_MIN_FREE_GB: u64 = 10;
+
+    pub fn from_env() -> Self {
+        Self::parse(
+            std::env::var("LUMEN_KV_DISK_MAX_GB").ok().as_deref(),
+            std::env::var("LUMEN_KV_DISK_TTL_SECS").ok().as_deref(),
+            std::env::var("LUMEN_KV_DISK_MIN_FREE_GB").ok().as_deref(),
+        )
+    }
+
+    /// The limits from the variables' raw values (`None` = unset). An unset
+    /// or empty value takes the default, and so does one that is not a whole
+    /// number (with a line on stderr); an explicit `0` keeps its meaning.
+    fn parse(max_gb: Option<&str>, ttl_secs: Option<&str>, min_free_gb: Option<&str>) -> Self {
+        let whole = |name: &str, raw: Option<&str>, default: u64| {
+            let raw = raw.map(str::trim).unwrap_or_default();
+            if raw.is_empty() {
+                return default;
+            }
+            raw.parse::<u64>().unwrap_or_else(|_| {
+                eprintln!("[kv-disk] {name}={raw:?} is not a whole number; using {default}");
+                default
+            })
+        };
+        Self {
+            max_bytes: whole("LUMEN_KV_DISK_MAX_GB", max_gb, Self::DEFAULT_MAX_GB)
+                .saturating_mul(GIB),
+            ttl_secs: whole("LUMEN_KV_DISK_TTL_SECS", ttl_secs, Self::DEFAULT_TTL_SECS),
+            min_free_bytes: whole(
+                "LUMEN_KV_DISK_MIN_FREE_GB",
+                min_free_gb,
+                Self::DEFAULT_MIN_FREE_GB,
+            )
+            .saturating_mul(GIB),
+        }
+    }
+}
+
+/// The L2 disk tier under `identity`, configured from env (see
+/// [`kv_disk_tier`]). `None` when the tier is off, or when the store cannot
+/// be opened (logged): the disk tier is an accelerator, never a reason to
+/// fail a load.
 pub fn open_store_from_env(identity: &str, log_tag: &str) -> Option<DiskKvStore> {
-    let enabled = matches!(
-        std::env::var("LUMEN_KV_DISK")
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    );
-    if !enabled {
+    if !kv_disk_tier::get() {
         return None;
     }
-    let max_bytes = std::env::var("LUMEN_KV_DISK_MAX_GB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|gb| gb * 1024 * 1024 * 1024)
-        .unwrap_or(0);
-    let ttl_secs = std::env::var("LUMEN_KV_DISK_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(86_400);
-    match DiskKvStore::open(DiskKvStore::default_root(), identity, max_bytes, ttl_secs)
-        .and_then(|mut store| store.write_in_background().map(|()| store))
-    {
+    open_store(
+        DiskKvStore::default_root(),
+        identity,
+        log_tag,
+        DiskTierLimits::from_env(),
+    )
+}
+
+/// [`open_store_from_env`] under `root` with `limits`, its writes on the
+/// background thread.
+fn open_store(
+    root: impl AsRef<Path>,
+    identity: &str,
+    log_tag: &str,
+    limits: DiskTierLimits,
+) -> Option<DiskKvStore> {
+    let opened = DiskKvStore::open(root, identity, limits.max_bytes, limits.ttl_secs).and_then(
+        |mut store| {
+            store.set_min_free_bytes(limits.min_free_bytes);
+            store.write_in_background().map(|()| store)
+        },
+    );
+    match opened {
         Ok(store) => {
             eprintln!(
-                "[{log_tag}] kv-disk tier ON: identity={identity:?} entries={} max_gb={}",
+                "[{log_tag}] kv-disk tier ON: identity={identity:?} entries={} max_gb={} \
+                 ttl_secs={} min_free_gb={} (LUMEN_KV_DISK=0 turns it off)",
                 store.len(),
-                max_bytes / (1024 * 1024 * 1024),
+                limits.max_bytes / GIB,
+                limits.ttl_secs,
+                limits.min_free_bytes / GIB,
             );
             Some(store)
         }
@@ -2564,5 +2787,219 @@ mod tests {
         store.index.entries[0].last_access_unix = 1; // ancient
         assert!(!store.prune_ttl(), "ttl=0 must never prune");
         assert_eq!(store.len(), 1);
+    }
+
+    // --- Defaults: on, 10 GB, 30 days, a 10 GB free-space floor ---
+
+    /// Unset is on: the tier is a registered flag whose default is on, and
+    /// `with(false)` (what `LUMEN_KV_DISK=0` gives) opens nothing, before
+    /// anything is read from or made on the disk.
+    #[test]
+    fn the_disk_tier_is_on_unless_turned_off() {
+        let d = kv_disk_tier::describe();
+        assert_eq!(d.env, "LUMEN_KV_DISK");
+        assert!(d.default, "unset LUMEN_KV_DISK must mean on");
+        assert_eq!(d.kind, lumen_flags::FlagKind::Optimization);
+        kv_disk_tier::with(false, || {
+            assert!(open_store_from_env("never-opened", "test").is_none());
+        });
+    }
+
+    #[test]
+    fn the_limits_default_to_10_gb_30_days_and_a_10_gb_floor() {
+        let unset = DiskTierLimits::parse(None, None, None);
+        assert_eq!(
+            unset,
+            DiskTierLimits {
+                max_bytes: 10 * GIB,
+                ttl_secs: 30 * 24 * 60 * 60,
+                min_free_bytes: 10 * GIB,
+            }
+        );
+        // Empty or unreadable is the default too, not zero (which means
+        // unlimited / never / no floor).
+        assert_eq!(DiskTierLimits::parse(Some(""), Some(" "), Some("")), unset);
+        assert_eq!(
+            DiskTierLimits::parse(Some("ten"), Some("-1"), Some("1.5")),
+            unset
+        );
+    }
+
+    #[test]
+    fn explicit_limits_win_and_an_explicit_zero_keeps_its_meaning() {
+        assert_eq!(
+            DiskTierLimits::parse(Some("100"), Some("3600"), Some(" 5 ")),
+            DiskTierLimits {
+                max_bytes: 100 * GIB,
+                ttl_secs: 3600,
+                min_free_bytes: 5 * GIB,
+            }
+        );
+        // 0 = unlimited budget, entries that never expire, no floor.
+        assert_eq!(
+            DiskTierLimits::parse(Some("0"), Some("0"), Some("0")),
+            DiskTierLimits {
+                max_bytes: 0,
+                ttl_secs: 0,
+                min_free_bytes: 0,
+            }
+        );
+        // A size too large to count in bytes saturates instead of wrapping
+        // to a tiny budget.
+        let huge = DiskTierLimits::parse(Some(&u64::MAX.to_string()), None, None);
+        assert_eq!(huge.max_bytes, u64::MAX);
+    }
+
+    /// What the server opens is what the limits say: the budget, the TTL and
+    /// the floor all reach the store.
+    #[test]
+    fn the_opened_store_carries_every_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = DiskTierLimits::parse(None, None, None);
+        let store = open_store(tmp.path(), "fp-abc123", "test", limits).expect("opens");
+        assert_eq!(store.max_bytes, 10 * GIB);
+        assert_eq!(store.ttl_secs, 30 * 24 * 60 * 60);
+        assert_eq!(store.min_free_bytes, 10 * GIB);
+        assert!(
+            store.writer.is_some(),
+            "the server writes in the background"
+        );
+    }
+
+    // --- The free-space floor ---
+
+    /// A volume whose free space is whatever `free` holds.
+    fn volume_with_free(free: std::sync::Arc<std::sync::atomic::AtomicU64>) -> FreeSpace {
+        std::sync::Arc::new(move |_| Ok(free.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    /// Below the floor a write is skipped, and nothing else moves: the entry
+    /// it would have replaced and every other one stay, on disk and readable.
+    /// Above it writes go on. A run of skips is logged once, and so is the
+    /// write that ends it.
+    #[test]
+    fn the_floor_skips_writes_below_it_and_keeps_what_is_stored() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fp-abc123");
+        let m = sample_manifest();
+        let rec = |v: f32| vec![f32_record(&[1, 2, 2, 4], v)];
+        let bytes = rec(0.0)[0].data.len() as u64;
+        let floor = 1_000_000;
+        let free = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.set_free_space_for_test(volume_with_free(free.clone()));
+        store.set_min_free_bytes(floor);
+        store.put("kept", &m, &rec(1.0)).unwrap();
+        store.put("other", &m, &rec(2.0)).unwrap();
+        let on_disk = names_in(&dir);
+
+        // One byte short of leaving the floor free.
+        free.store(floor + bytes - 1, SeqCst);
+        store.put("skipped", &m, &rec(3.0)).unwrap();
+        store.put("kept", &m, &rec(4.0)).unwrap();
+        store.put("skipped-too", &m, &rec(5.0)).unwrap();
+        assert!(!store.contains("skipped") && !store.contains("skipped-too"));
+        assert_eq!(names_in(&dir), on_disk, "a skipped write touched the disk");
+        assert_eq!(store.len(), 2);
+        assert_eq!(
+            store.get("kept").unwrap().map(|(_, r)| r),
+            Some(rec(1.0)),
+            "the stored state must survive a newer one the floor held back"
+        );
+        assert_eq!(store.get("other").unwrap().map(|(_, r)| r), Some(rec(2.0)));
+        assert_eq!(
+            store.floor_report_for_test(),
+            (3, 1),
+            "three skips, one line"
+        );
+
+        // Exactly the floor left free is allowed.
+        free.store(floor + bytes, SeqCst);
+        store.put("fits", &m, &rec(6.0)).unwrap();
+        assert_eq!(store.get("fits").unwrap().map(|(_, r)| r), Some(rec(6.0)));
+        assert_eq!(
+            store.floor_report_for_test(),
+            (0, 2),
+            "one more line: writes resume"
+        );
+        store.put("kept", &m, &rec(7.0)).unwrap();
+        assert_eq!(store.get("kept").unwrap().map(|(_, r)| r), Some(rec(7.0)));
+        assert_eq!(store.floor_report_for_test(), (0, 2));
+        drop(store);
+
+        // A restart finds exactly what was written.
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get("kept").unwrap().map(|(_, r)| r), Some(rec(7.0)));
+        assert!(!store.contains("skipped"));
+    }
+
+    /// The server's mode: a write still queued for the writer thread counts
+    /// as written, so two writes in a row cannot both pass a check that only
+    /// one of them fits. The free space here is a disk that fills as the
+    /// writer lands bytes on it, so either way the second write is held back.
+    #[test]
+    fn the_floor_counts_writes_still_queued() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample_manifest();
+        let big = |v: f32| vec![f32_record(&[1, 64, 64, 4], v)]; // 64 KiB
+        let bytes = big(0.0)[0].data.len() as u64;
+        let floor = 1_000_000;
+        let room = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(floor + bytes * 3 / 2));
+
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.set_create_for_test(disk_with_room(room.clone()));
+        store.set_free_space_for_test(volume_with_free(room.clone()));
+        store.set_min_free_bytes(floor);
+        store.write_in_background().unwrap();
+        store.put("first", &m, &big(1.0)).unwrap();
+        store.put("second", &m, &big(2.0)).unwrap();
+        assert!(drain_writes(std::time::Duration::from_secs(30)));
+        assert!(store.get("first").unwrap().is_some());
+        assert!(!store.contains("second"), "both writes passed the floor");
+        assert_eq!(store.floor_report_for_test(), (1, 1));
+
+        room.store(u64::MAX, SeqCst);
+        store.put("second", &m, &big(2.0)).unwrap();
+        assert!(drain_writes(std::time::Duration::from_secs(30)));
+        assert_eq!(store.get("second").unwrap().map(|(_, r)| r), Some(big(2.0)));
+        assert_eq!(store.floor_report_for_test(), (0, 2));
+    }
+
+    /// No floor reads no free space at all, and a volume whose free space
+    /// cannot be read is not held back (a write that does not fit then fails
+    /// as on a full disk).
+    #[test]
+    fn no_floor_or_an_unreadable_volume_does_not_hold_writes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample_manifest();
+        let records = vec![f32_record(&[1, 2, 2, 4], 1.0)];
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.set_free_space_for_test(std::sync::Arc::new(|_| -> std::io::Result<u64> {
+            panic!("no floor must not read the free space")
+        }));
+        store.put("no-floor", &m, &records).unwrap();
+        assert!(store.contains("no-floor"));
+
+        store.set_min_free_bytes(u64::MAX);
+        store.set_free_space_for_test(std::sync::Arc::new(|_| {
+            Err(std::io::ErrorKind::Other.into())
+        }));
+        store.put("unreadable", &m, &records).unwrap();
+        assert!(store.contains("unreadable"));
+        assert_eq!(store.floor_report_for_test(), (0, 0));
+    }
+
+    /// The real reading: a temp directory's volume reports some free space,
+    /// and a path that does not exist is an error, not zero.
+    #[test]
+    fn the_volume_free_space_reads_statvfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let free = volume_free_bytes(tmp.path()).expect("statvfs on a temp dir");
+        assert!(free > 0, "a writable temp dir on a volume with no space");
+        assert!(volume_free_bytes(&tmp.path().join("missing")).is_err());
     }
 }

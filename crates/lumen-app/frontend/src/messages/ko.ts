@@ -121,9 +121,9 @@ export const ko: Record<string, string> = {
   "diskkv.maxGb": "최대 크기 (GB)",
   "diskkv.ttl": "TTL (초)",
   "diskkv.hint.enable":
-    "프롬프트 prefix KV 캐시를 디스크에 저장해 서버 재시작 시 cold prefill 없이 재사용합니다. 설정:",
-  "diskkv.hint.maxGb": "디스크 사용 한도. 초과 시 오래된 항목부터 제거. 0 = 무제한. 설정:",
-  "diskkv.hint.ttl": "이 시간보다 오래 미사용된 디스크 항목 삭제. 기본 86400(하루); 0 = 만료 없음. 설정:",
+    "프롬프트 prefix KV 캐시를 디스크에 저장해 서버 재시작 시 cold prefill 없이 재사용합니다. 기본으로 켜져 있고 한도는 10 GB(아래)입니다. 디스크 여유 공간이 10 GB 미만이면 새로 저장하지 않으며(LUMEN_KV_DISK_MIN_FREE_GB), 이미 저장된 항목은 그대로 두고 계속 사용합니다. 설정:",
+  "diskkv.hint.maxGb": "디스크 사용 한도. 초과 시 오래된 항목부터 제거. 기본 10; 0 = 무제한. 설정:",
+  "diskkv.hint.ttl": "이 시간보다 오래 미사용된 디스크 항목 삭제. 기본 2592000(30일); 0 = 만료 없음. 설정:",
   // ── 컨텍스트 카드 ───────────────────────────────────────────────
   "context.title": "컨텍스트",
   "context.titleHint": "(QUANT 상태에 연동)",

@@ -41,10 +41,13 @@
 //!     `cargo xtask flags` generates `docs/env-flags.md` and decides which
 //!     flags the equivalence matrix may flip.
 //!
-//! Parse rule, fixed everywhere: unset → default; `"0"` → false; any other
-//! value → true. Flags needing fallback envs or fancier parsing stay
-//! hand-rolled and out of the registry — better a visible exception than a
-//! macro with four escape hatches.
+//! Parse rule, fixed everywhere: unset → default; `0`, `false`, `off` or `no`
+//! (any case, surrounding whitespace ignored) → false; any other value → true.
+//! The words joined `"0"` when `LUMEN_KV_DISK` moved here with a default of
+//! on: under a `"0"`-only rule, `LUMEN_KV_DISK=false` would have turned it ON,
+//! and so would the same word on every other default-on flag. Flags needing
+//! fallback envs or fancier parsing stay hand-rolled and out of the registry —
+//! better a visible exception than a macro with four escape hatches.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -107,7 +110,10 @@ pub fn registry_sorted() -> Vec<&'static FlagDesc> {
 #[doc(hidden)]
 pub fn read_env(env: &str, default: bool) -> bool {
     match std::env::var(env) {
-        Ok(v) => v != "0",
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         Err(_) => default,
     }
 }
@@ -309,7 +315,8 @@ mod tests {
         assert_eq!(off.kind, FlagKind::Behavior);
     }
 
-    /// The parse rule in one place: `"0"` is the only falsy string.
+    /// The parse rule in one place: `0`, `false`, `off` and `no` are off,
+    /// anything else is on.
     #[test]
     fn parse_rule_is_zero_means_off() {
         assert!(!read_env("LUMEN_FLAGS_TEST_UNSET_X", false));
@@ -321,10 +328,21 @@ mod tests {
         assert!(!read_env("LUMEN_FLAGS_TEST_PARSE", true));
         unsafe { std::env::set_var("LUMEN_FLAGS_TEST_PARSE", "1") };
         assert!(read_env("LUMEN_FLAGS_TEST_PARSE", false));
-        unsafe { std::env::set_var("LUMEN_FLAGS_TEST_PARSE", "yes") };
-        assert!(
-            read_env("LUMEN_FLAGS_TEST_PARSE", false),
-            "any non-\"0\" value is truthy"
-        );
+        for on in ["yes", "true", "on", "2", ""] {
+            unsafe { std::env::set_var("LUMEN_FLAGS_TEST_PARSE", on) };
+            assert!(
+                read_env("LUMEN_FLAGS_TEST_PARSE", false),
+                "{on:?} is not one of the off words, so it is on"
+            );
+        }
+        // A word that says off must not turn a default-on flag ON: before the
+        // rule knew these, `LUMEN_X=false` did exactly that.
+        for off in ["false", "off", "no", "FALSE", "Off", " 0 ", "no\n"] {
+            unsafe { std::env::set_var("LUMEN_FLAGS_TEST_PARSE", off) };
+            assert!(
+                !read_env("LUMEN_FLAGS_TEST_PARSE", true),
+                "{off:?} must turn the flag off"
+            );
+        }
     }
 }
