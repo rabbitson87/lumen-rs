@@ -7105,12 +7105,18 @@ fn format_qwen3_chat(
         // With a trace, the same holds for `thinking:true`: the block is
         // refilled with the reasoning the model produced, which is the only
         // way that turn can be a prefix of its own KV.
+        //
+        // The visible text is trimmed, as the template trims every message and
+        // as the tools renderer does: a reply handed back as `"\n\nA1"` would
+        // otherwise render `</think>\n\n\n\nA1`, whose newline run the
+        // pre-tokenizer reads as one piece, so the prompt stops being a token
+        // prefix of the KV the model wrote (`</think>`, `\n\n`, `A1`).
         if preserve_thinking && role.eq_ignore_ascii_case("assistant") {
             let (reasoning, visible) = crate::chat_io::split_reasoning_envelope(content);
             s.push_str("<think>\n");
             s.push_str(reasoning);
             s.push_str("\n</think>\n\n");
-            s.push_str(visible);
+            s.push_str(visible.trim());
         } else {
             // `preserve_thinking:false` checkpoints render the turn verbatim,
             // envelope included. That is deliberate: 3.6's template drops
@@ -7953,6 +7959,13 @@ mod tests {
             "turn 2 must extend turn 1's prompt + its reply, or the KV cannot be \
              reused:\nturn1={turn1_prompt:?}\nturn2={preserved:?}",
         );
+
+        // RED before: the reply as a client hands it back, with the newlines a
+        // stream can carry around it, was written verbatim (`</think>\n\n\n\nA1`)
+        // instead of trimmed as the template and the tools renderer write it.
+        let mut padded = convo.clone();
+        padded[2].1 = "\n\nA1\n".to_string();
+        assert_eq!(format_qwen3_chat(&padded, false, None, true), preserved);
     }
 
     /// Does reusing a session's KV give the same tokens as prefilling the
