@@ -2523,9 +2523,15 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                // The Qwen3.6 image path is greedy-only: the family's sampled
-                // branches key on text.
-                let _ = (temperature, top_p, ov, session_id);
+                // The image loops decode through the same sampled steps as the
+                // text ones, so this request's policy has to be installed here
+                // too, or it decodes with whatever the previous request left.
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
+                let _ = session_id;
                 let seq_id = m.alloc_seq_id();
                 // response_format wins over tools, matching the text path.
                 if let Some(schema) = response_schema {
@@ -2638,7 +2644,12 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p, ov, session_id);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
+                let _ = session_id;
                 let seq_id = m.alloc_seq_id();
                 let mut on_event = on_event;
                 // response_format wins over tools, matching the text path.
@@ -2773,7 +2784,12 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p, ov, session_id);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
+                let _ = session_id;
                 let seq_id = m.alloc_seq_id();
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
@@ -3106,7 +3122,12 @@ impl MlxBackend {
                 )
             }
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p, ov, session_id);
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
+                let _ = session_id;
                 let seq_id = m.alloc_seq_id();
                 let mut on_event = on_event;
                 if let Some(schema) = response_schema {
@@ -8951,6 +8972,95 @@ mod tests {
             let mut b = qwen_with_prefix_cache();
             let r = image_chat(&mut b, &[("system", ""), ("user", "U1")], &images, stream);
             assert!(r.is_err(), "stream={stream}");
+        }
+    }
+
+    /// RED before: the four image entry points never installed the request's
+    /// sampling, while their decode steps read it, so an image request decoded
+    /// with the previous request's temperature and seed (and a sampled image
+    /// request after a greedy one decoded greedily). The scripted runner has no
+    /// vision tower, so each call refuses after dispatch; what it installed
+    /// stays visible.
+    #[test]
+    fn an_image_request_decodes_with_its_own_sampling() {
+        use crate::chat_io::{ChatTurn, ResolvedToolChoice};
+        let images = vec![Vec::new(), vec![b"not really a png".to_vec()]];
+        let messages = vec![
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let turns = [ChatTurn::System("S"), ChatTurn::User("U1")];
+        let ov = SamplingOverrides::default();
+        let auto = ResolvedToolChoice::Auto;
+        let leftover = MlxQwen35Backend::qwen_sampling_config(1.5, 0.9, &ov);
+        for entry in 0..4 {
+            for (temperature, sampled) in [(0.0, false), (0.8, true)] {
+                let mut b = qwen_with_prefix_cache();
+                qwen(&mut b).set_sampling(leftover);
+                let _ = match entry {
+                    0 => b.chat_with_images(
+                        &messages,
+                        &images,
+                        4,
+                        temperature,
+                        1.0,
+                        &ov,
+                        false,
+                        None,
+                        &[],
+                        &auto,
+                        None,
+                    ),
+                    1 => b.chat_streaming_with_images(
+                        &messages,
+                        &images,
+                        4,
+                        temperature,
+                        1.0,
+                        &ov,
+                        false,
+                        None,
+                        &[],
+                        &auto,
+                        None,
+                        |_| Ok(()),
+                    ),
+                    2 => b.chat_from_history_with_images(
+                        &turns,
+                        &images,
+                        4,
+                        temperature,
+                        1.0,
+                        &ov,
+                        false,
+                        None,
+                        &[],
+                        &auto,
+                        None,
+                    ),
+                    _ => b.chat_streaming_from_history_with_images(
+                        &turns,
+                        &images,
+                        4,
+                        temperature,
+                        1.0,
+                        &ov,
+                        false,
+                        None,
+                        &[],
+                        &auto,
+                        None,
+                        |_| Ok(()),
+                    ),
+                };
+                let installed = qwen(&mut b).sampling;
+                assert_eq!(
+                    installed.map(|c| c.temperature),
+                    sampled.then_some(temperature),
+                    "entry {entry}, temperature {temperature}: the previous request's \
+                     sampling must not survive"
+                );
+            }
         }
     }
 
