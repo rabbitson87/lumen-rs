@@ -222,8 +222,12 @@ fn offloaded_experts_match_the_resident_model() {
 /// replica's reads are microseconds, so the read-time bar is lowered for the test).
 #[test]
 fn overlapping_reads_with_resident_experts_keeps_the_resident_models_logits() {
-    let overlapped = crate::offload::overlap::with(true, || {
-        crate::offload::test_overlap::with_any_read(offloaded_matches_resident)
+    // Build-ahead decode leaves the overlap out (its flag says so), and the flags matrix
+    // switches both on: pin it off, since the overlapped path is what this test is for.
+    let overlapped = super::model::build_ahead::with(false, || {
+        crate::offload::overlap::with(true, || {
+            crate::offload::test_overlap::with_any_read(offloaded_matches_resident)
+        })
     });
     assert!(overlapped > 0, "no call took the overlapped path");
 }
@@ -337,8 +341,12 @@ fn offloaded_experts_match_the_resident_model_for_every_call_size() {
 /// their reads, the rest take the plain path, and the logits stay the resident model's.
 #[test]
 fn overlapped_reads_match_the_resident_model_for_every_call_size() {
-    let overlapped = crate::offload::overlap::with(true, || {
-        crate::offload::test_overlap::with_any_read(every_call_size_matches_resident)
+    // Build-ahead decode leaves the overlap out (its flag says so), and the flags matrix
+    // switches both on: pin it off, since the overlapped path is what this test is for.
+    let overlapped = super::model::build_ahead::with(false, || {
+        crate::offload::overlap::with(true, || {
+            crate::offload::test_overlap::with_any_read(every_call_size_matches_resident)
+        })
     });
     assert!(overlapped > 0, "no call took the overlapped path");
 }

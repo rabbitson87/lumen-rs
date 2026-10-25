@@ -33,7 +33,8 @@ use super::slot_map::{ExpertKey, Slot};
 
 lumen_flags::flag! {
     /// Which resident expert the SSD expert pool evicts when it is full, for Flash-Next style
-    /// expert offload. Unset and `0` mean `bias` (the default); `clock` is plain CLOCK. `gclock` is CLOCK with a
+    /// expert offload. Unset and `0` mean `bias` (the default); `clock` is plain CLOCK, and so is
+    /// `1` (the flag switched on, as the flags matrix does: the policy before `bias`). `gclock` is CLOCK with a
     /// 2-bit hit counter in place of the reference bit, and loads start at zero. `bias` keeps a
     /// decayed hit count per expert and a per-layer table of which experts followed which at the
     /// previous token, and evicts the sampled expert it expects least. In trace-driven
@@ -75,7 +76,9 @@ impl EvictionKind {
     pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
         match raw.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") => Ok(Self::default()),
-            Some("clock") => Ok(Self::Clock),
+            // A bare "on" is the alternate the flags matrix flips to; it means
+            // the policy `bias` replaced, so the matrix runs the suite on it.
+            Some("clock" | "1" | "true" | "on" | "yes") => Ok(Self::Clock),
             Some("gclock") => Ok(Self::GClock),
             Some("bias") => Ok(Self::Bias),
             Some(other) => bail!("{EVICTION_ENV}={other:?} is not `clock`, `gclock` or `bias`"),
@@ -659,7 +662,10 @@ mod tests {
         assert_eq!(ok(Some(" Clock ")), EvictionKind::Clock);
         assert_eq!(ok(Some("gclock")), EvictionKind::GClock);
         assert_eq!(ok(Some("BIAS")), EvictionKind::Bias);
-        for bad in ["lru", "1", "bias,gclock", "gclock2"] {
+        // The flags matrix switches every Optimization flag on with `1`: that
+        // has to run a policy (the one `bias` replaced), not fail every load.
+        assert_eq!(ok(Some("1")), EvictionKind::Clock);
+        for bad in ["lru", "2", "bias,gclock", "gclock2"] {
             assert!(EvictionKind::parse(Some(bad)).is_err(), "{bad:?}");
         }
         assert_eq!(EvictionKind::default(), EvictionKind::Bias);

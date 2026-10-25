@@ -327,7 +327,8 @@ Leave a rollback point at each chat turn's conversation boundary, so
 *Optimization, default off.*
 
 Which resident expert the SSD expert pool evicts when it is full, for Flash-Next style
- expert offload. Unset and `0` mean `bias` (the default); `clock` is plain CLOCK. `gclock` is CLOCK with a
+ expert offload. Unset and `0` mean `bias` (the default); `clock` is plain CLOCK, and so is
+ `1` (the flag switched on, as the flags matrix does: the policy before `bias`). `gclock` is CLOCK with a
  2-bit hit counter in place of the reference bit, and loads start at zero. `bias` keeps a
  decayed hit count per expert and a per-layer table of which experts followed which at the
  previous token, and evicts the sampled expert it expects least. In trace-driven
