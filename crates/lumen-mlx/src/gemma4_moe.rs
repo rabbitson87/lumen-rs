@@ -1696,6 +1696,23 @@ pub(crate) mod imp {
             Ok((metas, records))
         }
 
+        /// The kind each layer's cache is stored as on disk (what
+        /// [`Self::to_disk_records`] tags it with), in layer order. Two caches
+        /// with the same tags can stand in for each other.
+        pub fn kind_tags(&self) -> Vec<LayerKindTag> {
+            self.layers
+                .iter()
+                .map(|l| match l {
+                    NativeGemma4LayerCache::Full(_) => LayerKindTag::Full,
+                    NativeGemma4LayerCache::Sliding(_) => LayerKindTag::Sliding,
+                    NativeGemma4LayerCache::FullQuantized(_) => LayerKindTag::FullQuantized,
+                    NativeGemma4LayerCache::SlidingQuantized(_) => LayerKindTag::SlidingQuantized,
+                    NativeGemma4LayerCache::SlidingTurboquant(_) => LayerKindTag::SlidingTurboquant,
+                    NativeGemma4LayerCache::FullTurboquant(_) => LayerKindTag::FullTurboquant,
+                })
+                .collect()
+        }
+
         /// Inverse of [`Self::to_disk_records`]. Rebuilds the layer vector from
         /// the persisted metadata + record blob. Layer kinds + geometry come
         /// from `metas` (written by the same model — guarded by the disk-store
@@ -6164,12 +6181,25 @@ pub(crate) mod imp {
             input_ids: &[u32],
             cache: &mut NativeGemma4PromptCache,
         ) -> Result<Array> {
-            if input_ids.is_empty() {
-                return Err(anyhow!("forward_last_token_chunked: empty input_ids"));
-            }
             let chunk = self
                 .prefill_chunk_decision(cache.offset() + input_ids.len())
                 .chunk;
+            self.forward_last_token_chunked_by(input_ids, cache, chunk)
+        }
+
+        /// [`Self::forward_last_token_chunked`] in chunks of `chunk` tokens,
+        /// counted from the cache's offset: a feed split in two at a multiple
+        /// of `chunk` past that offset runs the very chunks one call would.
+        pub fn forward_last_token_chunked_by(
+            &self,
+            input_ids: &[u32],
+            cache: &mut NativeGemma4PromptCache,
+            chunk: usize,
+        ) -> Result<Array> {
+            if input_ids.is_empty() {
+                return Err(anyhow!("forward_last_token_chunked: empty input_ids"));
+            }
+            let chunk = chunk.max(1);
             let report = prefill_chunk_log::get();
             let n_chunks = input_ids.len().div_ceil(chunk);
             let mut chunks = input_ids.chunks(chunk).enumerate().peekable();

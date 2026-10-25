@@ -222,8 +222,8 @@ fn a_failed_put_does_not_corrupt_the_byte_accounting() {
 /// assertion below records that as the deliberate ordering it is — the payload
 /// must land before it is advertised, and the alternative (advertise first)
 /// would let a reader chase an entry whose file does not exist. The orphan is
-/// bounded: `get` on an unknown key is a plain miss, and the file is
-/// overwritten the next time the same key is stored.
+/// bounded: `get` on an unknown key is a plain miss, and the next open deletes
+/// the file, since no index row leads to it.
 #[test]
 fn a_failed_index_write_is_reported_and_orphans_at_most_the_payload() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -249,6 +249,10 @@ fn a_failed_index_write_is_reported_and_orphans_at_most_the_payload() {
     );
     assert_eq!(reopened.len(), 0);
     assert_eq!(reopened.total_bytes(), 0);
+    assert!(
+        !dir.join("k.lkv").exists(),
+        "the payload no index row leads to must not keep its space"
+    );
 
     // Storing the same key again must succeed once the obstruction is gone and
     // must not be confused by the orphaned payload.

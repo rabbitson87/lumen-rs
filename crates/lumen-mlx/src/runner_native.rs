@@ -1790,15 +1790,16 @@ mod imp {
             let t_write = std::time::Instant::now();
             disk.put(&key, &manifest, &records)?;
             // This state holds everything the one this seq wrote (or was
-            // restored from) before it did, so that entry is now dead weight.
-            // The writer thread runs the delete after the write above.
+            // restored from) before it did, so that entry is now dead weight
+            // — once this one is on the disk. A write the disk refuses keeps
+            // the older state (see `DiskKvStore::supersede`).
             let superseded = self
                 .seqs
                 .get_mut(&seq_id)
                 .and_then(|s| s.persisted_key.replace(key.clone()))
                 .filter(|old| *old != key);
             if let Some(old) = superseded {
-                disk.remove(&old)?;
+                disk.supersede(&old, &key)?;
             }
             eprintln!(
                 "[mlx] kv-disk: point at {} = {:.0} MB (readback {read_ms:.0} ms, write {:.0} ms)",

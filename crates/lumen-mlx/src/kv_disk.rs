@@ -508,6 +508,15 @@ struct DiskEntry {
     bytes: u64,
     last_access_unix: u64,
     hits: u64,
+    /// The background write that makes this entry's file, until the writer
+    /// reports it landed (see [`DiskKvStore::reconcile`]). In memory only.
+    #[serde(skip)]
+    pending: Option<u64>,
+    /// The entry that replaces this one once its file is on the disk (see
+    /// [`DiskKvStore::supersede`]). Kept in the index, so a process that stops
+    /// before the replacement lands leaves the decision to the next open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -535,6 +544,13 @@ pub struct DiskKvStore {
     /// thread so a request never waits on the disk (see
     /// [`Self::write_in_background`]).
     writer: Option<FileWriter>,
+    /// How files are created: the filesystem, or in a test a disk that fills up.
+    create: CreateFile,
+    /// What the writer thread reports back: which writes landed, and the
+    /// failures of a disk that stopped taking them.
+    report: std::sync::Arc<std::sync::Mutex<WriterReport>>,
+    /// Number of the last write handed to the writer thread.
+    last_seq: u64,
 }
 
 impl DiskKvStore {
@@ -559,22 +575,49 @@ impl DiskKvStore {
             fingerprint,
             index,
             writer: None,
+            create: real_files(),
+            report: Default::default(),
+            last_seq: 0,
         };
         // Drop entries that expired while the process was down, and whatever a
         // process that died mid-write left behind: half-written temp files,
-        // and index rows whose file never landed.
+        // index rows whose file never landed, and files whose index row never
+        // did (no key leads to them, so they would only take the space).
         let mut changed = store.prune_ttl();
-        if let Ok(dir) = fs::read_dir(&store.dir) {
-            for e in dir.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".lkv.tmp") {
-                    let _ = fs::remove_file(e.path());
-                }
-            }
-        }
         let before = store.index.entries.len();
         let dir = store.dir.clone();
         store.index.entries.retain(|e| dir.join(&e.file).exists());
         changed |= store.index.entries.len() != before;
+        // A replacement that landed retires the entry it supersedes; one that
+        // never did leaves it be.
+        let listed: std::collections::HashSet<String> =
+            store.index.entries.iter().map(|e| e.key.clone()).collect();
+        let before = store.index.entries.len();
+        store.index.entries.retain_mut(|e| match &e.superseded_by {
+            Some(k) if listed.contains(k) => false,
+            Some(_) => {
+                e.superseded_by = None;
+                changed = true;
+                true
+            }
+            None => true,
+        });
+        changed |= store.index.entries.len() != before;
+        if let Ok(files) = fs::read_dir(&store.dir) {
+            let listed: std::collections::HashSet<&str> = store
+                .index
+                .entries
+                .iter()
+                .map(|e| e.file.as_str())
+                .collect();
+            for e in files.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let unlisted = name.ends_with(".lkv") && !listed.contains(name.as_str());
+                if name.ends_with(".tmp") || unlisted {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
         if changed {
             let _ = store.save_index();
         }
@@ -587,20 +630,39 @@ impl DiskKvStore {
     /// finishes the queued writes first.
     pub fn write_in_background(&mut self) -> Result<()> {
         if self.writer.is_none() {
-            self.writer = Some(FileWriter::spawn()?);
+            self.writer = Some(FileWriter::spawn(self.create.clone(), self.report.clone())?);
         }
         Ok(())
     }
 
+    /// Tests: create files through `create` (a disk that fills up) from now on.
+    /// Call before [`Self::write_in_background`], whose thread keeps the opener
+    /// it started with.
+    #[cfg(test)]
+    fn set_create_for_test(&mut self, create: CreateFile) {
+        assert!(
+            self.writer.is_none(),
+            "set the opener before the writer starts"
+        );
+        self.create = create;
+    }
+
     /// Write `bytes` to `path` through a temp file and a rename, so a reader
     /// never sees a partial file — inline, or queued on the background thread.
-    fn write_file(&self, path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    /// Returns the number of a queued write, whose outcome the writer reports.
+    fn write_file(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<Option<u64>> {
         match &self.writer {
             Some(w) => {
-                w.submit(FileJob::Write { path, bytes });
-                Ok(())
+                self.last_seq += 1;
+                let seq = self.last_seq;
+                w.submit(FileJob::Write {
+                    path,
+                    bytes,
+                    seq: Some(seq),
+                });
+                Ok(Some(seq))
             }
-            None => write_via_tmp(&path, &bytes),
+            None => write_via_tmp(&self.create, &path, &bytes).map(|()| None),
         }
     }
 
@@ -679,15 +741,22 @@ impl DiskKvStore {
         }
     }
 
+    /// Write the index through a temp file and a rename — on the background
+    /// thread when it runs, after the payload writes queued before it.
     fn save_index(&self) -> Result<()> {
         let path = Self::index_path(&self.dir);
         let bytes = serde_json::to_vec(&self.index).context("kv_disk: serialize index")?;
-        // Atomic-ish: write to temp then rename.
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &bytes).with_context(|| format!("kv_disk: write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("kv_disk: rename index {}", path.display()))?;
-        Ok(())
+        match &self.writer {
+            Some(w) => {
+                w.submit(FileJob::Write {
+                    path,
+                    bytes,
+                    seq: None,
+                });
+                Ok(())
+            }
+            None => write_via_tmp(&self.create, &path, &bytes),
+        }
     }
 
     /// Sanitize a cache key into a filesystem-safe basename. Keys are typically
@@ -709,6 +778,7 @@ impl DiskKvStore {
     /// Persist a snapshot under `key`, replacing any existing entry. Evicts LRU
     /// victims afterward to honor the byte budget.
     pub fn put(&mut self, key: &str, manifest: &KvManifest, records: &[ArrayRecord]) -> Result<()> {
+        self.reconcile();
         let file = Self::file_for(key);
         let path = self.dir.join(&file);
 
@@ -716,7 +786,7 @@ impl DiskKvStore {
         write_lkv(&mut buf, manifest, records)?;
         let bytes = buf.len() as u64;
 
-        self.write_file(path, buf)?;
+        let pending = self.write_file(path, buf)?;
 
         let now = now_unix();
         self.prune_ttl();
@@ -727,6 +797,8 @@ impl DiskKvStore {
             bytes,
             last_access_unix: now,
             hits: 0,
+            pending,
+            superseded_by: None,
         });
 
         self.evict_to_fit()?;
@@ -737,13 +809,20 @@ impl DiskKvStore {
     /// Whether `key` is in the index. Reads no file, so probing many
     /// candidate keys (see [`point_key`]) costs nothing per miss.
     pub fn contains(&self, key: &str) -> bool {
-        self.index.entries.iter().any(|e| e.key == key)
+        let report = lock(&self.report);
+        self.index.entries.iter().any(|e| {
+            e.key == key
+                && !e
+                    .pending
+                    .is_some_and(|seq| report.outcomes.contains(&(seq, false)))
+        })
     }
 
     /// Mark `key` as used now, so the last-access TTL and the LRU budget keep an
     /// entry that is read from memory instead of from here. Returns whether the
     /// key is stored. Reads no file.
     pub fn touch(&mut self, key: &str) -> Result<bool> {
+        self.reconcile();
         let Some(e) = self.index.entries.iter_mut().find(|e| e.key == key) else {
             return Ok(false);
         };
@@ -756,6 +835,7 @@ impl DiskKvStore {
     /// mismatch, or on a corrupt/unreadable file (treated as a miss, never a
     /// crash). Bumps the entry's access time + hit count on success.
     pub fn get(&mut self, key: &str) -> Result<Option<(KvManifest, Vec<ArrayRecord>)>> {
+        self.reconcile();
         let Some(pos) = self.index.entries.iter().position(|e| e.key == key) else {
             return Ok(None);
         };
@@ -798,22 +878,111 @@ impl DiskKvStore {
 
     /// Remove a single entry (file + index row). Missing file is not an error.
     pub fn remove(&mut self, key: &str) -> Result<()> {
-        if let Some(pos) = self.index.entries.iter().position(|e| e.key == key) {
-            let path = self.dir.join(&self.index.entries[pos].file);
-            self.delete_file(path);
-            self.index.entries.remove(pos);
+        self.reconcile();
+        if self.drop_entry(key) {
             self.save_index()?;
         }
         Ok(())
     }
 
+    /// Remove `key`'s row and queue the deletion of its file; whether it was
+    /// there. Does not save the index.
+    fn drop_entry(&mut self, key: &str) -> bool {
+        let Some(pos) = self.index.entries.iter().position(|e| e.key == key) else {
+            return false;
+        };
+        let e = self.index.entries.remove(pos);
+        self.delete_file(self.dir.join(&e.file));
+        true
+    }
+
+    /// `newer` holds everything `older` does (a later state of the same
+    /// conversation), so `older` goes — but only once `newer` is on the disk.
+    /// At once when it already is; when its background write is still queued,
+    /// after the writer reports it landed. If that write fails (a full disk),
+    /// `older` stays: the last state that made it to the disk is kept rather
+    /// than losing both. A `newer` that is not stored at all keeps `older` too.
+    pub fn supersede(&mut self, older: &str, newer: &str) -> Result<()> {
+        self.reconcile();
+        if older == newer {
+            return Ok(());
+        }
+        match self.index.entries.iter().find(|e| e.key == newer) {
+            None => Ok(()),
+            Some(e) if e.pending.is_none() => self.remove(older),
+            Some(_) => {
+                let Some(e) = self.index.entries.iter_mut().find(|e| e.key == older) else {
+                    return Ok(());
+                };
+                e.superseded_by = Some(newer.to_string());
+                self.save_index()
+            }
+        }
+    }
+
+    /// Apply what the writer thread reported since the last call. A write
+    /// that failed (a full disk) loses its index row, which would otherwise
+    /// read as a miss forever, count against the byte budget and stop the key
+    /// from being written again; the file it would have replaced, if any,
+    /// goes too, since no row leads to it any more. A write that landed lets
+    /// the entries it supersedes go.
+    fn reconcile(&mut self) {
+        let outcomes = std::mem::take(&mut lock(&self.report).outcomes);
+        let mut changed = false;
+        for (seq, landed) in outcomes {
+            let Some(pos) = self
+                .index
+                .entries
+                .iter()
+                .position(|e| e.pending == Some(seq))
+            else {
+                continue;
+            };
+            let key = self.index.entries[pos].key.clone();
+            if landed {
+                self.index.entries[pos].pending = None;
+            } else {
+                changed |= self.drop_entry(&key);
+            }
+            let retired: Vec<String> = self
+                .index
+                .entries
+                .iter_mut()
+                .filter(|e| e.superseded_by.as_deref() == Some(key.as_str()))
+                .filter_map(|e| {
+                    if landed {
+                        Some(e.key.clone())
+                    } else {
+                        e.superseded_by = None;
+                        None
+                    }
+                })
+                .collect();
+            changed |= !landed;
+            for older in retired {
+                changed |= self.drop_entry(&older);
+            }
+        }
+        if changed {
+            let _ = self.save_index();
+        }
+    }
+
     /// Drop all entries and their files.
     pub fn clear(&mut self) -> Result<()> {
+        self.reconcile();
         for e in std::mem::take(&mut self.index.entries) {
             self.delete_file(self.dir.join(&e.file));
         }
         self.save_index()?;
         Ok(())
+    }
+
+    /// Tests: `(writes failed since the last one that landed, lines logged)`.
+    #[cfg(test)]
+    fn write_report_for_test(&self) -> (u64, u64) {
+        let r = lock(&self.report);
+        (r.failing, r.lines)
     }
 
     /// Evict least-recently-used entries until under the byte budget.
@@ -843,12 +1012,85 @@ impl DiskKvStore {
     }
 }
 
-/// Write `bytes` to `<path>.tmp`, then rename it onto `path`.
-fn write_via_tmp(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("lkv.tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("kv_disk: write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("kv_disk: rename {}", path.display()))?;
-    Ok(())
+/// Opens a file for writing: the store's only way of putting bytes on the disk,
+/// so a test can stand in a disk that fills up part-way through a file.
+type CreateFile =
+    std::sync::Arc<dyn Fn(&Path) -> std::io::Result<Box<dyn Write + Send>> + Send + Sync>;
+
+/// The filesystem.
+fn real_files() -> CreateFile {
+    std::sync::Arc::new(|p| Ok(Box::new(fs::File::create(p)?) as Box<dyn Write + Send>))
+}
+
+/// Write `bytes` to `<path>.tmp`, then rename it onto `path`, so a reader
+/// never sees a partial file. A write that fails — a full disk stops it
+/// part-way — takes its temp file with it rather than leave the space taken
+/// until the next open.
+fn write_via_tmp(create: &CreateFile, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.flush()
+        })
+        .with_context(|| format!("kv_disk: write {}", tmp.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, path).with_context(|| format!("kv_disk: rename {}", path.display()))
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// What a store's writer thread reports back to it.
+#[derive(Default)]
+struct WriterReport {
+    /// `(write, landed)` for every numbered write since the store last looked.
+    outcomes: Vec<(u64, bool)>,
+    /// Writes failed since the last one that landed. A full disk fails every
+    /// write, so only the first failure of a run is logged, and the line that
+    /// says writes land again gives the count.
+    failing: u64,
+    /// Lines logged about failing writes.
+    lines: u64,
+}
+
+impl WriterReport {
+    fn note(&mut self, seq: Option<u64>, result: &Result<()>) {
+        if let Some(seq) = seq {
+            self.outcomes.push((seq, result.is_ok()));
+        }
+        match result {
+            Ok(()) if self.failing > 0 => {
+                eprintln!(
+                    "[kv-disk] writes land again ({} failed before this one)",
+                    self.failing
+                );
+                self.failing = 0;
+                self.lines += 1;
+            }
+            Ok(()) => {}
+            Err(e) => {
+                if self.failing == 0 {
+                    eprintln!(
+                        "[kv-disk] write failed, so that state is not kept on disk: {e:#}. \
+                         Serving goes on; further failures are counted, not logged, until a \
+                         write lands again"
+                    );
+                    self.lines += 1;
+                }
+                self.failing += 1;
+            }
+        }
+    }
+}
+
+/// `m`'s guard, whether or not a holder panicked (the data is counters).
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// File jobs submitted to any store's writer thread and not finished yet.
@@ -887,7 +1129,12 @@ pub fn drain_writes(timeout: std::time::Duration) -> bool {
 
 /// A file mutation queued for a store's writer thread.
 enum FileJob {
-    Write { path: PathBuf, bytes: Vec<u8> },
+    /// `seq` numbers a payload write, whose outcome goes back to the store.
+    Write {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        seq: Option<u64>,
+    },
     Remove(PathBuf),
 }
 
@@ -900,21 +1147,22 @@ struct FileWriter {
 }
 
 impl FileWriter {
-    fn spawn() -> Result<Self> {
+    fn spawn(
+        create: CreateFile,
+        report: std::sync::Arc<std::sync::Mutex<WriterReport>>,
+    ) -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<FileJob>();
         let handle = std::thread::Builder::new()
             .name("lumen-kv-disk-writer".into())
             .spawn(move || {
                 for job in rx {
                     match job {
-                        FileJob::Write { path, bytes } => {
-                            if let Err(e) = write_via_tmp(&path, &bytes) {
-                                // The index already lists the entry; a missing
-                                // file reads as a miss and is dropped on the
-                                // next open.
-                                eprintln!("[kv-disk] background write failed: {e:#}");
-                                let _ = fs::remove_file(path.with_extension("lkv.tmp"));
-                            }
+                        FileJob::Write { path, bytes, seq } => {
+                            // A failed write leaves nothing behind (see
+                            // `write_via_tmp`); the store drops its row when it
+                            // reads the report.
+                            let result = write_via_tmp(&create, &path, &bytes);
+                            lock(&report).note(seq, &result);
                         }
                         FileJob::Remove(path) => {
                             let _ = fs::remove_file(path);
@@ -1138,8 +1386,9 @@ pub fn open_store_from_env(identity: &str, log_tag: &str) -> Option<DiskKvStore>
 
 /// L2 spill trigger (opt-in via `LUMEN_KV_SPILL_MEM_GB`): true when MLX active
 /// memory exceeds the configured GB threshold, so the caller should drop cold
-/// in-memory prefix snapshots (which are already persisted to disk and will
-/// rehydrate on next access) to relieve pressure. `0` / unset disables spill.
+/// in-memory prefix snapshots to relieve pressure; a prompt that needed one
+/// resumes from whatever state the disk tier holds for it. `0` / unset
+/// disables spill.
 #[cfg(feature = "mlx-native")]
 pub fn under_memory_pressure() -> bool {
     let thr_gb = std::env::var("LUMEN_KV_SPILL_MEM_GB")
@@ -1778,6 +2027,365 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // --- A full disk (ENOSPC part-way through a file) ---
+
+    /// A disk with `room` bytes left: a write that does not fit puts what fits
+    /// on the disk and then fails with ENOSPC, as a real full disk does, and
+    /// the space comes back when the failed file goes (the store deletes it).
+    fn disk_with_room(room: std::sync::Arc<std::sync::atomic::AtomicU64>) -> CreateFile {
+        struct Filling {
+            file: fs::File,
+            room: std::sync::Arc<std::sync::atomic::AtomicU64>,
+            written: u64,
+            failed: bool,
+        }
+        impl Write for Filling {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                use std::sync::atomic::Ordering::SeqCst;
+                let left = self.room.load(SeqCst).min(buf.len() as u64) as usize;
+                if left == 0 && !buf.is_empty() {
+                    self.failed = true;
+                    return Err(std::io::Error::from_raw_os_error(28)); // ENOSPC
+                }
+                let n = self.file.write(&buf[..left])?;
+                self.room.fetch_sub(n as u64, SeqCst);
+                self.written += n as u64;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        impl Drop for Filling {
+            fn drop(&mut self) {
+                if self.failed {
+                    self.room
+                        .fetch_add(self.written, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        std::sync::Arc::new(move |p| {
+            Ok(Box::new(Filling {
+                file: fs::File::create(p)?,
+                room: room.clone(),
+                written: 0,
+                failed: false,
+            }) as Box<dyn Write + Send>)
+        })
+    }
+
+    /// File names in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The server's mode (writes on the background thread) on a disk that
+    /// fills up. Writes the disk refuses are given up: nothing truncated is
+    /// left on the disk or in the index, the snapshot they would have replaced
+    /// survives, and the store keeps serving — reads at once, writes as soon
+    /// as there is room again. A restart then finds exactly what landed.
+    #[test]
+    fn a_full_disk_gives_up_the_write_and_keeps_serving() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fp-abc123");
+        let m = sample_manifest();
+        let rec = |v: f32| vec![f32_record(&[1, 2, 2, 4], v)];
+        let room = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let drained = || assert!(drain_writes(std::time::Duration::from_secs(30)));
+
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.set_create_for_test(disk_with_room(room.clone()));
+        store.write_in_background().unwrap();
+        store.put("kept", &m, &rec(1.0)).unwrap();
+        drained();
+        let kept_bytes = store.total_bytes();
+
+        // The disk fills: less room than one snapshot. Queued, so `put` says
+        // nothing; a newer state of the same conversation supersedes `kept`
+        // the way the runners do it.
+        room.store(100, SeqCst);
+        store.put("lost", &m, &rec(2.0)).unwrap();
+        store.put("newer", &m, &rec(3.0)).unwrap();
+        store.supersede("kept", "newer").unwrap();
+        drained();
+
+        // Every broken promise at once, not just the first.
+        let mut broken = Vec::new();
+        let names = names_in(&dir);
+        if names.iter().any(|n| n.ends_with(".tmp")) {
+            broken.push(format!(
+                "a half-written file was left on a full disk: {names:?}"
+            ));
+        }
+        for k in ["lost", "newer"] {
+            if names.contains(&DiskKvStore::file_for(k)) {
+                broken.push(format!("{k}: a refused write left a file: {names:?}"));
+            }
+            if store.contains(k) {
+                broken.push(format!("{k}: a refused write is still listed"));
+            }
+            if store.get(k).unwrap().is_some() {
+                broken.push(format!("{k}: served"));
+            }
+        }
+        if store.get("kept").unwrap().map(|(_, r)| r) != Some(rec(1.0)) {
+            broken.push(
+                "the last state that reached the disk was deleted for one that never did".into(),
+            );
+        }
+        if store.len() != 1 {
+            broken.push(format!("{} entries listed, 1 on the disk", store.len()));
+        }
+        if store.total_bytes() != kept_bytes {
+            broken.push(format!(
+                "refused writes count against the budget: {} bytes listed, {kept_bytes} on the disk",
+                store.total_bytes()
+            ));
+        }
+        assert!(broken.is_empty(), "{broken:#?}");
+        let (failing, lines) = store.write_report_for_test();
+        assert!(failing >= 2, "{failing} failed writes counted");
+        assert_eq!(lines, 1, "a full disk must be logged once, not per write");
+
+        // Room again: writes land, and a newer state now does replace `kept`.
+        room.store(u64::MAX, SeqCst);
+        store.put("after", &m, &rec(4.0)).unwrap();
+        store.supersede("kept", "after").unwrap();
+        drained();
+        assert_eq!(store.get("after").unwrap().map(|(_, r)| r), Some(rec(4.0)));
+        assert!(store.get("kept").unwrap().is_none());
+        assert_eq!(
+            store.write_report_for_test(),
+            (0, 2),
+            "one more line: writes land again"
+        );
+        drop(store);
+
+        // A restart: the index and the files agree, and hold what landed.
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("after").unwrap().map(|(_, r)| r), Some(rec(4.0)));
+        assert_eq!(
+            names_in(&dir),
+            vec![DiskKvStore::file_for("after"), "index.json".to_string()]
+        );
+    }
+
+    /// The full disk for real: an 8 MB APFS volume mounted from a file (no root
+    /// needed). APFS fails a `write` part-way with ENOSPC and gives the space
+    /// back when the file goes, which is what `disk_with_room` models, and the
+    /// store behaves the same: the write is given up and leaves nothing behind,
+    /// the state it would have replaced is served, and writes that fit go on.
+    #[test]
+    #[ignore = "mounts a disk image with hdiutil: macOS, outside a sandbox"]
+    fn a_real_full_volume_gives_up_the_write_and_keeps_serving() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let (img, mnt) = (tmp.path().join("kv.dmg"), tmp.path().join("mnt"));
+        fs::create_dir(&mnt).unwrap();
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            assert!(
+                Command::new("hdiutil")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "hdiutil {args:?}"
+            );
+        };
+        let os = |s: &'static str| std::ffi::OsStr::new(s);
+        hdiutil(&[
+            os("create"),
+            os("-quiet"),
+            os("-size"),
+            os("8m"),
+            os("-fs"),
+            os("APFS"),
+            img.as_os_str(),
+        ]);
+        hdiutil(&[
+            os("attach"),
+            os("-quiet"),
+            os("-nobrowse"),
+            os("-noverify"),
+            os("-mountpoint"),
+            mnt.as_os_str(),
+            img.as_os_str(),
+        ]);
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let _detach = Detach(mnt.clone());
+        let drained = || assert!(drain_writes(std::time::Duration::from_secs(30)));
+        let m = sample_manifest();
+        let small = vec![f32_record(&[1, 2, 2, 4], 1.0)];
+        let big = vec![f32_record(&[1, 1024, 1024, 4], 0.0)]; // 16 MB: more than the volume
+        let dir = mnt.join("fp-abc123");
+
+        let mut store = DiskKvStore::open(&mnt, "fp-abc123", 0, 0).unwrap();
+        store.write_in_background().unwrap();
+        store.put("kept", &m, &small).unwrap();
+        drained();
+        store.put("big", &m, &big).unwrap();
+        store.supersede("kept", "big").unwrap();
+        drained();
+        assert!(
+            !store.contains("big"),
+            "a write the volume refused is listed"
+        );
+        assert!(store.get("big").unwrap().is_none());
+        assert_eq!(
+            store.get("kept").unwrap().map(|(_, r)| r),
+            Some(small.clone())
+        );
+        drained(); // the reads queued index writes
+        assert_eq!(
+            names_in(&dir),
+            vec!["index.json".to_string(), DiskKvStore::file_for("kept")]
+        );
+        // The payload failed and the index writes after it landed: one line for
+        // the failure, one for writes landing again.
+        assert_eq!(store.write_report_for_test(), (0, 2));
+        store.put("after", &m, &small).unwrap();
+        drained();
+        assert!(store.get("after").unwrap().is_some());
+        drop(store);
+
+        let store = DiskKvStore::open(&mnt, "fp-abc123", 0, 0).unwrap();
+        assert_eq!(store.len(), 2);
+        assert_eq!(
+            names_in(&dir),
+            vec![
+                DiskKvStore::file_for("after"),
+                "index.json".to_string(),
+                DiskKvStore::file_for("kept")
+            ]
+        );
+    }
+
+    /// A server stops right after a turn: the newer state's write is queued
+    /// and the store is never asked again, so only the index records that it
+    /// supersedes the older one. The next open finishes it — retires the older
+    /// state when the newer one is on the disk, and keeps it when the newer
+    /// one never landed.
+    #[test]
+    fn a_supersede_still_pending_at_exit_is_finished_by_the_next_open() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fp-abc123");
+        let m = sample_manifest();
+        let rec = |v: f32| vec![f32_record(&[1, 2, 2, 4], v)];
+        let room = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let session = |steps: &dyn Fn(&mut DiskKvStore)| {
+            let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+            store.set_create_for_test(disk_with_room(room.clone()));
+            store.write_in_background().unwrap();
+            steps(&mut store);
+            // Dropped without another call: the writer finishes its queue.
+        };
+
+        session(&|s| {
+            s.put("a", &m, &rec(1.0)).unwrap();
+            assert!(drain_writes(std::time::Duration::from_secs(30)));
+            s.put("b", &m, &rec(2.0)).unwrap();
+            s.supersede("a", "b").unwrap();
+        });
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(
+            store.len(),
+            1,
+            "the superseded state outlived its replacement"
+        );
+        assert_eq!(store.get("b").unwrap().map(|(_, r)| r), Some(rec(2.0)));
+        assert!(!dir.join("a.lkv").exists());
+        drop(store);
+
+        // Room for the index, not for the newer state.
+        let mut probe = Vec::new();
+        write_lkv(&mut probe, &m, &rec(3.0)).unwrap();
+        room.store(probe.len() as u64 - 1, SeqCst);
+        session(&|s| {
+            s.put("c", &m, &rec(3.0)).unwrap();
+            s.supersede("b", "c").unwrap();
+        });
+        let index = fs::read_to_string(dir.join("index.json")).unwrap();
+        assert!(
+            index.contains("superseded_by"),
+            "the index never recorded the supersede, so this proves nothing: {index}"
+        );
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(
+            store.get("b").unwrap().map(|(_, r)| r),
+            Some(rec(2.0)),
+            "the last state on the disk went for one that never got there"
+        );
+        assert!(!store.contains("c"));
+        assert_eq!(
+            names_in(&dir),
+            vec![DiskKvStore::file_for("b"), "index.json".to_string()]
+        );
+    }
+
+    /// Inline writes (tests, tools) report a full disk to the caller, and the
+    /// half-written temp file does not stay behind taking the space.
+    #[test]
+    fn a_full_disk_fails_an_inline_put_without_leaving_its_temp_file() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fp-abc123");
+        let m = sample_manifest();
+        let records = vec![f32_record(&[1, 2, 2, 4], 1.0)];
+        let room = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        store.set_create_for_test(disk_with_room(room.clone()));
+
+        let err = store.put("k", &m, &records).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("kv_disk: write"), "{msg}");
+        assert!(store.get("k").unwrap().is_none());
+        assert_eq!(names_in(&dir), Vec::<String>::new(), "something was left");
+
+        room.store(u64::MAX, SeqCst);
+        store.put("k", &m, &records).unwrap();
+        assert_eq!(store.get("k").unwrap().map(|(_, r)| r), Some(records));
+    }
+
+    /// A payload whose index row never reached the disk (the index write
+    /// failed, or the process stopped between the two) is unreachable: no key
+    /// leads to it. Opening the store deletes it rather than keep the space.
+    #[test]
+    fn open_deletes_payloads_the_index_does_not_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fp-abc123");
+        let m = sample_manifest();
+        let records = vec![f32_record(&[1, 2, 2, 4], 1.0)];
+        {
+            let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+            store.put("a", &m, &records).unwrap();
+        }
+        fs::copy(dir.join("a.lkv"), dir.join("orphan.lkv")).unwrap();
+        fs::write(dir.join("index.json.tmp"), b"{").unwrap();
+        let mut store = DiskKvStore::open(tmp.path(), "fp-abc123", 0, 0).unwrap();
+        assert_eq!(
+            names_in(&dir),
+            vec!["a.lkv".to_string(), "index.json".to_string()]
+        );
+        assert_eq!(store.get("a").unwrap().map(|(_, r)| r), Some(records));
     }
 
     #[test]

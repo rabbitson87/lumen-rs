@@ -643,10 +643,11 @@ pub(crate) mod imp {
         /// sidecar is missing or the env gate is off.
         correction_table: OnceLock<Option<Arc<CorrectionTable>>>,
         /// L2 disk persistence tier (opt-in via `LUMEN_KV_DISK`). `Some` once a
-        /// model is loaded with the disk tier enabled — boundary prefix
-        /// snapshots are serialized here so they survive process restart /
-        /// in-memory eviction. `None` keeps behaviour byte-identical to the
-        /// in-memory-only path. Fingerprint = sanitized `model_id`.
+        /// model is loaded with the disk tier enabled: it holds the states of
+        /// cold prefills at grid points (see [`restore_grid_head`]), so a
+        /// restart or an evicted snapshot resumes from one instead of
+        /// prefilling everything again, with the tokens a cold run gives.
+        /// `None` keeps behaviour byte-identical to the in-memory-only path.
         disk: Option<DiskKvStore>,
     }
 
@@ -658,6 +659,154 @@ pub(crate) mod imp {
         settings.push(("mlx".into(), crate::kv_disk::mlx_version()));
         let identity = crate::kv_disk::kv_identity(model_id, dir, &settings);
         crate::kv_disk::open_store_from_env(&identity, "gemma4")
+    }
+
+    // ── The disk tier: states a cold prefill passes through ──
+    //
+    // A cold MISS prefills `prompt[..boundary]` (the render of every message
+    // but the last; see `Gemma4Backend::prime_system_snapshot`) in chunks
+    // counted from 0, then the rest of the prompt from the boundary. So the
+    // state after any multiple of the chunk at or below the boundary is the
+    // state every later prompt sharing those tokens reaches on its own cold
+    // MISS — the next turns of the conversation (their boundary only grows)
+    // and other conversations with the same system prompt — and resuming
+    // from it is that cold computation exactly. Those are the only Gemma 4
+    // states written to disk. The snapshots kept in memory sit at the boundary
+    // and before the generation header: cuts no later prompt's cold prefill
+    // makes, so a prompt resumed from them comes out differently from its cold
+    // run (chunked and one-pass prefill agree only to cosine ~0.996 here).
+
+    /// The longest state on `disk` on `prompt`'s grid of `chunk`, at or below
+    /// `boundary`, whose layers are stored as `fresh`'s are (`fresh` is the
+    /// cache this prompt would be prefilled into, so a KV-quantization or
+    /// TurboQuant choice made by prompt length is never crossed). `None` when
+    /// there is none; a damaged or foreign file is a miss, and the store drops
+    /// it.
+    pub(crate) fn restore_grid_head(
+        disk: &mut DiskKvStore,
+        fresh: &NativeGemma4PromptCache,
+        prompt: &[u32],
+        boundary: usize,
+        chunk: usize,
+    ) -> Option<NativeGemma4PromptCache> {
+        let chunk = chunk.max(1);
+        let last = boundary.min(prompt.len()) / chunk * chunk;
+        let kinds = fresh.kind_tags();
+        for at in (chunk..=last).rev().step_by(chunk) {
+            let key = crate::kv_disk::point_key(chunk, &prompt[..at]);
+            if !disk.contains(&key) {
+                continue;
+            }
+            let Ok(Some((manifest, records))) = disk.get(&key) else {
+                continue;
+            };
+            if manifest.position != at
+                || manifest.prefix_tokens != prompt[..at]
+                || !manifest
+                    .layers
+                    .iter()
+                    .map(|m| m.kind)
+                    .eq(kinds.iter().copied())
+            {
+                continue;
+            }
+            match NativeGemma4PromptCache::from_disk_records(&manifest.layers, &records) {
+                Ok(cache) if cache.offset() == at => return Some(cache),
+                Ok(cache) => eprintln!(
+                    "[gemma4] kv-disk: state at {at} holds {} tokens; skipping",
+                    cache.offset()
+                ),
+                Err(e) => {
+                    eprintln!("[gemma4] kv-disk: state at {at} failed to load ({e:#}); skipping")
+                }
+            }
+        }
+        None
+    }
+
+    /// Prefill `prompt[cache.offset()..boundary]` in chunks of `chunk` — the
+    /// chunks one `forward_last_token_chunked` call over it runs — and, with a
+    /// disk tier, write the state at the last multiple of `chunk` it passes
+    /// (see [`restore_grid_head`]). `cache.offset()` is 0 or a restored grid
+    /// point; the last chunk is evaluated.
+    pub(crate) fn prefill_to_boundary(
+        model: &NativeGemma4Model,
+        disk: Option<&mut DiskKvStore>,
+        cache: &mut NativeGemma4PromptCache,
+        prompt: &[u32],
+        boundary: usize,
+        chunk: usize,
+    ) -> Result<()> {
+        let chunk = chunk.max(1);
+        let from = cache.offset();
+        let head = boundary / chunk * chunk;
+        if let Some(disk) = disk
+            && head > from
+            && from.is_multiple_of(chunk)
+        {
+            model
+                .forward_last_token_chunked_by(&prompt[from..head], cache, chunk)
+                .and_then(|logits| Ok(logits.eval()?))?;
+            persist_grid_head(disk, cache, &prompt[..head], chunk);
+        }
+        let at = cache.offset();
+        if at < boundary {
+            model
+                .forward_last_token_chunked_by(&prompt[at..boundary], cache, chunk)
+                .and_then(|logits| Ok(logits.eval()?))?;
+        }
+        Ok(())
+    }
+
+    /// Write `cache`, the cold state after `prefix` on a grid of `chunk`, to
+    /// `disk` under its content key — once: a state the disk holds is only
+    /// marked used. Failures are logged; the disk tier never fails a request.
+    fn persist_grid_head(
+        disk: &mut DiskKvStore,
+        cache: &NativeGemma4PromptCache,
+        prefix: &[u32],
+        chunk: usize,
+    ) {
+        let key = crate::kv_disk::point_key(chunk, prefix);
+        if disk.contains(&key) {
+            let _ = disk.touch(&key);
+            return;
+        }
+        let t = Instant::now();
+        let (layers, records) = match cache.to_disk_records() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[gemma4] kv-disk: state at {} not written: {e:#}",
+                    prefix.len()
+                );
+                return;
+            }
+        };
+        let read_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let manifest = KvManifest {
+            model_fingerprint: disk.fingerprint().to_string(),
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            position: prefix.len(),
+            prefix_tokens: prefix.to_vec(),
+            last_token: None,
+            is_deep: true,
+            layers,
+        };
+        let mb = records.iter().map(|r| r.data.len()).sum::<usize>() as f64 / 1e6;
+        match disk.put(&key, &manifest, &records) {
+            Ok(()) => eprintln!(
+                "[gemma4] kv-disk: state at {} = {mb:.0} MB (readback {read_ms:.0} ms)",
+                prefix.len()
+            ),
+            Err(e) => eprintln!(
+                "[gemma4] kv-disk: state at {} not written: {e:#}",
+                prefix.len()
+            ),
+        }
     }
 
     impl Gemma4Backend {
@@ -1994,29 +2143,9 @@ pub(crate) mod imp {
                     debug_assert_eq!(cache.offset(), lcp);
                     (cache, kind)
                 }
-                None => {
-                    // L2 disk tier: rehydrate a persisted snapshot (survives
-                    // restart / eviction) before paying a cold prefill. Register
-                    // the hit in-mem so later forks this process hit memory.
-                    if let Some((k, cache, prefix_tokens)) = self.load_prefix_from_disk(prompt, key)
-                    {
-                        eprintln!(
-                            "[gemma4] prefix-cache: disk rehydrate key={k:?} prefix={}",
-                            prefix_tokens.len()
-                        );
-                        self.prefix_caches.insert(
-                            k,
-                            Gemma4PrefixCacheEntry {
-                                master: cache.clone(),
-                                prefix_tokens,
-                                last_access: Instant::now(),
-                                hits: 1,
-                            },
-                        );
-                        return (cache, "hit-disk");
-                    }
-                    (self.make_cache_for_prompt_len(prompt.len()), "miss")
-                }
+                // A miss is a cold prefill, which `prime_system_snapshot` may
+                // resume from the disk tier's grid points.
+                None => (self.make_cache_for_prompt_len(prompt.len()), "miss"),
             }
         }
 
@@ -2045,11 +2174,30 @@ pub(crate) mod imp {
             // Chunked like every other prefill, and evaluated before the
             // snapshot is stored: a lazy snapshot only computes when the next
             // request forks it, so a failure there used to leave an entry
-            // every later request with this system prompt reused.
-            self.model
-                .forward_last_token_chunked(&prompt[..boundary], cache)
-                .and_then(|logits| Ok(logits.eval()?))
-                .with_context(|| format!("{route}: prime boundary prefill"))?;
+            // every later request with this system prompt reused. With a disk
+            // tier the prefill starts from the longest cold state it holds on
+            // this grid and leaves the newest one there (see
+            // `restore_grid_head`); either way the result is the cold one.
+            let chunk = self.model.prefill_chunk_decision(boundary).chunk;
+            if cache.offset() == 0
+                && let Some(disk) = self.disk.as_mut()
+                && let Some(restored) = restore_grid_head(disk, cache, prompt, boundary, chunk)
+            {
+                eprintln!(
+                    "[gemma4] prefix-cache: key={key:?} resumed from disk at {} of {boundary}",
+                    restored.offset()
+                );
+                *cache = restored;
+            }
+            prefill_to_boundary(
+                &self.model,
+                self.disk.as_mut(),
+                cache,
+                prompt,
+                boundary,
+                chunk,
+            )
+            .with_context(|| format!("{route}: prime boundary prefill"))?;
             self.save_prefix_snapshot(&Self::sys_key(key), cache, &prompt[..boundary]);
             Ok(())
         }
@@ -2253,50 +2401,21 @@ pub(crate) mod imp {
             // of MB for a multi-k-token prefix).
             self.evict_prefix_cache();
 
-            // L2 disk tier: durably persist this boundary snapshot so a future
-            // process forks it instead of cold-prefilling. This funnel is the
-            // only safe point (`offset == prompt.len()`, pre-decode, no rotation
-            // rollback). Synchronous (durable across restart); no-op when the
-            // disk tier is off; non-fatal + skipped for quantized/TQ layers
-            // (`to_disk_records` errors → dense-only until those are wired).
-            if self.disk.is_some() {
-                match cache.to_disk_records() {
-                    Ok((layers, records)) => {
-                        let created_at_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let fp = self.disk.as_ref().unwrap().fingerprint().to_string();
-                        let manifest = KvManifest {
-                            model_fingerprint: fp,
-                            created_at_unix,
-                            position: prompt.len(),
-                            prefix_tokens: prompt.to_vec(),
-                            last_token: None,
-                            is_deep: true,
-                            layers,
-                        };
-                        if let Err(e) = self.disk.as_mut().unwrap().put(key, &manifest, &records) {
-                            eprintln!("[gemma4] kv-disk persist skipped (key={key:?}): {e:#}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[gemma4] kv-disk persist skipped (key={key:?}): {e:#}");
-                    }
-                }
-                // L2 spill: under memory pressure, drop cold in-memory prefix
-                // snapshots (now durably on disk) to free RAM; they rehydrate via
-                // `prefix_fork`'s disk path on next access. Off unless
-                // `LUMEN_KV_SPILL_MEM_GB` is set.
-                if crate::kv_disk::under_memory_pressure() {
-                    self.spill_prefix_cache(crate::kv_disk::spill_keep_floor());
-                }
+            // These snapshots are not written to disk: their cuts are not ones
+            // a later prompt's cold prefill makes (see `restore_grid_head`).
+            // L2 spill: under memory pressure, drop cold in-memory prefix
+            // snapshots to free RAM; a prompt that needed one resumes from the
+            // disk tier's grid point instead. Off unless `LUMEN_KV_SPILL_MEM_GB`
+            // is set.
+            if self.disk.is_some() && crate::kv_disk::under_memory_pressure() {
+                self.spill_prefix_cache(crate::kv_disk::spill_keep_floor());
             }
         }
 
         /// Drop the coldest in-memory prefix snapshots until at most `keep_n`
-        /// remain (LRU by `last_access`). Spilled entries stay on the disk tier
-        /// and rehydrate via `prefix_fork`'s disk lookup.
+        /// remain (LRU by `last_access`). A prompt that needed a spilled one is
+        /// a miss, resumed from the disk tier's grid point (see
+        /// [`restore_grid_head`]).
         fn spill_prefix_cache(&mut self, keep_n: usize) {
             let before = self.prefix_caches.len();
             while self.prefix_caches.len() > keep_n {
@@ -2313,52 +2432,10 @@ pub(crate) mod imp {
             let after = self.prefix_caches.len();
             if after < before {
                 eprintln!(
-                    "[gemma4] prefix-cache: spilled {} cold snapshot(s) to disk (kept {after})",
+                    "[gemma4] prefix-cache: dropped {} cold snapshot(s) from memory (kept {after})",
                     before - after
                 );
             }
-        }
-
-        /// L2 disk tier: try to rehydrate a persisted boundary snapshot for
-        /// `key` (or its `sys_key`) whose tokens are a STRICT prefix of `prompt`
-        /// (so the forked cache's `offset == prefix_len` with no rotation
-        /// rollback). Picks the longer match. Returns the loaded cache + its
-        /// disk key + prefix tokens, or `None` (disk off / miss / non-prefix /
-        /// corrupt / unsupported layers).
-        fn load_prefix_from_disk(
-            &mut self,
-            prompt: &[u32],
-            key: &str,
-        ) -> Option<(String, NativeGemma4PromptCache, Vec<u32>)> {
-            self.disk.as_ref()?;
-            let candidates = [key.to_string(), Self::sys_key(key)];
-            let mut best: Option<(String, NativeGemma4PromptCache, Vec<u32>)> = None;
-            for k in candidates {
-                let loaded = match self.disk.as_mut().unwrap().get(&k) {
-                    Ok(Some(v)) => v,
-                    _ => continue,
-                };
-                let (manifest, records) = loaded;
-                let plen = manifest.prefix_tokens.len();
-                let is_strict =
-                    plen > 0 && plen < prompt.len() && prompt.starts_with(&manifest.prefix_tokens);
-                if !is_strict {
-                    continue;
-                }
-                if best
-                    .as_ref()
-                    .map(|(_, _, pt)| plen > pt.len())
-                    .unwrap_or(true)
-                {
-                    match NativeGemma4PromptCache::from_disk_records(&manifest.layers, &records) {
-                        Ok(cache) => best = Some((k, cache, manifest.prefix_tokens)),
-                        Err(e) => {
-                            eprintln!("[gemma4] kv-disk rehydrate decode failed (key={k:?}): {e:#}")
-                        }
-                    }
-                }
-            }
-            best
         }
 
         /// Max live prefix-cache entries before LRU eviction (`LUMEN_PREFIX_CACHE_MAX_ENTRIES`,
@@ -4064,6 +4141,304 @@ pub(crate) mod imp {
             let msgs = vec![("user".to_string(), "hi".to_string())];
             let ids = backend.build_chat_input(&msgs, false).expect("build");
             assert_eq!(ids[0], 2, "BOS=2 first");
+        }
+
+        // ───── the disk tier on a tiny random Gemma 4 (no checkpoint needed) ─────
+
+        const TINY_VOCAB: u32 = 512;
+
+        /// A Gemma 4 small enough to build in a test, with the shape of 26B-A4B: two sliding
+        /// layers (window 8, so short prompts rotate the ring) and one full layer with
+        /// `attention_k_eq_v`, a MoE block of 4 experts beside the dense MLP, affine 4-bit
+        /// weights. Random values; only the computation's exactness is asked of it.
+        fn tiny_gemma4() -> (tempfile::TempDir, NativeGemma4Model) {
+            use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
+            use mlx_rs::{Dtype, random};
+            const H: i32 = 128;
+            const HEADS: i32 = 2;
+            const HD: i32 = 64;
+            const GHD: i32 = 128;
+            const INTER: i32 = 128;
+            const MOE: i32 = 64;
+            const E: i32 = 4;
+            let dir = tempfile::tempdir().unwrap();
+            let config = serde_json::json!({
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "model_type": "gemma4",
+                "eos_token_id": [1],
+                "quantization": {"group_size": 32, "bits": 4, "mode": "affine"},
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": H,
+                    "num_hidden_layers": 3,
+                    "num_attention_heads": HEADS,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": HD,
+                    "global_head_dim": GHD,
+                    "vocab_size": TINY_VOCAB,
+                    "rms_norm_eps": 1e-6,
+                    "layer_types": ["sliding_attention", "sliding_attention", "full_attention"],
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 3,
+                    "max_position_embeddings": 4096,
+                    "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1000000.0,
+                            "rope_type": "proportional"
+                        },
+                        "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+                    },
+                    "attention_k_eq_v": true,
+                    "enable_moe_block": true,
+                    "num_experts": E,
+                    "top_k_experts": 2,
+                    "moe_intermediate_size": MOE,
+                    "intermediate_size": INTER,
+                    "final_logit_softcapping": 30.0,
+                    "tie_word_embeddings": true
+                }
+            });
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            random::seed(23).unwrap();
+            let dense = |shape: &[i32], scale: f32| {
+                random::normal::<f32>(shape, None, Some(scale), None)
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+            };
+            let mut w: HashMap<String, mlx_rs::Array> = HashMap::new();
+            let quant = |w: &mut HashMap<String, mlx_rs::Array>, name: String, shape: &[i32]| {
+                let (q, s, b) =
+                    quantize_with_mode(&dense(shape, 0.05), 32, 4, MODE_AFFINE).unwrap();
+                w.insert(format!("{name}.weight"), q);
+                w.insert(format!("{name}.scales"), s);
+                w.insert(format!("{name}.biases"), b.expect("affine has biases"));
+            };
+            let m = "language_model.model";
+            w.insert(
+                format!("{m}.embed_tokens.weight"),
+                dense(&[TINY_VOCAB as i32, H], 0.5),
+            );
+            w.insert(format!("{m}.norm.weight"), dense(&[H], 0.1));
+            for (l, full) in [(0, false), (1, false), (2, true)] {
+                let b = format!("{m}.layers.{l}");
+                let hd = if full { GHD } else { HD };
+                quant(&mut w, format!("{b}.self_attn.q_proj"), &[HEADS * hd, H]);
+                quant(&mut w, format!("{b}.self_attn.k_proj"), &[hd, H]);
+                if !full {
+                    quant(&mut w, format!("{b}.self_attn.v_proj"), &[hd, H]);
+                }
+                quant(&mut w, format!("{b}.self_attn.o_proj"), &[H, HEADS * hd]);
+                for n in ["q_norm", "k_norm"] {
+                    w.insert(format!("{b}.self_attn.{n}.weight"), dense(&[hd], 0.1));
+                }
+                quant(&mut w, format!("{b}.mlp.gate_proj"), &[INTER, H]);
+                quant(&mut w, format!("{b}.mlp.up_proj"), &[INTER, H]);
+                quant(&mut w, format!("{b}.mlp.down_proj"), &[H, INTER]);
+                quant(&mut w, format!("{b}.router.proj"), &[E, H]);
+                w.insert(format!("{b}.router.scale"), dense(&[H], 0.1));
+                w.insert(format!("{b}.router.per_expert_scale"), dense(&[E], 0.1));
+                let x = format!("{b}.experts.switch_glu");
+                quant(&mut w, format!("{x}.gate_proj"), &[E, MOE, H]);
+                quant(&mut w, format!("{x}.up_proj"), &[E, MOE, H]);
+                quant(&mut w, format!("{x}.down_proj"), &[E, H, MOE]);
+                for n in [
+                    "input_layernorm",
+                    "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "pre_feedforward_layernorm_2",
+                    "post_feedforward_layernorm",
+                    "post_feedforward_layernorm_1",
+                    "post_feedforward_layernorm_2",
+                ] {
+                    w.insert(format!("{b}.{n}.weight"), dense(&[H], 0.1));
+                }
+                w.insert(
+                    format!("{b}.layer_scalar"),
+                    mlx_rs::ops::ones::<f32>(&[1])
+                        .unwrap()
+                        .as_dtype(Dtype::Bfloat16)
+                        .unwrap(),
+                );
+            }
+            for a in w.values() {
+                a.eval().unwrap();
+            }
+            mlx_rs::Array::save_safetensors(&w, None, dir.path().join("model.safetensors"))
+                .unwrap();
+            let model = NativeGemma4Model::load(dir.path()).expect("tiny Gemma 4 loads");
+            (dir, model)
+        }
+
+        /// What a prompt comes to after its prime: the state at the boundary, the logits of the
+        /// rest of the prompt fed in one call, then four greedy steps — every byte of it.
+        #[derive(Debug, PartialEq)]
+        struct Outcome {
+            state: Vec<Vec<u8>>,
+            logits: Vec<u8>,
+            steps: Vec<u32>,
+        }
+
+        /// The cold MISS's prime of `prompt` up to `boundary` on a grid of `chunk` — from the
+        /// disk tier when one is given and holds a state on that grid — then the rest. Returns
+        /// where it resumed from and the outcome.
+        fn prime_and_finish(
+            model: &NativeGemma4Model,
+            mut disk: Option<&mut DiskKvStore>,
+            prompt: &[u32],
+            boundary: usize,
+            chunk: usize,
+        ) -> (Option<usize>, Outcome) {
+            use crate::kv_disk::record_from_array;
+            let mut cache = model.make_cache();
+            let mut resumed = None;
+            if let Some(d) = disk.as_deref_mut()
+                && let Some(c) = restore_grid_head(d, &cache, prompt, boundary, chunk)
+            {
+                resumed = Some(c.offset());
+                cache = c;
+            }
+            prefill_to_boundary(model, disk, &mut cache, prompt, boundary, chunk).unwrap();
+            assert_eq!(cache.offset(), boundary);
+            let (_, records) = cache.to_disk_records().unwrap();
+            let state = records.into_iter().map(|r| r.data).collect();
+            let argmax = |l: &mlx_rs::Array| -> u32 {
+                let f = l.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+                f.eval().unwrap();
+                let v = f.as_slice::<f32>();
+                assert!(v.iter().all(|x| x.is_finite()), "the tiny model overflowed");
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap()
+            };
+            let logits = model
+                .forward_last_token(&prompt[boundary..], &mut cache)
+                .unwrap();
+            let bits = record_from_array(&logits).unwrap().data;
+            let mut steps = vec![argmax(&logits)];
+            for _ in 0..4 {
+                let last = *steps.last().unwrap();
+                let l = model.forward_last_token(&[last], &mut cache).unwrap();
+                steps.push(argmax(&l));
+            }
+            (
+                resumed,
+                Outcome {
+                    state,
+                    logits: bits,
+                    steps,
+                },
+            )
+        }
+
+        /// Gemma 4's disk tier holds the states a cold prefill passes through on its grid, so a
+        /// prompt resumed from one comes out as its own cold run, byte for byte: the state at
+        /// the boundary, the logits after it, the greedy steps. Shown for the next turn of the
+        /// conversation after a restart (its boundary is further on; it resumes from turn 1's
+        /// state and leaves its own), for another conversation with the same opening, and for
+        /// the first prompt itself, whose prime is split at the grid point to write it. A
+        /// state that is damaged, or stored with other layer kinds than the prompt's cache, is a
+        /// miss and the prompt is fed cold.
+        #[test]
+        fn a_prompt_resumed_from_a_gemma4_disk_state_is_its_cold_run() {
+            let (_weights, model) = tiny_gemma4();
+            let chunk = 16;
+            let ids = |n: usize, k: u32| -> Vec<u32> {
+                (0..n as u32).map(|i| (i * k + 11) % TINY_VOCAB).collect()
+            };
+            let turn1 = ids(60, 37);
+            let turn2 = ids(140, 37);
+            let sibling: Vec<u32> = turn1[..40].iter().copied().chain(ids(24, 53)).collect();
+            let cold = |p: &[u32], b: usize| prime_and_finish(&model, None, p, b, chunk).1;
+            let (cold1, cold2, cold_sibling) =
+                (cold(&turn1, 40), cold(&turn2, 100), cold(&sibling, 40));
+
+            // Why the snapshots in memory are not written: turn 2 continued from turn 1's
+            // boundary (40, off the grid) is not turn 2's cold run, even on this replica.
+            let mut cache = model.make_cache();
+            prefill_to_boundary(&model, None, &mut cache, &turn1, 40, chunk).unwrap();
+            model
+                .forward_last_token_chunked_by(&turn2[40..100], &mut cache, chunk)
+                .and_then(|l| Ok(l.eval()?))
+                .unwrap();
+            let (_, records) = cache.to_disk_records().unwrap();
+            let off_grid: Vec<Vec<u8>> = records.into_iter().map(|r| r.data).collect();
+            assert!(
+                off_grid != cold2.state,
+                "a cut off the grid left the state bit-identical: the replica cannot tell cuts apart"
+            );
+
+            let root = tempfile::tempdir().unwrap();
+            let open = || DiskKvStore::open(root.path(), "tiny-gemma4", 0, 0).unwrap();
+            let file = |at: usize, p: &[u32]| {
+                root.path().join("tiny-gemma4").join(format!(
+                    "{}.lkv",
+                    crate::kv_disk::point_key(chunk, &p[..at])
+                ))
+            };
+
+            // Turn 1, cold, with the tier on: the prime is split at 32 to write that state, and
+            // the split changes nothing.
+            let mut disk = open();
+            let (resumed, out) = prime_and_finish(&model, Some(&mut disk), &turn1, 40, chunk);
+            assert_eq!((resumed, disk.len()), (None, 1));
+            assert!(file(32, &turn1).exists());
+            assert!(out == cold1, "writing the grid point changed the cold run");
+            drop(disk);
+
+            // A restart, turn 2 (boundary 100): resumed at 32, leaves 96, and is its cold run.
+            let mut disk = open();
+            let (resumed, out) = prime_and_finish(&model, Some(&mut disk), &turn2, 100, chunk);
+            assert_eq!(resumed, Some(32));
+            assert!(
+                file(96, &turn2).exists(),
+                "turn 2 leaves its own grid point"
+            );
+            assert!(out == cold2, "turn 2 resumed from disk is not its cold run");
+            // Another restart: turn 2 again resumes from its own, newer state.
+            let mut disk = open();
+            let (resumed, out) = prime_and_finish(&model, Some(&mut disk), &turn2, 100, chunk);
+            assert_eq!(resumed, Some(96));
+            assert!(out == cold2);
+
+            // Another conversation with the same 40-token opening resumes from turn 1's state.
+            let (resumed, out) = prime_and_finish(&model, Some(&mut disk), &sibling, 40, chunk);
+            assert_eq!(resumed, Some(32));
+            assert!(
+                out == cold_sibling,
+                "the sibling resumed from disk is not its cold run"
+            );
+
+            // A cache of other layer kinds (quantized KV, chosen by prompt length) never takes
+            // a state stored as bf16.
+            let quantized = model.make_cache_with_tq(Some(false), Some(true));
+            assert_ne!(quantized.kind_tags(), model.make_cache().kind_tags());
+            assert!(restore_grid_head(&mut disk, &quantized, &sibling, 40, chunk).is_none());
+            // Another grid is another computation.
+            assert!(restore_grid_head(&mut disk, &model.make_cache(), &sibling, 40, 8).is_none());
+            drop(disk);
+
+            // Damaged on disk: a miss, the file is dropped, and the prompt is fed cold.
+            let f = file(32, &turn1);
+            let mut bytes = std::fs::read(&f).unwrap();
+            let i = bytes.len() / 2;
+            bytes[i] ^= 0x40;
+            std::fs::write(&f, &bytes).unwrap();
+            let mut disk = open();
+            let (resumed, out) = prime_and_finish(&model, Some(&mut disk), &sibling, 40, chunk);
+            assert_eq!(resumed, None, "a damaged state was served");
+            assert!(out == cold_sibling);
+            // The cold prime wrote the state again in the damaged one's place.
+            assert_ne!(std::fs::read(&f).unwrap(), bytes);
+            assert!(
+                disk.get(&crate::kv_disk::point_key(chunk, &sibling[..32]))
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 }

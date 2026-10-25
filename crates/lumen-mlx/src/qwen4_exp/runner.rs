@@ -1226,8 +1226,9 @@ impl Qwen4ExpRunner {
             .get_mut(&seq_id)
             .and_then(|s| s.persisted_key.replace(key.clone()))
             .filter(|old| *old != key);
+        // Dropped once this state is on the disk; a refused write keeps the older one.
         if let Some(old) = superseded {
-            disk.remove(&old)?;
+            disk.supersede(&old, &key)?;
         }
         eprintln!(
             "[qwen4_exp] kv-disk: point at {} = {:.0} MB (readback {read_ms:.0} ms)",
@@ -2797,5 +2798,108 @@ mod tests {
             "another prompt"
         );
         assert!(fresh.load_head(&key, &b).unwrap().is_some());
+    }
+
+    // ───────────── the session's rollback point: on disk, after a restart, damaged ─────────────
+
+    /// The plain-chat path's disk tier. Turn 1 leaves its rollback point at 32 (the 16-token
+    /// grid) and writes it with `persist_point`; a restart's `restore_point` starts turn 2 there,
+    /// and turn 2 continues exactly as its own cold prefill: next token, state byte for byte,
+    /// greedy steps. A state on disk that is cut short, fails its CRC or was written under another
+    /// identity, one from another grid and one the prompt does not continue are all misses — the
+    /// turn is fed cold — and a damaged file is dropped, never served. Resident experts and a pool.
+    #[test]
+    fn a_session_point_from_disk_continues_exactly_and_a_bad_one_is_a_cold_turn() {
+        for budget in [None, Some(1u64)] {
+            session_point_restores_exactly(budget);
+        }
+    }
+
+    fn session_point_restores_exactly(budget: Option<u64>) {
+        let ids = fixture_ids();
+        assert!(ids.len() >= 46);
+        let (turn1, turn2) = (&ids[..40], &ids[..46]);
+        let cold = {
+            let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+            let (next, _) = Runner::prefill(&mut r, 1, turn2).unwrap();
+            (next, state_bytes(&r, 1), decode_some(&mut r, 1, next, 6))
+        };
+        let key = crate::kv_disk::point_key(16, &turn1[..32]);
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 in a process that writes its point under `fingerprint`: the file it leaves.
+        let write_point = |fingerprint: &str| {
+            let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+            r.set_disk_root_for_test(Some(dir.path()), fingerprint);
+            r.feed_with_mark(1, true, turn1, 32)
+                .unwrap()
+                .expect("a mark on the grid");
+            let written = r.persist_point(1, &turn1[..32], 16).unwrap();
+            assert!(
+                !r.persist_point(1, &turn1[..32], 16).unwrap(),
+                "a stored point is not written twice"
+            );
+            (
+                dir.path().join(fingerprint).join(format!("{key}.lkv")),
+                written,
+            )
+        };
+        // A new process on the same disk: where it starts turn 2, and the store's size after.
+        let restart = |fingerprint: &str, chunk: usize, prompt: &[u32]| {
+            let mut r = tiny_runner_with(chunk, MtpMode::Off, budget);
+            r.set_disk_root_for_test(Some(dir.path()), fingerprint);
+            let at = r.restore_point(7, prompt).unwrap();
+            let left = r.disk.as_ref().map_or(0, DiskKvStore::len);
+            (r, at, left)
+        };
+
+        assert!(write_point("tiny").1, "turn 1's point is written");
+        let (mut r, at, _) = restart("tiny", 16, turn2);
+        assert_eq!(at, Some(32), "restored at the point");
+        let (next, _) = Runner::extend(&mut r, 7, &turn2[32..]).unwrap();
+        assert_continues_like(&mut r, 7, next, &cold, "turn 2 restored after a restart");
+
+        // Misses that leave the entry alone: another grid, a prompt that does not continue it.
+        assert_eq!(restart("tiny", 8, turn2).1, None, "another grid");
+        let other: Vec<u32> = std::iter::once((turn2[0] + 1) % 128)
+            .chain(turn2[1..].iter().copied())
+            .collect();
+        assert_eq!(restart("tiny", 16, &other).1, None, "another conversation");
+        assert_eq!(
+            restart("tiny", 16, &turn2[..32]).1,
+            None,
+            "nothing left to feed"
+        );
+
+        let damages: [(&str, fn(&mut Vec<u8>)); 2] = [
+            ("cut short", |f| f.truncate(f.len() / 2)),
+            ("CRC mismatch", |f| {
+                let i = f.len() / 2;
+                f[i] ^= 0x40;
+            }),
+        ];
+        for (what, damage) in damages {
+            let (file, _) = write_point("tiny");
+            let mut bytes = std::fs::read(&file).unwrap();
+            damage(&mut bytes);
+            std::fs::write(&file, &bytes).unwrap();
+            let (mut r, at, left) = restart("tiny", 16, turn2);
+            assert_eq!(at, None, "{what}: served");
+            assert_eq!(left, 0, "{what}: the damaged entry is kept");
+            let (next, _) = Runner::prefill(&mut r, 7, turn2).unwrap();
+            assert_continues_like(&mut r, 7, next, &cold, what);
+        }
+
+        // Another identity's files under this one's directory: the manifest says whose they are.
+        write_point("other");
+        let mine = dir.path().join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        for f in ["index.json", &format!("{key}.lkv")] {
+            std::fs::copy(dir.path().join("other").join(f), mine.join(f)).unwrap();
+        }
+        let (mut r, at, left) = restart("mine", 16, turn2);
+        assert_eq!(at, None, "a foreign state was served");
+        assert_eq!(left, 0, "the foreign entry is kept");
+        let (next, _) = Runner::prefill(&mut r, 7, turn2).unwrap();
+        assert_continues_like(&mut r, 7, next, &cold, "foreign identity");
     }
 }
