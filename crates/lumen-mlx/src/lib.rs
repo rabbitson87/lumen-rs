@@ -13,6 +13,7 @@
 //! `subprocess` used to select have been removed, and naming one is an error
 //! (see [`check_backend_env`]).
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2363,7 +2364,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
-                        |_| {},
+                        |_| ControlFlow::Continue(()),
                         effort,
                     );
                 }
@@ -2400,7 +2401,7 @@ impl MlxBackend {
                     max_new_tokens,
                     thinking,
                     session_id,
-                    |_| {},
+                    |_| ControlFlow::Continue(()),
                     effort,
                 )?;
                 // With thinking ON the prompt opened the `<think>` block, so
@@ -2543,7 +2544,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
-                        |_| {},
+                        |_| ControlFlow::Continue(()),
                         effort,
                     );
                 }
@@ -2569,7 +2570,7 @@ impl MlxBackend {
                     max_new_tokens,
                     thinking,
                     seq_id,
-                    |_| {},
+                    |_| ControlFlow::Continue(()),
                     effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
@@ -2656,7 +2657,7 @@ impl MlxBackend {
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
                     let mut sink = |chunk: &str| {
-                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                        flow_of(on_event(crate::chat_io::BackendStreamEvent::Text(chunk)))
                     };
                     return m.chat_response_format(
                         PromptSource::Flat(messages),
@@ -2685,7 +2686,7 @@ impl MlxBackend {
                 }
                 let _ = tool_choice;
                 let mut sink = |chunk: &str| {
-                    let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                    flow_of(on_event(crate::chat_io::BackendStreamEvent::Text(chunk)))
                 };
                 let visible = m.chat_streaming_with_images(
                     messages,
@@ -2800,7 +2801,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
-                        |_| {},
+                        |_| ControlFlow::Continue(()),
                         effort,
                     );
                 }
@@ -2860,7 +2861,7 @@ impl MlxBackend {
                         thinking,
                         seq_id,
                         schema,
-                        |_| {},
+                        |_| ControlFlow::Continue(()),
                         effort,
                     );
                 }
@@ -2942,9 +2943,8 @@ impl MlxBackend {
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice, session_id);
                     let seq_id = m.alloc_seq_id();
-                    let mut text_adapter = |chunk: &str| {
-                        let _ = on_event(BackendStreamEvent::Text(chunk));
-                    };
+                    let mut text_adapter =
+                        |chunk: &str| flow_of(on_event(BackendStreamEvent::Text(chunk)));
                     return m.chat_response_format(
                         PromptSource::Flat(messages),
                         &[],
@@ -2989,9 +2989,10 @@ impl MlxBackend {
                         if !reasoning.is_empty() {
                             let _ = on_event(BackendStreamEvent::Reasoning(&reasoning));
                         }
-                        if !visible.is_empty() {
-                            let _ = on_event(BackendStreamEvent::Text(&visible));
+                        if visible.is_empty() {
+                            return ControlFlow::Continue(());
                         }
+                        flow_of(on_event(BackendStreamEvent::Text(&visible)))
                     };
                     // See the non-streaming twin: the session path is
                     // unconditional now, because the prompt identifies its own
@@ -3133,7 +3134,7 @@ impl MlxBackend {
                 if let Some(schema) = response_schema {
                     let _ = (tools, tool_choice);
                     let mut sink = |chunk: &str| {
-                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                        flow_of(on_event(crate::chat_io::BackendStreamEvent::Text(chunk)))
                     };
                     return m.chat_response_format(
                         PromptSource::History(turns),
@@ -3201,7 +3202,7 @@ impl MlxBackend {
                     let seq_id = m.alloc_seq_id();
                     let mut on_event = on_event;
                     let mut text_adapter = |chunk: &str| {
-                        let _ = on_event(crate::chat_io::BackendStreamEvent::Text(chunk));
+                        flow_of(on_event(crate::chat_io::BackendStreamEvent::Text(chunk)))
                     };
                     return m.chat_response_format(
                         PromptSource::History(turns),
@@ -4905,7 +4906,7 @@ impl MlxQwen35Backend {
         mut on_token: F,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> ControlFlow<()>,
     {
         use crate::chat_io::ParsedResponse;
 
@@ -5001,14 +5002,15 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut emitted_idx: usize = 0;
+        let mut halted = false;
         if let Ok(text) = self.decode(&generated)
             && !text.is_empty()
             && !text.contains('\u{FFFD}')
         {
-            on_token(&text);
+            halted = on_token(&text).is_break();
             emitted_idx = generated.len();
         }
-        if self.eos_tokens.contains(&last) {
+        if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
             return Ok(ParsedResponse {
@@ -5059,8 +5061,12 @@ impl MlxQwen35Backend {
                 && !text.is_empty()
                 && !text.contains('\u{FFFD}')
             {
-                on_token(&text);
                 emitted_idx = generated.len();
+                // The caller has what it needs (the first complete JSON value):
+                // the tokens after it would only be dropped.
+                if on_token(&text).is_break() {
+                    break;
+                }
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -5110,7 +5116,7 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<crate::chat_io::ParsedResponse>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> ControlFlow<()>,
     {
         let (prompt_ids, prepared) =
             self.build_response_format_input(source, images, thinking, effort)?;
@@ -5204,13 +5210,17 @@ impl MlxQwen35Backend {
     where
         F: FnMut(&str),
     {
+        let mut on_token = on_token;
         self.chat_streaming_with_images(
             messages,
             &[],
             max_new_tokens,
             thinking,
             seq_id,
-            on_token,
+            |text: &str| {
+                on_token(text);
+                ControlFlow::Continue(())
+            },
             effort,
         )
     }
@@ -5235,9 +5245,15 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> ControlFlow<()>,
     {
         let has_images = images.iter().any(|v| !v.is_empty());
+        // The speculative and prefix-cache loops below take text-only prompts and
+        // run to their own end; only the plain loop at the bottom (the one every
+        // image request takes) ends early when `on_token` says so.
+        let mut text_only = |text: &str| {
+            let _ = on_token(text);
+        };
         // Phase 2 S4 — MTP routing. `LUMEN_SPEC=mtp` activates the
         // qwen3_5_mtp speculative path when (1) the native runner installed
         // a drafter (via LUMEN_QWEN35_MTP=1 at load), and (2) the request
@@ -5255,7 +5271,7 @@ impl MlxQwen35Backend {
                 thinking,
                 seq_id,
                 k,
-                on_token,
+                &mut text_only,
                 effort,
             );
         }
@@ -5274,7 +5290,7 @@ impl MlxQwen35Backend {
                 max_new_tokens,
                 thinking,
                 seq_id,
-                on_token,
+                &mut text_only,
                 effort,
             );
         }
@@ -5286,7 +5302,7 @@ impl MlxQwen35Backend {
                 thinking,
                 seq_id,
                 cfg,
-                on_token,
+                &mut text_only,
                 effort,
             );
         }
@@ -5306,7 +5322,7 @@ impl MlxQwen35Backend {
                 thinking,
                 seq_id,
                 &key,
-                on_token,
+                &mut text_only,
                 effort,
             );
         }
@@ -5372,6 +5388,9 @@ impl MlxQwen35Backend {
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
         let mut emitted_idx: usize = 0;
+        // `on_token` ends the loop when the caller has what it needs (a client
+        // stop sequence matched): the tokens after it would only be dropped.
+        let mut halted = false;
         if let Ok(text) = self.decode(&generated)
             && !text.is_empty()
             && !text.contains('\u{FFFD}')
@@ -5387,11 +5406,11 @@ impl MlxQwen35Backend {
                 t_last_emit = Some(now);
                 n_emits += 1;
             }
-            on_token(&text);
+            halted = on_token(&text).is_break();
             prev_text = text;
             emitted_idx = generated.len();
         }
-        if self.eos_tokens.contains(&last) {
+        if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
             self.remove_seq(seq_id).ok();
             self.note_stop(&generated, max_new_tokens);
@@ -5422,7 +5441,7 @@ impl MlxQwen35Backend {
                         t_last_emit = Some(now);
                         n_emits += 1;
                     }
-                    on_token(&text);
+                    halted = on_token(&text).is_break();
                     emitted_idx = generated.len();
                 }
             } else if let Ok(text) = self.decode(&generated)
@@ -5440,8 +5459,11 @@ impl MlxQwen35Backend {
                     t_last_emit = Some(now);
                     n_emits += 1;
                 }
-                on_token(&text[prev_text.len()..]);
+                halted = on_token(&text[prev_text.len()..]).is_break();
                 prev_text = text;
+            }
+            if halted {
+                break;
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6871,7 +6893,7 @@ impl MlxQwen35Backend {
         effort: Option<crate::chat_io::ReasoningEffort>,
     ) -> Result<String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str) -> ControlFlow<()>,
     {
         let prompt_ids = self.build_chat_input(messages, thinking, effort)?;
         if prompt_ids.is_empty() {
@@ -6904,15 +6926,18 @@ impl MlxQwen35Backend {
 
         let mut generated: Vec<u32> = vec![last];
         let mut prev_text = String::new();
+        // `on_token` ends the loop when the caller has what it needs (a client
+        // stop sequence matched): the tokens after it would only be dropped.
+        let mut halted = false;
         if let Ok(text) = self.decode(&generated)
             && !text.is_empty()
             && !text.contains('\u{FFFD}')
         {
-            on_token(&text);
+            halted = on_token(&text).is_break();
             prev_text = text;
         }
 
-        if !self.eos_tokens.contains(&last) {
+        if !halted && !self.eos_tokens.contains(&last) {
             for _ in 1..max_new_tokens {
                 let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
                 last = next;
@@ -6922,10 +6947,10 @@ impl MlxQwen35Backend {
                     && text.len() > prev_text.len()
                     && !text.contains('\u{FFFD}')
                 {
-                    on_token(&text[prev_text.len()..]);
+                    halted = on_token(&text[prev_text.len()..]).is_break();
                     prev_text = text;
                 }
-                if self.eos_tokens.contains(&next) {
+                if halted || self.eos_tokens.contains(&next) {
                     break;
                 }
             }
@@ -7037,6 +7062,17 @@ impl MlxQwen35Backend {
 /// Phase 2: bridges Qwen35ResponseParser events to the generic
 /// `BackendStreamEvent` shape the engine consumes. Mirrors the
 /// Gemma 4 `emit_token_event` adapter.
+/// A server sink's answer as a decode loop reads it. The sink returns `Err`
+/// when it has what it needs (a client stop sequence matched, or the first
+/// complete JSON value of a `response_format` reply arrived), so the loop
+/// ends there instead of decoding tokens that would only be dropped.
+fn flow_of(sink: Result<()>) -> ControlFlow<()> {
+    match sink {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(_) => ControlFlow::Break(()),
+    }
+}
+
 fn forward_parse_event<F>(
     ev: crate::qwen3_5_tools::Qwen35ParseEvent,
     on_event: &mut F,
@@ -7539,7 +7575,14 @@ mod tests {
             .map(|(r, c)| (r.to_string(), c.to_string()))
             .collect();
         let reply = b
-            .chat_streaming_session(&messages, 8, false, None, |_| {}, None)
+            .chat_streaming_session(
+                &messages,
+                8,
+                false,
+                None,
+                |_| ControlFlow::Continue(()),
+                None,
+            )
             .expect("chat turn");
         assert_eq!(reply, "Blue");
         std::mem::take(&mut b.script_runner().feeds)
@@ -8137,8 +8180,15 @@ mod tests {
         };
         let run = |m: &mut MlxQwen35Backend, on: bool, msgs: &[(String, String)], sid: &str| {
             session_rollback_enabled::with(on, || {
-                m.chat_streaming_session(msgs, n_gen, false, Some(sid), |_| {}, None)
-                    .expect("chat turn")
+                m.chat_streaming_session(
+                    msgs,
+                    n_gen,
+                    false,
+                    Some(sid),
+                    |_| ControlFlow::Continue(()),
+                    None,
+                )
+                .expect("chat turn")
             })
         };
 
@@ -8235,8 +8285,15 @@ mod tests {
         };
         let run = |m: &mut MlxQwen35Backend, msgs: &[(String, String)], sid: &str| {
             session_rollback_enabled::with(true, || {
-                m.chat_streaming_session(msgs, n_gen, false, Some(sid), |_| {}, None)
-                    .expect("chat turn")
+                m.chat_streaming_session(
+                    msgs,
+                    n_gen,
+                    false,
+                    Some(sid),
+                    |_| ControlFlow::Continue(()),
+                    None,
+                )
+                .expect("chat turn")
             })
         };
         fn native(m: &mut MlxQwen35Backend) -> &mut NativeMlxRunner {
@@ -8883,9 +8940,11 @@ mod tests {
             let tokenizer = <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER)
                 .expect("script tokenizer");
             let mut b = MlxQwen35Backend::with_token_script(script, SCRIPT_EOS, tokenizer, 11);
-            b.chat_response_format_impl(vec![42], Vec::new(), None, max_tokens, 7, |_| {})
-                .expect("response_format loop")
-                .stop
+            b.chat_response_format_impl(vec![42], Vec::new(), None, max_tokens, 7, |_| {
+                ControlFlow::Continue(())
+            })
+            .expect("response_format loop")
+            .stop
         };
         assert_eq!(run(vec![5, 6, 5, 6, 5], 3), StopCause::MaxTokens);
         assert_eq!(run(vec![5, 6, SCRIPT_EOS], 3), StopCause::EndOfTurn);
@@ -9077,6 +9136,79 @@ mod tests {
         }
     }
 
+    /// RED before: the plain Qwen loops ignored the sink's `Err`, so a reply a
+    /// client stop sequence had already ended went on decoding to `max_tokens`
+    /// (the text after the stop was only dropped). The server's sink answers
+    /// `Err` once a stop sequence completes; the loop must end right there.
+    #[test]
+    fn a_plain_reply_stops_decoding_when_the_sink_has_what_it_needs() {
+        use crate::chat_io::{BackendStreamEvent, ResolvedToolChoice};
+        let messages = vec![
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let ov = SamplingOverrides::default();
+        let auto = ResolvedToolChoice::Auto;
+        for (cut_after, decoded) in [(None, 12), (Some(1), 1), (Some(3), 3)] {
+            let tokenizer =
+                <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+            let mut b = MlxBackend::Qwen35Family(MlxQwen35Backend::with_token_script(
+                vec![CHAT_BLUE; 16],
+                CHAT_IM_END,
+                tokenizer,
+                12,
+            ));
+            let mut texts = 0;
+            let parsed = b
+                .chat_streaming(
+                    &messages,
+                    12,
+                    0.0,
+                    1.0,
+                    &ov,
+                    false,
+                    None,
+                    &[],
+                    &auto,
+                    None,
+                    |ev| {
+                        if let BackendStreamEvent::Text(_) = ev {
+                            texts += 1;
+                            if cut_after.is_some_and(|n| texts >= n) {
+                                return Err(anyhow!("stop sequence"));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("a stop sequence is not an error");
+            assert_eq!(
+                qwen(&mut b).scripted_tokens_consumed(),
+                decoded,
+                "cut after {cut_after:?} text pieces"
+            );
+            assert_eq!(parsed.visible, "Blue".repeat(decoded));
+        }
+
+        // The `response_format` loop takes the same signal (the server's sink
+        // sends it at the end of the first complete JSON value).
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(SCRIPT_TOKENIZER).expect("script tokenizer");
+        let mut b =
+            MlxQwen35Backend::with_token_script(vec![5, 6, 5, 6, 5], SCRIPT_EOS, tokenizer, 11);
+        let mut pieces = 0;
+        b.chat_response_format_impl(vec![42], Vec::new(), None, 5, 7, |_| {
+            pieces += 1;
+            if pieces == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .expect("response_format loop");
+        assert_eq!(b.scripted_tokens_consumed(), 2);
+    }
+
     /// The guard is on images only: the same loop given no image still reuses
     /// the system prompt. (The dispatch sends text-only requests to the session
     /// path instead, so this calls the loop the image requests reach.)
@@ -9096,7 +9228,7 @@ mod tests {
                 4,
                 false,
                 seq,
-                |_| {},
+                |_| ControlFlow::Continue(()),
                 None,
             )
             .expect("text chat");
