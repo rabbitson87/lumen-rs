@@ -1394,26 +1394,20 @@ impl InferenceEngine {
                             }
                             if stopped {
                                 stopped_by_seq.set(true);
-                                return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                return Err(anyhow::anyhow!(STOP_SEQUENCE_BREAK));
                             }
                         } else {
-                            let mut sm = stop_matcher.borrow_mut();
-                            if sm.is_inert() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                            } else {
-                                let step = sm.push(t);
-                                if !step.emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
-                                }
-                                if step.stopped {
-                                    stopped_by_seq.set(true);
-                                    drop(sm);
-                                    // Break the backend decode loop early. The
-                                    // `stopped_by_seq` flag distinguishes this
-                                    // from a real error in the match below.
-                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                }
+                            // The `stopped_by_seq` flag distinguishes the early
+                            // break from a real error in the match below.
+                            let r = stream_text_through_stops(
+                                &mut stop_matcher.borrow_mut(),
+                                t,
+                                token_tx,
+                            );
+                            if r.is_err() {
+                                stopped_by_seq.set(true);
                             }
+                            return r;
                         }
                     }
                     BackendStreamEvent::Reasoning(t) => {
@@ -1462,26 +1456,20 @@ impl InferenceEngine {
                             }
                             if stopped {
                                 stopped_by_seq.set(true);
-                                return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
+                                return Err(anyhow::anyhow!(STOP_SEQUENCE_BREAK));
                             }
                         } else {
-                            let mut sm = stop_matcher.borrow_mut();
-                            if sm.is_inert() {
-                                let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                            } else {
-                                let step = sm.push(t);
-                                if !step.emit.is_empty() {
-                                    let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
-                                }
-                                if step.stopped {
-                                    stopped_by_seq.set(true);
-                                    drop(sm);
-                                    // Break the backend decode loop early. The
-                                    // `stopped_by_seq` flag distinguishes this
-                                    // from a real error in the match below.
-                                    return Err(anyhow::anyhow!("__lumen_stop_sequence__"));
-                                }
+                            // The `stopped_by_seq` flag distinguishes the early
+                            // break from a real error in the match below.
+                            let r = stream_text_through_stops(
+                                &mut stop_matcher.borrow_mut(),
+                                t,
+                                token_tx,
+                            );
+                            if r.is_err() {
+                                stopped_by_seq.set(true);
                             }
+                            return r;
                         }
                     }
                     BackendStreamEvent::Reasoning(t) => {
@@ -1575,9 +1563,14 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                // No trim here: a stop sequence or a complete JSON value ends
-                // the stream through the `stopped_by_seq` arm below instead.
-                let finish_reason = FinishReason::resolve(parsed.stop, has_tool_calls, false);
+                // A stop sequence or a complete JSON value ends the stream
+                // through the `stopped_by_seq` arm below — when the backend
+                // ends its decode loop on the sink's error. Qwen's plain and
+                // `response_format` loops ignore it and run on to the end; the
+                // matchers swallow everything after the stop, and the reason is
+                // still the stop, not the budget the loop then ran into.
+                let finish_reason =
+                    FinishReason::resolve(parsed.stop, has_tool_calls, stopped_by_seq.get());
                 // Observability: bump lifetime counters for `GET /v1/loads`.
                 let elapsed_s = gen_started.elapsed().as_secs_f64();
                 let tok_per_sec = if elapsed_s > 0.0 {
@@ -1591,6 +1584,7 @@ impl InferenceEngine {
                     prompt_tokens,
                     completion_tokens,
                     finish_reason,
+                    stop_sequence: stop_matcher.borrow().matched().map(str::to_owned),
                 });
             }
             Err(_) if stopped_by_seq.get() => {
@@ -1609,6 +1603,8 @@ impl InferenceEngine {
                     prompt_tokens,
                     completion_tokens: 0,
                     finish_reason: FinishReason::Stop,
+                    // OpenAI has no field for it; `None` for a JSON-value stop.
+                    stop_sequence: stop_matcher.borrow().matched().map(str::to_owned),
                 });
             }
             Err(e) => {
@@ -1715,6 +1711,10 @@ impl InferenceEngine {
         // falls through to a fresh, sequential per-call emission. Early
         // per-call Starts are intentionally NOT emitted (see closures below).
         let early_tc: Vec<(String, u32, String)> = Vec::new();
+        // `stop_sequences`, applied as the OpenAI stream applies `stop`: text
+        // that could still grow into a sequence is held back, so one split
+        // across two pieces is caught and never reaches the client.
+        let mut stops = lumen_core::stop::StopMatcher::new(ov.stop.clone());
         let result = if needs_structured {
             let assistant_text_buf: Vec<String> = req
                 .messages
@@ -1884,25 +1884,7 @@ impl InferenceEngine {
             if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
                 return;
             }
-            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
-                match ev {
-                    BackendStreamEvent::Text(t) => {
-                        let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                    }
-                    BackendStreamEvent::Reasoning(t) => {
-                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                    }
-                    BackendStreamEvent::ToolCallStart { name } => {
-                        // Early per-call Start suppressed — see the call-1
-                        // closure above and the reconciliation loop below.
-                        // Sequential Start_i → Args_i → Stop_i per call is the
-                        // standard order; batched up-front Starts dropped args
-                        // for parallel calls after index 0.
-                        let _ = name;
-                    }
-                }
-                Ok(())
-            };
+            let on_event = anthropic_stream_sink(token_tx, &mut stops);
             self.backend.chat_streaming_from_history_with_images(
                 &turns,
                 &turn_images,
@@ -1930,25 +1912,7 @@ impl InferenceEngine {
             if !self.admit_anthropic_stream(prompt_tokens, token_tx) {
                 return;
             }
-            let on_event = |ev: BackendStreamEvent<'_>| -> Result<()> {
-                match ev {
-                    BackendStreamEvent::Text(t) => {
-                        let _ = token_tx.try_send(StreamEvent::Delta(t.to_string()));
-                    }
-                    BackendStreamEvent::Reasoning(t) => {
-                        let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
-                    }
-                    BackendStreamEvent::ToolCallStart { name } => {
-                        // Early per-call Start suppressed — see the call-1
-                        // closure above and the reconciliation loop below.
-                        // Sequential Start_i → Args_i → Stop_i per call is the
-                        // standard order; batched up-front Starts dropped args
-                        // for parallel calls after index 0.
-                        let _ = name;
-                    }
-                }
-                Ok(())
-            };
+            let on_event = anthropic_stream_sink(token_tx, &mut stops);
             let thinking =
                 req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
             self.backend.chat_streaming_with_images(
@@ -1970,6 +1934,12 @@ impl InferenceEngine {
 
         match result {
             Ok(mut parsed) => {
+                // No sequence completed: release the tail held back in case it
+                // did, ahead of the tool blocks, as the OpenAI stream does.
+                let tail = stops.flush();
+                if !tail.is_empty() {
+                    let _ = token_tx.try_send(StreamEvent::Delta(tail));
+                }
                 // Bug A: resolve abbreviated tool names (e.g. the model dropped
                 // an MCP namespace) by unique suffix match before emitting.
                 remap_tool_call_names(&mut parsed.tool_calls, &tools_owned);
@@ -2000,13 +1970,30 @@ impl InferenceEngine {
                     &parsed.visible,
                     &parsed.tool_calls,
                 );
-                // This route applies no stop sequences while streaming, so
-                // nothing was trimmed.
-                let finish_reason = FinishReason::resolve(parsed.stop, has_tool_calls, false);
+                // A completed sequence ends decoding through the arm below when
+                // the backend stops on the sink's error. Qwen's plain loop does
+                // not, and lands here with the matcher having swallowed the rest;
+                // the stream still ended at the sequence.
+                let matched = stops.matched().map(str::to_owned);
+                let finish_reason =
+                    FinishReason::resolve(parsed.stop, has_tool_calls, matched.is_some());
                 let _ = token_tx.try_send(StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
                     finish_reason,
+                    stop_sequence: matched,
+                });
+            }
+            Err(_) if stops.matched().is_some() => {
+                // The sink broke the decode loop at a stop sequence; the text
+                // before it is already out and the rest is dropped. Tokens past
+                // the break are unknown here, so the count is 0, as on the
+                // OpenAI stream.
+                let _ = token_tx.try_send(StreamEvent::Done {
+                    prompt_tokens,
+                    completion_tokens: 0,
+                    finish_reason: FinishReason::Stop,
+                    stop_sequence: stops.matched().map(str::to_owned),
                 });
             }
             Err(e) => {
@@ -2924,6 +2911,10 @@ pub enum StreamEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         finish_reason: FinishReason,
+        /// The client stop sequence the stream was cut at. Anthropic reports
+        /// it (`stop_reason: "stop_sequence"` plus the string, see
+        /// [`anthropic_stop`]); OpenAI has no field for it.
+        stop_sequence: Option<String>,
     },
     /// Error during generation.
     Error(String),
@@ -2989,7 +2980,7 @@ impl FinishReason {
 /// Anthropic reports it as its own reason (`"stop_sequence"`) together with
 /// the string. When the turn ended in tool calls, `tool_use` wins and the
 /// field stays `null`, as before.
-fn anthropic_stop(
+pub(crate) fn anthropic_stop(
     finish: FinishReason,
     matched_stop: Option<String>,
 ) -> (&'static str, Option<String>) {
@@ -3016,6 +3007,65 @@ fn trim_at_stop(text: &mut String, stops: &[String]) -> Option<String> {
     let (i, s) = earliest?;
     text.truncate(i);
     Some(s.clone())
+}
+
+/// The error a streaming sink returns to end the backend's decode loop at a
+/// client stop sequence (or, for `response_format`, at the end of the first
+/// complete JSON value). The engine tells it from a real failure by its own
+/// record of the stop, never by this text.
+const STOP_SEQUENCE_BREAK: &str = "__lumen_stop_sequence__";
+
+/// Pass one streamed text piece through the client's stop sequences and send
+/// what is safe to send. A piece that could still grow into a sequence is held
+/// back, so a sequence split across pieces is caught before any of it goes out.
+/// `Err` once a sequence completes — the text before it has been sent, the
+/// sequence and everything after it are dropped, and [`StopMatcher::matched`]
+/// names it.
+///
+/// [`StopMatcher::matched`]: lumen_core::stop::StopMatcher::matched
+fn stream_text_through_stops(
+    stops: &mut lumen_core::stop::StopMatcher,
+    text: &str,
+    token_tx: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
+    if stops.is_inert() {
+        let _ = token_tx.try_send(StreamEvent::Delta(text.to_string()));
+        return Ok(());
+    }
+    let step = stops.push(text);
+    if !step.emit.is_empty() {
+        let _ = token_tx.try_send(StreamEvent::Delta(step.emit));
+    }
+    if step.stopped {
+        return Err(anyhow::anyhow!(STOP_SEQUENCE_BREAK));
+    }
+    Ok(())
+}
+
+/// The event sink both streaming `/v1/messages` branches hand the backend.
+/// Visible text goes through the request's `stop_sequences` (the trace is
+/// not matched, as the non-streaming route trims only the answer).
+fn anthropic_stream_sink<'a>(
+    token_tx: &'a mpsc::Sender<StreamEvent>,
+    stops: &'a mut lumen_core::stop::StopMatcher,
+) -> impl FnMut(BackendStreamEvent<'_>) -> Result<()> + 'a {
+    move |ev| {
+        match ev {
+            BackendStreamEvent::Text(t) => return stream_text_through_stops(stops, t, token_tx),
+            BackendStreamEvent::Reasoning(t) => {
+                let _ = token_tx.try_send(StreamEvent::ReasoningDelta(t.to_string()));
+            }
+            BackendStreamEvent::ToolCallStart { name } => {
+                // Early per-call Start suppressed — see the OpenAI stream's
+                // closures and the reconciliation loop after decode.
+                // Sequential Start_i → Args_i → Stop_i per call is the standard
+                // order; batched up-front Starts dropped args for parallel
+                // calls after index 0.
+                let _ = name;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Request sent through the channel to the engine thread.
@@ -3325,6 +3375,8 @@ impl InferenceEngine {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: seq.generated.len() as u32,
                         finish_reason: seq.finish_reason(),
+                        // Requests with `stop` are not batch-eligible.
+                        stop_sequence: None,
                     });
                     if let Some(qb) = self.mlx_batched_driver() {
                         let _ = qb.remove_seq(sid);
@@ -3445,6 +3497,7 @@ impl InferenceEngine {
                         prompt_tokens: seq.prompt_tokens,
                         completion_tokens: n_gen as u32,
                         finish_reason: seq.finish_reason(),
+                        stop_sequence: None,
                     });
                     to_remove.push(id);
                 }
@@ -4856,6 +4909,123 @@ mod finish_reason_mapping {
         assert_eq!(seq(vec![5, 6, 7]).finish_reason(), FinishReason::Length);
         assert_eq!(seq(vec![5, 6, 2]).finish_reason(), FinishReason::Stop);
         assert_eq!(seq(vec![2]).finish_reason(), FinishReason::Stop);
+    }
+}
+
+/// `/v1/messages` streaming and `stop_sequences`, against the sink the engine
+/// hands the backend, driven the way a backend decode loop drives it (each
+/// piece through the callback, `?` on its result). No model needed: the sink is
+/// the whole of what the route does with the text.
+#[cfg(test)]
+mod anthropic_stream_stops {
+    use super::{StreamEvent, anthropic_stream_sink};
+    use lumen_core::stop::StopMatcher;
+    use lumen_mlx::chat_io::BackendStreamEvent;
+
+    /// What a backend decode loop does with the sink: one callback per piece,
+    /// stopping at the first `Err`.
+    fn decode(
+        sink: &mut impl FnMut(BackendStreamEvent<'_>) -> anyhow::Result<()>,
+        pieces: &[BackendStreamEvent<'_>],
+    ) -> anyhow::Result<()> {
+        for p in pieces {
+            sink(p.clone())?;
+        }
+        Ok(())
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>) -> (String, String) {
+        let (mut text, mut trace) = (String::new(), String::new());
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::ReasoningDelta(t) => trace.push_str(&t),
+                _ => {}
+            }
+        }
+        (text, trace)
+    }
+
+    /// RED before: the sink forwarded every piece, so the stream ran past the
+    /// sequence to the end of the turn and nothing recorded which one hit.
+    #[test]
+    fn a_sequence_split_across_pieces_ends_the_stream_and_is_named() {
+        use BackendStreamEvent::Text;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut stops = StopMatcher::new(vec!["\n\nHuman:".into(), "END".into()]);
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+
+        // "EN" could still be the start of "END": it must be held, not sent.
+        decode(&mut sink, &[Text("The answer is 4. "), Text("EN")]).expect("no stop yet");
+        assert_eq!(drain(&mut rx).0, "The answer is 4. ");
+
+        let r = decode(&mut sink, &[Text("D of"), Text(" story"), Text(" more")]);
+        assert!(r.is_err(), "a completed sequence breaks the decode loop");
+        drop(sink);
+        assert_eq!(
+            drain(&mut rx).0,
+            "",
+            "neither the sequence nor anything after it reaches the client"
+        );
+        assert_eq!(stops.matched(), Some("END"));
+        assert_eq!(stops.flush(), "", "nothing is left to release");
+    }
+
+    /// Qwen's plain streaming loop calls the sink as `let _ = on_event(..)`, so
+    /// it decodes on past the stop to EOS or the budget. Seen on Flash-Next:
+    /// `stop_sequences: [", four"]` streamed "one, two, three, five, six, …" —
+    /// the sequence cut out of the middle and the answer carried on after it.
+    /// RED before: the matcher went back to matching after a stop.
+    #[test]
+    fn a_decode_loop_that_ignores_the_break_streams_nothing_after_the_stop() {
+        use BackendStreamEvent::Text;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut stops = StopMatcher::new(vec![", four".into()]);
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        for p in ["one", ", two", ", three", ", fo", "ur", ", five", ", six"] {
+            let _ = sink(Text(p));
+        }
+        drop(sink);
+        assert_eq!(drain(&mut rx).0, "one, two, three");
+        assert_eq!(stops.matched(), Some(", four"));
+        assert_eq!(
+            stops.flush(),
+            "",
+            "the Ok arm's flush releases nothing either"
+        );
+    }
+
+    #[test]
+    fn a_held_tail_that_never_completes_is_released_by_the_flush() {
+        use BackendStreamEvent::Text;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut stops = StopMatcher::new(vec!["END".into()]);
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        decode(&mut sink, &[Text("THE E"), Text("N")]).expect("no stop");
+        drop(sink);
+        assert_eq!(drain(&mut rx).0, "THE ");
+        assert_eq!(stops.matched(), None);
+        // What the engine's Ok arm sends before the tool blocks and `Done`.
+        assert_eq!(stops.flush(), "EN");
+    }
+
+    /// The non-streaming route trims only the answer, so the trace is not
+    /// matched here either; and a request without sequences is a pass-through.
+    #[test]
+    fn the_trace_is_not_matched_and_no_sequences_pass_everything() {
+        use BackendStreamEvent::{Reasoning, Text};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut stops = StopMatcher::new(vec!["END".into()]);
+        let mut sink = anthropic_stream_sink(&tx, &mut stops);
+        decode(&mut sink, &[Reasoning("think END think"), Text("ok")]).expect("no stop");
+        drop(sink);
+        assert_eq!(drain(&mut rx), ("ok".into(), "think END think".into()));
+
+        let mut none = StopMatcher::new(Vec::new());
+        let mut sink = anthropic_stream_sink(&tx, &mut none);
+        decode(&mut sink, &[Text("END"), Text(" of it")]).expect("no stops requested");
+        drop(sink);
+        assert_eq!(drain(&mut rx).0, "END of it");
     }
 }
 

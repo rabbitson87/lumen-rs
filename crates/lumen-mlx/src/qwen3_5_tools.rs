@@ -387,6 +387,15 @@ fn partial_tail_len(s: &str, needle: &str) -> usize {
 /// rendering that reproduces the tokens the model was actually fed; 3.6's
 /// template drops it from history instead, which is self-consistent for
 /// upstream but would cost this path the KV it can otherwise extend.
+///
+/// The visible text is trimmed, as the template trims every message
+/// (`render_content(..)|trim`). Written verbatim, a reply whose text before its
+/// call was only `"\n"` — what a streaming client is sent and hands back —
+/// rendered `</think>\n\n\n<tool_call>`: byte for byte the previous prompt plus
+/// that newline, but the pre-tokenizer groups a newline run into one piece, so
+/// the prompt's final `\n\n` token became one `\n\n\n` token. The previous
+/// prompt was then no longer a token prefix of the next, and the prefix cache
+/// re-fed the conversation from the system head on every tool round.
 fn render_assistant_open(content: &str, _thinking: bool) -> String {
     let (reasoning, visible) = split_reasoning_envelope(content);
     let mut s = String::new();
@@ -394,7 +403,7 @@ fn render_assistant_open(content: &str, _thinking: bool) -> String {
     s.push_str("<think>\n");
     s.push_str(reasoning);
     s.push_str("\n</think>\n\n");
-    s.push_str(visible);
+    s.push_str(visible.trim());
     s
 }
 
@@ -2084,5 +2093,148 @@ mod reasoning_effort_tests {
             none,
             "removing the sentence must leave the 3.6 block behind"
         );
+    }
+}
+
+/// A tool round's prompt must be a token prefix of the next round's, or the
+/// prefix cache (which stores the whole prompt, generation header included)
+/// misses and re-feeds from the system head.
+#[cfg(test)]
+mod tool_round_prefix_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// What the model generates after a thinking-off header when its text
+    /// before the call is `before`.
+    fn generated(before: &str) -> String {
+        format!(
+            "{before}<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n\
+             </parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    /// Round N's prompt and round N+1's, the second rebuilt from round N's
+    /// reply as a client gets it: the visible text the parser streamed (so
+    /// `"\n"` stays `"\n"`) and the parsed call, then a tool result.
+    fn two_rounds(before: &str) -> (String, String) {
+        let params = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let tools = vec![ToolDef {
+            name: "get_weather",
+            description: Some("Weather for a city"),
+            parameters: Some(&params),
+            response: None,
+        }];
+        let head = [
+            ChatTurn::System("You are terse."),
+            ChatTurn::User("Weather in Seoul?"),
+        ];
+        let round_n = format_qwen3_chat_with_tools_from_history(&head, false, &tools, None);
+
+        let mut parser = Qwen35ResponseParser::new();
+        let mut streamed = String::new();
+        // A delta at a time, the way the decode loop feeds it.
+        for piece in generated(before).split_inclusive('\n') {
+            for ev in parser.feed(piece) {
+                if let Qwen35ParseEvent::Text(t) = ev {
+                    streamed.push_str(&t);
+                }
+            }
+        }
+        let parsed = parser.finish();
+        assert_eq!(parsed.tool_calls.len(), 1, "{before:?}");
+        let args = parsed.tool_calls[0].arguments.clone();
+        let calls = [AssistantToolCall {
+            id: "call_1",
+            name: &parsed.tool_calls[0].name,
+            arguments: &args,
+        }];
+        let next = [
+            head[0].clone(),
+            head[1].clone(),
+            ChatTurn::Assistant {
+                text: &streamed,
+                tool_calls: &calls,
+            },
+            ChatTurn::Tool {
+                tool_call_id: "call_1",
+                name: Some("get_weather"),
+                content: "{\"temp\": 15}",
+            },
+        ];
+        let round_n1 = format_qwen3_chat_with_tools_from_history(&next, false, &tools, None);
+        (round_n, round_n1)
+    }
+
+    const REPLIES: [&str; 6] = [
+        "\n",
+        "\n\n",
+        " \n",
+        "",
+        "Let me check.\n",
+        "\n\nLet me check.",
+    ];
+
+    /// Tokenizer-free half: the next round continues the previous prompt with
+    /// something other than whitespace. A newline there merges with the
+    /// header's final `\n\n` (Qwen pre-tokenizes `\s*[\r\n]+` as one piece), so a
+    /// plain `starts_with` on the strings passes even when the tokens differ.
+    ///
+    /// RED before: `"\n"`, `"\n\n"`, `" \n"` and `"\n\nLet me check."` all put
+    /// whitespace right after the previous prompt.
+    #[test]
+    fn the_next_round_continues_the_previous_prompt_without_a_whitespace_seam() {
+        for before in REPLIES {
+            let (n, n1) = two_rounds(before);
+            assert!(n1.starts_with(&n), "{before:?}:\n{n1}");
+            let seam = n1[n.len()..].chars().next();
+            assert!(
+                seam.is_some_and(|c| !c.is_whitespace()),
+                "{before:?}: the next round continues the previous prompt with {seam:?}"
+            );
+        }
+    }
+
+    /// And it is the upstream rendering: `content|trim`, then `\n\n` before
+    /// the call only when text is left.
+    #[test]
+    fn a_replayed_tool_turn_renders_like_the_template() {
+        let (_, n1) = two_rounds("\n");
+        assert!(
+            n1.contains("</think>\n\n<tool_call>\n<function=get_weather>"),
+            "{n1}"
+        );
+        let (_, n1) = two_rounds("Let me check.\n");
+        assert!(
+            n1.contains("</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>"),
+            "{n1}"
+        );
+    }
+
+    /// The same check on the real tokenizer, which is what the cache compares.
+    #[test]
+    #[ignore = "requires a real Qwen tokenizer.json; set LUMEN_QWEN35_MODEL_DIR"]
+    fn the_previous_round_is_a_token_prefix_on_a_real_qwen_tokenizer() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            eprintln!("skip: set LUMEN_QWEN35_MODEL_DIR to a Qwen checkpoint");
+            return;
+        };
+        let tok = crate::text_tokenizer::TextTokenizer::from_file(
+            std::path::Path::new(&dir).join("tokenizer.json"),
+        )
+        .expect("tokenizer.json");
+        for before in REPLIES {
+            let (n, n1) = two_rounds(before);
+            let n = tok.encode(&n, false).unwrap();
+            let n1 = tok.encode(&n1, false).unwrap();
+            let common = n.iter().zip(&n1).take_while(|(a, b)| a == b).count();
+            assert!(
+                n1.starts_with(&n),
+                "{before:?}: round N ({} tokens) diverges from round N+1 at token {common}: \
+                 {:?} vs {:?}",
+                n.len(),
+                n.get(common),
+                n1.get(common),
+            );
+        }
     }
 }

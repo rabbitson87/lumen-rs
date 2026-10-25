@@ -41,8 +41,17 @@ fn stop_field_vec(stop: &Option<StopField>) -> Vec<String> {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    /// The completion budget everything downstream reads. Holds the server
+    /// default when the client sent neither name; see
+    /// [`Self::resolve_max_tokens`] for `max_completion_tokens`.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// OpenAI's current name for the budget; `max_tokens` is deprecated for
+    /// chat, and the official SDKs send only this one. It used to be dropped
+    /// (no `deny_unknown_fields`), so such a client got the server default
+    /// with a 200. Wins over `max_tokens` when both are sent, as on OpenAI.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_top_p")]
@@ -165,6 +174,15 @@ pub struct ChatTemplateKwargs {
 }
 
 impl ChatCompletionRequest {
+    /// Fold `max_completion_tokens` into `max_tokens`, the field the engine
+    /// reads. The route calls this first, before the `LUMEN_MAX_TOKENS_CAP`
+    /// cap, so either name is capped the same way.
+    pub fn resolve_max_tokens(&mut self) {
+        if let Some(n) = self.max_completion_tokens.take() {
+            self.max_tokens = n;
+        }
+    }
+
     /// Per-request sampling overrides for the backend (Gemma 4 sampler).
     pub fn sampling_overrides(&self) -> SamplingOverrides {
         SamplingOverrides {
@@ -558,6 +576,12 @@ pub struct CompletionRequest {
     pub prompt: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// Not part of OpenAI's legacy completions API, accepted so a client
+    /// that uses one budget name for both routes is not silently given the
+    /// default. Same precedence as on chat; see
+    /// [`ChatCompletionRequest::max_completion_tokens`].
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_top_p")]
@@ -975,6 +999,13 @@ impl Default for AnthropicThinking {
 }
 
 impl CompletionRequest {
+    /// See [`ChatCompletionRequest::resolve_max_tokens`].
+    pub fn resolve_max_tokens(&mut self) {
+        if let Some(n) = self.max_completion_tokens.take() {
+            self.max_tokens = n;
+        }
+    }
+
     /// Per-request sampling overrides for the backend (Gemma 4 sampler).
     pub fn sampling_overrides(&self) -> SamplingOverrides {
         SamplingOverrides {
@@ -2090,6 +2121,7 @@ mod tool_calling_serde {
             model: "x".into(),
             messages: vec![],
             max_tokens: 16,
+            max_completion_tokens: None,
             parallel_tool_calls: None,
             temperature: 0.7,
             top_p: 0.9,
@@ -2533,6 +2565,36 @@ mod inference_error_carries_its_cause {
         assert!(
             msg.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
             "the cause is the whole point of the message: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod max_completion_tokens_tests {
+    use super::CompletionRequest;
+
+    /// `/v1/completions` takes the same name with the same precedence, so a
+    /// client using one budget name for both routes is not given the default.
+    #[test]
+    fn completions_accept_max_completion_tokens_too() {
+        let parse = |v: serde_json::Value| {
+            let mut r: CompletionRequest = serde_json::from_value(v).expect("parses");
+            r.resolve_max_tokens();
+            r.max_tokens
+        };
+        assert_eq!(
+            parse(serde_json::json!({"model": "m", "prompt": "p", "max_completion_tokens": 7})),
+            7
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "model": "m", "prompt": "p", "max_tokens": 900, "max_completion_tokens": 7,
+            })),
+            7
+        );
+        assert_eq!(
+            parse(serde_json::json!({"model": "m", "prompt": "p", "max_tokens": 900})),
+            900
         );
     }
 }

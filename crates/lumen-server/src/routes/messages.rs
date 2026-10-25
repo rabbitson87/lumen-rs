@@ -4,7 +4,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::respond;
-use crate::engine::{EngineHandle, StreamEvent};
+use crate::engine::{EngineHandle, FinishReason, StreamEvent, anthropic_stop};
 use crate::types::{AnthropicError, AnthropicRequest};
 
 pub async fn handle(
@@ -236,6 +236,7 @@ async fn handle_streaming(
                 prompt_tokens,
                 completion_tokens: output_tokens,
                 finish_reason,
+                stop_sequence,
             } => {
                 // Close whatever is still open, and — if the turn produced no
                 // text and no tool calls — add the pro-forma empty text block
@@ -246,10 +247,7 @@ async fn handle_streaming(
                 blocks.finish(&mut buf);
                 tcp.write_all(&buf).await?;
 
-                let stop_reason = finish_reason.anthropic_str();
-                let delta = format!(
-                    "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
-                );
+                let delta = message_delta_frame(finish_reason, stop_sequence, output_tokens);
                 tcp.write_all(delta.as_bytes()).await?;
 
                 tcp.write_all(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
@@ -279,6 +277,22 @@ async fn handle_streaming(
 
     tcp.flush().await?;
     Ok(())
+}
+
+/// The `message_delta` frame that closes a stream: `stop_reason`, and the
+/// matched sequence when a client stop sequence ended it (`stop_reason:
+/// "stop_sequence"`), by the same rule as the non-streaming response.
+fn message_delta_frame(
+    finish_reason: FinishReason,
+    stop_sequence: Option<String>,
+    output_tokens: u32,
+) -> String {
+    let (stop_reason, stop_sequence) = anthropic_stop(finish_reason, stop_sequence);
+    let stop_sequence =
+        serde_json::to_string(&stop_sequence).expect("an Option<String> always serializes");
+    format!(
+        "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\",\"stop_sequence\":{stop_sequence}}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
+    )
 }
 
 fn append_anthropic_delta(buf: &mut Vec<u8>, prefix: &[u8], suffix: &[u8], text: &str) {
@@ -656,6 +670,46 @@ mod tests {
         let mut out = Vec::new();
         b.finish(&mut out);
         assert_eq!(shape(&out), ["start:\"text\"@0", "content_block_stop@0"]);
+    }
+
+    /// RED before: the frame hardcoded `"stop_sequence":null`, and the stream
+    /// never stopped on a sequence at all (see the engine's sink tests).
+    #[test]
+    fn message_delta_names_the_stop_sequence_that_ended_the_stream() {
+        let parse = |frame: String| {
+            let (_, v) = frames(frame.as_bytes()).pop().expect("one frame");
+            (
+                v["delta"]["stop_reason"].clone(),
+                v["delta"]["stop_sequence"].clone(),
+            )
+        };
+        assert_eq!(
+            parse(message_delta_frame(
+                FinishReason::Stop,
+                Some("\"END\"\n".into()),
+                3
+            )),
+            (
+                serde_json::json!("stop_sequence"),
+                serde_json::json!("\"END\"\n")
+            ),
+            "the sequence is JSON-escaped, not spliced in raw"
+        );
+        // Unchanged for every stream a sequence did not end.
+        for (finish, reason) in [
+            (FinishReason::Stop, "end_turn"),
+            (FinishReason::Length, "max_tokens"),
+            (FinishReason::ToolCalls, "tool_use"),
+        ] {
+            assert_eq!(
+                parse(message_delta_frame(finish, None, 3)),
+                (serde_json::json!(reason), serde_json::Value::Null)
+            );
+        }
+        let (_, v) = frames(message_delta_frame(FinishReason::Length, None, 42).as_bytes())
+            .pop()
+            .unwrap();
+        assert_eq!(v["usage"]["output_tokens"], 42);
     }
 
     /// A stream that opens with anything else still gets a well-formed

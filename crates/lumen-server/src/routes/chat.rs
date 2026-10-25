@@ -29,6 +29,11 @@ fn apply_max_tokens_cap(req: &mut ChatCompletionRequest) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2048);
+    cap_max_tokens(req, cap);
+}
+
+/// [`apply_max_tokens_cap`] with the cap already read (`0` = no cap).
+fn cap_max_tokens(req: &mut ChatCompletionRequest, cap: usize) {
     if cap == 0 {
         return;
     }
@@ -139,6 +144,9 @@ pub async fn handle(
         Err(e) => return reply_err(response, format!("invalid request: {e}"), 400).await,
     };
 
+    // Before the cap, so a budget sent as `max_completion_tokens` is capped
+    // like one sent as `max_tokens`.
+    req.resolve_max_tokens();
     log_request_diag(&req);
     apply_max_tokens_cap(&mut req);
 
@@ -524,6 +532,8 @@ async fn handle_streaming(
                 prompt_tokens,
                 completion_tokens,
                 finish_reason,
+                // OpenAI has no field for the matched sequence.
+                stop_sequence: _,
             } => {
                 let elapsed = stream_start.elapsed().as_secs_f64();
                 let total_chunks = n_reasoning_chunks + n_visible_chunks + n_tool_chunks;
@@ -821,5 +831,60 @@ mod tests {
         let legacy = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap());
 
         assert_eq!(std::str::from_utf8(&new_buf).unwrap(), legacy);
+    }
+
+    /// The budget `handle` decodes under, from the request body as sent:
+    /// the same two steps in the same order, with the cap passed in.
+    fn budget(body: serde_json::Value, cap: usize) -> usize {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(body).expect("a valid chat request");
+        req.resolve_max_tokens();
+        cap_max_tokens(&mut req, cap);
+        req.max_tokens
+    }
+
+    fn body(budget: serde_json::Value) -> serde_json::Value {
+        let mut b = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        b.as_object_mut()
+            .unwrap()
+            .extend(budget.as_object().unwrap().clone());
+        b
+    }
+
+    /// RED before: the field was dropped, so a client that sends only
+    /// `max_completion_tokens` (OpenAI's current name) got the server default.
+    #[test]
+    fn max_completion_tokens_alone_sets_the_budget() {
+        assert_eq!(
+            budget(body(serde_json::json!({"max_completion_tokens": 64})), 2048),
+            64
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_over_max_tokens() {
+        let both = serde_json::json!({"max_tokens": 900, "max_completion_tokens": 64});
+        assert_eq!(budget(body(both), 2048), 64);
+        // Order on the wire does not matter.
+        let both = serde_json::json!({"max_completion_tokens": 64, "max_tokens": 900});
+        assert_eq!(budget(body(both), 2048), 64);
+        // And the old name alone is unchanged.
+        assert_eq!(
+            budget(body(serde_json::json!({"max_tokens": 900})), 2048),
+            900
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_is_capped_like_max_tokens() {
+        for name in ["max_tokens", "max_completion_tokens"] {
+            let b = body(serde_json::json!({ name: 204_800 }));
+            assert_eq!(budget(b.clone(), 2048), 2048, "{name}");
+            // `LUMEN_MAX_TOKENS_CAP=0` turns the cap off for both.
+            assert_eq!(budget(b, 0), 204_800, "{name}");
+        }
     }
 }

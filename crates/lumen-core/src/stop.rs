@@ -12,6 +12,8 @@ pub struct StopMatcher {
     stops: Vec<String>,
     /// Bytes seen but not yet emitted (a possible partial-stop tail).
     buf: String,
+    /// The stop string that ended the stream, once one has.
+    matched: Option<String>,
 }
 
 /// Outcome of feeding one piece to a [`StopMatcher`].
@@ -31,7 +33,14 @@ impl StopMatcher {
         Self {
             stops,
             buf: String::new(),
+            matched: None,
         }
+    }
+
+    /// The stop string the stream was cut at, if one completed. Anthropic
+    /// reports it back (`stop_sequence`), so "a stop hit" is not enough.
+    pub fn matched(&self) -> Option<&str> {
+        self.matched.as_deref()
     }
 
     /// No stops configured — the matcher is a pass-through.
@@ -41,7 +50,18 @@ impl StopMatcher {
 
     /// Feed the next decoded piece. Returns the safe-to-emit prefix and the
     /// stop flag.
+    ///
+    /// Terminal once a stop has matched: every later piece emits nothing and
+    /// reports `stopped` again. A caller is meant to end decoding at the first
+    /// `stopped`, but not every decode loop can be ended from its callback, and
+    /// one that keeps going must not stream the text after the stop.
     pub fn push(&mut self, piece: &str) -> StopStep {
+        if self.matched.is_some() {
+            return StopStep {
+                emit: String::new(),
+                stopped: true,
+            };
+        }
         if self.stops.is_empty() {
             return StopStep {
                 emit: piece.to_string(),
@@ -51,15 +71,20 @@ impl StopMatcher {
         self.buf.push_str(piece);
 
         // 1) Full stop: emit everything before the earliest match, drop the rest.
-        let mut hit: Option<usize> = None;
-        for s in &self.stops {
+        //    Two stops matching at the same byte go to the one listed first —
+        //    the same rule as the non-streaming trim, so both name the same one.
+        let mut hit: Option<(usize, usize)> = None;
+        for (k, s) in self.stops.iter().enumerate() {
             if let Some(idx) = self.buf.find(s.as_str()) {
-                hit = Some(hit.map_or(idx, |b| b.min(idx)));
+                if hit.is_none_or(|(b, _)| idx < b) {
+                    hit = Some((idx, k));
+                }
             }
         }
-        if let Some(idx) = hit {
+        if let Some((idx, k)) = hit {
             let emit = self.buf[..idx].to_string();
             self.buf.clear();
+            self.matched = Some(self.stops[k].clone());
             return StopStep {
                 emit,
                 stopped: true,
@@ -174,5 +199,34 @@ mod tests {
             run(&["world", "lo"], &["hello world"]),
             ("hel".into(), true)
         );
+    }
+
+    #[test]
+    fn names_the_stop_that_matched() {
+        let mut m = StopMatcher::new(vec!["world".into(), "lo".into()]);
+        assert_eq!(m.matched(), None);
+        assert!(m.push("hel").emit == "he" && m.matched().is_none());
+        assert!(m.push("lo world").stopped);
+        assert_eq!(
+            m.matched(),
+            Some("lo"),
+            "the earliest match, not the first listed"
+        );
+        // Same start byte: the one listed first, as the non-streaming trim does.
+        let mut m = StopMatcher::new(vec!["bc".into(), "b".into()]);
+        assert!(m.push("abc").stopped);
+        assert_eq!(m.matched(), Some("bc"));
+        // Terminal: a decode loop that runs on past the stop streams nothing more.
+        let mut m = StopMatcher::new(vec!["STOP".into()]);
+        assert!(m.push("a STOP b").stopped);
+        let after = m.push(" more text STOP again");
+        assert_eq!((after.emit.as_str(), after.stopped), ("", true));
+        assert_eq!(m.flush(), "");
+        assert_eq!(m.matched(), Some("STOP"));
+        // A stream that never completes a stop names none.
+        let mut m = StopMatcher::new(vec!["STOP".into()]);
+        m.push("ST");
+        m.flush();
+        assert_eq!(m.matched(), None);
     }
 }

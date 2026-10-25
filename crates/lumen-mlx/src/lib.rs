@@ -5270,7 +5270,13 @@ impl MlxQwen35Backend {
             );
         }
 
-        if self.prefix_store.enabled()
+        // The prefix-cache path renders and prefills text only, and its key is
+        // the system prompt alone. Without `!has_images` here, an image request
+        // with a system message was answered from a prompt that never had the
+        // image in it, with a 200 — even on a checkpoint with no vision tower,
+        // which the image path below refuses.
+        if !has_images
+            && self.prefix_store.enabled()
             && let Some(key) = auto_prefix_key(messages, effort)
         {
             return self.chat_streaming_prefix_cache(
@@ -8850,6 +8856,129 @@ mod tests {
         assert_eq!(run(vec![5, 6, 5, 6, 5], 3), StopCause::MaxTokens);
         assert_eq!(run(vec![5, 6, SCRIPT_EOS], 3), StopCause::EndOfTurn);
         assert_eq!(run(vec![SCRIPT_EOS], 3), StopCause::EndOfTurn);
+    }
+
+    // ───────── an image request never takes the text-only prefix cache ─────────
+
+    /// A Qwen backend with the prefix cache on, as it is by default, behind the
+    /// [`MlxBackend`] dispatch the server calls. The scripted runner has no
+    /// vision tower, so a request that really reaches the image path fails — the
+    /// same refusal a checkpoint without `LUMEN_VISION=1` gives.
+    fn qwen_with_prefix_cache() -> MlxBackend {
+        let tokenizer =
+            <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+        let mut b =
+            MlxQwen35Backend::with_token_script(vec![CHAT_BLUE; 8], CHAT_IM_END, tokenizer, 12);
+        b.prefix_store = prefix_cache::PrefixCacheStore::with_incremental(true, 4, false);
+        MlxBackend::Qwen35Family(b)
+    }
+
+    fn image_chat(
+        b: &mut MlxBackend,
+        messages: &[(&str, &str)],
+        images: &[Vec<Vec<u8>>],
+        stream: bool,
+    ) -> Result<crate::chat_io::ParsedResponse> {
+        let messages: Vec<(String, String)> = messages
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect();
+        let ov = SamplingOverrides::default();
+        let auto = crate::chat_io::ResolvedToolChoice::Auto;
+        if stream {
+            b.chat_streaming_with_images(
+                &messages,
+                images,
+                4,
+                0.0,
+                1.0,
+                &ov,
+                false,
+                None,
+                &[],
+                &auto,
+                None,
+                |_| Ok(()),
+            )
+        } else {
+            b.chat_with_images(
+                &messages,
+                images,
+                4,
+                0.0,
+                1.0,
+                &ov,
+                false,
+                None,
+                &[],
+                &auto,
+                None,
+            )
+        }
+    }
+
+    fn qwen(b: &mut MlxBackend) -> &mut MlxQwen35Backend {
+        match b {
+            MlxBackend::Qwen35Family(m) => m,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("built as Qwen"),
+        }
+    }
+
+    /// RED before: with a system message the request took the prefix-cache
+    /// path, which renders text only, so the model answered `Blue` without ever
+    /// seeing the image — and without the vision tower this backend lacks.
+    #[test]
+    fn an_image_request_with_a_system_message_is_not_answered_without_its_image() {
+        let images = vec![Vec::new(), vec![b"not really a png".to_vec()]];
+        for stream in [false, true] {
+            let mut b = qwen_with_prefix_cache();
+            let r = image_chat(&mut b, &[("system", "S"), ("user", "U1")], &images, stream);
+            assert!(
+                r.is_err(),
+                "stream={stream}: the image path must be taken (and refuse here), \
+                 got a text-only answer {:?}",
+                r.map(|p| p.visible)
+            );
+            let q = qwen(&mut b);
+            assert!(
+                q.script_runner().feeds.is_empty(),
+                "stream={stream}: nothing may be prefilled without the image"
+            );
+            assert_eq!(q.prefix_cache_count(), 0, "stream={stream}");
+
+            // The control: no system message, so no prefix key — already refused.
+            let mut b = qwen_with_prefix_cache();
+            let r = image_chat(&mut b, &[("system", ""), ("user", "U1")], &images, stream);
+            assert!(r.is_err(), "stream={stream}");
+        }
+    }
+
+    /// The guard is on images only: the same loop given no image still reuses
+    /// the system prompt. (The dispatch sends text-only requests to the session
+    /// path instead, so this calls the loop the image requests reach.)
+    #[test]
+    fn the_image_loop_without_an_image_still_uses_the_prefix_cache() {
+        let mut b = qwen_with_prefix_cache();
+        let q = qwen(&mut b);
+        let messages = vec![
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let seq = q.alloc_seq_id();
+        let visible = q
+            .chat_streaming_with_images(
+                &messages,
+                &[Vec::new(), Vec::new()],
+                4,
+                false,
+                seq,
+                |_| {},
+                None,
+            )
+            .expect("text chat");
+        assert_eq!(visible, "BlueBlueBlueBlue");
+        assert_eq!(q.prefix_cache_count(), 1);
     }
 
     #[derive(Default)]

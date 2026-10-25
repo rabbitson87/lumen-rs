@@ -10,10 +10,11 @@ pub async fn handle(
     response: Response<ArenaWriter>,
     handle: EngineHandle,
 ) -> Result<(), SendableError> {
-    let req: CompletionRequest = match request.get_json_arena() {
+    let mut req: CompletionRequest = match request.get_json_arena() {
         Ok(r) => r,
         Err(e) => return reply_err(response, format!("invalid request: {e}"), 400).await,
     };
+    req.resolve_max_tokens();
 
     match handle.completion(req).await {
         Ok(resp) => respond(response, 200, &resp).await,
