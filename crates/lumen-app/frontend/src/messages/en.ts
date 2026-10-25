@@ -649,6 +649,7 @@ export const en: Record<string, string> = {
   "flashnext.summary.speedUnknown":
     "speed not measured yet",
   "flashnext.summary.auto": "auto",
+  "flashnext.summary.autoNow": "auto, with the memory other apps leave free now",
   "flashnext.summary.set": "set by you",
   "flashnext.summary.noFit": "this does not fit the GPU's memory",
   "flashnext.reset": "Reset to recommended",

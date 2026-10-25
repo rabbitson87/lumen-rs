@@ -919,10 +919,12 @@
   }
 
   // Whether the server is up changes whether the pack can be built, and a model that finished
-  // downloading may be the Flash-Next one.
+  // downloading may be the Flash-Next one. Switching tabs reads it again too: the pack
+  // or the draft head can be added or deleted on disk while the app is open.
   $effect(() => {
     void status.state;
     void models.length;
+    void activeTab;
     refreshFlashStatus();
   });
 

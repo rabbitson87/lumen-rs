@@ -639,6 +639,7 @@ export const ko: Record<string, string> = {
   "flashnext.summary.speedUnknown":
     "속도는 아직 측정 전",
   "flashnext.summary.auto": "자동",
+  "flashnext.summary.autoNow": "자동, 지금 다른 앱이 남긴 메모리 기준",
   "flashnext.summary.set": "직접 지정",
   "flashnext.summary.noFit": "GPU 메모리에 들어가지 않습니다",
   "flashnext.reset": "권장값으로 되돌리기",

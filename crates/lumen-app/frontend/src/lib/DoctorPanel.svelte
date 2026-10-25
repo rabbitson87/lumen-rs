@@ -318,6 +318,8 @@
     fixMessage = null;
     try {
       onReport(await api.doctorRun());
+      // The pack or the draft head may have been added or deleted on disk since the card read them.
+      onProbed?.();
     } finally {
       running = false;
     }

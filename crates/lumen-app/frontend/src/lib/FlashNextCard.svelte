@@ -23,6 +23,7 @@
   import type { Chip } from "./chips";
   import { fill } from "./format";
   import {
+    FLASH_NEXT,
     FLASH_NEXT_LANE_PRESETS,
     FLASH_NEXT_LANES_DEFAULT,
     envChoice,
@@ -33,6 +34,7 @@
     flashNextPlan,
     flashNextShadowedKeys,
     flashNextUsableBytes,
+    flashNextUsableNow,
     lanesValue,
     mtpMode,
     parseGbInput,
@@ -143,10 +145,30 @@
       })),
   );
 
+  // An `auto` pool is planned within what other apps leave free when the server loads: when that
+  // is less than the plan, the summary says what a server started now would get (the memory plan
+  // beside it explains why). Same rule as the calculator's note.
+  const poolNow = $derived.by(() => {
+    if (eff.poolExplicit || !memoryNow || !(memoryNow.reclaimable_bytes > 0)) return null;
+    const within = flashNextUsableNow(
+      usable,
+      memoryNow.total_bytes,
+      memoryNow.reclaimable_bytes,
+      memoryNow.server_footprint_bytes ?? 0,
+    );
+    if (usable - within < 0.05e9) return null;
+    const pool = within - FLASH_NEXT.trunkBytes - eff.estimate.plan.reserveBytes;
+    return Math.max(FLASH_NEXT.poolFloorBytes, Math.min(pool, eff.estimate.poolBytes));
+  });
+
   const summary = $derived(
     fill(t("flashnext.summary"), {
-      pool: (eff.estimate.poolBytes / 1e9).toFixed(1),
-      how: eff.poolExplicit ? t("flashnext.summary.set") : t("flashnext.summary.auto"),
+      pool: ((poolNow ?? eff.estimate.poolBytes) / 1e9).toFixed(1),
+      how: eff.poolExplicit
+        ? t("flashnext.summary.set")
+        : poolNow != null
+          ? t("flashnext.summary.autoNow")
+          : t("flashnext.summary.auto"),
       prompt: eff.promptTokens.toLocaleString("en-US"),
       pack: eff.pack ? t("flashnext.on") : t("flashnext.off"),
       head: eff.head ? t("flashnext.on") : t("flashnext.off"),
