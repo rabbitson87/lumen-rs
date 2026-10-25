@@ -829,6 +829,12 @@ pub fn inference_error_message(e: &anyhow::Error) -> String {
     format!("inference error: {e:#}")
 }
 
+/// [`inference_error_message`] for a refusal that reached a streaming route as
+/// the engine's event text, so both routes word it the same way.
+pub fn refusal_message(msg: &str) -> String {
+    format!("inference error: {msg}")
+}
+
 /// The status an inference failure goes out with: 400 for a prompt the size
 /// guard refused — the client's to fix, and one an SDK must not retry the way
 /// it retries a 5xx — and 500 for everything else.

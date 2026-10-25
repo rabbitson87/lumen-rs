@@ -75,22 +75,29 @@ async fn handle_streaming(
     // ask for extended thinking?", which is the spec's condition for a
     // `thinking` block appearing in the response at all.
     let emit_thinking = req.enable_thinking();
+    let mut token_rx = match handle.anthropic_messages_streaming(req).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            let mut err = AnthropicError::new(crate::types::inference_error_message(&e));
+            err.error.r#type = "api_error".into();
+            return respond(response, 500, &err).await;
+        }
+    };
+    // A request the engine refuses before decoding (a prompt over the context
+    // cap, an image it cannot read) gets the status the non-streaming route
+    // gives it, not `200` and an `error` event.
+    let first = match super::await_admission(&mut token_rx).await {
+        super::Admission::Refused(msg) => {
+            let err = AnthropicError::new(crate::types::refusal_message(&msg));
+            return respond(response, 400, &err).await;
+        }
+        super::Admission::Answered(first) => Some(first),
+        super::Admission::Pending => None,
+    };
     let head = super::sse_head(response.headers());
     let mut tcp = response.into_body().stream;
 
     tcp.write_all(head.as_bytes()).await?;
-
-    let mut token_rx = match handle.anthropic_messages_streaming(req).await {
-        Ok(rx) => rx,
-        Err(e) => {
-            let msg = format!(
-                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"server_error\",\"message\":\"{e}\"}}}}\n\n"
-            );
-            tcp.write_all(msg.as_bytes()).await?;
-            tcp.flush().await?;
-            return Ok(());
-        }
-    };
 
     let msg_id = format!(
         "msg_{:x}",
@@ -110,11 +117,16 @@ async fn handle_streaming(
     // accumulating usage across the stream reported 0 input tokens for a
     // 289-token tool prompt.
     //
-    // Anything other than `Start` first (an immediate `Error`, or a backend
-    // that never learned to send it) is carried into the loop below and
+    // Anything other than `Start` first (an `Error` that came after the
+    // admission wait above, or a backend that never learned to send `Start`)
+    // is carried into the loop below and
     // `message_start` goes out with `0` as before, rather than blocking the
     // stream on an event that may never come.
-    let (input_tokens, mut carry) = message_start_input_tokens(token_rx.recv().await);
+    let first = match first {
+        Some(first) => first,
+        None => token_rx.recv().await,
+    };
+    let (input_tokens, mut carry) = message_start_input_tokens(first);
     let start = format!(
         "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":1}}}}}}\n\n"
     );

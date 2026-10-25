@@ -1345,6 +1345,9 @@ impl InferenceEngine {
             let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
             return;
         }
+        // Admitted: the route waits for this (or the refusal above) before it
+        // writes the stream's head, so a refusal can still be an HTTP error.
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
 
         // Phase 1.5: when prior assistant tool_calls or role:"tool" are
         // in the request, dispatch through chat_streaming_from_history
@@ -2905,6 +2908,10 @@ pub enum StreamEvent {
     /// hours late by the format's own ordering, and the route was filling the
     /// field with a hardcoded `0`. Emitted immediately after the count and
     /// before prefill, so the wait costs nothing.
+    ///
+    /// It is also the admission: both streaming routes wait for it (briefly,
+    /// see `routes::await_admission`) before writing their head, so an `Error`
+    /// ahead of it is a refusal and can still go out as an HTTP error.
     Start { prompt_tokens: u32 },
     /// Generation complete with token counts and a finish-reason hint.
     Done {
@@ -3554,22 +3561,27 @@ impl InferenceEngine {
         thinking: bool,
         token_tx: mpsc::Sender<StreamEvent>,
     ) -> Result<(ActiveSeqState, bool)> {
-        let qb = self
-            .mlx_batched_driver()
-            .ok_or_else(|| anyhow::anyhow!("start_streaming_seq_mlx: not an MLX backend"))?;
-
         let msg_pairs: Vec<(String, String)> = messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        let driver_missing = || anyhow::anyhow!("start_streaming_seq_mlx: not an MLX backend");
         // `None`, and provably so rather than by omission: `admit_streaming_mlx`
         // routes to the non-batched path whenever `thinking` is true (see its
         // `|| thinking` guard), and Qwen 3.8's template emits the effort block
         // only when thinking is on. A batched sequence therefore never has an
         // effort to carry.
-        let prompt_ids = qb.build_chat_input(&msg_pairs, thinking, None)?;
+        let (prompt_ids, eos_tokens) = {
+            let qb = self.mlx_batched_driver().ok_or_else(driver_missing)?;
+            let prompt_ids = qb.build_chat_input(&msg_pairs, thinking, None)?;
+            (prompt_ids, qb.eos_tokens().to_vec())
+        };
         let prompt_tokens = prompt_ids.len() as u32;
-        let eos_tokens = qb.eos_tokens().to_vec();
+        // The sequential path's context guard and admission. Without the guard
+        // an over-cap prompt went straight into prefill here.
+        guard_prompt_fits(&self.backend, prompt_tokens)?;
+        let _ = token_tx.try_send(StreamEvent::Start { prompt_tokens });
+        let qb = self.mlx_batched_driver().ok_or_else(driver_missing)?;
         let max_new = if max_tokens == 0 { 256 } else { max_tokens };
 
         let t_prefill = std::time::Instant::now();

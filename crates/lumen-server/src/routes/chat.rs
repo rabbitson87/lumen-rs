@@ -174,21 +174,27 @@ async fn handle_streaming(
         .as_ref()
         .map(|o| o.include_usage)
         .unwrap_or(false);
+    let mut token_rx = match handle.chat_completion_streaming(req).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            return reply_err(response, crate::types::inference_error_message(&e), 500).await;
+        }
+    };
+    // A request the engine refuses before decoding (a prompt over the context
+    // cap) gets the status the non-streaming route gives it, not `200` and an
+    // error chunk. `carry` hands whatever came first to the loop below.
+    let first = match super::await_admission(&mut token_rx).await {
+        super::Admission::Refused(msg) => {
+            return reply_err(response, crate::types::refusal_message(&msg), 400).await;
+        }
+        super::Admission::Answered(first) => first,
+        super::Admission::Pending => None,
+    };
     let head = super::sse_head(response.headers());
     let mut tcp = response.into_body().stream;
 
     // Write HTTP headers for SSE
     tcp.write_all(head.as_bytes()).await?;
-
-    let mut token_rx = match handle.chat_completion_streaming(req).await {
-        Ok(rx) => rx,
-        Err(e) => {
-            let msg = format!("data: {{\"error\":\"{e}\"}}\n\n");
-            tcp.write_all(msg.as_bytes()).await?;
-            tcp.flush().await?;
-            return Ok(());
-        }
-    };
 
     let id = format!(
         "chatcmpl-{:x}",
@@ -278,7 +284,7 @@ async fn handle_streaming(
         s.push_str(",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n");
         s.into_bytes()
     };
-    let mut carry: Option<StreamEvent> = None;
+    let mut carry: Option<StreamEvent> = first;
     // Reasoning placement (see `engine::reasoning_in_content`). Default false
     // → match Ollama: stream thinking ONLY in `delta.reasoning`, never mirror
     // it into `delta.content` as `<think>…</think>`. Legacy dual emission is
