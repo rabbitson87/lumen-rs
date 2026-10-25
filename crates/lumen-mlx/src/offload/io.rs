@@ -948,28 +948,53 @@ mod tests {
             unsafe { pool.run(jobs) }.unwrap();
             (bufs, t.elapsed())
         };
-        let (full, _) = read_all(None);
+        let (full, unpaced) = read_all(None);
         for (b, &o) in full.iter().zip(&offs) {
             assert_eq!(b[..], data[o as usize..o as usize + b.len()]);
         }
         let bytes = (12 * (512 << 10)) as f64;
-        // 0.1 and 0.05 GB/s: 63 and 126 ms for the batch.
+        // 0.1 and 0.05 GB/s: 63 and 126 ms for the batch. The pacing is the lower bound, always
+        // checked. How far past it the batch ends depends on how late a sleeping thread wakes:
+        // with the user away macOS may coalesce timers (a 5 ms sleep measured 200 ms), so the
+        // upper bound and the ratio are only checked when this machine's sleeps are precise.
+        let oversleep = {
+            let mut late: Vec<Duration> = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    std::thread::sleep(Duration::from_millis(1));
+                    t.elapsed().saturating_sub(Duration::from_millis(1))
+                })
+                .collect();
+            late.sort();
+            late[2]
+        };
+        let precise = oversleep < Duration::from_millis(3);
         let mut took = Vec::new();
         for gbps in [0.1, 0.05] {
             let (paced, elapsed) = read_all(Some(gbps));
             assert_eq!(paced, full, "pacing at {gbps} GB/s changed the bytes");
             let want = Duration::from_secs_f64(bytes / (gbps * 1e9));
-            assert!(
-                elapsed >= want && elapsed < want + want / 2 + Duration::from_millis(30),
-                "{gbps} GB/s: {elapsed:?} for a batch the rate allows in {want:?}"
-            );
+            assert!(elapsed >= want, "{gbps} GB/s: {elapsed:?} < {want:?}");
+            if precise {
+                assert!(
+                    elapsed < want + want / 2 + 2 * unpaced + Duration::from_millis(30),
+                    "{gbps} GB/s: {elapsed:?} for a batch the rate allows in {want:?} \
+                     (unpaced {unpaced:?})"
+                );
+            }
             took.push(elapsed.as_secs_f64());
         }
         let ratio = took[1] / took[0];
-        assert!(
-            (1.7..2.3).contains(&ratio),
-            "half the rate took {ratio:.2}x as long"
-        );
+        if precise {
+            assert!(
+                (1.7..2.3).contains(&ratio),
+                "half the rate took {ratio:.2}x as long"
+            );
+        } else {
+            eprintln!(
+                "timers are coarse here (a 1 ms sleep overshoots by {oversleep:?}): checked the lower bound only"
+            );
+        }
         assert_eq!(pool.throttle_gbps(), Some(0.05));
         pool.set_throttle(None);
         assert_eq!(pool.throttle_gbps(), None);

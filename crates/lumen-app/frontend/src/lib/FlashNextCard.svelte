@@ -13,7 +13,13 @@
   import PackBuildControl from "./PackBuildControl.svelte";
   import PoolPicker from "./PoolPicker.svelte";
   import PromptPicker from "./PromptPicker.svelte";
-  import type { FlashNextSettings, FlashNextStatus, MeasureProgress, PackProgress } from "./api";
+  import type {
+    FlashNextSettings,
+    FlashNextStatus,
+    MeasureProgress,
+    MemoryUsage,
+    PackProgress,
+  } from "./api";
   import type { Chip } from "./chips";
   import { fill } from "./format";
   import {
@@ -44,6 +50,8 @@
     memoryLimitGb?: number | null;
     /** The Max context card. */
     contextMax?: number;
+    /** The live memory monitor's reading: what other apps leave free now. */
+    memoryNow?: MemoryUsage | null;
     status: FlashNextStatus | null;
     /** The latest expert-pack build report of this session. */
     build: PackProgress | null;
@@ -66,6 +74,7 @@
     ramGb,
     memoryLimitGb = null,
     contextMax,
+    memoryNow = null,
     status,
     build,
     measure,
@@ -374,6 +383,7 @@
         {memoryLimitGb}
         {env}
         {contextMax}
+        {memoryNow}
         {status}
         {measure}
         enabled={enabled}

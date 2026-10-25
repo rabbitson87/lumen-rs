@@ -73,6 +73,8 @@ const {
   flashNextSettingsEnv,
   flashNextShadowedKeys,
   flashNextUsableBytes,
+  flashNextLiveHeadroom,
+  flashNextUsableNow,
   geometryForModel,
   isFlashNextModelId,
   kvBytes,
@@ -134,6 +136,24 @@ test("usable memory is 2/3 of RAM up to 32 GiB and 3/4 above, times 0.88", () =>
   assert.equal(flashNextUsableBytes(36, 9), 9 * GIB);
   near(flashNextUsableBytes(16, 64), flashNextUsableBytes(16), 1);
   assert.equal(flashNextUsableBytes(36, null), flashNextUsableBytes(36));
+});
+
+// Same cases as `a_server_started_now_plans_within_what_other_apps_leave` in flash_next.rs.
+test("a server started now plans within what other apps leave, less 2 GB or 5% of RAM", () => {
+  const ram = 36 * GIB;
+  assert.equal(flashNextLiveHeadroom(ram), 2e9);
+  assert.equal(flashNextLiveHeadroom(64 * GIB), 3_435_973_836);
+  assert.equal(flashNextLiveHeadroom(16 * GIB), 2e9);
+  assert.equal(flashNextLiveHeadroom(24 * GIB), 2e9);
+  const usable = flashNextUsableBytes(36);
+  // Idle: more free than the GPU may use, so the plan is the usual one.
+  assert.equal(flashNextUsableNow(usable, ram, 30e9, 0), usable);
+  // An editor, a browser and chat apps open: 17.7 GB reclaimable, 15.7 GB to plan within.
+  assert.equal(flashNextUsableNow(usable, ram, 17_707_089_920, 0), 15_707_089_920);
+  // A running server's memory is a restarted one's too.
+  assert.equal(flashNextUsableNow(usable, ram, 7e9, 10e9), 15e9);
+  // Less than the headroom free is nothing.
+  assert.equal(flashNextUsableNow(usable, 16 * GIB, 1e9, 0), 0);
 });
 
 test("the reserve adds buffers, chunk activations, KV of the longest prompt and half the scores", () => {
@@ -551,6 +571,8 @@ test("the sizes, plan constants and speed tables match src/flash_next.rs", () =>
   assert.equal(num("WORKING_SET_SHARE_LARGE"), F.workingSetShareLarge);
   assert.equal(num("SMALL_RAM_BYTES"), F.smallRamGib * GIB);
   assert.equal(num("WORKING_SET_FILLABLE"), F.fillableShare);
+  assert.equal(num("LIVE_HEADROOM_BYTES"), F.liveHeadroomBytes);
+  assert.equal(num("LIVE_HEADROOM_RAM_SHARE"), F.liveHeadroomRamShare);
 
   const table = (name: string): number[][] => {
     const m = rs.match(new RegExp(`${name}: \\[\\(f64, f64\\); \\d\\] =\\s*\\[([^;]+)\\];`));

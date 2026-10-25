@@ -209,6 +209,11 @@ export interface MemoryUsage {
   total_bytes: number;
   /** Wired (kernel-locked) bytes; the rest of `used` is reclaimable. */
   wired_bytes: number;
+  /** What the rest of the machine gives up without anyone being compressed or swapped: free,
+   *  file-backed and purgeable pages. Flash-Next's server plans its expert pool within it. */
+  reclaimable_bytes: number;
+  /** The running lumen-server's footprint (0 when none runs). */
+  server_footprint_bytes: number;
 }
 
 export type LifecycleState = "stopped" | "starting" | "running" | "stopping" | "crashed";

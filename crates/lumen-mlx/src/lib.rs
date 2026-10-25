@@ -59,6 +59,9 @@ mod vision_splice;
 // On-disk KV-cache persistence primitives (P0). Pure format/store layer
 // compiles under default features; Array<->record conversion is gated behind
 // `mlx-native`. Phase 1 wires this into the prefix-cache disk tier.
+/// What other processes leave this one right now (`host_statistics64`), for memory plans made at
+/// load. Ungated: plain libc, no MLX.
+pub mod host_memory;
 pub mod kv_disk;
 
 /// Metal memory configuration re-exports. Used by `lumen-server` to
@@ -117,6 +120,26 @@ pub mod metal_memory {
     /// fills the cache up to the trigger and then fails with `Insufficient
     /// Memory` instead of recycling it.
     pub const WORKING_SET_SHARE: f64 = 0.88;
+
+    /// The memory a model's plan was made within when that is less than the working set's
+    /// share (Flash-Next plans its expert pool from what other apps leave free at load): 0
+    /// when no plan asked. The server sets MLX's memory limit after the load and lowers it to
+    /// this, or MLX's buffer cache would grow into the memory the plan left other apps.
+    static PLANNED_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Record the memory a plan was made within (see [`planned_limit`]).
+    pub fn set_planned_limit(bytes: usize) {
+        PLANNED_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The memory the loaded model's plan was made within, when it asked for MLX's limit to
+    /// be lowered to it.
+    pub fn planned_limit() -> Option<usize> {
+        match PLANNED_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
 
     /// `configured` lowered to [`WORKING_SET_SHARE`] of `working_set`; unchanged
     /// when the working set is unknown.

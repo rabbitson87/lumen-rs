@@ -16,6 +16,7 @@ use mlx_rs::Array;
 
 use super::config::Qwen4ExpConfig;
 use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpCache, Qwen4ExpModel};
+use crate::host_memory::HostMemory;
 use crate::kv_disk::{DiskKvStore, KvManifest};
 use crate::session_feed::PrefillGrid;
 use crate::{ProbeRows, Runner};
@@ -475,44 +476,234 @@ fn parse_pool_size(raw: &str) -> Result<Option<u64>> {
 /// reserve is conservative, and the sizes people write are round.
 const POOL_OVERSHOOT_OK: u64 = 500_000_000;
 
-/// The pool an operator asked for, lowered to what fits beside the trunk and a prefill's
-/// reserve. A request that does not fit would not fail at load but halfway through a long prompt,
-/// when the GPU runs out of memory, so it is lowered here (and said so), never run.
-fn fit_pool(requested: u64, usable: u64, plan: &MemoryPlan) -> u64 {
-    let fits = usable.saturating_sub(TRUNK_BYTES + plan.reserve);
-    if requested <= fits + POOL_OVERSHOOT_OK {
-        return requested;
+lumen_flags::flag! {
+    /// Plan the expert pool within the memory that is free right now, not only within the GPU's
+    /// working set: the working set's share is lowered to what this process holds plus the pages
+    /// the rest of the machine gives up without being compressed or swapped (free, file-backed
+    /// and purgeable ones), less a headroom of 2 GB or 5% of RAM, whichever is larger. The
+    /// pool cannot change while the server runs, so a server started while other apps hold
+    /// memory keeps a smaller pool (and decodes slower) until it is restarted; the log says so.
+    /// `0` plans from the working set alone, as before, and the system makes room for the pool by
+    /// compressing other apps and writing them to swap.
+    pub(crate) plan_reclaimable {
+        env: "LUMEN_MEMORY_PLAN_RECLAIMABLE",
+        default: true,
+        kind: Behavior,
     }
-    eprintln!(
-        "[qwen4_exp] a {:.1} GB expert pool does not fit: this GPU may use {:.1} GB, the trunk \
-         takes {:.1} and a {}-token prompt (chunk {}) {:.1}, which leaves {:.1} GB. Using that. \
-         A smaller LUMEN_MAX_PROMPT_TOKENS leaves more for the pool.",
-        requested as f64 / 1e9,
-        usable as f64 / 1e9,
-        TRUNK_BYTES as f64 / 1e9,
-        plan.ctx_tokens,
-        plan.chunk,
-        plan.reserve as f64 / 1e9,
-        fits as f64 / 1e9
-    );
-    fits
 }
 
-/// Bytes of expert pool: `LUMEN_MOE_EXPERT_CACHE_GB` (a size, or `auto`), and when unset what the
-/// GPU working set leaves after the trunk and a prefill's reserve. Holding all experts in memory
-/// is not an option on a Mac (they are 68 GB).
-fn expert_budget_bytes(usable: u64, plan: &MemoryPlan) -> Result<u64> {
-    let raw = std::env::var("LUMEN_MOE_EXPERT_CACHE_GB").unwrap_or_default();
-    Ok(match parse_pool_size(&raw)? {
-        Some(requested) => fit_pool(requested, usable, plan),
-        None => plan.pool,
-    })
+/// What a plan made from the memory free now leaves the rest of the machine: [`HEADROOM_MIN`],
+/// or [`HEADROOM_RAM_SHARE`] of RAM on a Mac of more than 40 GB. The plan is MLX's, and the
+/// process goes past it by ~1.2 GB whatever the pool (measured on Flash-Next with a 15K-token
+/// prompt at pools of 9.6, 13.0 and 19.2 GB: peak footprints 1.21, 1.22 and 1.23 GB over the
+/// plan): 0.55-0.75 GB it keeps beside MLX's buffers (tokenizer, I/O buffers, Metal driver) and
+/// ~0.5 GB by which MLX's prefill peak passes its soft limit. The rest is for the free pages the
+/// kernel keeps for itself (0.1-0.4 GB on a busy Mac, which it frees by compressing other apps)
+/// and for other apps growing while the server runs. At 1.5 GB that rest would be 0.3 GB.
+const HEADROOM_MIN: u64 = 2_000_000_000;
+const HEADROOM_RAM_SHARE: f64 = 0.05;
+
+fn headroom(ram: u64) -> u64 {
+    HEADROOM_MIN.max((ram as f64 * HEADROOM_RAM_SHARE) as u64)
+}
+
+/// The most memory a plan made now may count on (see [`plan_reclaimable`]): what this process
+/// holds plus what the rest of the machine gives up without swapping, less the headroom.
+fn free_now(host: &HostMemory) -> u64 {
+    host.available_to_self().saturating_sub(headroom(host.ram))
+}
+
+/// The smallest pool the expert bank runs with: a staging region and a layer beside it, two
+/// layers' worth of experts (1,024 slots, 2.83 GB on Flash-Next). The bank raises any smaller
+/// budget to its own count of this.
+fn pool_floor_bytes(cfg: &Qwen4ExpConfig) -> u64 {
+    2 * cfg.num_experts as u64 * cfg.routed_expert_bytes()
+}
+
+/// The expert pool a load builds and the memory it is planned within.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolChoice {
+    /// Bytes of expert pool asked of the bank, never below the floor.
+    pool: u64,
+    /// The memory the plan is made within: the GPU's share, lowered to what is free now. MLX's
+    /// memory limit and the budget the session code keeps the live memory under.
+    usable: u64,
+    /// Bytes that what is free now took off the GPU's share (0: it took nothing).
+    clamped_by: u64,
+    /// Not even the smallest pool fits beside the trunk and the reserve: the pool is the floor.
+    at_floor: bool,
+    /// What an explicit `LUMEN_MOE_EXPERT_CACHE_GB` asked for, when it was lowered to fit.
+    lowered_from: Option<u64>,
+}
+
+/// The pool for a GPU that may use `device` bytes when `free` bytes are free now (`None`: not
+/// read, or [`plan_reclaimable`] is off), with `requested` the operator's
+/// `LUMEN_MOE_EXPERT_CACHE_GB` and `floor` the smallest pool the bank runs.
+///
+/// `plan` is made for `device`: a busy machine keeps the chunk and the context its working set
+/// gets (the prompt guard reads the plan's context), only its pool shrinks. A requested size is
+/// lowered to what fits, as it is against the device alone: a pool that does not fit would not
+/// fail at load but halfway through a long prompt, when the GPU runs out of memory.
+fn choose_pool(
+    device: u64,
+    free: Option<u64>,
+    plan: &MemoryPlan,
+    requested: Option<u64>,
+    floor: u64,
+) -> PoolChoice {
+    let within = free.map_or(device, |f| f.min(device));
+    let fits = within.saturating_sub(TRUNK_BYTES + plan.reserve);
+    let (wanted, lowered_from) = match requested {
+        Some(r) if r > fits + POOL_OVERSHOOT_OK => (fits, Some(r)),
+        Some(r) => (r, None),
+        None => (fits, None),
+    };
+    let at_floor = wanted < floor;
+    let pool = wanted.max(floor);
+    // A pool at its floor holds more than `within` leaves: the plan is for what it holds, up to
+    // the device (where a tight Mac's plan stays, as before).
+    let usable = if at_floor {
+        within.max((TRUNK_BYTES + pool + plan.reserve).min(device))
+    } else {
+        within
+    };
+    PoolChoice {
+        pool,
+        usable,
+        clamped_by: device - within,
+        at_floor,
+        lowered_from,
+    }
+}
+
+/// What is free now, for the plan: `None` when [`plan_reclaimable`] is off (or the counts
+/// cannot be read), which plans from the working set alone.
+fn host_for_plan(device: u64) -> Option<HostMemory> {
+    if !plan_reclaimable::get() {
+        return None;
+    }
+    settled(HostMemory::read, std::thread::sleep, device)
+}
+
+/// Readings [`settled`] takes at most after the first, [`SETTLE_EVERY`] apart.
+const SETTLE_READS: usize = 6;
+const SETTLE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Growth between two readings below which the memory is taken as settled.
+const SETTLE_GROWTH: u64 = 250_000_000;
+
+/// A reading of what is free that is not still growing. The memory of a process that has just
+/// exited comes back about a second later (MLX's buffers are wired): measured when a loaded
+/// server's process had exited, 2.8 GB reclaimable, then 26 GB a second later. A server restarted
+/// at once would plan for the first. So while a reading would cut the plan, it is taken again,
+/// half a second apart, until it stops growing (at most 3 s). Memory other apps hold does not
+/// grow back, and costs the load one extra reading.
+fn settled(
+    mut read: impl FnMut() -> Option<HostMemory>,
+    mut sleep: impl FnMut(std::time::Duration),
+    device: u64,
+) -> Option<HostMemory> {
+    let mut host = read()?;
+    for _ in 0..SETTLE_READS {
+        if free_now(&host) >= device {
+            break;
+        }
+        sleep(SETTLE_EVERY);
+        let Some(next) = read() else { break };
+        let growing = free_now(&next) > free_now(&host) + SETTLE_GROWTH;
+        host = next;
+        if !growing {
+            break;
+        }
+    }
+    Some(host)
+}
+
+/// The log line that says what was free when the plan was made, part by part.
+fn free_line(host: &HostMemory) -> String {
+    format!(
+        "[qwen4_exp] free now: {:.1} GB (free {:.1} + file-backed {:.1} + purgeable {:.1}; other \
+         apps hold {:.1} GB that only compressing or swapping them frees) + this process {:.1} - \
+         headroom {:.1} = {:.1} GB for the plan (LUMEN_MEMORY_PLAN_RECLAIMABLE=0 plans without it)",
+        gb(host.reclaimable()),
+        gb(host.free),
+        gb(host.file_backed),
+        gb(host.purgeable),
+        gb(host.held_elsewhere()),
+        gb(host.own),
+        gb(headroom(host.ram)),
+        gb(free_now(host)),
+    )
+}
+
+/// The plan's log line: what the GPU may use, the pool, the chunk and the context, then why the
+/// pool is smaller than the working set would make it when it is (other apps hold memory, a
+/// requested size does not fit, not even the smallest pool fits). With nothing of that, the line
+/// is the one the plan has always printed.
+fn plan_line(device: u64, choice: &PoolChoice, plan: &MemoryPlan, use_head: bool) -> String {
+    let others = choice.clamped_by > 0;
+    let within = device - choice.clamped_by;
+    let mut line = format!("[qwen4_exp] GPU may use {:.1} GB", gb(device));
+    if others {
+        line += &format!(", {:.1} GB of it free now", gb(within));
+    }
+    line += &format!(
+        ": expert pool {:.2} GB, prefill chunk {} tokens, prompts up to {} tokens \
+         (LUMEN_MOE_EXPERT_CACHE_GB / LUMEN_QWEN35_PREFILL_CHUNK / LUMEN_MAX_PROMPT_TOKENS \
+         override){}",
+        gb(choice.pool),
+        plan.chunk,
+        plan.ctx_tokens,
+        if use_head { ", MTP draft head on" } else { "" }
+    );
+    if let Some(asked) = choice.lowered_from {
+        line += &format!(
+            ". A {:.1} GB expert pool does not fit: the trunk takes {:.1} GB and a {}-token \
+             prompt (chunk {}) {:.1} of the {:.1} GB {}, and a smaller LUMEN_MAX_PROMPT_TOKENS \
+             leaves more for the pool",
+            gb(asked),
+            gb(TRUNK_BYTES),
+            plan.ctx_tokens,
+            plan.chunk,
+            gb(plan.reserve),
+            gb(within),
+            if others {
+                "other apps leave"
+            } else {
+                "this GPU may use"
+            },
+        );
+    }
+    if choice.at_floor {
+        line += &format!(
+            ". Pool {:.2} GB, the smallest the engine runs",
+            gb(choice.pool)
+        );
+        if others {
+            line += &format!(
+                " (other apps hold memory: {:.1} GB below the working set, and not even this \
+                 pool fits beside them, so expect swapping); close apps and restart for a \
+                 bigger pool",
+                gb(choice.clamped_by)
+            );
+        } else {
+            line += ": the trunk and the prompt's reserve leave less (a smaller \
+                     LUMEN_MAX_PROMPT_TOKENS leaves more)";
+        }
+    } else if others {
+        line += &format!(
+            ". Pool {:.1} GB (other apps hold memory: {:.1} GB below the working set); close apps \
+             and restart for a bigger pool",
+            gb(choice.pool),
+            gb(choice.clamped_by)
+        );
+    }
+    line
 }
 
 impl Qwen4ExpRunner {
     pub(crate) fn load(dir: &Path) -> Result<(Self, LoadInfo)> {
         let ws = crate::metal_memory::working_set_limit().unwrap_or(16_000_000_000) as f64;
-        let mut usable = (ws * crate::metal_memory::WORKING_SET_SHARE) as u64;
+        let mut device = (ws * crate::metal_memory::WORKING_SET_SHARE) as u64;
         // An operator who capped MLX's memory plans within it. The server applies
         // `LUMEN_MEMORY_LIMIT_GB` (GiB) after the model is loaded, so read it here as well.
         let capped = std::env::var("LUMEN_MEMORY_LIMIT_GB")
@@ -523,14 +714,32 @@ impl Qwen4ExpRunner {
             .chain(crate::metal_memory::memory_limit().map(|l| l as u64))
             .min();
         if let Some(limit) = capped
-            && limit < usable
+            && limit < device
         {
-            usable = limit;
+            device = limit;
         }
         let cfg = Qwen4ExpConfig::load(dir)?;
-        let plan = plan_memory(usable, &cfg, chunk_override(), context_override());
+        let plan = plan_memory(device, &cfg, chunk_override(), context_override());
         let (chunk, ctx_tokens) = (plan.chunk, plan.ctx_tokens);
-        let budget = expert_budget_bytes(usable, &plan)?;
+        let host = host_for_plan(device);
+        if let Some(h) = &host {
+            eprintln!("{}", free_line(h));
+        }
+        let requested =
+            parse_pool_size(&std::env::var("LUMEN_MOE_EXPERT_CACHE_GB").unwrap_or_default())?;
+        let choice = choose_pool(
+            device,
+            host.as_ref().map(free_now),
+            &plan,
+            requested,
+            pool_floor_bytes(&cfg),
+        );
+        // MLX's buffer cache would otherwise grow into the memory the plan left other apps: the
+        // server lowers MLX's memory limit to this when it sets it (after the load).
+        if choice.usable < device {
+            crate::metal_memory::set_planned_limit(choice.usable as usize);
+        }
+        let budget = choice.pool;
         // The draft head's experts go through the pool, so the head costs next to no memory; the
         // governor measures whether drafts pay and stops them when they do not.
         let mode = mtp_mode_from_env()?;
@@ -542,14 +751,7 @@ impl Qwen4ExpRunner {
             );
         }
         let use_head = head_there && mode != MtpMode::Off;
-        eprintln!(
-            "[qwen4_exp] GPU may use {:.1} GB: expert pool {:.2} GB, prefill chunk {chunk} tokens, \
-             prompts up to {ctx_tokens} tokens (LUMEN_MOE_EXPERT_CACHE_GB / LUMEN_QWEN35_PREFILL_CHUNK / \
-             LUMEN_MAX_PROMPT_TOKENS override){}",
-            usable as f64 / 1e9,
-            budget as f64 / 1e9,
-            if use_head { ", MTP draft head on" } else { "" }
-        );
+        eprintln!("{}", plan_line(device, &choice, &plan, use_head));
         let model = Qwen4ExpModel::load_with(
             dir,
             LoadOptions {
@@ -589,7 +791,7 @@ impl Qwen4ExpRunner {
                 next_snapshot: 1,
                 chunk,
                 ctx_tokens,
-                memory_budget: usable,
+                memory_budget: choice.usable,
                 disk,
                 fingerprint,
                 spec,
@@ -1605,24 +1807,282 @@ mod tests {
     #[test]
     fn a_pool_that_does_not_fit_is_lowered_to_what_does() {
         let cfg = real_config();
+        let floor = pool_floor_bytes(&cfg);
+        let usable = 14_100_000_000;
+        let pool = |requested: u64, plan: &MemoryPlan| {
+            choose_pool(usable, None, plan, Some(requested), floor).pool
+        };
         // The 24 GB-class plan: ~6.9 GB left after the trunk and the reserve.
-        let plan = plan_memory(14_100_000_000, &cfg, None, None);
+        let plan = plan_memory(usable, &cfg, None, None);
         let fits = plan.pool;
-        assert_eq!(
-            fit_pool(4_000_000_000, 14_100_000_000, &plan),
-            4_000_000_000
-        );
-        assert_eq!(fit_pool(fits, 14_100_000_000, &plan), fits);
+        assert_eq!(pool(4_000_000_000, &plan), 4_000_000_000);
+        assert_eq!(pool(fits, &plan), fits);
         // Round numbers a little over the plan are taken as written.
-        assert_eq!(
-            fit_pool(fits + 400_000_000, 14_100_000_000, &plan),
-            fits + 400_000_000
-        );
+        assert_eq!(pool(fits + 400_000_000, &plan), fits + 400_000_000);
         // 12 GB on a 24 GB Mac is not.
-        assert_eq!(fit_pool(12_000_000_000, 14_100_000_000, &plan), fits);
+        let lowered = choose_pool(usable, None, &plan, Some(12_000_000_000), floor);
+        assert_eq!(lowered.pool, fits);
+        assert_eq!(lowered.lowered_from, Some(12_000_000_000));
+        assert_eq!(lowered.usable, usable, "the device's plan, as before");
+        let line = plan_line(usable, &lowered, &plan, false);
+        assert!(
+            line.contains("A 12.0 GB expert pool does not fit"),
+            "{line}"
+        );
+        assert!(line.contains("this GPU may use"), "{line}");
         // A shorter longest prompt leaves more room for the same request.
-        let short = plan_memory(14_100_000_000, &cfg, None, Some(4_096));
-        assert!(fit_pool(12_000_000_000, 14_100_000_000, &short) > fits);
+        let short = plan_memory(usable, &cfg, None, Some(4_096));
+        assert!(pool(12_000_000_000, &short) > fits);
+    }
+
+    /// The 36 GB M3 Max: 30.2 GB working set x 0.88.
+    const DEVICE_36GB: u64 = 26_600_000_000;
+
+    /// The page counts `vm_stat` printed on that Mac (16 KB pages): an editor, a browser, chat
+    /// apps open and an idle model server holding 10.7 GB in the compressor, then the same
+    /// after that server was stopped.
+    fn busy_36gb() -> HostMemory {
+        HostMemory {
+            ram: 38_654_705_664,
+            free: 92_438_528,
+            file_backed: 8_125_726_720,
+            purgeable: 42_876_928,
+            anonymous: 11_263_918_080,
+            wired: 4_838_866_944,
+            compressor: 13_398_736_896,
+            own: 0,
+        }
+    }
+
+    fn after_36gb() -> HostMemory {
+        HostMemory {
+            free: 10_487_791_616,
+            file_backed: 6_905_397_248,
+            purgeable: 313_901_056,
+            anonymous: 14_393_376_768,
+            wired: 3_508_453_376,
+            compressor: 2_424_668_160,
+            ..busy_36gb()
+        }
+    }
+
+    #[test]
+    fn the_headroom_is_two_gb_or_five_percent_of_ram() {
+        assert_eq!(headroom(16 << 30), 2_000_000_000);
+        assert_eq!(headroom(24 << 30), 2_000_000_000);
+        // 5% of 36 GiB is 1.93 GB: still the minimum.
+        assert_eq!(headroom(38_654_705_664), 2_000_000_000);
+        // 5% of 128 GiB.
+        assert_eq!(headroom(128 << 30), 6_871_947_673);
+    }
+
+    #[test]
+    fn free_now_is_free_file_backed_and_purgeable_pages_plus_our_own_less_the_headroom() {
+        let h = after_36gb();
+        assert_eq!(h.reclaimable(), 17_707_089_920);
+        assert_eq!(free_now(&h), 17_707_089_920 - 2_000_000_000);
+        // What this process already holds is the plan's to reuse.
+        let mine = HostMemory {
+            own: 2_000_000_000,
+            ..h
+        };
+        assert_eq!(free_now(&mine), free_now(&h) + 2_000_000_000);
+        // Less free than the headroom is nothing, not an underflow.
+        let full = HostMemory {
+            free: 0,
+            file_backed: 1_000_000_000,
+            purgeable: 0,
+            ..h
+        };
+        assert_eq!(free_now(&full), 0);
+        // Each part is in the log line.
+        let line = free_line(&h);
+        for part in [
+            "free now: 17.7 GB",
+            "free 10.5",
+            "file-backed 6.9",
+            "purgeable 0.3",
+            "other apps hold 20.9 GB",
+            "this process 0.0",
+            "headroom 2.0",
+            "= 15.7 GB for the plan",
+        ] {
+            assert!(line.contains(part), "{part:?} not in {line}");
+        }
+    }
+
+    #[test]
+    fn an_idle_machine_plans_from_the_working_set_as_before() {
+        let cfg = real_config();
+        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let idle = HostMemory {
+            free: 25_000_000_000,
+            ..after_36gb()
+        };
+        let choice = choose_pool(
+            DEVICE_36GB,
+            Some(free_now(&idle)),
+            &plan,
+            None,
+            pool_floor_bytes(&cfg),
+        );
+        let before = choose_pool(DEVICE_36GB, None, &plan, None, pool_floor_bytes(&cfg));
+        assert_eq!(choice, before);
+        assert_eq!(
+            (choice.pool, choice.usable, choice.clamped_by),
+            (plan.pool, DEVICE_36GB, 0)
+        );
+        assert_eq!(
+            plan_line(DEVICE_36GB, &choice, &plan, false),
+            format!(
+                "[qwen4_exp] GPU may use 26.6 GB: expert pool {:.2} GB, prefill chunk 1024 \
+                 tokens, prompts up to 16384 tokens (LUMEN_MOE_EXPERT_CACHE_GB / \
+                 LUMEN_QWEN35_PREFILL_CHUNK / LUMEN_MAX_PROMPT_TOKENS override)",
+                plan.pool as f64 / 1e9
+            )
+        );
+    }
+
+    #[test]
+    fn what_other_apps_hold_comes_out_of_the_pool_and_the_line_says_how_much() {
+        let cfg = real_config();
+        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let free = free_now(&after_36gb());
+        let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, pool_floor_bytes(&cfg));
+        assert_eq!(choice.usable, free);
+        assert_eq!(choice.clamped_by, DEVICE_36GB - free);
+        assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
+        assert_eq!(plan.pool - choice.pool, choice.clamped_by);
+        // 19.5 GB of pool on an idle 36 GB Mac, 8.6 GB with these apps open.
+        assert!(
+            (8_500_000_000..8_700_000_000).contains(&choice.pool),
+            "{choice:?}"
+        );
+        assert!(!choice.at_floor);
+        // The chunk and the context are the machine's: only the pool shrinks.
+        assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
+        let line = plan_line(DEVICE_36GB, &choice, &plan, false);
+        assert!(
+            line.contains("GPU may use 26.6 GB, 15.7 GB of it free now"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "Pool 8.6 GB (other apps hold memory: 10.9 GB below the working set); close \
+                 apps and restart for a bigger pool"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_pool_is_lowered_to_what_is_free_now() {
+        let cfg = real_config();
+        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let free = free_now(&after_36gb());
+        let floor = pool_floor_bytes(&cfg);
+        // 15 GB fits the working set, not what other apps leave.
+        let choice = choose_pool(DEVICE_36GB, Some(free), &plan, Some(15_000_000_000), floor);
+        assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
+        assert_eq!(choice.lowered_from, Some(15_000_000_000));
+        let line = plan_line(DEVICE_36GB, &choice, &plan, false);
+        assert!(
+            line.contains("A 15.0 GB expert pool does not fit"),
+            "{line}"
+        );
+        assert!(line.contains("of the 15.7 GB other apps leave"), "{line}");
+        assert!(line.contains("10.9 GB below the working set"), "{line}");
+        // A size that fits is taken as written; the memory limit is still what is free now.
+        let small = choose_pool(DEVICE_36GB, Some(free), &plan, Some(6_700_000_000), floor);
+        assert_eq!((small.pool, small.usable), (6_700_000_000, free));
+        assert_eq!(small.lowered_from, None);
+    }
+
+    #[test]
+    fn the_opt_out_plans_from_the_working_set_alone() {
+        plan_reclaimable::with(false, || assert_eq!(host_for_plan(DEVICE_36GB), None));
+        #[cfg(target_os = "macos")]
+        plan_reclaimable::with(true, || assert!(host_for_plan(1).is_some()));
+        // `None` is what the opt-out hands the plan: today's pool, with or without a request.
+        let cfg = real_config();
+        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        let floor = pool_floor_bytes(&cfg);
+        let off = choose_pool(DEVICE_36GB, None, &plan, None, floor);
+        assert_eq!(
+            (off.pool, off.usable, off.clamped_by),
+            (plan.pool, DEVICE_36GB, 0)
+        );
+        let asked = choose_pool(DEVICE_36GB, None, &plan, Some(15_000_000_000), floor);
+        assert_eq!(asked.pool, 15_000_000_000);
+    }
+
+    #[test]
+    fn a_reading_that_is_still_growing_is_taken_again_until_it_settles() {
+        let at = |reclaimable_gb: f64| HostMemory {
+            free: (reclaimable_gb * 1e9) as u64,
+            file_backed: 0,
+            purgeable: 0,
+            ..after_36gb()
+        };
+        let run = |readings: &[f64]| {
+            let mut left = readings
+                .iter()
+                .map(|&g| at(g))
+                .collect::<Vec<_>>()
+                .into_iter();
+            let mut sleeps = 0;
+            let got = settled(|| left.next(), |_| sleeps += 1, DEVICE_36GB).unwrap();
+            (got.free as f64 / 1e9, sleeps)
+        };
+        // A server that has just exited: its memory comes back a second later.
+        assert_eq!(run(&[2.8, 26.0, 25.9]), (25.9, 2));
+        // Memory other apps hold stays held: one more look, then the plan.
+        assert_eq!(run(&[8.3, 8.4]), (8.4, 1));
+        // More free than the GPU may use: nothing to wait for.
+        assert_eq!(run(&[40.0]), (40.0, 0));
+        // Still growing at the last look: the last reading, after at most 3 s.
+        let rising: Vec<f64> = (0..10).map(|i| 2.0 + i as f64).collect();
+        assert_eq!(run(&rising), (8.0, SETTLE_READS));
+        // A reading that fails ends the wait with what was read.
+        assert_eq!(run(&[3.0]), (3.0, 1));
+        assert!(settled(|| None, |_| {}, DEVICE_36GB).is_none());
+    }
+
+    #[test]
+    fn when_not_even_the_smallest_pool_fits_the_floor_is_used_and_the_line_says_so() {
+        let cfg = real_config();
+        let floor = pool_floor_bytes(&cfg);
+        assert_eq!(floor, 2 * 512 * 2_764_800, "1,024 slots of 2.76 MB");
+        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+        // The busy machine: 6.3 GB free now, less than the trunk and the reserve alone.
+        let free = free_now(&busy_36gb());
+        let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, floor);
+        assert!(choice.at_floor);
+        assert_eq!(choice.pool, floor);
+        // The plan is for what the floor holds: MLX gets that, not the 6.3 GB.
+        assert_eq!(choice.usable, TRUNK_BYTES + floor + plan.reserve);
+        assert_eq!(choice.clamped_by, DEVICE_36GB - free);
+        let line = plan_line(DEVICE_36GB, &choice, &plan, false);
+        assert!(
+            line.contains("Pool 2.83 GB, the smallest the engine runs"),
+            "{line}"
+        );
+        assert!(line.contains("20.3 GB below the working set"), "{line}");
+        assert!(line.contains("expect swapping"), "{line}");
+        // A Mac too small for the floor even when idle: the floor, and the plan stays the
+        // device's (as before).
+        let tiny = plan_memory(4_000_000_000, &cfg, None, None);
+        let tight = choose_pool(4_000_000_000, None, &tiny, None, floor);
+        assert_eq!(
+            (tight.pool, tight.usable, tight.at_floor),
+            (floor, 4_000_000_000, true)
+        );
+        let line = plan_line(4_000_000_000, &tight, &tiny, false);
+        assert!(
+            line.contains("the trunk and the prompt's reserve leave less"),
+            "{line}"
+        );
+        assert!(!line.contains("other apps"), "{line}");
     }
 
     fn real_config() -> Qwen4ExpConfig {
@@ -1651,6 +2111,17 @@ mod tests {
         cfg.linear_key_head_dim = 128;
         cfg.linear_value_head_dim = 128;
         cfg.linear_conv_kernel_dim = 4;
+        // 512 routed experts of 2,560 x 640, 4-bit in groups of 64.
+        cfg.num_experts = 512;
+        cfg.hidden_size = 2_560;
+        cfg.moe_intermediate_size = 640;
+        cfg.quant.set(
+            "language_model.model.layers.0.mlp.switch_mlp",
+            super::super::config::QuantSpec {
+                group_size: 64,
+                bits: 4,
+            },
+        );
         cfg
     }
 

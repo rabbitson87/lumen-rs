@@ -494,6 +494,10 @@ export const FLASH_NEXT = {
   workingSetShareLarge: 0.75,
   smallRamGib: 32,
   fillableShare: 0.88,
+  /** What the server leaves the rest of the machine when it plans within the memory free at its
+   *  load (`LUMEN_MEMORY_PLAN_RECLAIMABLE`, on by default): 2 GB, or 5% of RAM if more. */
+  liveHeadroomBytes: 2e9,
+  liveHeadroomRamShare: 0.05,
   /** What it takes on disk. */
   diskModelBytes: 97e9,
   diskPackBytes: 68e9,
@@ -514,6 +518,28 @@ export function flashNextUsableBytes(ramGb: number, memoryLimitGb?: number | nul
   const share = ram <= F.smallRamGib * GB ? F.workingSetShareSmall : F.workingSetShareLarge;
   const usable = ram * share * F.fillableShare;
   return memoryLimitGb != null && memoryLimitGb > 0 ? Math.min(usable, memoryLimitGb * GB) : usable;
+}
+
+/** What the server leaves the rest of the machine when it plans within what is free at its load
+ *  (`live_headroom` in `flash_next.rs`). */
+export function flashNextLiveHeadroom(ramBytes: number): number {
+  const F = FLASH_NEXT;
+  return Math.max(F.liveHeadroomBytes, Math.floor(ramBytes * F.liveHeadroomRamShare));
+}
+
+/** The memory a server started now plans within (`usable_now` in `flash_next.rs`): `usableBytes`
+ *  lowered to what the rest of the machine gives up without being compressed or swapped
+ *  (`reclaimableBytes`: free, file-backed and purgeable pages) plus the running server's footprint
+ *  (a new one replaces it), less the headroom. The plan's chunk and context stay `usableBytes`';
+ *  only the pool shrinks. */
+export function flashNextUsableNow(
+  usableBytes: number,
+  ramBytes: number,
+  reclaimableBytes: number,
+  serverFootprintBytes: number,
+): number {
+  const free = reclaimableBytes + serverFootprintBytes - flashNextLiveHeadroom(ramBytes);
+  return Math.min(usableBytes, Math.max(0, free));
 }
 
 /** What the memory is spent on for a GPU that may use `usableBytes`. */

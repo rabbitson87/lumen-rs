@@ -532,6 +532,10 @@ export const ko: Record<string, string> = {
     "Qwen 3.8 Flash-Next · 48 레이어 × 전문가 512 · 컨텍스트 토큰당 f32 KV {kb} KB",
   "flashnext.thisMac": "이 Mac: RAM {ram} GB, GPU가 채울 수 있는 양은 약 {usable} GB.",
   "flashnext.thisMac.limit": "(메모리 GB 설정 {n} GB로 제한됨.)",
+  "flashnext.freeNow":
+    "지금은 다른 앱이 메모리를 쓰고 있습니다: 지금 시작하는 서버는 {now} GB 안에서({below} GB 적게) 계획하므로 전문가 풀은 최대 {pool} GB입니다. 풀 크기는 서버를 다시 시작할 때까지 그대로이니, 더 큰 풀을 원하면 앱을 닫고 시작하세요.",
+  "flashnext.freeNow.floor":
+    "지금은 다른 앱이 메모리를 쓰고 있습니다: 지금 시작하는 서버가 계획할 수 있는 메모리는 {now} GB({below} GB 적게)라서 가장 작은 풀({floor} GB)조차 옆에 들어가지 않아 스왑이 생길 수 있습니다. 서버를 시작하기 전에 앱을 닫으세요.",
   "flashnext.tight":
     "빠듯한 기기입니다: 따로 지정하지 않으면 {chunk}토큰 청크와 {ctx}토큰 프롬프트로 계획합니다.",
   "flashnext.fits":

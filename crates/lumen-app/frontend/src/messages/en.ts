@@ -542,6 +542,10 @@ export const en: Record<string, string> = {
     "Qwen 3.8 Flash-Next · 48 layers × 512 experts · {kb} KB of f32 KV per token of context",
   "flashnext.thisMac": "This Mac: {ram} GB RAM, so the GPU may fill ~{usable} GB.",
   "flashnext.thisMac.limit": "(Capped by the Memory GB setting at {n} GB.)",
+  "flashnext.freeNow":
+    "Other apps hold memory right now: a server started now plans within {now} GB ({below} GB less), so its expert pool gets at most {pool} GB. The pool keeps that size until the server restarts: close apps before starting it for a bigger one.",
+  "flashnext.freeNow.floor":
+    "Other apps hold memory right now: a server started now has {now} GB to plan within ({below} GB less), and not even the smallest pool ({floor} GB) fits beside them, so expect swapping. Close apps before starting the server.",
   "flashnext.tight":
     "That is a tight machine: the plan takes {chunk}-token chunks and {ctx}-token prompts unless told otherwise.",
   "flashnext.fits":

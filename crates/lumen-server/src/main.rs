@@ -358,17 +358,28 @@ async fn main() -> Result<(), SendableError> {
             // cache that grew to 5 GB in 6 chunks, on a 28.1 GiB working set).
             let want_bytes = gb_to_bytes(memory_gb);
             let ws = lumen_mlx::metal_memory::working_set_limit();
-            let memory_bytes = lumen_mlx::metal_memory::clamp_memory_limit(want_bytes, ws);
+            let share_bytes = lumen_mlx::metal_memory::clamp_memory_limit(want_bytes, ws);
+            // A model that planned within less (Flash-Next, when other apps held memory at its
+            // load) keeps MLX's buffer cache within that too.
+            let planned = lumen_mlx::metal_memory::planned_limit().filter(|&p| p < share_bytes);
+            let memory_bytes = planned.unwrap_or(share_bytes);
+            let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
             match lumen_mlx::metal_memory::set_memory_limit(memory_bytes) {
                 Ok(prev) => eprintln!(
                     "[mlx-mem] memory_limit set to {:.1} GB (prev {} GB){}",
-                    memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    gib(memory_bytes),
                     prev / (1024 * 1024 * 1024),
-                    if memory_bytes < want_bytes {
+                    if planned.is_some() {
+                        format!(
+                            ", lowered from {:.1} GB to what the model's memory plan was made \
+                             within (other apps held memory at load)",
+                            gib(share_bytes),
+                        )
+                    } else if memory_bytes < want_bytes {
                         format!(
                             ", lowered from {memory_gb} GB to {:.0}% of the {:.1} GB GPU working set",
                             lumen_mlx::metal_memory::WORKING_SET_SHARE * 100.0,
-                            ws.unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0),
+                            gib(ws.unwrap_or(0)),
                         )
                     } else {
                         String::new()

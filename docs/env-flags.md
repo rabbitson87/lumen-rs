@@ -21,6 +21,7 @@ unset → default, `"0"` → off, any other value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::session::auto_session_enabled` |
 | `LUMEN_MLX_KV_BF16` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::kv_bf16` |
 | `LUMEN_MLX_MEMORY_EVICT` | on | Behavior | `lumen_mlx::session::memory_evict` |
@@ -170,6 +171,19 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_MEMORY_PLAN_RECLAIMABLE`
+
+*Behavior, default on.*
+
+Plan the expert pool within the memory that is free right now, not only within the GPU's
+ working set: the working set's share is lowered to what this process holds plus the pages
+ the rest of the machine gives up without being compressed or swapped (free, file-backed
+ and purgeable ones), less a headroom of 2 GB or 5% of RAM, whichever is larger. The
+ pool cannot change while the server runs, so a server started while other apps hold
+ memory keeps a smaller pool (and decodes slower) until it is restarted; the log says so.
+ `0` plans from the working set alone, as before, and the system makes room for the pool by
+ compressing other apps and writing them to swap.
 
 ### `LUMEN_MLX_AUTO_SESSION`
 

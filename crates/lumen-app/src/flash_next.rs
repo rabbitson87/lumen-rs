@@ -84,6 +84,24 @@ pub fn usable_bytes(ram_bytes: u64, memory_limit: Option<u64>) -> u64 {
     memory_limit.map_or(usable, |limit| usable.min(limit))
 }
 
+/// What the server leaves the rest of the machine when it plans within the memory that is free
+/// at its load (`LUMEN_MEMORY_PLAN_RECLAIMABLE`, on by default): 2 GB, or 5% of RAM on a Mac
+/// of more than 40 GB (`headroom` in the server's `qwen4_exp/runner.rs`).
+pub const LIVE_HEADROOM_BYTES: u64 = 2_000_000_000;
+const LIVE_HEADROOM_RAM_SHARE: f64 = 0.05;
+
+pub fn live_headroom(ram_bytes: u64) -> u64 {
+    LIVE_HEADROOM_BYTES.max((ram_bytes as f64 * LIVE_HEADROOM_RAM_SHARE) as u64)
+}
+
+/// The memory a server started now plans within: `usable`, lowered to what the rest of the
+/// machine gives up without being compressed or swapped (`reclaimable`: free, file-backed and
+/// purgeable pages) plus what the running server holds (a new one replaces it), less the
+/// headroom. The plan's chunk and context stay `usable`'s; only the pool shrinks.
+pub fn usable_now(usable: u64, ram_bytes: u64, reclaimable: u64, server_footprint: u64) -> u64 {
+    usable.min((reclaimable + server_footprint).saturating_sub(live_headroom(ram_bytes)))
+}
+
 /// What the memory is spent on, for a GPU that may use `usable` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPlan {
@@ -106,6 +124,12 @@ impl MemoryPlan {
     /// The trunk, the smallest pool and the reserve fit the usable memory.
     pub fn fits(&self) -> bool {
         self.pool >= POOL_FLOOR_BYTES
+    }
+
+    /// The pool `auto` gives when the server plans within `usable_now` bytes (see
+    /// [`usable_now`]): what is left after the trunk and this plan's reserve.
+    pub fn pool_within(&self, usable_now: u64) -> u64 {
+        usable_now.saturating_sub(TRUNK_BYTES + self.reserve)
     }
 }
 
@@ -1183,6 +1207,37 @@ mod tests {
             long.reserve,
             600_000_000 + 1024 * 1_100_000 + 65_536 * 59_904 + 2_000_000_000 / 2
         );
+    }
+
+    #[test]
+    fn a_server_started_now_plans_within_what_other_apps_leave() {
+        let ram = 36 * GIB;
+        assert_eq!(live_headroom(ram), LIVE_HEADROOM_BYTES);
+        assert_eq!(live_headroom(64 * GIB), 3_435_973_836);
+        assert_eq!(live_headroom(16 * GIB), LIVE_HEADROOM_BYTES);
+        assert_eq!(live_headroom(24 * GIB), LIVE_HEADROOM_BYTES);
+        let usable = usable_bytes(ram, None);
+        let plan = plan_memory(usable, None, None);
+        // Idle: more free than the GPU may use, so the plan is the usual one.
+        assert_eq!(usable_now(usable, ram, 30_000_000_000, 0), usable);
+        assert_eq!(plan.pool_within(usable), plan.pool);
+        // An editor, a browser and chat apps open (the server's own `free now` line on that
+        // Mac): 17.7 GB reclaimable, so 15.7 GB to plan within and an 8.6 GB pool, not 18.4.
+        let now = usable_now(usable, ram, 17_707_089_920, 0);
+        assert_eq!(now, 15_707_089_920);
+        assert_eq!(plan.pool_within(now), now - TRUNK_BYTES - plan.reserve);
+        assert_eq!(
+            (plan.pool_within(now) / 100_000_000, plan.pool / 100_000_000),
+            (85, 183)
+        );
+        // A running server's memory is a restarted one's too.
+        assert_eq!(
+            usable_now(usable, ram, 7_000_000_000, 10_000_000_000),
+            15_000_000_000
+        );
+        // Less than the headroom free is nothing.
+        assert_eq!(usable_now(usable, 16 * GIB, 1_000_000_000, 0), 0);
+        assert_eq!(plan.pool_within(0), 0);
     }
 
     #[test]

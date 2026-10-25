@@ -21,7 +21,8 @@ computes, except speculative decoding, which is marked.
 ## How the memory is planned
 
 The GPU's working set (the part of RAM the OS lets one process keep resident, about 75% of it,
-times 0.88 for the headroom other apps need; `LUMEN_MEMORY_LIMIT_GB` lowers it) is split into the
+times 0.88 for the headroom other apps need; `LUMEN_MEMORY_LIMIT_GB` lowers it, and so does what
+other apps hold at load, below) is split into the
 3.6 GB of resident weights, a reserve for prefilling, and the expert pool, which gets the rest. The
 reserve is 0.6 GB of buffers, about 1.1 MB per token of the prefill chunk, the KV cache of the
 longest prompt the plan allows (60 KB per token), and half the attention scores. So the longest prompt
@@ -42,6 +43,72 @@ smaller rows' plans were made on a 36 GB M3 Max with `LUMEN_MEMORY_LIMIT_GB` set
 what the plan does, not how a real 16 or 24 GB Mac's own memory pressure behaves. On a 16 GB Mac (under 11 GB of working set) the
 pool has room for only one staging region, so prefill cannot read the next layer while computing the
 current one; a 5.8K-token prompt prefilled at 209 tok/s there, with a peak resident size of 7.2 GB.
+
+### What other apps hold
+
+The working set says how much one process may keep resident, not how much is free. With an editor,
+a browser and chat apps open, a plan made from it alone takes memory those apps hold, and macOS makes
+room by compressing them and writing them to swap. So at load the server also reads the kernel's page
+counts (`host_statistics64`, the numbers `vm_stat` prints) and plans within
+
+    free now = this process + free pages + file-backed pages + purgeable pages - headroom
+
+when that is less than the working set's share. File-backed pages are copies of files, which the
+kernel drops and reads again (speculative read-ahead is among them); purgeable pages are caches their
+owners marked discardable. Taking either swaps nobody. Anonymous pages are not counted, inactive ones
+included: they are another app's heap or GPU buffers, and taking them is compressing or swapping that
+app. The headroom is 2 GB, or 5% of RAM on a Mac of more than 40 GB. The plan is MLX's, and the
+process goes about 1.2 GB past it whatever the pool (measured at pools of 9.6, 13.0 and 19.2 GB:
+0.55-0.75 GB beside MLX's buffers, and MLX's prefill peak ~0.5 GB over its soft limit); the rest is
+for the free pages the kernel keeps and for other apps growing while the server runs.
+
+`memory_pressure`'s "System-wide memory free percentage" is a different number: active + inactive +
+free + speculative pages over RAM (`kern.memorystatus_level`), so every page that is neither wired nor
+compressed, other apps' anonymous memory included. On the 36 GB M3 Max, read side by side:
+
+| State | free | file-backed | purgeable | Reclaimable | Other apps hold | `memory_pressure` |
+|---|---|---|---|---|---|---|
+| Editor, browser, chat apps and an idle model server (10.7 GB compressed) | 0.7 | 6.9 | 0.3 | 7.9 GB | 30.8 GB | 55% = 21.3 GB |
+| The same, the idle server stopped | 10.8 | 6.9 | 0.3 | 17.9 GB | 20.7 GB | 83% = 32.1 GB |
+
+Only the pool shrinks: the chunk and the longest prompt stay what the working set gives (a busy 36 GB
+Mac still takes 16K-token prompts, which the prompt guard reads from the plan). MLX's memory limit is
+lowered to the same figure, or its buffer cache would grow back into the memory left to other apps. The
+pool cannot change while the server runs, so a server started on a busy Mac keeps the smaller pool,
+and decodes slower, until it is restarted. The log says so:
+
+    [qwen4_exp] free now: 18.6 GB (free 14.1 + file-backed 4.5 + purgeable 0.0; other apps hold 20.0 GB that only compressing or swapping them frees) + this process 0.1 - headroom 1.9 = 16.7 GB for the plan (LUMEN_MEMORY_PLAN_RECLAIMABLE=0 plans without it)
+    [qwen4_exp] GPU may use 26.5 GB, 16.7 GB of it free now: expert pool 9.64 GB, prefill chunk 1024 tokens, prompts up to 16384 tokens (...). Pool 9.6 GB (other apps hold memory: 9.8 GB below the working set); close apps and restart for a bigger pool
+
+A process that has just exited gives its memory back about a second later (MLX's buffers are wired:
+2.8 GB was reclaimable when a loaded server's process had exited, 26 GB a second later), so a server
+restarted at once would plan for almost nothing. While a reading would cut the plan, the server takes
+it again every half second until it stops growing, for at most 3 s; memory other apps hold does not
+grow back, so on a busy Mac that costs the load one extra reading.
+
+An explicit `LUMEN_MOE_EXPERT_CACHE_GB` is lowered to what is free now in the same way, with a line
+that says so. When not even the smallest pool (2.83 GB) fits beside what other apps hold, the server
+uses it anyway, as a tight Mac always has, and the line says to expect swapping.
+`LUMEN_MEMORY_PLAN_RECLAIMABLE=0` plans from the working set alone, as before.
+
+Measured on the 36 GB M3 Max with those apps open: a fresh server per run, defaults (no pool size, no
+memory limit), a 14,962-token prompt of real text, then 300 tokens; runs stopped when swap grew by more
+than 1.5 GB. The headroom was 1.93 GB then (5% of RAM; it is now at least 2 GB).
+
+| Plan | Free now at load | Pool | Swap growth | Pages compressed | Peak footprint | First token | Decode |
+|---|---|---|---|---|---|---|---|
+| Free now (run 1) | 18.6 GB | 9.64 GB | 0 | 5.0 GB | 17.9 GB | 94.6 s | 2.9 tok/s |
+| Free now (run 2) | 21.9 GB | 12.97 GB | 0 | 7.2 GB | 21.3 GB | 97.2 s | 3.1 tok/s |
+| Working set (run 1) | 24.1 GB | 19.42 GB | +1.66 GB in 29 s, stopped | 21.8 GB | 25.3 GB | none | - |
+| Working set (run 2) | 26.9 GB | 19.42 GB | +1.82 GB in 76 s, stopped | 7.2 GB | 26.9 GB | none | - |
+
+The working-set plan grew swap by 1.7-1.8 GB before its first token, while it was still loading the
+pool and reading the prompt; the plan from what was free swapped nothing. It did not stop macOS from
+compressing other apps (their anonymous memory was 11.9 GB when the first run started and 7.9 GB when
+the second did): the kernel compresses inactive anonymous pages before it has dropped every file page. Decode speeds here are
+this machine's at the time (other GPU work running; 3.6 tok/s at a 19.2 GB pool with nothing in its
+way, against 13 on an idle machine), so they compare the runs with each other, not with the tables
+above. A real 16 or 24 GB Mac was not measured.
 
 ### What else is in memory
 
@@ -219,10 +286,11 @@ there); a 16 or 24 GB Mac has little to spare, which is why the reference uses d
 
 | Variable | Default | What it does |
 |---|---|---|
-| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool: `auto`, or a size such as `4g`, `8GB`, `12.5g`, `512m` (a plain number is GB). `auto` takes what the GPU's working set leaves after the 3.6 GB of resident weights and the prefill reserve. A size that does not fit beside them (at the longest prompt the plan allows) is lowered to what does, and the log says so; a shorter `LUMEN_MAX_PROMPT_TOKENS` makes room. Measured on a 36 GB M3 Max with the pack and direct reads, 300 tokens: 4.2 GB 6.1 tok/s, 6.7 GB 7.2, 10 GB 9.0, 15 GB 11.2, 19.8 GB 13.0. |
+| `LUMEN_MOE_EXPERT_CACHE_GB` | `auto` | Size of the expert pool: `auto`, or a size such as `4g`, `8GB`, `12.5g`, `512m` (a plain number is GB). `auto` takes what the GPU's working set (or what other apps leave free at load, when that is less) leaves after the 3.6 GB of resident weights and the prefill reserve. A size that does not fit beside them (at the longest prompt the plan allows) is lowered to what does, and the log says so; a shorter `LUMEN_MAX_PROMPT_TOKENS` makes room. Measured on a 36 GB M3 Max with the pack and direct reads, 300 tokens: 4.2 GB 6.1 tok/s, 6.7 GB 7.2, 10 GB 9.0, 15 GB 11.2, 19.8 GB 13.0. |
 | `LUMEN_QWEN35_PREFILL_CHUNK` | 1024 (512 under 11 GB) | Tokens per prefill chunk. Prefill speed does not depend on it; its activations come out of the pool. |
 | `LUMEN_MAX_PROMPT_TOKENS` | 16384 (8192 under 11 GB) | Longest prompt; the KV cache for it is planned out of the pool. |
 | `LUMEN_MEMORY_LIMIT_GB` | 32 | Cap on MLX's memory in GiB; the pool is planned within it. |
+| `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Plan the pool within what is free at load: this process, free, file-backed and purgeable pages, less 2 GB or 5% of RAM (see What other apps hold). MLX's memory limit is lowered to the same figure. `0` plans from the working set alone, and the system makes room by compressing and swapping other apps. |
 | `LUMEN_MOE_EVICTION` | `bias` | Which expert leaves the pool when it is full: `bias` (learned, see below), `gclock` or `clock`. Never changes the output. |
 | `LUMEN_MOE_IO_MODE` | `auto` | `direct` bypasses the page cache for expert reads, `buffered` uses it, `auto` uses it while the machine has more than 12 GB of memory to spare. |
 | `LUMEN_MOE_IO_LANES` | 32 | Reader threads (1–64). |

@@ -415,6 +415,18 @@ impl Qwen4ExpConfig {
         layers * (recurrent + window) as u64
     }
 
+    /// Bytes of one routed expert as the offload engine reads it: its gate, up and down
+    /// projections at the experts' quantization, with a bf16 scale and bias per group (2.76 MB on
+    /// Flash-Next: 2,560 x 640, 4-bit, groups of 64).
+    pub fn routed_expert_bytes(&self) -> u64 {
+        let q = self
+            .quant
+            .for_base("language_model.model.layers.0.mlp.switch_mlp");
+        let weights = (self.hidden_size * self.moe_intermediate_size) as u64;
+        let groups = weights / q.group_size.max(1) as u64;
+        3 * (weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2)
+    }
+
     pub fn rotary_dim(&self) -> usize {
         (self.head_dim as f32 * self.partial_rotary_factor) as usize
     }
@@ -509,6 +521,24 @@ mod tests {
             .quant
             .for_base("language_model.model.layers.0.mlp.shared_expert.up_proj");
         assert_eq!((other.group_size, other.bits), (32, 4));
+    }
+
+    #[test]
+    fn a_routed_expert_is_three_quantized_projections_with_a_scale_and_bias_per_group() {
+        let mut cfg = Qwen4ExpConfig::from_json(&tiny_json()).unwrap();
+        // 64 x 64 at 4 bits in groups of 32: 2,048 bytes of weights and 128 groups a projection.
+        assert_eq!(cfg.routed_expert_bytes(), 3 * (2_048 + 128 * 4));
+        // Flash-Next: 2,560 x 640, 4-bit, groups of 64, as the expert bank reads it (2.76 MB).
+        cfg.hidden_size = 2_560;
+        cfg.moe_intermediate_size = 640;
+        cfg.quant.set(
+            "language_model.model.layers.0.mlp.switch_mlp",
+            QuantSpec {
+                group_size: 64,
+                bits: 4,
+            },
+        );
+        assert_eq!(cfg.routed_expert_bytes(), 2_764_800);
     }
 
     #[test]

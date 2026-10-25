@@ -80,26 +80,38 @@ pub struct MemoryUsage {
     /// MLX allocation arrives, so `total - wired` is the realistic ceiling a
     /// model can claim, whereas `total - used` is the no-swap comfortable free.
     pub wired_bytes: u64,
+    /// What the rest of the machine gives up without anyone being compressed or swapped: free,
+    /// file-backed and purgeable pages. The number Flash-Next's server plans its expert pool
+    /// within at load (`host_memory` in lumen-mlx reads the same three counts).
+    pub reclaimable_bytes: u64,
+    /// The running lumen-server's footprint (0 when none runs): memory a server started in its
+    /// place would have too.
+    pub server_footprint_bytes: u64,
 }
 
-pub fn current_memory_usage() -> Option<MemoryUsage> {
-    let total = total_ram_bytes()?;
-    let out = Command::new("vm_stat").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
+/// The page counts of `vm_stat`'s output this monitor reads, in pages.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VmStat {
+    page_size: u64,
+    free: u64,
+    active: u64,
+    wired: u64,
+    purgeable: u64,
+    file_backed: u64,
+    compressor: u64,
+}
 
+fn parse_vm_stat(s: &str) -> VmStat {
     // First line: "Mach Virtual Memory Statistics: (page size of N bytes)"
-    let mut page_size: u64 = 16384;
-    let mut wired: u64 = 0;
-    let mut active: u64 = 0;
-    let mut compressed: u64 = 0;
+    let mut vm = VmStat {
+        page_size: 16384,
+        ..VmStat::default()
+    };
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("Mach Virtual Memory Statistics: (page size of ") {
             if let Some(num) = rest.split_whitespace().next() {
                 if let Ok(n) = num.parse() {
-                    page_size = n;
+                    vm.page_size = n;
                 }
             }
             continue;
@@ -113,17 +125,49 @@ pub fn current_memory_usage() -> Option<MemoryUsage> {
             Err(_) => continue,
         };
         match label.trim() {
-            "Pages wired down" => wired = val_pages,
-            "Pages active" => active = val_pages,
-            "Pages occupied by compressor" => compressed = val_pages,
+            "Pages free" => vm.free = val_pages,
+            "Pages active" => vm.active = val_pages,
+            "Pages wired down" => vm.wired = val_pages,
+            "Pages purgeable" => vm.purgeable = val_pages,
+            "File-backed pages" => vm.file_backed = val_pages,
+            "Pages occupied by compressor" => vm.compressor = val_pages,
             _ => {}
         }
     }
-    let used_bytes = (wired + active + compressed) * page_size;
+    vm
+}
+
+/// The physical footprint of process `pid` (what Activity Monitor calls its memory), for a
+/// process this user owns.
+pub fn process_footprint(pid: u32) -> Option<u64> {
+    // SAFETY: an all-zero `rusage_info_v2` is a valid value of a plain C struct.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is the struct the V2 flavor fills; the kernel writes at most its size.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+/// The memory monitor's snapshot; `server_pid` is the running lumen-server's, if one runs.
+pub fn current_memory_usage(server_pid: Option<u32>) -> Option<MemoryUsage> {
+    let total = total_ram_bytes()?;
+    let out = Command::new("vm_stat").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let vm = parse_vm_stat(&String::from_utf8(out.stdout).ok()?);
+    let page = vm.page_size;
     Some(MemoryUsage {
-        used_bytes,
+        used_bytes: (vm.wired + vm.active + vm.compressor) * page,
         total_bytes: total,
-        wired_bytes: wired * page_size,
+        wired_bytes: vm.wired * page,
+        reclaimable_bytes: (vm.free + vm.file_backed + vm.purgeable) * page,
+        server_footprint_bytes: server_pid.and_then(process_footprint).unwrap_or(0),
     })
 }
 
@@ -136,5 +180,54 @@ pub fn probe() -> SystemInfo {
         ram_gb,
         arch: std::env::consts::ARCH,
         recommended: ram_defaults(ram_gb),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `vm_stat` on a 36 GB Mac with an editor, a browser and chat apps open.
+    const SAMPLE: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                   640613.
+Pages active:                                 645980.
+Pages inactive:                               649963.
+Pages speculative:                              3561.
+Pages throttled:                                   0.
+Pages wired down:                             214120.
+Pages purgeable:                               19196.
+\"Translation faults\":                     9071745168.
+File-backed pages:                            421392.
+Anonymous pages:                              878112.
+Pages stored in compressor:                   305342.
+Pages occupied by compressor:                 147990.
+";
+
+    #[test]
+    fn free_file_backed_and_purgeable_pages_are_what_a_newcomer_gets_without_swapping() {
+        let vm = parse_vm_stat(SAMPLE);
+        assert_eq!(
+            vm,
+            VmStat {
+                page_size: 16384,
+                free: 640_613,
+                active: 645_980,
+                wired: 214_120,
+                purgeable: 19_196,
+                file_backed: 421_392,
+                compressor: 147_990,
+            }
+        );
+        // Speculative pages are file pages read ahead, already among the file-backed ones;
+        // inactive and anonymous pages belong to other apps.
+        assert_eq!(
+            (vm.free + vm.file_backed + vm.purgeable) * vm.page_size,
+            17_714_397_184
+        );
+    }
+
+    #[test]
+    fn this_process_has_a_footprint() {
+        assert!(process_footprint(std::process::id()).is_some_and(|b| b > 0));
     }
 }

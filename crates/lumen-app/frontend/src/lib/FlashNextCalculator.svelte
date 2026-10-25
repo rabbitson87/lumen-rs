@@ -8,7 +8,7 @@
   // theirs, passed as `env`); the choices themselves are made in that card, above it.
   import { t } from "./i18n.svelte";
   import MeasureControl from "./MeasureControl.svelte";
-  import type { FlashNextStatus, MeasureProgress } from "./api";
+  import type { FlashNextStatus, MeasureProgress, MemoryUsage } from "./api";
   import { fill } from "./format";
   import {
     FLASH_NEXT,
@@ -24,6 +24,7 @@
     flashNextPlanFits,
     flashNextSlowSsd,
     flashNextUsableBytes,
+    flashNextUsableNow,
   } from "./memory-estimate";
 
   interface Props {
@@ -35,6 +36,8 @@
     env: Record<string, string>;
     /** Current structured `context.max` (reaches the server as `LUMEN_MAX_CTX`). */
     contextMax?: number;
+    /** The live memory monitor's reading: what other apps leave free now. */
+    memoryNow?: MemoryUsage | null;
     status?: FlashNextStatus | null;
     /** The latest Measure report of this session. */
     measure?: MeasureProgress | null;
@@ -48,6 +51,7 @@
     memoryLimitGb = null,
     env,
     contextMax,
+    memoryNow = null,
     status = null,
     measure = null,
     enabled = false,
@@ -98,6 +102,21 @@
       flashNextUsableBytes(ram) > flashNextUsableBytes(ram, memoryLimitGb),
   );
 
+  // The server plans its pool within what other apps leave free when it loads: what a server
+  // started now would get, when that is less than the plan above (`null`: not less, or unknown).
+  const freeNow = $derived.by(() => {
+    if (!memoryNow || !(memoryNow.reclaimable_bytes > 0)) return null;
+    const within = flashNextUsableNow(
+      usable,
+      memoryNow.total_bytes,
+      memoryNow.reclaimable_bytes,
+      memoryNow.server_footprint_bytes ?? 0,
+    );
+    if (usable - within < 0.05e9) return null;
+    const pool = Math.max(0, within - FLASH_NEXT.trunkBytes - est.plan.reserveBytes);
+    return { within, below: usable - within, pool, floor: pool < FLASH_NEXT.poolFloorBytes };
+  });
+
   const gb = (b: number, d = 1) => (b / 1e9).toFixed(d);
   const fmtTok = (n: number) => n.toLocaleString("en-US");
 </script>
@@ -117,6 +136,23 @@
       {fill(t("flashnext.tight"), { chunk: defaults.chunk, ctx: fmtTok(defaults.ctxTokens) })}
     {/if}
   </div>
+  {#if freeNow}
+    <div class="text-warn text-[10.5px] mb-1 leading-snug">
+      {#if freeNow.floor}
+        {fill(t("flashnext.freeNow.floor"), {
+          now: gb(freeNow.within),
+          below: gb(freeNow.below),
+          floor: gb(FLASH_NEXT.poolFloorBytes, 2),
+        })}
+      {:else}
+        {fill(t("flashnext.freeNow"), {
+          now: gb(freeNow.within),
+          below: gb(freeNow.below),
+          pool: gb(freeNow.pool),
+        })}
+      {/if}
+    </div>
+  {/if}
   <div class="text-[10.5px] mb-2.5 leading-snug" class:text-ok={loads} class:text-err={!loads}>
     {#if loads}
       {fill(t("flashnext.fits"), { ctx: fmtTok(est.plan.ctxTokens), need: gb(loadNeed) })}

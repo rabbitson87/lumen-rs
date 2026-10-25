@@ -1413,6 +1413,7 @@
       ramGb={systemInfo?.ram_gb}
       memoryLimitGb={flashNextMemoryLimitGb}
       contextMax={config.context.max}
+      memoryNow={memoryUsage}
       status={flashStatus}
       build={packBuild}
       measure={measureReport}

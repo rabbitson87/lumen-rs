@@ -118,12 +118,13 @@ pub async fn get_system_info() -> CmdResult<SystemInfo> {
     Ok(sysinfo::probe())
 }
 
-/// Live system memory snapshot for the topbar monitor. Returns `None` only
-/// if the `vm_stat` probe fails — the UI hides the indicator in that case
+/// Live system memory snapshot for the topbar monitor and the Flash-Next memory plan. Returns
+/// `None` only if the `vm_stat` probe fails — the UI hides the indicator in that case
 /// rather than rendering nonsense.
 #[tauri::command]
-pub async fn get_memory_usage() -> CmdResult<Option<MemoryUsage>> {
-    Ok(sysinfo::current_memory_usage())
+pub async fn get_memory_usage(state: State<'_, AppState>) -> CmdResult<Option<MemoryUsage>> {
+    let pid = state.supervisor.status().await.pid;
+    Ok(sysinfo::current_memory_usage(pid))
 }
 
 /// Reset the Metal memory caps in `ServerConfig` to RAM-aware defaults
