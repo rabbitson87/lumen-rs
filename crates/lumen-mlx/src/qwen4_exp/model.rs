@@ -1099,12 +1099,18 @@ fn load_ple(
     let first = shard_base(0);
     let first_w = require(weights, &format!("{first}.weight"))?;
     let first_s = require(weights, &format!("{first}.scales"))?;
-    // 4-bit rows; the group size is what the shapes say (32 in both builds).
-    let bits = 4;
-    let row_dim = *first_w.shape().last().unwrap_or(&0) as i64 * 32 / bits;
+    // A row is one hash head's slice of the embedding; its bits are the quantization config's
+    // (4 in both 4-bit builds, which name the shards, 3 in a uniform 3-bit build, which takes the
+    // default), and the shapes have to agree, as the group size is what they say.
+    let row_dim = (cfg.ple_embed_dim / cfg.ngram_heads()) as i64;
+    let bits = cfg.quant.for_base(&first).bits;
+    let packed = *first_w.shape().last().unwrap_or(&0) as i64;
     let groups = *first_s.shape().last().unwrap_or(&0) as i64;
-    if groups == 0 || row_dim % groups != 0 {
-        bail!("{layer_base}: n-gram shard shapes do not describe 4-bit rows");
+    if packed * 32 != row_dim * i64::from(bits) || groups == 0 || row_dim % groups != 0 {
+        bail!(
+            "{layer_base}: n-gram shards of {packed} packed columns and {groups} scale groups \
+             do not describe {row_dim}-wide {bits}-bit rows"
+        );
     }
     let group_size = (row_dim / groups) as i32;
     let rows_per_shard = first_w.shape()[0] as u64;
@@ -1134,7 +1140,7 @@ fn load_ple(
             cfg.split_ngram_parts,
             &shard_base,
             group_size,
-            bits as i32,
+            bits,
             DEFAULT_ROW_CACHE,
             IoMode::Buffered,
         )?)
@@ -1158,7 +1164,7 @@ fn load_ple(
             shards,
             rows_per_shard,
             group_size,
-            bits as i32,
+            bits,
         )?)
     };
     Ok(Ple {
