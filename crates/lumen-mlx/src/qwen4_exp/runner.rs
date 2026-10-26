@@ -197,7 +197,29 @@ struct Seq {
     /// The disk entry this sequence last wrote or was restored from, so a longer
     /// state replaces it instead of piling up beside it.
     persisted_key: Option<String>,
+    /// The snapshot this sequence was forked from, while it still is that snapshot (anything
+    /// that may change it clears this): what a joint feed computed ahead is keyed on.
+    forked_from: Option<u64>,
 }
+
+/// A feed [`Qwen4ExpRunner::prefeed`] computed ahead: what extending a sequence forked from
+/// `snapshot` by `tokens` (keeping the state `mark` tokens in) gives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrefedKey {
+    snapshot: u64,
+    mark: Option<usize>,
+    tokens: Vec<u32>,
+}
+
+struct Prefed {
+    cache: Qwen4ExpCache,
+    next: u32,
+    point: Option<Qwen4ExpCache>,
+}
+
+/// The most tokens one joint feed takes, all its sequences together: one prefill group, whose
+/// residual streams the memory plan holds.
+const JOINT_FEED_TOKENS: usize = super::model::PREFILL_GROUP_TOKENS;
 
 pub(crate) struct Qwen4ExpRunner {
     model: Qwen4ExpModel,
@@ -215,6 +237,8 @@ pub(crate) struct Qwen4ExpRunner {
     disk: Option<DiskKvStore>,
     fingerprint: String,
     spec: Speculation,
+    /// Feeds computed ahead by [`Self::prefeed`], until the extend they belong to takes them.
+    prefed: HashMap<PrefedKey, Prefed>,
     /// Tests choose the draft of each round.
     #[cfg(test)]
     forced_draft: Option<Box<dyn FnMut() -> u32>>,
@@ -795,6 +819,7 @@ impl Qwen4ExpRunner {
                 disk,
                 fingerprint,
                 spec,
+                prefed: HashMap::new(),
                 #[cfg(test)]
                 forced_draft: None,
             },
@@ -963,6 +988,7 @@ impl Qwen4ExpRunner {
                         position,
                         rollback: point,
                         persisted_key: None,
+                        forked_from: None,
                         pending: None,
                         recent: Default::default(),
                         spec_off: false,
@@ -1002,9 +1028,13 @@ impl Qwen4ExpRunner {
     }
 
     fn seq(&mut self, seq_id: u64, what: &str) -> Result<&mut Seq> {
-        self.seqs
+        let seq = self
+            .seqs
             .get_mut(&seq_id)
-            .ok_or_else(|| anyhow!("qwen4_exp runner: {what} on unknown seq_id {seq_id}"))
+            .ok_or_else(|| anyhow!("qwen4_exp runner: {what} on unknown seq_id {seq_id}"))?;
+        // Whoever asks may change it: it no longer stands for the snapshot it was forked from.
+        seq.forked_from = None;
+        Ok(seq)
     }
 
     /// One decode step with the pick left to the caller, over the host logits. Always a plain
@@ -1024,6 +1054,7 @@ impl Qwen4ExpRunner {
         // A token buffered for a plain call is not valid for a masked one (it was picked without
         // the mask): go back to the state before it and take the step.
         seq.pending = None;
+        seq.forked_from = None;
         let logits = model.forward(&[last_token], &mut seq.cache, true)?;
         let mut host = crate::gemma4_sampling::imp::last_logits_to_cpu_f32(&logits)
             .context("qwen4_exp: logits to host")?;
@@ -1060,6 +1091,7 @@ impl Qwen4ExpRunner {
         let seq = self.seqs.get_mut(&seq_id).ok_or_else(|| {
             anyhow!("qwen4_exp runner: decode_step_spec on unknown seq_id {seq_id}")
         })?;
+        seq.forked_from = None;
         let started = std::time::Instant::now();
         if let Some(p) = seq.pending.take() {
             if p.after == last_token {
@@ -1281,6 +1313,7 @@ impl Qwen4ExpRunner {
                     cache,
                     position: at,
                     persisted_key: Some(key),
+                    forked_from: None,
                     pending: None,
                     recent: Default::default(),
                     spec_off: false,
@@ -1346,6 +1379,7 @@ impl Qwen4ExpRunner {
                 position: tokens.len(),
                 rollback: None,
                 persisted_key: None,
+                forked_from: None,
                 pending: None,
                 recent: Default::default(),
                 spec_off: false,
@@ -1368,6 +1402,145 @@ impl Qwen4ExpRunner {
         id
     }
 
+    /// Compute ahead, together, the extends `items` describe: each one a sequence forked from
+    /// `snapshot` and extended by `tokens`, keeping the state `mark` tokens in, exactly as
+    /// [`Self::extend_marked`] would compute it (the chunks counted from the snapshot, through
+    /// [`Qwen4ExpModel::forward_many`]), so that one pass over the layers reads each layer's
+    /// experts once for all of them. The extend that later asks for one of them takes the result
+    /// instead of computing it; one nobody asks for is dropped by [`Self::clear_prefeed`].
+    ///
+    /// `items` are the feeds of every request still to be served, so a feed computed earlier that
+    /// is not among them (its request was served, or went another way) is dropped first. Takes
+    /// the rest in order while they fit one joint feed ([`JOINT_FEED_TOKENS`]) and skips any this
+    /// runner could not extend as asked (an unknown snapshot, a context past the plan, a mark
+    /// between chunk ends: the extend itself reports those). Returns how many it fed; with fewer
+    /// than two there is nothing to share and it feeds none.
+    pub(crate) fn prefeed(&mut self, items: &[crate::prefix_cache::PrefeedItem]) -> Result<usize> {
+        let before = self.prefed.len();
+        self.prefed.retain(|k, _| {
+            items
+                .iter()
+                .any(|i| i.snapshot == k.snapshot && i.mark == k.mark && i.tokens == k.tokens)
+        });
+        if self.prefed.len() < before {
+            let _ = crate::metal_memory::clear_cache();
+        }
+        let mut take: Vec<(PrefedKey, Qwen4ExpCache, usize, Vec<usize>)> = Vec::new();
+        let mut tokens = 0;
+        for item in items {
+            let key = PrefedKey {
+                snapshot: item.snapshot,
+                mark: item.mark,
+                tokens: item.tokens.clone(),
+            };
+            if item.tokens.is_empty()
+                || self.prefed.contains_key(&key)
+                || take.iter().any(|(k, ..)| *k == key)
+                || tokens + item.tokens.len() > JOINT_FEED_TOKENS
+            {
+                continue;
+            }
+            let Some((cache, position)) = self.snapshots.get(&item.snapshot).cloned() else {
+                continue;
+            };
+            let cuts = chunk_cuts(0, item.tokens.len(), self.chunk);
+            if self.check_context(position, item.tokens.len()).is_err()
+                || item.mark.is_some_and(|m| !cuts.contains(&m))
+            {
+                continue;
+            }
+            tokens += item.tokens.len();
+            take.push((key, cache, position, cuts));
+        }
+        if take.len() < 2 {
+            return Ok(0);
+        }
+        self.mem_begin();
+        let started = std::time::Instant::now();
+        let mut caches: Vec<Qwen4ExpCache> = take.iter().map(|(_, c, ..)| c.clone()).collect();
+        let results = {
+            let mut feeds: Vec<super::model::JointFeed<'_>> = take
+                .iter()
+                .zip(caches.iter_mut())
+                .map(|((key, _, _, cuts), cache)| super::model::JointFeed {
+                    ids: &key.tokens,
+                    cache,
+                    cuts,
+                    mark: key.mark,
+                })
+                .collect();
+            self.model.forward_many(&mut feeds)?
+        };
+        let fed = take.len();
+        for (((key, ..), cache), (logits, point)) in take.into_iter().zip(caches).zip(results) {
+            logits.eval().context("qwen4_exp: evaluate a joint feed")?;
+            let next = Self::argmax(&logits)?;
+            self.prefed.insert(key, Prefed { cache, next, point });
+        }
+        self.feed_report(&format!(
+            "fed {fed} sequences together ({tokens} tokens) in {:.0} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        ));
+        Ok(fed)
+    }
+
+    /// The feed [`Self::prefeed`] computed for extending `seq_id` by `tokens` (keeping the state
+    /// `mark` tokens in), installed as that extend would leave it: `(next token, position,
+    /// snapshot id of the kept state)`. `None` unless the sequence is still the snapshot the feed
+    /// started from.
+    fn take_prefed(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        mark: Option<usize>,
+    ) -> Option<(u32, usize, Option<u64>)> {
+        if self.prefed.is_empty() {
+            return None;
+        }
+        let snapshot = self.seqs.get(&seq_id)?.forked_from?;
+        let have = self.snapshots.get(&snapshot)?.1;
+        if self.seqs.get(&seq_id)?.position != have {
+            return None;
+        }
+        let fed = self.prefed.remove(&PrefedKey {
+            snapshot,
+            mark,
+            tokens: tokens.to_vec(),
+        })?;
+        let seq = self.seqs.get_mut(&seq_id)?;
+        seq.forked_from = None;
+        seq.pending = None;
+        seq.cache = fed.cache;
+        seq.position = have + tokens.len();
+        let position = seq.position;
+        let kept = fed
+            .point
+            .zip(mark)
+            .map(|(p, m)| self.keep_snapshot(p, have + m));
+        self.feed_report(&format!(
+            "extended seq {seq_id} by {} tokens (fed ahead, together with others)",
+            tokens.len()
+        ));
+        Some((fed.next, position, kept))
+    }
+
+    /// Whether [`Self::prefeed`] holds the result of `item`.
+    pub(crate) fn holds_prefed(&self, item: &crate::prefix_cache::PrefeedItem) -> bool {
+        self.prefed.contains_key(&PrefedKey {
+            snapshot: item.snapshot,
+            mark: item.mark,
+            tokens: item.tokens.clone(),
+        })
+    }
+
+    /// Drop the feeds [`Self::prefeed`] computed that no extend took.
+    pub(crate) fn clear_prefeed(&mut self) {
+        if !self.prefed.is_empty() {
+            self.prefed.clear();
+            let _ = crate::metal_memory::clear_cache();
+        }
+    }
+
     /// [`Runner::extend`] (chunks counted from the sequence's position) that also keeps the state
     /// `mark` tokens in as a snapshot when `mark` is one of those chunk ends: `(next token,
     /// position, snapshot id)`. A mark between chunk ends is an error, not a guess.
@@ -1382,6 +1555,9 @@ impl Qwen4ExpRunner {
             return Ok((next, position, None));
         };
         self.mem_begin();
+        if let Some(fed) = self.take_prefed(seq_id, tokens, Some(mark)) {
+            return Ok(fed);
+        }
         let have = self.seq(seq_id, "extend")?.position;
         self.check_context(have, tokens.len())?;
         if tokens.is_empty() {
@@ -1606,6 +1782,15 @@ impl crate::prefix_cache::SnapshotRunner for Qwen4ExpRunner {
     ) -> Result<(u32, usize, Option<u64>)> {
         Qwen4ExpRunner::extend_marked(self, seq_id, tokens, mark)
     }
+    fn prefeed(&mut self, items: &[crate::prefix_cache::PrefeedItem]) -> Result<usize> {
+        Qwen4ExpRunner::prefeed(self, items)
+    }
+    fn clear_prefeed(&mut self) {
+        Qwen4ExpRunner::clear_prefeed(self)
+    }
+    fn holds_prefed(&self, item: &crate::prefix_cache::PrefeedItem) -> bool {
+        Qwen4ExpRunner::holds_prefed(self, item)
+    }
 }
 
 impl Runner for Qwen4ExpRunner {
@@ -1626,6 +1811,7 @@ impl Runner for Qwen4ExpRunner {
                 position: tokens.len(),
                 rollback: None,
                 persisted_key: None,
+                forked_from: None,
                 pending: None,
                 recent: Default::default(),
                 spec_off: false,
@@ -1653,6 +1839,7 @@ impl Runner for Qwen4ExpRunner {
             .seqs
             .get_mut(&seq_id)
             .ok_or_else(|| anyhow!("qwen4_exp runner: decode_step on unknown seq_id {seq_id}"))?;
+        seq.forked_from = None;
         let logits = model.forward(&[last_token], &mut seq.cache, true)?;
         let next = Self::argmax(&logits)?;
         seq.position += 1;
@@ -1669,6 +1856,9 @@ impl Runner for Qwen4ExpRunner {
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {
         // Feed a clone: a failed forward leaves the sequence exactly as it was.
         self.mem_begin();
+        if let Some((next, position, _)) = self.take_prefed(seq_id, tokens, None) {
+            return Ok((next, position));
+        }
         let have = self.seq(seq_id, "extend")?.position;
         self.check_context(have, tokens.len())?;
         let seq = self.seq(seq_id, "extend")?;
@@ -1733,6 +1923,7 @@ impl Runner for Qwen4ExpRunner {
                 position,
                 rollback: None,
                 persisted_key: None,
+                forked_from: Some(snapshot_id),
                 pending: None,
                 recent: Default::default(),
                 spec_off: false,
@@ -2264,6 +2455,7 @@ mod tests {
             disk: None,
             fingerprint: String::new(),
             spec,
+            prefed: HashMap::new(),
             forced_draft: None,
         }
     }
@@ -2623,6 +2815,157 @@ mod tests {
         }
         // With the draft head, whose cache the kept points carry too.
         exact_rounds(MtpMode::On, Some(1));
+    }
+
+    /// `LUMEN_JOINT_PREFILL`: two conversations that share a head, one round in, each extend
+    /// their own resume point. Feeding both rounds ahead in one pass (what the engine does when
+    /// the second request is waiting) must leave each request exactly what its cold prompt
+    /// gives: the next token, the state, six greedy steps, and a kept resume point the next
+    /// round continues from exactly. A feed computed for a prompt nobody sends is never taken.
+    #[test]
+    fn rounds_fed_together_continue_exactly_like_their_cold_prompts() {
+        for budget in [None, Some(1u64)] {
+            joint_rounds(budget);
+        }
+    }
+
+    fn joint_rounds(budget: Option<u64>) {
+        use crate::prefix_cache::{PrefeedItem, PrefixCacheStore, exact_reuse};
+        let ids = fixture_ids();
+        let at = 21;
+        // Two conversations with the same head (system prompt and tools) and their own rest.
+        let convo = |shift: u32| -> Vec<u32> {
+            (0..100)
+                .map(|i| {
+                    if i < at {
+                        ids[i]
+                    } else {
+                        (ids[i % ids.len()] + shift + 7 * (i / ids.len()) as u32) % 128
+                    }
+                })
+                .collect()
+        };
+        let (a, b) = (convo(0), convo(3));
+        exact_reuse::with(true, || {
+            let mut r = tiny_runner_with(16, MtpMode::Off, budget);
+            let mut store = PrefixCacheStore::with_incremental(true, 4, true);
+            let round = |r: &mut Qwen4ExpRunner, store: &mut PrefixCacheStore, seq, p: &[u32]| {
+                store
+                    .prefill_optionally_cached(r, seq, p, Some("k"), Some(at))
+                    .unwrap()
+                    .0
+            };
+            // Round 1 of each: a cold MISS (the head and A's point), then a HIT of the head.
+            round(&mut r, &mut store, 1, &a[..40]);
+            round(&mut r, &mut store, 2, &b[..44]);
+
+            // Round 2 of each, fed together ahead.
+            let plan_a = store.predict_feed(&r, "k", &a[..75]).expect("A extends").0;
+            let plan_b = store.predict_feed(&r, "k", &b[..82]).expect("B extends").0;
+            assert_ne!(plan_a.snapshot, plan_b.snapshot, "each its own point");
+            assert!(
+                plan_a.mark.is_some() && plan_b.mark.is_some(),
+                "each keeps a new point"
+            );
+            let stray = PrefeedItem {
+                tokens: plan_a.tokens[..plan_a.tokens.len() - 3].to_vec(),
+                ..plan_a.clone()
+            };
+            assert_eq!(r.prefeed(&[plan_a, plan_b, stray]).unwrap(), 3);
+            // What A's result holds is in memory already: its request plans no more.
+            let plan = store.plan_feed(&mut r, Some("k"), &a[..75], true);
+            assert_eq!((plan.kv_tokens, plan.states), (0, 0), "A's feed is held");
+            for (seq, prompt) in [(3, &a[..75]), (4, &b[..82])] {
+                let cold = cold_in_two_calls_with(MtpMode::Off, budget, prompt, at);
+                let next = round(&mut r, &mut store, seq, prompt);
+                assert_continues_like(&mut r, seq, next, &cold, &format!("{budget:?} seq {seq}"));
+            }
+            assert_eq!(
+                r.prefed.len(),
+                1,
+                "both rounds took theirs, the stray one is left"
+            );
+            r.clear_prefeed();
+            assert!(r.prefed.is_empty());
+
+            // Round 3 continues from the points the fed rounds kept.
+            for (seq, prompt) in [(5, &a[..100]), (6, &b[..100])] {
+                let cold = cold_in_two_calls_with(MtpMode::Off, budget, prompt, at);
+                let next = round(&mut r, &mut store, seq, prompt);
+                assert_continues_like(&mut r, seq, next, &cold, &format!("{budget:?} seq {seq}"));
+            }
+        });
+    }
+
+    /// A fed result stands for a sequence forked from its snapshot and not touched since: one
+    /// that took a decode step (or was changed any other way) computes its own extend.
+    #[test]
+    fn a_fed_result_is_only_taken_by_an_untouched_fork() {
+        use crate::prefix_cache::PrefeedItem;
+        let ids = fixture_ids();
+        let mut r = tiny_runner(16);
+        Runner::prefill(&mut r, 1, &ids[..20]).unwrap();
+        let (snap, _) = Runner::snapshot_state_deep(&mut r, 1).unwrap();
+        let item = |tokens: &[u32]| PrefeedItem {
+            snapshot: snap,
+            tokens: tokens.to_vec(),
+            mark: None,
+        };
+        assert_eq!(
+            r.prefeed(&[item(&ids[20..30]), item(&ids[20..34])])
+                .unwrap(),
+            2
+        );
+        // The next plan no longer has the second request (it was served, or went another way):
+        // its feed goes, the other stays, and one feed alone is not computed again.
+        assert_eq!(r.prefeed(&[item(&ids[20..30])]).unwrap(), 0);
+        assert_eq!(r.prefed.len(), 1);
+
+        // Touched after the fork: computes its own, the stash keeps the feed.
+        Runner::fork_from_snapshot(&mut r, snap, 2).unwrap();
+        let (step, _) = Runner::decode_step(&mut r, 2, ids[19], 20).unwrap();
+        let _ = step;
+        Runner::extend(&mut r, 2, &ids[20..30]).unwrap();
+        assert_eq!(r.prefed.len(), 1);
+
+        // Untouched: takes it, and the result is the extend's own.
+        Runner::fork_from_snapshot(&mut r, snap, 3).unwrap();
+        let taken = Runner::extend(&mut r, 3, &ids[20..30]).unwrap();
+        assert!(r.prefed.is_empty());
+        Runner::fork_from_snapshot(&mut r, snap, 4).unwrap();
+        r.clear_prefeed();
+        let own = Runner::extend(&mut r, 4, &ids[20..30]).unwrap();
+        assert_eq!(taken, own);
+        assert!(state_bytes(&r, 3) == state_bytes(&r, 4));
+    }
+
+    /// Feeds too short to take the staging path (one and two rows, a few of the replica's 16
+    /// experts each) are fed together through the expert pool, each layer for one and then the
+    /// other, and each still comes out as its own extend.
+    #[test]
+    fn short_feeds_fed_together_through_the_pool_match_their_own_extends() {
+        use crate::prefix_cache::PrefeedItem;
+        let ids = fixture_ids();
+        let mut r = tiny_runner_with(16, MtpMode::Off, Some(1));
+        Runner::prefill(&mut r, 1, &ids[..20]).unwrap();
+        let (snap, _) = Runner::snapshot_state_deep(&mut r, 1).unwrap();
+        let feeds = [&ids[20..21], &ids[20..22]];
+        let items = feeds.map(|tokens| PrefeedItem {
+            snapshot: snap,
+            tokens: tokens.to_vec(),
+            mark: None,
+        });
+        assert_eq!(r.prefeed(&items).unwrap(), 2);
+        for (i, tokens) in feeds.into_iter().enumerate() {
+            let (fed, own) = (10 + 2 * i as u64, 11 + 2 * i as u64);
+            Runner::fork_from_snapshot(&mut r, snap, fed).unwrap();
+            let taken = Runner::extend(&mut r, fed, tokens).unwrap();
+            Runner::fork_from_snapshot(&mut r, snap, own).unwrap();
+            let computed = Runner::extend(&mut r, own, tokens).unwrap();
+            assert_eq!(taken, computed, "feed {i}");
+            assert!(state_bytes(&r, fed) == state_bytes(&r, own), "feed {i}");
+        }
+        assert!(r.prefed.is_empty(), "both were taken");
     }
 
     fn exact_rounds(mtp: MtpMode, budget: Option<u64>) {

@@ -2181,6 +2181,18 @@ fn anthropic_flat_messages(req: &AnthropicRequest, system: Option<&str>) -> Vec<
         .collect()
 }
 
+/// Whether any message carries an image block (what `anthropic_images_flat`
+/// decodes), without decoding it.
+#[cfg(feature = "mlx-native")]
+fn anthropic_has_images(messages: &[AnthropicMessage]) -> bool {
+    messages.iter().any(|m| match &m.content {
+        AnthropicContent::Text(_) => false,
+        AnthropicContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, AnthropicContentBlock::Image { .. })),
+    })
+}
+
 /// An Anthropic request's history as the structured renderer reads it, built
 /// once per message so the turns can borrow from it: an assistant message's
 /// text (`as_text`, which also folds a replayed `thinking` block into the
@@ -3155,8 +3167,172 @@ impl InferenceEngine {
     }
 
     async fn run_sequential(&mut self, rx: &mut mpsc::Receiver<EngineRequest>) {
-        while let Some(req) = rx.recv().await {
+        // Requests that were already waiting when an earlier one was taken, oldest first: they
+        // are served in arrival order, like the ones still in the channel.
+        let mut waiting: std::collections::VecDeque<EngineRequest> = Default::default();
+        loop {
+            let req = match waiting.pop_front() {
+                Some(r) => r,
+                None => match rx.recv().await {
+                    Some(r) => r,
+                    None => return,
+                },
+            };
+            #[cfg(feature = "mlx-native")]
+            self.prefeed_with_waiting(&req, rx, &mut waiting);
             self.dispatch_request_sequential(req);
+            #[cfg(feature = "mlx-native")]
+            if waiting.is_empty() {
+                // Every request a feed was computed for has been served now.
+                match &mut self.backend {
+                    ModelBackend::Mlx(b) => b.clear_prefeed(),
+                }
+            }
+        }
+    }
+
+    /// Before serving `current`, compute its prefill together with those of the requests waiting
+    /// behind it (`LUMEN_JOINT_PREFILL`, Flash-Next): each layer's experts are then read from the
+    /// SSD once for all of them. Each request takes its own result when it is served (see
+    /// `MlxBackend::prefeed`), so nothing it returns changes; with the flag off or no request
+    /// waiting this does nothing, and the channel is not drained.
+    #[cfg(feature = "mlx-native")]
+    fn prefeed_with_waiting(
+        &mut self,
+        current: &EngineRequest,
+        rx: &mut mpsc::Receiver<EngineRequest>,
+        waiting: &mut std::collections::VecDeque<EngineRequest>,
+    ) {
+        let enabled = match &self.backend {
+            ModelBackend::Mlx(b) => b.joint_prefill_enabled(),
+        };
+        if !enabled {
+            return;
+        }
+        while let Ok(r) = rx.try_recv() {
+            waiting.push_back(r);
+        }
+        if waiting.is_empty() {
+            return;
+        }
+        // Every request still to be served, so feeds computed for others are dropped too.
+        let plans: Vec<lumen_mlx::PlannedPrefeed> = std::iter::once(current)
+            .chain(waiting.iter())
+            .filter_map(|r| self.plan_prefeed(r))
+            .collect();
+        match &mut self.backend {
+            ModelBackend::Mlx(b) => {
+                b.prefeed(plans);
+            }
+        }
+    }
+
+    /// What `req`'s prefill would extend from a prompt snapshot in memory, worked out from the
+    /// request as its handler works out the backend call (OpenAI chat and Anthropic Messages).
+    #[cfg(feature = "mlx-native")]
+    fn plan_prefeed(&mut self, req: &EngineRequest) -> Option<lumen_mlx::PlannedPrefeed> {
+        match req {
+            EngineRequest::ChatCompletion { req, .. }
+            | EngineRequest::StreamingChatCompletion { req, .. } => self.plan_openai_prefeed(req),
+            EngineRequest::AnthropicMessages { req, .. }
+            | EngineRequest::StreamingAnthropicMessages { req, .. } => {
+                self.plan_anthropic_prefeed(req)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::plan_prefeed`] for an Anthropic Messages request: the same turns (or flat
+    /// messages) `anthropic_messages` and `anthropic_messages_streaming` give the backend, which
+    /// has no `response_format` there. Requests with images never use the prefix cache, so they
+    /// are left out. A message of a role the handler refuses is left out of the plan, as the
+    /// streaming handler leaves it out of the prompt; the non-streaming one then refuses the
+    /// request and the feed planned for it is dropped unused.
+    #[cfg(feature = "mlx-native")]
+    fn plan_anthropic_prefeed(
+        &mut self,
+        req: &AnthropicRequest,
+    ) -> Option<lumen_mlx::PlannedPrefeed> {
+        if anthropic_has_images(&req.messages) {
+            return None;
+        }
+        let ov = req.sampling_overrides();
+        let tools_owned = anthropic_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+        let thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let system_text = anthropic_system_text(req);
+        let ModelBackend::Mlx(b) = &mut self.backend;
+        if anthropic_needs_structured_history(&req.messages) {
+            let history = AnthropicHistory::new(&req.messages);
+            let mut turns = history
+                .turns(&req.messages, system_text.as_deref(), &[], |_| Ok(()))
+                .ok()?;
+            lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
+            b.plan_tools_prefeed_from_history(
+                &turns,
+                thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                None,
+            )
+        } else {
+            let mut messages = anthropic_flat_messages(req, system_text.as_deref());
+            lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+            b.plan_tools_prefeed(&messages, thinking, &ov, &tools_owned, &tool_choice, None)
+        }
+    }
+
+    /// [`Self::plan_prefeed`] for an OpenAI chat request: the same inputs `chat_completion` and
+    /// `chat_completion_streaming` give the backend. Requests with images never use the prefix
+    /// cache, so they are left out.
+    #[cfg(feature = "mlx-native")]
+    fn plan_openai_prefeed(
+        &mut self,
+        req: &ChatCompletionRequest,
+    ) -> Option<lumen_mlx::PlannedPrefeed> {
+        if req.messages.iter().any(|m| !m.images.is_empty()) {
+            return None;
+        }
+        let ov = req.sampling_overrides();
+        let tools_owned = openai_tools_to_defs(req.tools.as_deref());
+        let tool_choice =
+            resolve_openai_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
+        let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
+        let thinking =
+            req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
+        let schema = req.response_json_schema();
+        let ModelBackend::Mlx(b) = &mut self.backend;
+        if needs_structured_history(&req.messages) {
+            let arg_values = openai_tool_call_args(&req.messages);
+            let calls = openai_tool_calls(&req.messages, &arg_values);
+            let turns = openai_history_turns(&req.messages, &calls);
+            b.plan_tools_prefeed_from_history(
+                &turns,
+                thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                schema.as_ref(),
+            )
+        } else {
+            let mut messages: Vec<(String, String)> = req
+                .messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect();
+            lumen_mlx::chat_io::strip_client_meta_wrappers_flat_indexed(&mut messages);
+            b.plan_tools_prefeed(
+                &messages,
+                thinking,
+                &ov,
+                &tools_owned,
+                &tool_choice,
+                schema.as_ref(),
+            )
         }
     }
 

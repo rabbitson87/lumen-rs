@@ -1273,6 +1273,28 @@ impl prefix_cache::SnapshotRunner for RunnerImpl {
         let (last, pos) = self.as_runner_mut().extend(seq_id, tokens)?;
         Ok((last, pos, None))
     }
+    fn prefeed(&mut self, items: &[prefix_cache::PrefeedItem]) -> Result<usize> {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return r.prefeed(items);
+        }
+        let _ = items;
+        Ok(0)
+    }
+    fn clear_prefeed(&mut self) {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            r.clear_prefeed();
+        }
+    }
+    fn holds_prefed(&self, item: &prefix_cache::PrefeedItem) -> bool {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen4Exp(r) = self {
+            return r.holds_prefed(item);
+        }
+        let _ = item;
+        false
+    }
 }
 
 /// Check `LUMEN_MLX_BACKEND` against the one runner there is.
@@ -1362,6 +1384,32 @@ fn mtp_sampling_is_supported(cfg: Option<&lumen_core::sampling::SamplingConfig>)
         && c.presence_penalty == 0.0
         && c.frequency_penalty == 0.0
         && c.dry.is_disabled()
+}
+
+lumen_flags::flag! {
+    /// When requests are waiting while one is served, compute the prefills of the ones that
+    /// extend a prompt snapshot in memory (Flash-Next agent rounds: tools requests whose
+    /// conversation the prefix cache holds) together with it, in one pass over the layers, so
+    /// each layer's experts are read from the SSD once for all of them instead of once per
+    /// request. Each request then takes its own result, computed with its own chunks from its
+    /// own snapshot, so no output changes. Only feeds that fit one prefill group together
+    /// (8,192 tokens) and the memory plan without releasing anything are joined; anything else
+    /// prefills on its own as before. Three 6-round agent sessions at once on a 2.9 GB pool:
+    /// 530 s against 609 s, every reply the same (`docs/flash-next.md`).
+    pub(crate) joint_prefill {
+        env: "LUMEN_JOINT_PREFILL",
+        default: true,
+        kind: Optimization,
+    }
+}
+
+/// A feed a waiting request will make, planned ahead for [`MlxBackend::prefeed`]: the snapshot it
+/// extends, by which tokens, keeping which state, and what it leaves in memory.
+#[derive(Debug, Clone)]
+pub struct PlannedPrefeed {
+    item: prefix_cache::PrefeedItem,
+    kv_tokens: usize,
+    states: usize,
 }
 
 /// Should prefill stop one token short so the first *generated* token can be
@@ -2321,6 +2369,113 @@ impl MlxBackend {
             Self::Qwen35Family(m) => m.drop_session(session_id),
             #[cfg(feature = "mlx-native")]
             Self::Gemma4(_) => false,
+        }
+    }
+
+    /// Whether [`Self::prefeed`] can compute anything (Flash-Next with `LUMEN_JOINT_PREFILL` on),
+    /// so the engine plans waiting requests only when it can.
+    pub fn joint_prefill_enabled(&self) -> bool {
+        #[cfg(feature = "mlx-native")]
+        if let Self::Qwen35Family(m) = self {
+            return joint_prefill::get() && matches!(m.runner, RunnerImpl::Qwen4Exp(_));
+        }
+        false
+    }
+
+    /// The extend a waiting text-only request's prefill would make from a prompt snapshot in
+    /// memory, for [`Self::prefeed`]; the arguments are those [`Self::chat`] takes. `None` unless
+    /// the request takes the tools path (tools and no `response_format`) and extends a snapshot.
+    /// The caller leaves requests with images out (they never use the prefix cache).
+    pub fn plan_tools_prefeed(
+        &mut self,
+        messages: &[(String, String)],
+        thinking: bool,
+        ov: &crate::SamplingOverrides,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Option<PlannedPrefeed> {
+        if tools.is_empty() {
+            return None;
+        }
+        self.plan_prefeed_as(
+            PromptSource::Flat(messages),
+            thinking,
+            ov,
+            tools,
+            tool_choice,
+            response_schema,
+        )
+    }
+
+    /// [`Self::plan_tools_prefeed`] for a request [`Self::chat_from_history`] takes (every such
+    /// request takes the tools path).
+    pub fn plan_tools_prefeed_from_history(
+        &mut self,
+        turns: &[crate::chat_io::ChatTurn<'_>],
+        thinking: bool,
+        ov: &crate::SamplingOverrides,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Option<PlannedPrefeed> {
+        self.plan_prefeed_as(
+            PromptSource::History(turns),
+            thinking,
+            ov,
+            tools,
+            tool_choice,
+            response_schema,
+        )
+    }
+
+    fn plan_prefeed_as(
+        &mut self,
+        source: PromptSource<'_, '_>,
+        thinking: bool,
+        ov: &crate::SamplingOverrides,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Option<PlannedPrefeed> {
+        // response_format wins over tools in every chat entry point.
+        if response_schema.is_some() {
+            return None;
+        }
+        let effort = self.resolved_effort(ov);
+        match self {
+            #[cfg(feature = "mlx-native")]
+            Self::Qwen35Family(m) => m.plan_tools_prefeed(
+                source,
+                thinking,
+                tools,
+                tool_choice,
+                crate::grammar::ToolCalls::from_parallel_flag(ov.parallel_tool_calls),
+                effort,
+            ),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = (source, thinking, tools, tool_choice, effort);
+                None
+            }
+        }
+    }
+
+    /// Compute planned feeds ahead, together (see [`MlxQwen35Backend::prefeed`]); the requests
+    /// that make them take the results when they are served. Returns how many were fed.
+    pub fn prefeed(&mut self, plans: Vec<PlannedPrefeed>) -> usize {
+        match self {
+            Self::Qwen35Family(m) => m.prefeed(plans),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Drop the feeds [`Self::prefeed`] computed that no request took (call once the requests
+    /// they were planned for have been served).
+    pub fn clear_prefeed(&mut self) {
+        if let Self::Qwen35Family(m) = self {
+            prefix_cache::SnapshotRunner::clear_prefeed(&mut m.runner);
         }
     }
 
@@ -5505,6 +5660,143 @@ impl MlxQwen35Backend {
         Ok(out)
     }
 
+    /// A tools request's rendered prompt: `(prompt ids, tool_choice prefill text, its tokens)`.
+    fn tools_prompt_ids(
+        &self,
+        source: PromptSource<'_, '_>,
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Result<(Vec<u32>, String, Vec<u32>)> {
+        match source {
+            PromptSource::Flat(messages) => self.build_chat_input_with_tools_split(
+                messages,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            ),
+            PromptSource::History(turns) => self.build_chat_input_with_tools_from_history_split(
+                turns,
+                thinking,
+                tools,
+                tool_choice,
+                effort,
+            ),
+        }
+    }
+
+    /// A text-only tools request's prefix-cache key and the rendered system/tools head.
+    fn tools_prefix_key(
+        source: PromptSource<'_, '_>,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> (Option<String>, Option<String>) {
+        match source {
+            PromptSource::Flat(messages) => (
+                auto_prefix_key(messages, effort),
+                Self::system_tools_head(messages, tools, effort),
+            ),
+            PromptSource::History(turns) => (
+                auto_prefix_key_from_turns(turns, effort),
+                Self::system_tools_head_from_turns(turns, tools, effort),
+            ),
+        }
+    }
+
+    /// The part of a tools prompt that is prefilled: all of it, or all but the last token when
+    /// an active grammar has to mask the first generated token (see
+    /// [`hold_back_last_prompt_token`]).
+    fn tools_prefill_ids<'p>(
+        &self,
+        grammar: Option<&crate::grammar::Gemma4GrammarState>,
+        prompt_ids: &'p [u32],
+    ) -> &'p [u32] {
+        #[cfg(feature = "mlx-native")]
+        if hold_back_last_prompt_token(
+            grammar.is_some_and(|g| g.is_active()),
+            prompt_ids,
+            self.runner.image_token_id(),
+        ) {
+            return &prompt_ids[..prompt_ids.len() - 1];
+        }
+        let _ = grammar;
+        prompt_ids
+    }
+
+    /// What a text-only tools request's prefill would extend from a prompt snapshot in memory,
+    /// for [`Self::prefeed`]: the prompt, the key and the held-back token exactly as
+    /// [`Self::chat_with_tools`] works them out, then the prefix cache's own choice of snapshot.
+    /// `None` when the request would feed nothing that way, or this runner cannot feed ahead.
+    #[cfg(feature = "mlx-native")]
+    fn plan_tools_prefeed(
+        &mut self,
+        source: PromptSource<'_, '_>,
+        thinking: bool,
+        tools: &[crate::chat_io::ToolDef<'_>],
+        tool_choice: &crate::chat_io::ResolvedToolChoice<'_>,
+        calls: crate::grammar::ToolCalls,
+        effort: Option<crate::chat_io::ReasoningEffort>,
+    ) -> Option<PlannedPrefeed> {
+        if !joint_prefill::get() || !matches!(self.runner, RunnerImpl::Qwen4Exp(_)) {
+            return None;
+        }
+        let (prompt_ids, ..) = self
+            .tools_prompt_ids(source, thinking, tools, tool_choice, effort)
+            .ok()?;
+        let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
+        let (key, _) = Self::tools_prefix_key(source, tools, effort);
+        let prefill_ids = self.tools_prefill_ids(grammar.as_ref(), &prompt_ids);
+        self.prefix_store
+            .predict_feed(&self.runner, key.as_deref()?, prefill_ids)
+            .map(|(item, kv_tokens, states)| PlannedPrefeed {
+                item,
+                kv_tokens,
+                states,
+            })
+    }
+
+    /// Compute the planned feeds ahead, together, as many of them (in order) as the memory plan
+    /// holds without releasing anything: what all of them leave in memory, plus the largest
+    /// once more, since each request's own path still makes room for its feed as if it were not
+    /// computed yet. `plans` are those of every request still to be served (feeds computed for
+    /// any other are dropped). Returns how many were fed (none when fewer than two fit).
+    fn prefeed(&mut self, plans: Vec<PlannedPrefeed>) -> usize {
+        use prefix_cache::SnapshotRunner;
+        let mut items: Vec<prefix_cache::PrefeedItem> = Vec::new();
+        let (mut kv, mut states, mut widest) = (0, 0, (0, 0));
+        for p in plans {
+            if items.contains(&p.item) {
+                continue;
+            }
+            let (k, st) = (kv + p.kv_tokens, states + p.states);
+            let w = (widest.0.max(p.kv_tokens), widest.1.max(p.states));
+            if !items.is_empty() && self.runner.memory_shortfall(k + w.0, st + w.1) > 0 {
+                break;
+            }
+            items.push(p.item);
+            (kv, states, widest) = (k, st, w);
+        }
+        // Called with fewer than two too: the runner drops what no waiting request plans any more.
+        match self.runner.prefeed(&items) {
+            Ok(n) => {
+                if n > 0 {
+                    eprintln!(
+                        "[mlx] joint prefill: {n} of {} waiting feeds together",
+                        items.len()
+                    );
+                }
+                n
+            }
+            Err(e) => {
+                eprintln!("[mlx] joint prefill failed, each request feeds its own: {e:#}");
+                self.runner.clear_prefeed();
+                0
+            }
+        }
+    }
+
     /// Phase 2: tool-aware chat. Routes through the Qwen 3.6 nested-XML chat
     /// template and parses any `<tool_call>...</tool_call>` blocks from the
     /// model's output. Emits `BackendStreamEvent::Text` for visible-text
@@ -5569,39 +5861,15 @@ impl MlxQwen35Backend {
                 ));
             }
         } else {
-            let (ids, prefill, prefill_tokens) = match source {
-                PromptSource::Flat(messages) => self.build_chat_input_with_tools_split(
-                    messages,
-                    thinking,
-                    tools,
-                    tool_choice,
-                    effort,
-                ),
-                PromptSource::History(turns) => self
-                    .build_chat_input_with_tools_from_history_split(
-                        turns,
-                        thinking,
-                        tools,
-                        tool_choice,
-                        effort,
-                    ),
-            }?;
+            let (ids, prefill, prefill_tokens) =
+                self.tools_prompt_ids(source, thinking, tools, tool_choice, effort)?;
             (ids, prefill, prefill_tokens, Vec::new())
         };
         let grammar = self.build_qwen35_tool_grammar(tools, tool_choice, calls);
         let (prefix_key, boundary_head) = if has_images {
             (None, None)
         } else {
-            match source {
-                PromptSource::Flat(messages) => (
-                    auto_prefix_key(messages, effort),
-                    Self::system_tools_head(messages, tools, effort),
-                ),
-                PromptSource::History(turns) => (
-                    auto_prefix_key_from_turns(turns, effort),
-                    Self::system_tools_head_from_turns(turns, tools, effort),
-                ),
-            }
+            Self::tools_prefix_key(source, tools, effort)
         };
         self.chat_with_tools_impl(
             prompt_ids,
@@ -5731,19 +5999,8 @@ impl MlxQwen35Backend {
         // the image runs stay wholly inside the prefilled span. The `is_none`
         // guard makes that explicit rather than relying on it.
         let mut grammar = grammar;
-        #[cfg(feature = "mlx-native")]
-        let hold_back_last = hold_back_last_prompt_token(
-            grammar.as_ref().is_some_and(|g| g.is_active()),
-            &prompt_ids,
-            self.runner.image_token_id(),
-        );
-        #[cfg(not(feature = "mlx-native"))]
-        let hold_back_last = false;
-        let prefill_ids = if hold_back_last {
-            &prompt_ids[..prompt_ids.len() - 1]
-        } else {
-            &prompt_ids[..]
-        };
+        let prefill_ids = self.tools_prefill_ids(grammar.as_ref(), &prompt_ids);
+        let hold_back_last = prefill_ids.len() < prompt_ids.len();
 
         #[cfg(feature = "mlx-native")]
         let (mut last, mut pos) = if prepared_images.is_empty() {

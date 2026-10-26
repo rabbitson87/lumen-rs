@@ -225,6 +225,39 @@ tokens) and re-feeds from the head, up to 6,099 tokens and 24 s, where exact kee
 cold prefill with the cache on (cut at the head) is not the cache-off prefill (one cut per chunk from the
 start): those two differed in 10 of the 18 rounds, so exact matches the former, not the latter.
 
+### Several agents at once (`LUMEN_JOINT_PREFILL`, on by default)
+
+The server serves one request at a time. When others are waiting, each waiting agent round that extends a
+conversation the prefix cache holds (a tools request) is fed together with the one being served: one pass
+over the layers feeds them all, so each layer's experts are read from the SSD once instead of once per
+request. Each request still gets its own feed, from its own snapshot and cut into its own chunks, so its
+reply is the one it gets alone. It takes the result only if, when its turn comes, its sequence is still the
+untouched fork of that snapshot; otherwise it computes its own, and the result fed ahead is dropped. Up to
+8,192 tokens are fed together, and only as much as the memory plan holds without dropping anything.
+`LUMEN_JOINT_PREFILL=0` feeds each request on its own. Both OpenAI-format (`/v1/chat/completions`) and
+Anthropic-format (`/v1/messages`) requests are fed ahead, streamed or not; requests with images are not
+(they do not use the prefix cache).
+
+Measured with the three 6-round agent tasks above sent at once (one second of tool time between a reply and
+the next request; 2.9 GB pool, greedy, streamed):
+
+| | 3 sessions | Mean wait for the first token | Replies that differ from serving one request at a time |
+|---|---|---|---|
+| One request at a time | 623.6 s | 25.5 s | (the reference) |
+| Three at once, `=0` | 609.0 s | 88.1 s | 0 of 18 |
+| Three at once (default) | 530.1 s (-13%) | 76.2 s | 0 of 18 |
+
+The wait includes the time a request spends queued behind the others. Without joint feeding, three at once
+is barely faster than one at a time: the server does the same work, only without the second between rounds.
+Joint feeding is what removes work: eight times two waiting rounds were fed together, and seven of those
+pairs took 20-29 s against 30-38 s apart (about 10 s saved each); two short rounds (74 and 58 tokens) took
+4.9 s against 7.2 s apart. Prefill took 77 s less in all; decode is the same (4.8 tok/s).
+
+Short feeds fed together each take the expert pool, as they would alone: staging a whole layer for them
+(as a long prefill does) made that same pair take 11.4 s. And a request whose result was fed ahead plans
+no more memory for it, since the result is in memory already: counted again, it released the agent's
+system-prompt head on a busier machine, and that conversation's next round prefilled cold (60 s).
+
 ## Which expert leaves the pool
 
 When a layer needs an expert that is not in the pool, another one has to give up its slot. The default,

@@ -22,6 +22,7 @@ value → on.
 | `LUMEN_GEMMA4_PREFILL_CHUNK_LOG` | off | Diagnostic | `lumen_mlx::gemma4_moe::imp::prefill_chunk_log` |
 | `LUMEN_GEMMA4_QUANT_KV_FUSED_ATTN` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_fused_attn` |
 | `LUMEN_GEMMA4_QUANT_KV_PREFILL_DEQUANT` | on | Behavior | `lumen_mlx::gemma4_moe::imp::quant_kv_prefill_dequant` |
+| `LUMEN_JOINT_PREFILL` | on | Optimization | `lumen_mlx::joint_prefill` |
 | `LUMEN_KV_DISK` | on | Optimization | `lumen_mlx::kv_disk::kv_disk_tier` |
 | `LUMEN_MEMORY_PLAN_RECLAIMABLE` | on | Behavior | `lumen_mlx::qwen4_exp::runner::plan_reclaimable` |
 | `LUMEN_MLX_AUTO_SESSION` | on | Behavior | `lumen_mlx::session::auto_session_enabled` |
@@ -173,6 +174,20 @@ Run quantized-KV prefill (queries of more than one token) through
  bf16 KV it matches the quantized path it replaces: 90.64% vs 90.88%
  at 4 bits, 95.40% vs 94.74% at 8 (`examples/gemma4_kv_quality.rs`).
  `=0` restores the quantized matmuls.
+
+### `LUMEN_JOINT_PREFILL`
+
+*Optimization, default on.*
+
+When requests are waiting while one is served, compute the prefills of the ones that
+ extend a prompt snapshot in memory (Flash-Next agent rounds: tools requests whose
+ conversation the prefix cache holds) together with it, in one pass over the layers, so
+ each layer's experts are read from the SSD once for all of them instead of once per
+ request. Each request then takes its own result, computed with its own chunks from its
+ own snapshot, so no output changes. Only feeds that fit one prefill group together
+ (8,192 tokens) and the memory plan without releasing anything are joined; anything else
+ prefills on its own as before. Three 6-round agent sessions at once on a 2.9 GB pool:
+ 530 s against 609 s, every reply the same (`docs/flash-next.md`).
 
 ### `LUMEN_KV_DISK`
 

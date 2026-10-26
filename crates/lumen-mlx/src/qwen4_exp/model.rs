@@ -1229,11 +1229,96 @@ pub(crate) struct Verified {
 /// Tokens a layer-major prefill keeps in flight: each layer's experts are read from the SSD
 /// once per group this size, and the group's residual streams (40 KB a token) wait in memory
 /// between layers. A group is long enough that a layer's compute outlasts the read of the next.
-const PREFILL_GROUP_TOKENS: usize = 8192;
+pub(crate) const PREFILL_GROUP_TOKENS: usize = 8192;
 
 /// A pass of at most this many rows is a decode step or a speculative verify: it keeps nothing
 /// alive between layers worth settling.
 const DECODE_ROWS: i32 = 4;
+
+/// One sequence of a joint feed ([`Qwen4ExpModel::forward_many`]): `ids` fed into `cache` in
+/// the chunks that end at `cuts`, keeping the state at `mark` (one of the cuts) when given.
+pub(crate) struct JointFeed<'a> {
+    pub(crate) ids: &'a [u32],
+    pub(crate) cache: &'a mut Qwen4ExpCache,
+    pub(crate) cuts: &'a [usize],
+    pub(crate) mark: Option<usize>,
+}
+
+/// One feed's part of a layer-major group: what `forward_group` was given for it.
+struct GroupFeed<'a> {
+    ids: &'a [u32],
+    cache: &'a mut Qwen4ExpCache,
+    cuts: &'a [usize],
+    marks: &'a [usize],
+    want_logits: bool,
+}
+
+/// One feed's working state while its group goes through the layers.
+struct GroupWork {
+    base_tokens: usize,
+    /// The n-gram tail the cache had, then the feed's tokens.
+    history: Vec<u32>,
+    /// Each chunk's `(start, end)` in the feed.
+    bounds: Vec<(usize, usize)>,
+    /// Each chunk's residual streams, layer by layer.
+    streams: Vec<Array>,
+    /// The chunk each mark ends (the callers only mark cuts).
+    mark_pieces: Vec<Option<usize>>,
+    snap_layers: Vec<Vec<LayerState>>,
+    snap_ple: Vec<Vec<Option<Array>>>,
+}
+
+impl GroupWork {
+    fn new(model: &Qwen4ExpModel, f: &GroupFeed<'_>) -> Result<Self> {
+        let mut history = f.cache.ngram_tail.clone();
+        history.extend_from_slice(f.ids);
+        let mut start = 0;
+        let bounds: Vec<(usize, usize)> = f
+            .cuts
+            .iter()
+            .map(|&end| {
+                let b = (start, end);
+                start = end;
+                b
+            })
+            .collect();
+        let streams = bounds
+            .iter()
+            .map(|&(s, e)| model.embed_streams(&f.ids[s..e]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            base_tokens: f.cache.tokens,
+            history,
+            bounds,
+            streams,
+            mark_pieces: f
+                .marks
+                .iter()
+                .map(|m| f.cuts.iter().position(|c| c == m))
+                .collect(),
+            snap_layers: vec![Vec::new(); f.marks.len()],
+            snap_ple: vec![vec![None; f.cache.ple_conv.len()]; f.marks.len()],
+        })
+    }
+}
+
+/// Whether a group feeding several chunks through each layer stages the layer for all of them
+/// ([`BulkHint`]): only when one chunk is big enough to take the staging path for its size alone,
+/// as every prefill of more than one chunk at the planned chunk sizes has. Staging reads the
+/// whole layer, which pays for such a chunk and lets the others gather from it. Chunks that are
+/// all small (short feeds fed together) each take their own path instead, for most the pool's,
+/// the later ones finding there the experts the first read: forcing a whole-layer read for those
+/// made two feeds of 74 and 58 tokens take 11.4 s together against 7.2 s apart (Flash-Next,
+/// 2.9 GB pool). Either way each call's output is the same (see `offload::stages_for_size`).
+fn stages_every_chunk(
+    chunk_rows: impl IntoIterator<Item = usize>,
+    top_k: usize,
+    experts: usize,
+) -> bool {
+    chunk_rows
+        .into_iter()
+        .any(|rows| crate::offload::stages_for_size(rows * top_k, experts))
+}
 
 /// Routes every layer call to the staging path while it lives (see `MoeOffload::set_bulk_hint`).
 struct BulkHint<'a>(&'a MoeOffload);
@@ -1509,31 +1594,7 @@ impl Qwen4ExpModel {
         marks: &[usize],
         group_tokens: usize,
     ) -> Result<(Array, Vec<Qwen4ExpCache>)> {
-        if ids.is_empty() {
-            bail!("qwen4_exp forward: no tokens");
-        }
-        if cache.layers.len() != self.layers.len() {
-            bail!("qwen4_exp forward: cache has {} layers", cache.layers.len());
-        }
-        let mut prev = 0;
-        for &c in cuts {
-            if c <= prev || c > ids.len() {
-                bail!(
-                    "qwen4_exp forward: cuts {cuts:?} do not split {} tokens",
-                    ids.len()
-                );
-            }
-            prev = c;
-        }
-        if prev != ids.len() {
-            bail!(
-                "qwen4_exp forward: the last cut {prev} is not the end {}",
-                ids.len()
-            );
-        }
-        if let Some(m) = marks.iter().find(|m| !cuts.contains(m)) {
-            bail!("qwen4_exp forward: mark {m} is not one of the cuts {cuts:?}");
-        }
+        self.check_feed(ids, cache, cuts, marks)?;
         let mut logits = None;
         let mut points: Vec<Option<Qwen4ExpCache>> = vec![None; marks.len()];
         let (mut group_start, mut next_cut) = (0, 0);
@@ -1589,87 +1650,190 @@ impl Qwen4ExpModel {
         marks: &[usize],
         want_logits: bool,
     ) -> Result<(Option<Array>, Vec<Qwen4ExpCache>)> {
-        let keep = self.cfg.ngram_size - 1;
-        let base_tokens = cache.tokens;
-        let mut history = cache.ngram_tail.clone();
-        history.extend_from_slice(ids);
+        let mut feeds = [GroupFeed {
+            ids,
+            cache,
+            cuts,
+            marks,
+            want_logits,
+        }];
+        let mut out = self.forward_group_many(&mut feeds)?;
+        Ok(out.pop().expect("one feed in, one result out"))
+    }
 
-        let mut start = 0;
-        let bounds: Vec<(usize, usize)> = cuts
-            .iter()
-            .map(|&end| {
-                let b = (start, end);
-                start = end;
-                b
+    /// Feed several sequences together: each `JointFeed` exactly as [`Self::forward_pieces`]
+    /// would feed it, but every chunk of every feed goes through a layer before any goes through
+    /// the next, so a layer's experts are read from the SSD once for all of them. Each feed's
+    /// arithmetic is its own (its chunks, in its order, on its own cache; the others only share
+    /// the staged experts), so its logits and states come out bit-for-bit as from its own
+    /// `forward_pieces`. Each feed has to fit one group (`PREFILL_GROUP_TOKENS`).
+    ///
+    /// Returns, per feed, the last position's logits and the state at its mark.
+    pub(crate) fn forward_many(
+        &self,
+        feeds: &mut [JointFeed<'_>],
+    ) -> Result<Vec<(Array, Option<Qwen4ExpCache>)>> {
+        for f in feeds.iter() {
+            self.check_feed(f.ids, f.cache, f.cuts, f.mark.as_slice())?;
+            if f.ids.len() > PREFILL_GROUP_TOKENS {
+                bail!(
+                    "qwen4_exp forward: a joint feed of {} tokens is more than one group ({})",
+                    f.ids.len(),
+                    PREFILL_GROUP_TOKENS
+                );
+            }
+        }
+        let marks: Vec<Vec<usize>> = feeds.iter().map(|f| f.mark.into_iter().collect()).collect();
+        let mut groups: Vec<GroupFeed<'_>> = feeds
+            .iter_mut()
+            .zip(&marks)
+            .map(|(f, m)| GroupFeed {
+                ids: f.ids,
+                cache: &mut *f.cache,
+                cuts: f.cuts,
+                marks: m,
+                want_logits: true,
             })
             .collect();
-        let mut streams = bounds
+        self.forward_group_many(&mut groups)?
+            .into_iter()
+            .map(|(logits, mut points)| {
+                let logits =
+                    logits.ok_or_else(|| anyhow!("qwen4_exp forward: no logits produced"))?;
+                Ok((logits, points.pop()))
+            })
+            .collect()
+    }
+
+    /// The checks [`Self::forward_pieces`] makes of a feed before computing any of it.
+    fn check_feed(
+        &self,
+        ids: &[u32],
+        cache: &Qwen4ExpCache,
+        cuts: &[usize],
+        marks: &[usize],
+    ) -> Result<()> {
+        if ids.is_empty() {
+            bail!("qwen4_exp forward: no tokens");
+        }
+        if cache.layers.len() != self.layers.len() {
+            bail!("qwen4_exp forward: cache has {} layers", cache.layers.len());
+        }
+        let mut prev = 0;
+        for &c in cuts {
+            if c <= prev || c > ids.len() {
+                bail!(
+                    "qwen4_exp forward: cuts {cuts:?} do not split {} tokens",
+                    ids.len()
+                );
+            }
+            prev = c;
+        }
+        if prev != ids.len() {
+            bail!(
+                "qwen4_exp forward: the last cut {prev} is not the end {}",
+                ids.len()
+            );
+        }
+        if let Some(m) = marks.iter().find(|m| !cuts.contains(m)) {
+            bail!("qwen4_exp forward: mark {m} is not one of the cuts {cuts:?}");
+        }
+        Ok(())
+    }
+
+    /// One layer-major group for each of several feeds (see [`Self::forward_group`]): every
+    /// chunk of every feed through layer 0, then every chunk through layer 1, and so on.
+    fn forward_group_many(
+        &self,
+        feeds: &mut [GroupFeed<'_>],
+    ) -> Result<Vec<(Option<Array>, Vec<Qwen4ExpCache>)>> {
+        let keep = self.cfg.ngram_size - 1;
+        let mut work = feeds
             .iter()
-            .map(|&(s, e)| self.embed_streams(&ids[s..e]))
+            .map(|f| GroupWork::new(self, f))
             .collect::<Result<Vec<_>>>()?;
 
-        // Several chunks through one layer: its experts are staged once and every chunk's gather
-        // reads them from there, whatever share of the experts the chunk routes to.
-        let layer_major = bounds.len() > 1;
-        let _bulk = layer_major
-            .then(|| self.offload.as_ref().map(BulkHint::on))
-            .flatten();
-        // The chunk each mark ends (the callers only mark cuts).
-        let mark_pieces: Vec<Option<usize>> = marks
+        let layer_major = work.iter().map(|w| w.bounds.len()).sum::<usize>() > 1;
+        let chunk_rows = work
             .iter()
-            .map(|m| cuts.iter().position(|c| c == m))
-            .collect();
-        let mut snap_layers: Vec<Vec<LayerState>> = vec![Vec::new(); marks.len()];
-        let mut snap_ple: Vec<Vec<Option<Array>>> =
-            vec![vec![None; cache.ple_conv.len()]; marks.len()];
+            .flat_map(|w| w.bounds.iter().map(|(s, e)| e - s));
+        let _bulk = (layer_major
+            && stages_every_chunk(
+                chunk_rows,
+                self.cfg.num_experts_per_tok,
+                self.cfg.num_experts,
+            ))
+        .then(|| self.offload.as_ref().map(BulkHint::on))
+        .flatten();
 
         for (i, layer) in self.layers.iter().enumerate() {
-            for (p, h) in streams.iter_mut().enumerate() {
-                let (s, e) = bounds[p];
-                if let Some((k, ple)) = &layer.ple {
-                    let injected = self
-                        .ple_forward(
-                            ple,
-                            h,
-                            &history[s..keep + e],
-                            e - s,
-                            &mut cache.ple_conv[*k],
-                            None,
-                        )
-                        .with_context(|| format!("layer {i}: n-gram injection"))?;
-                    *h = mlx_rs::ops::add(&*h, &injected)?;
-                }
-                *h = self
-                    .layer_forward(layer, h, &mut cache.layers[i], None)
-                    .with_context(|| format!("layer {i}"))?;
-                if layer_major {
-                    // Settle the chunk before the next one starts: the staged experts the
-                    // gather reads are replaced once the layer is done with.
-                    h.eval()
-                        .with_context(|| format!("layer {i}: evaluate chunk {p}"))?;
-                }
-                for (j, _) in mark_pieces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, mp)| **mp == Some(p))
-                {
-                    snap_layers[j].push(cache.layers[i].clone());
-                    if let Some((k, _)) = &layer.ple {
-                        snap_ple[j][*k] = cache.ple_conv[*k].clone();
+            for (f, w) in feeds.iter_mut().zip(work.iter_mut()) {
+                for (p, h) in w.streams.iter_mut().enumerate() {
+                    let (s, e) = w.bounds[p];
+                    if let Some((k, ple)) = &layer.ple {
+                        let injected = self
+                            .ple_forward(
+                                ple,
+                                h,
+                                &w.history[s..keep + e],
+                                e - s,
+                                &mut f.cache.ple_conv[*k],
+                                None,
+                            )
+                            .with_context(|| format!("layer {i}: n-gram injection"))?;
+                        *h = mlx_rs::ops::add(&*h, &injected)?;
+                    }
+                    *h = self
+                        .layer_forward(layer, h, &mut f.cache.layers[i], None)
+                        .with_context(|| format!("layer {i}"))?;
+                    if layer_major {
+                        // Settle the chunk before the next one starts: the staged experts the
+                        // gather reads are replaced once the layer is done with, and the pool
+                        // slots it reads are released at the next call's routing, which for
+                        // another feed's chunk does not wait for this one.
+                        h.eval()
+                            .with_context(|| format!("layer {i}: evaluate chunk {p}"))?;
+                    }
+                    for (j, _) in w
+                        .mark_pieces
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, mp)| **mp == Some(p))
+                    {
+                        w.snap_layers[j].push(f.cache.layers[i].clone());
+                        if let Some((k, _)) = &layer.ple {
+                            w.snap_ple[j][*k] = f.cache.ple_conv[*k].clone();
+                        }
                     }
                 }
             }
         }
 
+        let mut out = Vec::with_capacity(feeds.len());
+        for (f, w) in feeds.iter_mut().zip(work) {
+            out.push(self.finish_group(f, w)?);
+        }
+        Ok(out)
+    }
+
+    /// The end of one feed's group: the draft head, the logits, the cache's token count and
+    /// n-gram tail, and the states at the marks.
+    fn finish_group(
+        &self,
+        f: &mut GroupFeed<'_>,
+        w: GroupWork,
+    ) -> Result<(Option<Array>, Vec<Qwen4ExpCache>)> {
+        let keep = self.cfg.ngram_size - 1;
         // The draft head reads the final residual streams of every position: feed it the
         // group's (the state at the mark is the head's as of the marked chunk).
-        let mut mtp_snapshots = vec![None; marks.len()];
-        if let Some(st) = cache.mtp.as_mut() {
-            for (p, h) in streams.iter().enumerate() {
-                let (s, e) = bounds[p];
-                self.mtp_consume(st, &ids[s..e], h, base_tokens + s == 0)
+        let mut mtp_snapshots = vec![None; f.marks.len()];
+        if let Some(st) = f.cache.mtp.as_mut() {
+            for (p, h) in w.streams.iter().enumerate() {
+                let (s, e) = w.bounds[p];
+                self.mtp_consume(st, &f.ids[s..e], h, w.base_tokens + s == 0)
                     .context("qwen4_exp: feed the draft head")?;
-                for (j, _) in mark_pieces
+                for (j, _) in w
+                    .mark_pieces
                     .iter()
                     .enumerate()
                     .filter(|(_, mp)| **mp == Some(p))
@@ -1679,9 +1843,9 @@ impl Qwen4ExpModel {
             }
         }
 
-        let logits = if want_logits {
-            let (s, e) = *bounds.last().expect("a group has a chunk");
-            let last = streams.last().expect("a group has a chunk");
+        let logits = if f.want_logits {
+            let (s, e) = *w.bounds.last().expect("a group has a chunk");
+            let last = w.streams.last().expect("a group has a chunk");
             let l = (e - s) as i32;
             let h = if l > 1 {
                 last.try_index((.., (l - 1)..l, ..))?
@@ -1698,22 +1862,23 @@ impl Qwen4ExpModel {
             None
         };
 
-        cache.tokens += ids.len();
-        cache.ngram_tail = history[history.len() - keep..].to_vec();
-        let mut pending = cache.arrays();
+        f.cache.tokens += f.ids.len();
+        f.cache.ngram_tail = w.history[w.history.len() - keep..].to_vec();
+        let mut pending = f.cache.arrays();
         pending.extend(logits.iter());
         mlx_rs::transforms::eval(pending).context("qwen4_exp: evaluate the group and its state")?;
 
-        let points = marks
+        let points = f
+            .marks
             .iter()
-            .zip(snap_layers)
-            .zip(snap_ple)
+            .zip(w.snap_layers)
+            .zip(w.snap_ple)
             .zip(mtp_snapshots)
             .map(|(((&m, layers), ple_conv), mtp)| Qwen4ExpCache {
                 layers,
                 ple_conv,
-                ngram_tail: history[m..keep + m].to_vec(),
-                tokens: base_tokens + m,
+                ngram_tail: w.history[m..keep + m].to_vec(),
+                tokens: w.base_tokens + m,
                 mtp,
             })
             .collect();
@@ -2235,6 +2400,23 @@ mod convention_tests {
         assert!(norms_are_centered(0.2833), "HF-centered build");
         assert!(!norms_are_centered(1.2833), "folded build");
         assert!(!norms_are_centered(1.0), "random replica around one");
+    }
+}
+
+#[cfg(test)]
+mod staging_choice_tests {
+    use super::stages_every_chunk;
+
+    /// Flash-Next's shape (512 experts, top-10): a chunk of 205 rows takes the staging path for
+    /// its size, so a prefill of several chunks, or a short feed fed beside a long one, stages
+    /// each layer for all its chunks; short feeds fed together do not.
+    #[test]
+    fn only_a_chunk_big_enough_to_stage_stages_the_layer_for_all() {
+        assert!(stages_every_chunk([1024, 1024, 88], 10, 512));
+        assert!(stages_every_chunk([74, 1024, 1024, 88], 10, 512));
+        assert!(stages_every_chunk([205, 10], 10, 512));
+        assert!(!stages_every_chunk([74, 58], 10, 512));
+        assert!(!stages_every_chunk([204, 204, 204], 10, 512));
     }
 }
 

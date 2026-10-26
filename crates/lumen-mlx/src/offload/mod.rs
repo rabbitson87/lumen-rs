@@ -556,9 +556,13 @@ const TILED_GATHER_MIN_PER_EXPERT: usize = 4;
 /// (`BULK_MIN_PERCENT`), or one big enough to change the gather kernel (see
 /// `TILED_GATHER_MIN_PER_EXPERT`). `indices` is the call's `rows x top_k`.
 fn takes_staging_path(hinted: bool, distinct: usize, indices: usize, experts: usize) -> bool {
-    hinted
-        || distinct * 100 >= experts * BULK_MIN_PERCENT
-        || indices >= TILED_GATHER_MIN_PER_EXPERT * experts
+    hinted || distinct * 100 >= experts * BULK_MIN_PERCENT || stages_for_size(indices, experts)
+}
+
+/// Whether a layer call with `indices` (`rows x top_k`) entries over a layer of `experts` takes
+/// the staging path for its size alone, whatever it routes to (see `TILED_GATHER_MIN_PER_EXPERT`).
+pub(crate) fn stages_for_size(indices: usize, experts: usize) -> bool {
+    indices >= TILED_GATHER_MIN_PER_EXPERT * experts
 }
 
 /// A stats line every this many layer calls (about 125 decoded tokens of a

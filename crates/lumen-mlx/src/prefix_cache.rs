@@ -84,6 +84,22 @@ fn grid_point(origin: usize, len: usize, chunk: usize) -> usize {
     origin + len.saturating_sub(origin) / chunk * chunk
 }
 
+/// Where a HIT on an entry of `prefix_len` tokens resumes a `prompt_len`-token prompt under exact
+/// reuse (`exact`: the chunk of the cold grid), when the entry lies on that grid (`origin`):
+/// `(origin, grid point, mark)`, the mark being the grid point counted from the entry when the
+/// extend reaches past it (the state kept there is the conversation's next resume point).
+fn hit_resume(
+    exact: Option<usize>,
+    origin: Option<usize>,
+    prompt_len: usize,
+    prefix_len: usize,
+) -> Option<(usize, usize, Option<usize>)> {
+    exact.zip(origin).map(|(chunk, o)| {
+        let g = grid_point(o, prompt_len, chunk);
+        (o, g, (g > prefix_len).then(|| g - prefix_len))
+    })
+}
+
 /// Default for incremental chunked-prefill boundary caching (Phase 0). **ON**:
 /// on a cold MISS the stable head (system + rendered tools, via the tools-aware
 /// boundary in `lib.rs::system_tools_head*`) is snapshotted as a
@@ -96,6 +112,16 @@ const DEFAULT_INCREMENTAL: bool = true;
 /// The minimal runner surface the prefix cache needs. A backend implements this
 /// for its runner type — e.g. a blanket impl over a richer internal `Runner`
 /// trait — so the cache stays decoupled from any one runner enum.
+/// An extend a later request will make, for a runner to compute ahead together with others
+/// ([`SnapshotRunner::prefeed`]): a sequence forked from `snapshot`, extended by `tokens`, keeping
+/// the state `mark` tokens in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefeedItem {
+    pub snapshot: u64,
+    pub tokens: Vec<u32>,
+    pub mark: Option<usize>,
+}
+
 pub trait SnapshotRunner {
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
     fn extend(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)>;
@@ -143,6 +169,23 @@ pub trait SnapshotRunner {
     /// spare.
     fn memory_shortfall(&self, _kv_tokens: usize, _states: usize) -> u64 {
         0
+    }
+
+    /// Compute `items` ahead, in one pass over the model, so that the extends the requests make
+    /// later take the results instead of each reading the expert weights again (a runner that
+    /// streams them from the SSD). Returns how many it computed; the default computes none, and
+    /// every extend then computes its own as before.
+    fn prefeed(&mut self, _items: &[PrefeedItem]) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Drop whatever [`Self::prefeed`] computed that no extend took.
+    fn clear_prefeed(&mut self) {}
+
+    /// Whether [`Self::prefeed`] holds the result of `item`: it is in memory already, counted in
+    /// what the runner holds, and the extend that asks for it takes it instead of computing.
+    fn holds_prefed(&self, _item: &PrefeedItem) -> bool {
+        false
     }
 
     /// Whether where a feed is cut changes this runner's numbers (a mixture-of-experts model: a
@@ -607,10 +650,7 @@ impl PrefixCacheStore {
             // Exact reuse: the matched entry lies on this prompt's cold grid (`longest_hit` serves
             // nothing else but an identical prompt), so the suffix is fed in chunks counted from
             // it, and the state at the last grid point is kept for the next round.
-            let resume = exact.zip(origin).map(|(chunk, o)| {
-                let g = grid_point(o, prompt_ids.len(), chunk);
-                (o, g, (g > prefix.len()).then(|| g - prefix.len()))
-            });
+            let resume = hit_resume(exact, origin, prompt_ids.len(), prefix.len());
             let mut point = None;
             let t = Instant::now();
             // Lock the source entry across fork+extend so a re-entrant eviction
@@ -977,6 +1017,47 @@ impl PrefixCacheStore {
             })
     }
 
+    /// The extend [`Self::prefill_optionally_cached_with`] would make for `prompt_ids` under `key`
+    /// from a snapshot in memory, for a runner to compute ahead together with other requests'
+    /// ([`SnapshotRunner::prefeed`]), with what the feed leaves in memory (`kv_tokens`, `states`;
+    /// see [`Self::feed_cost`]). `None` for every other case: the cache off, a cold MISS, a disk
+    /// hit, an identical prompt. A prediction the call later disagrees with (an entry evicted in
+    /// between) is only computed for nothing: the runner keys what it computed on the snapshot,
+    /// the tokens and the mark, the inputs of the computation itself.
+    pub fn predict_feed<R: SnapshotRunner>(
+        &self,
+        runner: &R,
+        key: &str,
+        prompt_ids: &[u32],
+    ) -> Option<(PrefeedItem, usize, usize)> {
+        if !self.enabled {
+            return None;
+        }
+        let exact = exact_grid(runner);
+        let e = &self.entries.get(key)?[self.longest_hit(key, prompt_ids, exact.is_some())?];
+        let suffix = prompt_ids.get(e.prefix_tokens.len()..)?;
+        if suffix.is_empty() {
+            return None;
+        }
+        let mark = hit_resume(
+            exact,
+            e.grid_origin,
+            prompt_ids.len(),
+            e.prefix_tokens.len(),
+        )
+        .and_then(|(_, _, mark)| mark);
+        let (kv_tokens, states) = self.feed_cost_as(Some(key), prompt_ids, true, exact.is_some());
+        Some((
+            PrefeedItem {
+                snapshot: e.master_snapshot_id,
+                tokens: suffix.to_vec(),
+                mark,
+            },
+            kv_tokens,
+            states,
+        ))
+    }
+
     /// What [`Self::prefill_optionally_cached_with`] of `prompt_ids` under `key` leaves in memory,
     /// as `(tokens of KV, sequence states)` with every copy counted, for
     /// [`SnapshotRunner::memory_shortfall`].
@@ -1112,6 +1193,20 @@ impl PrefixCacheStore {
         head: bool,
     ) -> FeedPlan {
         self.skip_head = false;
+        // A feed computed ahead is in memory already, counted in what the runner holds: taking it
+        // adds nothing, and counting it again released snapshots (a head among them) to make room
+        // the feed did not need.
+        if let Some(item) = key
+            .and_then(|k| self.predict_feed(runner, k, prompt_ids))
+            .map(|(item, ..)| item)
+            .filter(|item| runner.holds_prefed(item))
+        {
+            return FeedPlan {
+                kv_tokens: 0,
+                states: 0,
+                fork: Some(item.snapshot),
+            };
+        }
         let exact = exact_grid(runner).is_some();
         let (mut kv_tokens, mut states) = self.feed_cost_as(key, prompt_ids, head, exact);
         if !crate::session::memory_evict::get() || !self.enabled {
@@ -2478,6 +2573,8 @@ mod tests {
         held: std::collections::HashSet<u64>,
         budget: u64,
         released: Vec<u64>,
+        /// Feeds it holds computed ahead (their memory is in `held`'s count already).
+        fed: Vec<PrefeedItem>,
     }
 
     impl SnapshotRunner for Budgeted {
@@ -2501,6 +2598,9 @@ mod tests {
         fn memory_shortfall(&self, kv_tokens: usize, _states: usize) -> u64 {
             (100 * self.held.len() as u64 + kv_tokens as u64).saturating_sub(self.budget)
         }
+        fn holds_prefed(&self, item: &PrefeedItem) -> bool {
+            self.fed.contains(item)
+        }
     }
 
     /// What the backend does before a tools-path prefill, without the sessions it would drop in
@@ -2522,6 +2622,7 @@ mod tests {
             held: [1, 2, 3].into_iter().collect(),
             budget,
             released: Vec::new(),
+            fed: Vec::new(),
         };
         let now = Instant::now();
         for (i, key) in ["a", "b", "c"].into_iter().enumerate() {
@@ -2579,6 +2680,27 @@ mod tests {
         make_room(&mut store, &mut runner, Some("a"), &prompt);
         assert_eq!(runner.released, vec![3]);
         assert_eq!(cached_keys(&store), vec!["a", "b"]);
+    }
+
+    /// RED before: a feed the runner computed ahead was counted again on top of the memory that
+    /// already holds it, which released a snapshot (on Flash-Next, an agent's head, so its next
+    /// round prefilled cold). The request that takes it now releases nothing for it.
+    #[test]
+    fn a_feed_computed_ahead_releases_nothing_to_make_room_for_itself() {
+        let prompt: Vec<u32> = (0..4).chain([9, 9, 9]).collect();
+        // 300 held; extending "a" by 3 leaves 4 + 2 x 3 = 10 more: room for 305 releases one.
+        let (mut store, mut runner) = three_snapshots(305, 4);
+        make_room(&mut store, &mut runner, Some("a"), &prompt);
+        assert_eq!(runner.released, vec![2]);
+
+        let (mut store, mut runner) = three_snapshots(305, 4);
+        runner.fed.push(PrefeedItem {
+            snapshot: 1,
+            tokens: vec![9, 9, 9],
+            mark: None,
+        });
+        make_room(&mut store, &mut runner, Some("a"), &prompt);
+        assert!(runner.released.is_empty(), "released {:?}", runner.released);
     }
 
     #[test]
