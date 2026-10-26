@@ -2396,12 +2396,15 @@ impl MlxBackend {
                 // `session_id` is a Lumen extension no such client sends. Before
                 // this, a client that did not know about it re-prefilled the
                 // whole conversation on every turn.
+                // No client to stream to, but a stop sequence still ends the reply: the server
+                // trims the answer at it, so the tokens after it would only be dropped.
+                let mut stops = StopWatch::new(thinking, &ov.stop);
                 let visible = m.chat_streaming_session(
                     messages,
                     max_new_tokens,
                     thinking,
                     session_id,
-                    |_| ControlFlow::Continue(()),
+                    |t| stops.feed(t),
                     effort,
                 )?;
                 // With thinking ON the prompt opened the `<think>` block, so
@@ -2563,14 +2566,16 @@ impl MlxBackend {
                     );
                 }
                 let _ = tool_choice;
-                // Non-streaming: drive the same loop and discard the deltas.
+                // Non-streaming: drive the same loop and discard the deltas, ending it at a stop
+                // sequence as the plain text path does.
+                let mut stops = StopWatch::new(thinking, &ov.stop);
                 let visible = m.chat_streaming_with_images(
                     messages,
                     images,
                     max_new_tokens,
                     thinking,
                     seq_id,
-                    |_| ControlFlow::Continue(()),
+                    |t| stops.feed(t),
                     effort,
                 )?;
                 Ok(crate::chat_io::ParsedResponse {
@@ -7059,9 +7064,35 @@ impl MlxQwen35Backend {
     }
 }
 
-/// Phase 2: bridges Qwen35ResponseParser events to the generic
-/// `BackendStreamEvent` shape the engine consumes. Mirrors the
-/// Gemma 4 `emit_token_event` adapter.
+/// A non-streaming reply's watch for the client's stop sequences: the decode loop ends at the
+/// first one in the visible text. The reasoning is not matched, as the server trims only the
+/// answer (and the streaming path routes the text through the same splitter before matching).
+struct StopWatch {
+    splitter: crate::qwen3_5_tools::ThinkingSplitter,
+    stops: lumen_core::stop::StopMatcher,
+}
+
+impl StopWatch {
+    fn new(thinking: bool, stops: &[String]) -> Self {
+        Self {
+            splitter: crate::qwen3_5_tools::ThinkingSplitter::new(thinking),
+            stops: lumen_core::stop::StopMatcher::new(stops.to_vec()),
+        }
+    }
+
+    fn feed(&mut self, chunk: &str) -> ControlFlow<()> {
+        if self.stops.is_inert() {
+            return ControlFlow::Continue(());
+        }
+        let (_, visible) = self.splitter.feed(chunk);
+        if !visible.is_empty() && self.stops.push(&visible).stopped {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
 /// A server sink's answer as a decode loop reads it. The sink returns `Err`
 /// when it has what it needs (a client stop sequence matched, or the first
 /// complete JSON value of a `response_format` reply arrived), so the loop
@@ -7073,6 +7104,9 @@ fn flow_of(sink: Result<()>) -> ControlFlow<()> {
     }
 }
 
+/// Phase 2: bridges Qwen35ResponseParser events to the generic
+/// `BackendStreamEvent` shape the engine consumes. Mirrors the
+/// Gemma 4 `emit_token_event` adapter.
 fn forward_parse_event<F>(
     ev: crate::qwen3_5_tools::Qwen35ParseEvent,
     on_event: &mut F,
@@ -9207,6 +9241,42 @@ mod tests {
         })
         .expect("response_format loop");
         assert_eq!(b.scripted_tokens_consumed(), 2);
+    }
+
+    /// RED before: a non-streaming plain reply decoded to `max_tokens` whatever stop sequence the
+    /// request named (the server trimmed the text afterwards). It now ends at the first one in
+    /// the visible text, and a request without stops still runs to its end.
+    #[test]
+    fn a_non_streaming_reply_stops_decoding_at_a_stop_sequence() {
+        use crate::chat_io::ResolvedToolChoice;
+        let messages = vec![
+            ("system".to_string(), "S".to_string()),
+            ("user".to_string(), "U1".to_string()),
+        ];
+        let auto = ResolvedToolChoice::Auto;
+        for (stop, decoded) in [(Vec::new(), 12), (vec!["BlueBlueBlue".to_string()], 3)] {
+            let tokenizer =
+                <Tokenizer as std::str::FromStr>::from_str(CHAT_TOKENIZER).expect("chat tokenizer");
+            let mut b = MlxBackend::Qwen35Family(MlxQwen35Backend::with_token_script(
+                vec![CHAT_BLUE; 16],
+                CHAT_IM_END,
+                tokenizer,
+                12,
+            ));
+            let ov = SamplingOverrides {
+                stop: stop.clone(),
+                ..Default::default()
+            };
+            let parsed = b
+                .chat(&messages, 12, 0.0, 1.0, &ov, false, None, &[], &auto, None)
+                .expect("chat");
+            assert_eq!(
+                qwen(&mut b).scripted_tokens_consumed(),
+                decoded,
+                "stop {stop:?}"
+            );
+            assert_eq!(parsed.visible, "Blue".repeat(decoded));
+        }
     }
 
     /// The guard is on images only: the same loop given no image still reuses
