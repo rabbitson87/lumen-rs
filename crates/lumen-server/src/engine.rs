@@ -895,31 +895,14 @@ impl InferenceEngine {
             resolve_anthropic_tool_choice(req.tool_choice.as_ref(), !tools_owned.is_empty());
         let tools_owned = tools_visible_to_model(tools_owned, &tool_choice);
 
-        let system_text = req
-            .system
-            .as_ref()
-            .map(|sys| match sys {
-                AnthropicSystem::Text(s) => s.clone(),
-                AnthropicSystem::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            })
-            .filter(|s| !s.is_empty());
+        let system_text = anthropic_system_text(req);
 
         // Flat `(role, content)` view — used as the plain-path input AND
         // by `count_chat_prompt_tokens` regardless of which dispatch path
         // we take below. For the structured path it's a token-budget
         // approximation only; the actual prompt may include more tokens
         // (tool definitions + tool_response wrapping).
-        let mut messages: Vec<(String, String)> = Vec::new();
-        if let Some(ref s) = system_text {
-            messages.push(("system".into(), s.clone()));
-        }
-        for msg in &req.messages {
-            messages.push((msg.role.clone(), msg.content.as_text()));
-        }
+        let mut messages = anthropic_flat_messages(req, system_text.as_deref());
         // Images travel beside the flattened text, so they have to survive the
         // same strip — see `images_aligned_to_kept` on the OpenAI path.
         let all_images = anthropic_images_flat(&req.messages, system_text.is_some())?;
@@ -947,190 +930,26 @@ impl InferenceEngine {
         let prompt_tokens: u32;
 
         let mut parsed = if needs_structured {
-            // Owning storage for ChatTurn::Assistant.tool_calls borrows.
-            // Anthropic ships `tool_use.input` as a real JSON Value, so we
-            // don't need to parse strings (vs OpenAI's JSON-encoded
-            // arguments). Per-message expansion: one assistant message
-            // with text + N tool_use blocks becomes one ChatTurn::Assistant;
-            // one user message with tool_result blocks expands to N
-            // ChatTurn::Tool entries plus any remaining text becomes a
-            // ChatTurn::User.
-            // Per-message extraction with direct match on the content
-            // variant — avoids the `Cow::synthesize` path through
-            // `.blocks()` which would return a temporary slice and cause
-            // borrow-checker grief on subsequent ChatTurn references.
-            let assistant_text_buf: Vec<String> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "assistant" {
-                        return String::new();
-                    }
-                    // `as_text` flattens exactly the Text blocks this used to
-                    // walk by hand, and also folds a replayed `thinking` block
-                    // into the leading `<think>` envelope the renderer reads.
-                    // Calling it rather than re-deriving it is what keeps this
-                    // path and the flat one (which already went through
-                    // `as_text`) from disagreeing about what a turn contains.
-                    m.content.as_text()
-                })
-                .collect();
-            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "assistant" {
-                        return Vec::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(_) => Vec::new(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::ToolUse { id, name, input } => {
-                                    Some(AssistantToolCall {
-                                        id: id.as_str(),
-                                        name: name.as_str(),
-                                        arguments: input,
-                                    })
-                                }
-                                _ => None,
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-            // tool_result content can be string or array-of-text-blocks;
-            // pre-flatten to owned strings so the ChatTurn::Tool borrows
-            // are stable for the request lifetime.
-            let tool_result_buf: Vec<Vec<(String, String)>> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "user" {
-                        return Vec::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(_) => Vec::new(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } => {
-                                    // Phase 1.6: when is_error:true, prefix
-                                    // the content with "[ERROR] " so the
-                                    // model recognizes it as a failure and
-                                    // can recover gracefully (apologize,
-                                    // suggest alternatives, retry with
-                                    // different args, etc.). Mirrors how
-                                    // Claude interprets is_error blocks.
-                                    let body = if *is_error {
-                                        format!("[ERROR] {}", content.as_text())
-                                    } else {
-                                        content.as_text()
-                                    };
-                                    Some((tool_use_id.clone(), body))
-                                }
-                                _ => None,
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-            // Extra `user` text in a tool-result message (Anthropic allows
-            // mixing text + tool_result blocks in one user message). We
-            // emit that text as a User turn AFTER all tool_result turns.
-            let user_text_buf: Vec<String> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "user" {
-                        return String::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
-                })
-                .collect();
-
+            // Per-message expansion: one assistant message with text + N
+            // tool_use blocks becomes one ChatTurn::Assistant; one user message
+            // with tool_result blocks expands to N ChatTurn::Tool entries plus
+            // any remaining text as a ChatTurn::User (`AnthropicHistory`).
+            let history = AnthropicHistory::new(&req.messages);
             // Message-indexed view of the already-decoded images (the flat
             // vector carries a leading slot for the synthesized system entry).
             let msg_images: &[Vec<Vec<u8>>] = &all_images[usize::from(system_text.is_some())..];
-            let tool_result_counts: Vec<usize> = tool_result_buf.iter().map(Vec::len).collect();
-            let user_has_text: Vec<bool> = user_text_buf.iter().map(|s| !s.is_empty()).collect();
-
-            let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
-            if let Some(ref s) = system_text {
-                turns.push(ChatTurn::System(s.as_str()));
-            }
-            for (i, msg) in req.messages.iter().enumerate() {
-                match msg.role.as_str() {
-                    "assistant" => {
-                        turns.push(ChatTurn::Assistant {
-                            text: assistant_text_buf[i].as_str(),
-                            tool_calls: assistant_tc_buf[i].as_slice(),
-                        });
-                    }
-                    "user" => {
-                        // Emit any tool_result blocks first (they belong
-                        // inside the preceding model turn per Gemma 4's
-                        // layout, which `render_chat_history` handles by
-                        // consuming consecutive Tool turns into the prior
-                        // Assistant turn).
-                        for (tcid, content) in &tool_result_buf[i] {
-                            turns.push(ChatTurn::Tool {
-                                tool_call_id: tcid.as_str(),
-                                name: None,
-                                content: content.as_str(),
-                            });
-                        }
-                        // Then any free-text portion of the user message.
-                        // (`user_text_buf` already covers both
-                        // `AnthropicContent::Text(s)` — via the synthesized
-                        // single-block view — and `AnthropicContent::Blocks`
-                        // shapes, so a missing text means the message had
-                        // no text content at all.) An image-only message still
-                        // gets a turn — that is where its placeholder run goes.
-                        let utext = user_text_buf[i].as_str();
-                        if !utext.is_empty() || !msg_images[i].is_empty() {
-                            turns.push(ChatTurn::User(utext));
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "anthropic_messages: unsupported role {:?}",
-                            msg.role
-                        ));
-                    }
-                }
-            }
-            // Built by replaying the expansion above; the length check catches
-            // the two drifting apart rather than letting an image bind to the
-            // wrong turn.
-            let turn_images = anthropic_turn_images(
+            let mut turns =
+                history.turns(&req.messages, system_text.as_deref(), msg_images, |role| {
+                    Err(anyhow::anyhow!(
+                        "anthropic_messages: unsupported role {role:?}"
+                    ))
+                })?;
+            let turn_images = history.turn_images(
                 &req.messages,
                 system_text.is_some(),
                 msg_images,
-                &tool_result_counts,
-                &user_has_text,
+                turns.len(),
             )?;
-            anyhow::ensure!(
-                turn_images.len() == turns.len(),
-                "anthropic turn/image expansion disagree ({} vs {} turns)",
-                turn_images.len(),
-                turns.len()
-            );
             let kept = lumen_mlx::chat_io::strip_client_meta_wrappers_indexed(&mut turns);
             let turn_images: Vec<Vec<Vec<u8>>> =
                 kept.iter().map(|&i| turn_images[i].clone()).collect();
@@ -1647,30 +1466,11 @@ impl InferenceEngine {
         let needs_structured = anthropic_needs_structured_history(&req.messages);
         let ov = req.sampling_overrides();
 
-        let system_text: Option<String> = req.system.as_ref().map(|sys| match sys {
-            AnthropicSystem::Text(s) => s.clone(),
-            AnthropicSystem::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| b.text.clone())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        });
-
-        let mut messages: Vec<(String, String)> = Vec::new();
-        if let Some(ref s) = system_text {
-            if !s.is_empty() {
-                messages.push(("system".into(), s.clone()));
-            }
-        }
-        for msg in &req.messages {
-            messages.push((msg.role.clone(), msg.content.as_text()));
-        }
+        let system_text = anthropic_system_text(req);
+        let mut messages = anthropic_flat_messages(req, system_text.as_deref());
         // Images ride beside the flattened text and must survive the same
         // strip — see `images_aligned_to_kept` on the OpenAI path.
-        let all_images = match anthropic_images_flat(
-            &req.messages,
-            system_text.as_ref().is_some_and(|s| !s.is_empty()),
-        ) {
+        let all_images = match anthropic_images_flat(&req.messages, system_text.is_some()) {
             Ok(v) => v,
             Err(e) => {
                 let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
@@ -1702,11 +1502,9 @@ impl InferenceEngine {
             req.enable_thinking_with_backend_default(self.backend.is_reasoning_first_family());
         let prompt_tokens: u32;
 
-        // Phase 1.5: structured-history dispatch for Anthropic streaming.
-        // Mirrors `anthropic_messages` non-stream: build owning buffers
-        // (`assistant_text_buf`, `assistant_tc_buf`, `tool_result_buf`,
-        // `user_text_buf`) so ChatTurn borrows stay alive across the
-        // backend call.
+        // Phase 1.5: structured-history dispatch for Anthropic streaming, the
+        // turns `anthropic_messages` builds (`AnthropicHistory`), except that a
+        // message of another role is left out rather than refused.
         //
         // Phase 1.6c: tracks tool_calls the backend announced mid-decode
         // so the post-decode loop skips redundant Start chunks.
@@ -1719,155 +1517,28 @@ impl InferenceEngine {
         // across two pieces is caught and never reaches the client.
         let mut stops = lumen_core::stop::StopMatcher::new(ov.stop.clone());
         let result = if needs_structured {
-            let assistant_text_buf: Vec<String> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "assistant" {
-                        return String::new();
-                    }
-                    // `as_text` flattens exactly the Text blocks this used to
-                    // walk by hand, and also folds a replayed `thinking` block
-                    // into the leading `<think>` envelope the renderer reads.
-                    // Calling it rather than re-deriving it is what keeps this
-                    // path and the flat one (which already went through
-                    // `as_text`) from disagreeing about what a turn contains.
-                    m.content.as_text()
-                })
-                .collect();
-            let assistant_tc_buf: Vec<Vec<AssistantToolCall<'_>>> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "assistant" {
-                        return Vec::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(_) => Vec::new(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::ToolUse { id, name, input } => {
-                                    Some(AssistantToolCall {
-                                        id: id.as_str(),
-                                        name: name.as_str(),
-                                        arguments: input,
-                                    })
-                                }
-                                _ => None,
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-            let tool_result_buf: Vec<Vec<(String, String)>> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "user" {
-                        return Vec::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(_) => Vec::new(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content,
-                                    is_error,
-                                } => {
-                                    let body = if *is_error {
-                                        format!("[ERROR] {}", content.as_text())
-                                    } else {
-                                        content.as_text()
-                                    };
-                                    Some((tool_use_id.clone(), body))
-                                }
-                                _ => None,
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-            let user_text_buf: Vec<String> = req
-                .messages
-                .iter()
-                .map(|m| {
-                    if m.role != "user" {
-                        return String::new();
-                    }
-                    match &m.content {
-                        AnthropicContent::Text(s) => s.clone(),
-                        AnthropicContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                AnthropicContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }
-                })
-                .collect();
-
+            let history = AnthropicHistory::new(&req.messages);
             // Message-indexed view of the already-decoded images (the flat
             // vector carries a leading slot for the synthesized system entry).
-            let msg_images: &[Vec<Vec<u8>>] =
-                &all_images[usize::from(system_text.as_ref().is_some_and(|s| !s.is_empty()))..];
-            let tool_result_counts: Vec<usize> = tool_result_buf.iter().map(Vec::len).collect();
-            let user_has_text: Vec<bool> = user_text_buf.iter().map(|s| !s.is_empty()).collect();
-
-            let mut turns: Vec<ChatTurn<'_>> = Vec::with_capacity(req.messages.len() + 4);
-            if let Some(ref s) = system_text {
-                if !s.is_empty() {
-                    turns.push(ChatTurn::System(s.as_str()));
-                }
-            }
-            for (i, msg) in req.messages.iter().enumerate() {
-                match msg.role.as_str() {
-                    "assistant" => {
-                        turns.push(ChatTurn::Assistant {
-                            text: assistant_text_buf[i].as_str(),
-                            tool_calls: assistant_tc_buf[i].as_slice(),
-                        });
-                    }
-                    "user" => {
-                        for (tid, body) in &tool_result_buf[i] {
-                            turns.push(ChatTurn::Tool {
-                                tool_call_id: tid.as_str(),
-                                name: None,
-                                content: body.as_str(),
-                            });
-                        }
-                        // An image-only message still gets a turn — that is
-                        // where its placeholder run goes.
-                        if !user_text_buf[i].is_empty() || !msg_images[i].is_empty() {
-                            turns.push(ChatTurn::User(user_text_buf[i].as_str()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Built by replaying the expansion above; the length check catches
-            // the two drifting apart rather than letting an image bind to the
-            // wrong turn.
-            let turn_images = match anthropic_turn_images(
-                &req.messages,
-                system_text.as_ref().is_some_and(|s| !s.is_empty()),
-                msg_images,
-                &tool_result_counts,
-                &user_has_text,
-            ) {
-                Ok(v) if v.len() == turns.len() => v,
-                Ok(v) => {
-                    let _ = token_tx.try_send(StreamEvent::Error(format!(
-                        "anthropic turn/image expansion disagree ({} vs {} turns)",
-                        v.len(),
-                        turns.len()
-                    )));
-                    return;
-                }
+            let msg_images: &[Vec<Vec<u8>>] = &all_images[usize::from(system_text.is_some())..];
+            let built = history
+                .turns(
+                    &req.messages,
+                    system_text.as_deref(),
+                    msg_images,
+                    |_| Ok(()),
+                )
+                .and_then(|turns| {
+                    let images = history.turn_images(
+                        &req.messages,
+                        system_text.is_some(),
+                        msg_images,
+                        turns.len(),
+                    )?;
+                    Ok((turns, images))
+                });
+            let (mut turns, turn_images) = match built {
+                Ok(v) => v,
                 Err(e) => {
                     let _ = token_tx.try_send(StreamEvent::Error(e.to_string()));
                     return;
@@ -2477,6 +2148,195 @@ fn images_aligned_to_kept(messages: &[ChatMessage], kept: &[usize]) -> Option<Ve
         return None;
     }
     Some(kept.iter().map(|&i| messages[i].images.clone()).collect())
+}
+
+/// An Anthropic request's system prompt as one text (its blocks joined by
+/// newlines); `None` when there is none or it is empty.
+fn anthropic_system_text(req: &AnthropicRequest) -> Option<String> {
+    req.system
+        .as_ref()
+        .map(|sys| match sys {
+            AnthropicSystem::Text(s) => s.clone(),
+            AnthropicSystem::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// The flat `(role, content)` view of an Anthropic request: the system prompt,
+/// then every message's text (`as_text`). The plain path's input, and what the
+/// prompt is counted from when the history needs no structure.
+fn anthropic_flat_messages(req: &AnthropicRequest, system: Option<&str>) -> Vec<(String, String)> {
+    system
+        .map(|s| ("system".to_string(), s.to_string()))
+        .into_iter()
+        .chain(
+            req.messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.as_text())),
+        )
+        .collect()
+}
+
+/// An Anthropic request's history as the structured renderer reads it, built
+/// once per message so the turns can borrow from it: an assistant message's
+/// text (`as_text`, which also folds a replayed `thinking` block into the
+/// leading `<think>` envelope) and its `tool_use` calls (Anthropic ships
+/// `input` as real JSON, so nothing is parsed), a user message's `tool_result`
+/// blocks (a failed one's content prefixed `[ERROR] ` so the model reads it as
+/// a failure and can recover) and its text blocks.
+struct AnthropicHistory<'r> {
+    assistant_text: Vec<String>,
+    assistant_calls: Vec<Vec<AssistantToolCall<'r>>>,
+    tool_results: Vec<Vec<(String, String)>>,
+    user_text: Vec<String>,
+}
+
+impl<'r> AnthropicHistory<'r> {
+    fn new(messages: &'r [AnthropicMessage]) -> Self {
+        let blocks = |m: &'r AnthropicMessage, role: &str| -> &'r [AnthropicContentBlock] {
+            match &m.content {
+                AnthropicContent::Blocks(b) if m.role == role => b,
+                _ => &[],
+            }
+        };
+        Self {
+            assistant_text: messages
+                .iter()
+                .map(|m| {
+                    if m.role == "assistant" {
+                        m.content.as_text()
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect(),
+            assistant_calls: messages
+                .iter()
+                .map(|m| {
+                    blocks(m, "assistant")
+                        .iter()
+                        .filter_map(|b| match b {
+                            AnthropicContentBlock::ToolUse { id, name, input } => {
+                                Some(AssistantToolCall {
+                                    id: id.as_str(),
+                                    name: name.as_str(),
+                                    arguments: input,
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect(),
+            tool_results: messages
+                .iter()
+                .map(|m| {
+                    blocks(m, "user")
+                        .iter()
+                        .filter_map(|b| match b {
+                            AnthropicContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                let body = if *is_error {
+                                    format!("[ERROR] {}", content.as_text())
+                                } else {
+                                    content.as_text()
+                                };
+                                Some((tool_use_id.clone(), body))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect(),
+            user_text: messages
+                .iter()
+                .map(|m| match &m.content {
+                    _ if m.role != "user" => String::new(),
+                    AnthropicContent::Text(s) => s.clone(),
+                    AnthropicContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                })
+                .collect(),
+        }
+    }
+
+    /// The turns: the system prompt, then for each message an assistant turn,
+    /// or a user message's tool results followed by its text (they belong inside
+    /// the preceding model turn, which the renderer handles by consuming the Tool
+    /// turns into it). A user message with no text still gets a turn when it
+    /// carries an image (`msg_images`, by message): its placeholder run goes
+    /// there. A message of any other role goes to `other`, which may refuse it.
+    fn turns<'a>(
+        &'a self,
+        messages: &[AnthropicMessage],
+        system: Option<&'a str>,
+        msg_images: &[Vec<Vec<u8>>],
+        mut other: impl FnMut(&str) -> Result<()>,
+    ) -> Result<Vec<ChatTurn<'a>>> {
+        let mut turns = Vec::with_capacity(messages.len() + 4);
+        turns.extend(system.map(ChatTurn::System));
+        for (i, msg) in messages.iter().enumerate() {
+            match msg.role.as_str() {
+                "assistant" => turns.push(ChatTurn::Assistant {
+                    text: self.assistant_text[i].as_str(),
+                    tool_calls: self.assistant_calls[i].as_slice(),
+                }),
+                "user" => {
+                    turns.extend(
+                        self.tool_results[i]
+                            .iter()
+                            .map(|(id, body)| ChatTurn::Tool {
+                                tool_call_id: id.as_str(),
+                                name: None,
+                                content: body.as_str(),
+                            }),
+                    );
+                    let image = msg_images.get(i).is_some_and(|v| !v.is_empty());
+                    if !self.user_text[i].is_empty() || image {
+                        turns.push(ChatTurn::User(self.user_text[i].as_str()));
+                    }
+                }
+                role => other(role)?,
+            }
+        }
+        Ok(turns)
+    }
+
+    /// The images of each turn [`Self::turns`] builds, by replaying its
+    /// expansion (see `anthropic_turn_images`), checked to be one per turn so
+    /// an image cannot bind to the wrong one.
+    fn turn_images(
+        &self,
+        messages: &[AnthropicMessage],
+        has_system_turn: bool,
+        msg_images: &[Vec<Vec<u8>>],
+        turns: usize,
+    ) -> Result<Vec<Vec<Vec<u8>>>> {
+        let counts: Vec<usize> = self.tool_results.iter().map(Vec::len).collect();
+        let has_text: Vec<bool> = self.user_text.iter().map(|s| !s.is_empty()).collect();
+        let images =
+            anthropic_turn_images(messages, has_system_turn, msg_images, &counts, &has_text)?;
+        anyhow::ensure!(
+            images.len() == turns,
+            "anthropic turn/image expansion disagree ({} vs {} turns)",
+            images.len(),
+            turns
+        );
+        Ok(images)
+    }
 }
 
 /// Per-message image attachments from an Anthropic request, aligned with the
@@ -4044,6 +3904,127 @@ mod anthropic_turn_image_alignment {
         let err = anthropic_turn_images(&messages, false, &[img(9)], &[0], &[false])
             .expect_err("an assistant turn has nowhere to put an image");
         assert!(err.to_string().contains("user message"), "{err}");
+    }
+}
+
+/// The one history builder both Anthropic handlers and the joint-prefill planner use.
+#[cfg(test)]
+mod anthropic_history_turns {
+    use super::{AnthropicHistory, anthropic_flat_messages, anthropic_system_text};
+    use crate::types::{AnthropicMessage, AnthropicRequest};
+    use lumen_mlx::chat_io::ChatTurn;
+    use serde_json::json;
+
+    fn messages(v: serde_json::Value) -> Vec<AnthropicMessage> {
+        serde_json::from_value(v).expect("anthropic messages")
+    }
+
+    fn show(turns: &[ChatTurn<'_>]) -> Vec<String> {
+        turns
+            .iter()
+            .map(|t| match t {
+                ChatTurn::System(s) => format!("system:{s}"),
+                ChatTurn::User(s) => format!("user:{s}"),
+                ChatTurn::Assistant { text, tool_calls } => {
+                    let calls: Vec<String> = tool_calls
+                        .iter()
+                        .map(|c| format!("{}#{}({})", c.name, c.id, c.arguments))
+                        .collect();
+                    format!("assistant:{text}|{}", calls.join(","))
+                }
+                ChatTurn::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } => format!("tool:{tool_call_id}:{content}"),
+            })
+            .collect()
+    }
+
+    fn agent_round() -> Vec<AnthropicMessage> {
+        messages(json!([
+            {"role": "user", "content": "find it"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Looking."},
+                {"type": "tool_use", "id": "t1", "name": "grep", "input": {"q": "x"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a.rs:1"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "no file", "is_error": true},
+                {"type": "text", "text": "and?"}]},
+        ]))
+    }
+
+    #[test]
+    fn a_messages_tool_results_come_before_its_text() {
+        let m = agent_round();
+        let h = AnthropicHistory::new(&m);
+        let turns = h.turns(&m, Some("S"), &[], |_| Ok(())).unwrap();
+        assert_eq!(
+            show(&turns),
+            [
+                "system:S",
+                "user:find it",
+                "assistant:Looking.|grep#t1({\"q\":\"x\"})",
+                "tool:t1:a.rs:1",
+                "tool:t2:[ERROR] no file",
+                "user:and?",
+            ]
+        );
+        let images = h.turn_images(&m, true, &[], turns.len()).unwrap();
+        assert_eq!(images.len(), turns.len());
+    }
+
+    /// The non-streaming handler refuses a message of another role, the streaming one (and the
+    /// planner) leave it out; an image-only user message gets a turn, a text-less one without
+    /// an image none.
+    #[test]
+    fn other_roles_go_to_the_caller_and_images_keep_their_turn() {
+        let m = messages(json!([
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "late"},
+            {"role": "user", "content": [{"type": "text", "text": ""}]},
+        ]));
+        let h = AnthropicHistory::new(&m);
+        let mut seen = Vec::new();
+        let turns = h
+            .turns(&m, None, &[], |role| {
+                seen.push(role.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(show(&turns), ["user:hi"]);
+        assert_eq!(seen, ["system"]);
+        assert!(
+            h.turns(&m, None, &[], |r| Err(anyhow::anyhow!(
+                "unsupported role {r:?}"
+            )))
+            .is_err()
+        );
+        let with_image = [Vec::new(), Vec::new(), vec![vec![1u8]]];
+        let turns = h.turns(&m, None, &with_image, |_| Ok(())).unwrap();
+        assert_eq!(show(&turns), ["user:hi", "user:"]);
+    }
+
+    #[test]
+    fn an_empty_system_prompt_is_none_and_blocks_join_by_line() {
+        let req = |system: serde_json::Value| -> AnthropicRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 1, "system": system,
+                "messages": [{"role": "user", "content": "q"}]
+            }))
+            .expect("request")
+        };
+        assert_eq!(anthropic_system_text(&req(json!(""))), None);
+        let blocks = req(json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]));
+        let system = anthropic_system_text(&blocks);
+        assert_eq!(system.as_deref(), Some("a\nb"));
+        assert_eq!(
+            anthropic_flat_messages(&blocks, system.as_deref()),
+            [
+                ("system".to_string(), "a\nb".to_string()),
+                ("user".to_string(), "q".to_string())
+            ]
+        );
     }
 }
 
