@@ -1370,15 +1370,15 @@ static DEFECTS: &[Defect] = &[
                   (allocation failure is not a catchable panic)",
         revert: &[Mutation {
             path: MLX,
-            find: r#"        let data_len = read_u64(r)? as usize;
-        if data_len != expected {
-            bail!(
-                "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
-                 with dtype {dtype:?} implies {expected} (corrupt record)"
-            );
-        }
+            find: r#"    let data_len = read_u64(r)? as usize;
+    if data_len != expected {
+        bail!(
+            "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
+             with dtype {dtype:?} implies {expected} (corrupt record)"
+        );
+    }
 "#,
-            replace: "        let data_len = read_u64(r)? as usize;\n",
+            replace: "    let data_len = read_u64(r)? as usize;\n",
         }],
         guards: &[mlx_ungated_test(
             "kv_disk_faults",

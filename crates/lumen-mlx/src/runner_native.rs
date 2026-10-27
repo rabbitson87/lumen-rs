@@ -1854,7 +1854,7 @@ mod imp {
                 if !disk.contains(&key) {
                     continue;
                 }
-                let Some((manifest, records)) = disk.get(&key)? else {
+                let Some((manifest, records)) = disk.get_arrays(&key)? else {
                     continue;
                 };
                 if manifest.position != at || manifest.prefix_tokens != prompt[..at] {
@@ -1957,7 +1957,7 @@ mod imp {
                     .disk
                     .as_mut()
                     .expect("disk tier present (checked above)");
-                disk.get(key)?
+                disk.get_arrays(key)?
             };
             let Some((manifest, records)) = loaded else {
                 return Ok(None);

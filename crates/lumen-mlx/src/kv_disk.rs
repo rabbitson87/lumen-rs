@@ -168,67 +168,84 @@ impl ArrayRecord {
     }
 
     fn read_from<R: Read>(r: &mut R) -> Result<Self> {
-        let mut r = CrcReader::new(r);
-        let rec = Self::read_body(&mut r)?;
-        r.verify("record")?;
-        Ok(rec)
+        read_record(r, |dtype, shape, len, r| {
+            let mut data = vec![0u8; len];
+            r.read_exact(&mut data)?;
+            let rec = ArrayRecord {
+                dtype,
+                shape: shape.to_vec(),
+                data,
+            };
+            rec.validate_len()?;
+            Ok(rec)
+        })
+    }
+}
+
+/// Read one record: its header, then `payload` reads its `len` payload bytes (the length its
+/// dtype and shape imply, checked before anything is allocated), then the CRC of all of it.
+fn read_record<R: Read, T>(
+    r: &mut R,
+    payload: impl FnOnce(DtypeTag, &[i32], usize, &mut dyn Read) -> Result<T>,
+) -> Result<T> {
+    let mut r = CrcReader::new(r);
+    let (dtype, shape, len) = read_record_header(&mut r)?;
+    let out = payload(dtype, &shape, len, &mut r)?;
+    r.verify("record")?;
+    Ok(out)
+}
+
+/// A record's `[dtype][ndim][shape][data_len]`, its payload length required to be the one the
+/// dtype and shape imply.
+fn read_record_header<R: Read>(r: &mut R) -> Result<(DtypeTag, Vec<i32>, usize)> {
+    let mut b1 = [0u8; 1];
+    r.read_exact(&mut b1)?;
+    let dtype = DtypeTag::from_u8(b1[0])?;
+
+    let ndim = read_u32(r)? as usize;
+    if ndim > 8 {
+        bail!("kv_disk: implausible ndim {ndim} (corrupt record)");
+    }
+    let mut shape = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        let mut sb = [0u8; 4];
+        r.read_exact(&mut sb)?;
+        let d = i32::from_le_bytes(sb);
+        if d < 0 {
+            bail!("kv_disk: negative dimension {d} (corrupt record)");
+        }
+        shape.push(d);
     }
 
-    fn read_body<R: Read>(r: &mut R) -> Result<Self> {
-        let mut b1 = [0u8; 1];
-        r.read_exact(&mut b1)?;
-        let dtype = DtypeTag::from_u8(b1[0])?;
-
-        let ndim = read_u32(r)? as usize;
-        if ndim > 8 {
-            bail!("kv_disk: implausible ndim {ndim} (corrupt record)");
-        }
-        let mut shape = Vec::with_capacity(ndim);
-        for _ in 0..ndim {
-            let mut sb = [0u8; 4];
-            r.read_exact(&mut sb)?;
-            let d = i32::from_le_bytes(sb);
-            if d < 0 {
-                bail!("kv_disk: negative dimension {d} (corrupt record)");
-            }
-            shape.push(d);
-        }
-
-        // Derive the payload size from shape × dtype and require the stored
-        // length to match it EXACTLY, before allocating anything.
-        //
-        // This is a memory-safety boundary, not a tidiness check. `data_len`
-        // arrives from a file that a previous process may have written
-        // partially (power loss, full disk, SIGKILL mid-flush) or that disk rot
-        // has touched; allocating it unvalidated turns a corrupt 8-byte field
-        // into a multi-terabyte request, and an allocation failure *aborts* —
-        // it is not a catchable panic, so no amount of caller-side error
-        // handling saves the process. Observed as SIGABRT on a 280 TB request.
-        //
-        // `ndim` was already bounded above; this closes the same hole for the
-        // payload. No heuristic cap is needed because the format is
-        // self-describing: shape and dtype determine the size exactly, and a
-        // record whose declared length disagrees is corrupt by definition.
-        let expected = shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
-            .and_then(|n| n.checked_mul(dtype.stored_elem_size()))
-            .filter(|_| !shape.is_empty())
-            .unwrap_or(0);
-        let data_len = read_u64(r)? as usize;
-        if data_len != expected {
-            bail!(
-                "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
-                 with dtype {dtype:?} implies {expected} (corrupt record)"
-            );
-        }
-        let mut data = vec![0u8; data_len];
-        r.read_exact(&mut data)?;
-
-        let rec = ArrayRecord { dtype, shape, data };
-        rec.validate_len()?;
-        Ok(rec)
+    // Derive the payload size from shape × dtype and require the stored
+    // length to match it EXACTLY, before allocating anything.
+    //
+    // This is a memory-safety boundary, not a tidiness check. `data_len`
+    // arrives from a file that a previous process may have written
+    // partially (power loss, full disk, SIGKILL mid-flush) or that disk rot
+    // has touched; allocating it unvalidated turns a corrupt 8-byte field
+    // into a multi-terabyte request, and an allocation failure *aborts* —
+    // it is not a catchable panic, so no amount of caller-side error
+    // handling saves the process. Observed as SIGABRT on a 280 TB request.
+    //
+    // `ndim` was already bounded above; this closes the same hole for the
+    // payload. No heuristic cap is needed because the format is
+    // self-describing: shape and dtype determine the size exactly, and a
+    // record whose declared length disagrees is corrupt by definition.
+    let expected = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+        .and_then(|n| n.checked_mul(dtype.stored_elem_size()))
+        .filter(|_| !shape.is_empty())
+        .unwrap_or(0);
+    let data_len = read_u64(r)? as usize;
+    if data_len != expected {
+        bail!(
+            "kv_disk: record declares {data_len} payload bytes but shape {shape:?} \
+             with dtype {dtype:?} implies {expected} (corrupt record)"
+        );
     }
+    Ok((dtype, shape, data_len))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,8 +402,19 @@ pub fn write_lkv<W: Write>(
     Ok(())
 }
 
+/// Buffer of a snapshot read: headers come through it, payloads at least this large bypass it.
+const READ_BUFFER_BYTES: usize = 1 << 20;
+
 /// Deserialize the `LKV2` binary layout back into `(KvManifest, records)`.
 pub fn read_lkv<R: Read>(r: &mut R) -> Result<(KvManifest, Vec<ArrayRecord>)> {
+    read_lkv_with(r, ArrayRecord::read_from)
+}
+
+/// [`read_lkv`] with each record read by `record`.
+fn read_lkv_with<R: Read, T>(
+    r: &mut R,
+    mut record: impl FnMut(&mut R) -> Result<T>,
+) -> Result<(KvManifest, Vec<T>)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).context("kv_disk: read magic")?;
     if magic != LKV_MAGIC {
@@ -409,7 +437,7 @@ pub fn read_lkv<R: Read>(r: &mut R) -> Result<(KvManifest, Vec<ArrayRecord>)> {
     let n = read_u32(r)? as usize;
     let mut records = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
-        records.push(ArrayRecord::read_from(r)?);
+        records.push(record(r)?);
     }
     let mut extra = [0u8; 1];
     if r.read(&mut extra).context("kv_disk: check end of file")? != 0 {
@@ -900,28 +928,51 @@ impl DiskKvStore {
     /// mismatch, or on a corrupt/unreadable file (treated as a miss, never a
     /// crash). Bumps the entry's access time + hit count on success.
     pub fn get(&mut self, key: &str) -> Result<Option<(KvManifest, Vec<ArrayRecord>)>> {
+        self.get_with(key, read_lkv)
+    }
+
+    /// [`Self::get`] with every record read straight into the memory of an MLX array of its
+    /// dtype and shape: the file is read once, in place, and nothing is held beside the
+    /// restored arrays. `get` keeps each record's bytes, which a restore then copies into
+    /// arrays (for an agent's 0.8 GB system-prompt head, that was 2-3 times its size in
+    /// transient memory).
+    #[cfg(feature = "mlx-native")]
+    pub fn get_arrays(&mut self, key: &str) -> Result<Option<(KvManifest, Vec<mlx_rs::Array>)>> {
+        self.get_with(key, |r| {
+            read_lkv_with(r, |r| read_record(r, mlx_conv::array_from_reader))
+        })
+    }
+
+    /// Load `key`'s file through `read`. A miss (`None`) when there is no such entry, when its
+    /// file is not there (a write still in flight, or removed: the row stays, so it heals once
+    /// the file lands), or when the file is unreadable, corrupt or of another model (the row
+    /// goes). Bumps the entry's access time and hit count on success.
+    fn get_with<T>(
+        &mut self,
+        key: &str,
+        read: impl FnOnce(&mut std::io::BufReader<fs::File>) -> Result<(KvManifest, T)>,
+    ) -> Result<Option<(KvManifest, T)>> {
         self.reconcile();
         let Some(pos) = self.index.entries.iter().position(|e| e.key == key) else {
             return Ok(None);
         };
         let path = self.dir.join(&self.index.entries[pos].file);
 
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            // File not present yet (async write in flight) or externally removed
-            // — miss WITHOUT dropping the index entry so it self-heals once the
-            // worker lands the payload.
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => {
                 self.remove(key)?;
                 return Ok(None);
             }
         };
-
-        let (manifest, records) = match read_lkv(&mut bytes.as_slice()) {
+        let (manifest, records) = match read(&mut std::io::BufReader::with_capacity(
+            READ_BUFFER_BYTES,
+            file,
+        )) {
             Ok(v) => v,
             Err(_) => {
-                // Present but corrupt — drop the entry and miss.
+                // Present but unreadable or corrupt: drop the entry and miss.
                 self.remove(key)?;
                 return Ok(None);
             }
@@ -1854,16 +1905,83 @@ mod mlx_conv {
     }
 
     /// Rebuild the `Array` that record `id` holds; `None` for an absent slot.
-    pub fn array_at(records: &[ArrayRecord], id: Option<usize>) -> Result<Option<Array>> {
+    pub fn array_at<T: RecordArray>(records: &[T], id: Option<usize>) -> Result<Option<Array>> {
         match id {
             None => Ok(None),
             Some(i) => {
                 let rec = records
                     .get(i)
                     .ok_or_else(|| anyhow!("kv_disk: record index {i} out of range"))?;
-                Ok(Some(record_to_array(rec)?))
+                Ok(Some(rec.to_array()?))
             }
         }
+    }
+
+    /// What a restore reads a state's arrays from: the byte records a state serializes to (and
+    /// [`DiskKvStore::get`] returns), or the arrays [`DiskKvStore::get_arrays`] read in place.
+    pub trait RecordArray {
+        fn to_array(&self) -> Result<Array>;
+    }
+
+    impl RecordArray for ArrayRecord {
+        fn to_array(&self) -> Result<Array> {
+            record_to_array(self)
+        }
+    }
+
+    impl RecordArray for Array {
+        fn to_array(&self) -> Result<Array> {
+            Ok(self.clone())
+        }
+    }
+
+    /// Read a record's `len` payload bytes from `r` straight into the memory of a new MLX array
+    /// of its dtype and shape: one pass, no copy. The array is allocated and evaluated first (so
+    /// its buffer exists and nothing reads it yet), checked to be one contiguous row-major
+    /// buffer of exactly `len` bytes, and filled through its data pointer, the way the expert
+    /// pool fills its slots. A 16-bit float lands as its bits, a bool as the 0/1 byte it is in
+    /// memory as on disk.
+    pub(super) fn array_from_reader(
+        dtype: DtypeTag,
+        shape: &[i32],
+        len: usize,
+        r: &mut dyn Read,
+    ) -> Result<Array> {
+        if dtype == DtypeTag::F64 {
+            bail!("kv_disk: f64 arrays are not supported");
+        }
+        let a = mlx_rs::ops::zeros_dtype(shape, dtype.to_mlx())
+            .context("kv_disk: allocate a restored array")?;
+        a.eval().context("kv_disk: allocate a restored array")?;
+        if len == 0 {
+            return Ok(a);
+        }
+        let strides = a.strides();
+        let mut expect = 1usize;
+        for (axis, &dim) in shape.iter().enumerate().rev() {
+            if dim > 1 && strides[axis] != expect {
+                bail!(
+                    "kv_disk: restored array is not contiguous (strides {strides:?}, shape {shape:?})"
+                );
+            }
+            expect *= dim.max(1) as usize;
+        }
+        if a.nbytes() != len {
+            bail!(
+                "kv_disk: restored array holds {} bytes, the record {len} (shape {shape:?}, {dtype:?})",
+                a.nbytes()
+            );
+        }
+        // SAFETY: the array is evaluated and owned here, so its buffer exists, is `len` bytes
+        // (checked above) and nothing else reads or writes it while it is filled.
+        let base = unsafe { mlx_sys::mlx_array_data_uint8(a.as_ptr()) } as *mut u8;
+        if base.is_null() {
+            bail!("kv_disk: restored array has no data pointer");
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(base, len) };
+        r.read_exact(buf)
+            .context("kv_disk: read a record into its array")?;
+        Ok(a)
     }
 
     /// Persist a TurboQuant rotating cache (Qwen's full-attention layers,
@@ -1895,9 +2013,9 @@ mod mlx_conv {
     }
 
     /// Inverse of [`turboquant_meta`].
-    pub fn turboquant_from_meta(
+    pub fn turboquant_from_meta<T: RecordArray>(
         m: &LayerMeta,
-        records: &[ArrayRecord],
+        records: &[T],
     ) -> Result<NativeRotatingKvCacheTurboQuant> {
         let kind = m.kind;
         let max_size = m
@@ -1932,8 +2050,8 @@ mod mlx_conv {
 
 #[cfg(feature = "mlx-native")]
 pub use mlx_conv::{
-    array_at, mlx_version, push_record, record_from_array, record_to_array, turboquant_from_meta,
-    turboquant_meta,
+    RecordArray, array_at, mlx_version, push_record, record_from_array, record_to_array,
+    turboquant_from_meta, turboquant_meta,
 };
 
 // ---------------------------------------------------------------------------
@@ -2645,6 +2763,134 @@ mod tests {
     mod mlx {
         use super::super::{DtypeTag, record_from_array, record_to_array};
         use mlx_rs::{Array, Dtype};
+
+        /// Not checks (ignored): what restoring an 0.8 GB state costs, `get` + `record_to_array`
+        /// against `get_arrays`, each in its own process so its peak memory is its own:
+        ///
+        /// ```text
+        /// D=/tmp/kvbench; for t in write records arrays; do LUMEN_KV_BENCH_DIR=$D cargo test \
+        ///   -p lumen-mlx --features mlx-native --lib restore_cost_$t -- --ignored --nocapture; done
+        /// ```
+        /// Where the measurement keeps its state (a test input, not a server setting).
+        const BENCH_DIR_ENV: &str = "LUMEN_KV_BENCH_DIR";
+
+        fn bench_store() -> (super::super::DiskKvStore, super::super::KvManifest) {
+            let dir = std::env::var(BENCH_DIR_ENV).expect(BENCH_DIR_ENV);
+            let m = super::sample_manifest();
+            let store = super::super::DiskKvStore::open(&dir, &m.model_fingerprint, 0, 0).unwrap();
+            (store, m)
+        }
+
+        /// The process's peak resident memory so far, in MB (macOS reports bytes).
+        fn peak_mb() -> f64 {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            u.ru_maxrss as f64 / 1e6
+        }
+
+        #[test]
+        #[ignore = "measurement"]
+        fn restore_cost_write() {
+            let (mut store, m) = bench_store();
+            let one: Vec<f32> = (0..(2 * 12_288 * 512))
+                .map(|i| (i % 977) as f32 * 1e-3)
+                .collect();
+            let rec = record_from_array(&Array::from_slice(&one, &[1, 2, 12_288, 512])).unwrap();
+            store.put("bench", &m, &vec![rec; 16]).unwrap();
+        }
+
+        #[test]
+        #[ignore = "measurement"]
+        fn restore_cost_records() {
+            let (mut store, _) = bench_store();
+            let base = peak_mb();
+            let t = std::time::Instant::now();
+            let (_, records) = store
+                .get("bench")
+                .unwrap()
+                .expect("run restore_cost_write first");
+            let arrays: Vec<Array> = records
+                .iter()
+                .map(|r| record_to_array(r).unwrap())
+                .collect();
+            drop(records);
+            println!(
+                "get + record_to_array: {} arrays in {:.0} ms, peak +{:.0} MB",
+                arrays.len(),
+                t.elapsed().as_secs_f64() * 1e3,
+                peak_mb() - base
+            );
+        }
+
+        #[test]
+        #[ignore = "measurement"]
+        fn restore_cost_arrays() {
+            let (mut store, _) = bench_store();
+            let base = peak_mb();
+            let t = std::time::Instant::now();
+            let (_, arrays) = store
+                .get_arrays("bench")
+                .unwrap()
+                .expect("run restore_cost_write first");
+            println!(
+                "get_arrays: {} arrays in {:.0} ms, peak +{:.0} MB",
+                arrays.len(),
+                t.elapsed().as_secs_f64() * 1e3,
+                peak_mb() - base
+            );
+        }
+
+        /// `get_arrays` reads a stored state straight into MLX arrays: every dtype a state holds
+        /// comes back bit for bit, as `get` and `record_to_array` give it. A damaged file is a
+        /// miss that drops the entry and a missing one a miss that keeps it, as with `get`.
+        #[test]
+        fn get_arrays_reads_each_record_into_its_array_bit_for_bit() {
+            use super::super::DiskKvStore;
+            let tmp = tempfile::tempdir().unwrap();
+            let vals: Vec<f32> = (0..24).map(|i| i as f32 * 0.37 - 2.0).collect();
+            let f32s = Array::from_slice(&vals, &[2, 3, 4]);
+            let arrays = [
+                f32s.as_dtype(Dtype::Bfloat16).unwrap(),
+                f32s.as_dtype(Dtype::Float16).unwrap(),
+                f32s,
+                Array::from_slice(&[true, false, true, true, false, false], &[2, 3]),
+                Array::from_slice(&[7u32, 0, u32::MAX, 42], &[4]),
+            ];
+            let records: Vec<_> = arrays
+                .iter()
+                .map(|a| record_from_array(a).unwrap())
+                .collect();
+            let m = super::sample_manifest();
+            let mut store = DiskKvStore::open(tmp.path(), &m.model_fingerprint, 0, 0).unwrap();
+            store.put("k", &m, &records).unwrap();
+
+            let (got_m, got) = store.get_arrays("k").unwrap().expect("a hit");
+            assert_eq!(got_m.prefix_tokens, m.prefix_tokens);
+            assert_eq!(got.len(), arrays.len());
+            for ((a, b), rec) in arrays.iter().zip(&got).zip(&records) {
+                assert_eq!((b.dtype(), b.shape()), (a.dtype(), a.shape()));
+                assert_eq!(record_from_array(b).unwrap(), *rec, "{:?}", a.dtype());
+                assert_eq!(
+                    record_from_array(&record_to_array(rec).unwrap()).unwrap(),
+                    *rec
+                );
+            }
+
+            // A flipped payload byte fails the record's CRC: a miss, and the entry goes.
+            let path = store.dir.join(&store.index.entries[0].file);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let at = bytes.len() - 8;
+            bytes[at] ^= 0x40;
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(store.get_arrays("k").unwrap().is_none());
+            assert!(!store.contains("k"));
+
+            // A file not there (yet): a miss, and the entry stays.
+            store.put("k", &m, &records).unwrap();
+            std::fs::remove_file(store.dir.join(&store.index.entries[0].file)).unwrap();
+            assert!(store.get_arrays("k").unwrap().is_none());
+            assert!(store.contains("k"));
+        }
 
         #[test]
         #[ignore = "MLX FFI requires non-sandbox host with Metal device"]

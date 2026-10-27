@@ -1287,7 +1287,7 @@ impl Qwen4ExpRunner {
             if !disk.contains(&key) {
                 continue;
             }
-            let Some((manifest, records)) = disk.get(&key)? else {
+            let Some((manifest, records)) = disk.get_arrays(&key)? else {
                 continue;
             };
             if manifest.position != at || manifest.prefix_tokens != prompt[..at] {
@@ -1661,7 +1661,7 @@ impl Qwen4ExpRunner {
             return Ok(None);
         };
         let t = std::time::Instant::now();
-        let Some((manifest, records)) = disk.get(key)? else {
+        let Some((manifest, records)) = disk.get_arrays(key)? else {
             return Ok(None);
         };
         let n = manifest.prefix_tokens.len();

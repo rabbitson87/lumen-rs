@@ -697,7 +697,7 @@ pub(crate) mod imp {
             if !disk.contains(&key) {
                 continue;
             }
-            let Ok(Some((manifest, records))) = disk.get(&key) else {
+            let Ok(Some((manifest, records))) = disk.get_arrays(&key) else {
                 continue;
             };
             if manifest.position != at

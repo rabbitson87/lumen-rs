@@ -204,7 +204,9 @@ Measured with a 12.3K-token agent prompt (instructions, two project documents, 2
 | 24 GB class (`LUMEN_MEMORY_LIMIT_GB=13`): a second agent's system prompt pushed the head out | 40.4 s | 2.8 s |
 | 24 GB class, after a restart | 43.3 s | 3.1 s |
 
-The head of 12,244 tokens is 795 MB on disk. The request that writes it spends 0.1 s reading it back
+The head of 12,244 tokens is 795 MB on disk; a restore reads each array straight into its memory, so
+loading an 0.8 GB state takes 0.8 GB, not 1.6 GB (and 0.3 s against 0.7 s, warm). The request that
+writes it spends 0.1 s reading it back
 and 0.1-0.4 s serializing it after its last token (its final chunk comes that much later); the file
 write runs on the disk tier's own thread and lands 0.3-1.4 s later. A request that starts while that
 write is still going shares the SSD with it (the in-memory hit right after the first request: 2.9-3.0 s

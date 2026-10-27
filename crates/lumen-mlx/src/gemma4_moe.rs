@@ -18,8 +18,8 @@ pub(crate) mod imp {
     use std::ffi::CStr;
 
     use crate::kv_disk::{
-        ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record, turboquant_from_meta,
-        turboquant_meta,
+        ArrayRecord, LayerKindTag, LayerMeta, RecordArray, array_at, push_record,
+        turboquant_from_meta, turboquant_meta,
     };
     use crate::native_attention::{
         QuantizedTriple, SPARSE_DECODE_MIN_KEYS, build_causal_mask, build_causal_mask_abs,
@@ -1717,7 +1717,10 @@ pub(crate) mod imp {
         /// the persisted metadata + record blob. Layer kinds + geometry come
         /// from `metas` (written by the same model — guarded by the disk-store
         /// fingerprint), so no model config is needed here.
-        pub fn from_disk_records(metas: &[LayerMeta], records: &[ArrayRecord]) -> Result<Self> {
+        pub fn from_disk_records<T: RecordArray>(
+            metas: &[LayerMeta],
+            records: &[T],
+        ) -> Result<Self> {
             let get = |id: Option<usize>| array_at(records, id);
             // Reconstruct a quantized `(packed, scales, biases)` 3-tuple from
             // three consecutive `m.arrays` slots starting at `base`.

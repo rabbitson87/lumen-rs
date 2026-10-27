@@ -23,8 +23,8 @@ mod imp {
     use mlx_rs::Array;
 
     use crate::kv_disk::{
-        ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record, turboquant_from_meta,
-        turboquant_meta,
+        ArrayRecord, LayerKindTag, LayerMeta, RecordArray, array_at, push_record,
+        turboquant_from_meta, turboquant_meta,
     };
     use crate::native_cache::{
         NativeKvCacheQuantized, NativeLayerCache, NativePromptCache,
@@ -373,9 +373,9 @@ mod imp {
         /// Reconstruct a snapshot from disk-persistable form. The inverse of
         /// `to_records`. `is_deep` should be `true` so `install_into_fresh`
         /// re-deep-clones into the destination cache for sibling isolation.
-        pub fn from_records(
+        pub fn from_records<T: RecordArray>(
             metas: &[LayerMeta],
-            records: &[ArrayRecord],
+            records: &[T],
             position: usize,
             is_deep: bool,
         ) -> Result<Self> {

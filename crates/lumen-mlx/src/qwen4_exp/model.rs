@@ -15,7 +15,7 @@ use super::config::{LayerKind, Qwen4ExpConfig, kv_bf16};
 use super::ngram::NgramHasher;
 use super::ngram_table::{DEFAULT_ROW_CACHE, FileTable, NgramTable, ResidentTable, ShardArrays};
 use crate::decode_probe::{self as probe, Stage};
-use crate::kv_disk::{ArrayRecord, LayerKindTag, LayerMeta, array_at, push_record};
+use crate::kv_disk::{ArrayRecord, LayerKindTag, LayerMeta, RecordArray, array_at, push_record};
 use crate::native_attention::{sdpa, sdpa_with_mask};
 use crate::native_cache::NativeKvCache;
 use crate::native_embedding::quantized_embedding_lookup_with_mode;
@@ -683,10 +683,10 @@ impl Qwen4ExpCache {
 
     /// Rebuild a state written by [`Self::to_records`] into `fresh` (a cache just
     /// made by the same model), `tokens` being the prefix it was captured after.
-    pub(crate) fn restore_records(
+    pub(crate) fn restore_records<T: RecordArray>(
         mut fresh: Self,
         metas: &[LayerMeta],
-        records: &[ArrayRecord],
+        records: &[T],
         tokens: &[u32],
         ngram_context: usize,
         eos: u32,
@@ -1018,10 +1018,10 @@ impl Qwen4ExpModel {
     }
 
     /// A cache holding the state `to_records` wrote after `tokens`.
-    pub(crate) fn cache_from_records(
+    pub(crate) fn cache_from_records<T: RecordArray>(
         &self,
         metas: &[LayerMeta],
-        records: &[ArrayRecord],
+        records: &[T],
         tokens: &[u32],
     ) -> Result<Qwen4ExpCache> {
         Qwen4ExpCache::restore_records(
