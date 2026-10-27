@@ -119,8 +119,8 @@ test("Flash-Next is not mistaken for a resident-weights family", () => {
 
 // ── Flash-Next: the memory plan the server makes (runner.rs `plan_memory`) ────
 
-test("KV is 59,904 bytes per token: 13 layers x (K,V of 2 heads x 256 dims + a 128-dim indexer key), f32", () => {
-  assert.equal(FLASH_NEXT.kvBytesPerToken, 13 * (2 * 2 * 256 * 4 + 128 * 4));
+test("KV is 29,952 bytes per token: 13 layers x (K,V of 2 heads x 256 dims + a 128-dim indexer key), bf16", () => {
+  assert.equal(FLASH_NEXT.kvBytesPerToken, 13 * (2 * 2 * 256 * 2 + 128 * 2));
 });
 
 test("the pool floor is 2 x 512 slots and the second staging region needs 3 x 512", () => {
@@ -162,7 +162,7 @@ test("the reserve adds buffers, chunk activations, KV of the longest prompt and 
   assert.deepEqual([p.chunk, p.ctxTokens, p.tight], [1024, 16_384, false]);
   const scores = 24 * 1024 * 16_384 * 4; // 1.61 GB, under the 2 GB budget
   assert.equal(p.buffersBytes, 600_000_000 + 1024 * 1_100_000);
-  assert.equal(p.kvBytes, 16_384 * 59_904);
+  assert.equal(p.kvBytes, 16_384 * 29_952);
   assert.equal(p.scoresBytes, scores / 2);
   assert.equal(p.reserveBytes, p.buffersBytes + p.kvBytes + p.scoresBytes);
   near(p.poolBytes, usable - 3.6e9 - p.reserveBytes, 1);
@@ -173,12 +173,12 @@ test("the reserve adds buffers, chunk activations, KV of the longest prompt and 
 test("a tight machine takes the smaller chunk, context and scores budget", () => {
   const p = flashNextPlan(flashNextUsableBytes(16));
   assert.deepEqual([p.chunk, p.ctxTokens, p.tight], [512, 8192, true]);
-  assert.equal(p.reserveBytes, 1_855_260_160);
-  near(p.poolBytes, 4_623_596_427, 2);
+  assert.equal(p.reserveBytes, 1_609_893_376);
+  near(p.poolBytes, 4_868_963_211, 2);
   // 24 GB is not tight: 1,024-token chunks, 16K prompts, an ~8 GB pool.
   const q = flashNextPlan(flashNextUsableBytes(24));
   assert.deepEqual([q.chunk, q.ctxTokens, q.tight], [1024, 16_384, false]);
-  near(q.poolBytes, 8_005_111_377, 2);
+  near(q.poolBytes, 8_495_844_945, 2);
 });
 
 test("an override replaces the default it names and nothing else", () => {
@@ -194,7 +194,7 @@ test("the longest prompt the user allows comes out of the pool", () => {
   const small = flashNextPlan(usable, null, 16_384);
   const big = flashNextPlan(usable, null, 81_920);
   assert.ok(big.poolBytes < small.poolBytes);
-  near(big.poolBytes, 14_278_370_058, 2);
+  near(big.poolBytes, 16_732_037_898, 2);
   // The app's default Max context (81,920) leaves a 16 GB Mac no room at all.
   const tight = flashNextPlan(flashNextUsableBytes(16), null, 81_920);
   assert.ok(!flashNextPlanFits(tight));
@@ -248,9 +248,9 @@ test("a LUMEN_MAX_PROMPT_TOKENS the user set wins, and Max context only lowers i
 
 test("the longest prompt that fits is found by search", () => {
   const usable = flashNextUsableBytes(16);
-  assert.equal(flashNextMaxContext(usable), 34_879);
-  assert.ok(flashNextPlanFits(flashNextPlan(usable, null, 34_879)));
-  assert.ok(!flashNextPlanFits(flashNextPlan(usable, null, 34_880)));
+  assert.equal(flashNextMaxContext(usable), 69_758);
+  assert.ok(flashNextPlanFits(flashNextPlan(usable, null, 69_758)));
+  assert.ok(!flashNextPlanFits(flashNextPlan(usable, null, 69_759)));
   assert.equal(flashNextMaxContext(flashNextUsableBytes(36)), FLASH_NEXT.maxContext);
   assert.equal(flashNextMaxContext(flashNextUsableBytes(8)), 0);
   // A bigger pool leaves less.
@@ -258,12 +258,12 @@ test("the longest prompt that fits is found by search", () => {
   assert.ok(flashNextMaxContext(u36, null, 20e9) < flashNextMaxContext(u36, null, 10e9));
 });
 
-test("a 14 GB Mac is the smallest that runs the model", () => {
-  assert.ok(!flashNextFits(13));
-  assert.ok(flashNextFits(14));
+test("a 13 GB Mac is the smallest that runs the model", () => {
+  assert.ok(!flashNextFits(12));
+  assert.ok(flashNextFits(13));
   assert.ok(flashNextFits(16));
   assert.ok(!flashNextFits(8));
-  assert.equal(flashNextMinRamGb(), 14);
+  assert.equal(flashNextMinRamGb(), 13);
   // A memory limit can take a big Mac below what it needs.
   assert.ok(flashNextFits(36, 8)); // 8 GiB makes it a tight machine, which still fits
   assert.ok(!flashNextFits(36, 6));
@@ -764,14 +764,14 @@ test("a pool chip is disabled when the pool does not fit beside the current long
   const usable = flashNextUsableBytes(36);
   const at = (gb: number | null, ctxTokens: number) =>
     flashNextPoolChip({ usableBytes: usable, chunk: 1024, ctxTokens, gb, pack: false, hw: null });
-  // At 16K a 36 GB Mac leaves an ~18.4 GB pool: 16 GB fits, 20 GB does not.
+  // At 16K a 36 GB Mac leaves an ~18.9 GB pool: 16 GB fits, 20 GB does not.
   assert.ok(at(16, 16_384).fits);
   assert.ok(!at(20, 16_384).fits);
   // The largest pool that fits is told to 0.1 GB, rounded down.
-  assert.equal(at(20, 16_384).maxFitGb, 18.3);
-  // At 128K the reserve takes ~10.6 GB: only ~11.3 GB is left, so 12 GB goes and 8 GB stays.
-  assert.ok(at(8, 131_072).fits);
-  assert.ok(!at(12, 131_072).fits);
+  assert.equal(at(20, 16_384).maxFitGb, 18.8);
+  // At 128K the reserve takes ~6.7 GB: ~15.3 GB is left, so 16 GB goes and 12 GB stays.
+  assert.ok(at(12, 131_072).fits);
+  assert.ok(!at(16, 131_072).fits);
   assert.ok(at(null, 131_072).fits);
   // Auto is what the plan leaves.
   near(at(null, 16_384).poolBytes, flashNextPlan(usable, 1024, 16_384).poolBytes, 1);

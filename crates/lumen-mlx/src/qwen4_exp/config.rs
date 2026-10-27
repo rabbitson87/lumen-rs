@@ -10,6 +10,32 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
+lumen_flags::flag! {
+    /// Keep Flash-Next's attention KV cache (and the sparse indexer's keys) in bf16 rather than
+    /// f32: 30 KB per token of context instead of 60, so the memory plan reserves half as much
+    /// for the longest prompt (+0.74 GB of expert pool at a 24 GB-class limit) and every retained
+    /// conversation state (a session, an agent's system-prompt head, a resume point, a disk
+    /// record) is half the size. Attention then runs in bf16 (the cast lands after the norm and
+    /// RoPE, as `LUMEN_MLX_KV_BF16` does for Qwen 3.5); the indexer's keys are pooled in f32.
+    ///
+    /// **`Behavior`: a numerics change.** Teacher-forced over 98K positions of Korean, English and
+    /// code (16K-token contexts), against f32: the same top token at 95.9% of positions, KL 0.0093
+    /// nats, perplexity -0.05%, flat over depth (for scale, the gs64 and gs32 4-bit builds differ
+    /// by KL 0.20). A 16K-token prefill is ~6% faster; decode reads half the KV bytes (~1% of a
+    /// token there). States saved under one setting are never restored under the other (the disk
+    /// identity includes it). `=0` restores f32.
+    pub(crate) kv_bf16 {
+        env: "LUMEN_QWEN4_KV_BF16",
+        default: true,
+        kind: Behavior,
+    }
+}
+
+/// Bytes of one cached K, V or indexer-key element: 2 under [`kv_bf16`], else 4.
+pub fn kv_elem_bytes() -> u64 {
+    if kv_bf16::get() { 2 } else { 4 }
+}
+
 /// Which attention a decoder layer runs. Every layer also has a MoE block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
@@ -384,9 +410,8 @@ impl Qwen4ExpConfig {
         Ok(())
     }
 
-    /// Rotated dimensions of each head (`head_dim * partial_rotary_factor`).
-    /// Bytes of cache one token of context takes: K and V (f32) of every full-attention layer
-    /// and the indexer's key, plus the same for the draft head's one layer.
+    /// Bytes of cache one token of context takes: K and V of every full-attention layer and the
+    /// indexer's key, plus the same for the draft head's one layer, at [`kv_elem_bytes`] each.
     pub fn kv_bytes_per_token(&self) -> u64 {
         let full_layers = self
             .layer_kinds
@@ -395,8 +420,8 @@ impl Qwen4ExpConfig {
             .count() as u64
             + 1;
         let per_layer =
-            (2 * self.num_key_value_heads * self.head_dim * 4 + self.indexer_head_dim * 4) as u64;
-        full_layers * per_layer
+            (2 * self.num_key_value_heads * self.head_dim + self.indexer_head_dim) as u64;
+        full_layers * per_layer * kv_elem_bytes()
     }
 
     /// Bytes of state a sequence holds whatever its length: each DeltaNet layer's recurrent state

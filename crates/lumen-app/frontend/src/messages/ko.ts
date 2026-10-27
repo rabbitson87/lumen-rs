@@ -421,7 +421,7 @@ export const ko: Record<string, string> = {
     "Qwen 3.6 장문 프롬프트의 prefill 청크당 토큰 수. 클수록 GPU 동기화 횟수 ↓(cold prefill 빠름)이지만 peak 메모리 ↑. RAM 여유 있으면 키우고, 장문서 OOM 나면 낮추세요. 기본 2048. Flash-Next는 튜닝 탭의 Flash-Next 카드에서 설정하세요(기본 1024, 청크가 전문가 풀에서 빠집니다).",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "최대 프롬프트 토큰 (거부 상한)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다. Flash-Next는 튜닝 탭의 Flash-Next 카드에서 설정하세요: 가장 긴 프롬프트의 KV 캐시(토큰당 60 KB)가 전문가 풀에서 빠지므로 이 값을 기준으로 풀을 계획합니다. 거기서 고르지 않으면 앱이 이 Mac의 기본값(16,384, GPU 메모리 11 GB 미만이면 8,192)을 보내며, 여기에 항목을 두면 그 값이 대신 쓰입니다.",
+    "프롬프트 길이 하드 상한: 이보다 긴 요청은 prefill 전에 깔끔한 에러로 거부됩니다 — 매우 긴 프롬프트(36GB Mac 기준 Gemma-4-26B ~20k tok, Qwen3.6-35B ~32k)에서 prefill 중 발생하는 uncaught Metal OOM이 서버 프로세스 전체를 죽이는 것을 막는 가드입니다. 기본 16384, 두 모델 다 실측 안전. 미설정 시 LUMEN_PREFILL_CHUNK로 폴백. RAM 여유가 있을 때만 높이세요 — prefill이 길수록 메모리가 비례 증가하고, 너무 큰 값은 OOM 크래시를 다시 노출시킵니다. Flash-Next는 튜닝 탭의 Flash-Next 카드에서 설정하세요: 가장 긴 프롬프트의 KV 캐시(토큰당 30 KB)가 전문가 풀에서 빠지므로 이 값을 기준으로 풀을 계획합니다. 거기서 고르지 않으면 앱이 이 Mac의 기본값(16,384, GPU 메모리 11 GB 미만이면 8,192)을 보내며, 여기에 항목을 두면 그 값이 대신 쓰입니다.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill 청크 로그",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "청크별 prefill 시간과 Metal peak 메모리 출력. 디버그 전용.",
@@ -568,7 +568,7 @@ export const ko: Record<string, string> = {
   "flashnext.plan.title":
     "메모리 계획",
   "flashnext.context.hint":
-    "서버의 프롬프트 상한(LUMEN_MAX_PROMPT_TOKENS)입니다. 그 KV 캐시(토큰당 60 KB)가 풀에서 빠집니다. 칩을 고르면 저장되며, 지정하지 않으면 앱이 이 Mac의 기본값을 보냅니다.",
+    "서버의 프롬프트 상한(LUMEN_MAX_PROMPT_TOKENS)입니다. 그 KV 캐시(토큰당 30 KB)가 풀에서 빠집니다. 칩을 고르면 저장되며, 지정하지 않으면 앱이 이 Mac의 기본값을 보냅니다.",
   "flashnext.peak": "상주 / 사용 가능",
   "flashnext.row.trunk": "상주 가중치",
   "flashnext.row.pool": "전문가 풀",
@@ -924,7 +924,7 @@ export const ko: Record<string, string> = {
   "doctor.hint.flash_next_ram.short":
     "Flash-Next는 상주 가중치 3.6 GB, 최소 2.8 GB의 전문가 풀, prefill 예비분을 GPU가 쓸 수 있는 RAM 몫(32 GB까지 2/3, 그 위는 3/4이며 메모리 한도가 더 낮출 수 있음) 안에 둬야 합니다. 그보다 작으면 모델을 로드할 수 없습니다.",
   "doctor.hint.flash_next_ram.context":
-    "가장 긴 프롬프트의 KV 캐시(토큰당 60 KB)가 GPU가 쓸 수 있는 RAM 몫에서 빠집니다. 앱은 직접 설정하지 않으면 LUMEN_MAX_PROMPT_TOKENS(16,384 토큰, 빠듯한 Mac은 8,192)를 보내며, 이는 최대 컨텍스트로 낮춰집니다. 이를 줄이거나(Flash-Next 메모리 계산기의 적용이 기록합니다) prefill 청크를 줄이고, 메모리 한도가 RAM보다 낮다면 올리세요.",
+    "가장 긴 프롬프트의 KV 캐시(토큰당 30 KB)가 GPU가 쓸 수 있는 RAM 몫에서 빠집니다. 앱은 직접 설정하지 않으면 LUMEN_MAX_PROMPT_TOKENS(16,384 토큰, 빠듯한 Mac은 8,192)를 보내며, 이는 최대 컨텍스트로 낮춰집니다. 이를 줄이거나(Flash-Next 메모리 계산기의 적용이 기록합니다) prefill 청크를 줄이고, 메모리 한도가 RAM보다 낮다면 올리세요.",
   "doctor.hint.flash_next_disk.room":
     "전문가 팩은 디코드를 약 7-15% 빠르게 합니다. 아래 명령으로 한 번 만들거나, LUMEN_MOE_PACK=build 로 설정하면 서버가 다음 시작 때 만듭니다.",
   "doctor.hint.flash_next_disk.noRoom":
@@ -944,7 +944,7 @@ export const ko: Record<string, string> = {
   "doctor.detail.active_model.incomplete":
     "필수 파일 (config.json + safetensors/gguf 샤드 1개 이상)이 누락되었습니다.",
   "doctor.detail.flash_next_ram":
-    "전문가 풀은 GPU가 쓸 수 있는 RAM 몫에서 상주 가중치 3.6 GB와 prefill 예비분(버퍼, 청크 활성값, 가장 긴 프롬프트의 KV 캐시(토큰당 60 KB), attention score)을 뺀 나머지입니다. 프롬프트 상한이 길수록 줄고, 풀이 클수록 토큰당 SSD 읽기가 줄어듭니다.",
+    "전문가 풀은 GPU가 쓸 수 있는 RAM 몫에서 상주 가중치 3.6 GB와 prefill 예비분(버퍼, 청크 활성값, 가장 긴 프롬프트의 KV 캐시(토큰당 30 KB), attention score)을 뺀 나머지입니다. 프롬프트 상한이 길수록 줄고, 풀이 클수록 토큰당 SSD 읽기가 줄어듭니다.",
   "doctor.detail.flash_next_ram.oneRegion":
     "4.2 GB 미만이면 풀이 스테이징 영역을 하나만 둘 수 있어, prefill이 현재 레이어를 계산하는 동안 다음 레이어를 읽지 못합니다.",
   "doctor.detail.flash_next_pack.absent":

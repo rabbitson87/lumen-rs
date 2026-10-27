@@ -54,8 +54,9 @@ const TIGHT_SCORES_BUDGET_BYTES: u64 = 800_000_000;
 const RESERVE_BASE_BYTES: u64 = 600_000_000;
 const RESERVE_PER_TOKEN_BYTES: u64 = 1_100_000;
 /// KV bytes of one token of context: 13 layers (12 full-attention + the draft head's) x
-/// (K and V of 2 heads x 256 dims in f32 + the indexer's 128-dim key in f32).
-pub const KV_BYTES_PER_TOKEN: u64 = 59_904;
+/// (K and V of 2 heads x 256 dims + the indexer's 128-dim key), in bf16: the server's default
+/// (`LUMEN_QWEN4_KV_BF16`; at `=0` it keeps f32, twice this).
+pub const KV_BYTES_PER_TOKEN: u64 = 29_952;
 const ATTENTION_HEADS: u64 = 24;
 /// The GPU working set as a share of RAM (Apple reports about 2/3 up to 32 GiB and 3/4 above;
 /// a 36 GB Mac is really ~0.78), and the share of it the server lets itself fill
@@ -1174,8 +1175,8 @@ mod tests {
     fn the_pool_sizes_are_the_slot_counts_of_the_servers_pool() {
         assert_eq!(POOL_FLOOR_BYTES, 2 * 512 * EXPERT_BYTES);
         assert_eq!(POOL_PREFETCH_BYTES, 3 * 512 * EXPERT_BYTES);
-        // 13 layers (12 full-attention and the draft head's) x (K,V + the indexer key), f32.
-        assert_eq!(KV_BYTES_PER_TOKEN, 13 * (2 * 2 * 256 * 4 + 128 * 4));
+        // 13 layers (12 full-attention and the draft head's) x (K,V + the indexer key), bf16.
+        assert_eq!(KV_BYTES_PER_TOKEN, 13 * (2 * 2 * 256 * 2 + 128 * 2));
     }
 
     #[test]
@@ -1197,7 +1198,7 @@ mod tests {
         let scores = 24 * 1024 * 16_384 * 4; // 1.61 GB, under the 2 GB budget
         assert_eq!(
             p.reserve,
-            600_000_000 + 1024 * 1_100_000 + 16_384 * 59_904 + scores / 2
+            600_000_000 + 1024 * 1_100_000 + 16_384 * 29_952 + scores / 2
         );
         assert_eq!(p.pool, usable - TRUNK_BYTES - p.reserve);
         assert!(p.fits());
@@ -1205,7 +1206,7 @@ mod tests {
         let long = plan_memory(usable, None, Some(65_536));
         assert_eq!(
             long.reserve,
-            600_000_000 + 1024 * 1_100_000 + 65_536 * 59_904 + 2_000_000_000 / 2
+            600_000_000 + 1024 * 1_100_000 + 65_536 * 29_952 + 2_000_000_000 / 2
         );
     }
 
@@ -1222,13 +1223,13 @@ mod tests {
         assert_eq!(usable_now(usable, ram, 30_000_000_000, 0), usable);
         assert_eq!(plan.pool_within(usable), plan.pool);
         // An editor, a browser and chat apps open (the server's own `free now` line on that
-        // Mac): 17.7 GB reclaimable, so 15.7 GB to plan within and an 8.6 GB pool, not 18.4.
+        // Mac): 17.7 GB reclaimable, so 15.7 GB to plan within and a 9.0 GB pool, not 18.8.
         let now = usable_now(usable, ram, 17_707_089_920, 0);
         assert_eq!(now, 15_707_089_920);
         assert_eq!(plan.pool_within(now), now - TRUNK_BYTES - plan.reserve);
         assert_eq!(
             (plan.pool_within(now) / 100_000_000, plan.pool / 100_000_000),
-            (85, 183)
+            (90, 188)
         );
         // A running server's memory is a restarted one's too.
         assert_eq!(
@@ -1244,12 +1245,12 @@ mod tests {
     fn a_tight_machine_takes_the_smaller_chunk_context_and_scores_budget() {
         let p = plan_memory(usable_bytes(16 * GIB, None), None, None);
         assert_eq!((p.chunk, p.ctx_tokens), (512, 8192));
-        assert_eq!(p.reserve, 1_855_260_160);
-        assert_eq!(p.pool, 4_623_596_427);
+        assert_eq!(p.reserve, 1_609_893_376);
+        assert_eq!(p.pool, 4_868_963_211);
         // 24 GB is not tight: 1,024-token chunks, 16K prompts, a ~8 GB pool.
         let p = plan_memory(usable_bytes(24 * GIB, None), None, None);
         assert_eq!((p.chunk, p.ctx_tokens), (1024, 16_384));
-        assert_eq!(p.pool, 8_005_111_377);
+        assert_eq!(p.pool, 8_495_844_945);
     }
 
     #[test]
@@ -1267,7 +1268,7 @@ mod tests {
         let small = plan_memory(usable, None, Some(16_384));
         let big = plan_memory(usable, None, Some(81_920));
         assert!(big.pool < small.pool);
-        assert_eq!(big.pool, 14_278_370_058);
+        assert_eq!(big.pool, 16_732_037_898);
         // On a 16 GB Mac the app's default 81,920-token Max context leaves no room at all.
         let tight = plan_memory(usable_bytes(16 * GIB, None), None, Some(81_920));
         assert!(!tight.fits());
@@ -1277,7 +1278,7 @@ mod tests {
     #[test]
     fn the_longest_prompt_that_fits_is_found_by_search() {
         let usable = usable_bytes(16 * GIB, None);
-        assert_eq!(max_fitting_context(usable, None), 34_879);
+        assert_eq!(max_fitting_context(usable, None), 69_758);
         let n = max_fitting_context(usable, None);
         assert!(plan_memory(usable, None, Some(n)).fits());
         assert!(!plan_memory(usable, None, Some(n + 1)).fits());
@@ -1289,12 +1290,12 @@ mod tests {
     }
 
     #[test]
-    fn a_14_gb_mac_is_the_smallest_that_runs_the_model() {
-        assert!(!fits(13 * GIB));
-        assert!(fits(14 * GIB));
+    fn a_13_gb_mac_is_the_smallest_that_runs_the_model() {
+        assert!(!fits(12 * GIB));
+        assert!(fits(13 * GIB));
         assert!(fits(16 * GIB));
         assert!(!fits(8 * GIB));
-        assert_eq!(min_ram_gib(), 14);
+        assert_eq!(min_ram_gib(), 13);
     }
 
     #[test]

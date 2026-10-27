@@ -431,7 +431,7 @@ export const en: Record<string, string> = {
     "Tokens per prefill chunk for Qwen 3.6 long prompts. Larger = fewer GPU syncs (faster cold prefill) but more peak memory. Raise on Macs with more RAM; lower if a long prompt OOMs. Default 2048. For Flash-Next use the Flash-Next card (Tuning tab): its default is 1024, and its chunk comes out of the expert pool.",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.label": "Max prompt tokens (reject cap)",
   "env.entry.LUMEN_MAX_PROMPT_TOKENS.help":
-    "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash. For Flash-Next set it in the Flash-Next card (Tuning tab): the model plans its expert pool around it, since the KV cache for the longest prompt (60 KB per token) comes out of the pool. Without a choice there the app sends this Mac's default (16,384; 8,192 under 11 GB of GPU memory), and an entry here replaces it.",
+    "Hard ceiling on prompt length: requests longer than this are rejected (clean error) BEFORE prefill — this guards the server from an uncaught Metal OOM that otherwise crashes the whole process on very long prompts (~20k tok for Gemma-4-26B, ~32k for Qwen3.6-35B on a 36 GB Mac). Default 16384, empirically safe for both families. Falls back to LUMEN_PREFILL_CHUNK. Raise ONLY if you have more RAM — a longer prefill needs proportionally more memory, and an over-large value re-exposes the OOM crash. For Flash-Next set it in the Flash-Next card (Tuning tab): the model plans its expert pool around it, since the KV cache for the longest prompt (30 KB per token) comes out of the pool. Without a choice there the app sends this Mac's default (16,384; 8,192 under 11 GB of GPU memory), and an entry here replaces it.",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.label": "Qwen prefill chunk log",
   "env.entry.LUMEN_QWEN35_PREFILL_CHUNK_LOG.help":
     "Print per-chunk prefill timing and peak Metal memory. Debug only.",
@@ -578,7 +578,7 @@ export const en: Record<string, string> = {
   "flashnext.plan.title":
     "Memory plan",
   "flashnext.context.hint":
-    "The server's prompt cap (LUMEN_MAX_PROMPT_TOKENS): its KV cache (60 KB per token) comes out of the pool. Picking a chip saves it; this Mac's default is what the app sends when none is set.",
+    "The server's prompt cap (LUMEN_MAX_PROMPT_TOKENS): its KV cache (30 KB per token) comes out of the pool. Picking a chip saves it; this Mac's default is what the app sends when none is set.",
   "flashnext.peak": "resident / usable",
   "flashnext.row.trunk": "resident weights",
   "flashnext.row.pool": "expert pool",
@@ -936,7 +936,7 @@ export const en: Record<string, string> = {
   "doctor.hint.flash_next_ram.short":
     "Flash-Next needs its 3.6 GB of resident weights, an expert pool of at least 2.8 GB and a prefill reserve inside the GPU's share of RAM (two thirds up to 32 GB, three quarters above; the memory limit lowers it). Below that the model cannot load.",
   "doctor.hint.flash_next_ram.context":
-    "The KV cache of the longest prompt (60 KB per token) comes out of the GPU's share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next memory calculator's Apply writes it) or the prefill chunk, or raise the memory limit if it is below your RAM.",
+    "The KV cache of the longest prompt (30 KB per token) comes out of the GPU's share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next memory calculator's Apply writes it) or the prefill chunk, or raise the memory limit if it is below your RAM.",
   "doctor.hint.flash_next_disk.room":
     "An expert pack makes decode about 7-15% faster. Build it once with the command below, or set LUMEN_MOE_PACK=build and the server builds it on its next start.",
   "doctor.hint.flash_next_disk.noRoom":
@@ -956,7 +956,7 @@ export const en: Record<string, string> = {
   "doctor.detail.active_model.incomplete":
     "Required files (config.json + at least one safetensors/gguf shard) are missing.",
   "doctor.detail.flash_next_ram":
-    "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of the longest prompt (60 KB per token) and attention scores. A longer prompt cap shrinks it; a bigger pool means fewer SSD reads per token.",
+    "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of the longest prompt (30 KB per token) and attention scores. A longer prompt cap shrinks it; a bigger pool means fewer SSD reads per token.",
   "doctor.detail.flash_next_ram.oneRegion":
     "With less than 4.2 GB the pool has room for one staging region only, so prefill cannot read the next layer while it computes the current one.",
   "doctor.detail.flash_next_pack.absent":

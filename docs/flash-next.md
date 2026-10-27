@@ -25,9 +25,9 @@ times 0.88 for the headroom other apps need; `LUMEN_MEMORY_LIMIT_GB` lowers it, 
 other apps hold at load, below) is split into the
 3.6 GB of resident weights, a reserve for prefilling, and the expert pool, which gets the rest. The
 reserve is 0.6 GB of buffers, about 1.1 MB per token of the prefill chunk, the KV cache of the
-longest prompt the plan allows (60 KB per token), and half the attention scores. So the longest prompt
+longest prompt the plan allows (30 KB per token in bf16, below; 60 KB in f32), and half the attention scores. So the longest prompt
 and the pool trade against each other: `LUMEN_MAX_PROMPT_TOKENS` (the server's prompt cap, which the
-plan also reads; `LUMEN_MAX_CTX` can only lower it) is 16,384 by default, and 65,536 takes about 3 GB out of the pool. The server rejects a
+plan also reads; `LUMEN_MAX_CTX` can only lower it) is 16,384 by default, and 65,536 takes about 1.5 GB out of the pool (3 GB in f32). The server rejects a
 longer prompt with the usual "prompt too large" error instead of running out of memory halfway. A
 chunk attends to a long context in blocks of query rows so its scores never exceed 2 GB.
 
@@ -43,6 +43,26 @@ smaller rows' plans were made on a 36 GB M3 Max with `LUMEN_MEMORY_LIMIT_GB` set
 what the plan does, not how a real 16 or 24 GB Mac's own memory pressure behaves. On a 16 GB Mac (under 11 GB of working set) the
 pool has room for only one staging region, so prefill cannot read the next layer while computing the
 current one; a 5.8K-token prompt prefilled at 209 tok/s there, with a peak resident size of 7.2 GB.
+The table's plans were made with an f32 KV cache; bf16 (the default now) leaves the pool more.
+
+### The KV cache in bf16 (`LUMEN_QWEN4_KV_BF16`, on by default)
+
+The 12 attention layers (and the draft head's) keep their keys and values, and the sparse indexer its
+keys, in bf16: 30 KB per token of context instead of 60, and attention runs in bf16 (the indexer pools
+its keys in f32). Everything that holds a conversation is half the size: the plan's reserve for the
+longest prompt, each session and resume point, an agent's system-prompt head (in memory and on disk).
+This changes the numbers slightly, so `LUMEN_QWEN4_KV_BF16=0` brings back f32 (and a disk state saved
+under one setting is never read under the other). Measured against f32 on this Mac:
+
+| | f32 | bf16 |
+|---|---|---|
+| Same top token, 98K teacher-forced positions (Korean, English, code; 16K-token contexts) | (the reference) | 95.9% (95.3-96.2% at every depth) |
+| KL from f32 / perplexity | - | 0.0093 nats / -0.05% |
+| Expert pool at `LUMEN_MEMORY_LIMIT_GB=13` (24 GB class) | 6.16 GB | 6.90 GB |
+| 16K-token prefill (two runs each, interleaved) | 60.8, 63.4 s | 56.7, 58.8 s |
+
+For scale, the two 4-bit builds (group size 64 and 32) differ from each other by KL 0.20. Decode at
+16K tokens reads 0.38 GB of KV per token instead of 0.77, about 1% of a token there.
 
 ### What other apps hold
 

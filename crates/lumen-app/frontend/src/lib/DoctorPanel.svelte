@@ -100,8 +100,8 @@
         return m;
       }
       case "flash_next_ram": {
-        // "16 GB RAM: expert pool ~4.6 GB at 8192 tokens" / "16 GB RAM: a 81920-token context does
-        // not fit, up to 34879 do" / "8 GB RAM, Flash-Next needs ~14 GB"
+        // "16 GB RAM: expert pool ~4.9 GB at 8192 tokens" / "16 GB RAM: a 81920-token context does
+        // not fit, up to 69758 do" / "8 GB RAM, Flash-Next needs ~13 GB"
         const ok = m.match(/^(\d+) GB RAM: expert pool ~([\d.]+) GB at (\d+) tokens$/);
         if (ok) return fill("doctor.msg.flash_next_ram.ok", { ram: ok[1], pool: ok[2], ctx: ok[3] });
         const ctx = m.match(/^(\d+) GB RAM: a (\d+)-token context does not fit, up to (\d+) do$/);

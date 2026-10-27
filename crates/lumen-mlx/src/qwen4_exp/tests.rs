@@ -18,6 +18,12 @@ use super::config::Qwen4ExpConfig;
 use super::model::{LoadOptions, MtpMode, NgramSource, Qwen4ExpModel};
 use super::ngram::NgramHasher;
 
+/// `f` with the KV cache in f32 (`LUMEN_QWEN4_KV_BF16=0`): the reference logits were computed
+/// with one, and these tests check the port's arithmetic against them at f32 tolerances.
+fn f32_kv<R>(f: impl FnOnce() -> R) -> R {
+    super::config::kv_bf16::with(false, f)
+}
+
 /// The committed replica. A missing fixture fails the test: a skip here would
 /// read as a pass.
 fn fixture_dir() -> PathBuf {
@@ -110,60 +116,64 @@ fn the_ngram_rows_match_the_reference() {
 
 #[test]
 fn a_full_prefill_matches_the_reference_logits() {
-    let dir = fixture_dir();
-    let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
-    let vocab = model.config().vocab_size;
-    let want = reference(&dir);
-    let ids: Vec<u32> = want["ids"]
-        .as_slice::<i32>()
-        .iter()
-        .map(|&t| t as u32)
-        .collect();
+    f32_kv(|| {
+        let dir = fixture_dir();
+        let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
+        let vocab = model.config().vocab_size;
+        let want = reference(&dir);
+        let ids: Vec<u32> = want["ids"]
+            .as_slice::<i32>()
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
 
-    let mut cache = model.make_cache();
-    let logits = model.forward(&ids, &mut cache, false).expect("forward");
-    let got = host_f32(&logits);
-    let expected = host_f32(&want["logits_full"]);
-    let (max_abs, min_cos) = compare(&got, &expected, vocab);
-    eprintln!("prefill: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
-    assert_eq!(
-        argmax_rows(&got, vocab),
-        argmax_rows(&expected, vocab),
-        "top-1 per position"
-    );
-    assert!(min_cos > 0.9999, "min cosine {min_cos}");
-    assert!(max_abs < 5e-3, "max |diff| {max_abs}");
+        let mut cache = model.make_cache();
+        let logits = model.forward(&ids, &mut cache, false).expect("forward");
+        let got = host_f32(&logits);
+        let expected = host_f32(&want["logits_full"]);
+        let (max_abs, min_cos) = compare(&got, &expected, vocab);
+        eprintln!("prefill: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+        assert_eq!(
+            argmax_rows(&got, vocab),
+            argmax_rows(&expected, vocab),
+            "top-1 per position"
+        );
+        assert!(min_cos > 0.9999, "min cosine {min_cos}");
+        assert!(max_abs < 5e-3, "max |diff| {max_abs}");
+    })
 }
 
 #[test]
 fn prefill_then_single_token_decode_matches_the_reference() {
-    let dir = fixture_dir();
-    let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
-    let vocab = model.config().vocab_size;
-    let want = reference(&dir);
-    let ids: Vec<u32> = want["ids"]
-        .as_slice::<i32>()
-        .iter()
-        .map(|&t| t as u32)
-        .collect();
-    let expected = host_f32(&want["logits_split"]);
+    f32_kv(|| {
+        let dir = fixture_dir();
+        let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
+        let vocab = model.config().vocab_size;
+        let want = reference(&dir);
+        let ids: Vec<u32> = want["ids"]
+            .as_slice::<i32>()
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        let expected = host_f32(&want["logits_split"]);
 
-    let mut cache = model.make_cache();
-    let mut got = host_f32(&model.forward(&ids[..40], &mut cache, false).unwrap());
-    for t in 40..ids.len() {
-        let step = model.forward(&ids[t..t + 1], &mut cache, false).unwrap();
-        got.extend(host_f32(&step));
-    }
-    let (max_abs, min_cos) = compare(&got, &expected, vocab);
-    eprintln!("prefill + decode: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
-    assert_eq!(
-        argmax_rows(&got, vocab),
-        argmax_rows(&expected, vocab),
-        "top-1 per position"
-    );
-    assert!(min_cos > 0.9999, "min cosine {min_cos}");
-    assert!(max_abs < 5e-3, "max |diff| {max_abs}");
-    assert_eq!(cache.len(), ids.len());
+        let mut cache = model.make_cache();
+        let mut got = host_f32(&model.forward(&ids[..40], &mut cache, false).unwrap());
+        for t in 40..ids.len() {
+            let step = model.forward(&ids[t..t + 1], &mut cache, false).unwrap();
+            got.extend(host_f32(&step));
+        }
+        let (max_abs, min_cos) = compare(&got, &expected, vocab);
+        eprintln!("prefill + decode: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+        assert_eq!(
+            argmax_rows(&got, vocab),
+            argmax_rows(&expected, vocab),
+            "top-1 per position"
+        );
+        assert!(min_cos > 0.9999, "min cosine {min_cos}");
+        assert!(max_abs < 5e-3, "max |diff| {max_abs}");
+        assert_eq!(cache.len(), ids.len());
+    })
 }
 
 /// The same prompt fed in uneven chunks must land on the same logits as one
@@ -171,33 +181,35 @@ fn prefill_then_single_token_decode_matches_the_reference() {
 /// indexer keys, the n-gram tail and its convolution) crosses the boundaries.
 #[test]
 fn chunked_prefill_matches_a_single_prefill() {
-    let dir = fixture_dir();
-    let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
-    let vocab = model.config().vocab_size;
-    let want = reference(&dir);
-    let ids: Vec<u32> = want["ids"]
-        .as_slice::<i32>()
-        .iter()
-        .map(|&t| t as u32)
-        .collect();
+    f32_kv(|| {
+        let dir = fixture_dir();
+        let model = Qwen4ExpModel::load(&dir, None).expect("load tiny replica");
+        let vocab = model.config().vocab_size;
+        let want = reference(&dir);
+        let ids: Vec<u32> = want["ids"]
+            .as_slice::<i32>()
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
 
-    let mut cache = model.make_cache();
-    let mut got = Vec::new();
-    let mut at = 0;
-    for len in [13, 1, 20, 7, 7] {
-        got.extend(host_f32(
-            &model
-                .forward(&ids[at..at + len], &mut cache, false)
-                .unwrap(),
-        ));
-        at += len;
-    }
-    assert_eq!(at, ids.len());
-    let expected = host_f32(&want["logits_full"]);
-    let (max_abs, min_cos) = compare(&got, &expected, vocab);
-    eprintln!("chunked prefill: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
-    assert_eq!(argmax_rows(&got, vocab), argmax_rows(&expected, vocab));
-    assert!(min_cos > 0.9999 && max_abs < 5e-3);
+        let mut cache = model.make_cache();
+        let mut got = Vec::new();
+        let mut at = 0;
+        for len in [13, 1, 20, 7, 7] {
+            got.extend(host_f32(
+                &model
+                    .forward(&ids[at..at + len], &mut cache, false)
+                    .unwrap(),
+            ));
+            at += len;
+        }
+        assert_eq!(at, ids.len());
+        let expected = host_f32(&want["logits_full"]);
+        let (max_abs, min_cos) = compare(&got, &expected, vocab);
+        eprintln!("chunked prefill: max |diff| {max_abs:.3e}, min cosine {min_cos:.6}");
+        assert_eq!(argmax_rows(&got, vocab), argmax_rows(&expected, vocab));
+        assert!(min_cos > 0.9999 && max_abs < 5e-3);
+    })
 }
 
 /// The offload engine in front of the replica's experts: logits bit-identical to the resident
@@ -473,12 +485,14 @@ fn the_forward_pass_runs_on_a_thread_that_did_not_load_the_model() {
     let expected = host_f32(&want["logits_full"]);
     let vocab = model.config().vocab_size;
     let got = std::thread::spawn(move || {
-        let mut cache = model.make_cache();
-        host_f32(
-            &model
-                .forward(&ids, &mut cache, false)
-                .expect("forward on another thread"),
-        )
+        f32_kv(|| {
+            let mut cache = model.make_cache();
+            host_f32(
+                &model
+                    .forward(&ids, &mut cache, false)
+                    .expect("forward on another thread"),
+            )
+        })
     })
     .join()
     .expect("worker thread");

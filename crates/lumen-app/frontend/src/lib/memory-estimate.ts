@@ -485,8 +485,8 @@ export const FLASH_NEXT = {
   reserveBaseBytes: 0.6e9,
   reservePerTokenBytes: 1.1e6,
   /** 13 layers (12 full-attention + the draft head's) x (K,V of 2 heads x 256 dims + the
-   *  indexer's 128-dim key), f32. */
-  kvBytesPerToken: 59_904,
+   *  indexer's 128-dim key), bf16: the server's default (`LUMEN_QWEN4_KV_BF16`). */
+  kvBytesPerToken: 29_952,
   attentionHeads: 24,
   /** GPU working set as a share of RAM (Apple reports ~2/3 up to 32 GiB, ~3/4 above) and the
    *  share of it the server lets itself fill (`WORKING_SET_SHARE` in lumen-mlx). */

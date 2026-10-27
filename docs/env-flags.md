@@ -52,6 +52,7 @@ value → on.
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
 | `LUMEN_QWEN4_BUILD_AHEAD` | off | Optimization | `lumen_mlx::qwen4_exp::model::build_ahead` |
+| `LUMEN_QWEN4_KV_BF16` | on | Behavior | `lumen_mlx::qwen4_exp::config::kv_bf16` |
 | `LUMEN_QWEN4_MEM_LOG` | off | Diagnostic | `lumen_mlx::qwen4_exp::runner::mem_log` |
 | `LUMEN_QWEN4_STAGE_SYNC` | off | Diagnostic | `lumen_mlx::decode_probe::stage_sync` |
 | `LUMEN_QWEN4_TOKEN_COUNTERS` | off | Diagnostic | `lumen_mlx::decode_probe::token_counters` |
@@ -586,6 +587,24 @@ Decode with the offloaded layers pipelined one segment ahead: submit the GPU wor
  host's graph building no longer sits between two GPU segments. Measured on the real
  checkpoint (M3 Max): identical text, but no end-to-end gain (15 GB pool 9.79 -> 9.81 tok/s,
  N=10; 6.7 GB +2%, noise); only ~5.5 ms of host build per token is hideable. Kept opt-in.
+
+### `LUMEN_QWEN4_KV_BF16`
+
+*Behavior, default on.*
+
+Keep Flash-Next's attention KV cache (and the sparse indexer's keys) in bf16 rather than
+ f32: 30 KB per token of context instead of 60, so the memory plan reserves half as much
+ for the longest prompt (+0.74 GB of expert pool at a 24 GB-class limit) and every retained
+ conversation state (a session, an agent's system-prompt head, a resume point, a disk
+ record) is half the size. Attention then runs in bf16 (the cast lands after the norm and
+ RoPE, as `LUMEN_MLX_KV_BF16` does for Qwen 3.5); the indexer's keys are pooled in f32.
+
+ **`Behavior`: a numerics change.** Teacher-forced over 98K positions of Korean, English and
+ code (16K-token contexts), against f32: the same top token at 95.9% of positions, KL 0.0093
+ nats, perplexity -0.05%, flat over depth (for scale, the gs64 and gs32 4-bit builds differ
+ by KL 0.20). A 16K-token prefill is ~6% faster; decode reads half the KV bytes (~1% of a
+ token there). States saved under one setting are never restored under the other (the disk
+ identity includes it). `=0` restores f32.
 
 ### `LUMEN_QWEN4_MEM_LOG`
 

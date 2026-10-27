@@ -2137,34 +2137,36 @@ mod tests {
 
     #[test]
     fn what_other_apps_hold_comes_out_of_the_pool_and_the_line_says_how_much() {
-        let cfg = real_config();
-        let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
-        let free = free_now(&after_36gb());
-        let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, pool_floor_bytes(&cfg));
-        assert_eq!(choice.usable, free);
-        assert_eq!(choice.clamped_by, DEVICE_36GB - free);
-        assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
-        assert_eq!(plan.pool - choice.pool, choice.clamped_by);
-        // 19.5 GB of pool on an idle 36 GB Mac, 8.6 GB with these apps open.
-        assert!(
-            (8_500_000_000..8_700_000_000).contains(&choice.pool),
-            "{choice:?}"
-        );
-        assert!(!choice.at_floor);
-        // The chunk and the context are the machine's: only the pool shrinks.
-        assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
-        let line = plan_line(DEVICE_36GB, &choice, &plan, false);
-        assert!(
-            line.contains("GPU may use 26.6 GB, 15.7 GB of it free now"),
-            "{line}"
-        );
-        assert!(
-            line.ends_with(
-                "Pool 8.6 GB (other apps hold memory: 10.9 GB below the working set); close \
+        f32_kv(|| {
+            let cfg = real_config();
+            let plan = plan_memory(DEVICE_36GB, &cfg, None, None);
+            let free = free_now(&after_36gb());
+            let choice = choose_pool(DEVICE_36GB, Some(free), &plan, None, pool_floor_bytes(&cfg));
+            assert_eq!(choice.usable, free);
+            assert_eq!(choice.clamped_by, DEVICE_36GB - free);
+            assert_eq!(choice.pool, free - TRUNK_BYTES - plan.reserve);
+            assert_eq!(plan.pool - choice.pool, choice.clamped_by);
+            // 19.5 GB of pool on an idle 36 GB Mac, 8.6 GB with these apps open.
+            assert!(
+                (8_500_000_000..8_700_000_000).contains(&choice.pool),
+                "{choice:?}"
+            );
+            assert!(!choice.at_floor);
+            // The chunk and the context are the machine's: only the pool shrinks.
+            assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
+            let line = plan_line(DEVICE_36GB, &choice, &plan, false);
+            assert!(
+                line.contains("GPU may use 26.6 GB, 15.7 GB of it free now"),
+                "{line}"
+            );
+            assert!(
+                line.ends_with(
+                    "Pool 8.6 GB (other apps hold memory: 10.9 GB below the working set); close \
                  apps and restart for a bigger pool"
-            ),
-            "{line}"
-        );
+                ),
+                "{line}"
+            );
+        })
     }
 
     #[test]
@@ -2319,47 +2321,51 @@ mod tests {
 
     #[test]
     fn the_pool_is_what_the_working_set_leaves_after_the_trunk_and_the_reserve() {
-        let cfg = real_config();
-        assert_eq!(
-            cfg.kv_bytes_per_token(),
-            13 * (2 * 2 * 256 * 4 + 128 * 4) as u64
-        );
-        // 36 GB Mac: 30.2 GB working set x 0.88.
-        let plan = plan_memory(26_600_000_000, &cfg, None, None);
-        assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
-        assert!(
-            (19_000_000_000..20_100_000_000).contains(&plan.pool),
-            "{plan:?}"
-        );
-        // 24 GB Mac: ~16 GB working set x 0.88.
-        let plan = plan_memory(14_100_000_000, &cfg, None, None);
-        assert_eq!(plan.chunk, 1024);
-        assert!(plan.pool > 6_500_000_000, "{plan:?}");
-        // A 16 GB Mac takes the tight settings and still has a pool that holds a staging region
-        // and a layer (2 x 512 experts x 2.76 MB).
-        let plan = plan_memory(9_400_000_000, &cfg, None, None);
-        assert_eq!(
-            (plan.chunk, plan.ctx_tokens, plan.scores_budget),
-            (512, 8_192, 800_000_000)
-        );
-        assert!(plan.pool > 2_850_000_000, "{plan:?}");
-        // Too little memory: the pool is zero and the slot floor takes over.
-        assert_eq!(plan_memory(4_000_000_000, &cfg, None, None).pool, 0);
+        f32_kv(|| {
+            let cfg = real_config();
+            assert_eq!(
+                cfg.kv_bytes_per_token(),
+                13 * (2 * 2 * 256 * 4 + 128 * 4) as u64
+            );
+            // 36 GB Mac: 30.2 GB working set x 0.88.
+            let plan = plan_memory(26_600_000_000, &cfg, None, None);
+            assert_eq!((plan.chunk, plan.ctx_tokens), (1024, 16_384));
+            assert!(
+                (19_000_000_000..20_100_000_000).contains(&plan.pool),
+                "{plan:?}"
+            );
+            // 24 GB Mac: ~16 GB working set x 0.88.
+            let plan = plan_memory(14_100_000_000, &cfg, None, None);
+            assert_eq!(plan.chunk, 1024);
+            assert!(plan.pool > 6_500_000_000, "{plan:?}");
+            // A 16 GB Mac takes the tight settings and still has a pool that holds a staging region
+            // and a layer (2 x 512 experts x 2.76 MB).
+            let plan = plan_memory(9_400_000_000, &cfg, None, None);
+            assert_eq!(
+                (plan.chunk, plan.ctx_tokens, plan.scores_budget),
+                (512, 8_192, 800_000_000)
+            );
+            assert!(plan.pool > 2_850_000_000, "{plan:?}");
+            // Too little memory: the pool is zero and the slot floor takes over.
+            assert_eq!(plan_memory(4_000_000_000, &cfg, None, None).pool, 0);
+        })
     }
 
     #[test]
     fn a_longer_context_or_a_bigger_chunk_takes_its_memory_out_of_the_pool() {
-        let cfg = real_config();
-        let base = plan_memory(26_600_000_000, &cfg, None, None);
-        let longer = plan_memory(26_600_000_000, &cfg, None, Some(65_536));
-        // 48K more tokens of 60 KB each: ~2.9 GB of KV, and the scores stay at their budget.
-        assert!(
-            base.pool - longer.pool > 2_800_000_000,
-            "{base:?} {longer:?}"
-        );
-        assert!(base.pool - longer.pool < 4_200_000_000);
-        let bigger = plan_memory(26_600_000_000, &cfg, Some(4096), None);
-        assert!(bigger.pool < base.pool);
+        f32_kv(|| {
+            let cfg = real_config();
+            let base = plan_memory(26_600_000_000, &cfg, None, None);
+            let longer = plan_memory(26_600_000_000, &cfg, None, Some(65_536));
+            // 48K more tokens of 60 KB each: ~2.9 GB of KV, and the scores stay at their budget.
+            assert!(
+                base.pool - longer.pool > 2_800_000_000,
+                "{base:?} {longer:?}"
+            );
+            assert!(base.pool - longer.pool < 4_200_000_000);
+            let bigger = plan_memory(26_600_000_000, &cfg, Some(4096), None);
+            assert!(bigger.pool < base.pool);
+        })
     }
 
     /// A 15K-token session holds its KV twice (the sequence's and its rollback point's) and a new
@@ -2367,21 +2373,23 @@ mod tests {
     /// rollback point, and a 13-token session 0.13 GB.
     #[test]
     fn a_session_feed_leaves_its_kv_and_a_new_sequence_s_state_twice() {
-        let cfg = real_config();
-        let (kv, states) = crate::session::feed_cost(0, 14_978);
-        let fresh = feed_growth(&cfg, kv, states);
-        assert!(
-            (1_850_000_000..2_150_000_000).contains(&fresh),
-            "{fresh} bytes for a 15K-token prompt"
-        );
-        // 36 layers x (48 x 128 x 128 f32 + a 3-wide window of 10,240 channels) = ~118 MB.
-        assert!((115_000_000..120_000_000).contains(&cfg.state_bytes()));
-        // Continuing a session adds the new tokens' KV twice, not another state.
-        let (kv, states) = crate::session::feed_cost(14_978, 15_478);
-        assert_eq!(
-            feed_growth(&cfg, kv, states),
-            2 * 500 * cfg.kv_bytes_per_token()
-        );
+        f32_kv(|| {
+            let cfg = real_config();
+            let (kv, states) = crate::session::feed_cost(0, 14_978);
+            let fresh = feed_growth(&cfg, kv, states);
+            assert!(
+                (1_850_000_000..2_150_000_000).contains(&fresh),
+                "{fresh} bytes for a 15K-token prompt"
+            );
+            // 36 layers x (48 x 128 x 128 f32 + a 3-wide window of 10,240 channels) = ~118 MB.
+            assert!((115_000_000..120_000_000).contains(&cfg.state_bytes()));
+            // Continuing a session adds the new tokens' KV twice, not another state.
+            let (kv, states) = crate::session::feed_cost(14_978, 15_478);
+            assert_eq!(
+                feed_growth(&cfg, kv, states),
+                2 * 500 * cfg.kv_bytes_per_token()
+            );
+        })
     }
 
     /// Measured in the soak (16 GB plan): with the cache's room asked of it, a 23-token chat turn
@@ -2389,21 +2397,23 @@ mod tests {
     /// would take the live memory past the budget itself still is.
     #[test]
     fn a_small_feed_only_has_to_stay_inside_the_budget() {
-        let cfg = real_config();
-        let budget = 13_960_000_000;
-        let (kv, states) = crate::session::feed_cost(0, 23);
-        let small = feed_growth(&cfg, kv, states);
-        assert!(small < SMALL_FEED, "{small}");
-        assert!(13_300_000_000 + small + CACHE_ROOM > budget);
-        assert_eq!(shortfall(13_300_000_000, small, budget), 0);
-        assert!(shortfall(13_800_000_000, small, budget) > 0);
-        // A 4.5K-token continuation is the smallest that asks for the room.
-        let cont = |fed: usize| {
-            let (kv, states) = crate::session::feed_cost(14_978, 14_978 + fed);
-            feed_growth(&cfg, kv, states)
-        };
-        assert!(cont(4_600) >= SMALL_FEED);
-        assert!(cont(4_000) < SMALL_FEED);
+        f32_kv(|| {
+            let cfg = real_config();
+            let budget = 13_960_000_000;
+            let (kv, states) = crate::session::feed_cost(0, 23);
+            let small = feed_growth(&cfg, kv, states);
+            assert!(small < SMALL_FEED, "{small}");
+            assert!(13_300_000_000 + small + CACHE_ROOM > budget);
+            assert_eq!(shortfall(13_300_000_000, small, budget), 0);
+            assert!(shortfall(13_800_000_000, small, budget) > 0);
+            // A 4.5K-token continuation is the smallest that asks for the room.
+            let cont = |fed: usize| {
+                let (kv, states) = crate::session::feed_cost(14_978, 14_978 + fed);
+                feed_growth(&cfg, kv, states)
+            };
+            assert!(cont(4_600) >= SMALL_FEED);
+            assert!(cont(4_000) < SMALL_FEED);
+        })
     }
 
     #[test]
@@ -2416,6 +2426,12 @@ mod tests {
         r.ctx_tokens = 10;
         r.memory_budget = u64::MAX;
         assert_eq!(r.memory_shortfall(1_000_000_000, 2), 0);
+    }
+
+    /// `f` with the KV cache in f32 (`LUMEN_QWEN4_KV_BF16=0`), for the plan's arithmetic, which
+    /// these tests check against figures measured with an f32 cache.
+    fn f32_kv<R>(f: impl FnOnce() -> R) -> R {
+        super::super::config::kv_bf16::with(false, f)
     }
 
     fn tiny_runner(chunk: usize) -> Qwen4ExpRunner {
@@ -2815,6 +2831,35 @@ mod tests {
         }
         // With the draft head, whose cache the kept points carry too.
         exact_rounds(MtpMode::On, Some(1));
+    }
+
+    /// `LUMEN_QWEN4_KV_BF16`: the attention caches (and the indexer's keys) hold bf16, the
+    /// memory plan counts half the bytes for them, the disk records keep the dtype, and an
+    /// agent's rounds still continue exactly like their cold prompts (both computed in bf16,
+    /// past the replica's indexer budget, so the sparse path too), with and without the expert
+    /// pool and the draft head.
+    #[test]
+    fn bf16_kv_rounds_continue_exactly_like_their_cold_prompts() {
+        use crate::kv_disk::{DtypeTag, LayerKindTag};
+        let f32_bytes = f32_kv(|| tiny_runner(16).model.config().kv_bytes_per_token());
+        super::super::config::kv_bf16::with(true, || {
+            let mut r = tiny_runner(16);
+            assert_eq!(2 * r.model.config().kv_bytes_per_token(), f32_bytes);
+            Runner::prefill(&mut r, 1, &fixture_ids()[..40]).unwrap();
+            let (metas, records) = r.seqs[&1].cache.to_records().unwrap();
+            let full: Vec<&DtypeTag> = metas
+                .iter()
+                .filter(|m| m.kind == LayerKindTag::Full)
+                .flat_map(|m| m.arrays.iter().flatten().map(|&i| &records[i].dtype))
+                .collect();
+            assert!(!full.is_empty());
+            assert!(full.iter().all(|d| **d == DtypeTag::BF16), "{full:?}");
+
+            for budget in [None, Some(1u64)] {
+                exact_rounds(MtpMode::Off, budget);
+            }
+            exact_rounds(MtpMode::On, Some(1));
+        });
     }
 
     /// `LUMEN_JOINT_PREFILL`: two conversations that share a head, one round in, each extend

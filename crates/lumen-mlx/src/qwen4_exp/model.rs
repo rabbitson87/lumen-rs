@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use mlx_rs::ops::indexing::{TryIndexOp, put_along_axis, take_along_axis};
 use mlx_rs::{Array, Dtype};
 
-use super::config::{LayerKind, Qwen4ExpConfig};
+use super::config::{LayerKind, Qwen4ExpConfig, kv_bf16};
 use super::ngram::NgramHasher;
 use super::ngram_table::{DEFAULT_ROW_CACHE, FileTable, NgramTable, ResidentTable, ShardArrays};
 use crate::decode_probe::{self as probe, Stage};
@@ -2196,6 +2196,16 @@ impl Qwen4ExpModel {
 
         let q = rope(&q, rot, false, cfg.rope_theta, 1.0, offset)?;
         let k = rope(&k, rot, false, cfg.rope_theta, 1.0, offset)?;
+        // `LUMEN_QWEN4_KV_BF16`: the cache holds bf16 and attention runs in it.
+        let (q, k, v) = if kv_bf16::get() {
+            (
+                q.as_dtype(Dtype::Bfloat16)?,
+                k.as_dtype(Dtype::Bfloat16)?,
+                v.as_dtype(Dtype::Bfloat16)?,
+            )
+        } else {
+            (q, k, v)
+        };
         let (k_all, v_all) = st.kv.update_and_fetch(&k, &v)?;
 
         let scale = (hd as f32).powf(-0.5);
@@ -2236,6 +2246,13 @@ impl Qwen4ExpModel {
         let parts = mlx_rs::ops::split_sections(&qk, &[nh * hd], -1)?;
         let q = mlx_rs::ops::reshape(&parts[0], &[b, s, nh, hd])?;
         let raw_k = mlx_rs::ops::reshape(&parts[1], &[b, s, hd])?;
+        // `LUMEN_QWEN4_KV_BF16` stores the keys in bf16 too; they are pooled in f32 below.
+        let bf16 = kv_bf16::get();
+        let raw_k = if bf16 {
+            raw_k.as_dtype(Dtype::Bfloat16)?
+        } else {
+            raw_k
+        };
         let all_k = match keys.as_ref() {
             Some(prev) => mlx_rs::ops::concatenate_axis(&[prev, &raw_k], 1)?,
             None => owned(&raw_k)?,
@@ -2249,6 +2266,11 @@ impl Qwen4ExpModel {
         let n_blocks = kv_len / ratio;
         // Mean of each block of `ratio` raw keys, normalised, positioned at the block start.
         let blocks = all_k.try_index((.., ..(n_blocks * ratio), ..))?;
+        let blocks = if bf16 {
+            blocks.as_dtype(Dtype::Float32)?
+        } else {
+            blocks
+        };
         let blocks = mlx_rs::ops::reshape(&blocks, &[b, n_blocks, ratio, hd])?;
         let pooled = mlx_rs::ops::mean_axis(&blocks, 2, false)?;
         let pooled = mlx_rs::fast::rms_norm(&pooled, &w.k_layernorm, eps)?;

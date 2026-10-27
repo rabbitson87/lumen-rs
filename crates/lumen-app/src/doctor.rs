@@ -614,7 +614,7 @@ fn flash_next_ram_check(ram_bytes: u64, launch: &LaunchPlan) -> CheckResult {
         let mut detail = String::from(
             "The expert pool is what the GPU's share of RAM leaves after the 3.6 GB of resident \
              weights and a prefill's reserve: buffers, the chunk's activations, the KV cache of \
-             the longest prompt (60 KB per token) and attention scores. A longer prompt cap \
+             the longest prompt (30 KB per token) and attention scores. A longer prompt cap \
              shrinks it; a bigger pool means fewer SSD reads per token.",
         );
         if plan.pool < flash_next::POOL_PREFETCH_BYTES {
@@ -641,7 +641,7 @@ fn flash_next_ram_check(ram_bytes: u64, launch: &LaunchPlan) -> CheckResult {
     if longest > 0 {
         return CheckResult {
             fix_hint: Some(
-                "The KV cache of the longest prompt (60 KB per token) comes out of the GPU's \
+                "The KV cache of the longest prompt (30 KB per token) comes out of the GPU's \
                  share of RAM. The app sends LUMEN_MAX_PROMPT_TOKENS (16,384 tokens, 8,192 on a \
                  tight Mac) unless you set it, lowered to Max context. Lower it (the Flash-Next \
                  memory calculator's Apply writes it) or the prefill chunk, or raise the memory \
@@ -1110,14 +1110,14 @@ mod flash_next_tests {
     fn a_16_gb_mac_is_told_its_pool_and_an_8_gb_one_what_it_needs() {
         let ok = flash_next_ram_check(16 * GIB, &default_launch());
         assert_eq!(ok.status, CheckStatus::Pass);
-        // 16 GB is a tight machine: 8K prompts, 512-token chunks, a ~4.6 GB pool.
-        assert_eq!(ok.message, "16 GB RAM: expert pool ~4.6 GB at 8192 tokens");
-        // 4.6 GB is above the 4.2 GB a second staging region needs.
+        // 16 GB is a tight machine: 8K prompts, 512-token chunks, a ~4.9 GB pool.
+        assert_eq!(ok.message, "16 GB RAM: expert pool ~4.9 GB at 8192 tokens");
+        // 4.9 GB is above the 4.2 GB a second staging region needs.
         assert!(!ok.detail.unwrap().contains("one staging region only"));
 
         let short = flash_next_ram_check(8 * GIB, &default_launch());
         assert_eq!(short.status, CheckStatus::Warn);
-        assert_eq!(short.message, "8 GB RAM, Flash-Next needs ~14 GB");
+        assert_eq!(short.message, "8 GB RAM, Flash-Next needs ~13 GB");
         assert!(short.fix_hint.is_some());
     }
 
@@ -1141,7 +1141,7 @@ mod flash_next_tests {
 
     #[test]
     fn a_long_prompt_cap_can_leave_no_room_for_the_pool() {
-        // With LUMEN_MAX_PROMPT_TOKENS at 81,920 the KV for it alone is 4.9 GB, so a 16 GB
+        // With LUMEN_MAX_PROMPT_TOKENS at 81,920 the KV for it alone is 2.5 GB, so a 16 GB
         // Mac no longer fits, though a shorter prompt would.
         let launch = LaunchPlan {
             ctx_tokens: Some(81_920),
@@ -1151,7 +1151,7 @@ mod flash_next_tests {
         assert_eq!(c.status, CheckStatus::Warn);
         assert_eq!(
             c.message,
-            "16 GB RAM: a 81920-token context does not fit, up to 34879 do"
+            "16 GB RAM: a 81920-token context does not fit, up to 69758 do"
         );
         let hint = c.fix_hint.unwrap();
         assert!(hint.contains("LUMEN_MAX_PROMPT_TOKENS"));
@@ -1160,7 +1160,7 @@ mod flash_next_tests {
         let big = flash_next_ram_check(36 * GIB, &launch);
         assert_eq!(
             big.message,
-            "36 GB RAM: expert pool ~14.3 GB at 81920 tokens"
+            "36 GB RAM: expert pool ~16.7 GB at 81920 tokens"
         );
     }
 
@@ -1177,15 +1177,15 @@ mod flash_next_tests {
         let ram = 16 * GIB;
         let c = flash_next_ram_check(ram, &flash_next::launch_plan(&cfg, ram));
         assert_eq!(c.status, CheckStatus::Pass);
-        assert_eq!(c.message, "16 GB RAM: expert pool ~4.6 GB at 8192 tokens");
-        // A user-set prompt cap wins, and this Mac cannot hold 40,960 tokens.
+        assert_eq!(c.message, "16 GB RAM: expert pool ~4.9 GB at 8192 tokens");
+        // A user-set prompt cap wins, and this Mac cannot hold 81,920 tokens.
         cfg.env_overrides
-            .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "40960".into());
+            .insert("LUMEN_MAX_PROMPT_TOKENS".into(), "81920".into());
         let big = flash_next_ram_check(ram, &flash_next::launch_plan(&cfg, ram));
         assert_eq!(big.status, CheckStatus::Warn);
         assert_eq!(
             big.message,
-            "16 GB RAM: a 40960-token context does not fit, up to 34879 do"
+            "16 GB RAM: a 81920-token context does not fit, up to 69758 do"
         );
         assert!(
             big.fix_hint
