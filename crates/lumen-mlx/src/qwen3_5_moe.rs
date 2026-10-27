@@ -2748,6 +2748,11 @@ mod imp {
             let vision = self.vision.as_ref().ok_or_else(|| {
                 anyhow!("image input requires LUMEN_VISION=1 and a vision-capable checkpoint")
             })?;
+            // CLIP's constants, not the 0.5 / 0.5 of the checkpoint's `preprocessor_config.json`:
+            // on the mlx-community mxfp4 build, 24 generated images of a word or code read back
+            // exactly 13 times with CLIP and 0 times with 0.5 / 0.5, and mlx_vlm (which applies the
+            // config) reads 0 of the same 24 with the same wrong answers as this path gives at
+            // 0.5 / 0.5. Do not switch without repeating that reading test.
             crate::qwen36_vision::prepare_image(encoded, vision.config())
                 .map_err(|e| anyhow!("image preprocessing failed: {e}"))
         }

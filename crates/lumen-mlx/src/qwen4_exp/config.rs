@@ -218,23 +218,7 @@ impl Qwen4ExpConfig {
         let json: Value =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         let mut cfg = Self::from_json(&json)?;
-        if let Ok(text) = std::fs::read_to_string(model_dir.join("preprocessor_config.json"))
-            && let Ok(pre) = serde_json::from_str::<Value>(&text)
-        {
-            let three = |k: &str| -> Option<[f32; 3]> {
-                let v: Vec<f32> = pre
-                    .get(k)?
-                    .as_array()?
-                    .iter()
-                    .filter_map(Value::as_f64)
-                    .map(|x| x as f32)
-                    .collect();
-                <[f32; 3]>::try_from(v).ok()
-            };
-            if let (Some(mean), Some(std)) = (three("image_mean"), three("image_std")) {
-                cfg.image_norm = crate::qwen36_vision::ImageNorm { mean, std };
-            }
-        }
+        cfg.image_norm = crate::qwen36_vision::ImageNorm::of_checkpoint(model_dir);
         // The chat model stops on `<|im_end|>`, which only the generation config and the
         // tokenizer name; the text config lists just `<|endoftext|>`.
         let mut more = Vec::new();

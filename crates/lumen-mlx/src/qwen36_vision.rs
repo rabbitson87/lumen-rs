@@ -650,11 +650,44 @@ pub struct ImageNorm {
 }
 
 impl ImageNorm {
-    /// OpenAI CLIP's constants, `Qwen2VLImageProcessor`'s default and what the Qwen 3.6 path uses.
+    /// OpenAI CLIP's constants, `Qwen2VLImageProcessor`'s default: what the Qwen 3.6 path uses
+    /// (see `prepare_image` in `qwen3_5_moe`) and what a checkpoint without a
+    /// `preprocessor_config.json` gets.
     pub const CLIP: Self = Self {
         mean: IMAGE_MEAN,
         std: IMAGE_STD,
     };
+
+    /// `image_mean` / `image_std` of a `preprocessor_config.json`; `None` unless both are there
+    /// with three numbers each.
+    pub fn from_preprocessor_json(text: &str) -> Option<Self> {
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        let three = |key: &str| -> Option<[f32; 3]> {
+            let v: Vec<f32> = json
+                .get(key)?
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_f64)
+                .map(|x| x as f32)
+                .collect();
+            <[f32; 3]>::try_from(v).ok()
+        };
+        Some(Self {
+            mean: three("image_mean")?,
+            std: three("image_std")?,
+        })
+    }
+
+    /// How the checkpoint in `model_dir` says its pixels are normalized: its
+    /// `preprocessor_config.json` (0.5 / 0.5 for Flash-Next, which reads images correctly with it),
+    /// else CLIP's. Qwen 3.6's file says 0.5 / 0.5 too, but that path keeps CLIP: it reads text far
+    /// better with it.
+    pub fn of_checkpoint(model_dir: &std::path::Path) -> Self {
+        std::fs::read_to_string(model_dir.join("preprocessor_config.json"))
+            .ok()
+            .and_then(|text| Self::from_preprocessor_json(&text))
+            .unwrap_or(Self::CLIP)
+    }
 }
 
 /// Round `value` to the nearest multiple of `factor`.
@@ -1492,5 +1525,57 @@ mod patch_embed_layout_tests {
         assert_ne!(mlx_layout, torch_layout);
         assert_eq!(*mlx_layout.last().unwrap(), 3, "MLX: channels last");
         assert_eq!(torch_layout[1], 3, "torch: channels at index 1");
+    }
+}
+
+#[cfg(test)]
+mod norm_tests {
+    use super::{ImageNorm, patchify_with};
+
+    const HALF: &str =
+        r#"{"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5], "patch_size": 16}"#;
+
+    #[test]
+    fn a_preprocessor_config_gives_its_mean_and_std() {
+        assert_eq!(
+            ImageNorm::from_preprocessor_json(HALF),
+            Some(ImageNorm {
+                mean: [0.5; 3],
+                std: [0.5; 3]
+            })
+        );
+        // Both lists, three numbers each, or nothing: a partial file does not mix with CLIP's.
+        assert_eq!(
+            ImageNorm::from_preprocessor_json(r#"{"image_mean": [0.5, 0.5, 0.5]}"#),
+            None
+        );
+        assert_eq!(
+            ImageNorm::from_preprocessor_json(r#"{"image_mean": [0.5], "image_std": [0.5]}"#),
+            None
+        );
+        assert_eq!(ImageNorm::from_preprocessor_json("not json"), None);
+    }
+
+    #[test]
+    fn a_checkpoint_dir_without_the_file_falls_back_to_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(ImageNorm::of_checkpoint(dir.path()), ImageNorm::CLIP);
+        std::fs::write(dir.path().join("preprocessor_config.json"), HALF).unwrap();
+        assert_ne!(ImageNorm::of_checkpoint(dir.path()), ImageNorm::CLIP);
+        assert_eq!(ImageNorm::of_checkpoint(dir.path()).std, [0.5; 3]);
+    }
+
+    /// White is +1.0 and black -1.0 under 0.5 / 0.5; CLIP's constants put them near +2.0 and -1.7.
+    #[test]
+    fn the_norm_decides_what_the_tower_sees() {
+        let norm = ImageNorm {
+            mean: [0.5; 3],
+            std: [0.5; 3],
+        };
+        let px = |rgb: u8, n: ImageNorm| patchify_with(&[rgb; 2 * 2 * 3], 2, 2, 2, 1, 1, n)[0];
+        assert!((px(255, norm) - 1.0).abs() < 1e-6);
+        assert!((px(0, norm) + 1.0).abs() < 1e-6);
+        assert!(px(255, ImageNorm::CLIP) > 1.9);
+        assert!(px(0, ImageNorm::CLIP) < -1.7);
     }
 }
