@@ -1367,13 +1367,19 @@ mod imp {
             // `vision_tower.*` / `model.visual.*` entry on the next line.
             let vision = if vision_enabled() {
                 match config.vision_config.clone() {
-                    Some(vcfg) if weights.get("vision_tower.pos_embed.weight").is_some() => Some(
-                        crate::qwen36_vision::NativeQwen36VisionTower::load(
+                    Some(vcfg) if weights.get("vision_tower.pos_embed.weight").is_some() => {
+                        let tower = crate::qwen36_vision::NativeQwen36VisionTower::load(
                             weights.tensors(),
                             vcfg,
                         )
-                        .context("load Qwen 3.6 vision tower")?,
-                    ),
+                        .context("load Qwen 3.6 vision tower")?;
+                        // Read on the loading thread, as the trunk is: a lazy weight carries the
+                        // loader's CPU stream, which the thread that serves a request does not have
+                        // ("There is no Stream(cpu, 0) in current thread" on the first image).
+                        mlx_rs::transforms::eval(tower.weights())
+                            .context("read the Qwen 3.6 vision tower")?;
+                        Some(tower)
+                    }
                     Some(_) => {
                         eprintln!(
                             "[vision] LUMEN_VISION=1 but {} ships no vision_tower.* weights \
