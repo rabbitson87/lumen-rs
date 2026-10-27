@@ -342,6 +342,8 @@ struct MemoryPlan {
     scores_budget: u64,
     /// Memory a prefill needs beyond the trunk and the expert pool.
     reserve: u64,
+    /// The resident weights: [`TRUNK_BYTES`], and the image tower under `LUMEN_VISION`.
+    trunk: u64,
     /// What is left for the expert pool.
     pool: u64,
 }
@@ -378,12 +380,19 @@ fn plan_memory(
     let scores =
         (cfg.num_attention_heads as u64 * chunk as u64 * ctx_tokens as u64 * 4).min(scores_budget);
     let reserve = prefill_reserve(chunk, ctx_tokens, cfg.kv_bytes_per_token(), scores);
+    let trunk = TRUNK_BYTES
+        + if crate::vision_splice::tower::vision_enabled() {
+            cfg.vision_tower_bytes()
+        } else {
+            0
+        };
     MemoryPlan {
         chunk,
         ctx_tokens,
         scores_budget,
         reserve,
-        pool: usable.saturating_sub(TRUNK_BYTES + reserve),
+        trunk,
+        pool: usable.saturating_sub(trunk + reserve),
     }
 }
 
@@ -576,7 +585,7 @@ fn choose_pool(
     floor: u64,
 ) -> PoolChoice {
     let within = free.map_or(device, |f| f.min(device));
-    let fits = within.saturating_sub(TRUNK_BYTES + plan.reserve);
+    let fits = within.saturating_sub(plan.trunk + plan.reserve);
     let (wanted, lowered_from) = match requested {
         Some(r) if r > fits + POOL_OVERSHOOT_OK => (fits, Some(r)),
         Some(r) => (r, None),
@@ -587,7 +596,7 @@ fn choose_pool(
     // A pool at its floor holds more than `within` leaves: the plan is for what it holds, up to
     // the device (where a tight Mac's plan stays, as before).
     let usable = if at_floor {
-        within.max((TRUNK_BYTES + pool + plan.reserve).min(device))
+        within.max((plan.trunk + pool + plan.reserve).min(device))
     } else {
         within
     };
@@ -685,7 +694,7 @@ fn plan_line(device: u64, choice: &PoolChoice, plan: &MemoryPlan, use_head: bool
              prompt (chunk {}) {:.1} of the {:.1} GB {}, and a smaller LUMEN_MAX_PROMPT_TOKENS \
              leaves more for the pool",
             gb(asked),
-            gb(TRUNK_BYTES),
+            gb(plan.trunk),
             plan.ctx_tokens,
             plan.chunk,
             gb(plan.reserve),
@@ -1209,6 +1218,93 @@ impl Qwen4ExpRunner {
 }
 
 impl Qwen4ExpRunner {
+    /// Decode and resize one image onto the tower's patch grid.
+    pub(crate) fn prepare_image(
+        &self,
+        encoded: &[u8],
+    ) -> Result<crate::qwen36_vision::PreparedImage> {
+        let tower = self.model.vision().ok_or_else(|| {
+            anyhow!("image input requires LUMEN_VISION=1 and a checkpoint with a vision tower")
+        })?;
+        crate::qwen36_vision::prepare_image_with(
+            encoded,
+            tower.config(),
+            self.model.config().image_norm,
+        )
+        .map_err(|e| anyhow!(e))
+    }
+
+    /// The id whose rows an image's features replace, when the tower is loaded.
+    pub(crate) fn image_token_id(&self) -> Option<u32> {
+        self.model.vision().and(self.model.config().image_token_id)
+    }
+
+    /// The loaded tower's config, for sizing a prompt's images without decoding them.
+    pub(crate) fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+        self.model.vision().map(|t| t.config().clone())
+    }
+
+    /// Start `seq_id` with an image prompt: `tokens` holds each image's placeholder run, `images`
+    /// the images in prompt order. The sequence takes 3-D rotary positions (decode then runs at
+    /// index + delta), its own fresh state (no prefix cache, session or disk tier: they are keyed
+    /// on text), and decodes without a draft head or speculation. Without images it is a plain
+    /// prefill.
+    pub(crate) fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        if images.is_empty() {
+            return Runner::prefill(self, seq_id, tokens);
+        }
+        if self.seqs.contains_key(&seq_id) {
+            bail!("qwen4_exp: seq {seq_id} already exists");
+        }
+        self.mem_begin();
+        self.check_context(0, tokens.len())?;
+        let merge = self
+            .model
+            .vision()
+            .ok_or_else(|| anyhow!("image input requires LUMEN_VISION=1 and a vision tower"))?
+            .config()
+            .spatial_merge_size;
+        let image_token = self
+            .model
+            .config()
+            .image_token_id
+            .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+        let grids: Vec<(usize, usize)> = images.iter().map(|p| p.merged_grid(merge)).collect();
+        let positions = crate::qwen36_vision::mrope_positions(tokens, image_token, &grids)
+            .map_err(|e| anyhow!("qwen4_exp: image positions: {e}"))?;
+        let delta = crate::qwen36_vision::next_position(&positions) - tokens.len() as i32;
+        let (runs, soft) = self.model.encode_images(tokens, images)?;
+        let mut cache = self.model.make_cache();
+        let logits = self.model.forward_image_prompt(
+            tokens, &mut cache, self.chunk, &positions, delta, &runs, &soft,
+        )?;
+        let next = Self::argmax(&logits)?;
+        self.seqs.insert(
+            seq_id,
+            Seq {
+                cache,
+                position: tokens.len(),
+                rollback: None,
+                persisted_key: None,
+                forked_from: None,
+                pending: None,
+                recent: Default::default(),
+                spec_off: true,
+            },
+        );
+        self.feed_report(&format!(
+            "prefilled an image prompt of {} tokens ({} image(s)) for seq {seq_id}",
+            tokens.len(),
+            images.len()
+        ));
+        Ok((next, tokens.len()))
+    }
+
     /// Write `seq_id`'s rollback point (the state after `prefix`, placed on a prefill grid of
     /// `chunk`) to the disk tier. Returns whether anything was written.
     pub(crate) fn persist_point(
@@ -1796,6 +1892,15 @@ impl crate::prefix_cache::SnapshotRunner for Qwen4ExpRunner {
 impl Runner for Qwen4ExpRunner {
     fn name(&self) -> &'static str {
         "qwen4_exp"
+    }
+
+    fn prefill_with_images(
+        &mut self,
+        seq_id: u64,
+        tokens: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(u32, usize)> {
+        Qwen4ExpRunner::prefill_with_images(self, seq_id, tokens, images)
     }
 
     fn prefill(&mut self, seq_id: u64, tokens: &[u32]) -> Result<(u32, usize)> {

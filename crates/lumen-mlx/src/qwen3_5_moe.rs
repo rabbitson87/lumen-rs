@@ -1270,15 +1270,7 @@ mod imp {
         vision: Option<crate::qwen36_vision::NativeQwen36VisionTower>,
     }
 
-    /// Opt-in gate for loading the ~0.9 GB image tower.
-    fn vision_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("LUMEN_VISION")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false)
-        })
-    }
+    use crate::vision_splice::tower::vision_enabled;
 
     /// Post-projection / post-RoPE intermediates shared by the plain and
     /// TurboQuant full-attention cores (`full_attn_qkv_rope` output).
@@ -2854,47 +2846,14 @@ mod imp {
             runs: &[(usize, usize)],
             soft: &[Array],
         ) -> Result<Array> {
-            let hidden = self.text_config().hidden_size as i32;
-            let dt = h.dtype();
-            let slices = crate::vision_splice::clip_runs_to_window(span_start, l, runs)?;
-            if slices.is_empty() {
-                return Ok(h.clone());
-            }
-
-            let take_span = |x: &Array, start: i32, end: i32| -> Result<Array> {
-                let idx: Vec<i32> = (start..end).collect();
-                let idx = Array::from_slice(&idx, &[idx.len() as i32]);
-                mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("splice: take_axis(axis=1)")
-            };
-
-            let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
-            let mut cursor = 0i32;
-            for s in &slices {
-                if s.local_start > cursor {
-                    segments.push(
-                        take_span(h, cursor, s.local_start)
-                            .context("splice: text span before image")?,
-                    );
-                }
-                let block = soft
-                    .get(s.image)
-                    .ok_or_else(|| anyhow!("splice: no features for image {}", s.image))?;
-                let run_len = runs[s.image].1 as i32;
-                let block = mlx_rs::ops::reshape(block, &[1, run_len, hidden])
-                    .context("splice: reshape image features")?;
-                let block = take_span(&block, s.row_start, s.row_end)
-                    .context("splice: clip image features to window")?;
-                segments.push(block.as_dtype(dt).context("splice: cast image features")?);
-                cursor = s.local_end;
-            }
-            if cursor < l {
-                segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
-            }
-            let refs: Vec<&Array> = segments.iter().collect();
-            let out =
-                mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
-            debug_assert_eq!(out.shape(), [1, l, hidden]);
-            Ok(out)
+            crate::vision_splice::tower::splice_soft_rows(
+                h,
+                span_start,
+                l,
+                runs,
+                soft,
+                self.text_config().hidden_size as i32,
+            )
         }
 
         /// Inner forward implementation, parameterized by both `last_only`

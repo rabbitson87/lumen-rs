@@ -178,6 +178,18 @@ pub struct Qwen4ExpConfig {
     /// layer multiplies by `1 + w`); the port multiplies by `w`, so these builds get
     /// `+ 1` at load. Decided from the weights, not the config: see the loader.
     pub norms_centered: bool,
+
+    /// `(sections, interleaved)` of the 3-D rotary positions an image prompt takes
+    /// (`rope_parameters.mrope_section` / `mrope_interleaved`); `None` when the config has no
+    /// usable list (three entries summing to `rotary_dim / 2`). Text prompts never use it.
+    pub mrope: Option<([usize; 3], bool)>,
+    /// The `<|image_pad|>` id an image's soft tokens replace.
+    pub image_token_id: Option<u32>,
+    /// The vision tower's `vision_config`, for a checkpoint that ships one.
+    pub vision: Option<crate::qwen35_config::NativeQwen36VisionConfig>,
+    /// How an image's pixels are normalized: `preprocessor_config.json`'s `image_mean` /
+    /// `image_std` (0.5 / 0.5 for Flash-Next), CLIP's when it gives none.
+    pub image_norm: crate::qwen36_vision::ImageNorm,
 }
 
 /// Append the ids in `v` (a number or a list of numbers) that are not there yet.
@@ -206,6 +218,23 @@ impl Qwen4ExpConfig {
         let json: Value =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         let mut cfg = Self::from_json(&json)?;
+        if let Ok(text) = std::fs::read_to_string(model_dir.join("preprocessor_config.json"))
+            && let Ok(pre) = serde_json::from_str::<Value>(&text)
+        {
+            let three = |k: &str| -> Option<[f32; 3]> {
+                let v: Vec<f32> = pre
+                    .get(k)?
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_f64)
+                    .map(|x| x as f32)
+                    .collect();
+                <[f32; 3]>::try_from(v).ok()
+            };
+            if let (Some(mean), Some(std)) = (three("image_mean"), three("image_std")) {
+                cfg.image_norm = crate::qwen36_vision::ImageNorm { mean, std };
+            }
+        }
         // The chat model stops on `<|im_end|>`, which only the generation config and the
         // tokenizer name; the text config lists just `<|endoftext|>`.
         let mut more = Vec::new();
@@ -309,7 +338,7 @@ impl Qwen4ExpConfig {
                 .ok_or_else(|| anyhow!("config.json has no `quantization` block (float checkpoints are not supported)"))?,
         )?;
 
-        let cfg = Self {
+        let mut cfg = Self {
             hidden_size: usize_of("hidden_size")?,
             num_hidden_layers,
             num_attention_heads: usize_of("num_attention_heads")?,
@@ -365,7 +394,34 @@ impl Qwen4ExpConfig {
                 .unwrap_or(false),
             quant,
             norms_centered: false,
+            mrope: None,
+            image_norm: crate::qwen36_vision::ImageNorm::CLIP,
+            image_token_id: root
+                .get("image_token_id")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+            vision: match root.get("vision_config") {
+                Some(v) if !v.is_null() => {
+                    Some(serde_json::from_value(v.clone()).context("config.json: vision_config")?)
+                }
+                _ => None,
+            },
         };
+        cfg.mrope = rope.and_then(|r| {
+            let s: Vec<usize> = r
+                .get("mrope_section")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|n| n as usize)
+                .collect();
+            let interleaved = r
+                .get("mrope_interleaved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (s.len() == 3 && s.iter().sum::<usize>() == cfg.rotary_dim() / 2)
+                .then(|| ([s[0], s[1], s[2]], interleaved))
+        });
         cfg.validate()?;
         Ok(cfg)
     }
@@ -452,6 +508,27 @@ impl Qwen4ExpConfig {
         3 * (weights * q.bits.max(0) as u64 / 8 + groups * 2 * 2)
     }
 
+    /// Bytes of the image tower in bf16 (patch embedding, position grid, blocks, merger), for
+    /// the memory plan under `LUMEN_VISION`; 0 for a checkpoint without one.
+    pub fn vision_tower_bytes(&self) -> u64 {
+        let Some(v) = &self.vision else {
+            return 0;
+        };
+        let (h, i) = (v.hidden_size as u64, v.intermediate_size as u64);
+        let patch = v.in_channels * v.temporal_patch_size * v.patch_size * v.patch_size;
+        let merged = h * v.merge_unit() as u64;
+        let block = 4 * h + (3 * h * h + 3 * h) + (h * h + h) + (i * h + i) + (h * i + h);
+        let params = h * patch as u64
+            + h
+            + v.num_position_embeddings as u64 * h
+            + v.depth as u64 * block
+            + 2 * h
+            + (merged * merged + merged)
+            + (v.out_hidden_size as u64 * merged + v.out_hidden_size as u64);
+        2 * params
+    }
+
+    /// Rotated dimensions of each head (`head_dim * partial_rotary_factor`).
     pub fn rotary_dim(&self) -> usize {
         (self.head_dim as f32 * self.partial_rotary_factor) as usize
     }

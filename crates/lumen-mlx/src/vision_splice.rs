@@ -97,6 +97,70 @@ pub(crate) mod tower {
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
+    /// Opt-in gate for loading an image tower (`LUMEN_VISION`, ~0.9 GB): without it a checkpoint's
+    /// `vision_tower.*` weights are dropped and the text path is unchanged, memory included.
+    pub(crate) fn vision_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("LUMEN_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Replace the embedding rows `[1, l, hidden]` covered by each image's placeholder run with
+    /// that image's features (`soft[i]`, `[run_len_i, hidden]`), for the prompt window
+    /// `[span_start, span_start + l)`; runs are prompt-global (see [`super::clip_runs_to_window`]).
+    pub(crate) fn splice_soft_rows(
+        h: &Array,
+        span_start: i32,
+        l: i32,
+        runs: &[(usize, usize)],
+        soft: &[Array],
+        hidden: i32,
+    ) -> Result<Array> {
+        let dt = h.dtype();
+        let slices = super::clip_runs_to_window(span_start, l, runs)?;
+        if slices.is_empty() {
+            return Ok(h.clone());
+        }
+
+        let take_span = |x: &Array, start: i32, end: i32| -> Result<Array> {
+            let idx: Vec<i32> = (start..end).collect();
+            let idx = Array::from_slice(&idx, &[idx.len() as i32]);
+            mlx_rs::ops::indexing::take_axis(x, &idx, 1).context("splice: take_axis(axis=1)")
+        };
+
+        let mut segments: Vec<Array> = Vec::with_capacity(slices.len() * 2 + 1);
+        let mut cursor = 0i32;
+        for s in &slices {
+            if s.local_start > cursor {
+                segments.push(
+                    take_span(h, cursor, s.local_start)
+                        .context("splice: text span before image")?,
+                );
+            }
+            let block = soft
+                .get(s.image)
+                .ok_or_else(|| anyhow!("splice: no features for image {}", s.image))?;
+            let run_len = runs[s.image].1 as i32;
+            let block = mlx_rs::ops::reshape(block, &[1, run_len, hidden])
+                .context("splice: reshape image features")?;
+            let block = take_span(&block, s.row_start, s.row_end)
+                .context("splice: clip image features to window")?;
+            segments.push(block.as_dtype(dt).context("splice: cast image features")?);
+            cursor = s.local_end;
+        }
+        if cursor < l {
+            segments.push(take_span(h, cursor, l).context("splice: trailing text span")?);
+        }
+        let refs: Vec<&Array> = segments.iter().collect();
+        let out =
+            mlx_rs::ops::concatenate_axis(&refs, 1).context("splice: concatenate segments")?;
+        debug_assert_eq!(out.shape(), [1, l, hidden]);
+        Ok(out)
+    }
+
     /// Run a tower in float32 instead of the checkpoint's bf16. Used by the
     /// golden-tensor parity tests, which compare against float32 PyTorch
     /// references; production leaves this off.
@@ -261,5 +325,47 @@ mod window_tests {
     fn unsorted_runs_are_rejected() {
         let runs = [(50usize, 10usize), (10, 10)];
         assert!(clip_runs_to_window(0, 100, &runs).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "mlx-native"))]
+mod splice_tests {
+    use super::tower::splice_soft_rows;
+    use mlx_rs::Array;
+
+    fn rows(a: &Array) -> Vec<f32> {
+        a.eval().unwrap();
+        a.try_as_slice::<f32>().unwrap().to_vec()
+    }
+
+    /// Each image's rows land on its placeholder run, clipped to the window a chunk covers; the
+    /// text rows around them are the window's own.
+    #[test]
+    fn image_rows_replace_their_placeholders_within_the_window() {
+        // A 6-token window starting at prompt position 4, hidden 2: rows 40, 41, ...
+        let h = Array::from_slice(
+            &(0..12).map(|i| 40.0 + i as f32).collect::<Vec<f32>>(),
+            &[1, 6, 2],
+        );
+        // Image 0 covers prompt positions 2..6 (its last two rows fall in the window), image 1
+        // covers 8..9.
+        let runs = [(2usize, 4usize), (8, 1)];
+        let soft = [
+            Array::from_slice(
+                &(0..8).map(|i| 100.0 + i as f32).collect::<Vec<f32>>(),
+                &[4, 2],
+            ),
+            Array::from_slice(&[200.0f32, 201.0], &[1, 2]),
+        ];
+        let out = splice_soft_rows(&h, 4, 6, &runs, &soft, 2).unwrap();
+        assert_eq!(
+            rows(&out),
+            [
+                104.0, 105.0, 106.0, 107.0, 44.0, 45.0, 46.0, 47.0, 200.0, 201.0, 50.0, 51.0
+            ]
+        );
+        // A window with no run is returned as it is.
+        let out = splice_soft_rows(&h, 20, 6, &runs, &soft, 2).unwrap();
+        assert_eq!(rows(&out), rows(&h));
     }
 }

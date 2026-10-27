@@ -315,7 +315,7 @@ impl Qwen4ExpModel {
         let h = self.mtp_fuse(head, embedded, multi)?;
         let (x, inject) = self.hyper_mix(&head.layer.attn_hc, &h)?;
         let inject = inject.ok_or_else(|| anyhow!("mtp: attn hyper-connection has no inject"))?;
-        let x = self.qsa_forward(qsa, &x, st)?;
+        let x = self.qsa_forward(qsa, &x, st, super::RopeAt::Index)?;
         let h = self.write_back(&h, &x, &inject)?;
         let (x, inject) = self.hyper_mix(&head.layer.mlp_hc, &h)?;
         let inject = inject.ok_or_else(|| anyhow!("mtp: mlp hyper-connection has no inject"))?;
@@ -344,7 +344,7 @@ impl Qwen4ExpModel {
         };
         let h = self.mtp_fuse(head, embedded, multi)?;
         let (x, _) = self.hyper_mix(&head.layer.attn_hc, &h)?;
-        let x = self.qsa_forward(qsa, &x, st)?;
+        let x = self.qsa_forward(qsa, &x, st, super::RopeAt::Index)?;
         // Nothing reads the attention output, but its cache writes must be real: settle them
         // now so a lazy graph over a whole prompt chunk does not outlive the chunk.
         let mut pending = LayerStateRef::qsa(st);

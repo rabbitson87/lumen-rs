@@ -3161,15 +3161,7 @@ pub(crate) mod imp {
         vision: Option<crate::gemma4_vision::NativeGemma4VisionTower>,
     }
 
-    /// Opt-in gate for loading the ~1.1 GB image tower.
-    fn vision_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("LUMEN_VISION")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false)
-        })
-    }
+    use crate::vision_splice::tower::vision_enabled;
 
     impl NativeGemma4Model {
         /// Load a Gemma 4 model from `model_dir` containing `config.json` and

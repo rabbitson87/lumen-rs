@@ -1071,3 +1071,147 @@ fn speculative_rounds_against_plain_steps_per_token() {
             .unwrap_or("")
     );
 }
+
+// ---- image prompts: 3-D rotary positions -----------------------------------------------------
+
+/// A copy of the replica whose config declares 3-D rotary sections (its rotary dim is 8, so
+/// `[2, 1, 1]`, interleaved as Flash-Next's) and an image token. It has no tower, so these tests
+/// feed text through the image path and check its position handling.
+fn mrope_replica() -> (tempfile::TempDir, Qwen4ExpModel) {
+    let src = fixture_dir();
+    let dir = tempfile::tempdir().expect("temp dir");
+    for name in ["model.safetensors", "mtp.json", "mtp.safetensors"] {
+        std::fs::copy(src.join(name), dir.path().join(name)).expect("copy the replica");
+    }
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(src.join("config.json")).unwrap()).unwrap();
+    let rope = &mut cfg["text_config"]["rope_parameters"];
+    rope["mrope_section"] = serde_json::json!([2, 1, 1]);
+    rope["mrope_interleaved"] = serde_json::json!(true);
+    cfg["image_token_id"] = serde_json::json!(77);
+    std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+    let model = Qwen4ExpModel::load(dir.path(), None).expect("load the replica copy");
+    assert!(model.config().mrope.is_some(), "the sections are usable");
+    (dir, model)
+}
+
+/// The prompt's logits and five greedy steps after it, fed through the image path at
+/// `positions` with `delta` (no images), or through the text path when `positions` is `None`.
+fn prompt_then_steps(
+    model: &Qwen4ExpModel,
+    ids: &[u32],
+    positions: Option<(&[[i32; 3]], i32)>,
+) -> (Vec<f32>, Vec<u32>) {
+    let mut cache = model.make_cache();
+    let cuts: Vec<usize> = (1..)
+        .map(|k| k * 16)
+        .take_while(|&c| c < ids.len())
+        .chain([ids.len()])
+        .collect();
+    let logits = match positions {
+        Some((pos, delta)) => model
+            .forward_image_prompt(ids, &mut cache, 16, pos, delta, &[], &[])
+            .expect("image path"),
+        None => {
+            model
+                .forward_pieces(ids, &mut cache, &cuts, None)
+                .expect("text path")
+                .0
+        }
+    };
+    let argmax = |a: &Array| -> u32 {
+        let v = host_f32(a);
+        (0..v.len()).max_by(|&x, &y| v[x].total_cmp(&v[y])).unwrap() as u32
+    };
+    let first = host_f32(&logits);
+    let mut steps = vec![argmax(&logits)];
+    for _ in 0..4 {
+        let l = model
+            .forward(&[*steps.last().unwrap()], &mut cache, true)
+            .expect("decode");
+        steps.push(argmax(&l));
+    }
+    if positions.is_some() {
+        assert!(
+            cache.to_records().is_err(),
+            "an image sequence is not persisted"
+        );
+    }
+    (first, steps)
+}
+
+/// Text fed through the image path at its own index (`[i, i, i]`, delta 0), or shifted by a
+/// constant (RoPE sees only relative positions), predicts what the text path does: the prompt's
+/// logits to rounding (the 3-D rotation is computed unfused), the same greedy steps after it
+/// (decode continues at index + delta), past the indexer's budget so the sparse path and its
+/// pooled block positions run too. Positions laid out as an image's grid do change them.
+#[test]
+fn text_through_the_image_path_matches_the_text_path() {
+    // In f32 (`LUMEN_QWEN4_KV_BF16=0`): the check is the positions', at f32 tolerances.
+    f32_kv(text_through_the_image_path);
+}
+
+fn text_through_the_image_path() {
+    let (_dir, model) = mrope_replica();
+    let ids = fixture_ids(&fixture_dir());
+    assert!(ids.len() > 2 * 16, "past the replica's indexer budget");
+    let vocab = model.config().vocab_size;
+    let (want, want_steps) = prompt_then_steps(&model, &ids, None);
+    for delta in [0i32, 7] {
+        let pos: Vec<[i32; 3]> = (0..ids.len() as i32)
+            .map(|i| [i + delta, i + delta, i + delta])
+            .collect();
+        let (got, steps) = prompt_then_steps(&model, &ids, Some((&pos, delta)));
+        let (max_abs, min_cos) = compare(&got, &want, vocab);
+        assert!(
+            min_cos > 0.9999 && max_abs < 2e-3,
+            "delta {delta}: {max_abs:e} / {min_cos}"
+        );
+        assert_eq!(steps, want_steps, "delta {delta}");
+    }
+    // Six tokens laid out as a 2 x 3 image after the first ten, as `mrope_positions` would.
+    let mut pos: Vec<[i32; 3]> = Vec::new();
+    for i in 0..10 {
+        pos.push([i, i, i]);
+    }
+    for k in 0..6 {
+        pos.push([10, 10 + k / 3, 10 + k % 3]);
+    }
+    let next = 13;
+    for i in 0..(ids.len() as i32 - 16) {
+        pos.push([next + i, next + i, next + i]);
+    }
+    let delta = next - 16;
+    let (got, _) = prompt_then_steps(&model, &ids, Some((&pos, delta)));
+    let (max_abs, _) = compare(&got, &want, vocab);
+    assert!(
+        max_abs > 1e-3,
+        "image positions changed nothing ({max_abs:e})"
+    );
+}
+
+/// An image's pixels are normalized as the checkpoint's `preprocessor_config.json` says (Flash-Next:
+/// 0.5 / 0.5), with CLIP's constants only when it says nothing.
+#[test]
+fn image_normalization_comes_from_the_preprocessor_config() {
+    use crate::qwen36_vision::ImageNorm;
+    let (dir, model) = mrope_replica();
+    assert_eq!(
+        model.config().image_norm,
+        ImageNorm::CLIP,
+        "no preprocessor config"
+    );
+    std::fs::write(
+        dir.path().join("preprocessor_config.json"),
+        r#"{"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5], "patch_size": 16}"#,
+    )
+    .unwrap();
+    let cfg = super::config::Qwen4ExpConfig::load(dir.path()).unwrap();
+    assert_eq!(
+        cfg.image_norm,
+        ImageNorm {
+            mean: [0.5; 3],
+            std: [0.5; 3]
+        }
+    );
+}

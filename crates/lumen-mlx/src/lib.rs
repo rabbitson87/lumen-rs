@@ -856,6 +856,9 @@ impl RunnerImpl {
     /// the other runners have no tower to size against.
     #[cfg(feature = "mlx-native")]
     fn prepare_image(&self, encoded: &[u8]) -> Result<crate::qwen36_vision::PreparedImage> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.prepare_image(encoded);
+        }
         self.native()
             .ok_or_else(|| anyhow!("image input requires the native MLX runner"))?
             .prepare_image(encoded)
@@ -864,12 +867,18 @@ impl RunnerImpl {
     /// Token id whose embedding rows the vision features replace.
     #[cfg(feature = "mlx-native")]
     fn image_token_id(&self) -> Option<u32> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.image_token_id();
+        }
         self.native()?.image_token_id()
     }
 
     /// The loaded tower's config, for header-only prompt sizing.
     #[cfg(feature = "mlx-native")]
     fn vision_config(&self) -> Option<crate::qwen36_vision::NativeQwen36VisionConfig> {
+        if let Self::Qwen4Exp(r) = self {
+            return r.vision_config();
+        }
         self.native()?.vision_config()
     }
 

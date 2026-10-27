@@ -349,6 +349,25 @@ With `LUMEN_MOE_IO_MODE=auto` on a Mac that has more than 12 GB to spare, the OS
 experts too and can make a small pool run faster than these numbers (a 4 GB pool even outran 6.7 GB
 there); a 16 or 24 GB Mac has little to spare, which is why the reference uses direct reads.
 
+## Images (`LUMEN_VISION=1`)
+
+The checkpoint carries an image tower (the Qwen 3-VL tower lumen already runs for Qwen 3.6: 27 blocks,
+patch 16, 2x2 merge). With `LUMEN_VISION=1` the server loads it (0.9 GB, counted in the memory plan, so
+the expert pool is that much smaller) and accepts images in OpenAI `image_url` and Anthropic `image`
+blocks. Without it nothing changes: the tower is not loaded and text output is the same, bit for bit.
+
+An image becomes its own run of placeholder tokens (one per 32x32 pixels after resizing, 16 to 1,024 per
+image, `LUMEN_VISION_MIN_IMAGE_TOKENS` / `LUMEN_VISION_MAX_IMAGE_TOKENS`), whose embeddings the tower's
+features replace before the four residual streams are formed. Its pixels are normalized as the
+checkpoint's `preprocessor_config.json` says. The prompt takes 3-D rotary positions (time, height, width)
+in the attention layers and in the sparse indexer, which places each block of keys at its first token's
+position; the reply decodes on from there. A request with an image starts from a fresh state: the prefix
+cache, joint prefill, the disk tier and the draft head are keyed on text and stay out of it.
+
+Measured on this Mac with a generated test image (a red circle, a blue square, "LUMEN 42"): the reply
+named all three, in 14 s for a 334-token prompt, and again with an 11K-character document before it
+(3,833 tokens, past the indexer's 2,048-token budget) in 15 s.
+
 ## Options
 
 | Variable | Default | What it does |

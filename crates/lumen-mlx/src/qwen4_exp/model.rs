@@ -580,6 +580,9 @@ pub struct Qwen4ExpModel {
     scores_budget: u64,
     /// `ones(hidden)`, the weight of a group norm whose scale is applied afterwards.
     ones_hidden: Array,
+    /// The image tower, under `LUMEN_VISION` for a checkpoint that ships one (see
+    /// [`Self::forward_image_prompt`]).
+    vision: Option<crate::qwen36_vision::NativeQwen36VisionTower>,
 }
 
 // ---- caches --------------------------------------------------------------------------------
@@ -630,6 +633,51 @@ pub struct Qwen4ExpCache {
     tokens: usize,
     /// The draft head's cache, for a model that has one.
     mtp: Option<MtpState>,
+    /// The 3-D rotary positions of a sequence that began with an image prompt; `None` for every
+    /// text-only one, which keeps the 1-D rope.
+    mrope: Option<MropeState>,
+}
+
+/// Every token's `[t, h, w]` rotary position so far, and what a text token after the prompt adds
+/// to its index (`next_position - prompt length`).
+#[derive(Clone)]
+struct MropeState {
+    positions: Vec<[i32; 3]>,
+    delta: i32,
+}
+
+impl MropeState {
+    /// Append the positions of `n` text tokens following the `fed` tokens this state covers.
+    fn extend_text(&mut self, fed: usize, n: usize) {
+        let delta = self.delta;
+        self.positions.extend((fed..fed + n).map(|i| {
+            let p = i as i32 + delta;
+            [p, p, p]
+        }));
+    }
+}
+
+/// Where the tokens fed now sit for the rotary embedding.
+#[derive(Clone, Copy)]
+pub(crate) enum RopeAt<'a> {
+    /// At their index: the fused 1-D rope from the cache's offset (every text-only sequence).
+    Index,
+    /// An image sequence: `new` holds the 3-D positions of the tokens fed now, `all` those of
+    /// every token through them (the indexer places each pooled key block at its first token's).
+    Mrope {
+        new: &'a [[i32; 3]],
+        all: &'a [[i32; 3]],
+    },
+}
+
+/// An image prompt fed through [`Qwen4ExpModel::forward_image_prompt`]: every token's 3-D
+/// position and the text delta after it, and each image's placeholder run (prompt-global) with
+/// its features.
+pub(crate) struct ImageFeed<'a> {
+    positions: &'a [[i32; 3]],
+    delta: i32,
+    runs: &'a [(usize, usize)],
+    soft: &'a [Array],
 }
 
 impl Qwen4ExpCache {
@@ -639,6 +687,9 @@ impl Qwen4ExpCache {
     /// convolution history). The n-gram tail is not stored: it is the last tokens of
     /// the prefix, which the manifest already holds.
     pub(crate) fn to_records(&self) -> Result<(Vec<LayerMeta>, Vec<ArrayRecord>)> {
+        if self.mrope.is_some() {
+            bail!("qwen4_exp: an image sequence's state is not persisted");
+        }
         let mut records = Vec::new();
         let mut metas = Vec::with_capacity(self.layers.len() + self.ple_conv.len());
         for layer in &self.layers {
@@ -834,6 +885,35 @@ impl Qwen4ExpModel {
         let expert_budget_bytes = options.expert_budget_bytes;
         let mut cfg = Qwen4ExpConfig::load(model_dir)?;
         let mut weights = NativeWeights::load_dir(model_dir)?;
+        // The image tower is read from the raw weights: `sanitize` drops `vision_tower.*`.
+        let vision = match &cfg.vision {
+            Some(vcfg)
+                if crate::vision_splice::tower::vision_enabled()
+                    && weights.get("vision_tower.pos_embed.weight").is_some() =>
+            {
+                let tower = crate::qwen36_vision::NativeQwen36VisionTower::load(
+                    weights.tensors(),
+                    vcfg.clone(),
+                )
+                .context("qwen4_exp: load the vision tower")?;
+                // Settled on the loading thread, as the trunk is (see `materialize_trunk`).
+                mlx_rs::transforms::eval(tower.weights())
+                    .context("qwen4_exp: read the vision tower")?;
+                let bytes: usize = tower.weights().iter().map(|a| a.nbytes()).sum();
+                eprintln!(
+                    "[qwen4_exp] vision tower loaded ({:.2} GB)",
+                    bytes as f64 / 1e9
+                );
+                Some(tower)
+            }
+            Some(_) if crate::vision_splice::tower::vision_enabled() => {
+                eprintln!(
+                    "[qwen4_exp] LUMEN_VISION=1 but the checkpoint ships no vision_tower.* weights: image input stays off"
+                );
+                None
+            }
+            _ => None,
+        };
         weights.sanitize()?;
         // `mtp.safetensors` sits in the same directory, so the loader picked it up under
         // `language_model.mtp.*`. The head is its own thing: take it out before the trunk is read.
@@ -972,6 +1052,7 @@ impl Qwen4ExpModel {
                 options.scores_budget_bytes
             },
             ones_hidden,
+            vision,
         })
     }
 
@@ -1056,6 +1137,7 @@ impl Qwen4ExpModel {
             ngram_tail: vec![self.cfg.eos_token_id; self.cfg.ngram_size - 1],
             tokens: 0,
             mtp: self.mtp.as_ref().map(|_| MtpState::new()),
+            mrope: None,
         }
     }
 }
@@ -1251,6 +1333,8 @@ struct GroupFeed<'a> {
     cuts: &'a [usize],
     marks: &'a [usize],
     want_logits: bool,
+    /// The image prompt these tokens are part of (the cache started with it).
+    image: Option<&'a ImageFeed<'a>>,
 }
 
 /// One feed's working state while its group goes through the layers.
@@ -1266,6 +1350,8 @@ struct GroupWork {
     mark_pieces: Vec<Option<usize>>,
     snap_layers: Vec<Vec<LayerState>>,
     snap_ple: Vec<Vec<Option<Array>>>,
+    /// An image sequence's 3-D positions through this group's last token, and its text delta.
+    mrope: Option<MropeState>,
 }
 
 impl GroupWork {
@@ -1282,10 +1368,37 @@ impl GroupWork {
                 b
             })
             .collect();
-        let streams = bounds
-            .iter()
-            .map(|&(s, e)| model.embed_streams(&f.ids[s..e]))
-            .collect::<Result<Vec<_>>>()?;
+        let base = f.cache.tokens;
+        let streams = match f.image {
+            None => bounds
+                .iter()
+                .map(|&(s, e)| model.embed_streams(&f.ids[s..e]))
+                .collect::<Result<Vec<_>>>()?,
+            Some(img) => bounds
+                .iter()
+                .map(|&(s, e)| model.embed_image_streams(&f.ids[s..e], base + s, img))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mrope = match (f.image, &f.cache.mrope) {
+            (Some(img), _) => {
+                let end = base + f.ids.len();
+                if base > 0 && f.cache.mrope.is_none() || img.positions.len() < end {
+                    bail!(
+                        "qwen4_exp: an image prompt starts a fresh sequence and has a position per token"
+                    );
+                }
+                Some(MropeState {
+                    positions: img.positions[..end].to_vec(),
+                    delta: img.delta,
+                })
+            }
+            (None, Some(m)) => {
+                let mut m = m.clone();
+                m.extend_text(base, f.ids.len());
+                Some(m)
+            }
+            (None, None) => None,
+        };
         Ok(Self {
             base_tokens: f.cache.tokens,
             history,
@@ -1298,6 +1411,7 @@ impl GroupWork {
                 .collect(),
             snap_layers: vec![Vec::new(); f.marks.len()],
             snap_ple: vec![vec![None; f.cache.ple_conv.len()]; f.marks.len()],
+            mrope,
         })
     }
 }
@@ -1361,8 +1475,18 @@ impl Qwen4ExpModel {
         probe::begin_step(ids.len());
         let mut h = self.embed_streams(ids)?;
         probe::stage(Stage::Embed, &[&h])?;
+        if let Some(m) = cache.mrope.as_mut() {
+            m.extend_text(cache.tokens, ids.len());
+        }
+        let at = match &cache.mrope {
+            Some(m) => RopeAt::Mrope {
+                new: &m.positions[cache.tokens..],
+                all: &m.positions,
+            },
+            None => RopeAt::Index,
+        };
         let ahead = match &self.offload {
-            Some(off) if self.builds_ahead(ids.len()) => Some(off),
+            Some(off) if self.builds_ahead(ids.len()) && cache.mrope.is_none() => Some(off),
             _ => None,
         };
         if let Some(off) = ahead {
@@ -1377,7 +1501,7 @@ impl Qwen4ExpModel {
                     probe::stage(Stage::Ple, &[&h])?;
                 }
                 h = self
-                    .layer_forward(layer, &h, &mut cache.layers[i], None)
+                    .layer_forward(layer, &h, &mut cache.layers[i], None, at)
                     .with_context(|| format!("layer {i}"))?;
             }
         }
@@ -1425,6 +1549,9 @@ impl Qwen4ExpModel {
         if cache.layers.len() != self.layers.len() {
             bail!("qwen4_exp verify: cache has {} layers", cache.layers.len());
         }
+        if cache.mrope.is_some() {
+            bail!("qwen4_exp verify: an image sequence decodes one token at a time");
+        }
         let keep = self.cfg.ngram_size - 1;
         let base_tokens = cache.tokens;
         let mut history = cache.ngram_tail.clone();
@@ -1448,7 +1575,13 @@ impl Qwen4ExpModel {
                 h = mlx_rs::ops::add(&h, &injected)?;
             }
             h = self
-                .layer_forward(layer, &h, &mut cache.layers[i], Some(&mut gdn_first[i]))
+                .layer_forward(
+                    layer,
+                    &h,
+                    &mut cache.layers[i],
+                    Some(&mut gdn_first[i]),
+                    RopeAt::Index,
+                )
                 .with_context(|| format!("layer {i}"))?;
         }
         let multi = h.clone();
@@ -1489,6 +1622,7 @@ impl Qwen4ExpModel {
             ngram_tail: history[1..1 + keep].to_vec(),
             tokens: base_tokens + 1,
             mtp: cache.mtp.clone(),
+            mrope: None,
         };
         let mut pending = cache.arrays();
         pending.extend(first.arrays());
@@ -1567,7 +1701,7 @@ impl Qwen4ExpModel {
         cuts: &[usize],
         marks: &[usize],
     ) -> Result<(Array, Vec<Qwen4ExpCache>)> {
-        self.forward_pieces_grouped(ids, cache, cuts, marks, PREFILL_GROUP_TOKENS)
+        self.forward_pieces_grouped(ids, cache, cuts, marks, PREFILL_GROUP_TOKENS, None)
     }
 
     /// [`Self::forward_pieces`] with the group size spelled out (a group always holds at least
@@ -1581,11 +1715,12 @@ impl Qwen4ExpModel {
         group_tokens: usize,
     ) -> Result<(Array, Option<Qwen4ExpCache>)> {
         let (logits, mut points) =
-            self.forward_pieces_grouped(ids, cache, cuts, mark.as_slice(), group_tokens)?;
+            self.forward_pieces_grouped(ids, cache, cuts, mark.as_slice(), group_tokens, None)?;
         Ok((logits, points.pop()))
     }
 
-    /// [`Self::forward_pieces_marked`] with the group size spelled out.
+    /// [`Self::forward_pieces_marked`] with the group size spelled out, and the image prompt the
+    /// tokens are, if they are one (see [`Self::forward_image_prompt`]).
     fn forward_pieces_grouped(
         &self,
         ids: &[u32],
@@ -1593,6 +1728,7 @@ impl Qwen4ExpModel {
         cuts: &[usize],
         marks: &[usize],
         group_tokens: usize,
+        image: Option<&ImageFeed<'_>>,
     ) -> Result<(Array, Vec<Qwen4ExpCache>)> {
         self.check_feed(ids, cache, cuts, marks)?;
         let mut logits = None;
@@ -1622,6 +1758,7 @@ impl Qwen4ExpModel {
                 &rel_cuts,
                 &rel_marks,
                 last,
+                image,
             )?;
             for (j, point) in mark_at.into_iter().zip(group_points) {
                 points[j] = Some(point);
@@ -1649,6 +1786,7 @@ impl Qwen4ExpModel {
         cuts: &[usize],
         marks: &[usize],
         want_logits: bool,
+        image: Option<&ImageFeed<'_>>,
     ) -> Result<(Option<Array>, Vec<Qwen4ExpCache>)> {
         let mut feeds = [GroupFeed {
             ids,
@@ -1656,6 +1794,7 @@ impl Qwen4ExpModel {
             cuts,
             marks,
             want_logits,
+            image,
         }];
         let mut out = self.forward_group_many(&mut feeds)?;
         Ok(out.pop().expect("one feed in, one result out"))
@@ -1693,6 +1832,7 @@ impl Qwen4ExpModel {
                 cuts: f.cuts,
                 marks: m,
                 want_logits: true,
+                image: None,
             })
             .collect();
         self.forward_group_many(&mut groups)?
@@ -1783,8 +1923,15 @@ impl Qwen4ExpModel {
                             .with_context(|| format!("layer {i}: n-gram injection"))?;
                         *h = mlx_rs::ops::add(&*h, &injected)?;
                     }
+                    let at = match &w.mrope {
+                        Some(m) => RopeAt::Mrope {
+                            new: &m.positions[w.base_tokens + s..w.base_tokens + e],
+                            all: &m.positions[..w.base_tokens + e],
+                        },
+                        None => RopeAt::Index,
+                    };
                     *h = self
-                        .layer_forward(layer, h, &mut f.cache.layers[i], None)
+                        .layer_forward(layer, h, &mut f.cache.layers[i], None, at)
                         .with_context(|| format!("layer {i}"))?;
                     if layer_major {
                         // Settle the chunk before the next one starts: the staged experts the
@@ -1864,6 +2011,7 @@ impl Qwen4ExpModel {
 
         f.cache.tokens += f.ids.len();
         f.cache.ngram_tail = w.history[w.history.len() - keep..].to_vec();
+        f.cache.mrope = w.mrope.clone();
         let mut pending = f.cache.arrays();
         pending.extend(logits.iter());
         mlx_rs::transforms::eval(pending).context("qwen4_exp: evaluate the group and its state")?;
@@ -1880,9 +2028,167 @@ impl Qwen4ExpModel {
                 ngram_tail: w.history[m..keep + m].to_vec(),
                 tokens: w.base_tokens + m,
                 mtp,
+                mrope: w.mrope.as_ref().map(|s| MropeState {
+                    positions: s.positions[..w.base_tokens + m].to_vec(),
+                    delta: s.delta,
+                }),
             })
             .collect();
         Ok((logits, points))
+    }
+
+    /// `x` `[b, heads, s, d]` rotated at the positions of the `s` tokens fed now: the fused 1-D
+    /// rope from `offset` for a text sequence, the 3-D one at each token's `[t, h, w]` for an image
+    /// sequence.
+    fn rotate(&self, x: &Array, offset: i32, at: RopeAt<'_>) -> Result<Array> {
+        match at {
+            RopeAt::Index => rope(
+                x,
+                self.cfg.rotary_dim() as i32,
+                false,
+                self.cfg.rope_theta,
+                1.0,
+                offset,
+            ),
+            RopeAt::Mrope { new, .. } => self.rotate_mrope(x, new),
+        }
+    }
+
+    /// `x` `[b, heads, s, d]` rotated at the 3-D `positions` of its `s` rows.
+    fn rotate_mrope(&self, x: &Array, positions: &[[i32; 3]]) -> Result<Array> {
+        let (sections, interleaved) = self
+            .cfg
+            .mrope
+            .ok_or_else(|| anyhow!("qwen4_exp: config.json has no usable mrope_section"))?;
+        crate::native_rope::mrope(
+            x,
+            self.cfg.rotary_dim() as i32,
+            positions,
+            sections,
+            interleaved,
+            self.cfg.rope_theta,
+        )
+    }
+
+    /// [`Self::embed_streams`] for the tokens `ids` of an image prompt starting at `start`: each
+    /// image's placeholder rows become its features (before the streams are tiled, so all of
+    /// them carry them, as the reference's `masked_scatter` then `repeat` does).
+    fn embed_image_streams(&self, ids: &[u32], start: usize, img: &ImageFeed<'_>) -> Result<Array> {
+        let embedded = to_f32(self.embed_untiled(ids)?)?;
+        let spliced = crate::vision_splice::tower::splice_soft_rows(
+            &embedded,
+            start as i32,
+            ids.len() as i32,
+            img.runs,
+            img.soft,
+            self.cfg.hidden_size as i32,
+        )?;
+        Ok(mlx_rs::ops::tile(
+            &spliced,
+            &[1, 1, self.cfg.hc_count as i32],
+        )?)
+    }
+
+    /// The loaded image tower, if any.
+    pub(crate) fn vision(&self) -> Option<&crate::qwen36_vision::NativeQwen36VisionTower> {
+        self.vision.as_ref()
+    }
+
+    /// Each image's placeholder run in `ids` and its features `[run_len, hidden]`, checked to
+    /// agree in number and length.
+    pub(crate) fn encode_images(
+        &self,
+        ids: &[u32],
+        images: &[crate::qwen36_vision::PreparedImage],
+    ) -> Result<(Vec<(usize, usize)>, Vec<Array>)> {
+        let tower = self.vision.as_ref().ok_or_else(|| {
+            anyhow!("image input requires LUMEN_VISION=1 and a checkpoint with a vision tower")
+        })?;
+        let image_token = self
+            .cfg
+            .image_token_id
+            .ok_or_else(|| anyhow!("config.json has no image_token_id"))?;
+        let runs = crate::vision_splice::image_token_runs(ids, image_token);
+        if runs.len() != images.len() {
+            bail!(
+                "the prompt has {} image placeholder run(s) for {} image(s)",
+                runs.len(),
+                images.len()
+            );
+        }
+        let cfg = tower.config();
+        let per_patch = cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size * cfg.in_channels;
+        let mut soft = Vec::with_capacity(images.len());
+        for (i, (img, run)) in images.iter().zip(&runs).enumerate() {
+            if img.num_tokens != run.1 {
+                bail!(
+                    "image {i} encodes to {} tokens but the prompt holds {} placeholders",
+                    img.num_tokens,
+                    run.1
+                );
+            }
+            let n = (img.grid.0 * img.grid.1) as i32;
+            let px = Array::from_slice(&img.patches, &[n, per_patch as i32]);
+            let rows = tower
+                .forward(&px, img.grid)
+                .with_context(|| format!("vision tower, image {i}"))?;
+            // Settled now, so the tower's intermediates are gone before the prefill allocates.
+            rows.eval()
+                .context("vision: evaluate the image's features")?;
+            soft.push(rows);
+        }
+        Ok((runs, soft))
+    }
+
+    /// Feed an image prompt into `cache`, a fresh one: `ids` holds each image's placeholder run
+    /// (`runs`, prompt-global, with its features `soft`), `positions` every token's 3-D rotary
+    /// position and `delta` what a later text token's position adds to its index (see
+    /// `qwen36_vision::mrope_positions` / `next_position`). Fed in chunks of `chunk`, layer-major
+    /// like [`Self::forward_pieces`]; the sequence then decodes with [`Self::forward`] at
+    /// positions shifted by `delta`. Returns the last position's logits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_image_prompt(
+        &self,
+        ids: &[u32],
+        cache: &mut Qwen4ExpCache,
+        chunk: usize,
+        positions: &[[i32; 3]],
+        delta: i32,
+        runs: &[(usize, usize)],
+        soft: &[Array],
+    ) -> Result<Array> {
+        if cache.tokens != 0 {
+            bail!("qwen4_exp: an image prompt starts a fresh sequence");
+        }
+        // The draft head never sees an image prompt; the sequence decodes without it.
+        cache.mtp = None;
+        if positions.len() != ids.len() {
+            bail!(
+                "qwen4_exp: {} positions for {} tokens",
+                positions.len(),
+                ids.len()
+            );
+        }
+        let image = ImageFeed {
+            positions,
+            delta,
+            runs,
+            soft,
+        };
+        let mut cuts: Vec<usize> = (1..)
+            .map(|k| k * chunk.max(1))
+            .take_while(|&c| c < ids.len())
+            .collect();
+        cuts.push(ids.len());
+        let (logits, _) = self.forward_pieces_grouped(
+            ids,
+            cache,
+            &cuts,
+            &[],
+            PREFILL_GROUP_TOKENS,
+            Some(&image),
+        )?;
+        Ok(logits)
     }
 
     /// `GatedResidual.__call__`: the block input and, when the layer has
@@ -1936,8 +2242,9 @@ impl Qwen4ExpModel {
         h: &Array,
         state: &mut LayerState,
         first_row: Option<&mut Option<GdnState>>,
+        at: RopeAt<'_>,
     ) -> Result<Array> {
-        let front = self.layer_front(layer, h, state, first_row)?;
+        let front = self.layer_front(layer, h, state, first_row, at)?;
         let view = layer.moe.view(self.offload.as_ref());
         let x = moe_block_forward(&front.x, &view).context("moe block")?;
         self.layer_back(&front.h_mid, &x, &front.inject)
@@ -1951,13 +2258,14 @@ impl Qwen4ExpModel {
         h: &Array,
         state: &mut LayerState,
         first_row: Option<&mut Option<GdnState>>,
+        at: RopeAt<'_>,
     ) -> Result<LayerFront> {
         let (x, inject) = self.hyper_mix(&layer.attn_hc, h)?;
         let inject = inject.ok_or_else(|| anyhow!("attn hyper-connection has no inject weight"))?;
         probe::stage(Stage::HcAttn, &[&x, &inject])?;
         let x = match (&layer.mixer, &mut *state) {
             (Mixer::Gdn(w), LayerState::Gdn(st)) => self.gdn_forward(w, &x, st, first_row)?,
-            (Mixer::Qsa(w), LayerState::Qsa(st)) => self.qsa_forward(w, &x, st)?,
+            (Mixer::Qsa(w), LayerState::Qsa(st)) => self.qsa_forward(w, &x, st, at)?,
             _ => bail!("cache layer kind does not match the layer"),
         };
         if probe::sync_on() {
@@ -2067,7 +2375,7 @@ impl Qwen4ExpModel {
             }
             None => h,
         };
-        self.layer_front(layer, h, &mut cache.layers[i], None)
+        self.layer_front(layer, h, &mut cache.layers[i], None, RopeAt::Index)
             .with_context(|| format!("layer {i}"))
     }
 
@@ -2170,7 +2478,7 @@ impl Qwen4ExpModel {
     }
 
     /// `Attention.__call__` with the QSA indexer.
-    fn qsa_forward(&self, w: &Qsa, x: &Array, st: &mut QsaState) -> Result<Array> {
+    fn qsa_forward(&self, w: &Qsa, x: &Array, st: &mut QsaState, at: RopeAt<'_>) -> Result<Array> {
         let cfg = &self.cfg;
         let (b, s) = (x.shape()[0], x.shape()[1]);
         let (nh, nkv, hd) = (
@@ -2178,10 +2486,9 @@ impl Qwen4ExpModel {
             cfg.num_key_value_heads as i32,
             cfg.head_dim as i32,
         );
-        let rot = cfg.rotary_dim() as i32;
         let offset = st.kv.offset() as i32;
 
-        let sparse = self.indexer_mask(&w.indexer, x, offset, &mut st.indexer_keys)?;
+        let sparse = self.indexer_mask(&w.indexer, x, offset, &mut st.indexer_keys, at)?;
 
         let q_full = mlx_rs::ops::reshape(&w.q_proj.apply(x)?, &[b, s, nh, hd * 2])?;
         let halves = mlx_rs::ops::split(&q_full, 2, -1)?;
@@ -2194,8 +2501,8 @@ impl Qwen4ExpModel {
         let v = mlx_rs::ops::reshape(&w.v_proj.apply(x)?, &[b, s, nkv, hd])?;
         let v = mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3])?;
 
-        let q = rope(&q, rot, false, cfg.rope_theta, 1.0, offset)?;
-        let k = rope(&k, rot, false, cfg.rope_theta, 1.0, offset)?;
+        let q = self.rotate(&q, offset, at)?;
+        let k = self.rotate(&k, offset, at)?;
         // `LUMEN_QWEN4_KV_BF16`: the cache holds bf16 and attention runs in it.
         let (q, k, v) = if kv_bf16::get() {
             (
@@ -2234,6 +2541,7 @@ impl Qwen4ExpModel {
         x: &Array,
         offset: i32,
         keys: &mut Option<Array>,
+        at: RopeAt<'_>,
     ) -> Result<Option<Array>> {
         let cfg = &self.cfg;
         let (b, s) = (x.shape()[0], x.shape()[1]);
@@ -2274,11 +2582,22 @@ impl Qwen4ExpModel {
         let blocks = mlx_rs::ops::reshape(&blocks, &[b, n_blocks, ratio, hd])?;
         let pooled = mlx_rs::ops::mean_axis(&blocks, 2, false)?;
         let pooled = mlx_rs::fast::rms_norm(&pooled, &w.k_layernorm, eps)?;
-        let pooled = rope(&pooled, rot, false, cfg.rope_theta, ratio as f32, 0)?;
+        // Each block sits where its first token does: `j * ratio` for a text sequence, that
+        // token's 3-D position for an image one.
+        let pooled = match at {
+            RopeAt::Index => rope(&pooled, rot, false, cfg.rope_theta, ratio as f32, 0)?,
+            RopeAt::Mrope { all, .. } => {
+                let starts: Vec<[i32; 3]> = (0..n_blocks as usize)
+                    .map(|j| all[j * ratio as usize])
+                    .collect();
+                let x4 = mlx_rs::ops::expand_dims(&pooled, 1)?;
+                mlx_rs::ops::squeeze_axes(&self.rotate_mrope(&x4, &starts)?, &[1])?
+            }
+        };
 
         let q = mlx_rs::fast::rms_norm(&q, &w.q_layernorm, eps)?;
         let q = mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3])?; // [b, nh, s, hd]
-        let q = rope(&q, rot, false, cfg.rope_theta, 1.0, offset)?;
+        let q = self.rotate(&q, offset, at)?;
 
         // score[b, s, block] = sum over heads of relu(q . pooled) / sqrt(hd)
         let pooled_t =

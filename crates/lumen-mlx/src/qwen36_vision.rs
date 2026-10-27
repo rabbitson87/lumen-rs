@@ -213,6 +213,21 @@ pub mod imp {
             &self.cfg
         }
 
+        /// Every weight array of the tower: what a loader evaluates on its own thread, and what
+        /// the tower's memory is.
+        pub fn weights(&self) -> Vec<&Array> {
+            let mut out = vec![&self.patch_proj_t, &self.patch_proj_b, &self.pos_embed];
+            for b in &self.blocks {
+                out.extend([
+                    &b.norm1_w, &b.norm1_b, &b.norm2_w, &b.norm2_b, &b.qkv_t, &b.qkv_b, &b.proj_t,
+                    &b.proj_b, &b.fc1_t, &b.fc1_b, &b.fc2_t, &b.fc2_b,
+                ]);
+            }
+            let m = &self.merger;
+            out.extend([&m.norm_w, &m.norm_b, &m.fc1_t, &m.fc1_b, &m.fc2_t, &m.fc2_b]);
+            out
+        }
+
         /// Encode one image into `[num_tokens, out_hidden_size]` embeddings.
         ///
         /// * `patches` — `[grid_h · grid_w, temporal·patch²·channels]` in
@@ -626,6 +641,22 @@ use crate::vision_image::{decode_bounded, env_usize};
 const IMAGE_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 const IMAGE_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
+/// Per-channel normalization of pixels in `[0, 1]`: `(v - mean) / std`, as a checkpoint's
+/// `preprocessor_config.json` gives it (`image_mean` / `image_std`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageNorm {
+    pub mean: [f32; 3],
+    pub std: [f32; 3],
+}
+
+impl ImageNorm {
+    /// OpenAI CLIP's constants, `Qwen2VLImageProcessor`'s default and what the Qwen 3.6 path uses.
+    pub const CLIP: Self = Self {
+        mean: IMAGE_MEAN,
+        std: IMAGE_STD,
+    };
+}
+
 /// Round `value` to the nearest multiple of `factor`.
 fn round_by_factor(value: f64, factor: usize) -> usize {
     ((value / factor as f64).round() as usize).max(1) * factor
@@ -698,6 +729,27 @@ pub fn patchify(
     temporal_patch_size: usize,
     merge_size: usize,
 ) -> Vec<f32> {
+    patchify_with(
+        rgb,
+        height,
+        width,
+        patch_size,
+        temporal_patch_size,
+        merge_size,
+        ImageNorm::CLIP,
+    )
+}
+
+/// [`patchify`] with the checkpoint's own normalization.
+pub fn patchify_with(
+    rgb: &[u8],
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    merge_size: usize,
+    norm: ImageNorm,
+) -> Vec<f32> {
     let (gh, gw) = (height / patch_size, width / patch_size);
     let per_patch = temporal_patch_size * patch_size * patch_size * 3;
     let mut out = vec![0.0f32; gh * gw * per_patch];
@@ -718,7 +770,7 @@ pub fn patchify(
                                 let dst = t_off + (py * patch_size + px) * 3;
                                 for c in 0..3 {
                                     let v = rgb[src + c] as f32 / 255.0;
-                                    out[dst + c] = (v - IMAGE_MEAN[c]) / IMAGE_STD[c];
+                                    out[dst + c] = (v - norm.mean[c]) / norm.std[c];
                                 }
                             }
                         }
@@ -926,6 +978,16 @@ pub fn prepare_image(
     encoded: &[u8],
     cfg: &NativeQwen36VisionConfig,
 ) -> Result<PreparedImage, String> {
+    prepare_image_with(encoded, cfg, ImageNorm::CLIP)
+}
+
+/// [`prepare_image`] with the checkpoint's own normalization.
+#[cfg(feature = "mlx-native")]
+pub fn prepare_image_with(
+    encoded: &[u8],
+    cfg: &NativeQwen36VisionConfig,
+    norm: ImageNorm,
+) -> Result<PreparedImage, String> {
     let factor = cfg.patch_size * cfg.spatial_merge_size;
     let px_per_token = factor * factor;
     let max_tokens = env_usize("LUMEN_VISION_MAX_IMAGE_TOKENS", DEFAULT_MAX_IMAGE_TOKENS);
@@ -955,13 +1017,14 @@ pub fn prepare_image(
     };
 
     let grid = (target_h / cfg.patch_size, target_w / cfg.patch_size);
-    let patches = patchify(
+    let patches = patchify_with(
         resized.as_raw(),
         target_h,
         target_w,
         cfg.patch_size,
         cfg.temporal_patch_size,
         cfg.spatial_merge_size,
+        norm,
     );
     Ok(PreparedImage {
         patches,

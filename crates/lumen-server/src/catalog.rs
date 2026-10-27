@@ -133,7 +133,7 @@ pub const RECOMMENDED: &[RecommendedModel] = &[
         label: "Qwen 3.8 — Flash-Next 125B-A6B (SSD-streamed)",
         approx_size_gb: 97,
         min_ram_gb: 16,
-        notes: "**Newest Qwen MoE, run from the SSD.** 125B parameters, ~6B active, 4-bit (group-64). Needs ~97 GB of free disk but only 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand, bit-identical to a run with everything in memory. Speed is set by the SSD and by how much RAM the expert cache can use: about 8 tok/s with 15 GB of cache on a 36 GB Mac, ~5-6 tok/s on 24 GB, 1.5-3 on a 16 GB Mac. Reuses a conversation's state across turns and restarts (enable the disk KV cache in settings). Text only; no thinking-budget or MTP support yet.",
+        notes: "**Newest Qwen MoE, run from the SSD.** 125B parameters, ~6B active, 4-bit (group-64). Needs ~97 GB of free disk but only 16 GB of RAM: the experts and the n-gram table are read from the SSD on demand, bit-identical to a run with everything in memory. Speed is set by the SSD and by how much RAM the expert cache can use: about 8 tok/s with 15 GB of cache on a 36 GB Mac, ~5-6 tok/s on 24 GB, 1.5-3 on a 16 GB Mac. Reuses a conversation's state across turns and restarts (the disk KV cache, on by default). Reads images too with LUMEN_VISION=1 (its 0.9 GB image tower comes out of the expert cache); no thinking-budget or MTP support yet.",
     },
     RecommendedModel {
         id: "mlx-community/Qwen3.6-35B-A3B-mxfp4",
