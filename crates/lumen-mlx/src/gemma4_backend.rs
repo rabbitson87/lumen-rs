@@ -1403,9 +1403,14 @@ pub(crate) mod imp {
         // ── Trait-shape API used by `lumen-server` ─────────────────
 
         /// Tokenize raw text without applying the chat template. Used by
-        /// the `/v1/completions` (legacy) endpoint.
+        /// the `/v1/completions` (legacy) endpoint, whose client writes the
+        /// whole prompt, control tokens included, so an added token spelled in
+        /// it is that token.
         pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-            self.chat.encode_plain(text)
+            self.chat
+                .tokenizer()
+                .encode(text, false)
+                .map_err(|e| anyhow!("tokenizer encode: {e}"))
         }
 
         /// Decode a token-id sequence into a UTF-8 string. Special tokens

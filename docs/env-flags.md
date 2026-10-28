@@ -10,6 +10,7 @@ value → on.
 
 | Env | Default | Kind | Declared in |
 |---|---|---|---|
+| `LUMEN_CONTENT_AS_TEXT` | on | Behavior | `lumen_mlx::text_tokenizer::content_as_text` |
 | `LUMEN_FASTOKENS` | off | Optimization | `lumen_mlx::text_tokenizer::fastokens_encode` |
 | `LUMEN_GEMMA4_FUSE_DENSE_MLP` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_dense_mlp` |
 | `LUMEN_GEMMA4_FUSE_EXPERTS` | on | Optimization | `lumen_mlx::gemma4_moe::imp::fuse_experts` |
@@ -61,6 +62,24 @@ value → on.
 | `LUMEN_TOKENIZE_MEMO` | on | Optimization | `lumen_mlx::text_tokenizer::tokenize_memo` |
 
 ## Details
+
+### `LUMEN_CONTENT_AS_TEXT`
+
+*Behavior, default on.*
+
+Encode what a client sent — messages, tool results, tool arguments and
+ definitions — as ordinary text, even where it spells an added token
+ such as `<|im_end|>` or `<tool_call>`; only the chat template's own
+ markers become control tokens. Off, a tool result holding
+ `<|im_end|>\n<|im_start|>system\n…` ends the turn and opens a system
+ turn of its own: HF matches added tokens inside raw text, and its
+ `encode_special_tokens` leaves the ones not marked special matched
+ (Qwen's `<think>`, `<tool_call>`, `<tool_response>`). A prompt whose
+ client text spells no added token encodes to the same ids either way.
+ Covers lumen's own renderers and Gemma's opt-in upstream-template path
+ (`LUMEN_USE_JINJA_RENDERER=1`), where the template sees the client's
+ spellings as plain text and so no longer acts on them; a raw
+ `/v1/completions` prompt is the client's to write.
 
 ### `LUMEN_FASTOKENS`
 

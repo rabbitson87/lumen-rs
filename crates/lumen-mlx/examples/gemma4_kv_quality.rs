@@ -205,7 +205,12 @@ mod imp {
         for f in files {
             text.push_str(&std::fs::read_to_string(&f)?);
         }
-        let ids = template.encode_plain(&text)?;
+        // As this corpus was always encoded — added tokens spelled in the
+        // sources matched — so its numbers compare with earlier runs.
+        let ids = template
+            .tokenizer()
+            .encode(&text, false)
+            .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
         if ids.len() < n {
             return Err(anyhow!("corpus is {} tokens, {n} asked for", ids.len()));
         }

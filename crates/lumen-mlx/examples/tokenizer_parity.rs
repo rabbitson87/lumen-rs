@@ -686,7 +686,9 @@ fn agentic(family: Family, repo: &RepoText, target_bytes: usize, seed: usize) ->
         })
         .collect();
     let mut s = match family {
-        Family::Qwen => lumen_mlx::render_tools_system_block(&defs, Some(&repo.system), None),
+        Family::Qwen => {
+            lumen_mlx::render_tools_system_block(&defs, Some(&repo.system), None).into_string()
+        }
         Family::Gemma => {
             let mut s = format!("<bos><|turn>system\n{}", repo.system);
             for (name, desc, params) in &tools {

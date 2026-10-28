@@ -561,6 +561,26 @@ pub fn split_reasoning_envelope(content: &str) -> (&str, &str) {
     (reasoning, visible)
 }
 
+/// Push an assistant turn's `content` verbatim: the tags of its reasoning
+/// envelope as template text, the rest as the client's.
+///
+/// For a checkpoint whose template replays the turn unchanged. The model wrote
+/// those two tags as control tokens, so a replay that kept them as text would
+/// no longer be a prefix of the turn's own KV. The envelope is recognised
+/// exactly as [`split_reasoning_envelope`] recognises it.
+pub fn push_reasoning_envelope_verbatim(out: &mut crate::prompt_text::PromptText, content: &str) {
+    if let Some(rest) = content.strip_prefix(REASONING_OPEN)
+        && let Some(end) = rest.find(REASONING_CLOSE)
+    {
+        out.push_str(REASONING_OPEN);
+        out.push_content(&rest[..end]);
+        out.push_str(REASONING_CLOSE);
+        out.push_content(&rest[end + REASONING_CLOSE.len()..]);
+    } else {
+        out.push_content(content);
+    }
+}
+
 /// Whether `content` already carries a reasoning envelope. Used to keep a
 /// client that sends *both* the envelope and the dedicated field from getting
 /// two nested blocks.

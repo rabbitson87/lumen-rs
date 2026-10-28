@@ -31,12 +31,14 @@
 //!     output is deterministic regardless of `serde_json::Value` insertion
 //!     order.
 //!
-//! Encoded as a single `encode_plain(...)` call — the Gemma 4 tokenizer's
-//! `added_tokens` table maps `<|tool>` / `<tool|>` / `<|"|>` to their
-//! single-token IDs at encode time, so we don't need to splice constants
-//! manually like `render_tool_response_block` does. Mid-text special
-//! tokens are still produced as the correct single IDs because the
-//! tokenizer regex-matches them before the BPE step.
+//! Rendered as [`PromptText`](crate::prompt_text::PromptText) and encoded
+//! in one `encode_prompt(...)` call: the tokenizer's `added_tokens` table maps
+//! the template's `<|tool>` / `<tool|>` / `<|"|>` to their single-token IDs, so
+//! we don't need to splice constants manually like
+//! `render_tool_response_block` does. The client's strings — names,
+//! descriptions, keys, enum and argument values — are marked as its own and
+//! encoded as ordinary text, so one that spells `<|"|>` cannot close the
+//! string it sits in.
 
 #[cfg(feature = "mlx-native")]
 #[allow(dead_code)] // re-exported via gemma4::tools once the server wires it
@@ -44,9 +46,9 @@ pub(crate) mod imp {
     use anyhow::{Context, Result, anyhow};
     use serde_json::Value;
     use std::collections::BTreeMap;
-    use std::fmt::Write;
 
     use crate::gemma4_chat::imp::Gemma4ChatTemplate;
+    use crate::prompt_text::PromptText;
 
     // The `ToolDef` struct lives in non-feature-gated `chat_io` so
     // lumen-server can hold it without depending on `mlx-native`. The
@@ -70,7 +72,7 @@ pub(crate) mod imp {
         if tools.is_empty() {
             return Ok(Vec::new());
         }
-        let mut text = String::new();
+        let mut text = PromptText::new();
         for (i, tool) in tools.iter().enumerate() {
             text.push_str("<|tool>");
             format_function_declaration(&mut text, tool).with_context(|| {
@@ -79,7 +81,7 @@ pub(crate) mod imp {
             text.push_str("<tool|>");
         }
         template
-            .encode_plain(&text)
+            .encode_prompt(&text)
             .context("encode rendered tool definitions")
     }
 
@@ -96,18 +98,20 @@ pub(crate) mod imp {
     /// ```text
     /// declaration:NAME{description:<|"|>D<|"|>,parameters:{...},response:{...}}
     /// ```
-    fn format_function_declaration(out: &mut String, tool: &ToolDef<'_>) -> Result<()> {
+    fn format_function_declaration(out: &mut PromptText, tool: &ToolDef<'_>) -> Result<()> {
         if tool.name.is_empty() {
             return Err(anyhow!("ToolDef::name is empty"));
         }
-        write!(out, "declaration:{}{{", tool.name).expect("write to String never fails");
+        out.push_str("declaration:");
+        out.push_content(tool.name);
+        out.push('{');
 
         // description:<|"|>...<|"|>  — emitted unconditionally because the
         // jinja `format_function_declaration` always emits it (the field is
         // pre-trimmed by the caller, an empty string is still wrapped).
         if let Some(desc) = tool.description {
             out.push_str("description:<|\"|>");
-            out.push_str(desc);
+            out.push_content(desc);
             out.push_str("<|\"|>");
         } else {
             // Match jinja's behavior when description is missing: emit the
@@ -137,7 +141,7 @@ pub(crate) mod imp {
             }
             if let Some(ty) = params.get("type").and_then(|t| t.as_str()) {
                 out.push_str("type:<|\"|>");
-                out.push_str(&ty.to_uppercase());
+                out.push_content(&ty.to_uppercase());
                 out.push_str("<|\"|>");
             }
             out.push('}');
@@ -149,14 +153,14 @@ pub(crate) mod imp {
             out.push_str("response:{");
             if let Some(desc) = resp.get("description").and_then(|d| d.as_str()) {
                 out.push_str("description:<|\"|>");
-                out.push_str(desc);
+                out.push_content(desc);
                 out.push_str("<|\"|>,");
             }
             if let Some(ty) = resp.get("type").and_then(|t| t.as_str())
                 && ty.eq_ignore_ascii_case("object")
             {
                 out.push_str("type:<|\"|>");
-                out.push_str(&ty.to_uppercase());
+                out.push_content(&ty.to_uppercase());
                 out.push_str("<|\"|>");
             }
             out.push('}');
@@ -168,7 +172,7 @@ pub(crate) mod imp {
     /// `format_parameters` macro port. Iterates `properties` in sorted key
     /// order (jinja `| dictsort`).
     fn format_parameters(
-        out: &mut String,
+        out: &mut PromptText,
         properties: &serde_json::Map<String, Value>,
         _required: Option<&[Value]>,
         filter_keys: bool,
@@ -191,15 +195,15 @@ pub(crate) mod imp {
     }
 
     /// Emit a single property entry: `KEY:{description:..., type:..., ...}`.
-    fn format_property(out: &mut String, key: &str, value: &Value) -> Result<()> {
-        out.push_str(key);
+    fn format_property(out: &mut PromptText, key: &str, value: &Value) -> Result<()> {
+        out.push_content(key);
         out.push_str(":{");
 
         let mut emitted = false;
 
         if let Some(desc) = value.get("description").and_then(|d| d.as_str()) {
             out.push_str("description:<|\"|>");
-            out.push_str(desc);
+            out.push_content(desc);
             out.push_str("<|\"|>");
             emitted = true;
         }
@@ -297,14 +301,17 @@ pub(crate) mod imp {
             out.push(',');
         }
         out.push_str("type:<|\"|>");
-        out.push_str(type_upper.as_deref().unwrap_or("STRING"));
+        match type_upper.as_deref() {
+            Some(ty) => out.push_content(ty),
+            None => out.push_str("STRING"),
+        }
         out.push_str("<|\"|>}");
         Ok(())
     }
 
     /// Body of an ARRAY's `items:{...}` block. Mirrors the jinja branches
     /// over `(item_key, item_value)` pairs.
-    fn emit_items_body(out: &mut String, items: &serde_json::Map<String, Value>) -> Result<()> {
+    fn emit_items_body(out: &mut PromptText, items: &serde_json::Map<String, Value>) -> Result<()> {
         let sorted: BTreeMap<&str, &Value> = items.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let mut first = true;
         for (key, value) in sorted {
@@ -338,7 +345,7 @@ pub(crate) mod imp {
                     out.push_str("type:");
                     if let Some(ty) = value.as_str() {
                         out.push_str("<|\"|>");
-                        out.push_str(&ty.to_uppercase());
+                        out.push_content(&ty.to_uppercase());
                         out.push_str("<|\"|>");
                     } else if let Some(types) = value.as_array() {
                         // type can be an array of strings (JSON Schema
@@ -352,7 +359,7 @@ pub(crate) mod imp {
                     }
                 }
                 _ => {
-                    out.push_str(key);
+                    out.push_content(key);
                     out.push(':');
                     format_argument(out, value, /* escape_keys */ true);
                 }
@@ -362,17 +369,17 @@ pub(crate) mod imp {
     }
 
     /// `format_argument(arg, escape_keys)` macro port.
-    fn format_argument(out: &mut String, value: &Value, escape_keys: bool) {
+    fn format_argument(out: &mut PromptText, value: &Value, escape_keys: bool) {
         match value {
             Value::String(s) => {
                 out.push_str("<|\"|>");
-                out.push_str(s);
+                out.push_content(s);
                 out.push_str("<|\"|>");
             }
             Value::Bool(true) => out.push_str("true"),
             Value::Bool(false) => out.push_str("false"),
             Value::Null => out.push_str("null"),
-            Value::Number(n) => write!(out, "{n}").expect("number to String"),
+            Value::Number(n) => out.push_str(&n.to_string()),
             Value::Array(arr) => format_argument_array(out, arr, escape_keys),
             Value::Object(map) => {
                 out.push('{');
@@ -386,10 +393,10 @@ pub(crate) mod imp {
                     first = false;
                     if escape_keys {
                         out.push_str("<|\"|>");
-                        out.push_str(key);
+                        out.push_content(key);
                         out.push_str("<|\"|>");
                     } else {
-                        out.push_str(key);
+                        out.push_content(key);
                     }
                     out.push(':');
                     format_argument(out, v, escape_keys);
@@ -399,7 +406,7 @@ pub(crate) mod imp {
         }
     }
 
-    fn format_argument_array(out: &mut String, arr: &[Value], escape_keys: bool) {
+    fn format_argument_array(out: &mut PromptText, arr: &[Value], escape_keys: bool) {
         out.push('[');
         for (i, item) in arr.iter().enumerate() {
             if i > 0 {
@@ -412,7 +419,7 @@ pub(crate) mod imp {
 
     /// Emit a string array as `[<|"|>v1<|"|>,<|"|>v2<|"|>,...]` (used for
     /// `required:[...]`).
-    fn emit_string_array(out: &mut String, arr: &[Value]) {
+    fn emit_string_array(out: &mut PromptText, arr: &[Value]) {
         let mut first = true;
         for item in arr {
             if let Some(s) = item.as_str() {
@@ -421,7 +428,7 @@ pub(crate) mod imp {
                 }
                 first = false;
                 out.push_str("<|\"|>");
-                out.push_str(s);
+                out.push_content(s);
                 out.push_str("<|\"|>");
             }
         }
@@ -434,8 +441,8 @@ pub(crate) mod imp {
     /// without requiring a tokenizer.json. The tokenized form is what the
     /// model sees, but the text form is what mlx_lm.apply_chat_template
     /// produces internally before tokenization.
-    pub fn render_tool_definitions_text(tools: &[ToolDef<'_>]) -> Result<String> {
-        let mut text = String::new();
+    pub fn render_tool_definitions_text(tools: &[ToolDef<'_>]) -> Result<PromptText> {
+        let mut text = PromptText::new();
         for tool in tools {
             text.push_str("<|tool>");
             format_function_declaration(&mut text, tool)?;
@@ -459,10 +466,10 @@ pub(crate) mod imp {
     ///
     /// Returns plain text without the `<|tool_call>` / `<tool_call|>`
     /// special-token markers — the caller splices those in as token IDs.
-    pub fn format_tool_call_body(name: &str, arguments: &Value) -> String {
-        let mut out = String::with_capacity(name.len() + 8);
+    pub fn format_tool_call_body(name: &str, arguments: &Value) -> PromptText {
+        let mut out = PromptText::new();
         out.push_str("call:");
-        out.push_str(name);
+        out.push_content(name);
         out.push('{');
         if let Some(map) = arguments.as_object() {
             // Keep insertion order — assistant tool-call arguments are
@@ -475,7 +482,7 @@ pub(crate) mod imp {
                     out.push(',');
                 }
                 first = false;
-                out.push_str(key);
+                out.push_content(key);
                 out.push(':');
                 format_argument(&mut out, value, /* escape_keys */ false);
             }
