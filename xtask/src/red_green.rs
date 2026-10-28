@@ -872,8 +872,8 @@ static DEFECTS: &[Defect] = &[
                   request with that system prompt failed too, until restart",
         revert: &[Mutation {
             path: MLX,
-            find: "                .forward_last_token_chunked(&prompt[..boundary], cache)",
-            replace: "                .forward_last_token(&prompt[..boundary], cache) // defect: one pass",
+            find: "    ) -> Result<()> {\n        let chunk = chunk.max(1);\n        let from = cache.offset();",
+            replace: "    ) -> Result<()> {\n        let chunk = usize::MAX; // defect: one pass\n        let from = cache.offset();",
         }],
         guards: &[srv_checkpoint(
             "engine::gemma_chunked_prefill::a_long_prompt_is_prefilled_in_chunks",

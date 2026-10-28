@@ -4748,6 +4748,10 @@ mod gemma_chunked_prefill {
     #[test]
     #[ignore = "requires a Gemma 4 checkpoint; set LUMEN_GEMMA4_MODEL_DIR"]
     fn a_long_prompt_is_prefilled_in_chunks() {
+        // With the disk tier on, the boundary resumes from a cold state the
+        // batch request above it (or an earlier run) wrote, which leaves a few
+        // hundred tokens to prefill: nothing for this to measure.
+        let _disk = ScopedEnv::set("LUMEN_KV_DISK", "0");
         let Some(mut engine) = gemma4(false) else {
             return;
         };
