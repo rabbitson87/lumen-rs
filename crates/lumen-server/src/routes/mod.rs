@@ -92,14 +92,12 @@ pub enum Admission {
 /// it is a refusal. Without this wait a refused stream went out as `200` plus
 /// an error chunk, which an SDK reads as a broken stream (and may retry)
 /// rather than as the `400` the same request gets without `stream`.
-pub async fn await_admission(
-    rx: &mut tokio::sync::mpsc::Receiver<crate::engine::StreamEvent>,
-) -> Admission {
+pub async fn await_admission(rx: &mut crate::engine::StreamRx) -> Admission {
     await_admission_within(rx, ADMISSION_WAIT).await
 }
 
 async fn await_admission_within(
-    rx: &mut tokio::sync::mpsc::Receiver<crate::engine::StreamEvent>,
+    rx: &mut crate::engine::StreamRx,
     wait: std::time::Duration,
 ) -> Admission {
     match tokio::time::timeout(wait, rx.recv()).await {
@@ -119,9 +117,8 @@ mod admission_tests {
 
     #[tokio::test]
     async fn an_error_before_the_start_is_a_refusal() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut rx) = crate::engine::stream_channel();
         tx.send(StreamEvent::Error("prompt too large".into()))
-            .await
             .unwrap();
         assert!(matches!(
             await_admission_within(&mut rx, WAIT).await,
@@ -131,10 +128,8 @@ mod admission_tests {
 
     #[tokio::test]
     async fn an_admitted_stream_keeps_its_first_event() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(StreamEvent::Start { prompt_tokens: 7 })
-            .await
-            .unwrap();
+        let (tx, mut rx) = crate::engine::stream_channel();
+        tx.send(StreamEvent::Start { prompt_tokens: 7 }).unwrap();
         assert!(matches!(
             await_admission_within(&mut rx, WAIT).await,
             Admission::Answered(Some(StreamEvent::Start { prompt_tokens: 7 }))
@@ -150,7 +145,7 @@ mod admission_tests {
     /// hold the head back until it does.
     #[tokio::test]
     async fn a_busy_engine_does_not_hold_the_head_back() {
-        let (_tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        let (_tx, mut rx) = crate::engine::stream_channel();
         let t0 = std::time::Instant::now();
         assert!(matches!(
             await_admission_within(&mut rx, WAIT).await,

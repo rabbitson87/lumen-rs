@@ -2060,6 +2060,24 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "stream-keeps-decoding-for-a-client-that-left",
+        symptom: "the engine sent every stream event with `let _ = try_send`, so \
+                  a client that had hung up was never noticed: the decode ran on \
+                  to `max_tokens` while the engine, which serves one request at a \
+                  time, held up everyone behind it, and the batched scheduler \
+                  kept the dead sequence in its batch",
+        revert: &[Mutation {
+            path: SRV,
+            find: "        self.send(event).is_ok()",
+            replace: "        let _ = self.send(event);\n        true // defect: a client that has gone is never noticed",
+        }],
+        guards: &[
+            srv("engine::anthropic_stream_stops::a_sink_ends_the_decode_once_the_client_has_gone"),
+            srv("engine::finish_reason_mapping::the_batched_scheduler_notices_a_client_that_left"),
+        ],
+        ..PLAIN
+    },
+    Defect {
         name: "qwen-parser-drops-the-tail-held-for-a-delimiter",
         symptom: "text held back in case it became a delimiter (`<`, `<tool`) \
                   was dropped when the reply ended, so an answer that ended in \
@@ -2146,7 +2164,8 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "anthropic-batch-guard-omits-images")
         | (_, "completions-unguarded")
         | (_, "streams-delivered-in-one-burst")
-        | (_, "undeclared-tool-name-forwarded") => "engine.rs",
+        | (_, "undeclared-tool-name-forwarded")
+        | (_, "stream-keeps-decoding-for-a-client-that-left") => "engine.rs",
         (_, "server-binds-every-interface")
         | (_, "api-key-not-enforced")
         | (_, "cors-setting-ignored") => "access.rs",

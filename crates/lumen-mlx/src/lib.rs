@@ -3161,8 +3161,11 @@ impl MlxBackend {
                 let visible = {
                     let mut text_adapter = |chunk: &str| {
                         let (reasoning, visible) = splitter.feed(chunk);
-                        if !reasoning.is_empty() {
-                            let _ = on_event(BackendStreamEvent::Reasoning(&reasoning));
+                        if !reasoning.is_empty()
+                            && flow_of(on_event(BackendStreamEvent::Reasoning(&reasoning)))
+                                .is_break()
+                        {
+                            return ControlFlow::Break(());
                         }
                         if visible.is_empty() {
                             return ControlFlow::Continue(());
