@@ -6297,6 +6297,9 @@ impl MlxQwen35Backend {
                 forward_parse_event(ev, &mut on_event)?;
             }
         }
+        for ev in parser.flush() {
+            forward_parse_event(ev, &mut on_event)?;
+        }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
         eprintln!(

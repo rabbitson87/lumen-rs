@@ -9,8 +9,8 @@
 
 use crate::qwen3_5_tools::{Qwen35ParseEvent, Qwen35ResponseParser};
 
-/// Everything one run of the parser yields.
-#[derive(Debug)]
+/// Everything one run of the parser yields, to compare runs by.
+#[derive(Debug, PartialEq)]
 pub(crate) struct Outcome {
     /// What the events add up to: `(text, reasoning, tool-call starts)`.
     pub(crate) events: (String, String, usize),
@@ -21,7 +21,11 @@ pub(crate) struct Outcome {
 
 /// Feed `chunks` to a fresh parser, in order, and finish it.
 pub(crate) fn run(chunks: &[&str]) -> Outcome {
-    let mut p = Qwen35ResponseParser::new();
+    run_with(Qwen35ResponseParser::new(), chunks)
+}
+
+/// [`run`] on `p`, which may start anywhere (a thinking-open parser).
+pub(crate) fn run_with(mut p: Qwen35ResponseParser, chunks: &[&str]) -> Outcome {
     let (mut text, mut reasoning, mut starts) = (String::new(), String::new(), 0);
     for chunk in chunks {
         for event in p.feed(chunk) {
@@ -30,6 +34,13 @@ pub(crate) fn run(chunks: &[&str]) -> Outcome {
                 Qwen35ParseEvent::Reasoning(r) => reasoning.push_str(&r),
                 Qwen35ParseEvent::ToolCallStart { .. } => starts += 1,
             }
+        }
+    }
+    for event in p.flush() {
+        match event {
+            Qwen35ParseEvent::Text(t) => text.push_str(&t),
+            Qwen35ParseEvent::Reasoning(r) => reasoning.push_str(&r),
+            Qwen35ParseEvent::ToolCallStart { .. } => starts += 1,
         }
     }
     let done = p.finish();
@@ -48,15 +59,10 @@ pub(crate) fn run(chunks: &[&str]) -> Outcome {
 /// `data` is one byte that picks how finely the text is cut, then the text
 /// (invalid UTF-8 is read lossily, which keeps the fuzzer's inputs useful).
 ///
-/// Whatever the text and the cuts, the parser does not panic and the events add
-/// up to the response it finishes with — fed whole and fed in pieces alike.
-///
-/// What is deliberately not asserted is that the two runs agree. They do not,
-/// always: the template's `\n\n` after `</think>` is swallowed only when it
-/// arrives in the chunk with the tag, and a parameter value's leading newline
-/// is stripped at the opener when the opener's chunk holds it and again at the
-/// closer (task 025, Issues 3 and 4). Asserting agreement would have this fail
-/// on those two until they are fixed, and hide anything new behind them.
+/// Whatever the text and the cuts: the parser does not panic, the events add up
+/// to the response it finishes with, and the response is the one the whole text
+/// gives — which tokens a model happens to write must not change what a client
+/// is told.
 ///
 /// # Panics
 /// On any violation; this is assertion machinery for tests and fuzz targets.
@@ -77,10 +83,9 @@ pub fn assert_qwen35_parser_contract(data: &[u8]) {
         }
     }
     chunks.push(&text[from..]);
-    for (how, fed) in [("whole", vec![&*text]), ("in pieces", chunks)] {
-        let run = run(&fed);
-        assert_eq!(run.events.0, run.visible, "{how}: {text:?}");
-        assert_eq!(run.events.1, run.reasoning, "{how}: {text:?}");
-        assert!(run.events.2 >= run.calls.len(), "{how}: {text:?}");
-    }
+    let whole = run(&[&text]);
+    assert_eq!(whole.events.0, whole.visible, "{text:?}");
+    assert_eq!(whole.events.1, whole.reasoning, "{text:?}");
+    assert!(whole.events.2 >= whole.calls.len(), "{text:?}");
+    assert_eq!(run(&chunks), whole, "{text:?} as {chunks:?}");
 }

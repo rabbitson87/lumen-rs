@@ -785,6 +785,8 @@ enum State {
     Visible,
     /// Inside a `<think>...</think>` block — text goes to `reasoning`.
     Thinking,
+    /// `</think>` is consumed; the template's `\n\n` after it may still arrive.
+    AfterThink,
     /// Inside a `<tool_call>...</tool_call>` block but BEFORE the
     /// `<function=NAME>\n` line is fully parsed. `ToolCallStart` will
     /// fire on transition out of this state.
@@ -850,6 +852,7 @@ impl Qwen35ResponseParser {
             let progressed = match &self.state {
                 State::Visible => self.try_advance_visible(&mut events),
                 State::Thinking => self.try_advance_thinking(&mut events),
+                State::AfterThink => self.try_advance_after_think(),
                 State::InToolCallHeader => self.try_advance_header(&mut events),
                 State::InToolCallBody => self.try_advance_body(),
                 State::InParameterValue { .. } => self.try_advance_value(),
@@ -861,8 +864,31 @@ impl Qwen35ResponseParser {
         events
     }
 
+    /// The stream is over: text held back in case it became a delimiter is that
+    /// text after all. Returns what that adds, as events, for a loop that streams
+    /// them. An unfinished call, and a separator that never got its second
+    /// newline, add nothing.
+    pub fn flush(&mut self) -> Vec<Qwen35ParseEvent> {
+        let held = std::mem::take(&mut self.buffer);
+        if held.is_empty() {
+            return Vec::new();
+        }
+        match self.state {
+            State::Visible => {
+                self.visible.push_str(&held);
+                vec![Qwen35ParseEvent::Text(held)]
+            }
+            State::Thinking => {
+                self.reasoning.push_str(&held);
+                vec![Qwen35ParseEvent::Reasoning(held)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Consume the parser and return the final structured response.
-    pub fn finish(self) -> ParsedResponse {
+    pub fn finish(mut self) -> ParsedResponse {
+        self.flush();
         ParsedResponse {
             visible: self.visible,
             reasoning: self.reasoning,
@@ -985,20 +1011,8 @@ impl Qwen35ResponseParser {
             if !prefix.is_empty() {
                 events.push(Qwen35ParseEvent::Reasoning(prefix.clone()));
             }
-            let mut consumed = idx + "</think>".len();
-            // The template writes `'</think>\n\n' + content`, so the blank line
-            // is part of the delimiter and not the start of the answer. Taking
-            // it here is what stops a thinking-on reply reaching the client as
-            // `"\n\nRed"`. At most one separator, so an answer that genuinely
-            // opens with a blank line keeps it.
-            for sep in ["\n\n", "\n"] {
-                if self.buffer[consumed..].starts_with(sep) {
-                    consumed += sep.len();
-                    break;
-                }
-            }
-            self.buffer.drain(..consumed);
-            self.state = State::Visible;
+            self.buffer.drain(..idx + "</think>".len());
+            self.state = State::AfterThink;
             true
         } else {
             // Buffer might be split mid-delimiter. Drain everything
@@ -1014,6 +1028,27 @@ impl Qwen35ResponseParser {
                 false
             }
         }
+    }
+
+    /// The template writes `'</think>\n\n' + content`, so the blank line is part
+    /// of the delimiter and not the start of the answer. Taking it is what stops
+    /// a thinking-on reply reaching the client as `"\n\nRed"`. At most one
+    /// separator, so an answer that genuinely opens with a blank line keeps it.
+    ///
+    /// It is a state of its own because the tag and the separator are separate
+    /// tokens as often as not: deciding at the end of the chunk that holds the
+    /// tag lets a separator that arrives in the next one into the answer. A lone
+    /// `\n` waits too, since the next byte decides whether it is `\n` or `\n\n`.
+    fn try_advance_after_think(&mut self) -> bool {
+        if self.buffer.starts_with("\n\n") {
+            self.buffer.drain(.."\n\n".len());
+        } else if self.buffer.starts_with('\n') && self.buffer.len() > 1 {
+            self.buffer.drain(.."\n".len());
+        } else if self.buffer.is_empty() || self.buffer == "\n" {
+            return false;
+        }
+        self.state = State::Visible;
+        true
     }
 
     fn try_advance_header(&mut self, events: &mut Vec<Qwen35ParseEvent>) -> bool {
@@ -1083,10 +1118,10 @@ impl Qwen35ResponseParser {
             if let Some(gt) = self.buffer.find('>') {
                 let key = self.buffer[param_open.len()..gt].trim().to_string();
                 self.buffer.drain(..gt + 1);
-                // Strip one leading newline before VALUE
-                if self.buffer.starts_with('\n') {
-                    self.buffer.drain(..1);
-                }
+                // The newline that frames the value is stripped with its
+                // closing twin in `try_advance_value`, once, wherever the
+                // chunks fall; taking it here too would also take a blank line
+                // that is the value's own.
                 self.state = State::InParameterValue { key };
                 true
             } else {
@@ -2720,5 +2755,116 @@ mod non_ascii_input {
             }
             assert_qwen35_parser_contract(&data);
         }
+    }
+}
+
+/// A stream parser fed the same text must return the same response however the
+/// text was cut: the cuts are the decode loop's tokens, and which tokens a
+/// model writes is not something a client or a test controls.
+#[cfg(test)]
+mod chunk_independence {
+    use super::*;
+    use crate::parser_contract::{Outcome, run, run_with};
+
+    /// `text` whole, cut in two at every character boundary, and one character
+    /// at a time, on a parser from `new`: one outcome, returned.
+    fn the_same_every_way(text: &str, new: fn() -> Qwen35ResponseParser) -> Outcome {
+        let whole = run_with(new(), &[text]);
+        for at in text.char_indices().map(|(i, _)| i) {
+            let split = run_with(new(), &[&text[..at], &text[at..]]);
+            assert_eq!(split, whole, "{text:?} cut at {at}");
+        }
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        let chunks: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(
+            run_with(new(), &chunks),
+            whole,
+            "{text:?} one character at a time"
+        );
+        whole
+    }
+
+    /// The template writes `</think>\n\n` before the answer, and the blank line
+    /// belongs to the delimiter. The tools loop feeds the tag and the separator
+    /// as separate tokens, so it has to be swallowed wherever it arrives.
+    #[test]
+    fn the_separator_after_the_close_tag_is_swallowed_wherever_it_arrives() {
+        let new = Qwen35ResponseParser::new;
+        assert_eq!(
+            the_same_every_way("<think>x</think>\n\nRed", new).visible,
+            "Red"
+        );
+        assert_eq!(
+            the_same_every_way("<think>x</think>\nRed", new).visible,
+            "Red"
+        );
+        assert_eq!(
+            the_same_every_way("<think>x</think>Red", new).visible,
+            "Red"
+        );
+        // At most one separator: an answer that opens with a blank line keeps it.
+        assert_eq!(
+            the_same_every_way("<think>x</think>\n\n\n\nRed", new).visible,
+            "\n\nRed"
+        );
+        let split = run(&["<think>x</think>", "\n\n", "Red"]);
+        assert_eq!(split.visible, "Red");
+        assert_eq!(split.reasoning, "x");
+    }
+
+    /// With thinking on the prompt opened the block, so the close tag is bare.
+    #[test]
+    fn the_separator_is_swallowed_after_a_prompt_opened_the_block() {
+        let new = Qwen35ResponseParser::with_thinking_open;
+        assert_eq!(the_same_every_way("why</think>\n\nRed", new).visible, "Red");
+        let split = run_with(new(), &["why", "</think>", "\n\n", "Red"]);
+        assert_eq!(
+            (split.visible.as_str(), split.reasoning.as_str()),
+            ("Red", "why")
+        );
+    }
+
+    /// A call right after the close tag is a call, not an answer.
+    #[test]
+    fn a_call_right_after_the_close_tag() {
+        let text = "<think>x</think>\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>";
+        let r = the_same_every_way(text, Qwen35ResponseParser::new);
+        assert_eq!((r.visible.as_str(), r.calls.len()), ("", 1));
+    }
+
+    /// `<parameter=KEY>\nVALUE\n</parameter>`: one newline after the opener and
+    /// one before the closer are framing; a blank line after the opener is the
+    /// value's own. It was stripped at the opener when the newline arrived with
+    /// it and again at the closer, so the same call parsed two ways.
+    #[test]
+    fn a_value_keeps_its_blank_line_however_the_opener_is_cut() {
+        let text = "<tool_call>\n<function=f>\n<parameter=k>\n\nx\n</parameter>\n</function>\n</tool_call>";
+        let r = the_same_every_way(text, Qwen35ResponseParser::new);
+        assert_eq!(
+            r.calls,
+            [("f".to_string(), serde_json::json!({"k": "\nx"}))]
+        );
+        let framed =
+            "<tool_call>\n<function=f>\n<parameter=k>\nx\n</parameter>\n</function>\n</tool_call>";
+        let r = the_same_every_way(framed, Qwen35ResponseParser::new);
+        assert_eq!(r.calls, [("f".to_string(), serde_json::json!({"k": "x"}))]);
+    }
+
+    /// A reply that stops inside something that might have become a delimiter
+    /// is that text, not a shorter reply.
+    #[test]
+    fn a_reply_that_ends_inside_a_delimiter_keeps_its_tail() {
+        for text in ["a <", "a <tool", "a </thi", "<"] {
+            let mut p = Qwen35ResponseParser::new();
+            p.feed(text);
+            assert_eq!(p.finish().visible, text);
+        }
+        let mut p = Qwen35ResponseParser::with_thinking_open();
+        p.feed("why <");
+        let done = p.finish();
+        assert_eq!(
+            (done.reasoning.as_str(), done.visible.as_str()),
+            ("why <", "")
+        );
     }
 }

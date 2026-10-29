@@ -2019,6 +2019,61 @@ static DEFECTS: &[Defect] = &[
         ],
         ..PLAIN
     },
+    Defect {
+        name: "qwen-parser-separator-after-think-leaks-across-chunks",
+        symptom: "the parser swallowed the template's `\\n\\n` after `</think>` \
+                  only when it arrived in the chunk that held the tag. The \
+                  tools loop feeds the tag and the separator as separate \
+                  tokens, so a thinking-on reply reached the client as \
+                  `\"\\n\\nRed\"` — the very leak the same-chunk code was \
+                  written to stop",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        } else if self.buffer.is_empty() || self.buffer == \"\\n\" {\n            return false;\n        }\n        self.state = State::Visible;",
+            replace: "        }\n        // defect: decided at the end of the chunk\n        self.state = State::Visible;",
+        }],
+        guards: &[
+            core_mlx_lib(
+                "qwen3_5_tools::chunk_independence::the_separator_after_the_close_tag_is_swallowed_wherever_it_arrives",
+            ),
+            core_mlx_lib(
+                "qwen3_5_tools::chunk_independence::the_separator_is_swallowed_after_a_prompt_opened_the_block",
+            ),
+            core_mlx_lib("qwen3_5_tools::chunk_independence::a_call_right_after_the_close_tag"),
+        ],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-strips-a-value-newline-twice",
+        symptom: "a parameter value's framing newline was stripped when the \
+                  opener's chunk held it and again when the value closed, so a \
+                  value that begins with a blank line lost it if the chunks \
+                  fell one way and kept it if they fell another",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                self.state = State::InParameterValue { key };",
+            replace: "                if self.buffer.starts_with('\\n') {\n                    self.buffer.drain(..1); // defect: stripped here and at the closer\n                }\n                self.state = State::InParameterValue { key };",
+        }],
+        guards: &[core_mlx_lib(
+            "qwen3_5_tools::chunk_independence::a_value_keeps_its_blank_line_however_the_opener_is_cut",
+        )],
+        ..PLAIN
+    },
+    Defect {
+        name: "qwen-parser-drops-the-tail-held-for-a-delimiter",
+        symptom: "text held back in case it became a delimiter (`<`, `<tool`) \
+                  was dropped when the reply ended, so an answer that ended in \
+                  `a <` finished as `a `",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        let held = std::mem::take(&mut self.buffer);",
+            replace: "        let held = String::new(); // defect: the held tail is dropped",
+        }],
+        guards: &[core_mlx_lib(
+            "qwen3_5_tools::chunk_independence::a_reply_that_ends_inside_a_delimiter_keeps_its_tail",
+        )],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2124,6 +2179,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "jinja-render-encodes-client-text-as-control-tokens") => "jinja_chat.rs",
         (_, "qwen-parser-cuts-bytes-by-character-count") => "qwen3_5_tools.rs",
         (_, "stream-held-while-the-text-contains-a-replacement-character") => "stream_detok.rs",
+        (_, "qwen-parser-separator-after-think-leaks-across-chunks")
+        | (_, "qwen-parser-strips-a-value-newline-twice")
+        | (_, "qwen-parser-drops-the-tail-held-for-a-delimiter") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),
