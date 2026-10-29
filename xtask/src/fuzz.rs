@@ -65,6 +65,10 @@ const TARGETS: &[(&str, &str)] = &[
         "request_parse",
         "raw bytes → the five HTTP request deserializers; a panic is a remote crash",
     ),
+    (
+        "qwen_parser_feed",
+        "text cut into chunks → the Qwen tool-call stream parser; no panic, events add up, cuts change nothing",
+    ),
 ];
 
 pub fn main(args: Vec<String>) -> ExitCode {

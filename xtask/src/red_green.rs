@@ -1958,6 +1958,40 @@ static DEFECTS: &[Defect] = &[
         )],
         ..PLAIN
     },
+    Defect {
+        name: "qwen-parser-cuts-bytes-by-character-count",
+        symptom: "the Qwen tool-call parser counted leading whitespace in \
+                  characters and then cut that many bytes, so a non-breaking \
+                  or ideographic space after `<tool_call>` or in the call \
+                  body, or a Korean or emoji character where a `<parameter=` \
+                  should be, put the cut inside a multibyte character and \
+                  panicked — on the engine thread, which ends the server",
+        revert: &[
+            Mutation {
+                path: MLX,
+                find: "        let leading_ws = self.buffer.len() - self.buffer.trim_start().len();",
+                replace: "        let leading_ws = self.buffer.chars().take_while(|c| c.is_whitespace()).count(); // defect: characters used as byte offsets",
+            },
+            Mutation {
+                path: MLX,
+                find: "        let leading = self.buffer.len() - self.buffer.trim_start().len();",
+                replace: "        let leading = self.buffer.chars().take_while(|c| c.is_whitespace()).count(); // defect: characters used as byte offsets",
+            },
+            Mutation {
+                path: MLX,
+                find: "                let noise = self.buffer.chars().next().map_or(1, char::len_utf8);",
+                replace: "                let noise = 1; // defect: one byte, not one character",
+            },
+        ],
+        guards: &[
+            core_mlx_lib("qwen3_5_tools::non_ascii_input::a_non_breaking_space_after_the_opener"),
+            core_mlx_lib("qwen3_5_tools::non_ascii_input::unicode_whitespace_inside_the_body"),
+            core_mlx_lib(
+                "qwen3_5_tools::non_ascii_input::noise_before_a_parameter_opener_is_dropped_a_character_at_a_time",
+            ),
+        ],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2061,6 +2095,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "release-requires-notarization") => "release.yml",
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
         (_, "jinja-render-encodes-client-text-as-control-tokens") => "jinja_chat.rs",
+        (_, "qwen-parser-cuts-bytes-by-character-count") => "qwen3_5_tools.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),

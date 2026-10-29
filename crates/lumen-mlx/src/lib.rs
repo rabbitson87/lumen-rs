@@ -42,6 +42,8 @@ mod gemma4_tools;
 pub mod gemma4_vision;
 pub mod grammar;
 mod jinja_chat;
+#[doc(hidden)]
+pub mod parser_contract;
 /// Pre-flight prefill allocation budget. Ungated on purpose — see the module
 /// docs: it is the OOM guard's arithmetic, and it is only testable at tier 0
 /// because it is separated from the backend that consumes it.

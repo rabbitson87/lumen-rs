@@ -1021,14 +1021,10 @@ impl Qwen35ResponseParser {
         // Expected next: a `<function=NAME>\n` block. Strip leading
         // whitespace/newlines, then look for `<function=NAME>` followed
         // by `\n`.
-        // Skip leading whitespace
-        let leading_ws = self
-            .buffer
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .count();
+        // Skip leading whitespace — in bytes, since `is_whitespace` includes
+        // U+00A0 and U+3000, which are two and three of them.
+        let leading_ws = self.buffer.len() - self.buffer.trim_start().len();
         if leading_ws > 0 {
-            // Drain the whitespace bytes (char count == byte count for ASCII).
             self.buffer.drain(..leading_ws);
         }
         let fn_open = "<function=";
@@ -1078,12 +1074,8 @@ impl Qwen35ResponseParser {
         let param_open = "<parameter=";
         let fn_close = "</function>";
         let tool_close = "</tool_call>";
-        // Skip leading whitespace
-        let leading = self
-            .buffer
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .count();
+        // Skip leading whitespace, counted in bytes (see `try_advance_header`).
+        let leading = self.buffer.len() - self.buffer.trim_start().len();
         if leading > 0 {
             self.buffer.drain(..leading);
         }
@@ -1122,14 +1114,15 @@ impl Qwen35ResponseParser {
         } else {
             // Unrecognized prefix — could be partial `<parameter=` /
             // `</function>` / `</tool_call>` waiting for more tokens.
-            // Keep the maximum partial suffix; otherwise drop one byte
+            // Keep the maximum partial suffix; otherwise drop one character
             // to make progress (handles stray whitespace / noise).
             let keep = self.partial_suffix_len(param_open).max(
                 self.partial_suffix_len(fn_close)
                     .max(self.partial_suffix_len(tool_close)),
             );
             if self.buffer.len() > keep {
-                self.buffer.drain(..1);
+                let noise = self.buffer.chars().next().map_or(1, char::len_utf8);
+                self.buffer.drain(..noise);
                 true
             } else {
                 false
@@ -2591,5 +2584,141 @@ mod content_is_not_control_tokens {
         let path = std::path::Path::new(&dir).join("tokenizer.json");
         let hf = tokenizers::Tokenizer::from_file(&path).expect("tokenizer.json");
         assert_content_adds_no_control_tokens(hf);
+    }
+}
+
+/// The parser reads text a model decoded, and that is not only ASCII: a
+/// non-breaking or ideographic space after `<tool_call>`, Korean or an emoji
+/// where a `<parameter=` should be. The cuts it makes are byte offsets, so a
+/// character count used as one lands inside a multibyte character and panics —
+/// on the engine thread, which takes the whole server down with it.
+#[cfg(test)]
+mod non_ascii_input {
+    use super::*;
+    use crate::parser_contract::assert_qwen35_parser_contract;
+
+    /// A well-formed call, to put noise into.
+    fn call(after_open: &str, in_body: &str) -> String {
+        format!(
+            "<tool_call>{after_open}<function=read>\n{in_body}\
+             <parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    /// What the parser returns for `text` fed as `chunks`.
+    fn parse(chunks: &[&str]) -> ParsedResponse {
+        let mut p = Qwen35ResponseParser::new();
+        for chunk in chunks {
+            p.feed(chunk);
+        }
+        p.finish()
+    }
+
+    /// Whole, split in two at every character boundary, and one character at a
+    /// time: the same single `read` call every way.
+    fn assert_one_read_call(text: &str) {
+        let want = |r: &ParsedResponse, how: &str| {
+            assert_eq!(r.tool_calls.len(), 1, "{how}: {text:?}");
+            assert_eq!(r.tool_calls[0].name, "read", "{how}: {text:?}");
+            assert_eq!(
+                r.tool_calls[0].arguments,
+                serde_json::json!({"path": "src/lib.rs"}),
+                "{how}: {text:?}"
+            );
+        };
+        want(&parse(&[text]), "whole");
+        for at in text.char_indices().map(|(i, _)| i) {
+            want(
+                &parse(&[&text[..at], &text[at..]]),
+                &format!("split at {at}"),
+            );
+        }
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        let chunks: Vec<&str> = chars.iter().map(String::as_str).collect();
+        want(&parse(&chunks), "one character at a time");
+    }
+
+    #[test]
+    fn a_non_breaking_space_after_the_opener() {
+        assert_one_read_call(&call("\u{a0}", ""));
+    }
+
+    #[test]
+    fn an_ideographic_space_after_the_opener() {
+        assert_one_read_call(&call("\u{3000}\n", ""));
+    }
+
+    #[test]
+    fn unicode_whitespace_inside_the_body() {
+        assert_one_read_call(&call("\n", "\u{a0}\u{3000}\u{2003}"));
+    }
+
+    #[test]
+    fn noise_before_a_parameter_opener_is_dropped_a_character_at_a_time() {
+        assert_one_read_call(&call("\n", "한국어 😀 "));
+    }
+
+    #[test]
+    fn noise_before_the_function_opener() {
+        assert_one_read_call(&call("한국어 😀\n", ""));
+    }
+
+    /// Pieces a model's output is made of, delimiters and their fragments
+    /// beside multibyte whitespace and text, so random strings keep landing on
+    /// the parser's boundaries.
+    const PIECES: &[&str] = &[
+        "<tool_call>",
+        "</tool_call>",
+        "<function=read>",
+        "<function=",
+        "</function>",
+        "<parameter=path>",
+        "<parameter=",
+        "</parameter>",
+        "<think>",
+        "</think>",
+        "\n",
+        " ",
+        "\u{a0}",
+        "\u{3000}",
+        "\u{2003}",
+        "한",
+        "😀",
+        "é",
+        "<",
+        ">",
+        "=",
+        "x",
+    ];
+
+    /// xorshift64*: deterministic, so a failure names a seed to replay.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Random text built from the parser's own delimiters and multibyte
+    /// characters, held to [`assert_qwen35_parser_contract`] — the function the
+    /// `qwen_parser_feed` fuzz target and its replay call too.
+    #[test]
+    fn random_text_in_random_chunks_meets_the_parser_contract() {
+        for seed in 1..=4000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut data = vec![rng.below(256) as u8];
+            for _ in 0..rng.below(40) {
+                data.extend_from_slice(PIECES[rng.below(PIECES.len())].as_bytes());
+            }
+            assert_qwen35_parser_contract(&data);
+        }
     }
 }
