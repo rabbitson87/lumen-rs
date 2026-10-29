@@ -54,6 +54,7 @@ pub mod prompt_text;
 /// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
 pub mod qwen35_config;
 pub mod qwen36_vision;
+pub(crate) mod stream_detok;
 pub mod text_tokenizer;
 pub use text_tokenizer::{TextTokenizer, TokenizeSnapshot, TokenizeStats};
 /// Resource-bounded image decoding shared by both image towers.
@@ -332,6 +333,7 @@ use runner_native::NativeMlxRunner;
 
 use chat_io::PromptSource;
 use prompt_text::PromptText;
+use stream_detok::StreamDetok;
 
 pub use native_runtime::FineTimings;
 
@@ -4283,7 +4285,7 @@ impl MlxQwen35Backend {
         );
 
         let mut generated: Vec<u32> = Vec::new();
-        let mut prev_text = String::new();
+        let mut detok = StreamDetok::whole();
         let mut n_attempts: u64 = 0;
         let mut n_accept_tokens: u64 = 0;
         let mut n_verify_tokens: u64 = 0;
@@ -4301,11 +4303,8 @@ impl MlxQwen35Backend {
             ($tok:expr) => {{
                 let tok = $tok;
                 generated.push(tok);
-                if let Ok(text) = self.decode(&generated) {
-                    if text.len() > prev_text.len() && !text.contains('\u{FFFD}') {
-                        on_token(&text[prev_text.len()..]);
-                        prev_text = text;
-                    }
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 step += 1;
                 if self.eos_tokens.contains(&tok) || step >= max_new_tokens {
@@ -5188,14 +5187,10 @@ impl MlxQwen35Backend {
         }
 
         let mut generated: Vec<u32> = vec![last];
-        let mut emitted_idx: usize = 0;
+        let mut detok = StreamDetok::tail();
         let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             halted = on_token(&text).is_break();
-            emitted_idx = generated.len();
         }
         if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -5242,13 +5237,7 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            let tail_start = emitted_idx;
-            if tail_start < generated.len()
-                && let Ok(text) = self.decode(&generated[tail_start..])
-                && !text.is_empty()
-                && !text.contains('\u{FFFD}')
-            {
-                emitted_idx = generated.len();
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 // The caller has what it needs (the first complete JSON value):
                 // the tokens after it would only be dropped.
                 if on_token(&text).is_break() {
@@ -5573,15 +5562,15 @@ impl MlxQwen35Backend {
         let mut n_emits: usize = 0;
 
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        let mut emitted_idx: usize = 0;
+        let mut detok = if incr_detok {
+            StreamDetok::tail()
+        } else {
+            StreamDetok::whole()
+        };
         // `on_token` ends the loop when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
         let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             if stream_timing {
                 let now = std::time::Instant::now();
                 if t_first_emit.is_none() {
@@ -5594,8 +5583,6 @@ impl MlxQwen35Backend {
                 n_emits += 1;
             }
             halted = on_token(&text).is_break();
-            prev_text = text;
-            emitted_idx = generated.len();
         }
         if halted || self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -5610,31 +5597,7 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            if incr_detok {
-                let tail_start = emitted_idx;
-                if tail_start < generated.len()
-                    && let Ok(text) = self.decode(&generated[tail_start..])
-                    && !text.is_empty()
-                    && !text.contains('\u{FFFD}')
-                {
-                    if stream_timing {
-                        let now = std::time::Instant::now();
-                        if t_first_emit.is_none() {
-                            t_first_emit = Some(now);
-                        }
-                        if n_emits == stream_skip {
-                            t_skip_emit = Some(now);
-                        }
-                        t_last_emit = Some(now);
-                        n_emits += 1;
-                    }
-                    halted = on_token(&text).is_break();
-                    emitted_idx = generated.len();
-                }
-            } else if let Ok(text) = self.decode(&generated)
-                && text.len() > prev_text.len()
-                && !text.contains('\u{FFFD}')
-            {
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 if stream_timing {
                     let now = std::time::Instant::now();
                     if t_first_emit.is_none() {
@@ -5646,8 +5609,7 @@ impl MlxQwen35Backend {
                     t_last_emit = Some(now);
                     n_emits += 1;
                 }
-                halted = on_token(&text[prev_text.len()..]).is_break();
-                prev_text = text;
+                halted = on_token(&text).is_break();
             }
             if halted {
                 break;
@@ -6164,16 +6126,13 @@ impl MlxQwen35Backend {
 
         // Detokenize + parser-feed for the first decoded token.
         let mut generated: Vec<u32> = vec![last];
-        let mut emitted_idx: usize = 0;
-        if let Ok(text) = self.decode(&generated) {
+        let mut detok = StreamDetok::tail();
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             if debug_qwen_tools {
                 eprintln!("[qwen35-tools] first decoded text: {text:?}");
             }
-            if !text.is_empty() && !text.contains('\u{FFFD}') {
-                for ev in parser.feed(&text) {
-                    forward_parse_event(ev, &mut on_event)?;
-                }
-                emitted_idx = generated.len();
+            for ev in parser.feed(&text) {
+                forward_parse_event(ev, &mut on_event)?;
             }
         }
         if self.eos_tokens.contains(&last) {
@@ -6245,7 +6204,7 @@ impl MlxQwen35Backend {
                     combined.extend_from_slice(&inj_tokens);
                     let (next2, pos2) = self.runner.extend(seq_id, &combined)?;
                     generated.extend_from_slice(&inj_tokens);
-                    emitted_idx = generated.len();
+                    detok.skip_to(generated.len());
                     for ev in parser.feed(&inj) {
                         forward_parse_event(ev, &mut on_event)?;
                     }
@@ -6258,14 +6217,10 @@ impl MlxQwen35Backend {
                     last = next2;
                     pos = pos2;
                     generated.push(last);
-                    if let Ok(text) = self.decode(&generated[emitted_idx..])
-                        && !text.is_empty()
-                        && !text.contains('\u{FFFD}')
-                    {
+                    if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                         for ev in parser.feed(&text) {
                             forward_parse_event(ev, &mut on_event)?;
                         }
-                        emitted_idx = generated.len();
                     }
                     if self.eos_tokens.contains(&last) {
                         break;
@@ -6317,19 +6272,13 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            let tail_start = emitted_idx;
-            if tail_start < generated.len()
-                && let Ok(text) = self.decode(&generated[tail_start..])
-                && !text.is_empty()
-                && !text.contains('\u{FFFD}')
-            {
+            if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
                 if debug_qwen_tools {
                     eprintln!("[qwen35-tools] step={step} text={text:?}");
                 }
                 for ev in parser.feed(&text) {
                     forward_parse_event(ev, &mut on_event)?;
                 }
-                emitted_idx = generated.len();
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6555,13 +6504,9 @@ impl MlxQwen35Backend {
 
         // ── Decode loop (parallel to chat_streaming) ──
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        let mut detok = StreamDetok::whole();
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             on_token(&text);
-            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             self.persist_boundary_snapshot(persist_after.take(), prefix_cache_key);
@@ -6577,12 +6522,8 @@ impl MlxQwen35Backend {
             last = next;
             pos = new_pos;
             generated.push(next);
-            if let Ok(text) = self.decode(&generated)
-                && text.len() > prev_text.len()
-                && !text.contains('\u{FFFD}')
-            {
-                on_token(&text[prev_text.len()..]);
-                prev_text = text;
+            if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                on_token(&fresh);
             }
             if self.eos_tokens.contains(&next) {
                 eprintln!(
@@ -6808,7 +6749,7 @@ impl MlxQwen35Backend {
         }
 
         let mut generated: Vec<u32> = Vec::new();
-        let mut prev_text = String::new();
+        let mut detok = StreamDetok::whole();
         let mut stats = spec_decode::SpecStats::default();
 
         let t_decode = std::time::Instant::now();
@@ -6834,12 +6775,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -6864,12 +6801,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, t_pred);
                 history.push(t_pred);
                 stats.committed_via_baseline += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&t_pred) {
                     break;
@@ -6911,12 +6844,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d1);
                 history.push(d1);
                 stats.committed_via_spec += 2;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&d0) || self.eos_tokens.contains(&d1) {
                     break;
@@ -6930,12 +6859,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, row1);
                 history.push(row1);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&row1) {
                     break;
@@ -6958,12 +6883,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, d0);
                 history.push(d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&d0) {
                     break;
@@ -6980,12 +6901,8 @@ impl MlxQwen35Backend {
                 ngram.observe(&history, after_d0);
                 history.push(after_d0);
                 stats.committed_via_spec += 1;
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(&after_d0) {
                     break;
@@ -7047,13 +6964,9 @@ impl MlxQwen35Backend {
         );
 
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        let mut detok = StreamDetok::whole();
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             on_token(&text);
-            prev_text = text;
         }
         if self.eos_tokens.contains(&last) {
             let out = self.decode(&generated).unwrap_or_default();
@@ -7112,12 +7025,8 @@ impl MlxQwen35Backend {
                     break;
                 }
                 generated.push(*tok);
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    on_token(&text[prev_text.len()..]);
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    on_token(&fresh);
                 }
                 if self.eos_tokens.contains(tok) {
                     stop = true;
@@ -7214,16 +7123,12 @@ impl MlxQwen35Backend {
         )?;
 
         let mut generated: Vec<u32> = vec![last];
-        let mut prev_text = String::new();
+        let mut detok = StreamDetok::whole();
         // `on_token` ends the loop when the caller has what it needs (a client
         // stop sequence matched): the tokens after it would only be dropped.
         let mut halted = false;
-        if let Ok(text) = self.decode(&generated)
-            && !text.is_empty()
-            && !text.contains('\u{FFFD}')
-        {
+        if let Some(text) = detok.next(&generated, |t| self.decode(t)) {
             halted = on_token(&text).is_break();
-            prev_text = text;
         }
 
         if !halted && !self.eos_tokens.contains(&last) {
@@ -7232,12 +7137,8 @@ impl MlxQwen35Backend {
                 last = next;
                 pos = new_pos;
                 generated.push(next);
-                if let Ok(text) = self.decode(&generated)
-                    && text.len() > prev_text.len()
-                    && !text.contains('\u{FFFD}')
-                {
-                    halted = on_token(&text[prev_text.len()..]).is_break();
-                    prev_text = text;
+                if let Some(fresh) = detok.next(&generated, |t| self.decode(t)) {
+                    halted = on_token(&fresh).is_break();
                 }
                 if halted || self.eos_tokens.contains(&next) {
                     break;
