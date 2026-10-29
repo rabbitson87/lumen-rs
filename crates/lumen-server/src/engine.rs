@@ -9,6 +9,7 @@ use lumen_mlx::chat_io::{
     AssistantToolCall, BackendStreamEvent, ChatTurn, ParsedResponse, ParsedToolCall,
     ResolvedToolChoice, StopCause, ToolDef,
 };
+use lumen_mlx::stream_detok::StreamDetok;
 
 /// Prints the tokenizer work one request did when it goes out of scope, so a
 /// guard rejection or an early `?` return is still reported.
@@ -3531,10 +3532,11 @@ impl InferenceEngine {
                 seq.generated.push(next_tok);
                 seq.last_token = next_tok;
                 seq.position = new_pos;
+                let last = seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new;
                 if let Some((visible, reasoning)) = channels {
-                    emit_channel_delta(seq, visible, reasoning);
+                    emit_channel_delta(seq, visible, reasoning, last);
                 }
-                if seq.eos_tokens.contains(&next_tok) || seq.generated.len() >= seq.max_new {
+                if last {
                     let n_gen = seq.generated.len();
                     let _ = seq.token_tx.try_send(StreamEvent::Done {
                         prompt_tokens: seq.prompt_tokens,
@@ -3637,15 +3639,13 @@ impl InferenceEngine {
         // token 0 (e.g. when the very first token opens the `<|channel>` span).
         let generated = vec![first_tok];
         let (vis0, rea0) = qb.stream_channels(&generated).unwrap_or_default();
-        let mut prev_text = String::new();
-        let mut prev_reasoning = String::new();
-        if !vis0.contains('\u{FFFD}') && !vis0.is_empty() {
-            let _ = token_tx.try_send(StreamEvent::Delta(vis0.clone()));
-            prev_text = vis0;
+        let mut visible = StreamDetok::whole();
+        let mut reasoning = StreamDetok::whole();
+        if let Some(delta) = visible.next(&generated, |_| Ok(vis0)) {
+            let _ = token_tx.try_send(StreamEvent::Delta(delta));
         }
-        if !rea0.contains('\u{FFFD}') && !rea0.is_empty() {
-            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(rea0.clone()));
-            prev_reasoning = rea0;
+        if let Some(delta) = reasoning.next(&generated, |_| Ok(rea0)) {
+            let _ = token_tx.try_send(StreamEvent::ReasoningDelta(delta));
         }
         let done = eos_tokens.contains(&first_tok) || generated.len() >= max_new;
 
@@ -3655,8 +3655,8 @@ impl InferenceEngine {
             max_new,
             last_token: first_tok,
             position,
-            prev_text,
-            prev_reasoning,
+            visible,
+            reasoning,
             prompt_tokens,
             eos_tokens,
         };
@@ -3856,11 +3856,11 @@ pub(crate) struct ActiveSeqState {
     pub max_new: usize,
     pub last_token: u32,
     pub position: usize,
-    pub prev_text: String,
-    /// Channel-aware streaming: cumulative reasoning-channel text already
-    /// emitted as `ReasoningDelta`. Mirrors `prev_text` for the visible
-    /// channel.
-    pub prev_reasoning: String,
+    /// What of the visible channel has gone out as `Delta`.
+    pub visible: StreamDetok,
+    /// Channel-aware streaming: what of the reasoning channel has gone out as
+    /// `ReasoningDelta`. Mirrors `visible`.
+    pub reasoning: StreamDetok,
     pub prompt_tokens: u32,
     /// EOS token IDs used by the batched decode loop for this sequence.
     pub eos_tokens: Vec<u32>,
@@ -3877,38 +3877,32 @@ impl ActiveSeqState {
     }
 }
 
-/// Overlap-scheduling helper: detokenize the seq's full `generated` prefix and
-/// emit the incremental text delta vs `prev_text`, then clear `pending_emit`.
-///
-/// This is intentionally *cumulative* (decode the whole prefix, diff against
-/// `prev_text`) rather than per-token: the diff `text[prev_text.len()..]`
-/// guarantees that emitting "one decode step late" produces a byte-for-byte
-/// identical stream to emitting eagerly — no byte is ever dropped or
-/// duplicated, regardless of how many tokens accumulated since the last flush.
-/// Multi-byte UTF-8 boundaries are handled by the replacement-char guard
-/// exactly as the original synchronous path did.
-/// Channel-aware incremental emit for the MLX batched scheduler. Diffs the
-/// freshly-decoded `(visible, reasoning)` channel strings against the seq's
-/// cumulative `prev_text` / `prev_reasoning` and sends only the new tail of
-/// each channel (`Delta` / `ReasoningDelta`). The replacement-char guard skips
-/// emitting across an incomplete multi-byte UTF-8 boundary exactly like the
-/// flat-decode path: the next token completes the char and the cumulative diff
-/// recovers the held bytes, so no byte is dropped or duplicated.
+/// Channel-aware incremental emit for the MLX batched scheduler. Hands the
+/// freshly-decoded `(visible, reasoning)` channel strings to the seq's two
+/// [`StreamDetok`]s and sends the new tail of each (`Delta` / `ReasoningDelta`).
+/// A tail that ends in an incomplete multi-byte UTF-8 character is held until
+/// the next token completes it; a replacement character the model wrote is
+/// sent like any other text. `last` is the seq's final token: whatever is still
+/// held goes out with it.
 #[cfg(feature = "mlx-native")]
-fn emit_channel_delta(seq: &mut ActiveSeqState, visible: String, reasoning: String) {
-    if !visible.contains('\u{FFFD}') && visible.len() > seq.prev_text.len() {
-        let delta = visible[seq.prev_text.len()..].to_string();
-        if !delta.is_empty() {
-            let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
-            seq.prev_text = visible;
-        }
+fn emit_channel_delta(seq: &mut ActiveSeqState, visible: String, reasoning: String, last: bool) {
+    let generated = &seq.generated;
+    let (visible, reasoning) = if last {
+        (
+            seq.visible.finish(generated, |_| Ok(visible)),
+            seq.reasoning.finish(generated, |_| Ok(reasoning)),
+        )
+    } else {
+        (
+            seq.visible.next(generated, |_| Ok(visible)),
+            seq.reasoning.next(generated, |_| Ok(reasoning)),
+        )
+    };
+    if let Some(delta) = visible {
+        let _ = seq.token_tx.try_send(StreamEvent::Delta(delta));
     }
-    if !reasoning.contains('\u{FFFD}') && reasoning.len() > seq.prev_reasoning.len() {
-        let delta = reasoning[seq.prev_reasoning.len()..].to_string();
-        if !delta.is_empty() {
-            let _ = seq.token_tx.try_send(StreamEvent::ReasoningDelta(delta));
-            seq.prev_reasoning = reasoning;
-        }
+    if let Some(delta) = reasoning {
+        let _ = seq.token_tx.try_send(StreamEvent::ReasoningDelta(delta));
     }
 }
 
@@ -5074,14 +5068,70 @@ mod finish_reason_mapping {
             max_new: 3,
             last_token: 0,
             position: 0,
-            prev_text: String::new(),
-            prev_reasoning: String::new(),
+            visible: lumen_mlx::stream_detok::StreamDetok::whole(),
+            reasoning: lumen_mlx::stream_detok::StreamDetok::whole(),
             prompt_tokens: 0,
             eos_tokens: vec![2],
         };
         assert_eq!(seq(vec![5, 6, 7]).finish_reason(), FinishReason::Length);
         assert_eq!(seq(vec![5, 6, 2]).finish_reason(), FinishReason::Stop);
         assert_eq!(seq(vec![2]).finish_reason(), FinishReason::Stop);
+    }
+
+    /// What the batched scheduler's per-token emit sends for a channel whose
+    /// text so far is, step by step, `steps`; the last one ends the sequence
+    /// when `last` is set.
+    #[cfg(feature = "mlx-native")]
+    fn batched_stream(steps: &[&str], last: bool) -> String {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut seq = super::ActiveSeqState {
+            token_tx: tx,
+            generated: Vec::new(),
+            max_new: 100,
+            last_token: 0,
+            position: 0,
+            visible: lumen_mlx::stream_detok::StreamDetok::whole(),
+            reasoning: lumen_mlx::stream_detok::StreamDetok::whole(),
+            prompt_tokens: 0,
+            eos_tokens: Vec::new(),
+        };
+        for (n, text) in steps.iter().enumerate() {
+            seq.generated.push(n as u32);
+            let is_last = last && n + 1 == steps.len();
+            super::emit_channel_delta(&mut seq, (*text).to_string(), String::new(), is_last);
+        }
+        let mut sent = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let super::StreamEvent::Delta(text) = event {
+                sent.push_str(&text);
+            }
+        }
+        sent
+    }
+
+    /// A replacement character the model wrote used to end the stream: the
+    /// channel's text contained it from then on, so nothing after it was sent.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn a_replacement_character_the_model_wrote_does_not_end_the_batched_stream() {
+        let steps = [
+            "a",
+            "a\u{FFFD}",
+            "a\u{FFFD}b",
+            "a\u{FFFD}bc",
+            "a\u{FFFD}bcd",
+        ];
+        assert_eq!(batched_stream(&steps, false), "a\u{FFFD}bcd");
+    }
+
+    /// A character the model began and never finished is held for the token
+    /// that would complete it, and goes out with the last one.
+    #[cfg(feature = "mlx-native")]
+    #[test]
+    fn the_last_token_sends_what_the_batched_stream_held() {
+        let steps = ["a", "a\u{FFFD}"];
+        assert_eq!(batched_stream(&steps, false), "a");
+        assert_eq!(batched_stream(&steps, true), "a\u{FFFD}");
     }
 }
 

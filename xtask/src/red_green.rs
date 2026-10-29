@@ -1992,6 +1992,33 @@ static DEFECTS: &[Defect] = &[
         ],
         ..PLAIN
     },
+    Defect {
+        name: "stream-held-while-the-text-contains-a-replacement-character",
+        symptom: "every decode loop sent the text decoded since its last send \
+                  only if it held no U+FFFD, to avoid sending half a \
+                  character. A replacement character the model really wrote \
+                  — an echoed file, a stray byte — stayed in that text for \
+                  good, so nothing after it was ever streamed, a later tool \
+                  call never reached the parser, and the batched scheduler's \
+                  channel diff stopped the same way",
+        revert: &[Mutation {
+            path: MLX,
+            find: "        if may_hold && self.held + 1 < MAX_HELD_TOKENS && fresh.ends_with(REPLACEMENT) {",
+            replace: "        if fresh.contains(REPLACEMENT) {\n            // defect: any replacement character holds the stream for good",
+        }],
+        guards: &[
+            core_mlx_lib(
+                "stream_detok::tests::a_genuine_replacement_character_does_not_end_the_stream",
+            ),
+            core_mlx_lib(
+                "stream_detok::tests::a_tool_call_after_a_replacement_character_reaches_the_parser",
+            ),
+            srv(
+                "engine::finish_reason_mapping::a_replacement_character_the_model_wrote_does_not_end_the_batched_stream",
+            ),
+        ],
+        ..PLAIN
+    },
 ];
 
 /// The file each mutation edits. `Mutation::path` names the source *directory*
@@ -2096,6 +2123,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "unsigned-bundle-reads-as-damaged") => "tauri.conf.json",
         (_, "jinja-render-encodes-client-text-as-control-tokens") => "jinja_chat.rs",
         (_, "qwen-parser-cuts-bytes-by-character-count") => "qwen3_5_tools.rs",
+        (_, "stream-held-while-the-text-contains-a-replacement-character") => "stream_detok.rs",
         (_, "runtime-kernel-needs-newer-metal") => "native_ssm.rs",
         (_, "qwen-extend-clamp-ignores-cached-prefix") => "runner_native.rs",
         _ => unreachable!("no file mapped for {}", defect.name),

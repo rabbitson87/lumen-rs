@@ -54,7 +54,7 @@ pub mod prompt_text;
 /// Qwen 3.5/3.6 `config.json` parsing. Ungated on purpose — see the module docs.
 pub mod qwen35_config;
 pub mod qwen36_vision;
-pub(crate) mod stream_detok;
+pub mod stream_detok;
 pub mod text_tokenizer;
 pub use text_tokenizer::{TextTokenizer, TokenizeSnapshot, TokenizeStats};
 /// Resource-bounded image decoding shared by both image towers.
@@ -5622,6 +5622,9 @@ impl MlxQwen35Backend {
                 break;
             }
         }
+        if !halted && let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            let _ = on_token(&text);
+        }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
         eprintln!(
@@ -6288,6 +6291,12 @@ impl MlxQwen35Backend {
                 break;
             }
         }
+        // Tokens still held back for a character they might have completed.
+        if let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            for ev in parser.feed(&text) {
+                forward_parse_event(ev, &mut on_event)?;
+            }
+        }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
         eprintln!(
@@ -6532,6 +6541,9 @@ impl MlxQwen35Backend {
                 );
                 break;
             }
+        }
+        if let Some(text) = detok.finish(&generated, |t| self.decode(t)) {
+            on_token(&text);
         }
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
         let n_gen = generated.len();
