@@ -627,6 +627,10 @@ mod imp {
         pub sw_up_s: Array,
         pub sw_down_w: Array,
         pub sw_down_s: Array,
+        // Affine only: mxfp4/nvfp4 carry no biases, affine carries one next to every scales.
+        pub sw_gate_b: Option<Array>,
+        pub sw_up_b: Option<Array>,
+        pub sw_down_b: Option<Array>,
         pub sw_gs: i32,
         pub sw_bits: i32,
         pub sw_mode: &'static CStr,
@@ -637,6 +641,9 @@ mod imp {
         pub se_up_s: Array,
         pub se_down_w: Array,
         pub se_down_s: Array,
+        pub se_gate_b: Option<Array>,
+        pub se_up_b: Option<Array>,
+        pub se_down_b: Option<Array>,
         pub se_gs: i32,
         pub se_bits: i32,
         pub se_mode: &'static CStr,
@@ -665,17 +672,17 @@ mod imp {
                     gate_proj: SwitchExpertWeights {
                         weight: &self.sw_gate_w,
                         scales: &self.sw_gate_s,
-                        biases: None,
+                        biases: self.sw_gate_b.as_ref(),
                     },
                     up_proj: SwitchExpertWeights {
                         weight: &self.sw_up_w,
                         scales: &self.sw_up_s,
-                        biases: None,
+                        biases: self.sw_up_b.as_ref(),
                     },
                     down_proj: SwitchExpertWeights {
                         weight: &self.sw_down_w,
                         scales: &self.sw_down_s,
-                        biases: None,
+                        biases: self.sw_down_b.as_ref(),
                     },
                     group_size: self.sw_gs,
                     bits: self.sw_bits,
@@ -684,13 +691,13 @@ mod imp {
                 shared_expert: SharedMlpWeights {
                     gate_proj_w: &self.se_gate_w,
                     gate_proj_s: &self.se_gate_s,
-                    gate_proj_b: None,
+                    gate_proj_b: self.se_gate_b.as_ref(),
                     up_proj_w: &self.se_up_w,
                     up_proj_s: &self.se_up_s,
-                    up_proj_b: None,
+                    up_proj_b: self.se_up_b.as_ref(),
                     down_proj_w: &self.se_down_w,
                     down_proj_s: &self.se_down_s,
-                    down_proj_b: None,
+                    down_proj_b: self.se_down_b.as_ref(),
                     group_size: self.se_gs,
                     bits: self.se_bits,
                     mode: self.se_mode,
@@ -704,7 +711,11 @@ mod imp {
                 }),
                 top_k: self.top_k,
                 norm_topk_prob: self.norm_topk_prob,
-                experts_in_scale_dtype: false,
+                // An affine checkpoint's scales are bf16 and the activations f32, and MLX would
+                // cast the experts' whole stacked scales and biases to f32 on every gather;
+                // meeting the scales' dtype instead casts only the activations. mxfp4/nvfp4
+                // scales are integers, so this changes nothing for them.
+                experts_in_scale_dtype: self.sw_mode == MODE_AFFINE,
                 offload: None,
             }
         }
@@ -1051,6 +1062,21 @@ mod imp {
         let sw_up_s = require_clone(weights, &format!("{prefix}.switch_mlp.up_proj.scales"))?;
         let sw_down_w = require_clone(weights, &format!("{prefix}.switch_mlp.down_proj.weight"))?;
         let sw_down_s = require_clone(weights, &format!("{prefix}.switch_mlp.down_proj.scales"))?;
+        let bias_of = |name: String| weights.get(&name).cloned();
+        let sw_gate_b = bias_of(format!("{prefix}.switch_mlp.gate_proj.biases"));
+        let sw_up_b = bias_of(format!("{prefix}.switch_mlp.up_proj.biases"));
+        let sw_down_b = bias_of(format!("{prefix}.switch_mlp.down_proj.biases"));
+        // MLX refuses an affine gather without biases ("Biases must be provided for affine
+        // quantization"), and it says so at the first prefill as a bare status code.
+        if sw_mode == MODE_AFFINE
+            && [&sw_gate_b, &sw_up_b, &sw_down_b]
+                .iter()
+                .any(|b| b.is_none())
+        {
+            return Err(anyhow!(
+                "{prefix}.switch_mlp is affine-quantized but ships no .biases next to its scales"
+            ));
+        }
 
         let (se_gs, se_bits, se_mode) =
             quant_params_resolve(config, &format!("{prefix}.shared_expert.gate_proj"));
@@ -1064,6 +1090,18 @@ mod imp {
             require_clone(weights, &format!("{prefix}.shared_expert.down_proj.weight"))?;
         let se_down_s =
             require_clone(weights, &format!("{prefix}.shared_expert.down_proj.scales"))?;
+        let se_gate_b = bias_of(format!("{prefix}.shared_expert.gate_proj.biases"));
+        let se_up_b = bias_of(format!("{prefix}.shared_expert.up_proj.biases"));
+        let se_down_b = bias_of(format!("{prefix}.shared_expert.down_proj.biases"));
+        if se_mode == MODE_AFFINE
+            && [&se_gate_b, &se_up_b, &se_down_b]
+                .iter()
+                .any(|b| b.is_none())
+        {
+            return Err(anyhow!(
+                "{prefix}.shared_expert is affine-quantized but ships no .biases next to its scales"
+            ));
+        }
 
         Ok(ResolvedMoeWeights {
             gate_w,
@@ -1077,6 +1115,9 @@ mod imp {
             sw_up_s,
             sw_down_w,
             sw_down_s,
+            sw_gate_b,
+            sw_up_b,
+            sw_down_b,
             sw_gs,
             sw_bits,
             sw_mode,
@@ -1086,6 +1127,9 @@ mod imp {
             se_up_s,
             se_down_w,
             se_down_s,
+            se_gate_b,
+            se_up_b,
+            se_down_b,
             se_gs,
             se_bits,
             se_mode,
@@ -1097,6 +1141,104 @@ mod imp {
             top_k: cfg.num_experts_per_tok as i32,
             norm_topk_prob: cfg.norm_topk_prob,
         })
+    }
+
+    /// An affine checkpoint carries a `.biases` next to every `.scales`, and MLX refuses an
+    /// affine `gather_qmm` without them. The loader used to read only `.weight` and `.scales`
+    /// and hand `biases: None` to every expert, so an affine MoE died at its first prefill with
+    /// a bare status code (`Qwen3.6-35B-A3B-MTPLX-Speed`).
+    #[cfg(test)]
+    mod affine_moe_loader_tests {
+        use super::*;
+
+        const PREFIX: &str = "language_model.model.layers.0.mlp";
+
+        fn config(mode: &str) -> NativeModelConfig {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/fixtures/qwen3_5_moe_config.json"))
+                    .expect("fixture parses");
+            raw["quantization_config"] =
+                serde_json::json!({ "mode": mode, "bits": 4, "group_size": 64 });
+            serde_json::from_value(raw).expect("config parses")
+        }
+
+        /// One element per tensor: the loader clones handles and never reads a value. Biases are
+        /// present only for the groups named in `biases_for`.
+        fn bag(biases_for: &[&str]) -> NativeWeights {
+            let mut tensors = HashMap::new();
+            let mut put = |name: String| {
+                tensors.insert(name, Array::from_slice(&[0.0f32], &[1]));
+            };
+            for gate in ["gate", "shared_expert_gate"] {
+                for part in ["weight", "scales", "biases"] {
+                    put(format!("{PREFIX}.{gate}.{part}"));
+                }
+            }
+            for group in ["switch_mlp", "shared_expert"] {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    for part in ["weight", "scales"] {
+                        put(format!("{PREFIX}.{group}.{proj}.{part}"));
+                    }
+                    if biases_for.contains(&group) {
+                        put(format!("{PREFIX}.{group}.{proj}.biases"));
+                    }
+                }
+            }
+            NativeWeights { tensors }
+        }
+
+        #[test]
+        fn affine_experts_keep_their_biases_and_meet_the_scales_dtype() {
+            let weights =
+                resolve_moe_layer(&bag(&["switch_mlp", "shared_expert"]), &config("affine"), 0)
+                    .expect("an affine layer with biases resolves");
+            let view = weights.view();
+            for proj in [
+                &view.switch_glu.gate_proj,
+                &view.switch_glu.up_proj,
+                &view.switch_glu.down_proj,
+            ] {
+                assert!(
+                    proj.biases.is_some(),
+                    "an affine gather needs the experts' biases"
+                );
+            }
+            assert!(view.shared_expert.gate_proj_b.is_some());
+            assert!(view.shared_expert.up_proj_b.is_some());
+            assert!(view.shared_expert.down_proj_b.is_some());
+            assert!(
+                view.experts_in_scale_dtype,
+                "bf16 scales against f32 activations would be cast whole on every gather"
+            );
+        }
+
+        #[test]
+        fn affine_experts_without_biases_fail_at_load_not_at_the_first_prefill() {
+            for (have, missing) in [
+                (&["shared_expert"][..], "switch_mlp"),
+                (&["switch_mlp"][..], "shared_expert"),
+            ] {
+                let err = resolve_moe_layer(&bag(have), &config("affine"), 0)
+                    .err()
+                    .expect("a layer without biases must be rejected");
+                assert!(
+                    err.to_string().contains(&format!(
+                        "{missing} is affine-quantized but ships no .biases"
+                    )),
+                    "got: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn mxfp4_experts_carry_no_biases_and_keep_the_activation_dtype() {
+            let weights = resolve_moe_layer(&bag(&[]), &config("mxfp4"), 0)
+                .expect("an mxfp4 layer needs no biases");
+            let view = weights.view();
+            assert!(view.switch_glu.up_proj.biases.is_none());
+            assert!(view.shared_expert.up_proj_b.is_none());
+            assert!(!view.experts_in_scale_dtype);
+        }
     }
 
     // ───────────────────────── model handle ─────────────────────────
