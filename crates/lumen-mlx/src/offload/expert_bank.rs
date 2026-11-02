@@ -616,7 +616,8 @@ mod tests {
         let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
             return;
         };
-        // Two staging regions of 256 plus eight slots to cache in, once the regions are borrowed.
+        // 520 slots is under the three layers' worth that two staging regions need
+        // (`regions_for`), so the pool lends one region of 256 and keeps 264 slots beside it.
         let mut bank = ExpertBank::open(
             Path::new(&dir),
             520,
@@ -626,26 +627,37 @@ mod tests {
             false,
         )
         .expect("open");
+        assert_eq!(bank.regions(), 1, "520 slots lend one staging region");
         bank.enter_staging();
         assert!(bank.acquire(999, &[0]).is_err());
         assert!(
             bank.acquire(0, &[256]).is_err(),
             "the 35B has experts 0..256"
         );
-        // More distinct experts than slots.
+        // Pin a whole layer: eight of the 264 slots beside the staging region are left.
+        let whole: Vec<u16> = (0..256).collect();
+        let held = bank
+            .acquire(0, &whole)
+            .expect("a whole layer fits beside the staging region");
+        // More distinct experts than slots left.
         let too_many: Vec<u16> = (0..9).collect();
-        let err = bank.acquire(0, &too_many).err().expect("pool too small");
+        let err = bank.acquire(1, &too_many).err().expect("pool too small");
         assert!(format!("{err}").contains("9 distinct"), "got: {err}");
-        // Nothing leaked: the whole pool is still usable.
+        // Nothing leaked: the eight slots the failed call tried for are still usable.
         let ok: Vec<u16> = (0..8).collect();
-        let a = bank.acquire(0, &ok).expect("all eight fit");
+        let a = bank.acquire(1, &ok).expect("all eight fit");
         bank.release(a);
-        // Handing the blocks back opens the whole pool again.
+        bank.release(held);
+        // Handing the staging block back opens the whole pool: two whole layers at once, which
+        // the 264 slots beside it could not hold.
         bank.leave_staging();
-        let wide: Vec<u16> = (0..256).collect();
         let a = bank
-            .acquire(0, &wide)
+            .acquire(0, &whole)
             .expect("a whole layer fits once the staging is back");
+        let b = bank
+            .acquire(1, &whole)
+            .expect("so does a second, beside the first");
         bank.release(a);
+        bank.release(b);
     }
 }
