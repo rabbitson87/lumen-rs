@@ -555,6 +555,26 @@ mod imp {
 
     impl RollbackPoint {
         pub fn capture(cache: &NativePromptCache, position: usize) -> Result<Self> {
+            Self::capture_with(cache, position, /* materialize */ true)
+        }
+
+        /// [`Self::capture`] that leaves the linear state as the graph it is.
+        ///
+        /// A decode loop that builds the next step while this one runs wants a
+        /// point it can return to if that next step is never asked for, and it
+        /// takes the point at the one moment the state is still being computed:
+        /// materializing it would wait for the very step the loop is trying to
+        /// overlap. The handles kept here are the ones the next step consumes, so
+        /// they are evaluated either way.
+        pub fn capture_lazy(cache: &NativePromptCache, position: usize) -> Result<Self> {
+            Self::capture_with(cache, position, /* materialize */ false)
+        }
+
+        fn capture_with(
+            cache: &NativePromptCache,
+            position: usize,
+            materialize: bool,
+        ) -> Result<Self> {
             let layers = cache
                 .layers()
                 .iter()
@@ -567,8 +587,10 @@ mod imp {
                             // Materialize now: the state is needed by the next
                             // piece anyway, and an evaluated array holds no
                             // graph behind it.
-                            for slot in c.slots().iter().flatten() {
-                                slot.eval().context("RollbackPoint: eval linear state")?;
+                            if materialize {
+                                for slot in c.slots().iter().flatten() {
+                                    slot.eval().context("RollbackPoint: eval linear state")?;
+                                }
                             }
                             RollbackLayer::Recurrent {
                                 slots: c.slots().to_vec(),

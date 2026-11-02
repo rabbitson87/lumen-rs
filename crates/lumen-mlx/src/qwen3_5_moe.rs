@@ -3151,6 +3151,64 @@ mod imp {
             if input_ids.is_empty() {
                 return Err(anyhow!("forward: input_ids is empty"));
             }
+            let ids_i32: Vec<i32> = input_ids.iter().map(|&u| u as i32).collect();
+            let ids_arr = Array::from_slice(&ids_i32, &[input_ids.len() as i32]);
+            self.forward_ids(
+                &ids_arr,
+                cache,
+                last_only,
+                capture_layer_ids,
+                positions,
+                soft,
+            )
+        }
+
+        /// One decode step whose token is still an unevaluated array — the
+        /// argmax of the step before it ([`Self::argmax_last_token_lazy`]).
+        ///
+        /// This is what lets a decode loop build step N+1 while step N is still
+        /// running on the GPU: nothing here reads the previous token on the
+        /// host. The graph is the one [`Self::forward_decode_shifted`] builds
+        /// for `&[token]`, so the two agree bit for bit.
+        pub fn forward_decode_lazy(
+            &self,
+            token: &Array,
+            cache: &mut NativePromptCache,
+            mrope_delta: i32,
+        ) -> Result<Array> {
+            let plan = if mrope_delta == 0 {
+                RopePlan::Sequential
+            } else {
+                RopePlan::Shifted(mrope_delta)
+            };
+            let ids = mlx_rs::ops::reshape(token, &[1])
+                .context("forward_decode_lazy: token to [1]")?
+                .as_dtype(mlx_rs::Dtype::Int32)
+                .context("forward_decode_lazy: token to int32")?;
+            let (logits, _) =
+                self.forward_ids(&ids, cache, /* last_only */ true, &[], plan, None)?;
+            Ok(logits)
+        }
+
+        /// Whether a decode step can be built before the previous one has
+        /// finished. It cannot when the graph reads a value back mid-way: SSD
+        /// expert offload reads the routing indices on the host to know which
+        /// experts to load, and the MTP capture slot would be overwritten by a
+        /// step whose result nobody asked for yet.
+        pub fn decode_pipelinable(&self) -> bool {
+            self.offload.is_none() && !self.mtp_capture_enabled.load(Ordering::Relaxed)
+        }
+
+        /// The graph itself, from an already-built `[L]` int32 token array.
+        fn forward_ids(
+            &self,
+            ids_arr: &Array,
+            cache: &mut NativePromptCache,
+            last_only: bool,
+            capture_layer_ids: &[usize],
+            positions: RopePlan<'_>,
+            soft: VisionSoft<'_>,
+        ) -> Result<(Array, Vec<Array>)> {
             if cache.len() != self.num_layers() {
                 return Err(anyhow!(
                     "forward: cache.len()={} mismatches num_layers={}",
@@ -3159,7 +3217,7 @@ mod imp {
                 ));
             }
             let cfg = self.text_config();
-            let l = input_ids.len() as i32;
+            let l = ids_arr.shape()[0];
 
             let timing_on = fine_timing_active();
             let mut fine = FineTimings::default();
@@ -3168,13 +3226,11 @@ mod imp {
             // `embed_tokens` as MXFP4-quantized; the lookup returns bf16,
             // which we cast to f32 for downstream determinism.
             let t_embed = timing_on.then(Instant::now);
-            let ids_i32: Vec<i32> = input_ids.iter().map(|&u| u as i32).collect();
-            let ids_arr = Array::from_slice(&ids_i32, &[l]);
             let embed_raw = quantized_embedding_lookup_with_mode(
                 &self.embed_weight,
                 &self.embed_scales,
                 self.embed_biases.as_ref(),
-                &ids_arr,
+                ids_arr,
                 self.embed_group,
                 self.embed_bits,
                 self.embed_mode,
@@ -3368,7 +3424,7 @@ mod imp {
                 // barriers inflate absolute ms but the SPLIT is valid.
                 eprintln!(
                     "[native-decode-fine] L={} embed={:.2} full_attn={:.2}/{} lin_attn={:.2}/{} moe={:.2}/{} lm_head={:.2} | lin_sub: in_proj={:.2} conv={:.2} norm_qk={:.2} ssm={:.2} out_proj={:.2}",
-                    input_ids.len(),
+                    l,
                     fine.embed_ms,
                     fine.full_attn_ms,
                     fine.full_attn_count,
@@ -4529,6 +4585,13 @@ mod imp {
         /// Mirrors `int(mx.argmax(logits[0, -1]).item())` from `mlx_runner.py`
         /// for a `[B=1, L, V]` logits tensor.
         pub fn argmax_last_token(&self, logits: &Array) -> Result<u32> {
+            Self::read_token(&self.argmax_last_token_lazy(logits)?)
+        }
+
+        /// [`Self::argmax_last_token`] without the read: the 0-d `u32` argmax,
+        /// still a graph. Evaluate it with `async_eval` and read it later with
+        /// [`Self::read_token`], or feed it to [`Self::forward_decode_lazy`].
+        pub fn argmax_last_token_lazy(&self, logits: &Array) -> Result<Array> {
             if logits.ndim() != 3 {
                 return Err(anyhow!(
                     "argmax_last_token: expected [B, L, V] logits, got ndim={}",
@@ -4543,8 +4606,12 @@ mod imp {
                 .take_axis(&idx_last, 1)
                 .context("argmax_last_token: take_axis(L-1) failed")?;
             // 2) full-reduce argmax over the [B=1, V] view → 0-d scalar (B=1 in runner)
-            let scalar = mlx_rs::ops::indexing::argmax(&last_row, /* keep_dims */ false)
-                .context("argmax_last_token: argmax (full reduce) failed")?;
+            mlx_rs::ops::indexing::argmax(&last_row, /* keep_dims */ false)
+                .context("argmax_last_token: argmax (full reduce) failed")
+        }
+
+        /// Read a 0-d `u32` token array, evaluating it if it is not yet.
+        pub fn read_token(scalar: &Array) -> Result<u32> {
             // Read scalar via try_as_slice (single eval). mlx-rs Array::try_item
             // calls eval() twice (mlx-rs-0.25.3/src/array/mod.rs:317-321), which
             // doubles command-buffer submits on every decode step. try_as_slice

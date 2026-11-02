@@ -2136,6 +2136,26 @@ mod imp {
             self.layers.is_empty()
         }
 
+        /// Whether one appended token can be taken back again by a truncation
+        /// (full-attention layers) plus the state a point kept (linear layers).
+        ///
+        /// True for the plain layout only: a buffer that grows in blocks, so
+        /// the rows past the offset are padding and cutting back is moving the
+        /// offset. The concatenating layout has no padding, so a cut offset
+        /// would leave a row the next append counts twice; the compressed
+        /// layouts keep their own rules and a decode loop has no business
+        /// guessing them.
+        pub fn rewinds_by_truncation(&self) -> bool {
+            use_step_prealloc()
+                && self.layers.iter().all(|l| match l {
+                    NativeLayerCache::Full(kv) => kv.base_offset() == 0,
+                    NativeLayerCache::Linear(_) => true,
+                    NativeLayerCache::FullTurboquant(_) | NativeLayerCache::FullQuantized(_) => {
+                        false
+                    }
+                })
+        }
+
         pub fn layer(&self, idx: usize) -> Option<&NativeLayerCache> {
             self.layers.get(idx)
         }

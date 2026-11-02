@@ -425,6 +425,18 @@ trait Runner {
         last_token: u32,
         position: usize,
     ) -> Result<(u32, usize)>;
+    /// [`Runner::decode_step`] for a greedy loop that feeds each token it gets
+    /// back in as the next input. Returns the same thing; a runner that can
+    /// build the next step while this one runs may do so. The default is the
+    /// plain step.
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        self.decode_step(seq_id, last_token, position)
+    }
     /// Phase 1: advance N sequences by one token each, returning
     /// `(next_token, position)` per input index. The default implementation
     /// loops over [`Runner::decode_step`] and is therefore **bit-identical** to
@@ -517,6 +529,15 @@ impl Runner for NativeMlxRunner {
         position: usize,
     ) -> Result<(u32, usize)> {
         NativeMlxRunner::decode_step(self, seq_id, last_token, position)
+    }
+
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        NativeMlxRunner::decode_step_chained(self, seq_id, last_token, position)
     }
 
     fn decode_step_batch(
@@ -898,6 +919,16 @@ impl RunnerImpl {
     ) -> Result<(u32, usize)> {
         self.as_runner_mut()
             .decode_step(seq_id, last_token, position)
+    }
+
+    fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        self.as_runner_mut()
+            .decode_step_chained(seq_id, last_token, position)
     }
 
     fn decode_step_batch(
@@ -3965,6 +3996,26 @@ impl MlxQwen35Backend {
         self.runner.decode_step(seq_id, last_token, position)
     }
 
+    /// [`Self::decode_step`] for a plain greedy loop: one that feeds each token
+    /// back in as the next input and touches nothing else of the sequence
+    /// between steps. Same tokens, same positions; the runner may keep the GPU a
+    /// step ahead (see `NativeMlxRunner::decode_step_chained`). A sampled
+    /// request needs each token on the host before the next step, so it takes
+    /// the plain step.
+    pub fn decode_step_chained(
+        &mut self,
+        seq_id: u64,
+        last_token: u32,
+        position: usize,
+    ) -> Result<(u32, usize)> {
+        #[cfg(feature = "mlx-native")]
+        if self.sampling.is_some() {
+            return self.decode_step(seq_id, last_token, position);
+        }
+        self.runner
+            .decode_step_chained(seq_id, last_token, position)
+    }
+
     /// Phase 1: advance N already-prefilled sequences by one token each in a
     /// single call, returning `(next_token, position)` per input index. Used by
     /// the multi-sequence batched scheduler (Phase 2). Currently a bit-identical
@@ -5237,7 +5288,7 @@ impl MlxQwen35Backend {
                     self.decode_step(seq_id, last, pos)?
                 }
             } else {
-                self.decode_step(seq_id, last, pos)?
+                self.decode_step_chained(seq_id, last, pos)?
             };
             last = next;
             pos = new_pos;
@@ -5598,7 +5649,7 @@ impl MlxQwen35Backend {
 
         let t_decode = std::time::Instant::now();
         for step in 1..max_new_tokens {
-            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
             last = next;
             pos = new_pos;
             generated.push(next);
@@ -6275,7 +6326,7 @@ impl MlxQwen35Backend {
                     self.decode_step(seq_id, last, pos)?
                 }
             } else {
-                self.decode_step(seq_id, last, pos)?
+                self.decode_step_chained(seq_id, last, pos)?
             };
             last = next;
             pos = new_pos;
@@ -6535,7 +6586,7 @@ impl MlxQwen35Backend {
 
         let t_decode = std::time::Instant::now();
         for step in 1..max_new_tokens {
-            let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+            let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
             last = next;
             pos = new_pos;
             generated.push(next);
@@ -7153,7 +7204,7 @@ impl MlxQwen35Backend {
 
         if !halted && !self.eos_tokens.contains(&last) {
             for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+                let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
                 last = next;
                 pos = new_pos;
                 generated.push(next);
@@ -7232,7 +7283,7 @@ impl MlxQwen35Backend {
         let mut generated: Vec<u32> = vec![last];
         if !self.eos_tokens.contains(&last) {
             for _ in 1..max_new_tokens {
-                let (next, new_pos) = self.decode_step(seq_id, last, pos)?;
+                let (next, new_pos) = self.decode_step_chained(seq_id, last, pos)?;
                 last = next;
                 pos = new_pos;
                 generated.push(next);

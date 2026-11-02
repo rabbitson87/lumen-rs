@@ -48,6 +48,7 @@ value → on.
 | `LUMEN_NATIVE_FUSE_SWIGLU` | on | Optimization | `lumen_mlx::native_moe::imp::swiglu_fuse` |
 | `LUMEN_NATIVE_KV_STEP_PREALLOC` | on | Optimization | `lumen_mlx::native_cache::imp::kv_step_prealloc` |
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
+| `LUMEN_NATIVE_PIPELINE_DECODE` | on | Optimization | `lumen_mlx::runner_native::imp::pipeline_decode` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
 | `LUMEN_NATIVE_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::widen_scales` |
@@ -559,6 +560,24 @@ Absorb `scale_q/k` into the rms_norm weight (bit-identical by
  linearity of rms_norm weight scaling). Default ON 2026-05-11:
  thermal-clean A/B (n=10, STEPS=100) Δ=−0.315 ms, Welch t=−3.33σ.
  Only active when `LUMEN_NATIVE_ALLOC_REUSE` is also on.
+
+### `LUMEN_NATIVE_PIPELINE_DECODE`
+
+*Optimization, default on.*
+
+Build each greedy decode step while the one before it is still running.
+
+ Blocking decode reads a token, then builds the next step's graph with
+ the GPU idle; on a small-active-parameter MoE that build is ~2.5 ms of a
+ ~13 ms step. With this on, a loop that feeds every token back as the
+ next input (`decode_step_chained`) submits step N+1 -- built from step
+ N's unread argmax -- before it reads step N, as mlx-lm's `generate_step`
+ does. The same graphs run in the same order, so the tokens are
+ bit-identical; the one extra step a loop leaves running when it stops is
+ taken back before anything else touches the sequence.
+
+ Does nothing (falls back to blocking decode) under SSD expert offload,
+ MTP, `LUMEN_NATIVE_TIMING`, or a quantized / TurboQuant KV cache.
 
 ### `LUMEN_NATIVE_RMS_NORM_GATED_FUSED`
 
