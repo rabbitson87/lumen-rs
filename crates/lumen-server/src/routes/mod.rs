@@ -8,6 +8,7 @@ pub mod messages;
 pub mod models;
 pub mod prefix_cache;
 pub mod sessions;
+pub mod stall_guard;
 
 use atomic_http::external::http::{HeaderMap, Response, StatusCode};
 use atomic_http::*;

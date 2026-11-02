@@ -2078,6 +2078,28 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "stream-writer-waits-for-ever-on-a-client-that-stopped-reading",
+        symptom: "a client that stayed connected but stopped reading left the SSE \
+                  route in `write_all` for as long as the connection lived, \
+                  holding the task, the socket and the queue of events the \
+                  engine had produced for it, and the engine kept decoding for \
+                  it: nothing ever noticed, because only a closed connection \
+                  is an error",
+        revert: &[Mutation {
+            path: SRV,
+            find: "self.waiting.get_or_insert_with(|| Box::pin(sleep(limit)));",
+            replace: "self.waiting.get_or_insert_with(|| Box::pin(sleep(Duration::from_secs(86_400)))); // defect: a stall is never noticed",
+        }],
+        guards: &[guard(
+            "lumen-server",
+            "",
+            true,
+            "",
+            "routes::stall_guard::tests::a_client_that_takes_no_bytes_times_out",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "qwen-parser-drops-the-tail-held-for-a-delimiter",
         symptom: "text held back in case it became a delimiter (`<`, `<tool`) \
                   was dropped when the reply ended, so an answer that ended in \
@@ -2166,6 +2188,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "streams-delivered-in-one-burst")
         | (_, "undeclared-tool-name-forwarded")
         | (_, "stream-keeps-decoding-for-a-client-that-left") => "engine.rs",
+        (_, "stream-writer-waits-for-ever-on-a-client-that-stopped-reading") => {
+            "routes/stall_guard.rs"
+        }
         (_, "server-binds-every-interface")
         | (_, "api-key-not-enforced")
         | (_, "cors-setting-ignored") => "access.rs",
