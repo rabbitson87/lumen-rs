@@ -527,8 +527,8 @@ impl Qwen35MtpBlock {
     /// resolved weights. Matches the trunk's middle-layer MoE dispatch.
     fn moe_mlp_forward(&self, x: &Array, w: &Qwen35MtpMoeMlp) -> Result<Array> {
         use crate::native_moe::{
-            AffineGateWeights, GateProj, MoeBlockWeights, SharedMlpWeights, SwitchExpertWeights,
-            SwitchGluWeights, moe_block_forward,
+            AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
+            SwitchExpertWeights, SwitchGluWeights, moe_block_forward,
         };
         let view = MoeBlockWeights {
             gate: GateProj::Affine(AffineGateWeights {
@@ -539,15 +539,17 @@ impl Qwen35MtpBlock {
                 bits: w.gate_bits,
             }),
             switch_glu: SwitchGluWeights {
-                gate_proj: SwitchExpertWeights {
-                    weight: &w.sw_gate_w,
-                    scales: &w.sw_gate_s,
-                    biases: w.sw_gate_b.as_ref(),
-                },
-                up_proj: SwitchExpertWeights {
-                    weight: &w.sw_up_w,
-                    scales: &w.sw_up_s,
-                    biases: w.sw_up_b.as_ref(),
+                gate_up: GateUpWeights::Split {
+                    gate: SwitchExpertWeights {
+                        weight: &w.sw_gate_w,
+                        scales: &w.sw_gate_s,
+                        biases: w.sw_gate_b.as_ref(),
+                    },
+                    up: SwitchExpertWeights {
+                        weight: &w.sw_up_w,
+                        scales: &w.sw_up_s,
+                        biases: w.sw_up_b.as_ref(),
+                    },
                 },
                 down_proj: SwitchExpertWeights {
                     weight: &w.sw_down_w,
