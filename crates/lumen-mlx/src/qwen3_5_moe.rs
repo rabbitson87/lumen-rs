@@ -124,6 +124,57 @@ mod imp {
     }
 
     lumen_flags::flag! {
+        /// Keep the affine projections' scales and biases in f32 so a matmul on the f32 residual
+        /// stream stops re-casting them on every call.
+        ///
+        /// MLX gives `quantized_matmul` the common dtype of the activations and the scales and
+        /// biases and casts whichever differs on every call. The trunk's activations are f32 and
+        /// the checkpoint's scales bf16, so each of a decode step's ~500 matmuls re-widened its
+        /// scales and biases before reading the weights. On stock MLX 0.32.3 (M3 Max, 17408x5120
+        /// 4-bit group 64) that is 187 GB/s against 276 GB/s with bf16 activations; pre-widened
+        /// scales recover most of it (237-250 GB/s). The widening is exact (bf16 -> f32), so the
+        /// output is bit-identical; the cost is the f32 copy minus the bf16 original the model
+        /// drops (`NativeWeights::release_scales_and_biases`): +1.45 GB of GPU memory on the 27B
+        /// (16.0 -> 17.5 GB footprint, `footprint`; `ps` RSS does not see GPU buffers).
+        /// Affine projections only (mxfp4/nvfp4 scales are integer exponents). Applies to
+        /// `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
+        /// (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
+        /// `=0` restores the per-call cast.
+        pub(crate) widen_scales {
+            env: "LUMEN_NATIVE_WIDEN_SCALES",
+            default: true,
+            kind: Optimization,
+        }
+    }
+
+    lumen_flags::flag! {
+        /// Run each quantized projection on a bf16 activation (cast back to f32 after) when the
+        /// activation is f32 and the scales are bf16/f16, so MLX takes its fast path (276 GB/s on
+        /// M3 Max against 187 GB/s with an f32 activation, stock MLX 0.32.3, 17408x5120 4-bit).
+        ///
+        /// **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
+        /// rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
+        /// throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
+        /// and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op when
+        /// `LUMEN_NATIVE_WIDEN_SCALES` already widened the scales, so it needs
+        /// `LUMEN_NATIVE_WIDEN_SCALES=0` too.
+        ///
+        /// Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
+        /// with a cast before and after every matmul eating part of the gain. Teacher-forced
+        /// top-1 agreement with the f32 activation over 6 seeds x ~675 positions
+        /// (`examples/kv_bf16_quality.rs --act-bf16`; the f32-vs-f32 control is 100.000%): 27B
+        /// 99.31%, 9B 99.09%. Every flip is a near-tie (the largest top1-top2 gap sits at the
+        /// 3.4th / 3.9th percentile) and agreement does not fall with context depth, but it is
+        /// below the 99.73% that the bf16 KV cache cleared before it became the default.
+        /// Default off.
+        pub(crate) act_bf16 {
+            env: "LUMEN_NATIVE_ACT_BF16",
+            default: false,
+            kind: Behavior,
+        }
+    }
+
+    lumen_flags::flag! {
         /// Store the full-attention KV cache affine-quantized (8-bit, group
         /// 64): half the bytes of bf16. Decode reads it through the fused
         /// kernel in `native_quant_attention`; prefill dequantizes each chunk
@@ -171,6 +222,13 @@ mod imp {
     /// that predate `lumen_flags` keep their entry point.
     pub fn set_kv_store_bf16(on: bool) {
         kv_bf16::set(on);
+    }
+
+    /// Pin `act_bf16` process-wide for an A/B harness, bypassing the env read. It only acts on
+    /// scales loaded as bf16/f16, so the model has to be loaded with
+    /// `LUMEN_NATIVE_WIDEN_SCALES=0`.
+    pub fn set_act_bf16(on: bool) {
+        act_bf16::set(on);
     }
 
     // config.json parsing lives in the ungated `qwen35_config` module so a
@@ -417,6 +475,15 @@ mod imp {
         pub fn keys(&self) -> impl Iterator<Item = &String> {
             self.tensors.keys()
         }
+
+        /// Drop this bag's handles on every scales and biases tensor. What else holds one (the
+        /// resolved projections, the embedding) keeps it alive; what nothing else holds -- the
+        /// bf16 originals of scales that `widen_scales` replaced -- is freed. Without this the
+        /// model holds both copies, +3.2 GB on the 27B instead of +1.6 GB.
+        pub(crate) fn release_scales_and_biases(&mut self) {
+            self.tensors
+                .retain(|k, _| !(k.ends_with(".scales") || k.ends_with(".biases")));
+        }
     }
 
     // ──────────────────── pre-resolved per-layer weights ─────────────────
@@ -476,6 +543,26 @@ mod imp {
     impl ResolvedLinear {
         /// `y = x @ deq(W).T` at this projection's own quant params.
         pub fn apply(&self, x: &Array) -> Result<Array> {
+            let scales_dtype = self.scales.dtype();
+            if act_bf16::get()
+                && x.dtype() == mlx_rs::Dtype::Float32
+                && matches!(
+                    scales_dtype,
+                    mlx_rs::Dtype::Bfloat16 | mlx_rs::Dtype::Float16
+                )
+            {
+                let narrow = x
+                    .as_dtype(scales_dtype)
+                    .context("quantized linear: cast activation to the scales dtype failed")?;
+                return self
+                    .matmul(&narrow)?
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .context("quantized linear: cast result to f32 failed");
+            }
+            self.matmul(x)
+        }
+
+        fn matmul(&self, x: &Array) -> Result<Array> {
             quantized_matmul_with_mode(
                 x,
                 &self.weight,
@@ -713,11 +800,37 @@ mod imp {
         // at load (4→3 is lossy → quality drops; this is the SPEED proof on the
         // 4-bit checkpoint — a production 3-bit needs a bf16 source). Only affine
         // (mxfp4/nvfp4 are fixed E2M1 4-bit). MLP/attn/lm_head all qualify.
-        match requant_target_bits_for(base) {
+        let lin = match requant_target_bits_for(base) {
             Some(tb) if lin.mode == MODE_AFFINE && lin.bits > tb => requant_linear_affine(&lin, tb)
-                .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit")),
-            _ => Ok(lin),
+                .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit"))?,
+            _ => lin,
+        };
+        if widen_scales::get() && lin.mode == MODE_AFFINE {
+            widen_linear_scales(lin)
+                .with_context(|| format!("resolve_linear({base}): widen scales"))
+        } else {
+            Ok(lin)
         }
+    }
+
+    /// Widen an affine projection's scales and biases to f32 (exact), evaluated now so the cast
+    /// is not rebuilt on every decode step.
+    fn widen_linear_scales(lin: ResolvedLinear) -> Result<ResolvedLinear> {
+        let widen = |a: Array| -> Result<Array> {
+            if a.dtype() == mlx_rs::Dtype::Float32 {
+                return Ok(a);
+            }
+            let wide = a
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .context("widen: cast to f32")?;
+            wide.eval().context("widen: eval")?;
+            Ok(wide)
+        };
+        Ok(ResolvedLinear {
+            scales: widen(lin.scales)?,
+            biases: lin.biases.map(widen).transpose()?,
+            ..lin
+        })
     }
 
     /// `LUMEN_NATIVE_REQUANT_BITS` → target affine bits ∈ {2,3} (else None/off).
@@ -1460,6 +1573,10 @@ mod imp {
                 ),
                 None => None,
             };
+
+            if widen_scales::get() {
+                weights.release_scales_and_biases();
+            }
 
             Ok(Self {
                 config,
@@ -4337,6 +4454,11 @@ pub use imp::MtpStepOutput;
 /// `examples/kv_bf16_ab.rs`.
 #[cfg(feature = "mlx-native")]
 pub use imp::set_kv_store_bf16;
+
+/// bf16 activation cast toggle, for the same kind of harness — see
+/// `examples/kv_bf16_quality.rs --act-bf16`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_act_bf16;
 
 // ───────────────────────── unit tests ─────────────────────────
 //

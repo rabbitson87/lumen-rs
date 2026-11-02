@@ -36,6 +36,7 @@ value → on.
 | `LUMEN_MOE_OVERLAP` | off | Optimization | `lumen_mlx::offload::overlap` |
 | `LUMEN_MOE_PROBE_LAYER_SYNC` | off | Diagnostic | `lumen_mlx::native_moe::imp::moe_layer_sync_probe` |
 | `LUMEN_MOE_TRACE` | off | Diagnostic | `lumen_mlx::offload::trace::moe_trace` |
+| `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
@@ -49,6 +50,7 @@ value → on.
 | `LUMEN_NATIVE_LINEAR_ATTN_SCALE_FUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::linear_attn_scale_fuse` |
 | `LUMEN_NATIVE_RMS_NORM_GATED_FUSED` | off | Optimization | `lumen_mlx::native_ssm::imp::rms_norm_gated_fused` |
 | `LUMEN_NATIVE_TIMING` | off | Diagnostic | `lumen_mlx::native_runtime::imp::fine_timing` |
+| `LUMEN_NATIVE_WIDEN_SCALES` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::widen_scales` |
 | `LUMEN_PREFIX_EXACT_REUSE` | on | Behavior | `lumen_mlx::prefix_cache::exact_reuse` |
 | `LUMEN_QWEN35_QUANT_KV` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::quant_kv` |
 | `LUMEN_QWEN35_REASONING_EFFORT` | on | Behavior | `lumen_mlx::reasoning_effort_enabled` |
@@ -417,6 +419,30 @@ Write a binary trace of the expert pool's layer calls (expert ids in request ord
  eviction policies offline. Any value but `0` is the output path. Never changes the output
  or what is resident; costs one `Option` check per layer call when off.
 
+### `LUMEN_NATIVE_ACT_BF16`
+
+*Behavior, default off.*
+
+Run each quantized projection on a bf16 activation (cast back to f32 after) when the
+ activation is f32 and the scales are bf16/f16, so MLX takes its fast path (276 GB/s on
+ M3 Max against 187 GB/s with an f32 activation, stock MLX 0.32.3, 17408x5120 4-bit).
+
+ **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
+ rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
+ throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
+ and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op when
+ `LUMEN_NATIVE_WIDEN_SCALES` already widened the scales, so it needs
+ `LUMEN_NATIVE_WIDEN_SCALES=0` too.
+
+ Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
+ with a cast before and after every matmul eating part of the gain. Teacher-forced
+ top-1 agreement with the f32 activation over 6 seeds x ~675 positions
+ (`examples/kv_bf16_quality.rs --act-bf16`; the f32-vs-f32 control is 100.000%): 27B
+ 99.31%, 9B 99.09%. Every flip is a near-tie (the largest top1-top2 gap sits at the
+ 3.4th / 3.9th percentile) and agreement does not fall with context depth, but it is
+ below the 99.73% that the bf16 KV cache cleared before it became the default.
+ Default off.
+
 ### `LUMEN_NATIVE_ALLOC_REUSE`
 
 *Optimization, default on.*
@@ -550,6 +576,27 @@ Per-step decode timing capture (`take_native_decode_timing_log`).
  Costs an eval barrier per timed stage; default OFF. (Parse note:
  previously a truthy list `1|true|TRUE|yes`; the uniform rule now
  accepts any non-`"0"`.)
+
+### `LUMEN_NATIVE_WIDEN_SCALES`
+
+*Optimization, default on.*
+
+Keep the affine projections' scales and biases in f32 so a matmul on the f32 residual
+ stream stops re-casting them on every call.
+
+ MLX gives `quantized_matmul` the common dtype of the activations and the scales and
+ biases and casts whichever differs on every call. The trunk's activations are f32 and
+ the checkpoint's scales bf16, so each of a decode step's ~500 matmuls re-widened its
+ scales and biases before reading the weights. On stock MLX 0.32.3 (M3 Max, 17408x5120
+ 4-bit group 64) that is 187 GB/s against 276 GB/s with bf16 activations; pre-widened
+ scales recover most of it (237-250 GB/s). The widening is exact (bf16 -> f32), so the
+ output is bit-identical; the cost is the f32 copy minus the bf16 original the model
+ drops (`NativeWeights::release_scales_and_biases`): +1.45 GB of GPU memory on the 27B
+ (16.0 -> 17.5 GB footprint, `footprint`; `ps` RSS does not see GPU buffers).
+ Affine projections only (mxfp4/nvfp4 scales are integer exponents). Applies to
+ `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
+ (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
+ `=0` restores the per-call cast.
 
 ### `LUMEN_PREFIX_EXACT_REUSE`
 

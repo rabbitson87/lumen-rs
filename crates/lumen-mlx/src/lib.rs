@@ -297,6 +297,8 @@ pub use native_attention::set_sparse_decode;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_act_bf16;
+#[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_kv_store_bf16;
 
 /// Qwen 3.5/3.6 `config.json` parsing. Public so the Phase 3 fault sweep can
