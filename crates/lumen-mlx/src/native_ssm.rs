@@ -57,10 +57,16 @@ mod imp {
         /// wins σ-significantly across a 12-run 4-condition matrix
         /// (Δp50=−0.33 ms, Δtps=+1.96 vs legacy direct dispatch). `=0` falls
         /// back to the legacy direct-ops path.
+        ///
+        /// **`Behavior`, not `Optimization`:** the legacy ops round some gates
+        /// differently from the compiled function, by one unit in the last place
+        /// (three of 256 in `linattn_prework_gates_are_the_composed_gates_to_the_bit`
+        /// at `=0`), so `=0` can change a near-tie. Gates the fused prework kernel
+        /// computes (decode) are the compiled function's either way.
         pub(crate) ssm_compile {
             env: "LUMEN_NATIVE_COMPILE",
             default: true,
-            kind: Optimization,
+            kind: Behavior,
         }
     }
 
@@ -1185,18 +1191,22 @@ mod fused_kernel_tests {
     /// softplus: the kernel replicates MLX's own functors, so a difference is a defect, not noise.
     #[test]
     fn linattn_prework_gates_are_the_composed_gates_to_the_bit() {
-        // Many heads in one call, so one call covers many gate values.
-        for (i, dt) in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float32]
-            .into_iter()
-            .enumerate()
-        {
-            let w = Prework::new(1, 256, 32, 32, 0.013 * (i as f32 + 1.0), dt);
-            let got = w.run();
-            let want_beta = mlx_rs::ops::sigmoid(&w.b_pre).unwrap();
-            let want_g = compute_g(&w.a_log, &w.a_pre, &w.dt_bias).unwrap();
-            let bits = |a: &Array| -> Vec<u32> { values(a).iter().map(|v| v.to_bits()).collect() };
-            assert_eq!(bits(&got.beta), bits(&want_beta), "{dt:?} beta");
-            assert_eq!(bits(&got.g), bits(&want_g), "{dt:?} g");
-        }
+        // The composed gates are the compiled `compute_g` the model runs by default.
+        super::imp::ssm_compile::with(true, || {
+            // Many heads in one call, so one call covers many gate values.
+            for (i, dt) in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float32]
+                .into_iter()
+                .enumerate()
+            {
+                let w = Prework::new(1, 256, 32, 32, 0.013 * (i as f32 + 1.0), dt);
+                let got = w.run();
+                let want_beta = mlx_rs::ops::sigmoid(&w.b_pre).unwrap();
+                let want_g = compute_g(&w.a_log, &w.a_pre, &w.dt_bias).unwrap();
+                let bits =
+                    |a: &Array| -> Vec<u32> { values(a).iter().map(|v| v.to_bits()).collect() };
+                assert_eq!(bits(&got.beta), bits(&want_beta), "{dt:?} beta");
+                assert_eq!(bits(&got.g), bits(&want_g), "{dt:?} g");
+            }
+        });
     }
 }

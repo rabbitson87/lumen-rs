@@ -39,7 +39,7 @@ value → on.
 | `LUMEN_NATIVE_ACT_BF16` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::act_bf16` |
 | `LUMEN_NATIVE_ALLOC_REUSE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::alloc_reuse` |
 | `LUMEN_NATIVE_CACHED_STREAM` | off | Optimization | `lumen_mlx::native_quant::imp::cached_stream` |
-| `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
+| `LUMEN_NATIVE_COMPILE` | on | Behavior | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
 | `LUMEN_NATIVE_DECODE_QMV` | on | Optimization | `lumen_mlx::native_qmv::decode_qmv` |
@@ -474,12 +474,18 @@ Share one `OnceLock` stream + sentinel across FFI quant ops instead
 
 ### `LUMEN_NATIVE_COMPILE`
 
-*Optimization, default on.*
+*Behavior, default on.*
 
 compute_g persistent compile cache. Default ON (LANDED Phase 3):
  wins σ-significantly across a 12-run 4-condition matrix
  (Δp50=−0.33 ms, Δtps=+1.96 vs legacy direct dispatch). `=0` falls
  back to the legacy direct-ops path.
+
+ **`Behavior`, not `Optimization`:** the legacy ops round some gates
+ differently from the compiled function, by one unit in the last place
+ (three of 256 in `linattn_prework_gates_are_the_composed_gates_to_the_bit`
+ at `=0`), so `=0` can change a near-tie. Gates the fused prework kernel
+ computes (decode) are the compiled function's either way.
 
 ### `LUMEN_NATIVE_COMPILE_ROUTING`
 
