@@ -10,8 +10,9 @@
 //!   experts and slot 8 the shared expert. Gate and up are dotted against the activation and
 //!   SwiGLU'd in the same kernel. With a router in front it also does the router's select (see
 //!   below), so no kernel sits between the logits and the experts.
-//! * [`DOWN_COMBINE_SOURCE`]: one simdgroup per output row. Each slot's down projection is
-//!   weighted by its score (the shared expert by its sigmoid gate) and summed.
+//! * [`DOWN_COMBINE_SOURCE`]: one simdgroup per slot, nine to a threadgroup, for a few output
+//!   rows. Each slot's down projection is weighted by its score (the shared expert by its sigmoid
+//!   gate) and summed.
 //!
 //! Routed slots round where the composed block rounds: the activation to bf16, the gate/up and down
 //! dot products to bf16 (the down output before it is weighted), and SwiGLU op by op as MLX's bf16
@@ -337,60 +338,62 @@ const EXPERT_FROM_LOGITS: &str = r#"
     }
 "#;
 
+/// The down projections and the combine: a threadgroup of nine simdgroups, one per slot (the eight
+/// routed experts, then the shared one), computes `R` output rows of every slot at once; simdgroup
+/// 0 then adds them up as the composed block does. It casts each expert's output to f32 (after
+/// the bf16 rounding of the gather), multiplies it by its score and sums the eight products in
+/// order (MLX's col_reduce_small: product 0, then each next one added to the running sum), then
+/// adds the shared expert's gated output. One simdgroup walking the nine slots in turn added the
+/// same way, but chained nine matvecs in one simdgroup: 0.2 ms a token slower on the 35B-A3B
+/// decode.
 const DOWN_COMBINE_SOURCE: &str = r#"
     const int lane = thread_index_in_simdgroup;
-    const int rg = thread_position_in_grid.y;
+    const int s = simdgroup_index_in_threadgroup;
+    const int rg = threadgroup_position_in_grid.y;
     constexpr int G = I / 64;
     constexpr int WPR = I / 8;
     constexpr int BLOCKS = I / 512;
+    threadgroup float part[(K + 1) * R];
 
-    // The composed block casts each expert's output to f32, multiplies it by its score, and sums
-    // the eight products in order (MLX's col_reduce_small: product 0, then each next one added to
-    // the running sum), then adds the shared expert's gated output.
-    float total[R];
+    const bool routed = s < K;
+    const uint e = routed ? inds[s] : 0u;
+    float acc[R];
     for (int r = 0; r < R; ++r) {
-        total[r] = 0.0f;
+        acc[r] = 0.0f;
     }
-    for (int s = 0; s <= K; ++s) {
-        const bool routed = s < K;
-        const uint e = routed ? inds[s] : 0u;
-        float acc[R];
+    for (int blk = 0; blk < BLOCKS; ++blk) {
+        float x_thread[16];
+        const device float* xl = act + s * I + blk * 512 + lane * 16;
+        const float sum = routed ? load_vector_bf16(xl, x_thread) : load_vector_f32(xl, x_thread);
         for (int r = 0; r < R; ++r) {
-            acc[r] = 0.0f;
-        }
-        for (int blk = 0; blk < BLOCKS; ++blk) {
-            float x_thread[16];
-            const device float* xl = act + s * I + blk * 512 + lane * 16;
-            const float sum = routed ? load_vector_bf16(xl, x_thread) : load_vector_f32(xl, x_thread);
-            for (int r = 0; r < R; ++r) {
-                const int row = rg * R + r;
-                const size_t rr = (size_t)e * H + row;
-                auto wp = routed ? (w + rr * WPR) : (dw + (size_t)row * WPR);
-                auto sp = routed ? (sc + rr * G) : (ds + (size_t)row * G);
-                auto bp = routed ? (bi + rr * G) : (db + (size_t)row * G);
-                const int scale_at = blk * 8 + lane / 4;
-                const device uint16_t* pw = (const device uint16_t*)(wp + blk * 64 + lane * 2);
-                const float sc_v = sp[scale_at];
-                const float bi_v = bp[scale_at];
-                acc[r] += qdot4(pw, x_thread, sc_v, bi_v, sum);
-            }
-        }
-        for (int r = 0; r < R; ++r) {
-            float y = simd_sum(acc[r]);
-            if (routed) {
-                y = RB(y);
-                const float product = y * scores[s];
-                total[r] = (s == 0) ? product : (product + total[r]);
-            } else {
-                const float gated = sscore[0] * y;
-                total[r] = total[r] + gated;
-            }
+            const int row = rg * R + r;
+            const size_t rr = (size_t)e * H + row;
+            auto wp = routed ? (w + rr * WPR) : (dw + (size_t)row * WPR);
+            auto sp = routed ? (sc + rr * G) : (ds + (size_t)row * G);
+            auto bp = routed ? (bi + rr * G) : (db + (size_t)row * G);
+            const int scale_at = blk * 8 + lane / 4;
+            const device uint16_t* pw = (const device uint16_t*)(wp + blk * 64 + lane * 2);
+            const float sc_v = sp[scale_at];
+            const float bi_v = bp[scale_at];
+            acc[r] += qdot4(pw, x_thread, sc_v, bi_v, sum);
         }
     }
-    if (lane == 0) {
-        for (int r = 0; r < R; ++r) {
-            out[rg * R + r] = total[r];
+    for (int r = 0; r < R; ++r) {
+        const float y = simd_sum(acc[r]);
+        if (lane == 0) {
+            part[s * R + r] = routed ? RB(y) : y;
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s == 0 && lane < R) {
+        float total = 0.0f;
+        for (int j = 0; j < K; ++j) {
+            const float product = part[j * R + lane] * scores[j];
+            total = (j == 0) ? product : (product + total);
+        }
+        const float gated = sscore[0] * part[K * R + lane];
+        total = total + gated;
+        out[rg * R + lane] = total;
     }
 "#;
 
@@ -793,8 +796,9 @@ pub(crate) fn down_combine(
         config.add_template_arg_int("I", inter)?;
         config.add_template_arg_int("K", TOP_K)?;
         config.add_template_arg_int("R", ROWS_DOWN)?;
-        config.set_grid(32, hidden / ROWS_DOWN, 1)?;
-        config.set_thread_group(32, ROWS_PER_GROUP, 1)?;
+        // One threadgroup of nine simdgroups (a slot each) per `ROWS_DOWN` output rows.
+        config.set_grid(32, (TOP_K + 1) * (hidden / ROWS_DOWN), 1)?;
+        config.set_thread_group(32, TOP_K + 1, 1)?;
         config.add_output_arg(&[hidden], Dtype::Float32)?;
         Ok(k.down
             .apply(
