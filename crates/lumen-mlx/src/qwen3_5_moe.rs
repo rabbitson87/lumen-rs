@@ -1688,6 +1688,56 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// Stages `LUMEN_PROBE_ABLATE` removes from every single-token (decode) forward.
+    #[derive(Clone, Copy, Default)]
+    struct Ablate {
+        gdn: bool,
+        attn: bool,
+        moe: bool,
+        lm_head: bool,
+        /// Inside a linear-attention block: the conv + silu + split + q/k norm chain, replaced by
+        /// plain slices of the in-projection.
+        gdn_conv: bool,
+        /// `sigmoid(b)` and `compute_g`, replaced by the raw `b` and `a` projections.
+        gdn_gates: bool,
+        /// The gated-delta recurrence kernel, replaced by `v` and the unchanged state.
+        gdn_ssm: bool,
+        /// The gated RMS norm, replaced by `out * z`.
+        gdn_norm: bool,
+    }
+
+    /// PROBE (timing only, NOT correct — `LUMEN_PROBE_ABLATE=gdn,attn,moe,lm_head`, any subset):
+    /// replaces a stage of each decode step with a stand-in that costs one elementwise op, so the
+    /// step time that remains is the real pipelined decode without that stage. The linear-attention
+    /// block (`gdn`), the full-attention block (`attn`) and the MoE block (`moe`) become
+    /// `0 * their input` (the layer's norms stay, as does everything that feeds the next stage);
+    /// `lm_head` becomes a broadcast of the normed hidden state's sum over the vocabulary, which
+    /// still depends on every layer. The output is garbage and prefill is untouched. The drop in
+    /// ms/token against the unablated run is that stage's whole cost in the pipeline: bytes,
+    /// dispatches and their gaps together, which a per-stage `eval` timing cannot show.
+    ///
+    /// Inside the linear-attention block, `gdn_conv`, `gdn_gates`, `gdn_ssm` and `gdn_norm` remove
+    /// one sub-stage each. Their stand-ins only slice or multiply, so removing one does not prune
+    /// the work that feeds another; to price the recurrence kernel alone, remove `gdn_conv` and
+    /// `gdn_gates` too (their stand-ins are views) and compare with those two alone.
+    fn probe_ablate() -> Ablate {
+        static CELL: std::sync::OnceLock<Ablate> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let v = std::env::var("LUMEN_PROBE_ABLATE").unwrap_or_default();
+            let has = |k: &str| v.split(',').any(|p| p.trim() == k);
+            Ablate {
+                gdn: has("gdn"),
+                attn: has("attn"),
+                moe: has("moe"),
+                lm_head: has("lm_head"),
+                gdn_conv: has("gdn_conv"),
+                gdn_gates: has("gdn_gates"),
+                gdn_ssm: has("gdn_ssm"),
+                gdn_norm: has("gdn_norm"),
+            }
+        })
+    }
+
     /// PROBE (timing only — `LUMEN_PROBE_SKIP_INPROJ_SMALL=1`, requires
     /// LINCOMPUTE skip too): gate-0 of lever A (in_proj concat). Skips the 3
     /// SMALL in_proj matmuls (z/b/a) and keeps only in_proj_qkv. Combined with
@@ -2730,6 +2780,11 @@ mod imp {
                 }
             };
             let timing_on = fine_timing_active();
+            let ablate = if s == 1 {
+                probe_ablate()
+            } else {
+                Ablate::default()
+            };
 
             // (A: in_proj) Four separate in_proj matmuls + reshape z.
             //     The `qwen3_5_moe` checkpoint stores these split (no
@@ -2859,7 +2914,14 @@ mod imp {
             // M4 fused input-side path (LUMEN_NATIVE_FUSE_LINATTN_IN): conv+silu
             // +split+q/k-RMSNorm in ONE kernel (parity: examples/m2c_*). Produces
             // q_scaled/k_scaled/v_post directly; bypasses the conv+norm blocks.
-            let (q_scaled, k_scaled, v_post) = if fuse_linattn_in_enabled()
+            let (q_scaled, k_scaled, v_post) = if ablate.gdn_conv {
+                let parts = mlx_rs::ops::split_sections(&mixed_qkv, &[key_dim, 2 * key_dim], -1)?;
+                (
+                    mlx_rs::ops::reshape(&parts[0], &[b, s, nk, dn])?,
+                    mlx_rs::ops::reshape(&parts[1], &[b, s, nk, dn])?,
+                    mlx_rs::ops::reshape(&parts[2], &[b, s, nv, dv])?,
+                )
+            } else if fuse_linattn_in_enabled()
                 && s == 1
                 && alloc_reuse_enabled()
                 && linear_attn_scale_fuse_enabled()
@@ -3025,11 +3087,19 @@ mod imp {
 
             // (D: ssm) sigmoid(b) + compute_g + Metal SSM step kernel.
             let t_ssm = timing_on.then(Instant::now);
-            let beta = mlx_rs::ops::sigmoid(&b_pre)
-                .context("layer_linear_attn_forward: sigmoid(b) failed")?;
+            let beta = if ablate.gdn_gates {
+                b_pre.clone()
+            } else {
+                mlx_rs::ops::sigmoid(&b_pre)
+                    .context("layer_linear_attn_forward: sigmoid(b) failed")?
+            };
             let a_log = &lw.a_log;
             let dt_bias = &lw.dt_bias;
-            let g = compute_g(a_log, &a_pre, dt_bias)?;
+            let g = if ablate.gdn_gates {
+                a_pre.clone()
+            } else {
+                compute_g(a_log, &a_pre, dt_bias)?
+            };
             // G6-G-1: borrow state_in from cache (same pattern as conv_state
             // above). Saves another ~21 mlx-c entry calls/step.
             let _state_in_owned;
@@ -3042,7 +3112,9 @@ mod imp {
                     &_state_in_owned
                 }
             };
-            let (out_kernel, new_state) = if self.ssm_capture_enabled() {
+            let (out_kernel, new_state) = if ablate.gdn_ssm {
+                (v_post.clone(), state_in.clone())
+            } else if self.ssm_capture_enabled() {
                 // Capture-commit: emit per-position SSM state + stash conv_input
                 // for O(1) speculative rollback in mtp_step Step E.
                 let (y, ns, state_per_pos) = gated_delta_step_kernel_capture(
@@ -3065,7 +3137,11 @@ mod imp {
             // (E: out_proj) RMSNormGated → reshape → out_proj matmul → cast.
             let t_out = timing_on.then(Instant::now);
             let norm_w = &lw.norm_weight;
-            let out_normed = rms_norm_gated(&out_kernel, &z_4d, norm_w, eps)?;
+            let out_normed = if ablate.gdn_norm {
+                mlx_rs::ops::multiply(&out_kernel, &z_4d)?
+            } else {
+                rms_norm_gated(&out_kernel, &z_4d, norm_w, eps)?
+            };
             let out_flat = mlx_rs::ops::reshape(&out_normed, &[b, s, value_dim])
                 .context("layer_linear_attn_forward: reshape out_flat failed")?;
             let out_proj_raw = lw.out_proj.apply(&out_flat)?;
@@ -3514,6 +3590,11 @@ mod imp {
             }
             let cfg = self.text_config();
             let l = ids_arr.shape()[0];
+            let ablate = if l == 1 {
+                probe_ablate()
+            } else {
+                Ablate::default()
+            };
 
             let timing_on = fine_timing_active();
             let mut fine = FineTimings::default();
@@ -3584,7 +3665,9 @@ mod imp {
                     reset_layer_sub_timings();
                 }
                 let t_attn = timing_on.then(Instant::now);
-                let attn = if is_linear {
+                let attn = if (is_linear && ablate.gdn) || (!is_linear && ablate.attn) {
+                    mlx_rs::ops::multiply(&normed, Array::from_f32(0.0))?
+                } else if is_linear {
                     let lin = layer_cache.as_linear_mut()?;
                     self.layer_linear_attn_forward(&normed, layer_idx, lin)?
                 } else if matches!(layer_cache, NativeLayerCache::FullTurboquant(_)) {
@@ -3626,7 +3709,11 @@ mod imp {
                     reset_layer_sub_timings();
                 }
                 let t_moe = timing_on.then(Instant::now);
-                let mlp_out = self.layer_moe_forward(&h_normed, layer_idx)?;
+                let mlp_out = if ablate.moe {
+                    mlx_rs::ops::multiply(&h_normed, Array::from_f32(0.0))?
+                } else {
+                    self.layer_moe_forward(&h_normed, layer_idx)?
+                };
                 if let Some(t0) = t_moe {
                     mlp_out.eval().context("forward: timing eval(moe) failed")?;
                     fine.moe_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -3692,7 +3779,10 @@ mod imp {
             };
             let t_lm = timing_on.then(Instant::now);
             let normed_out = rms_norm(&hidden_for_head, &self.final_norm_weight, cfg.rms_norm_eps)?;
-            let logits = if let Some(lm_head) = &self.lm_head {
+            let logits = if ablate.lm_head {
+                let total = normed_out.sum_axis(-1, true)?;
+                mlx_rs::ops::broadcast_to(&total, &[1, 1, cfg.vocab_size as i32])?
+            } else if let Some(lm_head) = &self.lm_head {
                 lm_head.apply(&normed_out)?
             } else {
                 // Tied path — fold the embed tensors directly.
