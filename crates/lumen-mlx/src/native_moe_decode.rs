@@ -44,7 +44,7 @@ use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
 use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights, SwitchGluWeights,
 };
-use crate::native_qmv::QMV_HEADER;
+use crate::native_qmv::{QMV_8BIT, QMV_BF16, QMV_F32};
 use crate::native_quant::MODE_AFFINE;
 
 lumen_flags::flag! {
@@ -83,11 +83,12 @@ const ROWS_PER_GROUP: i32 = 4;
 const ROWS_GATE_UP: i32 = 2;
 const ROWS_DOWN: i32 = 2;
 
-/// What the expert kernels need beside MLX's matvec helpers ([`QMV_HEADER`]): the routed slots
-/// follow the composed block's bf16 activation (`load_vector_bf16`), the shared slot its f32 one
-/// (`load_vector_f32`), the router its 8-bit gate (`load_vector8`, `qdot8`).
-const MOE_HEADER: &str = r#"
-// MLX's Sigmoid on f32 and on bf16 (every operation rounds to bf16; `x` is already bf16).
+/// MLX's Sigmoid on f32 and on bf16 (every operation rounds to bf16; `x` is already bf16), for the
+/// gate/up kernel's SwiGLU and the router's shared gate. Beside it the expert kernels take MLX's
+/// matvec helpers: the routed slots follow the composed block's bf16 activation ([`QMV_BF16`]),
+/// the shared slot its f32 one ([`QMV_F32`]), the router its 8-bit gate ([`QMV_8BIT`]). The Metal
+/// text carries no comments: MLX copies and hashes a run-time kernel's whole source on every call.
+const SIGMOID_HEADER: &str = r#"
 inline float sigmoid_f32(float x) {
     const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     return (x < 0) ? y : 1 - y;
@@ -100,6 +101,9 @@ inline float sigmoid_bf16(float x) {
 }
 "#;
 
+/// Gate, up and SwiGLU of one slot's rows: `R` gate rows and `R` up rows a simdgroup, as MLX's
+/// `qmv_fast` takes four, each summed in its order. A routed slot rounds as the composed block
+/// does: the gather returns bf16, and the compiled SwiGLU is bf16 op by op.
 const GATE_UP_SOURCE: &str = r#"
     const int lane = thread_index_in_simdgroup;
     const int rg = thread_position_in_grid.y;
@@ -110,7 +114,6 @@ const GATE_UP_SOURCE: &str = r#"
     const bool routed = slot < K;
     /*EXPERT*/
 
-    // Four rows (R gate, R up) a simdgroup, as MLX's qmv_fast does, each summed in its order.
     float g_acc[R];
     float u_acc[R];
     for (int r = 0; r < R; ++r) {
@@ -148,7 +151,6 @@ const GATE_UP_SOURCE: &str = r#"
         if (lane == 0) {
             float a;
             if (routed) {
-                // The gather returns bf16; the compiled SwiGLU is bf16 op by op.
                 const float gr = RB(g);
                 const float ur = RB(u);
                 a = RB(RB(gr * sigmoid_bf16(gr)) * ur);
@@ -429,7 +431,8 @@ impl Kernels {
         } else {
             EXPERT_FROM_LOGITS
         };
-        let header = format!("{QMV_HEADER}{MOE_HEADER}");
+        let gate_up_header = format!("{QMV_BF16}{QMV_F32}{SIGMOID_HEADER}");
+        let down_header = format!("{QMV_BF16}{QMV_F32}");
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
         Ok(Self {
@@ -439,7 +442,7 @@ impl Kernels {
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "inds",
                 ],
                 &["act"],
-                &header,
+                &gate_up_header,
                 &matvec(
                     GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
                     probe.gateup,
@@ -453,7 +456,7 @@ impl Kernels {
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "logits",
                 ],
                 &["act", "inds", "scores", "sscore"],
-                &header,
+                &gate_up_header,
                 &matvec(
                     GATE_UP_SOURCE.replace("/*EXPERT*/", routed_expert),
                     probe.gateup,
@@ -467,7 +470,7 @@ impl Kernels {
                     "act", "w", "sc", "bi", "dw", "ds", "db", "inds", "scores", "sscore",
                 ],
                 &["out"],
-                &header,
+                &down_header,
                 &matvec(DOWN_COMBINE_SOURCE.to_owned(), probe.down),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
@@ -476,7 +479,7 @@ impl Kernels {
                 "moe_decode_router_logits",
                 &["x", "gw", "gs", "gb", "sw", "ss", "sb"],
                 &["logits"],
-                &header,
+                QMV_8BIT,
                 if probe.logits {
                     ROUTER_LOGITS_ZERO
                 } else {

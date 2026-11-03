@@ -636,20 +636,41 @@ mod imp {
                     .as_dtype(mlx_rs::Dtype::Float32)
                     .context("quantized linear: cast result to f32 failed");
             }
-            if let Some(biases) = &self.biases
-                && let Some(plan) = crate::native_qmv::plan(
-                    x,
-                    &self.weight,
-                    &self.scales,
-                    Some(biases),
-                    self.group_size,
-                    self.bits,
-                    self.mode,
-                )
-            {
-                return crate::native_qmv::matvec(&plan, x, &self.weight, &self.scales, biases);
+            let weights = self.weights();
+            if let Some(plan) = crate::native_qmv::plan(x, &weights) {
+                return crate::native_qmv::matvec(&plan, x, &weights);
             }
             self.matmul(x)
+        }
+
+        /// [`Self::apply`] of each projection to the same `x`, in one decode-kernel launch when
+        /// the kernels take them all (`native_qmv::matvec_shared`: one f32 row, bf16 scales);
+        /// `None` otherwise, and the caller applies them one at a time. Equal in every bit to
+        /// `apply`.
+        pub fn apply_shared<const P: usize>(
+            x: &Array,
+            projections: [&ResolvedLinear; P],
+        ) -> Result<Option<[Array; P]>> {
+            if act_bf16::get() {
+                return Ok(None);
+            }
+            let weights = projections.map(ResolvedLinear::weights);
+            let Some(outputs) = crate::native_qmv::matvec_shared(x, &weights)? else {
+                return Ok(None);
+            };
+            Ok(outputs.try_into().ok())
+        }
+
+        /// The tensors and parameters the decode kernels read.
+        fn weights(&self) -> crate::native_qmv::Weights<'_> {
+            crate::native_qmv::Weights {
+                weight: &self.weight,
+                scales: &self.scales,
+                biases: self.biases.as_ref(),
+                group_size: self.group_size,
+                bits: self.bits,
+                mode: self.mode,
+            }
         }
 
         fn matmul(&self, x: &Array) -> Result<Array> {
@@ -930,14 +951,7 @@ mod imp {
             _ => lin,
         };
         // The decode kernels read bf16 scales as they are, so a projection they serve keeps them.
-        let kernels_read_scales = crate::native_qmv::serves(
-            &lin.weight,
-            &lin.scales,
-            lin.biases.as_ref(),
-            lin.group_size,
-            lin.bits,
-            lin.mode,
-        );
+        let kernels_read_scales = crate::native_qmv::serves(&lin.weights());
         if widen_scales::get() && lin.mode == MODE_AFFINE && !kernels_read_scales {
             widen_linear_scales(lin)
                 .with_context(|| format!("resolve_linear({base}): widen scales"))
@@ -2645,11 +2659,17 @@ mod imp {
                     probe_projection_stand_in(x, num_kv * head_dim)?,
                 )
             } else {
-                let q_proj_raw = lw.q_proj.apply(x)?;
+                let [q_proj_raw, k_proj_raw, v_proj_raw] =
+                    match ResolvedLinear::apply_shared(x, [&lw.q_proj, &lw.k_proj, &lw.v_proj])? {
+                        Some(qkv) => qkv,
+                        None => [
+                            lw.q_proj.apply(x)?,
+                            lw.k_proj.apply(x)?,
+                            lw.v_proj.apply(x)?,
+                        ],
+                    };
                 let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
-                let k_proj_raw = lw.k_proj.apply(x)?;
                 let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
-                let v_proj_raw = lw.v_proj.apply(x)?;
                 let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
                 (q_proj, k_proj, v_proj)
             };
@@ -2955,19 +2975,30 @@ mod imp {
             //     returns the input dtype (f32 here) so the casts were
             //     identity ops adding only graph nodes.
             let t_in_proj = timing_on.then(Instant::now);
-            let mixed_qkv = if ablate.gdn_proj {
-                probe_projection_stand_in(x, conv_dim)?
-            } else {
-                lw.in_proj_qkv.apply(x)?
-            };
             // PROBE lever-A gate-0: skip the 3 small in_proj matmuls (z/b/a).
             // Only valid with LINCOMPUTE skip (which returns early below using
             // only mixed_qkv) — the dummies are never consumed.
             let skip_inproj_small = probe_skip_lincompute() && probe_skip_inproj_small() && s == 1;
+            // A decode step runs the four projections in one kernel launch.
+            let shared = if ablate.gdn_proj || skip_inproj_small {
+                None
+            } else {
+                ResolvedLinear::apply_shared(
+                    x,
+                    [&lw.in_proj_qkv, &lw.in_proj_z, &lw.in_proj_b, &lw.in_proj_a],
+                )?
+            };
+            let (mixed_qkv, shared_zba) = match shared {
+                Some([qkv, z, b, a]) => (qkv, Some((z, b, a))),
+                None if ablate.gdn_proj => (probe_projection_stand_in(x, conv_dim)?, None),
+                None => (lw.in_proj_qkv.apply(x)?, None),
+            };
             let (z_4d, b_pre, a_pre) = if skip_inproj_small {
                 (mixed_qkv.clone(), mixed_qkv.clone(), mixed_qkv.clone())
             } else {
-                let (z_flat, b_pre, a_pre) = if ablate.gdn_proj {
+                let (z_flat, b_pre, a_pre) = if let Some(zba) = shared_zba {
+                    zba
+                } else if ablate.gdn_proj {
                     (
                         probe_projection_stand_in(x, value_dim)?,
                         probe_projection_stand_in(x, nv)?,
@@ -3443,17 +3474,12 @@ mod imp {
                 let up = it.next().expect("dense mlp: fused split[1] (up)");
                 (gate, up)
             } else {
-                let gate = d
-                    .gate_proj
-                    .as_ref()
-                    .expect("dense mlp: gate_proj missing")
-                    .apply(x)?;
-                let up = d
-                    .up_proj
-                    .as_ref()
-                    .expect("dense mlp: up_proj missing")
-                    .apply(x)?;
-                (gate, up)
+                let gate_proj = d.gate_proj.as_ref().expect("dense mlp: gate_proj missing");
+                let up_proj = d.up_proj.as_ref().expect("dense mlp: up_proj missing");
+                match ResolvedLinear::apply_shared(x, [gate_proj, up_proj])? {
+                    Some([gate, up]) => (gate, up),
+                    None => (gate_proj.apply(x)?, up_proj.apply(x)?),
+                }
             };
             // Reuse the landed mxfp4 SwiGLU fusion (-0.671ms/step, t=-29σ) — the
             // dense path was running raw silu+multiply (2 dispatches). Same

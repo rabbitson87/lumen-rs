@@ -504,7 +504,9 @@ Conv-state advance via `slice` (view/copy) instead of `take_axis`
 Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 and whose
  scales and biases are bf16 or f16 in kernels that read those scales as they are
  (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
- call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`.
+ call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
+ single-token step runs the projections of one activation (linear attention's four input
+ projections, attention's q/k/v, a dense MLP's gate and up) in one launch.
 
  A matvec is up to MLX's batch limit of rows (6 to 33, by GPU and size; 13-15 on an M3 Max):
  a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
@@ -516,11 +518,9 @@ Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 a
  MLX's matmul (and widens every affine projection's scales again).
 
  M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
- 218 -> 200 us, 5120x17408 213 -> 200 us, 10240x5120 129 -> 121 us, 8192x2048 43.4 -> 42.1 us
- against MLX on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 120,
- 40.1 us). Qwen3.6-35B-A3B affine decode, runs no other work slowed: 9.3 -> 9.0-9.2
- ms/token, the text identical in every run. Footprint without the f32 copies: 35B-A3B 20.63
- -> 20.52 GB, 27B 18.51 -> 17.22 GB.
+ 218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
+ on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 1066 us); a small
+ projection (32x2048) is slower alone, 3.6 -> 6.1 us, which the shared launch removes.
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 

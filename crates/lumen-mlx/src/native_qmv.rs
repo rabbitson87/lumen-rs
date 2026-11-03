@@ -9,9 +9,17 @@
 //! on this GPU, in its arithmetic, so its output equals `quantized_matmul` on the widened scales in
 //! every bit. With the kernels serving a projection's decode steps, its scales need no f32 copy
 //! ([`serves`]).
+//!
+//! A run-time kernel costs CPU on every call that MLX's own matmul does not: `fast::metal_kernel`
+//! rebuilds the kernel's whole source text and hashes it each time it is called and encoded. A
+//! decode step that is close to CPU-bound (the 35B-A3B's) feels that, so projections that share an
+//! activation run in one launch ([`matvec_shared`]) and every source carries only the helpers it
+//! calls, with no comments inside the Metal text.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
@@ -24,7 +32,9 @@ lumen_flags::flag! {
     /// Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 and whose
     /// scales and biases are bf16 or f16 in kernels that read those scales as they are
     /// (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
-    /// call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`.
+    /// call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`. A
+    /// single-token step runs the projections of one activation (linear attention's four input
+    /// projections, attention's q/k/v, a dense MLP's gate and up) in one launch.
     ///
     /// A matvec is up to MLX's batch limit of rows (6 to 33, by GPU and size; 13-15 on an M3 Max):
     /// a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
@@ -36,11 +46,9 @@ lumen_flags::flag! {
     /// MLX's matmul (and widens every affine projection's scales again).
     ///
     /// M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
-    /// 218 -> 200 us, 5120x17408 213 -> 200 us, 10240x5120 129 -> 121 us, 8192x2048 43.4 -> 42.1 us
-    /// against MLX on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 120,
-    /// 40.1 us). Qwen3.6-35B-A3B affine decode, runs no other work slowed: 9.3 -> 9.0-9.2
-    /// ms/token, the text identical in every run. Footprint without the f32 copies: 35B-A3B 20.63
-    /// -> 20.52 GB, 27B 18.51 -> 17.22 GB.
+    /// 218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
+    /// on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 1066 us); a small
+    /// projection (32x2048) is slower alone, 3.6 -> 6.1 us, which the shared launch removes.
     pub(crate) decode_qmv {
         env: "LUMEN_NATIVE_DECODE_QMV",
         default: true,
@@ -51,13 +59,15 @@ lumen_flags::flag! {
 /// Output rows one simdgroup owns, and simdgroups to a threadgroup: MLX's `qmv_fast` takes 4 and 2.
 const ROWS: i32 = 4;
 const SIMDGROUPS: i32 = 2;
+/// Projections one shared launch takes at most: linear attention's four input projections.
+const MAX_SHARED: usize = 4;
 
 /// MLX's `qmv_fast` (`qmv_fast_impl<float, 64, 4>`), one simdgroup per `R` output rows of vector
 /// `z`: lane `l` takes values `16 l .. 16 l + 16` of every block of 512, the rows' sums run block
-/// by block in `qdot`'s order, then `simd_sum` adds the lanes.
-const FAST_SOURCE: &str = r#"
+/// by block in `qdot`'s order, then `simd_sum` adds the lanes. [`fast_source`] puts in front of it
+/// the choice of the projection (`w`, `sc`, `bi`, `out`, `N`) and the row group `rg` within it.
+const FAST_BODY: &str = r#"
     const int lane = thread_index_in_simdgroup;
-    const int rg = thread_position_in_grid.y;
     const int vec = thread_position_in_grid.z;
     constexpr int G = K / 64;
     constexpr int WPR = K / 8;
@@ -86,6 +96,32 @@ const FAST_SOURCE: &str = r#"
         }
     }
 "#;
+
+/// [`FAST_BODY`] for `projections` projections of one activation (`w0`, `sc0`, `bi0`, `out0`,
+/// `N0`, then `w1`, ...): projection `p` owns the `Np / R` row groups after those of the ones
+/// before it, along the grid's y axis.
+fn fast_source(projections: usize) -> String {
+    let mut s = String::from("    int rg = thread_position_in_grid.y;\n    int p = 0;\n");
+    for p in 1..projections {
+        let q = p - 1;
+        s += &format!(
+            "    if (p == {q} && rg >= N{q} / R) {{\n        rg -= N{q} / R;\n        p = {p};\n    }}\n"
+        );
+    }
+    let pick = |name: &str| {
+        (0..projections - 1)
+            .rev()
+            .fold(format!("{name}{}", projections - 1), |rest, p| {
+                format!("p == {p} ? {name}{p} : {rest}")
+            })
+    };
+    s += &format!("    const device uint32_t* w = {};\n", pick("w"));
+    s += &format!("    const auto sc = {};\n", pick("sc"));
+    s += &format!("    const auto bi = {};\n", pick("bi"));
+    s += &format!("    device float* out = {};\n", pick("out"));
+    s += &format!("    const int N = {};\n", pick("N"));
+    s + FAST_BODY
+}
 
 /// MLX's `qmv_wide` (`qmv_wide_impl<float, 64, 4, V, 8>`), `M` vectors in tiles of `V`: eight lanes
 /// to a row, lane `k` taking groups `k, k + 8, ...` of the row, each decoded eight values at a time
@@ -144,7 +180,7 @@ const WIDE_SOURCE: &str = r#"
 "#;
 
 /// The matvec MLX runs for some number of vectors, which the kernels reproduce.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
     /// `qmv_fast`, each vector on its own.
     Fast,
@@ -245,6 +281,17 @@ fn gpu() -> Option<Gpu> {
     })
 }
 
+/// One quantized projection's tensors and parameters, as the kernels read them.
+#[derive(Clone, Copy)]
+pub(crate) struct Weights<'a> {
+    pub weight: &'a Array,
+    pub scales: &'a Array,
+    pub biases: Option<&'a Array>,
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: &'a CStr,
+}
+
 /// A matvec the kernels run: `vectors` rows of `inputs` against `[outputs, inputs]` weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -254,64 +301,43 @@ pub(crate) struct Plan {
     kind: Kind,
 }
 
-/// `[outputs, inputs]` when the kernels read this projection: `decode_qmv` is on, the weights are
-/// affine 4-bit group 64 in the lengths MLX runs as `qmv_fast` (inputs a multiple of 512, outputs a
-/// multiple of 8), and the scales and biases are bf16 or f16, which `quantized_matmul` would cast.
-fn layout(
-    weight: &Array,
-    scales: &Array,
-    biases: Option<&Array>,
-    group_size: i32,
-    bits: i32,
-    mode: &CStr,
-) -> Option<(i32, i32)> {
-    if !decode_qmv::get() || mode != MODE_AFFINE || (group_size, bits) != (64, 4) {
+/// `[outputs, inputs]` and the biases when the kernels read this projection: `decode_qmv` is on,
+/// the weights are affine 4-bit group 64 in the lengths MLX runs as `qmv_fast` (inputs a multiple
+/// of 512, outputs a multiple of 8), and the scales and biases are bf16 or f16, which
+/// `quantized_matmul` would cast.
+fn layout<'a>(w: &Weights<'a>) -> Option<(i32, i32, &'a Array)> {
+    if !decode_qmv::get() || w.mode != MODE_AFFINE || (w.group_size, w.bits) != (64, 4) {
         return None;
     }
-    let (Some(biases), &[outputs, packed]) = (biases, weight.shape()) else {
+    let (Some(biases), &[outputs, packed]) = (w.biases, w.weight.shape()) else {
         return None;
     };
     let inputs = packed * 8;
     let ok = inputs % 512 == 0
         && outputs % (ROWS * SIMDGROUPS) == 0
-        && weight.dtype() == Dtype::Uint32
-        && scales.shape() == [outputs, inputs / 64]
+        && w.weight.dtype() == Dtype::Uint32
+        && w.scales.shape() == [outputs, inputs / 64]
         && biases.shape() == [outputs, inputs / 64]
-        && matches!(scales.dtype(), Dtype::Bfloat16 | Dtype::Float16)
-        && biases.dtype() == scales.dtype();
-    ok.then_some((outputs, inputs))
+        && matches!(w.scales.dtype(), Dtype::Bfloat16 | Dtype::Float16)
+        && biases.dtype() == w.scales.dtype();
+    ok.then_some((outputs, inputs, biases))
 }
 
 /// Whether the kernels run every matvec of this projection that MLX would run as one, so a load
 /// may keep its scales in bf16: the projection has their layout and the GPU is known (a single
 /// vector needs no GPU rule; several do).
-pub(crate) fn serves(
-    weight: &Array,
-    scales: &Array,
-    biases: Option<&Array>,
-    group_size: i32,
-    bits: i32,
-    mode: &CStr,
-) -> bool {
-    gpu().is_some() && layout(weight, scales, biases, group_size, bits, mode).is_some()
+pub(crate) fn serves(w: &Weights<'_>) -> bool {
+    gpu().is_some() && layout(w).is_some()
 }
 
-/// The matvec [`matvec`] runs for `x` against these tensors, or `None` when they are not the
+/// The matvec [`matvec`] runs for `x` against this projection, or `None` when it is not the
 /// kernels' (see [`layout`]), `x` is not f32, or `x` has as many rows as MLX runs as a matrix.
 ///
 /// Rows count as MLX counts them for a contiguous `x`: every vector of the leading axes. MLX counts
 /// a strided `x` by its second-to-last axis instead, so a strided `[n, 1, k]` would run elsewhere;
 /// the trunk's activations come out of norms and are contiguous.
-pub(crate) fn plan(
-    x: &Array,
-    weight: &Array,
-    scales: &Array,
-    biases: Option<&Array>,
-    group_size: i32,
-    bits: i32,
-    mode: &CStr,
-) -> Option<Plan> {
-    let (outputs, inputs) = layout(weight, scales, biases, group_size, bits, mode)?;
+pub(crate) fn plan(x: &Array, w: &Weights<'_>) -> Option<Plan> {
+    let (outputs, inputs, _) = layout(w)?;
     if x.dtype() != Dtype::Float32 || x.shape().last() != Some(&inputs) {
         return None;
     }
@@ -331,7 +357,8 @@ pub(crate) fn plan(
 }
 
 struct Kernels {
-    fast: MetalKernel,
+    /// `fast[p - 1]` runs `p` projections of one activation.
+    fast: [MetalKernel; MAX_SHARED],
     wide: MetalKernel,
 }
 
@@ -339,28 +366,117 @@ thread_local! {
     /// MLX keeps one stream per thread and the engine decodes on one thread, so the kernels are
     /// built once per thread rather than per call.
     static KERNELS: OnceCell<Kernels> = const { OnceCell::new() };
+    /// Launch configs by shape, built once: a config is a dozen FFI calls, a decode step runs a
+    /// few shapes many times.
+    static CONFIGS: RefCell<HashMap<ConfigKey, Rc<MetalKernelConfig>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// What a launch's config depends on: the kernel, the row count, the input length and each
+/// projection's output rows (unused slots 0).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ConfigKey {
+    kind: Kind,
+    vectors: i32,
+    inputs: i32,
+    outputs: [i32; MAX_SHARED],
+}
+
+/// The config for `key`, built by `build` the first time.
+fn config(
+    key: ConfigKey,
+    build: impl FnOnce(&MetalKernelConfig) -> Result<()>,
+) -> Result<Rc<MetalKernelConfig>> {
+    if let Some(c) = CONFIGS.with(|m| m.borrow().get(&key).cloned()) {
+        return Ok(c);
+    }
+    let c = MetalKernelConfig::new();
+    build(&c)?;
+    let c = Rc::new(c);
+    CONFIGS.with(|m| m.borrow_mut().insert(key, Rc::clone(&c)));
+    Ok(c)
+}
+
+/// The input names, output names and source of the fast kernel over `projections` projections of
+/// one activation: `x`, then `w`, `sc`, `bi` of each; `out` of each.
+struct FastSignature {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    source: String,
+}
+
+impl FastSignature {
+    fn new(projections: usize) -> Self {
+        let mut inputs = vec!["x".to_string()];
+        for p in 0..projections {
+            inputs.extend([format!("w{p}"), format!("sc{p}"), format!("bi{p}")]);
+        }
+        Self {
+            inputs,
+            outputs: (0..projections).map(|p| format!("out{p}")).collect(),
+            source: fast_source(projections),
+        }
+    }
+
+    fn inputs(&self) -> Vec<&str> {
+        self.inputs.iter().map(String::as_str).collect()
+    }
+
+    fn outputs(&self) -> Vec<&str> {
+        self.outputs.iter().map(String::as_str).collect()
+    }
 }
 
 fn with_kernels<R>(f: impl FnOnce(&Kernels) -> Result<R>) -> Result<R> {
     KERNELS.with(|cell| {
         if cell.get().is_none() {
-            // The names are literals: `cargo xtask test` reads kernel names off the constructor
-            // calls to check that every kernel ran in its Metal 3.1 pass.
+            // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
+            // names off the constructor calls to check that every kernel ran in its Metal 3.1 pass.
+            let [one, two, three, four] = [1, 2, 3, 4].map(FastSignature::new);
             let kernels = Kernels {
-                fast: MetalKernel::new_with_header(
-                    "decode_qmv_affine4",
-                    &["x", "w", "sc", "bi"],
-                    &["out"],
-                    QMV_HEADER,
-                    FAST_SOURCE,
-                    /* ensure_row_contiguous */ true,
-                    /* atomic_outputs */ false,
-                )?,
+                fast: [
+                    MetalKernel::new_with_header(
+                        "decode_qmv_affine4",
+                        &one.inputs(),
+                        &one.outputs(),
+                        QMV_F32,
+                        &one.source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_affine4_x2",
+                        &two.inputs(),
+                        &two.outputs(),
+                        QMV_F32,
+                        &two.source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_affine4_x3",
+                        &three.inputs(),
+                        &three.outputs(),
+                        QMV_F32,
+                        &three.source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                    MetalKernel::new_with_header(
+                        "decode_qmv_affine4_x4",
+                        &four.inputs(),
+                        &four.outputs(),
+                        QMV_F32,
+                        &four.source,
+                        /* ensure_row_contiguous */ true,
+                        /* atomic_outputs */ false,
+                    )?,
+                ],
                 wide: MetalKernel::new_with_header(
                     "decode_qmv_wide_affine4",
                     &["x", "w", "sc", "bi"],
                     &["out"],
-                    QMV_HEADER,
+                    QMV_WIDE,
                     WIDE_SOURCE,
                     /* ensure_row_contiguous */ true,
                     /* atomic_outputs */ false,
@@ -374,66 +490,159 @@ fn with_kernels<R>(f: impl FnOnce(&Kernels) -> Result<R>) -> Result<R> {
     })
 }
 
-/// `x @ deq(weight).T` as [`plan`] planned it: `x`'s shape with the last axis the weight's rows,
-/// f32.
-pub(crate) fn matvec(
-    plan: &Plan,
-    x: &Array,
-    weight: &Array,
-    scales: &Array,
-    biases: &Array,
-) -> Result<Array> {
-    let Plan {
-        vectors,
-        inputs,
-        outputs,
-        kind,
-    } = *plan;
-    let flat = mlx_rs::ops::reshape(x, &[vectors * inputs])?;
-    let y = with_kernels(|k| {
-        let config = MetalKernelConfig::new();
-        config.add_template_arg_int("K", inputs)?;
-        config.add_template_arg_int("N", outputs)?;
-        config.add_output_arg(&[vectors * outputs], Dtype::Float32)?;
-        let kernel = match kind {
-            Kind::Fast => {
-                config.add_template_arg_int("R", ROWS)?;
-                config.set_grid(32, outputs / ROWS, vectors)?;
-                config.set_thread_group(32, SIMDGROUPS, 1)?;
-                &k.fast
-            }
-            Kind::Wide { vecs } => {
-                config.add_template_arg_int("M", vectors)?;
-                config.add_template_arg_int("V", vecs)?;
-                let tiles = (vectors + vecs - 1) / vecs;
-                config.set_grid(32 * tiles, SIMDGROUPS * (outputs / (ROWS * SIMDGROUPS)), 1)?;
-                config.set_thread_group(32, SIMDGROUPS, 1)?;
-                &k.wide
-            }
-        };
-        Ok(kernel
-            .apply(&[&flat, weight, scales, biases], &config, 1)
-            .context("decode matvec kernel failed")?
-            .swap_remove(0))
-    })?;
+/// `x`'s shape with the last axis `outputs`, for an output the kernels wrote flat.
+fn reshape_out(y: &Array, x: &Array, outputs: i32) -> Result<Array> {
     let mut shape = x.shape().to_vec();
     if let Some(last) = shape.last_mut() {
         *last = outputs;
     }
-    Ok(mlx_rs::ops::reshape(&y, &shape)?)
+    Ok(mlx_rs::ops::reshape(y, &shape)?)
+}
+
+/// `qmv_fast` for every plan, one launch: the plans share `x` and its row count.
+fn run_fast(x: &Array, plans: &[Plan], weights: &[Weights<'_>]) -> Result<Vec<Array>> {
+    let (vectors, inputs) = (plans[0].vectors, plans[0].inputs);
+    let flat = mlx_rs::ops::reshape(x, &[vectors * inputs])?;
+    let mut tensors: Vec<&Array> = vec![&flat];
+    for w in weights {
+        let biases = w
+            .biases
+            .context("decode matvec: projection without biases")?;
+        tensors.extend([w.weight, w.scales, biases]);
+    }
+    let mut outputs = [0; MAX_SHARED];
+    for (o, plan) in outputs.iter_mut().zip(plans) {
+        *o = plan.outputs;
+    }
+    let key = ConfigKey {
+        kind: Kind::Fast,
+        vectors,
+        inputs,
+        outputs,
+    };
+    let config = config(key, |config| {
+        config.add_template_arg_int("K", inputs)?;
+        config.add_template_arg_int("R", ROWS)?;
+        for (p, plan) in plans.iter().enumerate() {
+            config.add_template_arg_int(&format!("N{p}"), plan.outputs)?;
+            config.add_output_arg(&[vectors * plan.outputs], Dtype::Float32)?;
+        }
+        let groups: i32 = plans.iter().map(|p| p.outputs / ROWS).sum();
+        config.set_grid(32, groups, vectors)?;
+        config.set_thread_group(32, SIMDGROUPS, 1)
+    })?;
+    let ys = with_kernels(|k| {
+        k.fast[plans.len() - 1]
+            .apply(&tensors, &config, plans.len())
+            .context("decode matvec kernel failed")
+    })?;
+    ys.iter()
+        .zip(plans)
+        .map(|(y, plan)| reshape_out(y, x, plan.outputs))
+        .collect()
+}
+
+/// `x @ deq(weight).T` as [`plan`] planned it: `x`'s shape with the last axis the weight's rows,
+/// f32.
+pub(crate) fn matvec(plan: &Plan, x: &Array, w: &Weights<'_>) -> Result<Array> {
+    let Kind::Wide { vecs } = plan.kind else {
+        return Ok(run_fast(x, &[*plan], &[*w])?.swap_remove(0));
+    };
+    let Plan {
+        vectors,
+        inputs,
+        outputs,
+        ..
+    } = *plan;
+    let biases = w
+        .biases
+        .context("decode matvec: projection without biases")?;
+    let flat = mlx_rs::ops::reshape(x, &[vectors * inputs])?;
+    let key = ConfigKey {
+        kind: plan.kind,
+        vectors,
+        inputs,
+        outputs: [outputs, 0, 0, 0],
+    };
+    let config = config(key, |config| {
+        config.add_template_arg_int("K", inputs)?;
+        config.add_template_arg_int("N", outputs)?;
+        config.add_template_arg_int("M", vectors)?;
+        config.add_template_arg_int("V", vecs)?;
+        config.add_output_arg(&[vectors * outputs], Dtype::Float32)?;
+        let tiles = (vectors + vecs - 1) / vecs;
+        config.set_grid(32 * tiles, SIMDGROUPS * (outputs / (ROWS * SIMDGROUPS)), 1)?;
+        config.set_thread_group(32, SIMDGROUPS, 1)
+    })?;
+    let y = with_kernels(|k| {
+        Ok(k.wide
+            .apply(&[&flat, w.weight, w.scales, biases], &config, 1)
+            .context("decode matvec kernel failed")?
+            .swap_remove(0))
+    })?;
+    reshape_out(&y, x, outputs)
+}
+
+/// `x @ deq(W).T` for each of up to four projections of one activation, in one launch, or `None`
+/// when that launch cannot run them: one is not the kernels' (see [`plan`]) or MLX would not run it
+/// as `qmv_fast` (several vectors on a GPU that runs them as `qmv_wide`). The caller then runs the
+/// projections one at a time. Each output equals [`matvec`]'s for its projection in every bit: the
+/// launch gives every projection's rows their own simdgroups, as its own launch would.
+pub(crate) fn matvec_shared(x: &Array, weights: &[Weights<'_>]) -> Result<Option<Vec<Array>>> {
+    if weights.is_empty() || weights.len() > MAX_SHARED {
+        return Ok(None);
+    }
+    let Some(plans) = weights
+        .iter()
+        .map(|w| plan(x, w).filter(|p| p.kind == Kind::Fast))
+        .collect::<Option<Vec<Plan>>>()
+    else {
+        return Ok(None);
+    };
+    run_fast(x, &plans, weights).map(Some)
 }
 
 /// MLX's own quantized matvec, transcribed (`kernels/quantized.h`, MLX 0.32): the helpers its
 /// `qmv_fast` and `qmv_wide` run, so a kernel built on them adds in the order `quantized_matmul`
-/// and `gather_qmm` do. A matvec row is one simdgroup's lanes, each 16 values of every 512 (4-bit weights), summed
-/// per lane in `qdot`'s order and then across lanes with `simd_sum`; changing that partition or
-/// order changes the low bits.
-pub(crate) const QMV_HEADER: &str = r#"
-#define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
+/// and `gather_qmm` do. A `qmv_fast` row is one simdgroup's lanes, each 16 values of every 512
+/// (4-bit weights), summed per lane in `qdot`'s order and then across lanes with `simd_sum`;
+/// changing that partition or order changes the low bits.
+///
+/// Each kernel takes only the pieces it calls, and the Metal text carries no comments: MLX copies
+/// and hashes a run-time kernel's whole source on every call.
+///
+/// `QMV_F32`: `load_vector` over f32 activations (each quad summed left to right, the lanes'
+/// values pre-divided by 16, 256, 4096), and `qdot` for 4-bit weights, 16 values.
+pub(crate) const QMV_F32: &str = r#"
+inline float load_vector_f32(const device float* x, thread float* x_thread) {
+    float sum = 0;
+    for (int i = 0; i < 16; i += 4) {
+        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+        x_thread[i] = x[i];
+        x_thread[i + 1] = x[i + 1] / 16.0f;
+        x_thread[i + 2] = x[i + 2] / 256.0f;
+        x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+    return sum;
+}
+inline float qdot4(const device uint16_t* ws, const thread float* x_thread, float scale, float bias, float sum) {
+    float accum = 0;
+    for (int i = 0; i < 4; i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+    return scale * accum + sum * bias;
+}
+"#;
 
-// load_vector over bf16 activations. The composed path casts the activation to bf16 before the
-// gather, so `x` (f32 here) is rounded first; the quad sum then rounds to bf16 after every add, as
-// `sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]` does on bf16 operands.
+/// `load_vector` over bf16 activations. The composed path casts the activation to bf16 before the
+/// gather, so `x` (f32 here) is rounded first; the quad sum then rounds to bf16 after every add, as
+/// `sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]` does on bf16 operands. `RB` rounds through bf16.
+pub(crate) const QMV_BF16: &str = r#"
+#define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
 inline float load_vector_bf16(const device float* x, thread float* x_thread) {
     float sum = 0;
     for (int i = 0; i < 16; i += 4) {
@@ -449,51 +658,11 @@ inline float load_vector_bf16(const device float* x, thread float* x_thread) {
     }
     return sum;
 }
+"#;
 
-// load_vector over f32 activations.
-inline float load_vector_f32(const device float* x, thread float* x_thread) {
-    float sum = 0;
-    for (int i = 0; i < 16; i += 4) {
-        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-        x_thread[i] = x[i];
-        x_thread[i + 1] = x[i + 1] / 16.0f;
-        x_thread[i + 2] = x[i + 2] / 256.0f;
-        x_thread[i + 3] = x[i + 3] / 4096.0f;
-    }
-    return sum;
-}
-
-// qdot for 4-bit weights, 16 values.
-inline float qdot4(
-    const device uint16_t* ws,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum) {
-    float accum = 0;
-    for (int i = 0; i < 4; i++) {
-        accum +=
-            (x_thread[4 * i] * (ws[i] & 0x000f) +
-             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-             x_thread[4 * i + 3] * (ws[i] & 0xf000));
-    }
-    return scale * accum + sum * bias;
-}
-
-// dequantize<float, 8, 4> (qmv_wide's): eight 4-bit values from four bytes, scale * q + bias.
-inline void dequantize4x8(const device uint8_t* w, float scale, float bias, thread float* w_local) {
-    const float s = float(scale);
-    const float b = float(bias);
-    float sc[2] = {s, s / 16.0f};
-    for (int i = 0; i < 4; i++) {
-        w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
-        w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
-    }
-}
-
-// load_vector and qdot for 8-bit weights over f32 activations, `V` values a lane (`V` is 8 under
-// `qmv_fast`, 4 under `qmv`).
+/// `load_vector` and `qdot` for 8-bit weights over f32 activations, `V` values a lane (`V` is 8
+/// under `qmv_fast`, 4 under `qmv`).
+pub(crate) const QMV_8BIT: &str = r#"
 template <int V>
 inline float load_vector8(const device float* x, thread float* x_thread) {
     float sum = 0;
@@ -504,17 +673,25 @@ inline float load_vector8(const device float* x, thread float* x_thread) {
     return sum;
 }
 template <int V>
-inline float qdot8(
-    const device uint8_t* w,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum) {
+inline float qdot8(const device uint8_t* w, const thread float* x_thread, float scale, float bias, float sum) {
     float accum = 0;
     for (int i = 0; i < V; i++) {
         accum += x_thread[i] * w[i];
     }
     return scale * accum + sum * bias;
+}
+"#;
+
+/// `dequantize<float, 8, 4>` (`qmv_wide`'s): eight 4-bit values from four bytes, `scale * q + bias`.
+const QMV_WIDE: &str = r#"
+inline void dequantize4x8(const device uint8_t* w, float scale, float bias, thread float* w_local) {
+    const float s = float(scale);
+    const float b = float(bias);
+    float sc[2] = {s, s / 16.0f};
+    for (int i = 0; i < 4; i++) {
+        w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
+        w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
+    }
 }
 "#;
 
@@ -529,6 +706,23 @@ mod tests {
         w: Array,
         s: Array,
         b: Array,
+    }
+
+    impl Projection {
+        fn weights(&self) -> Weights<'_> {
+            self.weights_with(&self.s, &self.b)
+        }
+
+        fn weights_with<'a>(&'a self, s: &'a Array, b: &'a Array) -> Weights<'a> {
+            Weights {
+                weight: &self.w,
+                scales: s,
+                biases: Some(b),
+                group_size: 64,
+                bits: 4,
+                mode: MODE_AFFINE,
+            }
+        }
     }
 
     /// An affine 4-bit group-64 `[rows, inputs]` projection quantized from bf16 weights, so its
@@ -584,10 +778,6 @@ mod tests {
             .count()
     }
 
-    fn plan_for(x: &Array, p: &Projection) -> Option<Plan> {
-        plan(x, &p.w, &p.s, Some(&p.b), 64, 4, MODE_AFFINE)
-    }
-
     #[test]
     fn the_kernels_equal_quantized_matmul_on_widened_scales_bit_for_bit() {
         let generation = gpu()
@@ -607,7 +797,7 @@ mod tests {
             // A decode step, an MTP verify, batches up to past MLX's batch limit (13-15 here).
             for vectors in [1, 2, 3, 5, 6, 7, 11, 12, 14] {
                 let x = activation(&[1, vectors, inputs], 1000 + vectors as u64);
-                let Some(plan) = plan_for(&x, &p) else {
+                let Some(plan) = plan(&x, &p.weights()) else {
                     let limit = gpu().map(|g| g.batch_limit(inputs, rows));
                     assert!(
                         Some(vectors) >= limit,
@@ -616,7 +806,7 @@ mod tests {
                     continue;
                 };
                 wide_runs += usize::from(matches!(plan.kind, Kind::Wide { .. }));
-                let got = matvec(&plan, &x, &p.w, &p.s, &p.b).expect("kernel");
+                let got = matvec(&plan, &x, &p.weights()).expect("kernel");
                 let off = differing(&mlx_on_widened_scales(&x, &p), &got);
                 assert_eq!(
                     off, 0,
@@ -627,6 +817,56 @@ mod tests {
         }
         // From generation 15 MLX runs several vectors as `qmv_wide`, so the wide kernel ran here.
         assert_eq!(wide_runs > 0, generation >= 15);
+    }
+
+    /// One launch over the projections of one activation gives each projection's own output: the
+    /// 35B-A3B's linear-attention input projections (four), attention's q/k/v (three), a dense
+    /// MLP's gate and up (two), and one alone.
+    #[test]
+    fn a_shared_launch_equals_each_projection_alone_bit_for_bit() {
+        let groups: [&[(i32, i32)]; 4] = [
+            &[(8192, 2048), (4096, 2048), (32, 2048), (32, 2048)],
+            &[(8192, 2048), (512, 2048), (512, 2048)],
+            &[(1024, 1024), (1024, 1024)],
+            &[(64, 1536)],
+        ];
+        for (g, shapes) in groups.iter().enumerate() {
+            let ps: Vec<Projection> = shapes
+                .iter()
+                .enumerate()
+                .map(|(i, &(rows, inputs))| projection(rows, inputs, (10 * g + i) as u64))
+                .collect();
+            let weights: Vec<Weights<'_>> = ps.iter().map(Projection::weights).collect();
+            let x = activation(&[1, 1, shapes[0].1], 50 + g as u64);
+            let got = matvec_shared(&x, &weights)
+                .expect("kernel")
+                .expect("the shared launch must take one vector of these projections");
+            assert_eq!(got.len(), ps.len());
+            for (p, (y, &(rows, inputs))) in ps.iter().zip(got.iter().zip(shapes.iter())) {
+                let off = differing(&mlx_on_widened_scales(&x, p), y);
+                assert_eq!(off, 0, "group {g}, {rows}x{inputs}: {off} outputs differ");
+            }
+        }
+        // Several vectors on a GPU that runs them as `qmv_wide` are not the shared launch's.
+        let ps = [projection(512, 2048, 1), projection(32, 2048, 2)];
+        let weights = [ps[0].weights(), ps[1].weights()];
+        let x = activation(&[1, 3, 2048], 3);
+        let shared = matvec_shared(&x, &weights).expect("kernel");
+        assert_eq!(
+            shared.is_some(),
+            gpu().is_some_and(|g| g.kind(3, 2048, 512) == Some(Kind::Fast))
+        );
+        // Neither are projections of different input lengths, nor more than four.
+        let mixed = [projection(64, 512, 4), projection(64, 1024, 5)];
+        let x = activation(&[1, 1, 512], 6);
+        assert!(
+            matvec_shared(&x, &[mixed[0].weights(), mixed[1].weights()])
+                .expect("kernel")
+                .is_none()
+        );
+        let five: Vec<Projection> = (0..5).map(|i| projection(8, 512, 20 + i)).collect();
+        let five: Vec<Weights<'_>> = five.iter().map(Projection::weights).collect();
+        assert!(matvec_shared(&x, &five).expect("kernel").is_none());
     }
 
     /// Several vectors as `qmv_fast` (MLX's choice below generation 15) equal MLX's single-vector
@@ -642,7 +882,7 @@ mod tests {
             outputs: rows,
             kind: Kind::Fast,
         };
-        let got = matvec(&plan, &x, &p.w, &p.s, &p.b).expect("kernel");
+        let got = matvec(&plan, &x, &p.weights()).expect("kernel");
         let rows_of_x = mlx_rs::ops::split(&x, vectors, 1).expect("split");
         let one_by_one: Vec<Array> = rows_of_x
             .iter()
@@ -707,36 +947,37 @@ mod tests {
     fn projections_the_kernels_cannot_run_stay_on_quantized_matmul() {
         let p = projection(16, 1024, 1);
         let x = activation(&[1, 1, 1024], 2);
-        let takes = |x: &Array, p: &Projection, scales: &Array, biases: Option<&Array>| {
-            plan(x, &p.w, scales, biases, 64, 4, MODE_AFFINE).is_some()
-        };
-        assert!(takes(&x, &p, &p.s, Some(&p.b)));
-        assert!(serves(&p.w, &p.s, Some(&p.b), 64, 4, MODE_AFFINE));
+        let (ws, wb) = (wide(&p.s), wide(&p.b));
+        assert!(plan(&x, &p.weights()).is_some());
+        assert!(serves(&p.weights()));
         // As many vectors as MLX runs as a matrix (prefill).
-        assert!(!takes(&activation(&[1, 64, 1024], 3), &p, &p.s, Some(&p.b)));
+        assert!(plan(&activation(&[1, 64, 1024], 3), &p.weights()).is_none());
         // A bf16 activation meets bf16 scales without a cast.
         let x_bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
-        assert!(!takes(&x_bf16, &p, &p.s, Some(&p.b)));
+        assert!(plan(&x_bf16, &p.weights()).is_none());
         // Widened scales: MLX reads them without a cast too.
-        assert!(!takes(&x, &p, &wide(&p.s), Some(&wide(&p.b))));
-        assert!(!serves(
-            &p.w,
-            &wide(&p.s),
-            Some(&wide(&p.b)),
-            64,
-            4,
-            MODE_AFFINE
-        ));
-        assert!(!takes(&x, &p, &p.s, None));
+        assert!(plan(&x, &p.weights_with(&ws, &wb)).is_none());
+        assert!(!serves(&p.weights_with(&ws, &wb)));
+        let no_biases = Weights {
+            biases: None,
+            ..p.weights()
+        };
+        assert!(plan(&x, &no_biases).is_none());
         // An input length MLX does not run as `qmv_fast`, and rows not a multiple of 8.
         let q = projection(16, 768, 4);
-        assert!(!takes(&activation(&[1, 1, 768], 5), &q, &q.s, Some(&q.b)));
-        assert!(!serves(&q.w, &q.s, Some(&q.b), 64, 4, MODE_AFFINE));
+        assert!(plan(&activation(&[1, 1, 768], 5), &q.weights()).is_none());
+        assert!(!serves(&q.weights()));
         let q = projection(12, 1024, 6);
-        assert!(!takes(&x, &q, &q.s, Some(&q.b)));
+        assert!(plan(&x, &q.weights()).is_none());
         // Other quantizations.
-        assert!(plan(&x, &p.w, &p.s, Some(&p.b), 32, 4, MODE_AFFINE).is_none());
-        assert!(plan(&x, &p.w, &p.s, Some(&p.b), 64, 8, MODE_AFFINE).is_none());
+        for (group_size, bits) in [(32, 4), (64, 8)] {
+            let other = Weights {
+                group_size,
+                bits,
+                ..p.weights()
+            };
+            assert!(plan(&x, &other).is_none());
+        }
     }
 
     /// Bench: one matvec's time and GB/s, MLX's against the kernel's, over `layers` distinct
@@ -808,8 +1049,8 @@ mod tests {
                                 4,
                                 MODE_AFFINE,
                             ),
-                            1 => matvec(&one, &x, &p.w, &p.s, &p.b),
-                            2 => matvec(&one, &x, &p.w, s, b),
+                            1 => matvec(&one, &x, &p.weights()),
+                            2 => matvec(&one, &x, &p.weights_with(s, b)),
                             _ => quantized_matmul_with_mode(
                                 &x_bf16,
                                 &p.w,
