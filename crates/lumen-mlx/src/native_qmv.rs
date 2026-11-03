@@ -784,43 +784,46 @@ mod tests {
 
     #[test]
     fn the_kernels_equal_quantized_matmul_on_widened_scales_bit_for_bit() {
-        let generation = gpu()
-            .expect("MLX must report this GPU's architecture")
-            .generation;
-        let mut wide_runs = 0;
-        // One block of 512 inputs, then the 35B-A3B's linear-attention and attention projections.
-        for (rows, inputs) in [
-            (8, 512),
-            (8192, 2048),
-            (2048, 4096),
-            (32, 2048),
-            (512, 2048),
-        ] {
-            let p = projection(rows, inputs, (rows * 7 + inputs) as u64);
-            assert_eq!(p.s.dtype(), Dtype::Bfloat16);
-            // A decode step, an MTP verify, batches up to past MLX's batch limit (13-15 here).
-            for vectors in [1, 2, 3, 5, 6, 7, 11, 12, 14] {
-                let x = activation(&[1, vectors, inputs], 1000 + vectors as u64);
-                let Some(plan) = plan(&x, &p.weights()) else {
-                    let limit = gpu().map(|g| g.batch_limit(inputs, rows));
-                    assert!(
-                        Some(vectors) >= limit,
-                        "{rows}x{inputs}: the kernels must take {vectors} vectors (limit {limit:?})"
+        // The kernels under test, whatever the equivalence matrix flips.
+        decode_qmv::with(true, || {
+            let generation = gpu()
+                .expect("MLX must report this GPU's architecture")
+                .generation;
+            let mut wide_runs = 0;
+            // One block of 512 inputs, then the 35B-A3B's linear-attention and attention projections.
+            for (rows, inputs) in [
+                (8, 512),
+                (8192, 2048),
+                (2048, 4096),
+                (32, 2048),
+                (512, 2048),
+            ] {
+                let p = projection(rows, inputs, (rows * 7 + inputs) as u64);
+                assert_eq!(p.s.dtype(), Dtype::Bfloat16);
+                // A decode step, an MTP verify, batches up to past MLX's batch limit (13-15 here).
+                for vectors in [1, 2, 3, 5, 6, 7, 11, 12, 14] {
+                    let x = activation(&[1, vectors, inputs], 1000 + vectors as u64);
+                    let Some(plan) = plan(&x, &p.weights()) else {
+                        let limit = gpu().map(|g| g.batch_limit(inputs, rows));
+                        assert!(
+                            Some(vectors) >= limit,
+                            "{rows}x{inputs}: the kernels must take {vectors} vectors (limit {limit:?})"
+                        );
+                        continue;
+                    };
+                    wide_runs += usize::from(matches!(plan.kind, Kind::Wide { .. }));
+                    let got = matvec(&plan, &x, &p.weights()).expect("kernel");
+                    let off = differing(&mlx_on_widened_scales(&x, &p), &got);
+                    assert_eq!(
+                        off, 0,
+                        "{rows}x{inputs}, {vectors} vectors ({:?}): {off} outputs differ",
+                        plan.kind
                     );
-                    continue;
-                };
-                wide_runs += usize::from(matches!(plan.kind, Kind::Wide { .. }));
-                let got = matvec(&plan, &x, &p.weights()).expect("kernel");
-                let off = differing(&mlx_on_widened_scales(&x, &p), &got);
-                assert_eq!(
-                    off, 0,
-                    "{rows}x{inputs}, {vectors} vectors ({:?}): {off} outputs differ",
-                    plan.kind
-                );
+                }
             }
-        }
-        // From generation 15 MLX runs several vectors as `qmv_wide`, so the wide kernel ran here.
-        assert_eq!(wide_runs > 0, generation >= 15);
+            // From generation 15 MLX runs several vectors as `qmv_wide`, so the wide kernel ran here.
+            assert_eq!(wide_runs > 0, generation >= 15);
+        });
     }
 
     /// One launch over the projections of one activation gives each projection's own output: the
@@ -828,49 +831,52 @@ mod tests {
     /// MLP's gate and up (two), and one alone.
     #[test]
     fn a_shared_launch_equals_each_projection_alone_bit_for_bit() {
-        let groups: [&[(i32, i32)]; 4] = [
-            &[(8192, 2048), (4096, 2048), (32, 2048), (32, 2048)],
-            &[(8192, 2048), (512, 2048), (512, 2048)],
-            &[(1024, 1024), (1024, 1024)],
-            &[(64, 1536)],
-        ];
-        for (g, shapes) in groups.iter().enumerate() {
-            let ps: Vec<Projection> = shapes
-                .iter()
-                .enumerate()
-                .map(|(i, &(rows, inputs))| projection(rows, inputs, (10 * g + i) as u64))
-                .collect();
-            let weights: Vec<Weights<'_>> = ps.iter().map(Projection::weights).collect();
-            let x = activation(&[1, 1, shapes[0].1], 50 + g as u64);
-            let got = matvec_shared(&x, &weights)
-                .expect("kernel")
-                .expect("the shared launch must take one vector of these projections");
-            assert_eq!(got.len(), ps.len());
-            for (p, (y, &(rows, inputs))) in ps.iter().zip(got.iter().zip(shapes.iter())) {
-                let off = differing(&mlx_on_widened_scales(&x, p), y);
-                assert_eq!(off, 0, "group {g}, {rows}x{inputs}: {off} outputs differ");
+        // The kernels under test, whatever the equivalence matrix flips.
+        decode_qmv::with(true, || {
+            let groups: [&[(i32, i32)]; 4] = [
+                &[(8192, 2048), (4096, 2048), (32, 2048), (32, 2048)],
+                &[(8192, 2048), (512, 2048), (512, 2048)],
+                &[(1024, 1024), (1024, 1024)],
+                &[(64, 1536)],
+            ];
+            for (g, shapes) in groups.iter().enumerate() {
+                let ps: Vec<Projection> = shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(rows, inputs))| projection(rows, inputs, (10 * g + i) as u64))
+                    .collect();
+                let weights: Vec<Weights<'_>> = ps.iter().map(Projection::weights).collect();
+                let x = activation(&[1, 1, shapes[0].1], 50 + g as u64);
+                let got = matvec_shared(&x, &weights)
+                    .expect("kernel")
+                    .expect("the shared launch must take one vector of these projections");
+                assert_eq!(got.len(), ps.len());
+                for (p, (y, &(rows, inputs))) in ps.iter().zip(got.iter().zip(shapes.iter())) {
+                    let off = differing(&mlx_on_widened_scales(&x, p), y);
+                    assert_eq!(off, 0, "group {g}, {rows}x{inputs}: {off} outputs differ");
+                }
             }
-        }
-        // Several vectors on a GPU that runs them as `qmv_wide` are not the shared launch's.
-        let ps = [projection(512, 2048, 1), projection(32, 2048, 2)];
-        let weights = [ps[0].weights(), ps[1].weights()];
-        let x = activation(&[1, 3, 2048], 3);
-        let shared = matvec_shared(&x, &weights).expect("kernel");
-        assert_eq!(
-            shared.is_some(),
-            gpu().is_some_and(|g| g.kind(3, 2048, 512) == Some(Kind::Fast))
-        );
-        // Neither are projections of different input lengths, nor more than four.
-        let mixed = [projection(64, 512, 4), projection(64, 1024, 5)];
-        let x = activation(&[1, 1, 512], 6);
-        assert!(
-            matvec_shared(&x, &[mixed[0].weights(), mixed[1].weights()])
-                .expect("kernel")
-                .is_none()
-        );
-        let five: Vec<Projection> = (0..5).map(|i| projection(8, 512, 20 + i)).collect();
-        let five: Vec<Weights<'_>> = five.iter().map(Projection::weights).collect();
-        assert!(matvec_shared(&x, &five).expect("kernel").is_none());
+            // Several vectors on a GPU that runs them as `qmv_wide` are not the shared launch's.
+            let ps = [projection(512, 2048, 1), projection(32, 2048, 2)];
+            let weights = [ps[0].weights(), ps[1].weights()];
+            let x = activation(&[1, 3, 2048], 3);
+            let shared = matvec_shared(&x, &weights).expect("kernel");
+            assert_eq!(
+                shared.is_some(),
+                gpu().is_some_and(|g| g.kind(3, 2048, 512) == Some(Kind::Fast))
+            );
+            // Neither are projections of different input lengths, nor more than four.
+            let mixed = [projection(64, 512, 4), projection(64, 1024, 5)];
+            let x = activation(&[1, 1, 512], 6);
+            assert!(
+                matvec_shared(&x, &[mixed[0].weights(), mixed[1].weights()])
+                    .expect("kernel")
+                    .is_none()
+            );
+            let five: Vec<Projection> = (0..5).map(|i| projection(8, 512, 20 + i)).collect();
+            let five: Vec<Weights<'_>> = five.iter().map(Projection::weights).collect();
+            assert!(matvec_shared(&x, &five).expect("kernel").is_none());
+        });
     }
 
     /// Several vectors as `qmv_fast` (MLX's choice below generation 15) equal MLX's single-vector
@@ -949,39 +955,42 @@ mod tests {
 
     #[test]
     fn projections_the_kernels_cannot_run_stay_on_quantized_matmul() {
-        let p = projection(16, 1024, 1);
-        let x = activation(&[1, 1, 1024], 2);
-        let (ws, wb) = (wide(&p.s), wide(&p.b));
-        assert!(plan(&x, &p.weights()).is_some());
-        assert!(serves(&p.weights()));
-        // As many vectors as MLX runs as a matrix (prefill).
-        assert!(plan(&activation(&[1, 64, 1024], 3), &p.weights()).is_none());
-        // A bf16 activation meets bf16 scales without a cast.
-        let x_bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
-        assert!(plan(&x_bf16, &p.weights()).is_none());
-        // Widened scales: MLX reads them without a cast too.
-        assert!(plan(&x, &p.weights_with(&ws, &wb)).is_none());
-        assert!(!serves(&p.weights_with(&ws, &wb)));
-        let no_biases = Weights {
-            biases: None,
-            ..p.weights()
-        };
-        assert!(plan(&x, &no_biases).is_none());
-        // An input length MLX does not run as `qmv_fast`, and rows not a multiple of 8.
-        let q = projection(16, 768, 4);
-        assert!(plan(&activation(&[1, 1, 768], 5), &q.weights()).is_none());
-        assert!(!serves(&q.weights()));
-        let q = projection(12, 1024, 6);
-        assert!(plan(&x, &q.weights()).is_none());
-        // Other quantizations.
-        for (group_size, bits) in [(32, 4), (64, 8)] {
-            let other = Weights {
-                group_size,
-                bits,
+        // The kernels under test, whatever the equivalence matrix flips.
+        decode_qmv::with(true, || {
+            let p = projection(16, 1024, 1);
+            let x = activation(&[1, 1, 1024], 2);
+            let (ws, wb) = (wide(&p.s), wide(&p.b));
+            assert!(plan(&x, &p.weights()).is_some());
+            assert!(serves(&p.weights()));
+            // As many vectors as MLX runs as a matrix (prefill).
+            assert!(plan(&activation(&[1, 64, 1024], 3), &p.weights()).is_none());
+            // A bf16 activation meets bf16 scales without a cast.
+            let x_bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
+            assert!(plan(&x_bf16, &p.weights()).is_none());
+            // Widened scales: MLX reads them without a cast too.
+            assert!(plan(&x, &p.weights_with(&ws, &wb)).is_none());
+            assert!(!serves(&p.weights_with(&ws, &wb)));
+            let no_biases = Weights {
+                biases: None,
                 ..p.weights()
             };
-            assert!(plan(&x, &other).is_none());
-        }
+            assert!(plan(&x, &no_biases).is_none());
+            // An input length MLX does not run as `qmv_fast`, and rows not a multiple of 8.
+            let q = projection(16, 768, 4);
+            assert!(plan(&activation(&[1, 1, 768], 5), &q.weights()).is_none());
+            assert!(!serves(&q.weights()));
+            let q = projection(12, 1024, 6);
+            assert!(plan(&x, &q.weights()).is_none());
+            // Other quantizations.
+            for (group_size, bits) in [(32, 4), (64, 8)] {
+                let other = Weights {
+                    group_size,
+                    bits,
+                    ..p.weights()
+                };
+                assert!(plan(&x, &other).is_none());
+            }
+        });
     }
 
     /// Bench: one matvec's time and GB/s, MLX's against the kernel's, over `layers` distinct

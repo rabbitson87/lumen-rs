@@ -1524,31 +1524,34 @@ mod imp {
         /// 4-bit group-64 experts, so an mxfp4 or group-32 layer would only pay the load time.
         #[test]
         fn only_layers_the_decode_kernels_can_read_are_stacked() {
-            let stacked = |mode: &str, group: i32, requested: bool| {
-                let resolved = resolve_moe_layer(
-                    &stackable_bag(mode, group),
-                    &config_with_group(mode, group as usize),
-                    0,
-                    requested,
-                )
-                .expect("resolves");
-                let is_stack = matches!(resolved.sw_gate_up, ResolvedGateUp::Fused(_));
-                assert_eq!(resolved.decode_kernels_ready, is_stack, "{mode} g{group}");
-                is_stack
-            };
-            assert!(
-                stacked("affine", 64, true),
-                "affine 4-bit group 64 is what the kernels read"
-            );
-            assert!(!stacked("affine", 64, false), "nothing asked for a stack");
-            assert!(
-                !stacked("affine", 32, true),
-                "the kernels are written for group 64"
-            );
-            assert!(
-                !stacked("mxfp4", 32, true),
-                "the kernels read affine experts"
-            );
+            // Without the stack-everything flag the equivalence matrix may turn on.
+            fuse_moe_gate_up::with(false, || {
+                let stacked = |mode: &str, group: i32, requested: bool| {
+                    let resolved = resolve_moe_layer(
+                        &stackable_bag(mode, group),
+                        &config_with_group(mode, group as usize),
+                        0,
+                        requested,
+                    )
+                    .expect("resolves");
+                    let is_stack = matches!(resolved.sw_gate_up, ResolvedGateUp::Fused(_));
+                    assert_eq!(resolved.decode_kernels_ready, is_stack, "{mode} g{group}");
+                    is_stack
+                };
+                assert!(
+                    stacked("affine", 64, true),
+                    "affine 4-bit group 64 is what the kernels read"
+                );
+                assert!(!stacked("affine", 64, false), "nothing asked for a stack");
+                assert!(
+                    !stacked("affine", 32, true),
+                    "the kernels are written for group 64"
+                );
+                assert!(
+                    !stacked("mxfp4", 32, true),
+                    "the kernels read affine experts"
+                );
+            });
         }
 
         #[test]
