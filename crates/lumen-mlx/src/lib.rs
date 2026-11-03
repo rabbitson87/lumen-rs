@@ -7227,11 +7227,10 @@ impl MlxQwen35Backend {
 
         let out = self.decode(&generated).unwrap_or_default();
 
-        // Persist session: prompt + all generated tokens. Don't remove_seq —
-        // the cache state is needed for the next turn.
+        // Persist session: what the sequence was fed. Don't remove_seq — the
+        // cache state is needed for the next turn.
         let prompt_len = prompt_ids.len();
-        let mut new_tokens = prompt_ids;
-        new_tokens.extend_from_slice(&generated);
+        let new_tokens = session::held_tokens(prompt_ids, &generated, pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -7302,8 +7301,7 @@ impl MlxQwen35Backend {
         }
 
         let prompt_len = prompt_ids.len();
-        let mut new_tokens = prompt_ids;
-        new_tokens.extend_from_slice(&generated);
+        let new_tokens = session::held_tokens(prompt_ids, &generated, pos);
         session::persist_point(
             &mut self.runner,
             session_id,
@@ -7946,7 +7944,8 @@ mod tests {
 
     /// Where the replay does reproduce the header (3.8 with thinking off
     /// renders the empty block), the whole session is still extended — the
-    /// point is only the fallback.
+    /// point is only the fallback. The extension starts at the reply's last
+    /// token: turn one returned it and stopped, never feeding it.
     #[test]
     fn a_turn_that_extends_the_whole_session_still_extends_it() {
         session_rollback_enabled::with(true, || {
@@ -7959,7 +7958,7 @@ mod tests {
                 ("assistant", "Blue"),
                 ("user", "U2"),
             ];
-            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Extend(8)]);
+            assert_eq!(chat_turn(&mut b, &turn2), vec![ScriptFeed::Extend(9)]);
         });
     }
 
@@ -8341,17 +8340,19 @@ mod tests {
     /// `forward_chunked` on that same cache, so the argument should cover
     /// session reuse too.
     ///
-    /// It does not, in practice: a `session_id` conversation and the same
-    /// conversation cold-prefilled produce different reasoning traces on
-    /// Qwen3.8-27B, deterministically, and identically across runs on each
-    /// side. That was written off as reduction-order noise, which is
-    /// inconsistent with chunk invariance — hence this.
+    /// A `session_id` conversation and the same conversation cold-prefilled did
+    /// produce different reasoning traces on Qwen3.8-27B. The cause was an
+    /// off-by-one in the session store, not arithmetic: a turn's last returned
+    /// token is never fed, yet the session listed it, so the next turn's
+    /// `extend` started one token late (`session::held_tokens` fixes it, and
+    /// `a_completion_continuing_its_reply_equals_a_cold_one` guards it). This
+    /// test had the same slip until its session arm fed that token.
     ///
-    /// Exactly one thing session reuse does that chunked prefill does not: the
-    /// tokens between the two prompts went through the cache **one at a time**
-    /// as decode steps rather than inside a bulk chunk. The three arms separate
-    /// that from `extend` itself, so the answer names a mechanism instead of a
-    /// suspicion.
+    /// What session reuse still does that chunked prefill does not: the tokens
+    /// between the two prompts went through the cache **one at a time** as
+    /// decode steps (M=1) rather than inside a bulk chunk (M=N), a different
+    /// matmul, so their keys and values need not equal a prefill's in every
+    /// bit. The three arms separate that from `extend` itself.
     #[test]
     #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
     fn session_reuse_reproduces_a_cold_prefill() {
@@ -8404,7 +8405,11 @@ mod tests {
         // Arm C — what a session actually does: prefill, decode, then extend.
         let (first, pos) = m.prefill(1, &p).expect("prefill P");
         let g = decode_n(m, 1, first, pos, n_gen);
-        let (cf, cp) = m.runner.extend(1, &s).expect("extend after decode");
+        // `decode_n` returns the token it generated last without feeding it, so the extend
+        // feeds that token ahead of the suffix: the cache then holds P + G + S, as in A and B.
+        let mut tail = vec![*g.last().expect("generated tokens")];
+        tail.extend_from_slice(&s);
+        let (cf, cp) = m.runner.extend(1, &tail).expect("extend after decode");
         let c = decode_n(m, 1, cf, cp, n_gen);
         m.remove_seq(1).ok();
 
@@ -8444,23 +8449,58 @@ mod tests {
         // `extend` is exact and must stay that way — this is the invariant
         // worth guarding, and it held: A and B were bit-identical.
         assert_eq!(ab, None, "extend must reproduce a bulk prefill exactly");
-        // The session arm is NOT asserted equal, because it is not: measured
-        // divergence at token 44 of 48, with the first 43 identical. The cause
-        // is the only thing left once `extend` is exonerated — the tokens
-        // between the two prompts advanced the cache one at a time, and a
-        // single-token forward is a different matmul shape (M=1, GEMV) from a
-        // bulk chunk (M=N, GEMM), so the reduction order differs and a near-tie
-        // argmax eventually flips. Chunk invariance does not cover this: 256 vs
-        // 2048 are both GEMM.
+        // The session arm is not asserted equal: its generated tokens' cache
+        // came from decode steps, a different matmul than a prefill's, so a
+        // near-tie could flip on some prompt. None did: all 48 tokens equal
+        // the cold prefill's on Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B.
         //
         // What IS asserted is that the immediate next-token prediction agrees.
-        // A cache that had genuinely diverged would not survive one token, let
-        // alone forty-three, so this separates "float drift" from "wrong KV"
-        // without inventing a threshold.
+        // A cache that had genuinely diverged (a token fed twice, or skipped,
+        // as the session store once skipped one) does not survive one token,
+        // so this separates float drift from a wrong KV without a threshold.
         assert!(
             ac.is_none_or(|i| i > 0),
             "the first token after reuse must match a cold prefill; \
              diverging immediately means the reused KV is wrong, not imprecise"
+        );
+    }
+
+    /// A completion that continues the previous one's prompt and reply extends that session, and
+    /// must answer as a cold prefill of the same prompt does. The previous turn's last token was
+    /// returned but never fed (each decode step feeds the token before the one it returns), so the
+    /// session may only claim the tokens before it; the next turn then feeds it.
+    #[test]
+    #[ignore = "needs a real Qwen checkpoint; set LUMEN_QWEN35_MODEL_DIR"]
+    fn a_completion_continuing_its_reply_equals_a_cold_one() {
+        let Ok(dir) = std::env::var("LUMEN_QWEN35_MODEL_DIR") else {
+            return;
+        };
+        let mut backend = MlxBackend::load(&dir).expect("load checkpoint");
+        let MlxBackend::Qwen35Family(m) = &mut backend else {
+            panic!("this equivalence only concerns the Qwen path");
+        };
+        let user = |text: &str| [("user".to_string(), text.to_string())];
+        let p = m
+            .build_chat_input(
+                &user("Summarize the history of the printing press."),
+                false,
+                None,
+            )
+            .expect("prompt");
+        let reply = m.completion_session(&p, 24, Some("turn")).expect("turn 1");
+        let rendered = m
+            .build_chat_input(&user("And another one."), false, None)
+            .expect("suffix");
+        let mut next = p;
+        next.extend_from_slice(&reply);
+        next.extend_from_slice(&rendered[rendered.len().saturating_sub(16)..]);
+        let warm = m
+            .completion_session(&next, 24, Some("turn"))
+            .expect("turn 2");
+        let cold = m.completion_session(&next, 24, Some("cold")).expect("cold");
+        assert_eq!(
+            warm, cold,
+            "the extended session must answer as a cold prefill"
         );
     }
 

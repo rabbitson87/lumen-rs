@@ -13,7 +13,7 @@
 //! let start = sessions.position(runner, &key, &prompt, "", || alloc_seq())?;
 //! let (first, pos, point) = session::feed(runner, &key, &start, &prompt, boundary, "")?;
 //! // … decode from `first` at `pos` on `start.seq_id` …
-//! sessions.store(runner, &key, start.seq_id, prompt_and_generated, point);
+//! sessions.store(runner, &key, start.seq_id, session::held_tokens(prompt, &generated, pos), point);
 //! ```
 //!
 //! What a runner gets for what it implements:
@@ -131,9 +131,9 @@ pub(crate) struct SessionState {
 impl SessionState {
     /// Is this session exactly `prompt_ids`, one turn earlier?
     ///
-    /// `tokens` is what the model was fed plus what it generated, so a strict
-    /// prefix match means the KV behind this sequence is a prefix of the KV this
-    /// prompt needs — the suffix can be appended instead of re-prefilling the
+    /// `tokens` is what the sequence was fed: the prompt and the generated tokens
+    /// it holds ([`held_tokens`]), so a strict prefix match means the KV
+    /// behind this sequence is a prefix of the KV this prompt needs — the suffix can be appended instead of re-prefilling the
     /// whole conversation. It is also the *only* thing that makes reuse safe, so
     /// key selection can be a guess: a wrong guess costs a prefill, never an
     /// answer.
@@ -223,21 +223,22 @@ lumen_flags::flag! {
     /// prefix instead, which needs no cooperation and cannot be wrong: the same
     /// `starts_with` gate guards the reuse itself.
     ///
-    /// **`Behavior`, not `Optimization`, and the mechanism is measured rather
-    /// than assumed.** `session_reuse_reproduces_a_cold_prefill` runs three
-    /// arms over the same tokens and localizes it: `extend` reproduces a bulk
-    /// prefill **bit-identically**, so the cache handoff is exact. What is not
-    /// exact is the decode path in between — the tokens between two prompts
-    /// advanced the cache one at a time, and a single-token forward is a
-    /// different matmul shape (M=1, GEMV) from a bulk chunk (M=N, GEMM), so the
-    /// reduction order differs. Measured on Qwen3.8-27B: identical for 43
-    /// tokens, then a near-tie argmax flips at 44. (Chunk invariance does not
-    /// cover this — 256 vs 2048 are both GEMM.)
+    /// **`Behavior`, not `Optimization`.** `session_reuse_reproduces_a_cold_prefill`
+    /// runs three arms over the same tokens: `extend` reproduces a bulk prefill
+    /// **bit-identically**, so the cache handoff is exact. What a session adds
+    /// is the decode path in between: the tokens between two prompts advanced
+    /// the cache one at a time (M=1) rather than in a bulk chunk (M=N), a
+    /// different matmul, so their keys and values need not equal a prefill's in
+    /// every bit, and a near-tie could flip. Measured with the arms fed the same
+    /// tokens: all 48 tokens equal a cold prefill's on Qwen3.6-35B-A3B,
+    /// Qwen3.6-27B and Qwen3.8-27B. (An earlier "flips at 44" was the test
+    /// leaving out the reply's last token, which the session store also did:
+    /// see `held_tokens`.)
     ///
-    /// Each path is deterministic and stable across runs; they just are not
-    /// each other, so the equivalence matrix must never flip this. Not a new
-    /// property — the explicit-`session_id` path has always had it, and this
-    /// output is byte-identical to that path's.
+    /// Each path is deterministic and stable across runs, but they are not
+    /// guaranteed to be each other, so the equivalence matrix must never flip
+    /// this. Not a new property — the explicit-`session_id` path has always had
+    /// it, and this output is byte-identical to that path's.
     pub(crate) auto_session_enabled {
         env: "LUMEN_MLX_AUTO_SESSION",
         default: true,
@@ -404,6 +405,21 @@ pub(crate) fn feed<R: SessionRunner + ?Sized>(
         ),
     }
     Ok((last, pos, plan.mark.or(start.point)))
+}
+
+/// The tokens a turn leaves in its sequence: the prompt and the reply, up to `position`, the
+/// number of tokens the sequence holds after the turn's last step.
+///
+/// A plain decode step feeds the token before the one it returns, so the last token a turn
+/// returned is not among them. A session that listed it would start the next turn's `extend` one
+/// token late, and the model would never see that token (most often the reply's end-of-turn
+/// marker): the next turn would answer differently from a cold prefill of the same prompt.
+/// Counting by the position rather than by "all but the last" also holds for a step that fed
+/// more than it returned.
+pub(crate) fn held_tokens(mut prompt: Vec<u32>, generated: &[u32], position: usize) -> Vec<u32> {
+    prompt.extend_from_slice(generated);
+    prompt.truncate(position);
+    prompt
 }
 
 /// Write a turn's rollback point to the runner's disk tier, after the turn.
@@ -725,8 +741,8 @@ impl Sessions {
 
 /// Which live session a prompt should extend, when the client named none.
 ///
-/// A session's `tokens` are what the model was fed plus what it generated, so a
-/// session whose tokens are a strict prefix of this prompt **is** this
+/// A session's `tokens` are what the model was fed (its prompt and its reply up
+/// to the last token), so a session whose tokens are a strict prefix of this prompt **is** this
 /// conversation one turn earlier — no id required, and none available: neither
 /// the OpenAI nor the Anthropic request has a conversation identifier, and
 /// `session_id` is a Lumen extension no stock client sends. Matching on the
@@ -847,7 +863,7 @@ mod tests {
     /// every one of them re-prefilled the whole conversation, every turn.
     ///
     /// The prompt identifies its own conversation instead: a session's tokens
-    /// are what the model was fed plus what it generated, so a strict prefix
+    /// are what the model was fed, its prompt and reply, so a strict prefix
     /// match is that conversation, one turn earlier.
     #[test]
     fn a_prompt_finds_its_own_conversation_without_being_told_which() {
@@ -874,6 +890,21 @@ mod tests {
             longest_prefix_session(&map, &[1, 2, 3, 4, 5, 6, 7]).as_deref(),
             Some("mine")
         );
+    }
+
+    /// A turn's last returned token was never fed, so the session does not claim it, and the
+    /// next prompt that repeats it extends the session from that token on.
+    #[test]
+    fn a_session_holds_the_reply_only_as_far_as_the_sequence_was_fed() {
+        let (prompt, reply) = (vec![1, 2, 3], [7, 8, 9]);
+        // Prefill fed 3 tokens, two decode steps fed 7 and 8 and returned 8 and 9.
+        let held = held_tokens(prompt.clone(), &reply, 5);
+        assert_eq!(held, [1, 2, 3, 7, 8]);
+        let session = session_with(held, Instant::now());
+        let next_turn = [1, 2, 3, 7, 8, 9, 4];
+        assert_eq!(session.reusable_len(&next_turn), Some(5));
+        // A reply that ended on its first token: only the prompt was fed.
+        assert_eq!(held_tokens(prompt, &[7], 3), [1, 2, 3]);
     }
 
     /// The guard that makes guessing a key safe at all.

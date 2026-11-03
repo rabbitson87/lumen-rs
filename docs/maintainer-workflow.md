@@ -582,20 +582,31 @@ session (`prefill(P)`, decode `|G|`, `extend(S)`):
 | arm | vs cold |
 |---|---|
 | `extend` after a bulk prefill | **bit-identical** |
-| a real session | identical for 43 tokens, flips at 44 |
+| a real session | identical for all 48 tokens (Qwen3.6-35B-A3B, Qwen3.6-27B, Qwen3.8-27B) |
 
-So `extend` is exact and the cache handoff is not the source. What differs is the
-decode path in between: those tokens advanced the cache **one at a time**, and a
-single-token forward is a different matmul shape (M=1, GEMV) from a bulk chunk
-(M=N, GEMM). Chunk invariance never covered that case — 256 and 2048 are both
-GEMM. The test hard-asserts the `extend` arm and only reports the session arm,
-because a permanently-red test is worse than none; what it does assert there is
-that the *first* token matches, which separates float drift from a wrong KV
-without inventing a threshold.
+So `extend` is exact and the cache handoff is not the source. The drift that
+started this was an off-by-one in the session store: a turn's last returned
+token is never fed (a decode step feeds the token before the one it returns),
+yet the session listed it, so the next turn's `extend` started one token late
+and the model never saw the reply's end-of-turn marker. The session now holds
+the reply only as far as the sequence was fed (`session::held_tokens`), and
+`a_completion_continuing_its_reply_equals_a_cold_one` checks a continued
+completion against a cold one. The three-arm test had the same slip — its
+session arm left that token out — which is where an earlier "identical for 43
+tokens, flips at 44" came from.
+
+What a session still adds is the decode path between the two prompts: those
+tokens advanced the cache **one at a time** (M=1), a different matmul from a
+bulk chunk (M=N), so their keys and values need not equal a prefill's in every
+bit. Chunk invariance never covered that case — 256 and 2048 are both bulk. No
+token flipped in the measurements above, but nothing guarantees it, so the test
+hard-asserts the `extend` arm and, for the session arm, only that the *first*
+token matches, which separates float drift from a wrong KV without inventing a
+threshold.
 
 `LUMEN_MLX_AUTO_SESSION` is registered `Behavior` for this reason and the
-equivalence matrix must never flip it. The session path has always had the drift;
-the flag only changes who reaches it.
+equivalence matrix must never flip it. The session path has always had the
+possibility; the flag only changes who reaches it.
 
 **A chat turn's own tail never comes back, so exact extension misses every plain
 chat turn.** The generation header a turn ends with
