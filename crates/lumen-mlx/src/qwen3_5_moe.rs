@@ -141,6 +141,12 @@ mod imp {
         /// `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
         /// (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
         /// `=0` restores the per-call cast.
+        ///
+        /// A projection whose matvecs `LUMEN_NATIVE_DECODE_QMV` runs (4-bit group 64, inputs a
+        /// multiple of 512, outputs a multiple of 8) keeps its bf16 scales instead: those
+        /// kernels read them as they are, faster than MLX reads the f32 copy, and only a
+        /// prefill-sized matmul still casts them. On the 4-bit Qwen checkpoints that is every
+        /// trunk projection, so the copy, and its memory, is gone there.
         pub(crate) widen_scales {
             env: "LUMEN_NATIVE_WIDEN_SCALES",
             default: true,
@@ -156,9 +162,10 @@ mod imp {
         /// **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
         /// rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
         /// throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
-        /// and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op when
-        /// `LUMEN_NATIVE_WIDEN_SCALES` already widened the scales, so it needs
-        /// `LUMEN_NATIVE_WIDEN_SCALES=0` too.
+        /// and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op on scales
+        /// `LUMEN_NATIVE_WIDEN_SCALES` widened; it does act on the projections that keep bf16
+        /// scales for `LUMEN_NATIVE_DECODE_QMV` (every trunk projection of a 4-bit group-64
+        /// checkpoint), where it replaces those kernels.
         ///
         /// Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
         /// with a cast before and after every matmul eating part of the gain. Teacher-forced
@@ -629,6 +636,19 @@ mod imp {
                     .as_dtype(mlx_rs::Dtype::Float32)
                     .context("quantized linear: cast result to f32 failed");
             }
+            if let Some(biases) = &self.biases
+                && let Some(plan) = crate::native_qmv::plan(
+                    x,
+                    &self.weight,
+                    &self.scales,
+                    Some(biases),
+                    self.group_size,
+                    self.bits,
+                    self.mode,
+                )
+            {
+                return crate::native_qmv::matvec(&plan, x, &self.weight, &self.scales, biases);
+            }
             self.matmul(x)
         }
 
@@ -909,7 +929,16 @@ mod imp {
                 .with_context(|| format!("resolve_linear({base}): requant to {tb}-bit"))?,
             _ => lin,
         };
-        if widen_scales::get() && lin.mode == MODE_AFFINE {
+        // The decode kernels read bf16 scales as they are, so a projection they serve keeps them.
+        let kernels_read_scales = crate::native_qmv::serves(
+            &lin.weight,
+            &lin.scales,
+            lin.biases.as_ref(),
+            lin.group_size,
+            lin.bits,
+            lin.mode,
+        );
+        if widen_scales::get() && lin.mode == MODE_AFFINE && !kernels_read_scales {
             widen_linear_scales(lin)
                 .with_context(|| format!("resolve_linear({base}): widen scales"))
         } else {

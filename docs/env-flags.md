@@ -42,6 +42,7 @@ value → on.
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
+| `LUMEN_NATIVE_DECODE_QMV` | on | Optimization | `lumen_mlx::native_qmv::decode_qmv` |
 | `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
 | `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Optimization | `lumen_mlx::native_moe_decode::fused_router` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
@@ -434,9 +435,10 @@ Run each quantized projection on a bf16 activation (cast back to f32 after) when
  **`Behavior`, not `Optimization`: this is a numerics change.** The activation is
  rounded to bf16 before the matmul (the accumulation stays f32), as mlx-lm does
  throughout. Applies to every `ResolvedLinear::apply` -- the Qwen trunk and MTP head
- and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op when
- `LUMEN_NATIVE_WIDEN_SCALES` already widened the scales, so it needs
- `LUMEN_NATIVE_WIDEN_SCALES=0` too.
+ and Gemma 4 -- whose activation is f32 and scales are bf16/f16. A no-op on scales
+ `LUMEN_NATIVE_WIDEN_SCALES` widened; it does act on the projections that keep bf16
+ scales for `LUMEN_NATIVE_DECODE_QMV` (every trunk projection of a 4-bit group-64
+ checkpoint), where it replaces those kernels.
 
  Measured on Qwen3.6-27B (M3 Max): 65.9 -> 62.0 ms/step against the widened default,
  with a cast before and after every matmul eating part of the gain. Teacher-forced
@@ -493,6 +495,31 @@ Compile-wrap the MoE routing graph. Default OFF (A/B WASH). (Parse
 Conv-state advance via `slice` (view/copy) instead of `take_axis`
  (gather kernel). Bit-identical for the s==1 decode regime — same
  indices, cheaper Metal kernel. Default OFF (A/B WASH).
+
+### `LUMEN_NATIVE_DECODE_QMV`
+
+*Optimization, default on.*
+
+Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 and whose
+ scales and biases are bf16 or f16 in kernels that read those scales as they are
+ (`native_qmv::matvec`), instead of MLX's `quantized_matmul`, which casts them to f32 on every
+ call, and keep such projections' scales in bf16 under `LUMEN_NATIVE_WIDEN_SCALES`.
+
+ A matvec is up to MLX's batch limit of rows (6 to 33, by GPU and size; 13-15 on an M3 Max):
+ a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
+ which casts the bf16 scales per call there; against a matmul that size the cast is noise.
+
+ Bit-identical: the kernels run MLX's own matvec for that many rows on this GPU (`qmv_fast`
+ for one, `qmv_wide` or `qmv_fast` for more), its lane partition and order of adds, and
+ widening a bf16 or f16 scale to f32 is exact. An `Optimization` flag. Default on; `=0` keeps
+ MLX's matmul (and widens every affine projection's scales again).
+
+ M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
+ 218 -> 200 us, 5120x17408 213 -> 200 us, 10240x5120 129 -> 121 us, 8192x2048 43.4 -> 42.1 us
+ against MLX on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 120,
+ 40.1 us). Qwen3.6-35B-A3B affine decode, runs no other work slowed: 9.3 -> 9.0-9.2
+ ms/token, the text identical in every run. Footprint without the f32 copies: 35B-A3B 20.63
+ -> 20.52 GB, 27B 18.51 -> 17.22 GB.
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 
@@ -691,6 +718,12 @@ Keep the affine projections' scales and biases in f32 so a matmul on the f32 res
  `resolve_linear`, i.e. the Qwen 3.5/3.6 trunk and lm_head. Measured on Qwen3.6-27B
  (4-bit group 64, M3 Max): decode 84.3 -> 67.1 ms/step, 192 greedy tokens identical.
  `=0` restores the per-call cast.
+
+ A projection whose matvecs `LUMEN_NATIVE_DECODE_QMV` runs (4-bit group 64, inputs a
+ multiple of 512, outputs a multiple of 8) keeps its bf16 scales instead: those
+ kernels read them as they are, faster than MLX reads the f32 copy, and only a
+ prefill-sized matmul still casts them. On the 4-bit Qwen checkpoints that is every
+ trunk projection, so the copy, and its memory, is gone there.
 
 ### `LUMEN_PREFIX_EXACT_REUSE`
 
