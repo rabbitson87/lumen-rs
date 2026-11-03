@@ -43,6 +43,7 @@ value → on.
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
 | `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
+| `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Behavior | `lumen_mlx::native_moe_decode::fused_router` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
 | `LUMEN_NATIVE_FUSE_LINATTN_IN` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
 | `LUMEN_NATIVE_FUSE_MOE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_moe_gate_up` |
@@ -516,6 +517,25 @@ Run a single-token decode step's routed and shared experts in two Metal kernels
  comparing the composed model's 384-token windows with its 1-token windows (two valid
  kernel paths, `--window-control`) agrees 98.62% too, so this is the noise between
  kernel paths, not a loss on top of it.
+
+### `LUMEN_NATIVE_FUSED_MOE_ROUTER`
+
+*Behavior, default on.*
+
+Route a single-token step with two kernels (the expert and shared-gate logits; then softmax,
+ top-8, renormalisation and the shared sigmoid) instead of the twelve MLX ops, when
+ `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts in kernels and the router is an 8-bit
+ group-64 gate over a multiple of 256 experts.
+
+ Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
+ accumulate in a different order, so two experts whose probabilities differ by float noise
+ can swap places. A `Behavior` flag. Default on; `=0` keeps the composed router.
+
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over six server runs: 11.9 ms
+ composed, 11.1 ms with the expert kernels only, 10.5 ms with the router kernels too (-0.6
+ ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops). Teacher-forced
+ top-1 agreement with the composed ops over 4,050 positions: 98.79%, against 98.62% between
+ the composed model's prefill and decode kernels.
 
 ### `LUMEN_NATIVE_FUSE_GATE_UP`
 
