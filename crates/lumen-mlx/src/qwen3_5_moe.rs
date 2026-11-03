@@ -1690,6 +1690,15 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// Whether any `LUMEN_PROBE_ABLATE` stage is set (its runs never stop at EOS).
+    fn probe_ablate_set() -> bool {
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            std::env::var("LUMEN_PROBE_ABLATE")
+                .is_ok_and(|v| v.split(',').any(|p| !p.trim().is_empty()))
+        })
+    }
+
     /// Stages `LUMEN_PROBE_ABLATE` removes from every single-token (decode) forward.
     #[derive(Clone, Copy, Default)]
     struct Ablate {
@@ -2188,6 +2197,11 @@ mod imp {
         /// Same shape and same preference order as the Gemma 4 path, which had
         /// already met this and grown the fallback.
         pub fn eos_tokens(&self) -> &[u32] {
+            // A timing ablation (`LUMEN_PROBE_ABLATE`) turns the output into garbage, which can
+            // reach EOS within a few tokens; its benchmark needs every requested token.
+            if probe_ablate_set() {
+                return &[];
+            }
             let top = &self.config.eos_token_ids;
             if !top.is_empty() {
                 top

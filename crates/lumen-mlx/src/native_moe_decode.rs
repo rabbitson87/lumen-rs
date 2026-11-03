@@ -433,6 +433,55 @@ const ROUTER_LOGITS_SOURCE: &str = r#"
     }
 "#;
 
+/// PROBE (timing only, NOT correct — `LUMEN_PROBE_ABLATE=moe_logits,moe_select,moe_gateup,moe_down`,
+/// any subset): empties one piece of the MoE decode kernels while every launch, and every
+/// dependency between launches, stays, so the drop in ms/token against an unablated run is that
+/// piece's work in the pipeline. `moe_logits`: the router logits kernel writes zeros. `moe_select`:
+/// the gate/up kernel takes experts 0..7 instead of running the folded select (it still binds the
+/// logits, so it still waits for them). `moe_gateup`, `moe_down`: the matvec loops of the gate/up
+/// or down kernel run no blocks.
+#[derive(Clone, Copy, Default)]
+struct Probe {
+    logits: bool,
+    select: bool,
+    gateup: bool,
+    down: bool,
+}
+
+fn probe() -> Probe {
+    let v = std::env::var("LUMEN_PROBE_ABLATE").unwrap_or_default();
+    let has = |k: &str| v.split(',').any(|p| p.trim() == k);
+    Probe {
+        logits: has("moe_logits"),
+        select: has("moe_select"),
+        gateup: has("moe_gateup"),
+        down: has("moe_down"),
+    }
+}
+
+/// The matvec block loop of the expert kernels, and the same loop running no blocks (probe).
+const MATVEC_LOOP: &str = "for (int blk = 0; blk < BLOCKS; ++blk) {";
+const NO_MATVEC_LOOP: &str = "for (int blk = 0; blk < 0; ++blk) {";
+
+/// `moe_select` probe: experts 0..7 with equal scores, written where the select would write them.
+const EXPERT_FIXED: &str = r#"
+    const uint e = routed ? (uint)slot : 0u;
+    if (slot == 0 && rg == 0 && lane < 8) {
+        inds[lane] = (uint)lane;
+        scores[lane] = 0.125f;
+        if (lane == 0) {
+            sscore[0] = 0.5f;
+        }
+    }
+"#;
+
+/// `moe_logits` probe: the router logits kernel's launch with none of its work.
+const ROUTER_LOGITS_ZERO: &str = r#"
+    if (thread_index_in_simdgroup == 0) {
+        logits[thread_position_in_grid.y] = 0.0f;
+    }
+"#;
+
 struct Kernels {
     gate_up: MetalKernel,
     gate_up_routed: MetalKernel,
@@ -442,6 +491,19 @@ struct Kernels {
 
 impl Kernels {
     fn new() -> Result<Self> {
+        let probe = probe();
+        let matvec = |source: String, empty: bool| {
+            if empty {
+                source.replace(MATVEC_LOOP, NO_MATVEC_LOOP)
+            } else {
+                source
+            }
+        };
+        let routed_expert = if probe.select {
+            EXPERT_FIXED
+        } else {
+            EXPERT_FROM_LOGITS
+        };
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
         Ok(Self {
@@ -452,7 +514,10 @@ impl Kernels {
                 ],
                 &["act"],
                 MOE_HEADER,
-                &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
+                &matvec(
+                    GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
+                    probe.gateup,
+                ),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
@@ -463,7 +528,10 @@ impl Kernels {
                 ],
                 &["act", "inds", "scores", "sscore"],
                 MOE_HEADER,
-                &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_LOGITS),
+                &matvec(
+                    GATE_UP_SOURCE.replace("/*EXPERT*/", routed_expert),
+                    probe.gateup,
+                ),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
@@ -474,7 +542,7 @@ impl Kernels {
                 ],
                 &["out"],
                 MOE_HEADER,
-                DOWN_COMBINE_SOURCE,
+                &matvec(DOWN_COMBINE_SOURCE.to_owned(), probe.down),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
@@ -483,7 +551,11 @@ impl Kernels {
                 &["x", "gw", "gs", "gb", "sw", "ss", "sb"],
                 &["logits"],
                 MOE_HEADER,
-                ROUTER_LOGITS_SOURCE,
+                if probe.logits {
+                    ROUTER_LOGITS_ZERO
+                } else {
+                    ROUTER_LOGITS_SOURCE
+                },
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
