@@ -1709,6 +1709,23 @@ mod imp {
         gdn_ssm: bool,
         /// The gated RMS norm, replaced by `out * z`.
         gdn_norm: bool,
+        /// Inside a full-attention block: the q/k/v projections, replaced by the layer input cut
+        /// or tiled to each projection's width (at most one copy for q).
+        attn_proj: bool,
+        /// The per-head q and k RMS norms, replaced by the unnormalised views.
+        attn_norm: bool,
+        /// RoPE on q and k, replaced by the unrotated views.
+        attn_rope: bool,
+        /// The KV cache append: attention reads only the new token's own K and V.
+        attn_cache: bool,
+        /// The SDPA kernel, replaced by two tiny adds that still read the last cached K and V (so
+        /// the cache append is not pruned from the graph).
+        attn_sdpa: bool,
+        /// `sigmoid(gate) * attention`, replaced by the attention output.
+        attn_gate: bool,
+        /// The output projection, replaced by zero times a view of the first `hidden` gated
+        /// columns (one elementwise op; unzeroed, the model hits EOS within a few tokens).
+        attn_oproj: bool,
     }
 
     /// PROBE (timing only, NOT correct — `LUMEN_PROBE_ABLATE=gdn,attn,moe,lm_head`, any subset):
@@ -1725,6 +1742,14 @@ mod imp {
     /// one sub-stage each. Their stand-ins only slice or multiply, so removing one does not prune
     /// the work that feeds another; to price the recurrence kernel alone, remove `gdn_conv` and
     /// `gdn_gates` too (their stand-ins are views) and compare with those two alone.
+    ///
+    /// Inside the full-attention block, `attn_proj`, `attn_norm`, `attn_rope`, `attn_cache`,
+    /// `attn_sdpa`, `attn_gate` and `attn_oproj` do the same for the seven stages between the
+    /// layer input and output. Each stand-in is a view, one tiny elementwise op, or (q's tiled
+    /// input under `attn_proj`) one copy, so a stage's drop is slightly under its true cost.
+    /// `attn_cache` also shortens what the SDPA reads to one key, and `attn_sdpa` keeps the cache
+    /// append alive through two adds on the last cached key and value, so price the SDPA kernel
+    /// with `attn_sdpa` and the append with `attn_cache` minus the SDPA's length-dependent part.
     fn probe_ablate() -> Ablate {
         static CELL: std::sync::OnceLock<Ablate> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
@@ -1739,8 +1764,41 @@ mod imp {
                 gdn_gates: has("gdn_gates"),
                 gdn_ssm: has("gdn_ssm"),
                 gdn_norm: has("gdn_norm"),
+                attn_proj: has("attn_proj"),
+                attn_norm: has("attn_norm"),
+                attn_rope: has("attn_rope"),
+                attn_cache: has("attn_cache"),
+                attn_sdpa: has("attn_sdpa"),
+                attn_gate: has("attn_gate"),
+                attn_oproj: has("attn_oproj"),
             }
         })
+    }
+
+    /// The `Ablate` for a forward of `tokens` tokens: decode steps only, like every stage probe.
+    fn probe_ablate_for(tokens: i32) -> Ablate {
+        if tokens == 1 {
+            probe_ablate()
+        } else {
+            Ablate::default()
+        }
+    }
+
+    /// Stand-in for a projection's output under `attn_proj`: the input `[B, L, hidden]` tiled
+    /// along the last axis and cut to `width` columns. A cut is a view; a tile is one copy.
+    fn probe_projection_stand_in(x: &Array, width: i32) -> Result<Array> {
+        use mlx_rs::ops::indexing::TryIndexOp;
+        let hidden = x.shape()[x.ndim() - 1];
+        let tiled = if width > hidden {
+            let copies = vec![x; ((width + hidden - 1) / hidden) as usize];
+            mlx_rs::ops::concatenate_axis(&copies, -1)
+                .context("probe attn_proj: tile the layer input")?
+        } else {
+            x.clone()
+        };
+        tiled
+            .try_index((.., .., 0..width))
+            .context("probe attn_proj: cut the layer input")
     }
 
     /// PROBE (timing only — `LUMEN_PROBE_SKIP_INPROJ_SMALL=1`, requires
@@ -2242,16 +2300,32 @@ mod imp {
             positions: RopePlan<'_>,
         ) -> Result<Array> {
             let p = self.full_attn_qkv_rope(x, layer_idx, cache.offset() as i32, positions)?;
+            let ablate = probe_ablate_for(p.l);
             // (5) Append to KV cache and fetch full history. Under bf16 storage
             // the cast happens here, after k_norm and RoPE, so the cache holds
             // exactly what attention will read.
             let k_store = Self::to_kv_dtype(&p.k_rope, "layer_full_attn_forward: k")?;
             let v_store = Self::to_kv_dtype(&p.v_t, "layer_full_attn_forward: v")?;
-            let (k_full, v_full) = cache.update_and_fetch(&k_store, &v_store)?;
+            let (k_full, v_full) = if ablate.attn_cache {
+                (k_store, v_store)
+            } else {
+                cache.update_and_fetch(&k_store, &v_store)?
+            };
             // (6) GQA SDPA. mlx-rs handles the head broadcast internally.
             let q = Self::to_kv_dtype(&p.q_rope, "layer_full_attn_forward: q")?;
             let kv_len = k_full.shape()[2] as usize;
-            let attn_out = if !causal
+            let attn_out = if ablate.attn_sdpa {
+                use mlx_rs::ops::indexing::TryIndexOp;
+                let last = kv_len as i32 - 1;
+                let k_last = k_full
+                    .try_index((.., 0..1, last..(last + 1), ..))
+                    .context("probe attn_sdpa: last key")?;
+                let v_last = v_full
+                    .try_index((.., 0..1, last..(last + 1), ..))
+                    .context("probe attn_sdpa: last value")?;
+                mlx_rs::ops::add(&q, &mlx_rs::ops::add(&k_last, &v_last)?)
+                    .context("probe attn_sdpa: stand-in")?
+            } else if !causal
                 && p.l == 1
                 && kv_len >= SPARSE_DECODE_MIN_KEYS
                 && sparse_decode::get()
@@ -2436,6 +2510,9 @@ mod imp {
             offset: i32,
             positions: RopePlan<'_>,
         ) -> Result<(Array, Array)> {
+            if probe_ablate_for(queries_t.shape()[2]).attn_rope {
+                return Ok((queries_t.clone(), k_t.clone()));
+            }
             // Explicit positions mean MRoPE: an image block's tokens share a
             // `t` and spread over an `h`/`w` grid, which no scalar offset can
             // express. Text-only prompts pass `None` and keep the fused kernel
@@ -2516,12 +2593,22 @@ mod imp {
             // (1) q/k/v projections. MXFP4 matmul output follows activation
             //     dtype — pass f32 in, get f32 out, but cast unconditionally
             //     to keep the contract resilient if MLX changes defaults.
-            let q_proj_raw = lw.q_proj.apply(x)?;
-            let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
-            let k_proj_raw = lw.k_proj.apply(x)?;
-            let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
-            let v_proj_raw = lw.v_proj.apply(x)?;
-            let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
+            let ablate = probe_ablate_for(l);
+            let (q_proj, k_proj, v_proj) = if ablate.attn_proj {
+                (
+                    probe_projection_stand_in(x, num_heads * head_dim * 2)?,
+                    probe_projection_stand_in(x, num_kv * head_dim)?,
+                    probe_projection_stand_in(x, num_kv * head_dim)?,
+                )
+            } else {
+                let q_proj_raw = lw.q_proj.apply(x)?;
+                let q_proj = Self::to_f32(q_proj_raw, &format!("layer{layer_idx}.q_proj"))?;
+                let k_proj_raw = lw.k_proj.apply(x)?;
+                let k_proj = Self::to_f32(k_proj_raw, &format!("layer{layer_idx}.k_proj"))?;
+                let v_proj_raw = lw.v_proj.apply(x)?;
+                let v_proj = Self::to_f32(v_proj_raw, &format!("layer{layer_idx}.v_proj"))?;
+                (q_proj, k_proj, v_proj)
+            };
 
             // (2a) Reshape q_proj to [B, L, num_heads, head_dim*2] and split
             //      the last axis into two halves (queries, gate).
@@ -2552,14 +2639,22 @@ mod imp {
             //     q_norm and k_norm.
             let q_norm_w = &lw.q_norm_weight;
             let k_norm_w = &lw.k_norm_weight;
-            let queries_n = rms_norm(&queries, q_norm_w, eps)?;
+            let queries_n = if ablate.attn_norm {
+                queries
+            } else {
+                rms_norm(&queries, q_norm_w, eps)?
+            };
             let queries_t = mlx_rs::ops::transpose_axes(&queries_n, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose queries failed")?;
 
             // (2b) Reshape k/v to [B, L, num_kv, head_dim] then RMSNorm/transpose.
             let k_4d = mlx_rs::ops::reshape(&k_proj, &[b, l, num_kv, head_dim])
                 .context("layer_full_attn_forward: reshape k_proj failed")?;
-            let k_n = rms_norm(&k_4d, k_norm_w, eps)?;
+            let k_n = if ablate.attn_norm {
+                k_4d
+            } else {
+                rms_norm(&k_4d, k_norm_w, eps)?
+            };
             let k_t = mlx_rs::ops::transpose_axes(&k_n, &[0, 2, 1, 3])
                 .context("layer_full_attn_forward: transpose keys failed")?;
 
@@ -2612,7 +2707,10 @@ mod imp {
                 .context("layer_full_attn_forward: transpose attn_out failed")?;
             let attn_flat = mlx_rs::ops::reshape(&attn_t, &[b, l, num_heads * head_dim])
                 .context("layer_full_attn_forward: reshape attn_out failed")?;
-            let gated = if sigmoid_mul_fuse_enabled_pub() {
+            let ablate = probe_ablate_for(l);
+            let gated = if ablate.attn_gate {
+                attn_flat
+            } else if sigmoid_mul_fuse_enabled_pub() {
                 sigmoid_mul_fused(gate, &attn_flat)
                     .context("layer_full_attn_forward: fused sigmoid_mul failed")?
             } else {
@@ -2623,7 +2721,19 @@ mod imp {
             };
 
             // (8) o_proj: project back to hidden_size.
-            let o_proj_raw = lw.o_proj.apply(&gated)?;
+            let o_proj_raw = if ablate.attn_oproj {
+                use mlx_rs::ops::indexing::TryIndexOp;
+                let hidden = (self.text_config().hidden_size as i32).min(num_heads * head_dim);
+                // Zeroed: the raw cut drives the model to EOS within a few tokens, and the
+                // benchmark needs a fixed number of them.
+                let cut = gated
+                    .try_index((.., .., 0..hidden))
+                    .context("probe attn_oproj: cut the gated attention")?;
+                mlx_rs::ops::multiply(&cut, Array::from_f32(0.0))
+                    .context("probe attn_oproj: zero the cut")?
+            } else {
+                lw.o_proj.apply(&gated)?
+            };
             Self::to_f32(o_proj_raw, &format!("layer{layer_idx}.o_proj"))
         }
 
@@ -2790,11 +2900,7 @@ mod imp {
                 }
             };
             let timing_on = fine_timing_active();
-            let ablate = if s == 1 {
-                probe_ablate()
-            } else {
-                Ablate::default()
-            };
+            let ablate = probe_ablate_for(s);
 
             // (A: in_proj) Four separate in_proj matmuls + reshape z.
             //     The `qwen3_5_moe` checkpoint stores these split (no
@@ -3669,11 +3775,7 @@ mod imp {
             }
             let cfg = self.text_config();
             let l = ids_arr.shape()[0];
-            let ablate = if l == 1 {
-                probe_ablate()
-            } else {
-                Ablate::default()
-            };
+            let ablate = probe_ablate_for(l);
 
             let timing_on = fine_timing_active();
             let mut fine = FineTimings::default();
