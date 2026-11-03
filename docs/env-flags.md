@@ -527,10 +527,11 @@ Run a single-token decode step's routed and shared experts in two Metal kernels
 
 *Behavior, default on.*
 
-Route a single-token step with two kernels (the expert and shared-gate logits; then softmax,
- top-8, renormalisation and the shared sigmoid) instead of the twelve MLX ops, when
- `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts in kernels and the router is an 8-bit
- group-64 gate over a multiple of 32 experts.
+Route a single-token step with a logits kernel (the expert and shared-gate logits) and the
+ select (softmax, top-8, renormalisation, the shared sigmoid) inside the experts' gate/up
+ kernel, instead of the twelve MLX ops, when `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts
+ in kernels and the router is an 8-bit group-64 gate over a multiple of 32 experts and at
+ least 512 hidden units.
 
  Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
  accumulate in a different order, so two experts whose probabilities differ by float noise
@@ -538,7 +539,8 @@ Route a single-token step with two kernels (the expert and shared-gate logits; t
 
  Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over six server runs: 11.9 ms
  composed, 11.1 ms with the expert kernels only, 10.5 ms with the router kernels too (-0.6
- ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops). Teacher-forced
+ ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops); folding the
+ select into the gate/up kernel took another 0.1 ms. Teacher-forced
  top-1 agreement with the composed ops over 4,050 positions: 98.79%, against 98.62% between
  the composed model's prefill and decode kernels.
 

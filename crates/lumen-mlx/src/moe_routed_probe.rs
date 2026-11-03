@@ -21,7 +21,7 @@ use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, moe_block_forward, moe_router,
 };
-use crate::native_moe_decode::{route, route_logits};
+use crate::native_moe_decode::{route_logits, run_routed};
 use crate::native_norm::rms_norm;
 use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
@@ -292,11 +292,8 @@ fn decode_kernels_against_composed_block() {
         let l = route_logits(x, &w, dims)?;
         consume(x, &l)
     };
-    let router = |x: &Array| {
-        let (_, scores, shared) = route(x, &w, dims)?;
-        let both = mlx_rs::ops::add(&scores.sum(None)?, &shared.sum(None)?)?;
-        Ok(mlx_rs::ops::multiply(x, &both)?)
-    };
+    // The router's logits kernel and the experts with the select folded into the gate/up kernel.
+    let folded = |x: &Array| run_routed(x, &w, dims);
     // The expert kernels alone, over sixteen fixed routings (eight distinct experts each).
     let routings: Vec<(Array, Array, Array)> = (0..16u32)
         .map(|r| {
@@ -369,12 +366,12 @@ fn decode_kernels_against_composed_block() {
     let t_down = time_chain(&down_only, &x0, &norm_w).expect("down timing");
     let t_control = time_chain(&control, &x0, &norm_w).expect("control timing");
     let t_logits = time_chain(&logits_only, &x0, &norm_w).expect("logits timing");
-    let t_router = time_chain(&router, &x0, &norm_w).expect("router timing");
+    let t_folded = time_chain(&folded, &x0, &norm_w).expect("folded timing");
     let t_experts = time_chain(&experts, &x0, &norm_w).expect("experts timing");
     println!();
     report("consumer-only control", &t_control);
     report("router logits kernel (- control)", &t_logits);
-    report("router, both kernels (- control)", &t_router);
+    report("logits + experts, select folded", &t_folded);
     report("expert kernels, fixed routing", &t_experts);
     report("  gate/up/swiglu kernel (- control)", &t_up);
     report("  down/combine kernel (- control)", &t_down);
@@ -387,12 +384,11 @@ fn decode_kernels_against_composed_block() {
         5.3e6 / (bw.best_gbps * 1e9) * 1e6,
     );
     println!(
-        "\nper block (us): router logits {:.1} | router select {:.1} | router total {:.1} | expert kernels {:.1} (floor {:.1}) | block {:.1}",
+        "\nper block (us): router logits {:.1} | expert kernels, fixed routing {:.1} (floor {:.1}) | logits + experts with the select folded {:.1} | block {:.1}",
         us(&t_logits),
-        us(&t_router) - us(&t_logits),
-        us(&t_router),
         t_experts.wall_us - norm_t.wall_us,
         bytes / (bw.best_gbps * 1e9) * 1e6,
+        t_folded.wall_us - norm_t.wall_us,
         timings[2].wall_us - norm_t.wall_us,
     );
 }

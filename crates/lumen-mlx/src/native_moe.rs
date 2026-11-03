@@ -913,7 +913,7 @@ mod imp {
         let last_axis = (x.ndim() as i32) - 1;
         let timing_on = fine_timing_active();
 
-        // A single token's routing and experts in kernels: four dispatches instead of ~40.
+        // A single token's routing and experts in kernels: three dispatches instead of ~40.
         if w.fused_decode
             && w.offload.is_none()
             && !timing_on
@@ -921,17 +921,14 @@ mod imp {
             && let Some(dims) =
                 crate::native_moe_decode::plan(x, &w.switch_glu, &w.shared_expert, w.top_k)
         {
-            let (inds, scores, shared_score) =
-                if crate::native_moe_decode::router_supported(w, dims) {
-                    crate::native_moe_decode::route(x, w, dims)?
-                } else {
-                    let (inds, scores) = routing_graph(x, w)?;
-                    let shared_logits = project_gate(x, &w.shared_gate)
-                        .context("moe_block_forward: shared_expert_gate(x) failed")?;
-                    let shared_score = mlx_rs::ops::sigmoid(&shared_logits)
-                        .context("moe_block_forward: sigmoid(shared_gate) failed")?;
-                    (inds, scores, shared_score)
-                };
+            if crate::native_moe_decode::router_supported(w, dims) {
+                return crate::native_moe_decode::run_routed(x, w, dims);
+            }
+            let (inds, scores) = routing_graph(x, w)?;
+            let shared_logits = project_gate(x, &w.shared_gate)
+                .context("moe_block_forward: shared_expert_gate(x) failed")?;
+            let shared_score = mlx_rs::ops::sigmoid(&shared_logits)
+                .context("moe_block_forward: sigmoid(shared_gate) failed")?;
             return crate::native_moe_decode::run(
                 x,
                 &inds,

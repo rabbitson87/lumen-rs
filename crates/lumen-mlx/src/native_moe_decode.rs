@@ -1,4 +1,5 @@
-//! Two kernels for the routed and shared experts of a single-token MoE decode step.
+//! Two kernels for the routed and shared experts of a single-token MoE decode step, and one for
+//! the router's logits.
 //!
 //! The composed block runs the experts as about twenty-five MLX ops: the gate/up gather, the
 //! SwiGLU, the down gather, the weighting and sum over the routed experts, then the shared expert's
@@ -7,7 +8,8 @@
 //!
 //! * [`GATE_UP_SOURCE`]: one simdgroup per (slot, intermediate row), where slot 0..7 are the routed
 //!   experts and slot 8 the shared expert. Gate and up are dotted against the activation and
-//!   SwiGLU'd in the same kernel.
+//!   SwiGLU'd in the same kernel. With a router in front it also does the router's select (see
+//!   below), so no kernel sits between the logits and the experts.
 //! * [`DOWN_COMBINE_SOURCE`]: one simdgroup per output row. Each slot's down projection is
 //!   weighted by its score (the shared expert by its sigmoid gate) and summed.
 //!
@@ -15,10 +17,13 @@
 //! dot products to bf16 (the down output before it is weighted), and SwiGLU op by op as MLX's bf16
 //! `sigmoid`, `multiply` do. The shared expert stays in f32 as it does there.
 //!
-//! The router has two kernels of its own ([`ROUTER_LOGITS_SOURCE`], [`ROUTER_SELECT_SOURCE`]): the
-//! 256 expert logits and the shared expert's gate logit, then softmax, top-8, renormalisation and
-//! the shared sigmoid in one simdgroup. They replace the gate matmul, softmax, argpartition,
-//! take-along, sum, divide, the shared gate matmul and its sigmoid (twelve dispatches).
+//! The router is one kernel of its own ([`ROUTER_LOGITS_SOURCE`], the 256 expert logits and the
+//! shared expert's gate logit) plus a prologue of the gate/up kernel: every routed simdgroup
+//! repeats softmax and an argmax per rank up to its own slot's, and one of them stores the
+//! renormalised top-8 and the shared sigmoid for the down kernel. That replaces the gate matmul,
+//! softmax, argpartition, take-along, sum, divide, the shared gate matmul and its sigmoid (twelve
+//! dispatches), and a separate select kernel (one simdgroup, ~8 us, plus the dependency it
+//! chained) that sat between the logits and the experts before.
 //!
 //! One rounding is easy to miss and decides whether the result matches. MLX's quantized matvec
 //! sums the activation four elements at a time in the activation's own type (`load_vector` adds
@@ -41,10 +46,11 @@ use crate::native_moe::{
 use crate::native_quant::MODE_AFFINE;
 
 lumen_flags::flag! {
-    /// Route a single-token step with two kernels (the expert and shared-gate logits; then softmax,
-    /// top-8, renormalisation and the shared sigmoid) instead of the twelve MLX ops, when
-    /// `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts in kernels and the router is an 8-bit
-    /// group-64 gate over a multiple of 32 experts.
+    /// Route a single-token step with a logits kernel (the expert and shared-gate logits) and the
+    /// select (softmax, top-8, renormalisation, the shared sigmoid) inside the experts' gate/up
+    /// kernel, instead of the twelve MLX ops, when `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts
+    /// in kernels and the router is an 8-bit group-64 gate over a multiple of 32 experts and at
+    /// least 512 hidden units.
     ///
     /// Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
     /// accumulate in a different order, so two experts whose probabilities differ by float noise
@@ -52,7 +58,8 @@ lumen_flags::flag! {
     ///
     /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over six server runs: 11.9 ms
     /// composed, 11.1 ms with the expert kernels only, 10.5 ms with the router kernels too (-0.6
-    /// ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops). Teacher-forced
+    /// ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops); folding the
+    /// select into the gate/up kernel took another 0.1 ms. Teacher-forced
     /// top-1 agreement with the composed ops over 4,050 positions: 98.79%, against 98.62% between
     /// the composed model's prefill and decode kernels.
     pub(crate) fused_router {
@@ -89,7 +96,7 @@ const GATE_UP_SOURCE: &str = r#"
     constexpr int G = H / 64;
     constexpr int WPR = H / 8;
     const bool routed = slot < K;
-    const uint e = routed ? inds[slot] : 0u;
+    /*EXPERT*/
 
     float g_part[R];
     float u_part[R];
@@ -157,6 +164,82 @@ const GATE_UP_SOURCE: &str = r#"
                 a = (g / (1.0f + metal::exp(-g))) * u;
             }
             act[slot * I + rg * R + r] = a;
+        }
+    }
+"#;
+
+/// Where [`GATE_UP_SOURCE`] gets a slot's expert from: the routing the caller already has.
+const EXPERT_FROM_INDICES: &str = "const uint e = routed ? inds[slot] : 0u;";
+
+/// Where it gets it from when the router's select is folded in: every routed simdgroup repeats the
+/// select over the router logits for its own slot (softmax, then the slot-th largest probability by
+/// repeated argmax, the lowest index winning a tie), and the simdgroup of slot 0 and row group 0
+/// runs all eight rounds and stores the routing the down kernel reads. No kernel sits between the
+/// router logits and the experts. The arithmetic is the standalone select's, op for op.
+const EXPERT_FROM_LOGITS: &str = r#"
+    uint e = 0u;
+    {
+        constexpr int PER = E / 32;
+        const bool writer = slot == 0 && rg == 0;
+        const int rounds = writer ? 8 : (routed ? slot + 1 : 0);
+        if (rounds > 0) {
+            float p[PER];
+            float m = -INFINITY;
+            for (int k = 0; k < PER; ++k) {
+                p[k] = logits[lane + k * 32];
+                m = metal::max(m, p[k]);
+            }
+            m = simd_max(m);
+            float sum = 0.0f;
+            for (int k = 0; k < PER; ++k) {
+                p[k] = metal::exp(p[k] - m);
+                sum += p[k];
+            }
+            sum = simd_sum(sum);
+            const float inv = 1.0f / sum;
+            for (int k = 0; k < PER; ++k) {
+                p[k] = p[k] * inv;
+            }
+            float sel_p[8];
+            for (int r = 0; r < 8; ++r) {
+                sel_p[r] = 0.0f;
+                if (r < rounds) {
+                    float bv = -INFINITY;
+                    uint bi = 0xFFFFFFFFu;
+                    for (int k = 0; k < PER; ++k) {
+                        if (p[k] > bv) {
+                            bv = p[k];
+                            bi = lane + k * 32;
+                        }
+                    }
+                    const float gv = simd_max(bv);
+                    const uint gi = simd_min(bv == gv ? bi : 0xFFFFFFFFu);
+                    for (int k = 0; k < PER; ++k) {
+                        if (lane + k * 32 == gi) {
+                            p[k] = -INFINITY;
+                        }
+                    }
+                    sel_p[r] = gv;
+                    if (r == slot) {
+                        e = gi;
+                    }
+                    if (writer && lane == 0) {
+                        inds[r] = gi;
+                    }
+                }
+            }
+            if (writer && lane == 0) {
+                float denom = 0.0f;
+                for (int r = 0; r < 8; ++r) {
+                    denom += sel_p[r];
+                }
+                for (int r = 0; r < 8; ++r) {
+                    scores[r] = sel_p[r] / denom;
+                }
+                const float z = logits[E];
+                const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+                sscore[0] = z < 0.0f ? y : 1.0f - y;
+            }
         }
     }
 "#;
@@ -258,74 +341,11 @@ const ROUTER_LOGITS_SOURCE: &str = r#"
     }
 "#;
 
-/// One simdgroup (E / 32 logits a lane, so no barrier anywhere): softmax over the `E` expert
-/// logits (`1 / sum` multiplied in, as MLX does), the eight largest probabilities by repeated
-/// argmax (the lowest index wins a tie), their renormalisation, and the shared expert's sigmoid
-/// gate.
-const ROUTER_SELECT_SOURCE: &str = r#"
-    constexpr int PER = E / 32;
-    const uint lane = thread_index_in_simdgroup;
-
-    float p[PER];
-    float m = -INFINITY;
-    for (int k = 0; k < PER; ++k) {
-        p[k] = logits[lane + k * 32];
-        m = metal::max(m, p[k]);
-    }
-    m = simd_max(m);
-    float sum = 0.0f;
-    for (int k = 0; k < PER; ++k) {
-        p[k] = metal::exp(p[k] - m);
-        sum += p[k];
-    }
-    sum = simd_sum(sum);
-    const float inv = 1.0f / sum;
-    for (int k = 0; k < PER; ++k) {
-        p[k] = p[k] * inv;
-    }
-
-    float sel_p[8];
-    uint sel_i[8];
-    for (int r = 0; r < 8; ++r) {
-        float bv = -INFINITY;
-        uint bi = 0xFFFFFFFFu;
-        for (int k = 0; k < PER; ++k) {
-            if (p[k] > bv) {
-                bv = p[k];
-                bi = lane + k * 32;
-            }
-        }
-        const float gv = simd_max(bv);
-        const uint gi = simd_min(bv == gv ? bi : 0xFFFFFFFFu);
-        for (int k = 0; k < PER; ++k) {
-            if (lane + k * 32 == gi) {
-                p[k] = -INFINITY;
-            }
-        }
-        sel_p[r] = gv;
-        sel_i[r] = gi;
-    }
-
-    if (lane == 0) {
-        float denom = 0.0f;
-        for (int r = 0; r < 8; ++r) {
-            denom += sel_p[r];
-        }
-        for (int r = 0; r < 8; ++r) {
-            inds[r] = sel_i[r];
-            scores[r] = sel_p[r] / denom;
-        }
-        const float z = logits[E];
-        const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
-        sscore[0] = z < 0.0f ? y : 1.0f - y;
-    }
-"#;
-
 struct Kernels {
     gate_up: MetalKernel,
+    gate_up_routed: MetalKernel,
     down: MetalKernel,
     router_logits: MetalKernel,
-    router_select: MetalKernel,
 }
 
 impl Kernels {
@@ -339,7 +359,17 @@ impl Kernels {
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "inds",
                 ],
                 &["act"],
-                GATE_UP_SOURCE,
+                &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
+                /* ensure_row_contiguous */ true,
+                /* atomic_outputs */ false,
+            )?,
+            gate_up_routed: MetalKernel::new(
+                "moe_decode_gate_up_swiglu_routed",
+                &[
+                    "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "logits",
+                ],
+                &["act", "inds", "scores", "sscore"],
+                &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_LOGITS),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
@@ -358,14 +388,6 @@ impl Kernels {
                 &["x", "gw", "gs", "gb", "sw", "ss", "sb"],
                 &["logits"],
                 ROUTER_LOGITS_SOURCE,
-                /* ensure_row_contiguous */ true,
-                /* atomic_outputs */ false,
-            )?,
-            router_select: MetalKernel::new(
-                "moe_decode_router_select",
-                &["logits"],
-                &["inds", "scores", "sscore"],
-                ROUTER_SELECT_SOURCE,
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
@@ -516,6 +538,66 @@ pub(crate) fn gate_up_swiglu(
     })
 }
 
+/// [`gate_up_swiglu`] with the router's select folded in: takes the `[experts + 1]` logits of
+/// [`route_logits`] instead of the chosen experts, and also returns the routing it chose (the
+/// experts' ids `[8]` u32, their renormalised probabilities `[8]` f32, the shared sigmoid gate
+/// `[1]` f32) for the down kernel.
+fn gate_up_swiglu_routed(
+    x: &Array,
+    logits: &Array,
+    experts: i32,
+    glu: &SwitchGluWeights<'_>,
+    shared: &SharedMlpWeights<'_>,
+    dims: Dims,
+) -> Result<(Array, Array, Array, Array)> {
+    let GateUpWeights::Fused(gate_up) = &glu.gate_up else {
+        return Err(anyhow!(
+            "moe decode kernels need the stacked gate/up experts"
+        ));
+    };
+    let Dims { hidden, inter } = dims;
+    let slots = TOP_K + 1;
+    with_kernels(|k| {
+        let config = MetalKernelConfig::new();
+        config.add_template_arg_int("H", hidden)?;
+        config.add_template_arg_int("I", inter)?;
+        config.add_template_arg_int("K", TOP_K)?;
+        config.add_template_arg_int("R", ROWS_GATE_UP)?;
+        config.add_template_arg_int("E", experts)?;
+        config.set_grid(32, inter / ROWS_GATE_UP, slots)?;
+        config.set_thread_group(32, ROWS_PER_GROUP, 1)?;
+        config.add_output_arg(&[slots * inter], Dtype::Float32)?;
+        config.add_output_arg(&[TOP_K], Dtype::Uint32)?;
+        config.add_output_arg(&[TOP_K], Dtype::Float32)?;
+        config.add_output_arg(&[1], Dtype::Float32)?;
+        let mut out = k
+            .gate_up_routed
+            .apply(
+                &[
+                    x,
+                    gate_up.weight,
+                    gate_up.scales,
+                    need(gate_up.biases, "gate/up")?,
+                    shared.gate_proj_w,
+                    shared.gate_proj_s,
+                    need(shared.gate_proj_b, "shared gate")?,
+                    shared.up_proj_w,
+                    shared.up_proj_s,
+                    need(shared.up_proj_b, "shared up")?,
+                    logits,
+                ],
+                &config,
+                4,
+            )
+            .context("moe decode: gate/up/swiglu kernel with the router select failed")?;
+        let sscore = out.pop().ok_or_else(|| anyhow!("no shared score"))?;
+        let scores = out.pop().ok_or_else(|| anyhow!("no scores"))?;
+        let inds = out.pop().ok_or_else(|| anyhow!("no indices"))?;
+        let act = out.pop().ok_or_else(|| anyhow!("no activations"))?;
+        Ok((act, inds, scores, sscore))
+    })
+}
+
 /// Down projections of the nine slots, weighted and summed: `[hidden]` f32.
 pub(crate) fn down_combine(
     act: &Array,
@@ -600,20 +682,9 @@ fn router_gates<'a>(w: &'a MoeBlockWeights<'a>, dims: Dims) -> Option<RouterGate
     })
 }
 
-/// Whether [`route`] can replace the composed router of this layer.
+/// Whether [`run_routed`] can replace the composed router of this layer.
 pub(crate) fn router_supported(w: &MoeBlockWeights<'_>, dims: Dims) -> bool {
     fused_router::get() && router_gates(w, dims).is_some()
-}
-
-/// The routing of `x` (`[1, 1, hidden]`): the eight experts' ids (`[8]` u32), their renormalised
-/// probabilities (`[8]` f32) and the shared expert's sigmoid gate (`[1]` f32).
-pub(crate) fn route(
-    x: &Array,
-    w: &MoeBlockWeights<'_>,
-    dims: Dims,
-) -> Result<(Array, Array, Array)> {
-    let logits = route_logits(x, w, dims)?;
-    route_select(&logits, w, dims)
 }
 
 /// The router's first kernel: the `[experts + 1]` f32 logits, the shared expert's gate last.
@@ -648,39 +719,6 @@ pub(crate) fn route_logits(x: &Array, w: &MoeBlockWeights<'_>, dims: Dims) -> Re
     })
 }
 
-/// The router's second kernel: softmax, top-8, renormalisation and the shared sigmoid over the
-/// logits of [`route_logits`].
-pub(crate) fn route_select(
-    logits: &Array,
-    w: &MoeBlockWeights<'_>,
-    dims: Dims,
-) -> Result<(Array, Array, Array)> {
-    let gates = router_gates(w, dims).ok_or_else(|| anyhow!("moe decode: router not supported"))?;
-    with_kernels(|k| {
-        let select_config = MetalKernelConfig::new();
-        select_config.add_template_arg_int("E", gates.experts)?;
-        select_config.set_grid(32, 1, 1)?;
-        select_config.set_thread_group(32, 1, 1)?;
-        select_config.add_output_arg(&[TOP_K], Dtype::Uint32)?;
-        select_config.add_output_arg(&[TOP_K], Dtype::Float32)?;
-        select_config.add_output_arg(&[1], Dtype::Float32)?;
-        let mut out = k
-            .router_select
-            .apply(&[logits], &select_config, 3)
-            .context("moe decode: router select kernel failed")?;
-        let shared_score = out
-            .pop()
-            .ok_or_else(|| anyhow!("router select: no shared score"))?;
-        let scores = out
-            .pop()
-            .ok_or_else(|| anyhow!("router select: no scores"))?;
-        let inds = out
-            .pop()
-            .ok_or_else(|| anyhow!("router select: no indices"))?;
-        Ok((inds, scores, shared_score))
-    })
-}
-
 /// The routed and shared experts' contribution to the block, `[1, 1, hidden]` f32: routed experts
 /// `inds` weighted by `scores`, plus the shared expert weighted by `shared_score`.
 pub(crate) fn run(
@@ -700,6 +738,46 @@ pub(crate) fn run(
     let act = gate_up_swiglu(&x, &inds, glu, shared, dims)?;
     let out = down_combine(&act, &inds, &scores, &shared_score, glu, shared, dims)?;
     Ok(mlx_rs::ops::reshape(&out, &[1, 1, hidden])?)
+}
+
+/// [`route_logits`], then the experts with the router's select folded into the gate/up kernel:
+/// the routed and shared experts' contribution to the block, `[1, 1, hidden]` f32.
+pub(crate) fn run_routed(x: &Array, w: &MoeBlockWeights<'_>, dims: Dims) -> Result<Array> {
+    Ok(run_routed_with_routing(x, w, dims)?.0)
+}
+
+/// [`run_routed`], and the routing the gate/up kernel chose: the experts' ids (`[8]` u32), their
+/// renormalised probabilities (`[8]` f32) and the shared expert's sigmoid gate (`[1]` f32).
+fn run_routed_with_routing(
+    x: &Array,
+    w: &MoeBlockWeights<'_>,
+    dims: Dims,
+) -> Result<(Array, [Array; 3])> {
+    let gates = router_gates(w, dims).ok_or_else(|| anyhow!("moe decode: router not supported"))?;
+    let logits = route_logits(x, w, dims)?;
+    let hidden = dims.hidden;
+    let x = mlx_rs::ops::reshape(&x.as_dtype(Dtype::Float32)?, &[hidden])?;
+    let (act, inds, scores, shared_score) = gate_up_swiglu_routed(
+        &x,
+        &logits,
+        gates.experts,
+        &w.switch_glu,
+        &w.shared_expert,
+        dims,
+    )?;
+    let out = down_combine(
+        &act,
+        &inds,
+        &scores,
+        &shared_score,
+        &w.switch_glu,
+        &w.shared_expert,
+        dims,
+    )?;
+    Ok((
+        mlx_rs::ops::reshape(&out, &[1, 1, hidden])?,
+        [inds, scores, shared_score],
+    ))
 }
 
 #[cfg(test)]
@@ -852,8 +930,8 @@ mod tests {
         );
     }
 
-    /// The router kernels pick the composed router's experts with its probabilities, and the
-    /// shared gate's sigmoid, for many activations.
+    /// The router (logits kernel, then the select inside the gate/up kernel) picks the composed
+    /// router's experts with its probabilities, and the shared gate's sigmoid, for many activations.
     fn router_matches_the_composed_router(hidden: i32, inter: i32, experts: i32, inputs: u64) {
         use crate::native_moe::moe_router;
         use crate::native_quant::quantized_matmul_with_mode;
@@ -871,7 +949,8 @@ mod tests {
                 "the kernels must take this router, or the comparison compares the composed one with itself"
             );
             let (want_inds, want_scores) = moe_router(&x, &w).expect("composed router");
-            let (inds, scores, shared_score) = route(&x, &w, dims).expect("kernel router");
+            let (_, [inds, scores, shared_score]) =
+                run_routed_with_routing(&x, &w, dims).expect("kernel router");
 
             let by_expert = |inds: &Array, scores: &Array| {
                 let ids = host(&inds.as_dtype(Dtype::Float32).unwrap());
