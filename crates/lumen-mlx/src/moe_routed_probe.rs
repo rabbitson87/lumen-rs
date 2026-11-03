@@ -124,7 +124,7 @@ impl Layer {
         let rows = |a: &Array| -> Result<Array> {
             Ok(mlx_rs::ops::indexing::take_axis(
                 a,
-                &Array::from_slice(
+                Array::from_slice(
                     &(0..experts / copies).collect::<Vec<i32>>(),
                     &[experts / copies],
                 ),
