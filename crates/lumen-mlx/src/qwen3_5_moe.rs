@@ -249,6 +249,11 @@ mod imp {
         /// the result is the composed block's up to float noise and not bit-identical: a
         /// `Behavior` flag. Default on; `=0` restores the composed ops.
         ///
+        /// SSD expert offload serves the experts through the composed ops, so for an affine
+        /// checkpoint the offloaded output is the composed ops' (`=0`) bit for bit and this flag's
+        /// resident output to float noise, not bit for bit as the offload promises elsewhere. The
+        /// mxfp4 checkpoints do not take the kernels and keep that promise.
+        ///
         /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
         /// 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
         /// bytes identical, the rest the last token or two. Teacher-forced, one token per forward
@@ -5639,6 +5644,13 @@ mod config_tests {
 
 /// Serving the routed experts from an SSD-backed slot pool must not change a
 /// single bit of the model's output (task 023).
+///
+/// These tests are written for the A3B mxfp4 checkpoint. An affine 4-bit group-64 checkpoint's
+/// resident decode steps run the MoE decode kernels (`LUMEN_NATIVE_FUSED_MOE_DECODE`), which the
+/// offload path cannot (it gathers from the bank's per-role pools, not from stacked tensors), so
+/// there the offloaded output equals the resident output of the composed ops
+/// (`LUMEN_NATIVE_FUSED_MOE_DECODE=0`) bit for bit, and the kernels' to float noise. Run on the
+/// affine checkpoint they fail at the first decode step unless that flag is 0.
 #[cfg(all(test, feature = "mlx-native"))]
 mod offload_tests {
     use super::imp::NativeQwen3_5MoeModel;

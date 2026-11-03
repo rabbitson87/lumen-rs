@@ -509,6 +509,11 @@ Run a single-token decode step's routed and shared experts in two Metal kernels
  the result is the composed block's up to float noise and not bit-identical: a
  `Behavior` flag. Default on; `=0` restores the composed ops.
 
+ SSD expert offload serves the experts through the composed ops, so for an affine
+ checkpoint the offloaded output is the composed ops' (`=0`) bit for bit and this flag's
+ resident output to float noise, not bit for bit as the offload promises elsewhere. The
+ mxfp4 checkpoints do not take the kernels and keep that promise.
+
  Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
  12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
  bytes identical, the rest the last token or two. Teacher-forced, one token per forward
