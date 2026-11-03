@@ -281,8 +281,14 @@ fn decode_kernels_against_composed_block() {
     // The pieces of the kernel block, each against a consumer-only control so the one or two glue
     // ops that keep the output alive cancel.
     let w = layer.view(true, true);
-    let dims = crate::native_moe_decode::plan(&x0, &w.switch_glu, &w.shared_expert, w.top_k)
-        .expect("the kernels take this layer");
+    let dims = crate::native_moe_decode::plan(
+        &x0,
+        &w.switch_glu,
+        &w.shared_expert,
+        w.top_k,
+        w.experts_in_scale_dtype,
+    )
+    .expect("the kernels take this layer");
     let constant = Array::from_slice(&vec![0.001f32; 257], &[257]);
     constant.eval().expect("eval");
     let consume =

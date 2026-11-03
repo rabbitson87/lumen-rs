@@ -73,11 +73,6 @@ lumen_flags::flag! {
 const TOP_K: i32 = 8;
 /// Simdgroups per threadgroup of the expert kernels.
 const ROWS_PER_GROUP: i32 = 4;
-/// MLX hands a kernel input of fewer than eight elements over in the `constant` address space.
-/// The router kernel picks the shared gate's scales and biases (`[1, hidden / 64]`) or the
-/// experts' (`device`) with one expression, which does not compile across address spaces, so a
-/// router needs at least this many groups per row to run on the kernels.
-const MIN_GATE_GROUPS: i32 = 8;
 /// Rows one simdgroup of each expert kernel owns, so the activation it loads is used for all of
 /// them (MLX's own quantized matvec does four). More rows means fewer simdgroups to hide memory
 /// latency with, so the best count is each kernel's own, found end to end (ABBA on the 35B-A3B
@@ -87,43 +82,98 @@ const MIN_GATE_GROUPS: i32 = 8;
 const ROWS_GATE_UP: i32 = 2;
 const ROWS_DOWN: i32 = 2;
 
+/// MLX's own quantized matvec, transcribed (`kernels/quantized.h`, MLX 0.32): the helpers its
+/// `qmv_fast` runs for 4-bit weights, so the decode kernels add in the order the composed
+/// `gather_qmm` and `quantized_matmul` do. A matvec row is one simdgroup's lanes, each 16 values of
+/// every 512, summed per lane in `qdot`'s order and then across lanes with `simd_sum`; changing
+/// that partition or order changes the low bits.
+const MOE_HEADER: &str = r#"
+#define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
+
+// load_vector over bf16 activations. The composed path casts the activation to bf16 before the
+// gather, so `x` (f32 here) is rounded first; the quad sum then rounds to bf16 after every add, as
+// `sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]` does on bf16 operands.
+inline float load_vector_bf16(const device float* x, thread float* x_thread) {
+    float sum = 0;
+    for (int i = 0; i < 16; i += 4) {
+        const float a = RB(x[i]);
+        const float b = RB(x[i + 1]);
+        const float c = RB(x[i + 2]);
+        const float d = RB(x[i + 3]);
+        sum += RB(RB(RB(a + b) + c) + d);
+        x_thread[i] = a;
+        x_thread[i + 1] = b / 16.0f;
+        x_thread[i + 2] = c / 256.0f;
+        x_thread[i + 3] = d / 4096.0f;
+    }
+    return sum;
+}
+
+// load_vector over f32 activations (the shared expert's).
+inline float load_vector_f32(const device float* x, thread float* x_thread) {
+    float sum = 0;
+    for (int i = 0; i < 16; i += 4) {
+        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+        x_thread[i] = x[i];
+        x_thread[i + 1] = x[i + 1] / 16.0f;
+        x_thread[i + 2] = x[i + 2] / 256.0f;
+        x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+    return sum;
+}
+
+// qdot for 4-bit weights, 16 values.
+inline float qdot4(
+    const device uint16_t* ws,
+    const thread float* x_thread,
+    float scale,
+    float bias,
+    float sum) {
+    float accum = 0;
+    for (int i = 0; i < 4; i++) {
+        accum +=
+            (x_thread[4 * i] * (ws[i] & 0x000f) +
+             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+             x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+    return scale * accum + sum * bias;
+}
+
+// MLX's Sigmoid on f32 and on bf16 (every operation rounds to bf16; `x` is already bf16).
+inline float sigmoid_f32(float x) {
+    const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    return (x < 0) ? y : 1 - y;
+}
+inline float sigmoid_bf16(float x) {
+    const float e = RB(metal::precise::exp(metal::abs(x)));
+    const float d = RB(1.0f + e);
+    const float y = RB(1.0f / d);
+    return (x < 0.0f) ? y : RB(1.0f - y);
+}
+"#;
+
 const GATE_UP_SOURCE: &str = r#"
-    #define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
-    // MLX sums the activation four at a time in the activation's own type (`sum += x[i] + x[i + 1]
-    // + x[i + 2] + x[i + 3]`), so bf16 activations round after every add; f32 ones do not.
-    #define QSUM(a, b, c, d) (routed ? RB(RB(RB((a) + (b)) + (c)) + (d)) : (((a) + (b)) + (c)) + (d))
     const int lane = thread_index_in_simdgroup;
     const int rg = thread_position_in_grid.y;
     const int slot = thread_position_in_grid.z;
     constexpr int G = H / 64;
     constexpr int WPR = H / 8;
+    constexpr int BLOCKS = H / 512;
     const bool routed = slot < K;
     /*EXPERT*/
 
-    float g_part[R];
-    float u_part[R];
+    // Four rows (R gate, R up) a simdgroup, as MLX's qmv_fast does, each summed in its order.
+    float g_acc[R];
+    float u_acc[R];
     for (int r = 0; r < R; ++r) {
-        g_part[r] = 0.0f;
-        u_part[r] = 0.0f;
+        g_acc[r] = 0.0f;
+        u_acc[r] = 0.0f;
     }
-    for (int grp = lane; grp < G; grp += 32) {
-        // The group's activation, once for the R rows this simdgroup owns.
-        float xq[64];
-        float xs = 0.0f;
-        for (int j = 0; j < 8; ++j) {
-            for (int i = 0; i < 8; ++i) {
-                const float raw = x[grp * 64 + j * 8 + i];
-                xq[j * 8 + i] = routed ? RB(raw) : raw;
-            }
-            xs += QSUM(xq[j * 8], xq[j * 8 + 1], xq[j * 8 + 2], xq[j * 8 + 3]);
-            xs += QSUM(xq[j * 8 + 4], xq[j * 8 + 5], xq[j * 8 + 6], xq[j * 8 + 7]);
-            // Nibble i is read where it sits (masked, not shifted), so its activation is divided
-            // by 16^i once here for all R rows. Both factors are exact powers of two times a
-            // 4-bit integer, so the product is bit for bit x * nibble.
-            for (int i = 0; i < 8; ++i) {
-                xq[j * 8 + i] *= 1.0f / static_cast<float>(1u << (4 * i));
-            }
-        }
+    for (int blk = 0; blk < BLOCKS; ++blk) {
+        float x_thread[16];
+        const device float* xl = x + blk * 512 + lane * 16;
+        const float sum = routed ? load_vector_bf16(xl, x_thread) : load_vector_f32(xl, x_thread);
         for (int r = 0; r < R; ++r) {
             const int row = rg * R + r;
             const size_t rgate = (size_t)e * (2 * I) + row;
@@ -134,36 +184,29 @@ const GATE_UP_SOURCE: &str = r#"
             auto su = routed ? (sc + rup * G) : (us + (size_t)row * G);
             auto bg = routed ? (bi + rgate * G) : (gb + (size_t)row * G);
             auto bu = routed ? (bi + rup * G) : (ub + (size_t)row * G);
-            float ag = 0.0f;
-            float au = 0.0f;
-            for (int j = 0; j < 8; ++j) {
-                const uint32_t pg = wg[grp * 8 + j];
-                const uint32_t pu = wu[grp * 8 + j];
-                for (int i = 0; i < 8; ++i) {
-                    ag += xq[j * 8 + i] * static_cast<float>(pg & (0xFu << (4 * i)));
-                    au += xq[j * 8 + i] * static_cast<float>(pu & (0xFu << (4 * i)));
-                }
-            }
-            g_part[r] += static_cast<float>(sg[grp]) * ag + static_cast<float>(bg[grp]) * xs;
-            u_part[r] += static_cast<float>(su[grp]) * au + static_cast<float>(bu[grp]) * xs;
+            const int scale_at = blk * 8 + lane / 4;
+            const device uint16_t* pg = (const device uint16_t*)(wg + blk * 64 + lane * 2);
+            const device uint16_t* pu = (const device uint16_t*)(wu + blk * 64 + lane * 2);
+            const float s_g = sg[scale_at];
+            const float b_g = bg[scale_at];
+            const float s_u = su[scale_at];
+            const float b_u = bu[scale_at];
+            g_acc[r] += qdot4(pg, x_thread, s_g, b_g, sum);
+            u_acc[r] += qdot4(pu, x_thread, s_u, b_u, sum);
         }
     }
     for (int r = 0; r < R; ++r) {
-        const float g = simd_sum(g_part[r]);
-        const float u = simd_sum(u_part[r]);
+        const float g = simd_sum(g_acc[r]);
+        const float u = simd_sum(u_acc[r]);
         if (lane == 0) {
             float a;
             if (routed) {
+                // The gather returns bf16; the compiled SwiGLU is bf16 op by op.
                 const float gr = RB(g);
                 const float ur = RB(u);
-                // MLX's sigmoid, op by op: y = 1 / (1 + exp(|x|)); x < 0 ? y : 1 - y.
-                const float ex = RB(metal::exp(metal::abs(gr)));
-                const float d = RB(1.0f + ex);
-                const float y = RB(1.0f / d);
-                const float sig = gr < 0.0f ? y : RB(1.0f - y);
-                a = RB(RB(gr * sig) * ur);
+                a = RB(RB(gr * sigmoid_bf16(gr)) * ur);
             } else {
-                a = (g / (1.0f + metal::exp(-g))) * u;
+                a = (g * sigmoid_f32(g)) * u;
             }
             act[slot * I + rg * R + r] = a;
         }
@@ -247,14 +290,15 @@ const EXPERT_FROM_LOGITS: &str = r#"
 "#;
 
 const DOWN_COMBINE_SOURCE: &str = r#"
-    #define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
-    #define QSUM(a, b, c, d) (routed ? RB(RB(RB((a) + (b)) + (c)) + (d)) : (((a) + (b)) + (c)) + (d))
     const int lane = thread_index_in_simdgroup;
     const int rg = thread_position_in_grid.y;
     constexpr int G = I / 64;
     constexpr int WPR = I / 8;
-    constexpr int CHUNKS = I / 16;
+    constexpr int BLOCKS = I / 512;
 
+    // The composed block casts each expert's output to f32, multiplies it by its score, and sums
+    // the eight products in order (MLX's col_reduce_small: product 0, then each next one added to
+    // the running sum), then adds the shared expert's gated output.
     float total[R];
     for (int r = 0; r < R; ++r) {
         total[r] = 0.0f;
@@ -262,46 +306,37 @@ const DOWN_COMBINE_SOURCE: &str = r#"
     for (int s = 0; s <= K; ++s) {
         const bool routed = s < K;
         const uint e = routed ? inds[s] : 0u;
-        float part[R];
+        float acc[R];
         for (int r = 0; r < R; ++r) {
-            part[r] = 0.0f;
+            acc[r] = 0.0f;
         }
-        for (int c = lane; c < CHUNKS; c += 32) {
-            // This lane's 16 activations, once for the R rows.
-            float av[16];
-            for (int i = 0; i < 16; ++i) {
-                av[i] = act[s * I + c * 16 + i];
-            }
-            float xs = 0.0f;
-            xs += QSUM(av[0], av[1], av[2], av[3]);
-            xs += QSUM(av[4], av[5], av[6], av[7]);
-            xs += QSUM(av[8], av[9], av[10], av[11]);
-            xs += QSUM(av[12], av[13], av[14], av[15]);
-            // As in the gate/up kernel: nibble i is masked in place, its activation pre-divided.
-            for (int i = 0; i < 8; ++i) {
-                const float inv = 1.0f / static_cast<float>(1u << (4 * i));
-                av[i] *= inv;
-                av[8 + i] *= inv;
-            }
+        for (int blk = 0; blk < BLOCKS; ++blk) {
+            float x_thread[16];
+            const device float* xl = act + s * I + blk * 512 + lane * 16;
+            const float sum = routed ? load_vector_bf16(xl, x_thread) : load_vector_f32(xl, x_thread);
             for (int r = 0; r < R; ++r) {
                 const int row = rg * R + r;
                 const size_t rr = (size_t)e * H + row;
                 auto wp = routed ? (w + rr * WPR) : (dw + (size_t)row * WPR);
                 auto sp = routed ? (sc + rr * G) : (ds + (size_t)row * G);
                 auto bp = routed ? (bi + rr * G) : (db + (size_t)row * G);
-                const uint32_t p0 = wp[c * 2];
-                const uint32_t p1 = wp[c * 2 + 1];
-                float acc = 0.0f;
-                for (int i = 0; i < 8; ++i) {
-                    acc += av[i] * static_cast<float>(p0 & (0xFu << (4 * i)));
-                    acc += av[8 + i] * static_cast<float>(p1 & (0xFu << (4 * i)));
-                }
-                part[r] += static_cast<float>(sp[c / 4]) * acc + static_cast<float>(bp[c / 4]) * xs;
+                const int scale_at = blk * 8 + lane / 4;
+                const device uint16_t* pw = (const device uint16_t*)(wp + blk * 64 + lane * 2);
+                const float sc_v = sp[scale_at];
+                const float bi_v = bp[scale_at];
+                acc[r] += qdot4(pw, x_thread, sc_v, bi_v, sum);
             }
         }
         for (int r = 0; r < R; ++r) {
-            const float y = simd_sum(part[r]);
-            total[r] += routed ? scores[s] * RB(y) : sscore[0] * y;
+            float y = simd_sum(acc[r]);
+            if (routed) {
+                y = RB(y);
+                const float product = y * scores[s];
+                total[r] = (s == 0) ? product : (product + total[r]);
+            } else {
+                const float gated = sscore[0] * y;
+                total[r] = total[r] + gated;
+            }
         }
     }
     if (lane == 0) {
@@ -355,32 +390,35 @@ impl Kernels {
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
         Ok(Self {
-            gate_up: MetalKernel::new(
+            gate_up: MetalKernel::new_with_header(
                 "moe_decode_gate_up_swiglu",
                 &[
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "inds",
                 ],
                 &["act"],
+                MOE_HEADER,
                 &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
-            gate_up_routed: MetalKernel::new(
+            gate_up_routed: MetalKernel::new_with_header(
                 "moe_decode_gate_up_swiglu_routed",
                 &[
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "logits",
                 ],
                 &["act", "inds", "scores", "sscore"],
+                MOE_HEADER,
                 &GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_LOGITS),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
-            down: MetalKernel::new(
+            down: MetalKernel::new_with_header(
                 "moe_decode_down_combine",
                 &[
                     "act", "w", "sc", "bi", "dw", "ds", "db", "inds", "scores", "sscore",
                 ],
                 &["out"],
+                MOE_HEADER,
                 DOWN_COMBINE_SOURCE,
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
@@ -429,10 +467,17 @@ pub(crate) fn plan(
     glu: &SwitchGluWeights<'_>,
     shared: &SharedMlpWeights<'_>,
     top_k: i32,
+    experts_in_scale_dtype: bool,
 ) -> Option<Dims> {
     let [1, 1, hidden] = *x.shape() else {
         return None;
     };
+    // The kernels reproduce the composed block bit for bit, which fixes what that block does: an
+    // f32 activation, cast to bf16 for the routed experts (whose bf16 scales it follows) and left
+    // in f32 for the shared expert.
+    if x.dtype() != Dtype::Float32 || !experts_in_scale_dtype {
+        return None;
+    }
     let GateUpWeights::Fused(gate_up) = &glu.gate_up else {
         return None;
     };
@@ -445,11 +490,14 @@ pub(crate) fn plan(
     }
     let experts = *gate_up.weight.shape().first()?;
     let inter = *gate_up.weight.shape().get(1)? / 2;
-    if hidden % 64 != 0 || inter % 16 != 0 || inter % ROWS_GATE_UP != 0 || hidden % ROWS_DOWN != 0 {
+    // MLX runs a one-row matvec as `qmv_fast`, whose lane partition the kernels copy, only when the
+    // input length is a multiple of 512 (4-bit weights).
+    if hidden % 512 != 0 || inter % 512 != 0 || inter % ROWS_GATE_UP != 0 || hidden % ROWS_DOWN != 0
+    {
         return None;
     }
     let shape_is = |a: &Array, want: &[i32]| a.shape() == want;
-    let float = |d: Dtype| matches!(d, Dtype::Bfloat16 | Dtype::Float16 | Dtype::Float32);
+    let bf16 = |d: Dtype| d == Dtype::Bfloat16;
     let (gu_b, down_b) = (gate_up.biases?, glu.down_proj.biases?);
     let (sg_b, su_b, sd_b) = (shared.gate_proj_b?, shared.up_proj_b?, shared.down_proj_b?);
     let shapes_ok = shape_is(gate_up.weight, &[experts, 2 * inter, hidden / 8])
@@ -468,11 +516,11 @@ pub(crate) fn plan(
         && shape_is(su_b, &[inter, hidden / 64])
         && shape_is(sd_b, &[hidden, inter / 64]);
     // The kernels pick routed or shared pointers with one expression, so each role's two tensors
-    // must share a type.
+    // must share a type; the routed one is bf16, which the composed block's cast follows.
     let gate_up_dtype = gate_up.scales.dtype();
     let down_dtype = glu.down_proj.scales.dtype();
-    let dtypes_ok = float(gate_up_dtype)
-        && float(down_dtype)
+    let dtypes_ok = bf16(gate_up_dtype)
+        && bf16(down_dtype)
         && [
             gu_b.dtype(),
             shared.gate_proj_s.dtype(),
@@ -658,7 +706,6 @@ fn router_gates<'a>(w: &'a MoeBlockWeights<'a>, dims: Dims) -> Option<RouterGate
     let ok = w.norm_topk_prob
         && w.top_k == TOP_K
         && experts % 32 == 0
-        && dims.hidden / 64 >= MIN_GATE_GROUPS
         && (gate.bits, gate.group_size, shared.bits, shared.group_size) == (8, 64, 8, 64)
         && rows(gate.weight, experts, dims.hidden / 4)
         && rows(gate.scales, experts, dims.hidden / 64)
@@ -788,6 +835,16 @@ mod tests {
     use crate::moe_routed_probe::Layer;
     use crate::native_moe::moe_block_forward;
 
+    /// [`super::plan`] for the synthetic layers, whose experts are bf16 behind an f32 activation.
+    fn plan(
+        x: &Array,
+        glu: &SwitchGluWeights<'_>,
+        shared: &SharedMlpWeights<'_>,
+        top_k: i32,
+    ) -> Option<Dims> {
+        super::plan(x, glu, shared, top_k, true)
+    }
+
     fn host(a: &Array) -> Vec<f32> {
         let a = a.as_dtype(Dtype::Float32).expect("f32");
         a.eval().expect("eval");
@@ -838,8 +895,8 @@ mod tests {
 
     #[test]
     fn kernels_match_the_composed_block_on_a_small_layer() {
-        // Two input groups, so only two lanes of a simdgroup carry gate/up work.
-        kernels_match_the_composed_block(128, 64, 16);
+        // One block of 512 inputs, and 16 experts: the router stays composed.
+        kernels_match_the_composed_block(512, 512, 16);
     }
 
     #[test]
@@ -849,13 +906,13 @@ mod tests {
 
     #[test]
     fn kernels_match_the_composed_block_when_the_rows_outnumber_the_lanes() {
-        // 4096 hidden = 64 input groups (two per lane); 1024 intermediate = 64 chunks (two per lane).
+        // 4096 hidden = 8 blocks of 512 inputs; 1024 intermediate = 2.
         kernels_match_the_composed_block(4096, 1024, 16);
     }
 
     #[test]
     fn layers_the_kernels_cannot_run_stay_on_the_composed_block() {
-        let layer = Layer::build(128, 64, 16).expect("layer");
+        let layer = Layer::build(512, 512, 16).expect("layer");
         let x = layer.activation(1).expect("x");
         let stacked = layer.view(true, true);
         let top_k = stacked.top_k;
@@ -869,11 +926,34 @@ mod tests {
         assert!(plan(&two, &stacked.switch_glu, &stacked.shared_expert, top_k).is_none());
         // Not a top-8 router.
         assert!(plan(&x, &stacked.switch_glu, &stacked.shared_expert, 4).is_none());
+        // The composed block would not cast to bf16 here, or not run the shared expert in f32.
+        assert!(
+            super::plan(
+                &x,
+                &stacked.switch_glu,
+                &stacked.shared_expert,
+                top_k,
+                false
+            )
+            .is_none()
+        );
+        let bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
+        assert!(plan(&bf16, &stacked.switch_glu, &stacked.shared_expert, top_k).is_none());
+        // MLX runs these as `qmv`, not `qmv_fast`: an input length that is not a multiple of 512.
+        for (hidden, inter) in [(640, 512), (512, 640)] {
+            let odd = Layer::build(hidden, inter, 16).expect("layer");
+            let v = odd.view(true, true);
+            let x = odd.activation(1).expect("x");
+            assert!(
+                plan(&x, &v.switch_glu, &v.shared_expert, top_k).is_none(),
+                "{hidden}x{inter}"
+            );
+        }
     }
 
-    /// The kernel's routed activations are the composed SwiGLU's, element for element but for the
-    /// rare element whose f32 accumulation order tips a bf16 rounding. This is what the quad-sum
-    /// emulation in the kernel buys: without it 13% match.
+    /// The kernel's routed activations are the composed SwiGLU's, every one of them: the matvec
+    /// follows MLX's lane partition and add order, the activation is rounded to bf16 and summed
+    /// four at a time in bf16 as `load_vector` does, and the SwiGLU rounds op by op.
     #[test]
     fn routed_activations_are_the_composed_swiglu() {
         use crate::native_moe::{moe_router, swiglu_fused};
@@ -924,11 +1004,11 @@ mod tests {
                 equal += usize::from(a.to_bits() == b.to_bits());
             }
         }
-        let share = equal as f64 / total as f64;
-        assert!(
-            share > 0.995,
-            "only {:.2}% of the routed activations equal the composed block's",
-            share * 100.0
+        assert_eq!(
+            equal,
+            total,
+            "{} of {total} routed activations differ from the composed block's",
+            total - equal
         );
     }
 
@@ -998,30 +1078,92 @@ mod tests {
 
     #[test]
     fn router_kernels_match_the_composed_router_with_512_experts() {
-        router_matches_the_composed_router(1024, 256, 512, 60);
+        router_matches_the_composed_router(1024, 512, 512, 60);
     }
 
     #[test]
     fn kernels_match_the_composed_block_with_a_512_expert_router() {
-        kernels_match_the_composed_block(1024, 256, 512);
+        kernels_match_the_composed_block(1024, 512, 512);
+    }
+
+    /// The experts' contribution for the composed router's routing, kernels against composed ops:
+    /// how many of the block's elements differ in any bit, and the largest relative gap.
+    fn expert_bits(hidden: i32, inter: i32, experts: i32, inputs: u64) -> (usize, usize, f64) {
+        use crate::native_moe::moe_router;
+        use crate::native_quant::quantized_matmul_with_mode;
+
+        let layer = Layer::build(hidden, inter, experts).expect("layer");
+        let composed = layer.view(true, false);
+        let kernels = layer.view(true, true);
+        let GateProj::Affine(shared_gate) = &kernels.shared_gate else {
+            panic!("an affine shared gate");
+        };
+        let (mut differ, mut total, mut worst) = (0usize, 0usize, 0f64);
+        for seed in 0..inputs {
+            let x = layer.activation(3000 + seed).expect("x");
+            let dims = plan(
+                &x,
+                &kernels.switch_glu,
+                &kernels.shared_expert,
+                kernels.top_k,
+            )
+            .expect("plan");
+            let (inds, scores) = moe_router(&x, &composed).expect("composed router");
+            let logit = quantized_matmul_with_mode(
+                &x,
+                shared_gate.weight,
+                shared_gate.scales,
+                Some(shared_gate.biases),
+                true,
+                64,
+                8,
+                MODE_AFFINE,
+            )
+            .expect("shared gate");
+            let shared_score = mlx_rs::ops::sigmoid(&logit).expect("sigmoid");
+            let got = host(
+                &run(
+                    &x,
+                    &inds,
+                    &scores,
+                    &shared_score,
+                    &kernels.switch_glu,
+                    &kernels.shared_expert,
+                    dims,
+                )
+                .expect("kernel experts"),
+            );
+            let want = host(&moe_block_forward(&x, &composed).expect("composed block"));
+            for (a, b) in want.iter().zip(&got) {
+                total += 1;
+                if a.to_bits() != b.to_bits() {
+                    differ += 1;
+                    worst = worst.max(f64::from((a - b).abs()) / f64::from(a.abs().max(1e-30)));
+                }
+            }
+        }
+        (differ, total, worst)
     }
 
     #[test]
-    fn a_router_over_a_narrow_hidden_state_stays_on_the_composed_ops() {
-        // 256 / 64 = 4 groups: the shared gate's scales hold four elements, which MLX would pass in
-        // the constant address space and the router kernel could not compile.
-        let layer = Layer::build(256, 64, 256).expect("layer");
-        let w = layer.view(true, true);
-        let x = layer.activation(3).expect("x");
-        let dims = plan(&x, &w.switch_glu, &w.shared_expert, w.top_k).expect("experts supported");
-        assert!(!router_supported(&w, dims));
-        // The experts still run on the kernels, behind the composed router.
-        kernels_match_the_composed_block(256, 64, 256);
+    fn the_expert_kernels_equal_the_composed_experts_bit_for_bit() {
+        // 4 blocks of 512 inputs to the gate/up matvec and one to the down; 2 blocks to the down;
+        // 8 and 2 blocks, with 512 experts.
+        for (hidden, inter, experts) in [(2048, 512, 256), (1024, 512, 512), (4096, 1024, 32)] {
+            let (differ, total, worst) = expert_bits(hidden, inter, experts, 24);
+            eprintln!(
+                "EXPERT-BITS {hidden}x{inter}x{experts}: {differ}/{total} differ, worst relative gap {worst:.2e}"
+            );
+            assert_eq!(
+                differ, 0,
+                "{hidden}x{inter}x{experts}: {differ} of {total} block elements differ from the composed ops (worst relative gap {worst:.2e})"
+            );
+        }
     }
 
     #[test]
     fn a_router_over_a_few_experts_stays_on_the_composed_ops() {
-        let layer = Layer::build(128, 64, 16).expect("layer");
+        let layer = Layer::build(512, 512, 16).expect("layer");
         let w = layer.view(true, true);
         let x = layer.activation(3).expect("x");
         let dims = plan(&x, &w.switch_glu, &w.shared_expert, w.top_k).expect("experts supported");

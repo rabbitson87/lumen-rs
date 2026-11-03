@@ -918,8 +918,13 @@ mod imp {
             && w.offload.is_none()
             && !timing_on
             && !crate::decode_probe::sync_on()
-            && let Some(dims) =
-                crate::native_moe_decode::plan(x, &w.switch_glu, &w.shared_expert, w.top_k)
+            && let Some(dims) = crate::native_moe_decode::plan(
+                x,
+                &w.switch_glu,
+                &w.shared_expert,
+                w.top_k,
+                w.experts_in_scale_dtype,
+            )
         {
             if crate::native_moe_decode::router_supported(w, dims) {
                 return crate::native_moe_decode::run_routed(x, w, dims);
