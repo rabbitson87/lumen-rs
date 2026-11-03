@@ -530,7 +530,7 @@ Run a single-token decode step's routed and shared experts in two Metal kernels
 Route a single-token step with two kernels (the expert and shared-gate logits; then softmax,
  top-8, renormalisation and the shared sigmoid) instead of the twelve MLX ops, when
  `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts in kernels and the router is an 8-bit
- group-64 gate over a multiple of 256 experts.
+ group-64 gate over a multiple of 32 experts.
 
  Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
  accumulate in a different order, so two experts whose probabilities differ by float noise

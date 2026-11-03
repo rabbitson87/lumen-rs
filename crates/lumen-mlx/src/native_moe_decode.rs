@@ -17,7 +17,7 @@
 //!
 //! The router has two kernels of its own ([`ROUTER_LOGITS_SOURCE`], [`ROUTER_SELECT_SOURCE`]): the
 //! 256 expert logits and the shared expert's gate logit, then softmax, top-8, renormalisation and
-//! the shared sigmoid in one threadgroup. They replace the gate matmul, softmax, argpartition,
+//! the shared sigmoid in one simdgroup. They replace the gate matmul, softmax, argpartition,
 //! take-along, sum, divide, the shared gate matmul and its sigmoid (twelve dispatches).
 //!
 //! One rounding is easy to miss and decides whether the result matches. MLX's quantized matvec
@@ -44,7 +44,7 @@ lumen_flags::flag! {
     /// Route a single-token step with two kernels (the expert and shared-gate logits; then softmax,
     /// top-8, renormalisation and the shared sigmoid) instead of the twelve MLX ops, when
     /// `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts in kernels and the router is an 8-bit
-    /// group-64 gate over a multiple of 256 experts.
+    /// group-64 gate over a multiple of 32 experts.
     ///
     /// Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
     /// accumulate in a different order, so two experts whose probabilities differ by float noise
@@ -64,8 +64,14 @@ lumen_flags::flag! {
 
 /// Routed experts per token. The kernels are written for Qwen's top-8 routing.
 const TOP_K: i32 = 8;
-/// Output rows per threadgroup (the simdgroup count of a threadgroup).
+/// Simdgroups per threadgroup of the expert kernels.
 const ROWS_PER_GROUP: i32 = 4;
+/// Rows one simdgroup of each expert kernel owns, so the activation it loads is used for all of
+/// them (MLX's own quantized matvec does four). More rows means fewer simdgroups to hide memory
+/// latency with, so the best count is each kernel's own, found on the benchmark
+/// (`moe_routed_probe`).
+const ROWS_GATE_UP: i32 = 2;
+const ROWS_DOWN: i32 = 1;
 
 const GATE_UP_SOURCE: &str = r#"
     #define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
@@ -73,61 +79,74 @@ const GATE_UP_SOURCE: &str = r#"
     // + x[i + 2] + x[i + 3]`), so bf16 activations round after every add; f32 ones do not.
     #define QSUM(a, b, c, d) (routed ? RB(RB(RB((a) + (b)) + (c)) + (d)) : (((a) + (b)) + (c)) + (d))
     const int lane = thread_index_in_simdgroup;
-    const int row = thread_position_in_grid.y;
+    const int rg = thread_position_in_grid.y;
     const int slot = thread_position_in_grid.z;
     constexpr int G = H / 64;
     constexpr int WPR = H / 8;
     const bool routed = slot < K;
     const uint e = routed ? inds[slot] : 0u;
-    const size_t rg = (size_t)e * (2 * I) + row;
-    const size_t ru = rg + I;
 
-    auto wg = routed ? (w + rg * WPR) : (gw + (size_t)row * WPR);
-    auto wu = routed ? (w + ru * WPR) : (uw + (size_t)row * WPR);
-    auto sg = routed ? (sc + rg * G) : (gs + (size_t)row * G);
-    auto su = routed ? (sc + ru * G) : (us + (size_t)row * G);
-    auto bg = routed ? (bi + rg * G) : (gb + (size_t)row * G);
-    auto bu = routed ? (bi + ru * G) : (ub + (size_t)row * G);
-
-    float g_part = 0.0f;
-    float u_part = 0.0f;
+    float g_part[R];
+    float u_part[R];
+    for (int r = 0; r < R; ++r) {
+        g_part[r] = 0.0f;
+        u_part[r] = 0.0f;
+    }
     for (int grp = lane; grp < G; grp += 32) {
-        float ag = 0.0f;
-        float au = 0.0f;
+        // The group's activation, once for the R rows this simdgroup owns.
+        float xq[64];
         float xs = 0.0f;
         for (int j = 0; j < 8; ++j) {
-            const uint32_t pg = wg[grp * 8 + j];
-            const uint32_t pu = wu[grp * 8 + j];
-            float xq[8];
             for (int i = 0; i < 8; ++i) {
                 const float raw = x[grp * 64 + j * 8 + i];
-                xq[i] = routed ? RB(raw) : raw;
-                ag += xq[i] * static_cast<float>((pg >> (4 * i)) & 0xFu);
-                au += xq[i] * static_cast<float>((pu >> (4 * i)) & 0xFu);
+                xq[j * 8 + i] = routed ? RB(raw) : raw;
             }
-            xs += QSUM(xq[0], xq[1], xq[2], xq[3]);
-            xs += QSUM(xq[4], xq[5], xq[6], xq[7]);
+            xs += QSUM(xq[j * 8], xq[j * 8 + 1], xq[j * 8 + 2], xq[j * 8 + 3]);
+            xs += QSUM(xq[j * 8 + 4], xq[j * 8 + 5], xq[j * 8 + 6], xq[j * 8 + 7]);
         }
-        g_part += static_cast<float>(sg[grp]) * ag + static_cast<float>(bg[grp]) * xs;
-        u_part += static_cast<float>(su[grp]) * au + static_cast<float>(bu[grp]) * xs;
+        for (int r = 0; r < R; ++r) {
+            const int row = rg * R + r;
+            const size_t rgate = (size_t)e * (2 * I) + row;
+            const size_t rup = rgate + I;
+            auto wg = routed ? (w + rgate * WPR) : (gw + (size_t)row * WPR);
+            auto wu = routed ? (w + rup * WPR) : (uw + (size_t)row * WPR);
+            auto sg = routed ? (sc + rgate * G) : (gs + (size_t)row * G);
+            auto su = routed ? (sc + rup * G) : (us + (size_t)row * G);
+            auto bg = routed ? (bi + rgate * G) : (gb + (size_t)row * G);
+            auto bu = routed ? (bi + rup * G) : (ub + (size_t)row * G);
+            float ag = 0.0f;
+            float au = 0.0f;
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t pg = wg[grp * 8 + j];
+                const uint32_t pu = wu[grp * 8 + j];
+                for (int i = 0; i < 8; ++i) {
+                    ag += xq[j * 8 + i] * static_cast<float>((pg >> (4 * i)) & 0xFu);
+                    au += xq[j * 8 + i] * static_cast<float>((pu >> (4 * i)) & 0xFu);
+                }
+            }
+            g_part[r] += static_cast<float>(sg[grp]) * ag + static_cast<float>(bg[grp]) * xs;
+            u_part[r] += static_cast<float>(su[grp]) * au + static_cast<float>(bu[grp]) * xs;
+        }
     }
-    const float g = simd_sum(g_part);
-    const float u = simd_sum(u_part);
-    if (lane == 0) {
-        float a;
-        if (routed) {
-            const float gr = RB(g);
-            const float ur = RB(u);
-            // MLX's sigmoid, op by op: y = 1 / (1 + exp(|x|)); x < 0 ? y : 1 - y.
-            const float e = RB(metal::exp(metal::abs(gr)));
-            const float d = RB(1.0f + e);
-            const float y = RB(1.0f / d);
-            const float sig = gr < 0.0f ? y : RB(1.0f - y);
-            a = RB(RB(gr * sig) * ur);
-        } else {
-            a = (g / (1.0f + metal::exp(-g))) * u;
+    for (int r = 0; r < R; ++r) {
+        const float g = simd_sum(g_part[r]);
+        const float u = simd_sum(u_part[r]);
+        if (lane == 0) {
+            float a;
+            if (routed) {
+                const float gr = RB(g);
+                const float ur = RB(u);
+                // MLX's sigmoid, op by op: y = 1 / (1 + exp(|x|)); x < 0 ? y : 1 - y.
+                const float ex = RB(metal::exp(metal::abs(gr)));
+                const float d = RB(1.0f + ex);
+                const float y = RB(1.0f / d);
+                const float sig = gr < 0.0f ? y : RB(1.0f - y);
+                a = RB(RB(gr * sig) * ur);
+            } else {
+                a = (g / (1.0f + metal::exp(-g))) * u;
+            }
+            act[slot * I + rg * R + r] = a;
         }
-        act[slot * I + row] = a;
     }
 "#;
 
@@ -135,43 +154,58 @@ const DOWN_COMBINE_SOURCE: &str = r#"
     #define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
     #define QSUM(a, b, c, d) (routed ? RB(RB(RB((a) + (b)) + (c)) + (d)) : (((a) + (b)) + (c)) + (d))
     const int lane = thread_index_in_simdgroup;
-    const int row = thread_position_in_grid.y;
+    const int rg = thread_position_in_grid.y;
     constexpr int G = I / 64;
     constexpr int WPR = I / 8;
     constexpr int CHUNKS = I / 16;
 
-    float total = 0.0f;
+    float total[R];
+    for (int r = 0; r < R; ++r) {
+        total[r] = 0.0f;
+    }
     for (int s = 0; s <= K; ++s) {
         const bool routed = s < K;
         const uint e = routed ? inds[s] : 0u;
-        const size_t r = (size_t)e * H + row;
-        auto wp = routed ? (w + r * WPR) : (dw + (size_t)row * WPR);
-        auto sp = routed ? (sc + r * G) : (ds + (size_t)row * G);
-        auto bp = routed ? (bi + r * G) : (db + (size_t)row * G);
-        float part = 0.0f;
+        float part[R];
+        for (int r = 0; r < R; ++r) {
+            part[r] = 0.0f;
+        }
         for (int c = lane; c < CHUNKS; c += 32) {
-            const uint32_t p0 = wp[c * 2];
-            const uint32_t p1 = wp[c * 2 + 1];
-            float acc = 0.0f;
-            float xs = 0.0f;
+            // This lane's 16 activations, once for the R rows.
             float av[16];
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < 16; ++i) {
                 av[i] = act[s * I + c * 16 + i];
-                av[8 + i] = act[s * I + c * 16 + 8 + i];
-                acc += av[i] * static_cast<float>((p0 >> (4 * i)) & 0xFu);
-                acc += av[8 + i] * static_cast<float>((p1 >> (4 * i)) & 0xFu);
             }
+            float xs = 0.0f;
             xs += QSUM(av[0], av[1], av[2], av[3]);
             xs += QSUM(av[4], av[5], av[6], av[7]);
             xs += QSUM(av[8], av[9], av[10], av[11]);
             xs += QSUM(av[12], av[13], av[14], av[15]);
-            part += static_cast<float>(sp[c / 4]) * acc + static_cast<float>(bp[c / 4]) * xs;
+            for (int r = 0; r < R; ++r) {
+                const int row = rg * R + r;
+                const size_t rr = (size_t)e * H + row;
+                auto wp = routed ? (w + rr * WPR) : (dw + (size_t)row * WPR);
+                auto sp = routed ? (sc + rr * G) : (ds + (size_t)row * G);
+                auto bp = routed ? (bi + rr * G) : (db + (size_t)row * G);
+                const uint32_t p0 = wp[c * 2];
+                const uint32_t p1 = wp[c * 2 + 1];
+                float acc = 0.0f;
+                for (int i = 0; i < 8; ++i) {
+                    acc += av[i] * static_cast<float>((p0 >> (4 * i)) & 0xFu);
+                    acc += av[8 + i] * static_cast<float>((p1 >> (4 * i)) & 0xFu);
+                }
+                part[r] += static_cast<float>(sp[c / 4]) * acc + static_cast<float>(bp[c / 4]) * xs;
+            }
         }
-        const float y = simd_sum(part);
-        total += routed ? scores[s] * RB(y) : sscore[0] * y;
+        for (int r = 0; r < R; ++r) {
+            const float y = simd_sum(part[r]);
+            total[r] += routed ? scores[s] * RB(y) : sscore[0] * y;
+        }
     }
     if (lane == 0) {
-        out[row] = total;
+        for (int r = 0; r < R; ++r) {
+            out[rg * R + r] = total[r];
+        }
     }
 "#;
 
@@ -207,51 +241,28 @@ const ROUTER_LOGITS_SOURCE: &str = r#"
     }
 "#;
 
-/// One threadgroup of 256 threads: softmax over the `E` expert logits (`1 / sum` multiplied in, as
-/// MLX does), the eight largest probabilities by repeated argmax (the lowest index wins a tie),
-/// their renormalisation, and the shared expert's sigmoid gate.
+/// One simdgroup (E / 32 logits a lane, so no barrier anywhere): softmax over the `E` expert
+/// logits (`1 / sum` multiplied in, as MLX does), the eight largest probabilities by repeated
+/// argmax (the lowest index wins a tie), their renormalisation, and the shared expert's sigmoid
+/// gate.
 const ROUTER_SELECT_SOURCE: &str = r#"
-    constexpr int T = 256;
-    constexpr int PER = E / T;
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint simd = simdgroup_index_in_threadgroup;
+    constexpr int PER = E / 32;
     const uint lane = thread_index_in_simdgroup;
-    threadgroup float sh_f[8];
-    threadgroup uint sh_i[8];
 
     float p[PER];
     float m = -INFINITY;
     for (int k = 0; k < PER; ++k) {
-        p[k] = logits[tid + k * T];
+        p[k] = logits[lane + k * 32];
         m = metal::max(m, p[k]);
     }
     m = simd_max(m);
-    if (lane == 0) {
-        sh_f[simd] = m;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float gm = sh_f[0];
-    for (int s = 1; s < 8; ++s) {
-        gm = metal::max(gm, sh_f[s]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     float sum = 0.0f;
     for (int k = 0; k < PER; ++k) {
-        p[k] = metal::exp(p[k] - gm);
+        p[k] = metal::exp(p[k] - m);
         sum += p[k];
     }
     sum = simd_sum(sum);
-    if (lane == 0) {
-        sh_f[simd] = sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    for (int s = 0; s < 8; ++s) {
-        total += sh_f[s];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = 1.0f / total;
+    const float inv = 1.0f / sum;
     for (int k = 0; k < PER; ++k) {
         p[k] = p[k] * inv;
     }
@@ -264,27 +275,13 @@ const ROUTER_SELECT_SOURCE: &str = r#"
         for (int k = 0; k < PER; ++k) {
             if (p[k] > bv) {
                 bv = p[k];
-                bi = tid + k * T;
+                bi = lane + k * 32;
             }
         }
-        const float sm = simd_max(bv);
-        const uint si = simd_min(bv == sm ? bi : 0xFFFFFFFFu);
-        if (lane == 0) {
-            sh_f[simd] = sm;
-            sh_i[simd] = si;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float gv = sh_f[0];
-        uint gi = sh_i[0];
-        for (int s = 1; s < 8; ++s) {
-            if (sh_f[s] > gv || (sh_f[s] == gv && sh_i[s] < gi)) {
-                gv = sh_f[s];
-                gi = sh_i[s];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float gv = simd_max(bv);
+        const uint gi = simd_min(bv == gv ? bi : 0xFFFFFFFFu);
         for (int k = 0; k < PER; ++k) {
-            if (tid + k * T == gi) {
+            if (lane + k * 32 == gi) {
                 p[k] = -INFINITY;
             }
         }
@@ -292,7 +289,7 @@ const ROUTER_SELECT_SOURCE: &str = r#"
         sel_i[r] = gi;
     }
 
-    if (tid == 0) {
+    if (lane == 0) {
         float denom = 0.0f;
         for (int r = 0; r < 8; ++r) {
             denom += sel_p[r];
@@ -407,7 +404,7 @@ pub(crate) fn plan(
     }
     let experts = *gate_up.weight.shape().first()?;
     let inter = *gate_up.weight.shape().get(1)? / 2;
-    if hidden % 64 != 0 || inter % 16 != 0 || hidden % ROWS_PER_GROUP != 0 {
+    if hidden % 64 != 0 || inter % 16 != 0 || inter % ROWS_GATE_UP != 0 || hidden % ROWS_DOWN != 0 {
         return None;
     }
     let shape_is = |a: &Array, want: &[i32]| a.shape() == want;
@@ -456,7 +453,7 @@ fn need<'a>(b: Option<&'a Array>, what: &str) -> Result<&'a Array> {
 
 /// Gate, up and SwiGLU of the eight routed experts and the shared expert: `[9 * inter]` f32, the
 /// shared expert's row last. `x` is `[hidden]` f32, `inds` `[8]` u32.
-fn gate_up_swiglu(
+pub(crate) fn gate_up_swiglu(
     x: &Array,
     inds: &Array,
     glu: &SwitchGluWeights<'_>,
@@ -475,7 +472,8 @@ fn gate_up_swiglu(
         config.add_template_arg_int("H", hidden)?;
         config.add_template_arg_int("I", inter)?;
         config.add_template_arg_int("K", TOP_K)?;
-        config.set_grid(32, inter, slots)?;
+        config.add_template_arg_int("R", ROWS_GATE_UP)?;
+        config.set_grid(32, inter / ROWS_GATE_UP, slots)?;
         config.set_thread_group(32, ROWS_PER_GROUP, 1)?;
         config.add_output_arg(&[slots * inter], Dtype::Float32)?;
         Ok(k.gate_up
@@ -502,7 +500,7 @@ fn gate_up_swiglu(
 }
 
 /// Down projections of the nine slots, weighted and summed: `[hidden]` f32.
-fn down_combine(
+pub(crate) fn down_combine(
     act: &Array,
     inds: &Array,
     scores: &Array,
@@ -517,7 +515,8 @@ fn down_combine(
         config.add_template_arg_int("H", hidden)?;
         config.add_template_arg_int("I", inter)?;
         config.add_template_arg_int("K", TOP_K)?;
-        config.set_grid(32, hidden, 1)?;
+        config.add_template_arg_int("R", ROWS_DOWN)?;
+        config.set_grid(32, hidden / ROWS_DOWN, 1)?;
         config.set_thread_group(32, ROWS_PER_GROUP, 1)?;
         config.add_output_arg(&[hidden], Dtype::Float32)?;
         Ok(k.down
@@ -557,7 +556,7 @@ fn router_gates<'a>(w: &'a MoeBlockWeights<'a>, dims: Dims) -> Option<RouterGate
     let rows = |a: &Array, n: i32, cols: i32| a.shape() == [n, cols];
     let ok = w.norm_topk_prob
         && w.top_k == TOP_K
-        && experts % 256 == 0
+        && experts % 32 == 0
         && (gate.bits, gate.group_size, shared.bits, shared.group_size) == (8, 64, 8, 64)
         && rows(gate.weight, experts, dims.hidden / 4)
         && rows(gate.scales, experts, dims.hidden / 64)
@@ -595,6 +594,12 @@ pub(crate) fn route(
     w: &MoeBlockWeights<'_>,
     dims: Dims,
 ) -> Result<(Array, Array, Array)> {
+    let logits = route_logits(x, w, dims)?;
+    route_select(&logits, w, dims)
+}
+
+/// The router's first kernel: the `[experts + 1]` f32 logits, the shared expert's gate last.
+pub(crate) fn route_logits(x: &Array, w: &MoeBlockWeights<'_>, dims: Dims) -> Result<Array> {
     let gates = router_gates(w, dims).ok_or_else(|| anyhow!("moe decode: router not supported"))?;
     let x = mlx_rs::ops::reshape(&x.as_dtype(Dtype::Float32)?, &[dims.hidden])?;
     with_kernels(|k| {
@@ -621,17 +626,29 @@ pub(crate) fn route(
             )
             .context("moe decode: router logits kernel failed")?
             .swap_remove(0);
+        Ok(logits)
+    })
+}
 
+/// The router's second kernel: softmax, top-8, renormalisation and the shared sigmoid over the
+/// logits of [`route_logits`].
+pub(crate) fn route_select(
+    logits: &Array,
+    w: &MoeBlockWeights<'_>,
+    dims: Dims,
+) -> Result<(Array, Array, Array)> {
+    let gates = router_gates(w, dims).ok_or_else(|| anyhow!("moe decode: router not supported"))?;
+    with_kernels(|k| {
         let select_config = MetalKernelConfig::new();
         select_config.add_template_arg_int("E", gates.experts)?;
-        select_config.set_grid(256, 1, 1)?;
-        select_config.set_thread_group(256, 1, 1)?;
+        select_config.set_grid(32, 1, 1)?;
+        select_config.set_thread_group(32, 1, 1)?;
         select_config.add_output_arg(&[TOP_K], Dtype::Uint32)?;
         select_config.add_output_arg(&[TOP_K], Dtype::Float32)?;
         select_config.add_output_arg(&[1], Dtype::Float32)?;
         let mut out = k
             .router_select
-            .apply(&[&logits], &select_config, 3)
+            .apply(&[logits], &select_config, 3)
             .context("moe decode: router select kernel failed")?;
         let shared_score = out
             .pop()
@@ -881,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn router_kernels_match_the_composed_router_with_two_experts_per_thread() {
+    fn router_kernels_match_the_composed_router_with_512_experts() {
         router_matches_the_composed_router(1024, 256, 512, 60);
     }
 
@@ -898,7 +915,7 @@ mod tests {
         let dims = plan(&x, &w.switch_glu, &w.shared_expert, w.top_k).expect("experts supported");
         assert!(
             !router_supported(&w, dims),
-            "16 experts is not a multiple of 256"
+            "a 16-expert router is not a multiple of 32"
         );
     }
 }

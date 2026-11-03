@@ -21,6 +21,7 @@ use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, moe_block_forward, moe_router,
 };
+use crate::native_moe_decode::{route, route_logits};
 use crate::native_norm::rms_norm;
 use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
@@ -275,5 +276,123 @@ fn decode_kernels_against_composed_block() {
     println!(
         "\ndecode kernels vs composed: {:+.2} ms/token over {LAYERS_PER_TOKEN} layers (positive = kernels faster)",
         (timings[0].wall_us - timings[2].wall_us) * LAYERS_PER_TOKEN / 1e3
+    );
+
+    // The pieces of the kernel block, each against a consumer-only control so the one or two glue
+    // ops that keep the output alive cancel.
+    let w = layer.view(true, true);
+    let dims = crate::native_moe_decode::plan(&x0, &w.switch_glu, &w.shared_expert, w.top_k)
+        .expect("the kernels take this layer");
+    let constant = Array::from_slice(&vec![0.001f32; 257], &[257]);
+    constant.eval().expect("eval");
+    let consume =
+        |x: &Array, a: &Array| -> Result<Array> { Ok(mlx_rs::ops::multiply(x, &a.sum(None)?)?) };
+    let control = |x: &Array| consume(x, &constant);
+    let logits_only = |x: &Array| {
+        let l = route_logits(x, &w, dims)?;
+        consume(x, &l)
+    };
+    let router = |x: &Array| {
+        let (_, scores, shared) = route(x, &w, dims)?;
+        let both = mlx_rs::ops::add(&scores.sum(None)?, &shared.sum(None)?)?;
+        Ok(mlx_rs::ops::multiply(x, &both)?)
+    };
+    // The expert kernels alone, over sixteen fixed routings (eight distinct experts each).
+    let routings: Vec<(Array, Array, Array)> = (0..16u32)
+        .map(|r| {
+            let mut ids: Vec<u32> = (0..256u32).collect();
+            let mut state = 0x9E37_79B9u32.wrapping_mul(r + 1);
+            for i in (1..ids.len()).rev() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ids.swap(i, (state >> 8) as usize % (i + 1));
+            }
+            ids.truncate(TOP_K as usize);
+            (
+                Array::from_slice(&ids, &[TOP_K]),
+                Array::from_slice(&[1.0f32 / TOP_K as f32; 8], &[TOP_K]),
+                Array::from_slice(&[0.5f32], &[1]),
+            )
+        })
+        .collect();
+    let next = std::cell::Cell::new(0usize);
+    let experts = |x: &Array| {
+        let (inds, scores, shared) = &routings[next.get() % routings.len()];
+        next.set(next.get() + 1);
+        crate::native_moe_decode::run(
+            x,
+            inds,
+            scores,
+            shared,
+            &w.switch_glu,
+            &w.shared_expert,
+            dims,
+        )
+    };
+    // Each expert kernel alone: the first over the activation, the second over a fixed
+    // activation (so the two can be told apart without a dependency between them).
+    let x32 = mlx_rs::ops::reshape(&x0, &[2048]).expect("reshape");
+    let act_fixed = {
+        let a = random::normal::<f32>(&[(TOP_K + 1) * 512], None, None, None).expect("act");
+        a.eval().expect("eval");
+        a
+    };
+    let up_only = |x: &Array| {
+        let x32 = mlx_rs::ops::reshape(x, &[2048])?;
+        let (inds, _, _) = &routings[next.get() % routings.len()];
+        next.set(next.get() + 1);
+        let act = crate::native_moe_decode::gate_up_swiglu(
+            &x32,
+            inds,
+            &w.switch_glu,
+            &w.shared_expert,
+            dims,
+        )?;
+        consume(x, &act)
+    };
+    let down_only = |x: &Array| {
+        let (inds, scores, shared) = &routings[next.get() % routings.len()];
+        next.set(next.get() + 1);
+        let out = crate::native_moe_decode::down_combine(
+            &act_fixed,
+            inds,
+            scores,
+            shared,
+            &w.switch_glu,
+            &w.shared_expert,
+            dims,
+        )?;
+        let n = mlx_rs::ops::multiply(x, &out.sum(None)?)?;
+        Ok(n)
+    };
+    let _ = &x32;
+    let t_up = time_chain(&up_only, &x0, &norm_w).expect("gate/up timing");
+    let t_down = time_chain(&down_only, &x0, &norm_w).expect("down timing");
+    let t_control = time_chain(&control, &x0, &norm_w).expect("control timing");
+    let t_logits = time_chain(&logits_only, &x0, &norm_w).expect("logits timing");
+    let t_router = time_chain(&router, &x0, &norm_w).expect("router timing");
+    let t_experts = time_chain(&experts, &x0, &norm_w).expect("experts timing");
+    println!();
+    report("consumer-only control", &t_control);
+    report("router logits kernel (- control)", &t_logits);
+    report("router, both kernels (- control)", &t_router);
+    report("expert kernels, fixed routing", &t_experts);
+    report("  gate/up/swiglu kernel (- control)", &t_up);
+    report("  down/combine kernel (- control)", &t_down);
+    let us = |a: &Timing| a.wall_us - t_control.wall_us;
+    println!(
+        "\nexpert kernels alone (us): gate/up/swiglu {:.1} (floor {:.1}) | down/combine {:.1} (floor {:.1})",
+        us(&t_up),
+        10.6e6 / (bw.best_gbps * 1e9) * 1e6,
+        us(&t_down),
+        5.3e6 / (bw.best_gbps * 1e9) * 1e6,
+    );
+    println!(
+        "\nper block (us): router logits {:.1} | router select {:.1} | router total {:.1} | expert kernels {:.1} (floor {:.1}) | block {:.1}",
+        us(&t_logits),
+        us(&t_router) - us(&t_logits),
+        us(&t_router),
+        t_experts.wall_us - norm_t.wall_us,
+        bytes / (bw.best_gbps * 1e9) * 1e6,
+        timings[2].wall_us - norm_t.wall_us,
     );
 }
