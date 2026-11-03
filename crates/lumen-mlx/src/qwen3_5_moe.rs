@@ -241,31 +241,28 @@ mod imp {
         /// Run a single-token decode step's routed and shared experts in two Metal kernels
         /// (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
         /// gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
-        /// layers with a top-8 router; prefill, SSD expert offload and other layouts keep the
+        /// layers with a top-8 router whose hidden and intermediate sizes are multiples of 512,
+        /// behind an f32 activation and bf16 expert scales; prefill, SSD expert offload and other
+        /// layouts keep the composed ops.
+        ///
+        /// Bit-identical to the composed ops: the kernels run MLX's own quantized matvec arithmetic
+        /// (its lane partition, `load_vector`'s division and bf16 quad sum, `qdot`'s expression),
+        /// round to bf16 where the composed block does, and add the eight routed outputs in the
+        /// composed reduction's order. An `Optimization` flag. Default on; `=0` restores the
         /// composed ops.
         ///
-        /// The kernels round where the composed block rounds (including MLX's bf16 sum of the
-        /// activation in `load_vector`), but a dot product accumulates in a different order, so
-        /// the result is the composed block's up to float noise and not bit-identical: a
-        /// `Behavior` flag. Default on; `=0` restores the composed ops.
+        /// SSD expert offload serves the experts through the composed ops. Because the kernels
+        /// equal them in every bit, an offloaded run equals the resident run on an affine
+        /// checkpoint too: the weights-gated offload tests pass with the kernels on.
         ///
-        /// SSD expert offload serves the experts through the composed ops, so for an affine
-        /// checkpoint the offloaded output is the composed ops' (`=0`) bit for bit and this flag's
-        /// resident output to float noise, not bit for bit as the offload promises elsewhere. The
-        /// mxfp4 checkpoints do not take the kernels and keep that promise.
-        ///
-        /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
-        /// 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
-        /// bytes identical, the rest the last token or two. Teacher-forced, one token per forward
-        /// (`kv_bf16_quality --fused-moe-decode`, 6 prompts, 4,050 positions): top-1 agreement with
-        /// the composed ops 98.62%, every disagreement at a small logit gap. The same harness
-        /// comparing the composed model's 384-token windows with its 1-token windows (two valid
-        /// kernel paths, `--window-control`) agrees 98.62% too, so this is the noise between
-        /// kernel paths, not a loss on top of it.
+        /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.2 ms/token composed
+        /// against 9.5 with the kernels (and the router kernels), the generated text identical
+        /// byte for byte. Before the kernels were bit-identical they ran at 11.1 ms against 12.0
+        /// with 814 of 819 bytes the same.
         pub(crate) fused_moe_decode {
             env: "LUMEN_NATIVE_FUSED_MOE_DECODE",
             default: true,
-            kind: Behavior,
+            kind: Optimization,
         }
     }
 
@@ -5747,12 +5744,12 @@ mod config_tests {
 /// Serving the routed experts from an SSD-backed slot pool must not change a
 /// single bit of the model's output (task 023).
 ///
-/// These tests are written for the A3B mxfp4 checkpoint. An affine 4-bit group-64 checkpoint's
-/// resident decode steps run the MoE decode kernels (`LUMEN_NATIVE_FUSED_MOE_DECODE`), which the
-/// offload path cannot (it gathers from the bank's per-role pools, not from stacked tensors), so
-/// there the offloaded output equals the resident output of the composed ops
-/// (`LUMEN_NATIVE_FUSED_MOE_DECODE=0`) bit for bit, and the kernels' to float noise. Run on the
-/// affine checkpoint they fail at the first decode step unless that flag is 0.
+/// These tests are written for the A3B mxfp4 checkpoint, and hold on the A3B affine one as well.
+/// An affine 4-bit group-64 checkpoint's resident decode steps run the MoE decode kernels
+/// (`LUMEN_NATIVE_FUSED_MOE_DECODE`), which the offload path cannot (it gathers from the bank's
+/// per-role pools, not from stacked tensors); the kernels equal the composed ops in every bit, so
+/// the offloaded output still equals the resident one. Run them on the affine checkpoint with
+/// `LUMEN_QWEN35_MODEL_DIR` pointing at it.
 #[cfg(all(test, feature = "mlx-native"))]
 mod offload_tests {
     use super::imp::NativeQwen3_5MoeModel;

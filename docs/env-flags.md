@@ -42,8 +42,8 @@ value → on.
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
-| `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
-| `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Behavior | `lumen_mlx::native_moe_decode::fused_router` |
+| `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
+| `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Optimization | `lumen_mlx::native_moe_decode::fused_router` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
 | `LUMEN_NATIVE_FUSE_LINATTN_IN` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
 | `LUMEN_NATIVE_FUSE_MOE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_moe_gate_up` |
@@ -496,53 +496,49 @@ Conv-state advance via `slice` (view/copy) instead of `take_axis`
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 
-*Behavior, default on.*
+*Optimization, default on.*
 
 Run a single-token decode step's routed and shared experts in two Metal kernels
  (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
  gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
- layers with a top-8 router; prefill, SSD expert offload and other layouts keep the
+ layers with a top-8 router whose hidden and intermediate sizes are multiples of 512,
+ behind an f32 activation and bf16 expert scales; prefill, SSD expert offload and other
+ layouts keep the composed ops.
+
+ Bit-identical to the composed ops: the kernels run MLX's own quantized matvec arithmetic
+ (its lane partition, `load_vector`'s division and bf16 quad sum, `qdot`'s expression),
+ round to bf16 where the composed block does, and add the eight routed outputs in the
+ composed reduction's order. An `Optimization` flag. Default on; `=0` restores the
  composed ops.
 
- The kernels round where the composed block rounds (including MLX's bf16 sum of the
- activation in `load_vector`), but a dot product accumulates in a different order, so
- the result is the composed block's up to float noise and not bit-identical: a
- `Behavior` flag. Default on; `=0` restores the composed ops.
+ SSD expert offload serves the experts through the composed ops. Because the kernels
+ equal them in every bit, an offloaded run equals the resident run on an affine
+ checkpoint too: the weights-gated offload tests pass with the kernels on.
 
- SSD expert offload serves the experts through the composed ops, so for an affine
- checkpoint the offloaded output is the composed ops' (`=0`) bit for bit and this flag's
- resident output to float noise, not bit for bit as the offload promises elsewhere. The
- mxfp4 checkpoints do not take the kernels and keep that promise.
-
- Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
- 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
- bytes identical, the rest the last token or two. Teacher-forced, one token per forward
- (`kv_bf16_quality --fused-moe-decode`, 6 prompts, 4,050 positions): top-1 agreement with
- the composed ops 98.62%, every disagreement at a small logit gap. The same harness
- comparing the composed model's 384-token windows with its 1-token windows (two valid
- kernel paths, `--window-control`) agrees 98.62% too, so this is the noise between
- kernel paths, not a loss on top of it.
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.2 ms/token composed
+ against 9.5 with the kernels (and the router kernels), the generated text identical
+ byte for byte. Before the kernels were bit-identical they ran at 11.1 ms against 12.0
+ with 814 of 819 bytes the same.
 
 ### `LUMEN_NATIVE_FUSED_MOE_ROUTER`
 
-*Behavior, default on.*
+*Optimization, default on.*
 
 Route a single-token step with a logits kernel (the expert and shared-gate logits) and the
  select (softmax, top-8, renormalisation, the shared sigmoid) inside the experts' gate/up
  kernel, instead of the twelve MLX ops, when `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts
- in kernels and the router is an 8-bit group-64 gate over a multiple of 32 experts and at
- least 512 hidden units.
+ in kernels and the router is an 8-bit group-64 gate over a multiple of 128 experts.
 
- Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
- accumulate in a different order, so two experts whose probabilities differ by float noise
- can swap places. A `Behavior` flag. Default on; `=0` keeps the composed router.
+ Bit-identical to the composed router: the logits run MLX's matvec arithmetic, the softmax
+ adds as MLX's kernel does, and the eight experts come in the order the composed sort leaves
+ them (ascending probability, equal ones by index), so the routing, the scores and the
+ block's output equal the composed ones in every bit. An `Optimization` flag. Default on;
+ `=0` keeps the composed router.
 
- Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over six server runs: 11.9 ms
- composed, 11.1 ms with the expert kernels only, 10.5 ms with the router kernels too (-0.6
- ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops); folding the
- select into the gate/up kernel took another 0.1 ms. Teacher-forced
- top-1 agreement with the composed ops over 4,050 positions: 98.79%, against 98.62% between
- the composed model's prefill and decode kernels.
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.9 ms composed, 11.1 ms
+ with the expert kernels only, 10.5 ms with the router kernels too (-0.6 ms; the router alone
+ is 31 us a layer, 1.24 ms a token, in the composed ops); folding the select into the
+ gate/up kernel took another 0.1 ms.
 
 ### `LUMEN_NATIVE_FUSE_GATE_UP`
 

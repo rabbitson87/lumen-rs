@@ -49,23 +49,22 @@ lumen_flags::flag! {
     /// Route a single-token step with a logits kernel (the expert and shared-gate logits) and the
     /// select (softmax, top-8, renormalisation, the shared sigmoid) inside the experts' gate/up
     /// kernel, instead of the twelve MLX ops, when `LUMEN_NATIVE_FUSED_MOE_DECODE` runs the experts
-    /// in kernels and the router is an 8-bit group-64 gate over a multiple of 32 experts and at
-    /// least 512 hidden units.
+    /// in kernels and the router is an 8-bit group-64 gate over a multiple of 128 experts.
     ///
-    /// Softmax and the top-8 are computed in f32 as the composed ops do; the logits' dot products
-    /// accumulate in a different order, so two experts whose probabilities differ by float noise
-    /// can swap places. A `Behavior` flag. Default on; `=0` keeps the composed router.
+    /// Bit-identical to the composed router: the logits run MLX's matvec arithmetic, the softmax
+    /// adds as MLX's kernel does, and the eight experts come in the order the composed sort leaves
+    /// them (ascending probability, equal ones by index), so the routing, the scores and the
+    /// block's output equal the composed ones in every bit. An `Optimization` flag. Default on;
+    /// `=0` keeps the composed router.
     ///
-    /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over six server runs: 11.9 ms
-    /// composed, 11.1 ms with the expert kernels only, 10.5 ms with the router kernels too (-0.6
-    /// ms; the router alone is 31 us a layer, 1.24 ms a token, in the composed ops); folding the
-    /// select into the gate/up kernel took another 0.1 ms. Teacher-forced
-    /// top-1 agreement with the composed ops over 4,050 positions: 98.79%, against 98.62% between
-    /// the composed model's prefill and decode kernels.
+    /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA: 11.9 ms composed, 11.1 ms
+    /// with the expert kernels only, 10.5 ms with the router kernels too (-0.6 ms; the router alone
+    /// is 31 us a layer, 1.24 ms a token, in the composed ops); folding the select into the
+    /// gate/up kernel took another 0.1 ms.
     pub(crate) fused_router {
         env: "LUMEN_NATIVE_FUSED_MOE_ROUTER",
         default: true,
-        kind: Behavior,
+        kind: Optimization,
     }
 }
 
@@ -908,8 +907,6 @@ mod tests {
         a.as_slice::<f32>().to_vec()
     }
 
-    /// `(cosine, largest gap / largest value)` of two outputs.
-
     /// The decode kernels give the composed block's output (router, routed experts, shared
     /// expert, their sum) for the same weights and activation, bit for bit.
     fn kernels_match_the_composed_block(hidden: i32, inter: i32, experts: i32) {
@@ -1214,7 +1211,10 @@ mod tests {
     }
 
     fn assert_router_is_bit_exact(label: &str, layer: &Layer, inputs: u64) {
-        let (routing, scored, differ, total, worst) = router_bits(layer, inputs);
+        // The comparison is of the kernel router, so it holds the flag on when the equivalence
+        // matrix has flipped it off.
+        let (routing, scored, differ, total, worst) =
+            fused_router::with(true, || router_bits(layer, inputs));
         eprintln!(
             "ROUTER-BITS {label}: routing positions off {routing}, score/gate bits off {scored}, block {differ}/{total} differ (worst {worst:.2e})"
         );
