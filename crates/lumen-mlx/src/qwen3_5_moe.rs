@@ -237,6 +237,33 @@ mod imp {
         }
     }
 
+    lumen_flags::flag! {
+        /// Run a single-token decode step's routed and shared experts in two Metal kernels
+        /// (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
+        /// gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
+        /// layers with a top-8 router; prefill, SSD expert offload and other layouts keep the
+        /// composed ops.
+        ///
+        /// The kernels round where the composed block rounds (including MLX's bf16 sum of the
+        /// activation in `load_vector`), but a dot product accumulates in a different order, so
+        /// the result is the composed block's up to float noise and not bit-identical: a
+        /// `Behavior` flag, off by default.
+        ///
+        /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
+        /// 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
+        /// bytes identical, the rest the last token or two. Teacher-forced, one token per forward
+        /// (`kv_bf16_quality --fused-moe-decode`, 6 prompts, 4,050 positions): top-1 agreement with
+        /// the composed ops 98.62%, every disagreement at a small logit gap. The same harness
+        /// comparing the composed model's 384-token windows with its 1-token windows (two valid
+        /// kernel paths, `--window-control`) agrees 98.62% too, so this is the noise between
+        /// kernel paths, not a loss on top of it.
+        pub(crate) fused_moe_decode {
+            env: "LUMEN_NATIVE_FUSED_MOE_DECODE",
+            default: false,
+            kind: Behavior,
+        }
+    }
+
     pub(crate) fn kv_store_bf16() -> bool {
         kv_bf16::get()
     }
@@ -253,6 +280,14 @@ mod imp {
     /// `LUMEN_NATIVE_WIDEN_SCALES=0`.
     pub fn set_act_bf16(on: bool) {
         act_bf16::set(on);
+    }
+
+    /// Pin `fused_moe_decode` process-wide for an A/B harness, bypassing the env read. The expert
+    /// tensors are stacked at load, so the model has to be loaded with
+    /// `LUMEN_NATIVE_FUSED_MOE_DECODE=1` (or `LUMEN_NATIVE_FUSE_MOE_GATE_UP=1`) for this to have
+    /// anything to switch.
+    pub fn set_fused_moe_decode(on: bool) {
+        fused_moe_decode::set(on);
     }
 
     // config.json parsing lives in the ungated `qwen35_config` module so a
@@ -711,6 +746,9 @@ mod imp {
         // routing meta
         pub top_k: i32,
         pub norm_topk_prob: bool,
+        /// The experts are stacked, so single-token steps may run the decode kernels; whether they
+        /// do is `fused_moe_decode`, read at each call so a harness can switch it.
+        pub decode_kernels_ready: bool,
     }
 
     impl ResolvedMoeWeights {
@@ -768,6 +806,7 @@ mod imp {
                 // meeting the scales' dtype instead casts only the activations. mxfp4/nvfp4
                 // scales are integers, so this changes nothing for them.
                 experts_in_scale_dtype: self.sw_mode == MODE_AFFINE,
+                fused_decode: self.decode_kernels_ready && fused_moe_decode::get(),
                 offload: None,
             }
         }
@@ -1236,6 +1275,7 @@ mod imp {
             sg_bits,
             top_k: cfg.num_experts_per_tok as i32,
             norm_topk_prob: cfg.norm_topk_prob,
+            decode_kernels_ready: fuse_gate_up,
         })
     }
 
@@ -1863,7 +1903,8 @@ mod imp {
 
             // The bank serves gate and up as separate pools and never loads the stacked
             // tensors, so a stacked copy would only be built to sit unused.
-            let fuse_experts = fuse_moe_gate_up::get() && expert_budget_bytes.is_none();
+            let fuse_experts = (fuse_moe_gate_up::get() || fused_moe_decode::get())
+                && expert_budget_bytes.is_none();
 
             // D1 — resolve per-layer weight handles once.
             let num_layers = config.text_config.num_hidden_layers;
@@ -4882,6 +4923,11 @@ pub use imp::set_kv_store_bf16;
 /// `examples/kv_bf16_quality.rs --act-bf16`.
 #[cfg(feature = "mlx-native")]
 pub use imp::set_act_bf16;
+
+/// Decode-kernel toggle for the same kind of harness — see
+/// `examples/kv_bf16_quality.rs --fused-moe-decode`.
+#[cfg(feature = "mlx-native")]
+pub use imp::set_fused_moe_decode;
 
 // ───────────────────────── unit tests ─────────────────────────
 //

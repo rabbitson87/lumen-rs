@@ -42,6 +42,7 @@ value → on.
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
+| `LUMEN_NATIVE_FUSED_MOE_DECODE` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
 | `LUMEN_NATIVE_FUSE_LINATTN_IN` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
 | `LUMEN_NATIVE_FUSE_MOE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_moe_gate_up` |
@@ -491,6 +492,30 @@ Compile-wrap the MoE routing graph. Default OFF (A/B WASH). (Parse
 Conv-state advance via `slice` (view/copy) instead of `take_axis`
  (gather kernel). Bit-identical for the s==1 decode regime — same
  indices, cheaper Metal kernel. Default OFF (A/B WASH).
+
+### `LUMEN_NATIVE_FUSED_MOE_DECODE`
+
+*Behavior, default off.*
+
+Run a single-token decode step's routed and shared experts in two Metal kernels
+ (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
+ gate/up layout of `LUMEN_NATIVE_FUSE_MOE_GATE_UP`. Applies to affine 4-bit group-64
+ layers with a top-8 router; prefill, SSD expert offload and other layouts keep the
+ composed ops.
+
+ The kernels round where the composed block rounds (including MLX's bf16 sum of the
+ activation in `load_vector`), but a dot product accumulates in a different order, so
+ the result is the composed block's up to float noise and not bit-identical: a
+ `Behavior` flag, off by default.
+
+ Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
+ 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
+ bytes identical, the rest the last token or two. Teacher-forced, one token per forward
+ (`kv_bf16_quality --fused-moe-decode`, 6 prompts, 4,050 positions): top-1 agreement with
+ the composed ops 98.62%, every disagreement at a small logit gap. The same harness
+ comparing the composed model's 384-token windows with its 1-token windows (two valid
+ kernel paths, `--window-control`) agrees 98.62% too, so this is the noise between
+ kernel paths, not a loss on top of it.
 
 ### `LUMEN_NATIVE_FUSE_GATE_UP`
 

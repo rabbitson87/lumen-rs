@@ -255,6 +255,8 @@ mod native_kernels;
 #[cfg(feature = "mlx-native")]
 pub mod native_metal_bridge;
 mod native_moe;
+#[cfg(feature = "mlx-native")]
+mod native_moe_decode;
 mod native_norm;
 mod native_quant;
 mod native_rope;
@@ -265,6 +267,8 @@ pub mod native_ssm;
 pub use bandwidth::{MemoryBandwidth, measure_memory_bandwidth};
 #[cfg(feature = "mlx-native")]
 mod decode_probe;
+#[cfg(all(test, feature = "mlx-native"))]
+mod moe_routed_probe;
 #[cfg(feature = "mlx-native")]
 mod offload;
 /// Build the contiguous expert pack of a Flash-Next checkpoint (`lumen-server --pack-experts`).
@@ -298,6 +302,8 @@ pub use native_attention::set_sparse_decode;
 pub use qwen3_5_moe::MtpStepOutput;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_act_bf16;
+#[cfg(feature = "mlx-native")]
+pub use qwen3_5_moe::set_fused_moe_decode;
 #[cfg(feature = "mlx-native")]
 pub use qwen3_5_moe::set_kv_store_bf16;
 

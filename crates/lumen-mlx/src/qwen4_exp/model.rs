@@ -520,6 +520,7 @@ impl MoeLayer {
             top_k: self.top_k,
             norm_topk_prob: true,
             experts_in_scale_dtype: true,
+            fused_decode: false,
             offload: offload.map(|offload| OffloadLayer {
                 offload,
                 layer: self.layer,

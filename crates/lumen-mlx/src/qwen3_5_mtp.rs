@@ -584,6 +584,7 @@ impl Qwen35MtpBlock {
             top_k: w.top_k,
             norm_topk_prob: w.norm_topk_prob,
             experts_in_scale_dtype: false,
+            fused_decode: false,
             offload: None,
         };
         moe_block_forward(x, &view)
