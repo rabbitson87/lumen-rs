@@ -80,10 +80,12 @@ const ROWS_PER_GROUP: i32 = 4;
 const MIN_GATE_GROUPS: i32 = 8;
 /// Rows one simdgroup of each expert kernel owns, so the activation it loads is used for all of
 /// them (MLX's own quantized matvec does four). More rows means fewer simdgroups to hide memory
-/// latency with, so the best count is each kernel's own, found on the benchmark
-/// (`moe_routed_probe`).
+/// latency with, so the best count is each kernel's own, found end to end (ABBA on the 35B-A3B
+/// decode, `moe_routed_probe` is too noisy to tell them apart). The down kernel repeats the
+/// activation's setup for every row it owns, so it gained from two rows once the nibble masking
+/// had made the dot products cheaper; four rows and four gate/up rows were no different.
 const ROWS_GATE_UP: i32 = 2;
-const ROWS_DOWN: i32 = 1;
+const ROWS_DOWN: i32 = 2;
 
 const GATE_UP_SOURCE: &str = r#"
     #define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
