@@ -175,11 +175,33 @@ mod imp {
             ensure_row_contiguous: bool,
             atomic_outputs: bool,
         ) -> Result<Self> {
+            Self::new_with_header(
+                name,
+                input_names,
+                output_names,
+                "",
+                source,
+                ensure_row_contiguous,
+                atomic_outputs,
+            )
+        }
+
+        /// [`Self::new`] with `header` placed ahead of the generated kernel function: helper
+        /// functions and types the body calls. MLX compiles the header once per distinct text.
+        pub fn new_with_header(
+            name: &str,
+            input_names: &[&str],
+            output_names: &[&str],
+            header: &str,
+            source: &str,
+            ensure_row_contiguous: bool,
+            atomic_outputs: bool,
+        ) -> Result<Self> {
             let cname = CString::new(name).map_err(|_| anyhow!("kernel name contains nul byte"))?;
             let csource =
                 CString::new(source).map_err(|_| anyhow!("kernel source contains nul byte"))?;
-            // Empty header — we don't use additional code injection.
-            let cheader = CString::new("").unwrap();
+            let cheader =
+                CString::new(header).map_err(|_| anyhow!("kernel header contains nul byte"))?;
 
             // Build the input/output name vectors. RAII guard so they're freed
             // after construction.
