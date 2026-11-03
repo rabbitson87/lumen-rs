@@ -66,6 +66,11 @@ lumen_flags::flag! {
 const TOP_K: i32 = 8;
 /// Simdgroups per threadgroup of the expert kernels.
 const ROWS_PER_GROUP: i32 = 4;
+/// MLX hands a kernel input of fewer than eight elements over in the `constant` address space.
+/// The router kernel picks the shared gate's scales and biases (`[1, hidden / 64]`) or the
+/// experts' (`device`) with one expression, which does not compile across address spaces, so a
+/// router needs at least this many groups per row to run on the kernels.
+const MIN_GATE_GROUPS: i32 = 8;
 /// Rows one simdgroup of each expert kernel owns, so the activation it loads is used for all of
 /// them (MLX's own quantized matvec does four). More rows means fewer simdgroups to hide memory
 /// latency with, so the best count is each kernel's own, found on the benchmark
@@ -569,6 +574,7 @@ fn router_gates<'a>(w: &'a MoeBlockWeights<'a>, dims: Dims) -> Option<RouterGate
     let ok = w.norm_topk_prob
         && w.top_k == TOP_K
         && experts % 32 == 0
+        && dims.hidden / 64 >= MIN_GATE_GROUPS
         && (gate.bits, gate.group_size, shared.bits, shared.group_size) == (8, 64, 8, 64)
         && rows(gate.weight, experts, dims.hidden / 4)
         && rows(gate.scales, experts, dims.hidden / 64)
@@ -917,6 +923,19 @@ mod tests {
     #[test]
     fn kernels_match_the_composed_block_with_a_512_expert_router() {
         kernels_match_the_composed_block(1024, 256, 512);
+    }
+
+    #[test]
+    fn a_router_over_a_narrow_hidden_state_stays_on_the_composed_ops() {
+        // 256 / 64 = 4 groups: the shared gate's scales hold four elements, which MLX would pass in
+        // the constant address space and the router kernel could not compile.
+        let layer = Layer::build(256, 64, 256).expect("layer");
+        let w = layer.view(true, true);
+        let x = layer.activation(3).expect("x");
+        let dims = plan(&x, &w.switch_glu, &w.shared_expert, w.top_k).expect("experts supported");
+        assert!(!router_supported(&w, dims));
+        // The experts still run on the kernels, behind the composed router.
+        kernels_match_the_composed_block(256, 64, 256);
     }
 
     #[test]
