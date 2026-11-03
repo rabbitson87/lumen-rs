@@ -1715,6 +1715,9 @@ mod imp {
         gdn_ssm: bool,
         /// The gated RMS norm, replaced by `out * z`.
         gdn_norm: bool,
+        /// The four in-projections and the out-projection, replaced by the layer input (or the
+        /// gated output) cut or tiled to each one's width (a copy for the two wider than it).
+        gdn_proj: bool,
         /// Inside a full-attention block: the q/k/v projections, replaced by the layer input cut
         /// or tiled to each projection's width (at most one copy for q).
         attn_proj: bool,
@@ -1770,6 +1773,7 @@ mod imp {
                 gdn_gates: has("gdn_gates"),
                 gdn_ssm: has("gdn_ssm"),
                 gdn_norm: has("gdn_norm"),
+                gdn_proj: has("gdn_proj"),
                 attn_proj: has("attn_proj"),
                 attn_norm: has("attn_norm"),
                 attn_rope: has("attn_rope"),
@@ -2922,7 +2926,11 @@ mod imp {
             //     returns the input dtype (f32 here) so the casts were
             //     identity ops adding only graph nodes.
             let t_in_proj = timing_on.then(Instant::now);
-            let mixed_qkv = lw.in_proj_qkv.apply(x)?;
+            let mixed_qkv = if ablate.gdn_proj {
+                probe_projection_stand_in(x, conv_dim)?
+            } else {
+                lw.in_proj_qkv.apply(x)?
+            };
             // PROBE lever-A gate-0: skip the 3 small in_proj matmuls (z/b/a).
             // Only valid with LINCOMPUTE skip (which returns early below using
             // only mixed_qkv) — the dummies are never consumed.
@@ -2930,9 +2938,19 @@ mod imp {
             let (z_4d, b_pre, a_pre) = if skip_inproj_small {
                 (mixed_qkv.clone(), mixed_qkv.clone(), mixed_qkv.clone())
             } else {
-                let z_flat = lw.in_proj_z.apply(x)?;
-                let b_pre = lw.in_proj_b.apply(x)?;
-                let a_pre = lw.in_proj_a.apply(x)?;
+                let (z_flat, b_pre, a_pre) = if ablate.gdn_proj {
+                    (
+                        probe_projection_stand_in(x, value_dim)?,
+                        probe_projection_stand_in(x, nv)?,
+                        probe_projection_stand_in(x, nv)?,
+                    )
+                } else {
+                    (
+                        lw.in_proj_z.apply(x)?,
+                        lw.in_proj_b.apply(x)?,
+                        lw.in_proj_a.apply(x)?,
+                    )
+                };
                 let z_4d = mlx_rs::ops::reshape(&z_flat, &[b, s, nv, dv])
                     .context("layer_linear_attn_forward: reshape z failed")?;
                 (z_4d, b_pre, a_pre)
@@ -3340,7 +3358,11 @@ mod imp {
             };
             let out_flat = mlx_rs::ops::reshape(&out_normed, &[b, s, value_dim])
                 .context("layer_linear_attn_forward: reshape out_flat failed")?;
-            let out_proj_raw = lw.out_proj.apply(&out_flat)?;
+            let out_proj_raw = if ablate.gdn_proj {
+                probe_projection_stand_in(&out_flat, x.shape()[2])?
+            } else {
+                lw.out_proj.apply(&out_flat)?
+            };
             let out_final = Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.out_proj"))?;
             if let Some(t0) = t_out {
                 out_final
