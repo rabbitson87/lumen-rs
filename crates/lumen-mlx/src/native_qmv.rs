@@ -10,11 +10,12 @@
 //! every bit. With the kernels serving a projection's decode steps, its scales need no f32 copy
 //! ([`serves`]).
 //!
-//! A run-time kernel costs CPU on every call that MLX's own matmul does not: `fast::metal_kernel`
-//! rebuilds the kernel's whole source text and hashes it each time it is called and encoded. A
-//! decode step that is close to CPU-bound (the 35B-A3B's) feels that, so projections that share an
-//! activation run in one launch ([`matvec_shared`]) and every source carries only the helpers it
-//! calls, with no comments inside the Metal text.
+//! Each call costs more than MLX's own matmul beside its bytes: a small projection's launch is
+//! slower alone, and `fast::metal_kernel` rebuilds the kernel's whole source text and hashes it each
+//! time it is called and encoded. With a launch per projection the 35B-A3B decoded slower than MLX
+//! on the widened copies, so projections that share an activation run in one launch
+//! ([`matvec_shared`]) and every source carries only the helpers it calls, with no comments inside
+//! the Metal text.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
@@ -49,6 +50,9 @@ lumen_flags::flag! {
     /// 218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
     /// on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 1066 us); a small
     /// projection (32x2048) is slower alone, 3.6 -> 6.1 us, which the shared launch removes.
+    /// Pipelined greedy decode against MLX on the widened copies, alternating runs, text identical
+    /// in every run: Qwen3.6-27B 61.4 / 61.6 / 61.1 -> 56.6 / 57.2 / 56.7 ms/token, footprint 18.51
+    /// -> 17.21 GB; Qwen3.6-35B-A3B 9.3 / 9.3 / 9.3 -> 9.2 / 9.2 / 9.2 ms/token, 20.65 -> 20.52 GB.
     pub(crate) decode_qmv {
         env: "LUMEN_NATIVE_DECODE_QMV",
         default: true,

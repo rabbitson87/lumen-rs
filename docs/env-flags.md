@@ -521,6 +521,9 @@ Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 a
  218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
  on widened scales (MLX on bf16 activations and scales, the bound: 195, 196, 1066 us); a small
  projection (32x2048) is slower alone, 3.6 -> 6.1 us, which the shared launch removes.
+ Pipelined greedy decode against MLX on the widened copies, alternating runs, text identical
+ in every run: Qwen3.6-27B 61.4 / 61.6 / 61.1 -> 56.6 / 57.2 / 56.7 ms/token, footprint 18.51
+ -> 17.21 GB; Qwen3.6-35B-A3B 9.3 / 9.3 / 9.3 -> 9.2 / 9.2 / 9.2 ms/token, 20.65 -> 20.52 GB.
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 
