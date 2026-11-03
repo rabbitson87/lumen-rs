@@ -103,6 +103,12 @@ const GATE_UP_SOURCE: &str = r#"
             }
             xs += QSUM(xq[j * 8], xq[j * 8 + 1], xq[j * 8 + 2], xq[j * 8 + 3]);
             xs += QSUM(xq[j * 8 + 4], xq[j * 8 + 5], xq[j * 8 + 6], xq[j * 8 + 7]);
+            // Nibble i is read where it sits (masked, not shifted), so its activation is divided
+            // by 16^i once here for all R rows. Both factors are exact powers of two times a
+            // 4-bit integer, so the product is bit for bit x * nibble.
+            for (int i = 0; i < 8; ++i) {
+                xq[j * 8 + i] *= 1.0f / static_cast<float>(1u << (4 * i));
+            }
         }
         for (int r = 0; r < R; ++r) {
             const int row = rg * R + r;
@@ -120,8 +126,8 @@ const GATE_UP_SOURCE: &str = r#"
                 const uint32_t pg = wg[grp * 8 + j];
                 const uint32_t pu = wu[grp * 8 + j];
                 for (int i = 0; i < 8; ++i) {
-                    ag += xq[j * 8 + i] * static_cast<float>((pg >> (4 * i)) & 0xFu);
-                    au += xq[j * 8 + i] * static_cast<float>((pu >> (4 * i)) & 0xFu);
+                    ag += xq[j * 8 + i] * static_cast<float>(pg & (0xFu << (4 * i)));
+                    au += xq[j * 8 + i] * static_cast<float>(pu & (0xFu << (4 * i)));
                 }
             }
             g_part[r] += static_cast<float>(sg[grp]) * ag + static_cast<float>(bg[grp]) * xs;
@@ -181,6 +187,12 @@ const DOWN_COMBINE_SOURCE: &str = r#"
             xs += QSUM(av[4], av[5], av[6], av[7]);
             xs += QSUM(av[8], av[9], av[10], av[11]);
             xs += QSUM(av[12], av[13], av[14], av[15]);
+            // As in the gate/up kernel: nibble i is masked in place, its activation pre-divided.
+            for (int i = 0; i < 8; ++i) {
+                const float inv = 1.0f / static_cast<float>(1u << (4 * i));
+                av[i] *= inv;
+                av[8 + i] *= inv;
+            }
             for (int r = 0; r < R; ++r) {
                 const int row = rg * R + r;
                 const size_t rr = (size_t)e * H + row;
@@ -191,8 +203,8 @@ const DOWN_COMBINE_SOURCE: &str = r#"
                 const uint32_t p1 = wp[c * 2 + 1];
                 float acc = 0.0f;
                 for (int i = 0; i < 8; ++i) {
-                    acc += av[i] * static_cast<float>((p0 >> (4 * i)) & 0xFu);
-                    acc += av[8 + i] * static_cast<float>((p1 >> (4 * i)) & 0xFu);
+                    acc += av[i] * static_cast<float>(p0 & (0xFu << (4 * i)));
+                    acc += av[8 + i] * static_cast<float>(p1 & (0xFu << (4 * i)));
                 }
                 part[r] += static_cast<float>(sp[c / 4]) * acc + static_cast<float>(bp[c / 4]) * xs;
             }
