@@ -140,6 +140,31 @@ inline float qdot4(
     return scale * accum + sum * bias;
 }
 
+// load_vector and qdot for 8-bit weights over f32 activations, `V` values a lane: the router's
+// gate matvec (`V` is 8 under `qmv_fast`, 4 under `qmv`).
+template <int V>
+inline float load_vector8(const device float* x, thread float* x_thread) {
+    float sum = 0;
+    for (int i = 0; i < V; i++) {
+        sum += x[i];
+        x_thread[i] = x[i];
+    }
+    return sum;
+}
+template <int V>
+inline float qdot8(
+    const device uint8_t* w,
+    const thread float* x_thread,
+    float scale,
+    float bias,
+    float sum) {
+    float accum = 0;
+    for (int i = 0; i < V; i++) {
+        accum += x_thread[i] * w[i];
+    }
+    return scale * accum + sum * bias;
+}
+
 // MLX's Sigmoid on f32 and on bf16 (every operation rounds to bf16; `x` is already bf16).
 inline float sigmoid_f32(float x) {
     const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
@@ -217,73 +242,97 @@ const GATE_UP_SOURCE: &str = r#"
 const EXPERT_FROM_INDICES: &str = "const uint e = routed ? inds[slot] : 0u;";
 
 /// Where it gets it from when the router's select is folded in: every routed simdgroup repeats the
-/// select over the router logits for its own slot (softmax, then the slot-th largest probability by
-/// repeated argmax, the lowest index winning a tie), and the simdgroup of slot 0 and row group 0
-/// runs all eight rounds and stores the routing the down kernel reads. No kernel sits between the
-/// router logits and the experts. The arithmetic is the standalone select's, op for op.
+/// composed router's select over the router logits for its own slot, and the simdgroup of slot 0
+/// and row group 0 runs it whole and stores the routing the down kernel reads. No kernel sits
+/// between the router logits and the experts.
+///
+/// The select is MLX's, op for op. Softmax: each of `E / 4` threads of its kernel takes four
+/// consecutive logits (a lane here plays thread `lane + 32 g` of simdgroup `g`), sums their
+/// `fast::exp` in order, then the simdgroup sums (`simd_sum`), then the simdgroups' sums are
+/// `simd_sum`med, and each probability is `exp * (1 / sum)`. `argpartition` is a full ascending
+/// sort on Metal, so the experts come in ascending order of probability (equal probabilities in
+/// index order, hence the highest index is the top one): slot `s` is the `(7 - s)`-th largest. The
+/// eight probabilities are added in that order, starting from the smallest, for the renormalising
+/// sum, and each is divided by it.
 const EXPERT_FROM_LOGITS: &str = r#"
     uint e = 0u;
     {
-        constexpr int PER = E / 32;
+        constexpr int GROUPS = E / 128;
         const bool writer = slot == 0 && rg == 0;
-        const int rounds = writer ? 8 : (routed ? slot + 1 : 0);
-        if (rounds > 0) {
-            float p[PER];
-            float m = -INFINITY;
-            for (int k = 0; k < PER; ++k) {
-                p[k] = logits[lane + k * 32];
-                m = metal::max(m, p[k]);
+        const int ranks = writer ? 8 : (routed ? 8 - slot : 0);
+        if (ranks > 0) {
+            float p[GROUPS][4];
+            float top = -INFINITY;
+            for (int g = 0; g < GROUPS; ++g) {
+                for (int i = 0; i < 4; ++i) {
+                    p[g][i] = logits[(lane + 32 * g) * 4 + i];
+                    top = (top < p[g][i]) ? p[g][i] : top;
+                }
             }
-            m = simd_max(m);
-            float sum = 0.0f;
-            for (int k = 0; k < PER; ++k) {
-                p[k] = metal::exp(p[k] - m);
-                sum += p[k];
+            top = simd_max(top);
+            float group_sum[GROUPS];
+            for (int g = 0; g < GROUPS; ++g) {
+                float partial = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    p[g][i] = metal::fast::exp(p[g][i] - top);
+                    partial += p[g][i];
+                }
+                group_sum[g] = simd_sum(partial);
             }
-            sum = simd_sum(sum);
-            const float inv = 1.0f / sum;
-            for (int k = 0; k < PER; ++k) {
-                p[k] = p[k] * inv;
+            float sum_in = 0.0f;
+            for (int g = 0; g < GROUPS; ++g) {
+                if (lane == g) {
+                    sum_in = group_sum[g];
+                }
             }
-            float sel_p[8];
+            const float inv = 1 / simd_sum(sum_in);
+            for (int g = 0; g < GROUPS; ++g) {
+                for (int i = 0; i < 4; ++i) {
+                    p[g][i] = p[g][i] * inv;
+                }
+            }
+
+            float largest[8];
             for (int r = 0; r < 8; ++r) {
-                sel_p[r] = 0.0f;
-                if (r < rounds) {
-                    float bv = -INFINITY;
-                    uint bi = 0xFFFFFFFFu;
-                    for (int k = 0; k < PER; ++k) {
-                        if (p[k] > bv) {
-                            bv = p[k];
-                            bi = lane + k * 32;
+                largest[r] = 0.0f;
+                if (r < ranks) {
+                    float best = -INFINITY;
+                    uint at = 0u;
+                    for (int g = 0; g < GROUPS; ++g) {
+                        for (int i = 0; i < 4; ++i) {
+                            if (p[g][i] >= best) {
+                                best = p[g][i];
+                                at = (uint)((lane + 32 * g) * 4 + i);
+                            }
                         }
                     }
-                    const float gv = simd_max(bv);
-                    const uint gi = simd_min(bv == gv ? bi : 0xFFFFFFFFu);
-                    for (int k = 0; k < PER; ++k) {
-                        if (lane + k * 32 == gi) {
-                            p[k] = -INFINITY;
+                    const float top_p = simd_max(best);
+                    const uint top_i = simd_max(best == top_p ? at : 0u);
+                    for (int g = 0; g < GROUPS; ++g) {
+                        for (int i = 0; i < 4; ++i) {
+                            if ((uint)((lane + 32 * g) * 4 + i) == top_i) {
+                                p[g][i] = -INFINITY;
+                            }
                         }
                     }
-                    sel_p[r] = gv;
-                    if (r == slot) {
-                        e = gi;
+                    largest[r] = top_p;
+                    if (r == 7 - slot) {
+                        e = top_i;
                     }
                     if (writer && lane == 0) {
-                        inds[r] = gi;
+                        inds[7 - r] = top_i;
                     }
                 }
             }
             if (writer && lane == 0) {
                 float denom = 0.0f;
-                for (int r = 0; r < 8; ++r) {
-                    denom += sel_p[r];
+                for (int j = 0; j < 8; ++j) {
+                    denom = largest[7 - j] + denom;
                 }
-                for (int r = 0; r < 8; ++r) {
-                    scores[r] = sel_p[r] / denom;
+                for (int j = 0; j < 8; ++j) {
+                    scores[j] = largest[7 - j] / denom;
                 }
-                const float z = logits[E];
-                const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
-                sscore[0] = z < 0.0f ? y : 1.0f - y;
+                sscore[0] = sigmoid_f32(logits[E]);
             }
         }
     }
@@ -347,34 +396,41 @@ const DOWN_COMBINE_SOURCE: &str = r#"
 "#;
 
 /// One simdgroup per gate row: rows `0..E` are the experts' router logits, row `E` the shared
-/// expert's gate. 8-bit affine group 64, activation in f32 (so MLX sums it in f32 as well).
+/// expert's gate. 8-bit affine group 64 over an f32 activation, in the order MLX's matvec adds: the
+/// experts' rows (256 of them or more, a multiple of 8) run as `qmv_fast`, eight values a lane in
+/// blocks of 256; the shared gate has one row, which MLX runs as `qmv`, four values a lane in
+/// blocks of 128.
 const ROUTER_LOGITS_SOURCE: &str = r#"
     const int lane = thread_index_in_simdgroup;
     const int row = thread_position_in_grid.y;
     constexpr int G = H / 64;
-    constexpr int WPR = H / 4;
-    const bool shared_row = row == E;
-    auto wr = shared_row ? sw : (gw + (size_t)row * WPR);
-    auto sr = shared_row ? ss : (gs + (size_t)row * G);
-    auto br = shared_row ? sb : (gb + (size_t)row * G);
-
-    float part = 0.0f;
-    for (int grp = lane; grp < G; grp += 32) {
-        float acc = 0.0f;
-        float xs = 0.0f;
-        for (int j = 0; j < 16; ++j) {
-            const uint32_t p = wr[grp * 16 + j];
-            for (int i = 0; i < 4; ++i) {
-                const float xv = x[grp * 64 + j * 4 + i];
-                acc += xv * static_cast<float>((p >> (8 * i)) & 0xFFu);
-                xs += xv;
-            }
+    float result = 0.0f;
+    if (row < E) {
+        constexpr int BLOCKS = H / 256;
+        const device uint8_t* wr = (const device uint8_t*)gw + (size_t)row * H;
+        for (int blk = 0; blk < BLOCKS; ++blk) {
+            float x_thread[8];
+            const float sum = load_vector8<8>(x + blk * 256 + lane * 8, x_thread);
+            const int scale_at = row * G + blk * 4 + lane / 8;
+            const float s = gs[scale_at];
+            const float b = gb[scale_at];
+            result += qdot8<8>(wr + blk * 256 + lane * 8, x_thread, s, b, sum);
         }
-        part += static_cast<float>(sr[grp]) * acc + static_cast<float>(br[grp]) * xs;
+    } else {
+        constexpr int BLOCKS = H / 128;
+        const device uint8_t* wr = (const device uint8_t*)sw;
+        for (int blk = 0; blk < BLOCKS; ++blk) {
+            float x_thread[4];
+            const float sum = load_vector8<4>(x + blk * 128 + lane * 4, x_thread);
+            const int scale_at = blk * 2 + lane / 16;
+            const float s = ss[scale_at];
+            const float b = sb[scale_at];
+            result += qdot8<4>(wr + blk * 128 + lane * 4, x_thread, s, b, sum);
+        }
     }
-    const float v = simd_sum(part);
+    result = simd_sum(result);
     if (lane == 0) {
-        logits[row] = v;
+        logits[row] = result;
     }
 "#;
 
@@ -423,10 +479,11 @@ impl Kernels {
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
             )?,
-            router_logits: MetalKernel::new(
+            router_logits: MetalKernel::new_with_header(
                 "moe_decode_router_logits",
                 &["x", "gw", "gs", "gb", "sw", "ss", "sb"],
                 &["logits"],
+                MOE_HEADER,
                 ROUTER_LOGITS_SOURCE,
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
@@ -705,7 +762,7 @@ fn router_gates<'a>(w: &'a MoeBlockWeights<'a>, dims: Dims) -> Option<RouterGate
     let rows = |a: &Array, n: i32, cols: i32| a.shape() == [n, cols];
     let ok = w.norm_topk_prob
         && w.top_k == TOP_K
-        && experts % 32 == 0
+        && experts % 128 == 0
         && (gate.bits, gate.group_size, shared.bits, shared.group_size) == (8, 64, 8, 64)
         && rows(gate.weight, experts, dims.hidden / 4)
         && rows(gate.scales, experts, dims.hidden / 64)
@@ -852,21 +909,9 @@ mod tests {
     }
 
     /// `(cosine, largest gap / largest value)` of two outputs.
-    fn closeness(a: &[f32], b: &[f32]) -> (f64, f64) {
-        assert_eq!(a.len(), b.len());
-        let dot: f64 = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| f64::from(*x) * f64::from(*y))
-            .sum();
-        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-        let gap = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-        let top = a.iter().fold(0f32, |m, x| m.max(x.abs()));
-        (dot / (norm(a) * norm(b)), f64::from(gap) / f64::from(top))
-    }
 
     /// The decode kernels give the composed block's output (router, routed experts, shared
-    /// expert, their sum) for the same weights and activation, up to f32 accumulation order.
+    /// expert, their sum) for the same weights and activation, bit for bit.
     fn kernels_match_the_composed_block(hidden: i32, inter: i32, experts: i32) {
         let layer = Layer::build(hidden, inter, experts).expect("layer");
         let composed = layer.view(true, false);
@@ -885,10 +930,16 @@ mod tests {
             );
             let want = host(&moe_block_forward(&x, &composed).expect("composed block"));
             let got = host(&moe_block_forward(&x, &kernels).expect("kernel block"));
-            let (cosine, gap) = closeness(&want, &got);
-            assert!(
-                cosine > 0.99999 && gap < 1e-2,
-                "{hidden}x{inter}x{experts} seed {seed}: cosine {cosine:.6}, largest gap {gap:.3e} of the largest value"
+            let off = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                off,
+                0,
+                "{hidden}x{inter}x{experts} seed {seed}: {off} of {} elements differ",
+                want.len()
             );
         }
     }
@@ -1012,75 +1063,6 @@ mod tests {
         );
     }
 
-    /// The router (logits kernel, then the select inside the gate/up kernel) picks the composed
-    /// router's experts with its probabilities, and the shared gate's sigmoid, for many activations.
-    fn router_matches_the_composed_router(hidden: i32, inter: i32, experts: i32, inputs: u64) {
-        use crate::native_moe::moe_router;
-        use crate::native_quant::quantized_matmul_with_mode;
-
-        let layer = Layer::build(hidden, inter, experts).expect("layer");
-        let w = layer.view(true, true);
-        let GateProj::Affine(shared_gate) = &w.shared_gate else {
-            panic!("an affine shared gate");
-        };
-        for seed in 0..inputs {
-            let x = layer.activation(2000 + seed).expect("x");
-            let dims = plan(&x, &w.switch_glu, &w.shared_expert, w.top_k).expect("supported");
-            assert!(
-                router_supported(&w, dims),
-                "the kernels must take this router, or the comparison compares the composed one with itself"
-            );
-            let (want_inds, want_scores) = moe_router(&x, &w).expect("composed router");
-            let (_, [inds, scores, shared_score]) =
-                run_routed_with_routing(&x, &w, dims).expect("kernel router");
-
-            let by_expert = |inds: &Array, scores: &Array| {
-                let ids = host(&inds.as_dtype(Dtype::Float32).unwrap());
-                let sc = host(scores);
-                let mut pairs: Vec<(u32, f32)> = ids.iter().map(|i| *i as u32).zip(sc).collect();
-                pairs.sort_by_key(|(id, _)| *id);
-                pairs
-            };
-            let (want, got) = (
-                by_expert(&want_inds, &want_scores),
-                by_expert(&inds, &scores),
-            );
-            let ids = |v: &[(u32, f32)]| v.iter().map(|(i, _)| *i).collect::<Vec<_>>();
-            assert_eq!(ids(&got), ids(&want), "seed {seed}: different experts");
-            for ((_, a), (_, b)) in want.iter().zip(&got) {
-                assert!((a - b).abs() < 1e-5, "seed {seed}: score {a} against {b}");
-            }
-
-            let logit = quantized_matmul_with_mode(
-                &x,
-                shared_gate.weight,
-                shared_gate.scales,
-                Some(shared_gate.biases),
-                true,
-                64,
-                8,
-                MODE_AFFINE,
-            )
-            .expect("shared gate");
-            let want_shared = host(&mlx_rs::ops::sigmoid(&logit).unwrap())[0];
-            let got_shared = host(&shared_score)[0];
-            assert!(
-                (want_shared - got_shared).abs() < 1e-6,
-                "seed {seed}: shared gate {want_shared} against {got_shared}"
-            );
-        }
-    }
-
-    #[test]
-    fn router_kernels_match_the_composed_router_at_the_a3b_shape() {
-        router_matches_the_composed_router(2048, 512, 256, 120);
-    }
-
-    #[test]
-    fn router_kernels_match_the_composed_router_with_512_experts() {
-        router_matches_the_composed_router(1024, 512, 512, 60);
-    }
-
     #[test]
     fn kernels_match_the_composed_block_with_a_512_expert_router() {
         kernels_match_the_composed_block(1024, 512, 512);
@@ -1159,6 +1141,113 @@ mod tests {
                 "{hidden}x{inter}x{experts}: {differ} of {total} block elements differ from the composed ops (worst relative gap {worst:.2e})"
             );
         }
+    }
+
+    /// The router's routing and the whole block with the router in kernels, against the composed
+    /// router and block: (routing positions that differ, score or gate bits that differ, block
+    /// elements that differ, block elements), with the largest relative gap of the last.
+    fn router_bits(layer: &Layer, inputs: u64) -> (usize, usize, usize, usize, f64) {
+        use crate::native_moe::moe_router;
+        use crate::native_quant::quantized_matmul_with_mode;
+
+        let composed = layer.view(true, false);
+        let kernels = layer.view(true, true);
+        let GateProj::Affine(shared_gate) = &kernels.shared_gate else {
+            panic!("an affine shared gate");
+        };
+        let (mut routing, mut scored, mut differ, mut total, mut worst) = (0, 0, 0, 0, 0f64);
+        for seed in 0..inputs {
+            let x = layer.activation(5000 + seed).expect("x");
+            let dims = plan(
+                &x,
+                &kernels.switch_glu,
+                &kernels.shared_expert,
+                kernels.top_k,
+            )
+            .expect("plan");
+            assert!(
+                router_supported(&kernels, dims),
+                "the kernels must take this router, or the comparison compares the composed one with itself"
+            );
+            let (want_inds, want_scores) = moe_router(&x, &composed).expect("composed router");
+            let logit = quantized_matmul_with_mode(
+                &x,
+                shared_gate.weight,
+                shared_gate.scales,
+                Some(shared_gate.biases),
+                true,
+                64,
+                8,
+                MODE_AFFINE,
+            )
+            .expect("shared gate");
+            let want_gate = host(&mlx_rs::ops::sigmoid(&logit).expect("sigmoid"));
+            let (got_block, [inds, scores, gate]) =
+                run_routed_with_routing(&x, &kernels, dims).expect("kernel router");
+
+            let ids = |a: &Array| {
+                let a = a.as_dtype(Dtype::Float32).expect("f32");
+                host(&a)
+            };
+            routing += ids(&want_inds)
+                .iter()
+                .zip(ids(&inds))
+                .filter(|(a, b)| **a != *b)
+                .count();
+            scored += host(&want_scores)
+                .iter()
+                .zip(host(&scores))
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            scored += usize::from(want_gate[0].to_bits() != host(&gate)[0].to_bits());
+
+            let want = host(&moe_block_forward(&x, &composed).expect("composed block"));
+            for (a, b) in want.iter().zip(host(&got_block)) {
+                total += 1;
+                if a.to_bits() != b.to_bits() {
+                    differ += 1;
+                    worst = worst.max(f64::from((a - b).abs()) / f64::from(a.abs().max(1e-30)));
+                }
+            }
+        }
+        (routing, scored, differ, total, worst)
+    }
+
+    fn assert_router_is_bit_exact(label: &str, layer: &Layer, inputs: u64) {
+        let (routing, scored, differ, total, worst) = router_bits(layer, inputs);
+        eprintln!(
+            "ROUTER-BITS {label}: routing positions off {routing}, score/gate bits off {scored}, block {differ}/{total} differ (worst {worst:.2e})"
+        );
+        assert_eq!(
+            (routing, scored, differ),
+            (0, 0, 0),
+            "{label}: routing positions off {routing}, score/gate bits off {scored}, block elements off {differ} of {total}"
+        );
+    }
+
+    #[test]
+    fn the_router_and_block_equal_the_composed_ones_bit_for_bit() {
+        // 256 experts: two simdgroups of MLX's softmax; 512: four.
+        assert_router_is_bit_exact(
+            "2048x512x256",
+            &Layer::build(2048, 512, 256).expect("layer"),
+            60,
+        );
+        assert_router_is_bit_exact(
+            "1024x512x512",
+            &Layer::build(1024, 512, 512).expect("layer"),
+            40,
+        );
+    }
+
+    #[test]
+    fn equal_probabilities_are_ordered_as_the_composed_sort_orders_them() {
+        // Runs of four identical gate rows: the top eight are two runs of four equal probabilities.
+        let tied = Layer::build(2048, 512, 256)
+            .expect("layer")
+            .with_tied_router(4)
+            .expect("tied router");
+        assert_router_is_bit_exact("tied 2048x512x256", &tied, 30);
     }
 
     #[test]

@@ -110,6 +110,35 @@ impl Layer {
         })
     }
 
+    /// The same layer with a router whose experts come in runs of `copies` identical gate rows, so
+    /// they get the same logit, the same probability, and the sort that orders them must break the
+    /// ties. `copies` must divide the number of experts.
+    pub(crate) fn with_tied_router(mut self, copies: i32) -> Result<Self> {
+        let repeat = |a: &Array| -> Result<Array> {
+            let r = mlx_rs::ops::repeat_axis::<f32>(a.clone(), copies, 0)?;
+            let r = r.as_dtype(a.dtype())?;
+            r.eval()?;
+            Ok(r)
+        };
+        let experts = self.gate.w.shape()[0];
+        let rows = |a: &Array| -> Result<Array> {
+            Ok(mlx_rs::ops::indexing::take_axis(
+                a,
+                &Array::from_slice(
+                    &(0..experts / copies).collect::<Vec<i32>>(),
+                    &[experts / copies],
+                ),
+                0,
+            )?)
+        };
+        self.gate = Quant {
+            w: repeat(&rows(&self.gate.w)?)?,
+            s: repeat(&rows(&self.gate.s)?)?,
+            b: repeat(&rows(&self.gate.b)?)?,
+        };
+        Ok(self)
+    }
+
     /// The layer as the block reads it: experts stacked or not, decode kernels allowed or not.
     pub(crate) fn view(&self, stacked: bool, fused_decode: bool) -> MoeBlockWeights<'_> {
         MoeBlockWeights {
