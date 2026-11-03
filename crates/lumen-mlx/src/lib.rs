@@ -258,6 +258,8 @@ mod native_moe;
 #[cfg(feature = "mlx-native")]
 mod native_moe_decode;
 mod native_norm;
+#[cfg(feature = "mlx-native")]
+mod native_qmv;
 mod native_quant;
 mod native_rope;
 mod native_runtime;

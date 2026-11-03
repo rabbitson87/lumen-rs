@@ -44,6 +44,7 @@ use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
 use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights, SwitchGluWeights,
 };
+use crate::native_qmv::QMV_HEADER;
 use crate::native_quant::MODE_AFFINE;
 
 lumen_flags::flag! {
@@ -82,89 +83,10 @@ const ROWS_PER_GROUP: i32 = 4;
 const ROWS_GATE_UP: i32 = 2;
 const ROWS_DOWN: i32 = 2;
 
-/// MLX's own quantized matvec, transcribed (`kernels/quantized.h`, MLX 0.32): the helpers its
-/// `qmv_fast` runs for 4-bit weights, so the decode kernels add in the order the composed
-/// `gather_qmm` and `quantized_matmul` do. A matvec row is one simdgroup's lanes, each 16 values of
-/// every 512, summed per lane in `qdot`'s order and then across lanes with `simd_sum`; changing
-/// that partition or order changes the low bits.
+/// What the expert kernels need beside MLX's matvec helpers ([`QMV_HEADER`]): the routed slots
+/// follow the composed block's bf16 activation (`load_vector_bf16`), the shared slot its f32 one
+/// (`load_vector_f32`), the router its 8-bit gate (`load_vector8`, `qdot8`).
 const MOE_HEADER: &str = r#"
-#define RB(v) static_cast<float>(static_cast<bfloat16_t>(v))
-
-// load_vector over bf16 activations. The composed path casts the activation to bf16 before the
-// gather, so `x` (f32 here) is rounded first; the quad sum then rounds to bf16 after every add, as
-// `sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]` does on bf16 operands.
-inline float load_vector_bf16(const device float* x, thread float* x_thread) {
-    float sum = 0;
-    for (int i = 0; i < 16; i += 4) {
-        const float a = RB(x[i]);
-        const float b = RB(x[i + 1]);
-        const float c = RB(x[i + 2]);
-        const float d = RB(x[i + 3]);
-        sum += RB(RB(RB(a + b) + c) + d);
-        x_thread[i] = a;
-        x_thread[i + 1] = b / 16.0f;
-        x_thread[i + 2] = c / 256.0f;
-        x_thread[i + 3] = d / 4096.0f;
-    }
-    return sum;
-}
-
-// load_vector over f32 activations (the shared expert's).
-inline float load_vector_f32(const device float* x, thread float* x_thread) {
-    float sum = 0;
-    for (int i = 0; i < 16; i += 4) {
-        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-        x_thread[i] = x[i];
-        x_thread[i + 1] = x[i + 1] / 16.0f;
-        x_thread[i + 2] = x[i + 2] / 256.0f;
-        x_thread[i + 3] = x[i + 3] / 4096.0f;
-    }
-    return sum;
-}
-
-// qdot for 4-bit weights, 16 values.
-inline float qdot4(
-    const device uint16_t* ws,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum) {
-    float accum = 0;
-    for (int i = 0; i < 4; i++) {
-        accum +=
-            (x_thread[4 * i] * (ws[i] & 0x000f) +
-             x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-             x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-             x_thread[4 * i + 3] * (ws[i] & 0xf000));
-    }
-    return scale * accum + sum * bias;
-}
-
-// load_vector and qdot for 8-bit weights over f32 activations, `V` values a lane: the router's
-// gate matvec (`V` is 8 under `qmv_fast`, 4 under `qmv`).
-template <int V>
-inline float load_vector8(const device float* x, thread float* x_thread) {
-    float sum = 0;
-    for (int i = 0; i < V; i++) {
-        sum += x[i];
-        x_thread[i] = x[i];
-    }
-    return sum;
-}
-template <int V>
-inline float qdot8(
-    const device uint8_t* w,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum) {
-    float accum = 0;
-    for (int i = 0; i < V; i++) {
-        accum += x_thread[i] * w[i];
-    }
-    return scale * accum + sum * bias;
-}
-
 // MLX's Sigmoid on f32 and on bf16 (every operation rounds to bf16; `x` is already bf16).
 inline float sigmoid_f32(float x) {
     const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
@@ -507,6 +429,7 @@ impl Kernels {
         } else {
             EXPERT_FROM_LOGITS
         };
+        let header = format!("{QMV_HEADER}{MOE_HEADER}");
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
         Ok(Self {
@@ -516,7 +439,7 @@ impl Kernels {
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "inds",
                 ],
                 &["act"],
-                MOE_HEADER,
+                &header,
                 &matvec(
                     GATE_UP_SOURCE.replace("/*EXPERT*/", EXPERT_FROM_INDICES),
                     probe.gateup,
@@ -530,7 +453,7 @@ impl Kernels {
                     "x", "w", "sc", "bi", "gw", "gs", "gb", "uw", "us", "ub", "logits",
                 ],
                 &["act", "inds", "scores", "sscore"],
-                MOE_HEADER,
+                &header,
                 &matvec(
                     GATE_UP_SOURCE.replace("/*EXPERT*/", routed_expert),
                     probe.gateup,
@@ -544,7 +467,7 @@ impl Kernels {
                     "act", "w", "sc", "bi", "dw", "ds", "db", "inds", "scores", "sscore",
                 ],
                 &["out"],
-                MOE_HEADER,
+                &header,
                 &matvec(DOWN_COMBINE_SOURCE.to_owned(), probe.down),
                 /* ensure_row_contiguous */ true,
                 /* atomic_outputs */ false,
@@ -553,7 +476,7 @@ impl Kernels {
                 "moe_decode_router_logits",
                 &["x", "gw", "gs", "gb", "sw", "ss", "sb"],
                 &["logits"],
-                MOE_HEADER,
+                &header,
                 if probe.logits {
                     ROUTER_LOGITS_ZERO
                 } else {
