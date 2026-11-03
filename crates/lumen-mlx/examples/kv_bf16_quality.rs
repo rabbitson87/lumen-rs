@@ -48,8 +48,8 @@
 //! ... --example kv_bf16_quality -- --window-control
 //!
 //! # the fused MoE decode kernels against the composed ops, one token per forward (the kernels
-//! # run on single-token steps only); the experts are stacked at load, hence the env
-//! LUMEN_NATIVE_FUSED_MOE_DECODE=1 MODEL_ID=... ... --example kv_bf16_quality -- --fused-moe-decode
+//! # run on single-token steps only); the experts are stacked at load, so the flag must not be 0
+//! MODEL_ID=... ... --example kv_bf16_quality -- --fused-moe-decode
 //! ```
 
 use anyhow::{Result, anyhow};
@@ -282,11 +282,11 @@ fn main() -> Result<()> {
         ));
     }
     if mode == Mode::FusedMoeDecode
-        && std::env::var("LUMEN_NATIVE_FUSED_MOE_DECODE").as_deref() != Ok("1")
+        && std::env::var("LUMEN_NATIVE_FUSED_MOE_DECODE").as_deref() == Ok("0")
     {
         return Err(anyhow!(
-            "--fused-moe-decode switches kernels over experts stacked at load: run with \
-             LUMEN_NATIVE_FUSED_MOE_DECODE=1"
+            "--fused-moe-decode switches kernels over experts stacked at load: do not run with \
+             LUMEN_NATIVE_FUSED_MOE_DECODE=0"
         ));
     }
 

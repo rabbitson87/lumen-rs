@@ -247,7 +247,7 @@ mod imp {
         /// The kernels round where the composed block rounds (including MLX's bf16 sum of the
         /// activation in `load_vector`), but a dot product accumulates in a different order, so
         /// the result is the composed block's up to float noise and not bit-identical: a
-        /// `Behavior` flag, off by default.
+        /// `Behavior` flag. Default on; `=0` restores the composed ops.
         ///
         /// Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
         /// 12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
@@ -259,7 +259,7 @@ mod imp {
         /// kernel paths, not a loss on top of it.
         pub(crate) fused_moe_decode {
             env: "LUMEN_NATIVE_FUSED_MOE_DECODE",
-            default: false,
+            default: true,
             kind: Behavior,
         }
     }
@@ -1155,11 +1155,15 @@ mod imp {
         })
     }
 
+    /// `stack_requested`: the model is resident (not SSD-offloaded) and a flag wants the experts
+    /// stacked. The layer is stacked if `LUMEN_NATIVE_FUSE_MOE_GATE_UP` asks for it outright or
+    /// the decode kernels can read it (affine 4-bit group 64); an mxfp4 layer would only pay the
+    /// load time.
     fn resolve_moe_layer(
         weights: &NativeWeights,
         config: &NativeModelConfig,
         layer_idx: usize,
-        fuse_gate_up: bool,
+        stack_requested: bool,
     ) -> Result<ResolvedMoeWeights> {
         let cfg = &config.text_config;
         let prefix = format!("language_model.model.layers.{layer_idx}.mlp");
@@ -1234,7 +1238,9 @@ mod imp {
             scales: sw_up_s,
             biases: sw_up_b,
         };
-        let sw_gate_up = if fuse_gate_up {
+        let stack = stack_requested
+            && (fuse_moe_gate_up::get() || (sw_mode == MODE_AFFINE && sw_bits == 4 && sw_gs == 64));
+        let sw_gate_up = if stack {
             ResolvedGateUp::Fused(fuse_expert_gate_up(&sw_gate, &sw_up)?)
         } else {
             ResolvedGateUp::Split {
@@ -1275,7 +1281,7 @@ mod imp {
             sg_bits,
             top_k: cfg.num_experts_per_tok as i32,
             norm_topk_prob: cfg.norm_topk_prob,
-            decode_kernels_ready: fuse_gate_up,
+            decode_kernels_ready: stack,
         })
     }
 
@@ -1383,10 +1389,10 @@ mod imp {
         }
 
         /// A layer whose experts have real `[E, out, ..]` shapes, so they can be stacked.
-        fn stackable_bag(mode: &str) -> NativeWeights {
+        fn stackable_bag(mode: &str, group: i32) -> NativeWeights {
             const E: i32 = 3;
             const HIDDEN: i32 = 64;
-            const INTER: i32 = 32;
+            const INTER: i32 = 64;
             let affine = mode == "affine";
             let mut weights = bag(if affine {
                 &["switch_mlp", "shared_expert"]
@@ -1405,7 +1411,7 @@ mod imp {
                     .as_dtype(mlx_rs::Dtype::Bfloat16)
                     .expect("bf16");
                 let (wq, sc, bi) =
-                    quantize_with_mode(&w, 32, 4, if affine { MODE_AFFINE } else { MODE_MXFP4 })
+                    quantize_with_mode(&w, group, 4, if affine { MODE_AFFINE } else { MODE_MXFP4 })
                         .expect("quantize");
                 let base = format!("{PREFIX}.switch_mlp.{proj}");
                 weights.tensors.insert(format!("{base}.weight"), wq);
@@ -1417,28 +1423,26 @@ mod imp {
             weights
         }
 
-        fn config32(mode: &str) -> NativeModelConfig {
+        fn config_with_group(mode: &str, group: usize) -> NativeModelConfig {
             let mut cfg = config(mode);
             if let Some(q) = cfg.quantization_config.as_mut() {
-                q.group_size = 32;
+                q.group_size = group;
             }
             cfg
         }
 
         /// The stacked tensors hold the gate rows then the up rows of every expert, for
-        /// both quantization modes, and replace the separate ones.
+        /// both quantization modes.
         #[test]
         fn stacked_experts_are_the_gate_rows_then_the_up_rows() {
             for mode in ["affine", "mxfp4"] {
-                let bag = stackable_bag(mode);
-                let cfg = config32(mode);
+                let bag = stackable_bag(mode, 32);
+                let cfg = config_with_group(mode, 32);
                 let split = resolve_moe_layer(&bag, &cfg, 0, false).expect("split resolves");
-                let fused = resolve_moe_layer(&bag, &cfg, 0, true).expect("stacked resolves");
-                let (ResolvedGateUp::Split { gate, up }, ResolvedGateUp::Fused(both)) =
-                    (&split.sw_gate_up, &fused.sw_gate_up)
-                else {
-                    panic!("{mode}: wrong layouts");
+                let ResolvedGateUp::Split { gate, up } = &split.sw_gate_up else {
+                    panic!("{mode}: stacked without being asked");
                 };
+                let both = &fuse_expert_gate_up(gate, up).expect("stack");
                 // Per expert `e`: the stacked rows are `gate[e]` followed by `up[e]`.
                 let expert_rows = |a: &Array, e: usize| -> Vec<u8> {
                     let per_expert = a.shape()[1] as usize * a.shape()[2] as usize;
@@ -1471,9 +1475,40 @@ mod imp {
             }
         }
 
+        /// A layer is stacked only when something reads the stack: the decode kernels read affine
+        /// 4-bit group-64 experts, so an mxfp4 or group-32 layer would only pay the load time.
+        #[test]
+        fn only_layers_the_decode_kernels_can_read_are_stacked() {
+            let stacked = |mode: &str, group: i32, requested: bool| {
+                let resolved = resolve_moe_layer(
+                    &stackable_bag(mode, group),
+                    &config_with_group(mode, group as usize),
+                    0,
+                    requested,
+                )
+                .expect("resolves");
+                let is_stack = matches!(resolved.sw_gate_up, ResolvedGateUp::Fused(_));
+                assert_eq!(resolved.decode_kernels_ready, is_stack, "{mode} g{group}");
+                is_stack
+            };
+            assert!(
+                stacked("affine", 64, true),
+                "affine 4-bit group 64 is what the kernels read"
+            );
+            assert!(!stacked("affine", 64, false), "nothing asked for a stack");
+            assert!(
+                !stacked("affine", 32, true),
+                "the kernels are written for group 64"
+            );
+            assert!(
+                !stacked("mxfp4", 32, true),
+                "the kernels read affine experts"
+            );
+        }
+
         #[test]
         fn dropping_the_separate_experts_leaves_the_stacked_ones() {
-            let mut bag = stackable_bag("mxfp4");
+            let mut bag = stackable_bag("mxfp4", 32);
             let down = format!("{PREFIX}.switch_mlp.down_proj.weight");
             bag.release_expert_gate_up();
             assert!(bag.keys().all(|k| !k.contains("switch_mlp.gate_proj")));
@@ -1969,7 +2004,13 @@ mod imp {
             if widen_scales::get() {
                 weights.release_scales_and_biases();
             }
-            if fuse_experts && mlp_kind == MlpKind::Moe {
+            let stacked_any = layer_weights.iter().any(|l| {
+                matches!(
+                    &l.mlp,
+                    MlpWeights::Moe(m) if matches!(m.sw_gate_up, ResolvedGateUp::Fused(_))
+                )
+            });
+            if stacked_any {
                 weights.release_expert_gate_up();
                 // The sources of each stack were read into buffers that are now idle.
                 let _ = crate::metal_memory::clear_cache();

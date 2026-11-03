@@ -42,7 +42,7 @@ value → on.
 | `LUMEN_NATIVE_COMPILE` | on | Optimization | `lumen_mlx::native_ssm::imp::ssm_compile` |
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
-| `LUMEN_NATIVE_FUSED_MOE_DECODE` | off | Behavior | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
+| `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Behavior | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
 | `LUMEN_NATIVE_FUSE_LINATTN_IN` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_linattn_in` |
 | `LUMEN_NATIVE_FUSE_MOE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_moe_gate_up` |
@@ -495,7 +495,7 @@ Conv-state advance via `slice` (view/copy) instead of `take_axis`
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 
-*Behavior, default off.*
+*Behavior, default on.*
 
 Run a single-token decode step's routed and shared experts in two Metal kernels
  (`native_moe_decode`) instead of about twenty-five MLX ops. Implies the stacked
@@ -506,7 +506,7 @@ Run a single-token decode step's routed and shared experts in two Metal kernels
  The kernels round where the composed block rounds (including MLX's bf16 sum of the
  activation in `load_vector`), but a dot product accumulates in a different order, so
  the result is the composed block's up to float noise and not bit-identical: a
- `Behavior` flag, off by default.
+ `Behavior` flag. Default on; `=0` restores the composed ops.
 
  Qwen3.6-35B-A3B affine, M3 Max, pipelined greedy decode, ABBA over four server runs:
  12.0 / 12.0 ms/token off against 11.1 / 11.1 on (-0.9 ms, -7.5%); 814 of 819 generated
