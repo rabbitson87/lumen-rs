@@ -3501,7 +3501,15 @@ impl MlxBackend {
     ) -> Result<Vec<u32>> {
         match self {
             Self::Qwen35Family(m) => {
-                let _ = (temperature, top_p, ov);
+                // Installed on every request, greedy ones included, as every
+                // chat entry point does: the decode steps read it, so leaving
+                // it out decoded a completion with the previous request's
+                // temperature and seed, and never with its own.
+                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(
+                    temperature,
+                    top_p,
+                    ov,
+                ));
                 // Unconditional, like the chat twin: without an explicit id the
                 // prompt identifies its own continuation, so a client that
                 // re-sends prompt + completion + more extends the KV instead of
@@ -9627,6 +9635,28 @@ mod tests {
                      sampling must not survive"
                 );
             }
+        }
+    }
+
+    /// RED before: `/v1/completions` dropped the request's `temperature` and
+    /// `top_p` on Qwen and installed nothing, while its decode steps read the
+    /// installed sampling, so a completion decoded greedily when it asked to
+    /// sample, and with the previous request's temperature and seed when it
+    /// asked for greedy.
+    #[test]
+    fn a_completion_decodes_with_its_own_sampling() {
+        let ov = SamplingOverrides::default();
+        let leftover = MlxQwen35Backend::qwen_sampling_config(1.5, 0.9, &ov);
+        for (temperature, sampled) in [(0.0, false), (0.8, true)] {
+            let mut b = qwen_with_prefix_cache();
+            qwen(&mut b).set_sampling(leftover);
+            b.generate(&[CHAT_BLUE, CHAT_BLUE], 4, temperature, 1.0, &ov, None)
+                .expect("a scripted completion");
+            assert_eq!(
+                qwen(&mut b).sampling.map(|c| c.temperature),
+                sampled.then_some(temperature),
+                "temperature {temperature}: the completion must decode with its own sampling"
+            );
         }
     }
 

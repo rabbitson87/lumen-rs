@@ -654,6 +654,26 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "qwen-completion-sampling-dropped",
+        symptom: "`/v1/completions` on Qwen still opened with \
+                  `let _ = (temperature, top_p, ov)` after the chat entry points \
+                  were fixed, and installed no sampling at all. Its decode steps \
+                  read whatever the last request installed: a sampled completion \
+                  decoded greedily (measured on Qwen3.6-35B-A3B: \
+                  `temperature: 0.7` ran at the greedy pipeline's 9.0 ms/token \
+                  with identical text on every run), and a greedy completion \
+                  after a sampled chat request sampled",
+        revert: &[Mutation {
+            path: MLX,
+            find: "                // temperature and seed, and never with its own.\n                m.set_sampling(MlxQwen35Backend::qwen_sampling_config(\n                    temperature,\n                    top_p,\n                    ov,\n                ));",
+            replace: "                // temperature and seed, and never with its own.\n                let _ = (temperature, top_p, ov); // defect: the request's sampling is dropped",
+        }],
+        guards: &[core_mlx_lib(
+            "tests::a_completion_decodes_with_its_own_sampling",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "tool-schema-uncounted-in-usage",
         symptom: "`usage.prompt_tokens` omitted the entire tool-schema block. \
                   The counter rendered through the tool-free `build_chat_input` \
@@ -2178,6 +2198,7 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         | (_, "tool-schema-uncounted-in-usage")
         | (_, "tool-history-uncounted")
         | (_, "qwen-sampling-discarded")
+        | (_, "qwen-completion-sampling-dropped")
         | (_, "mtp-drops-sampling-knobs")
         | (_, "replay-drops-think-block")
         | (_, "gemma-batch-grammar-skips-prefix-cache") => "lib.rs",
