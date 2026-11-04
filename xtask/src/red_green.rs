@@ -845,6 +845,23 @@ static DEFECTS: &[Defect] = &[
         ..PLAIN
     },
     Defect {
+        name: "top-p-draw-ignores-the-kept-mass",
+        symptom: "a top-p draw scaled its uniform by 1 instead of the nucleus \
+                  mass, so the mass top-p cut away fell through to the last \
+                  token kept and the least likely survivor came up far too \
+                  often; every draw was still inside the nucleus, so only a \
+                  test of the sampled distribution itself sees it",
+        revert: &[Mutation {
+            path: CORE,
+            find: "    let r = rng.next_f32() * mass;\n    let mut acc = 0.0_f32;\n    for &i in &kept {",
+            replace: "    let r = rng.next_f32(); // defect: the kept mass is ignored\n    let mut acc = 0.0_f32;\n    for &i in &kept {",
+        }],
+        guards: &[core(
+            "sampling::nucleus_tests::sampled_tokens_follow_the_nucleus_distribution",
+        )],
+        ..PLAIN
+    },
+    Defect {
         name: "greedy-decode-drops-the-grammar",
         symptom: "on Gemma 4 a grammar was applied only by the sampled decode \
                   branch, so a greedy request (temperature 0, penalties off — \
@@ -2167,7 +2184,9 @@ fn file_for(defect: &Defect, m: &Mutation) -> PathBuf {
         (_, "gemma-cached-stream-thought-channel") | (_, "greedy-decode-drops-the-grammar") => {
             "gemma4_backend.rs"
         }
-        (_, "temperature-zero-is-a-coin-flip") => "sampling.rs",
+        (_, "temperature-zero-is-a-coin-flip") | (_, "top-p-draw-ignores-the-kept-mass") => {
+            "sampling.rs"
+        }
         (_, "gemma-boundary-prefill-unchunked") | (_, "gemma-drop-leaves-boundary-snapshot") => {
             "gemma4_backend.rs"
         }

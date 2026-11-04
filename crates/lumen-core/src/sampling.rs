@@ -250,38 +250,120 @@ pub fn sample_top_p(probs: &[f32], top_p: f32, rng: &mut Xorshift64) -> u32 {
         return categorical(probs, rng);
     }
 
-    let mut idx: Vec<u32> = (0..probs.len() as u32).collect();
-    idx.sort_unstable_by(|&a, &b| {
-        probs[b as usize]
-            .partial_cmp(&probs[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut cum = 0.0_f32;
-    let mut cutoff = idx.len();
-    for (rank, &i) in idx.iter().enumerate() {
-        cum += probs[i as usize];
-        if cum >= top_p {
-            cutoff = rank + 1;
-            break;
-        }
-    }
-    cutoff = cutoff.max(1);
-
-    let kept = &idx[..cutoff];
+    let kept = nucleus(probs, top_p);
     let mass: f32 = kept.iter().map(|&i| probs[i as usize]).sum();
     if mass <= 0.0 {
         return kept[0];
     }
     let r = rng.next_f32() * mass;
     let mut acc = 0.0_f32;
-    for &i in kept {
+    for &i in &kept {
         acc += probs[i as usize];
         if r < acc {
             return i;
         }
     }
     *kept.last().unwrap()
+}
+
+/// Bits of an `f32` dropped to name its top-p bucket. What is left is the
+/// exponent and the top three mantissa bits, so a bucket spans an eighth of an
+/// octave; positive floats order like their bit patterns, so buckets order like
+/// the probabilities in them.
+const NUCLEUS_BUCKET_SHIFT: u32 = 20;
+/// A bucket for every rank key, `0.0` up to infinity (a key never has its sign
+/// bit set).
+const NUCLEUS_BUCKETS: usize = 1 << (31 - NUCLEUS_BUCKET_SHIFT);
+
+/// What top-p ranks a token by: its probability, with zero, negative and NaN
+/// entries all ranked as zero, so the order is total.
+#[inline]
+fn rank_key(p: f32) -> f32 {
+    if p > 0.0 { p } else { 0.0 }
+}
+
+#[inline]
+fn nucleus_bucket(p: f32) -> usize {
+    (rank_key(p).to_bits() >> NUCLEUS_BUCKET_SHIFT) as usize
+}
+
+/// Top-p ranks tokens most probable first, the lower id first on a tie.
+fn rank_order(probs: &[f32], a: u32, b: u32) -> std::cmp::Ordering {
+    rank_key(probs[b as usize])
+        .total_cmp(&rank_key(probs[a as usize]))
+        .then(a.cmp(&b))
+}
+
+/// Where the top-p nucleus ends, as `(id, rank key)` of its last token: the
+/// nucleus is the shortest run of the vocabulary in rank order whose mass
+/// reaches `top_p`. `None` when no run does, so the nucleus is everything.
+///
+/// Only one bucket is sorted. A histogram of the mass by bucket names the
+/// bucket the run ends in: every token above it is in the nucleus and every
+/// token below it out, so the cut is found by ranking that bucket alone. Sums
+/// are `f64`, so they differ from exact ones by rounding alone; an `f32` running
+/// sum drifts by more than a small token's mass over a long run.
+fn nucleus_end(probs: &[f32], top_p: f32) -> Option<(u32, f32)> {
+    let mut mass = [0.0_f64; NUCLEUS_BUCKETS];
+    for &p in probs {
+        mass[nucleus_bucket(p)] += f64::from(rank_key(p));
+    }
+    let target = f64::from(top_p);
+    let mut above = 0.0_f64;
+    let mut floor = None;
+    for b in (0..NUCLEUS_BUCKETS).rev() {
+        if above + mass[b] >= target {
+            floor = Some(b);
+            break;
+        }
+        above += mass[b];
+    }
+    let floor = floor?;
+    let mut boundary: Vec<u32> = (0..probs.len() as u32)
+        .filter(|&i| nucleus_bucket(probs[i as usize]) == floor)
+        .collect();
+    boundary.sort_unstable_by(|&a, &b| rank_order(probs, a, b));
+    let mut cum = above;
+    // The bucket's own sum reached `target` in the histogram; summed again in
+    // rank order it can fall short by rounding, and then the whole bucket is in.
+    let last = boundary
+        .iter()
+        .position(|&i| {
+            cum += f64::from(rank_key(probs[i as usize]));
+            cum >= target
+        })
+        .map_or(boundary.last().copied(), |r| Some(boundary[r]))?;
+    Some((last, rank_key(probs[last as usize])))
+}
+
+/// Whether a token with rank key `key` is in the nucleus that ends at `end`.
+#[inline]
+fn in_nucleus(id: u32, key: f32, (end, end_key): (u32, f32)) -> bool {
+    key > end_key || (key == end_key && id <= end)
+}
+
+/// The top-p nucleus in rank order (see [`nucleus_end`]).
+fn nucleus(probs: &[f32], top_p: f32) -> Vec<u32> {
+    let mut kept: Vec<u32> = match nucleus_end(probs, top_p) {
+        Some(end) => (0..probs.len() as u32)
+            .filter(|&i| in_nucleus(i, rank_key(probs[i as usize]), end))
+            .collect(),
+        None => (0..probs.len() as u32).collect(),
+    };
+    kept.sort_unstable_by(|&a, &b| rank_order(probs, a, b));
+    kept
+}
+
+/// Zero every probability outside the top-p nucleus, in place.
+fn mask_outside_nucleus(probs: &mut [f32], top_p: f32) {
+    let Some(end) = nucleus_end(probs, top_p) else {
+        return;
+    };
+    for (i, p) in probs.iter_mut().enumerate() {
+        if !in_nucleus(i as u32, rank_key(*p), end) {
+            *p = 0.0;
+        }
+    }
 }
 
 fn categorical(probs: &[f32], rng: &mut Xorshift64) -> u32 {
@@ -432,25 +514,7 @@ pub fn sampling_distribution(logits: &mut [f32], recent: &[u32], cfg: &SamplingC
     // so the returned vector is the exact distribution sampled from.
     let top_p = cfg.top_p;
     if top_p < 1.0 && top_p > 0.0 {
-        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-        idx.sort_unstable_by(|&a, &b| {
-            logits[b as usize]
-                .partial_cmp(&logits[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut cum = 0.0_f32;
-        let mut cutoff = idx.len();
-        for (rank, &i) in idx.iter().enumerate() {
-            cum += logits[i as usize];
-            if cum >= top_p {
-                cutoff = rank + 1;
-                break;
-            }
-        }
-        cutoff = cutoff.max(1);
-        for &i in &idx[cutoff..] {
-            logits[i as usize] = 0.0;
-        }
+        mask_outside_nucleus(logits, top_p);
         let mass: f32 = logits.iter().sum();
         if mass > 0.0 {
             let inv = 1.0 / mass;
@@ -798,5 +862,208 @@ mod tests {
         // The peak (idx 0) softmax prob > 0.6 alone, so only idx 0 survives.
         assert!(dist[0] > 0.99, "nucleus collapses to peak: {dist:?}");
         assert_eq!(dist[3], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod nucleus_tests {
+    use super::*;
+
+    const TOP_PS: [f32; 8] = [1e-4, 0.1, 0.5, 0.8, 0.9, 0.95, 0.99, 0.999_999];
+
+    /// Every token in the order its definition names: most probable first,
+    /// the lower id first on a tie, zero / negative / NaN ranked as zero.
+    fn ranked_by_definition(probs: &[f32]) -> Vec<u32> {
+        let key = |i: u32| {
+            let p = probs[i as usize];
+            if p > 0.0 { p } else { 0.0 }
+        };
+        let mut ids: Vec<u32> = (0..probs.len() as u32).collect();
+        ids.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap().then(a.cmp(&b)));
+        ids
+    }
+
+    /// The shortest run of `ranked` whose mass reaches `top_p`, or all of it.
+    fn cut_by_definition<'a>(probs: &[f32], ranked: &'a [u32], top_p: f32) -> &'a [u32] {
+        let mut cum = 0.0_f64;
+        let len = ranked
+            .iter()
+            .position(|&i| {
+                cum += f64::from(probs[i as usize].max(0.0));
+                cum >= f64::from(top_p)
+            })
+            .map_or(ranked.len(), |r| r + 1);
+        &ranked[..len]
+    }
+
+    fn gaussian(rng: &mut Xorshift64) -> f32 {
+        let u1 = rng.next_f32().max(1e-7);
+        let u2 = rng.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+
+    fn softmax(mut logits: Vec<f32>) -> Vec<f32> {
+        softmax_inplace(&mut logits);
+        logits
+    }
+
+    /// Probability vectors of the shapes a sampler meets: flat to peaked,
+    /// logits on a coarse grid (bf16 logits tie constantly), a masked tail,
+    /// a power law, and one flat vector.
+    fn distributions() -> Vec<(String, Vec<f32>)> {
+        let mut rng = Xorshift64::new(7);
+        let mut out = Vec::new();
+        for n in [1usize, 2, 7, 1000, 50_000] {
+            for scale in [0.3_f32, 1.0, 3.0, 8.0] {
+                let logits: Vec<f32> = (0..n).map(|_| gaussian(&mut rng) * scale).collect();
+                let tied: Vec<f32> = logits.iter().map(|l| (l * 8.0).round() / 8.0).collect();
+                let masked: Vec<f32> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &l)| if i % 3 == 1 { f32::NEG_INFINITY } else { l })
+                    .collect();
+                out.push((format!("gaussian n={n} scale={scale}"), softmax(logits)));
+                out.push((format!("tied n={n} scale={scale}"), softmax(tied)));
+                out.push((format!("masked n={n} scale={scale}"), softmax(masked)));
+            }
+        }
+        let zipf: Vec<f32> = (0..20_000)
+            .map(|i| -1.1 * ((i * 7919 % 20_000) as f32 + 1.0).ln())
+            .collect();
+        out.push(("zipf".into(), softmax(zipf)));
+        out.push(("flat".into(), vec![1.0 / 4096.0; 4096]));
+        out
+    }
+
+    #[test]
+    fn the_nucleus_is_the_run_its_definition_names() {
+        for (name, probs) in distributions() {
+            let ranked = ranked_by_definition(&probs);
+            for top_p in TOP_PS {
+                let kept = cut_by_definition(&probs, &ranked, top_p);
+                assert_eq!(nucleus(&probs, top_p), kept, "{name}, top_p={top_p}");
+                let mut masked = probs.clone();
+                mask_outside_nucleus(&mut masked, top_p);
+                let mut expected = vec![0.0; probs.len()];
+                for &i in kept {
+                    expected[i as usize] = probs[i as usize];
+                }
+                assert_eq!(masked, expected, "mask: {name}, top_p={top_p}");
+            }
+        }
+    }
+
+    /// Tokens too small for an `f32` running sum still count toward `top_p`.
+    /// Each of the hundred is under half an ulp of 0.9, so an `f32` sum stalls
+    /// there and would keep the whole vocabulary, the 1e-12 tail included; their
+    /// mass passes `top_p` after 41 of them.
+    #[test]
+    fn small_probabilities_add_up_to_the_cut() {
+        let mut probs = vec![0.9_f32];
+        probs.extend(std::iter::repeat_n(2.5e-8_f32, 100));
+        probs.extend(std::iter::repeat_n(1e-12_f32, 10));
+        let top_p = 0.900_001;
+        let kept = nucleus(&probs, top_p);
+        assert_eq!(kept, (0..=41).collect::<Vec<u32>>());
+        assert_eq!(
+            kept,
+            cut_by_definition(&probs, &ranked_by_definition(&probs), top_p)
+        );
+    }
+
+    /// The distribution a sampler is meant to draw from: the nucleus by its
+    /// definition, renormalized.
+    fn intended(probs: &[f32], top_p: f32) -> Vec<f64> {
+        let ranked = ranked_by_definition(probs);
+        let kept = cut_by_definition(probs, &ranked, top_p);
+        let mass: f64 = kept.iter().map(|&i| f64::from(probs[i as usize])).sum();
+        let mut q = vec![0.0; probs.len()];
+        for &i in kept {
+            q[i as usize] = f64::from(probs[i as usize]) / mass;
+        }
+        q
+    }
+
+    /// Kolmogorov–Smirnov distance from uniform of the draws' randomized
+    /// probability integral transform: a token `x` maps to the target mass of
+    /// every token less probable than it, plus a uniform share of its own.
+    /// Draws from `target` make those points uniform on `[0, 1)`; any other
+    /// distribution, even one with the same support, does not.
+    fn pit_ks_distance(target: &[f64], draws: &[u32]) -> f64 {
+        let mut order: Vec<usize> = (0..target.len()).collect();
+        order.sort_by(|&a, &b| target[a].total_cmp(&target[b]).then(a.cmp(&b)));
+        let mut below = vec![0.0; target.len()];
+        let mut acc = 0.0;
+        for &i in &order {
+            below[i] = acc;
+            acc += target[i];
+        }
+        let mut jitter = Xorshift64::new(0xC0FFEE);
+        let mut u: Vec<f64> = draws
+            .iter()
+            .map(|&t| {
+                let v = (jitter.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                below[t as usize] + v * target[t as usize]
+            })
+            .collect();
+        u.sort_by(f64::total_cmp);
+        let n = u.len() as f64;
+        u.iter()
+            .enumerate()
+            .map(|(i, &x)| ((i + 1) as f64 / n - x).max(x - i as f64 / n))
+            .fold(0.0, f64::max)
+    }
+
+    /// Both samplers draw from the nucleus they are meant to, not merely from
+    /// inside it: the `sample_from_logits` path (`sample_top_p`) and the
+    /// `sampling_distribution` + `sample_distribution` path Qwen decodes with.
+    /// The bound is the KS critical value at α = 0.001.
+    #[test]
+    fn sampled_tokens_follow_the_nucleus_distribution() {
+        const DRAWS: usize = 20_000;
+        let bound = 1.95 / (DRAWS as f64).sqrt();
+        let mut rng = Xorshift64::new(11);
+        let wide: Vec<f32> = (0..4096)
+            .map(|_| (gaussian(&mut rng) * 3.0 * 8.0).round() / 8.0)
+            .collect();
+        let cases = [
+            // The boundary token holds a sixth of the nucleus.
+            (
+                "five tokens",
+                [0.3_f32, 0.25, 0.2, 0.15, 0.1].map(f32::ln).to_vec(),
+                0.8,
+            ),
+            ("4096 tied logits", wide, 0.9),
+        ];
+        let cfg = |top_p| SamplingConfig {
+            temperature: 1.0,
+            top_p,
+            ..SamplingConfig::default()
+        };
+        for (name, logits, top_p) in cases {
+            let target = intended(&softmax(logits.clone()), top_p);
+            let mut rng = Xorshift64::new(5);
+            let from_logits: Vec<u32> = (0..DRAWS)
+                .map(|_| sample_from_logits(&mut logits.clone(), &[], &cfg(top_p), &mut rng))
+                .collect();
+            let p = sampling_distribution(&mut logits.clone(), &[], &cfg(top_p));
+            let from_distribution: Vec<u32> = (0..DRAWS)
+                .map(|_| sample_distribution(&p, &mut rng))
+                .collect();
+            for (path, draws) in [
+                ("sample_from_logits", from_logits),
+                ("sampling_distribution", from_distribution),
+            ] {
+                assert!(
+                    draws.iter().all(|&t| target[t as usize] > 0.0),
+                    "{name}, {path}: drew a token outside the nucleus"
+                );
+                let d = pit_ks_distance(&target, &draws);
+                assert!(
+                    d < bound,
+                    "{name}, {path}: KS distance {d:.4} over the bound {bound:.4}"
+                );
+            }
+        }
     }
 }
