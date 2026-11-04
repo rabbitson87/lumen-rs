@@ -41,10 +41,12 @@ lumen_flags::flag! {
     /// a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
     /// which casts the bf16 scales per call there; against a matmul that size the cast is noise.
     ///
-    /// Bit-identical: the kernels run MLX's own matvec for that many rows on this GPU (`qmv_fast`
-    /// for one, `qmv_wide` or `qmv_fast` for more), its lane partition and order of adds, and
-    /// widening a bf16 or f16 scale to f32 is exact. An `Optimization` flag. Default on; `=0` keeps
-    /// MLX's matmul (and widens every affine projection's scales again).
+    /// Bit-identical: the kernels run MLX's own matvec arithmetic for that many rows on this GPU
+    /// (`qmv_fast` for one; for more, `qmv_wide` or `qmv_fast` as MLX would, or `qmv_fast` row by
+    /// row under `LUMEN_NATIVE_DECODE_QMV_ROWS`, which this flag's off path then also runs row by
+    /// row), its lane partition and order of adds, and widening a bf16 or f16 scale to f32 is
+    /// exact. An `Optimization` flag. Default on; `=0` keeps MLX's matmul (and widens every affine
+    /// projection's scales again).
     ///
     /// M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
     /// 218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
@@ -60,43 +62,80 @@ lumen_flags::flag! {
     }
 }
 
+lumen_flags::flag! {
+    /// Run a matvec of two to four vectors (an MTP verify, a few sequences decoded together, a
+    /// prompt of a few tokens) as `qmv_fast`'s arithmetic for each vector, all of them in the same
+    /// simdgroups, so each weight block is read once and dotted with every vector. Each row then
+    /// equals the single-vector matvec of that row in every bit. MLX runs that many vectors as
+    /// `qmv_wide` from GPU generation 15 on, whose lane partition differs.
+    ///
+    /// **`Behavior`, not `Optimization`**: the low bits differ from MLX's matvec of that many rows
+    /// (not from a decode step). In exchange an MTP verify computes exactly what the decode steps it
+    /// stands in for would, and a sequence decoded beside others exactly what it would alone.
+    /// `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
+    /// same bits.
+    ///
+    /// M3 Max, GPU time per launch of 17408x5120: one vector 94.9 us; two as `qmv_wide` on the f32
+    /// activation 135.1 us, two here 105.5 us. Qwen3.6-27B MTP K=1 (in-process bench): cycle 96.1
+    /// -> 81.2 ms, 17.4 -> 20.6 tok/s, acceptance unchanged (0.670). Default on; `=0` runs them as
+    /// MLX would.
+    pub(crate) decode_qmv_rows {
+        env: "LUMEN_NATIVE_DECODE_QMV_ROWS",
+        default: true,
+        kind: Behavior,
+    }
+}
+
 /// Output rows one simdgroup owns, and simdgroups to a threadgroup: MLX's `qmv_fast` takes 4 and 2.
 const ROWS: i32 = 4;
 const SIMDGROUPS: i32 = 2;
+/// Vectors one simdgroup dots with each weight block: a `qmv_fast` matvec of up to this many runs
+/// them together (`decode_qmv_rows`, or MLX's choice below GPU generation 15), more one each.
+const MAX_ROW_VECTORS: i32 = 4;
 /// Projections one shared launch takes at most: linear attention's four input projections.
 const MAX_SHARED: usize = 4;
 
-/// MLX's `qmv_fast` (`qmv_fast_impl<float, 64, 4>`), one simdgroup per `R` output rows of vector
-/// `z`: lane `l` takes values `16 l .. 16 l + 16` of every block of 512, the rows' sums run block
-/// by block in `qdot`'s order, then `simd_sum` adds the lanes. [`fast_source`] puts in front of it
-/// the choice of the projection (`w`, `sc`, `bi`, `out`, `N`) and the row group `rg` within it.
+/// MLX's `qmv_fast` (`qmv_fast_impl<float, 64, 4>`), one simdgroup per `R` output rows of the `VV`
+/// vectors from `z * VV`: lane `l` takes values `16 l .. 16 l + 16` of every block of 512, each
+/// vector's row sums run block by block in `qdot`'s order, then `simd_sum` adds the lanes. A
+/// weight block is read once and dotted with each vector in turn, so every vector's arithmetic is
+/// `qmv_fast`'s for that vector alone. [`fast_source`] puts in front of it the choice of the
+/// projection (`w`, `sc`, `bi`, `out`, `N`) and the row group `rg` within it.
 const FAST_BODY: &str = r#"
     const int lane = thread_index_in_simdgroup;
-    const int vec = thread_position_in_grid.z;
+    const int vec0 = thread_position_in_grid.z * VV;
     constexpr int G = K / 64;
     constexpr int WPR = K / 8;
     constexpr int BLOCKS = K / 512;
-    const device float* xv = x + (size_t)vec * K;
-    float acc[R];
-    for (int r = 0; r < R; ++r) {
-        acc[r] = 0.0f;
+    float acc[VV][R];
+    for (int v = 0; v < VV; ++v) {
+        for (int r = 0; r < R; ++r) {
+            acc[v][r] = 0.0f;
+        }
     }
     for (int blk = 0; blk < BLOCKS; ++blk) {
-        float x_thread[16];
-        const float sum = load_vector_f32(xv + blk * 512 + lane * 16, x_thread);
+        float x_thread[VV][16];
+        float sum[VV];
+        for (int v = 0; v < VV; ++v) {
+            sum[v] = load_vector_f32(x + (size_t)(vec0 + v) * K + blk * 512 + lane * 16, x_thread[v]);
+        }
         const int scale_at = blk * 8 + lane / 4;
         for (int r = 0; r < R; ++r) {
             const size_t row = (size_t)rg * R + r;
             const device uint16_t* pw = (const device uint16_t*)(w + row * WPR + blk * 64 + lane * 2);
             const float s = sc[row * G + scale_at];
             const float b = bi[row * G + scale_at];
-            acc[r] += qdot4(pw, x_thread, s, b, sum);
+            for (int v = 0; v < VV; ++v) {
+                acc[v][r] += qdot4(pw, x_thread[v], s, b, sum[v]);
+            }
         }
     }
-    for (int r = 0; r < R; ++r) {
-        const float y = simd_sum(acc[r]);
-        if (lane == 0) {
-            out[(size_t)vec * N + rg * R + r] = y;
+    for (int v = 0; v < VV; ++v) {
+        for (int r = 0; r < R; ++r) {
+            const float y = simd_sum(acc[v][r]);
+            if (lane == 0) {
+                out[(size_t)(vec0 + v) * N + rg * R + r] = y;
+            }
         }
     }
 "#;
@@ -346,18 +385,68 @@ pub(crate) fn plan(x: &Array, w: &Weights<'_>) -> Option<Plan> {
         return None;
     }
     let vectors = i32::try_from(x.size() / inputs as usize).ok()?;
-    let kind = match vectors {
-        0 => return None,
-        // One vector runs as `qmv_fast` on every GPU.
-        1 => Kind::Fast,
-        _ => gpu()?.kind(vectors, inputs, outputs)?,
-    };
+    let kind = kind_for(vectors, inputs, outputs)?;
     Some(Plan {
         vectors,
         inputs,
         outputs,
         kind,
     })
+}
+
+/// The matvec the kernels run for `vectors` rows: `qmv_fast` for one on every GPU, and for two to
+/// [`MAX_ROW_VECTORS`] under `decode_qmv_rows`; otherwise MLX's choice on this GPU, `None` where
+/// that is a matrix kernel.
+fn kind_for(vectors: i32, inputs: i32, outputs: i32) -> Option<Kind> {
+    match vectors {
+        ..=0 => None,
+        1 => Some(Kind::Fast),
+        2..=MAX_ROW_VECTORS if decode_qmv_rows::get() => Some(Kind::Fast),
+        _ => gpu()?.kind(vectors, inputs, outputs),
+    }
+}
+
+/// The rows of a matvec that `decode_qmv_rows` makes row-exact while the kernels are off
+/// (`decode_qmv=0`): `x` f32, two to [`MAX_ROW_VECTORS`] rows, against an affine 4-bit group-64
+/// projection in `qmv_fast`'s lengths. The caller runs MLX's matmul on each row ([`row_by_row`]),
+/// which gives the kernels' bits. `None` otherwise.
+pub(crate) fn rows_without_kernels(x: &Array, w: &Weights<'_>) -> Option<i32> {
+    if decode_qmv::get() || !decode_qmv_rows::get() || x.dtype() != Dtype::Float32 {
+        return None;
+    }
+    let &[outputs, packed] = w.weight.shape() else {
+        return None;
+    };
+    let inputs = packed * 8;
+    let qmv_fast_lengths = w.mode == MODE_AFFINE
+        && (w.group_size, w.bits) == (64, 4)
+        && w.biases.is_some()
+        && w.weight.dtype() == Dtype::Uint32
+        && inputs % 512 == 0
+        && outputs % 8 == 0;
+    let vectors = i32::try_from(x.size() / inputs.max(1) as usize).ok()?;
+    (qmv_fast_lengths
+        && x.shape().last() == Some(&inputs)
+        && (2..=MAX_ROW_VECTORS).contains(&vectors))
+    .then_some(vectors)
+}
+
+/// `matmul` applied to each of `x`'s `rows` vectors alone, the outputs in `x`'s shape with the last
+/// axis the projection's outputs.
+pub(crate) fn row_by_row(
+    x: &Array,
+    rows: i32,
+    matmul: impl Fn(&Array) -> Result<Array>,
+) -> Result<Array> {
+    let inputs = *x.shape().last().context("row_by_row: scalar activation")?;
+    let flat = mlx_rs::ops::reshape(x, &[rows, 1, inputs])?;
+    let outs = mlx_rs::ops::split(&flat, rows, 0)?
+        .iter()
+        .map(&matmul)
+        .collect::<Result<Vec<Array>>>()?;
+    let y = mlx_rs::ops::concatenate_axis(&outs, 0)?;
+    let outputs = *y.shape().last().context("row_by_row: scalar output")?;
+    reshape_out(&y, x, outputs)
 }
 
 struct Kernels {
@@ -524,15 +613,22 @@ fn run_fast(x: &Array, plans: &[Plan], weights: &[Weights<'_>]) -> Result<Vec<Ar
         inputs,
         outputs,
     };
+    // Every vector's arithmetic is `qmv_fast`'s alone, however many share a simdgroup.
+    let vv = if vectors <= MAX_ROW_VECTORS {
+        vectors
+    } else {
+        1
+    };
     let config = config(key, |config| {
         config.add_template_arg_int("K", inputs)?;
         config.add_template_arg_int("R", ROWS)?;
+        config.add_template_arg_int("VV", vv)?;
         for (p, plan) in plans.iter().enumerate() {
             config.add_template_arg_int(&format!("N{p}"), plan.outputs)?;
             config.add_output_arg(&[vectors * plan.outputs], Dtype::Float32)?;
         }
         let groups: i32 = plans.iter().map(|p| p.outputs / ROWS).sum();
-        config.set_grid(32, groups, vectors)?;
+        config.set_grid(32, groups, vectors / vv)?;
         config.set_thread_group(32, SIMDGROUPS, 1)
     })?;
     let ys = with_kernels(|k| {
@@ -588,8 +684,8 @@ pub(crate) fn matvec(plan: &Plan, x: &Array, w: &Weights<'_>) -> Result<Array> {
 }
 
 /// `x @ deq(W).T` for each of up to four projections of one activation, in one launch, or `None`
-/// when that launch cannot run them: one is not the kernels' (see [`plan`]) or MLX would not run it
-/// as `qmv_fast` (several vectors on a GPU that runs them as `qmv_wide`). The caller then runs the
+/// when that launch cannot run them: one is not the kernels' (see [`plan`]) or its plan is not
+/// `qmv_fast` (more vectors than `decode_qmv_rows` takes, on a GPU that runs them as `qmv_wide`). The caller then runs the
 /// projections one at a time. Each output equals [`matvec`]'s for its projection in every bit: the
 /// launch gives every projection's rows their own simdgroups, as its own launch would.
 pub(crate) fn matvec_shared(x: &Array, weights: &[Weights<'_>]) -> Result<Option<Vec<Array>>> {
@@ -773,6 +869,12 @@ mod tests {
         .expect("quantized_matmul")
     }
 
+    /// MLX's single-vector matvec of each of `x`'s rows.
+    fn mlx_row_by_row(x: &Array, p: &Projection) -> Array {
+        let rows = (x.size() / *x.shape().last().expect("inputs") as usize) as i32;
+        row_by_row(x, rows, |row| Ok(mlx_on_widened_scales(row, p))).expect("row by row")
+    }
+
     fn differing(want: &Array, got: &Array) -> usize {
         assert_eq!(got.shape(), want.shape());
         let (want, got) = (host(want), host(got));
@@ -782,6 +884,8 @@ mod tests {
             .count()
     }
 
+    /// A `qmv_fast` plan equals MLX's single-vector matvec of every row, a `qmv_wide` plan MLX's
+    /// matvec of all the rows at once, with the row-exact range (`decode_qmv_rows`) on and off.
     #[test]
     fn the_kernels_equal_quantized_matmul_on_widened_scales_bit_for_bit() {
         // The kernels under test, whatever the equivalence matrix flips.
@@ -789,40 +893,87 @@ mod tests {
             let generation = gpu()
                 .expect("MLX must report this GPU's architecture")
                 .generation;
-            let mut wide_runs = 0;
-            // One block of 512 inputs, then the 35B-A3B's linear-attention and attention projections.
-            for (rows, inputs) in [
-                (8, 512),
-                (8192, 2048),
-                (2048, 4096),
-                (32, 2048),
-                (512, 2048),
-            ] {
-                let p = projection(rows, inputs, (rows * 7 + inputs) as u64);
-                assert_eq!(p.s.dtype(), Dtype::Bfloat16);
-                // A decode step, an MTP verify, batches up to past MLX's batch limit (13-15 here).
-                for vectors in [1, 2, 3, 5, 6, 7, 11, 12, 14] {
-                    let x = activation(&[1, vectors, inputs], 1000 + vectors as u64);
-                    let Some(plan) = plan(&x, &p.weights()) else {
-                        let limit = gpu().map(|g| g.batch_limit(inputs, rows));
-                        assert!(
-                            Some(vectors) >= limit,
-                            "{rows}x{inputs}: the kernels must take {vectors} vectors (limit {limit:?})"
-                        );
-                        continue;
-                    };
-                    wide_runs += usize::from(matches!(plan.kind, Kind::Wide { .. }));
-                    let got = matvec(&plan, &x, &p.weights()).expect("kernel");
-                    let off = differing(&mlx_on_widened_scales(&x, &p), &got);
-                    assert_eq!(
-                        off, 0,
-                        "{rows}x{inputs}, {vectors} vectors ({:?}): {off} outputs differ",
-                        plan.kind
-                    );
-                }
+            for rows_exact in [false, true] {
+                decode_qmv_rows::with(rows_exact, || {
+                    let mut wide_runs = 0;
+                    // One block of 512 inputs, then the 35B-A3B's linear-attention and attention
+                    // projections.
+                    for (rows, inputs) in [
+                        (8, 512),
+                        (8192, 2048),
+                        (2048, 4096),
+                        (32, 2048),
+                        (512, 2048),
+                    ] {
+                        let p = projection(rows, inputs, (rows * 7 + inputs) as u64);
+                        assert_eq!(p.s.dtype(), Dtype::Bfloat16);
+                        // A decode step, MTP verifies, batches up to past MLX's batch limit (13-15
+                        // here).
+                        for vectors in [1, 2, 3, 4, 5, 6, 7, 11, 12, 14] {
+                            let x = activation(&[1, vectors, inputs], 1000 + vectors as u64);
+                            let Some(plan) = plan(&x, &p.weights()) else {
+                                let limit = gpu().map(|g| g.batch_limit(inputs, rows));
+                                assert!(
+                                    Some(vectors) >= limit,
+                                    "{rows}x{inputs}: the kernels must take {vectors} vectors (limit {limit:?})"
+                                );
+                                continue;
+                            };
+                            if rows_exact && vectors <= MAX_ROW_VECTORS {
+                                assert_eq!(plan.kind, Kind::Fast, "{vectors} vectors row-exact");
+                            }
+                            let want = match plan.kind {
+                                Kind::Fast => mlx_row_by_row(&x, &p),
+                                Kind::Wide { .. } => {
+                                    wide_runs += 1;
+                                    mlx_on_widened_scales(&x, &p)
+                                }
+                            };
+                            let got = matvec(&plan, &x, &p.weights()).expect("kernel");
+                            let off = differing(&want, &got);
+                            assert_eq!(
+                                off, 0,
+                                "{rows}x{inputs}, {vectors} vectors ({:?}, rows exact {rows_exact}): {off} outputs differ",
+                                plan.kind
+                            );
+                        }
+                    }
+                    // From generation 15 MLX runs several vectors as `qmv_wide`, so the wide
+                    // kernel ran here (past the row-exact range when that is on).
+                    assert_eq!(wide_runs > 0, generation >= 15);
+                });
             }
-            // From generation 15 MLX runs several vectors as `qmv_wide`, so the wide kernel ran here.
-            assert_eq!(wide_runs > 0, generation >= 15);
+        });
+    }
+
+    /// With the kernels off, the row-exact range still runs row by row: MLX's single-vector matvec
+    /// of each row gives the kernels' bits, so `decode_qmv` stays an optimization.
+    #[test]
+    fn row_exact_matvecs_are_the_same_with_the_kernels_off() {
+        decode_qmv_rows::with(true, || {
+            let p = projection(2048, 4096, 31);
+            for vectors in 2..=MAX_ROW_VECTORS {
+                let x = activation(&[1, vectors, 4096], 40 + vectors as u64);
+                let kernel = decode_qmv::with(true, || {
+                    assert_eq!(rows_without_kernels(&x, &p.weights()), None);
+                    let plan = plan(&x, &p.weights()).expect("plan");
+                    matvec(&plan, &x, &p.weights()).expect("kernel")
+                });
+                let off_path = decode_qmv::with(false, || {
+                    assert_eq!(plan(&x, &p.weights()), None);
+                    let rows = rows_without_kernels(&x, &p.weights()).expect("row-exact range");
+                    assert_eq!(rows, vectors);
+                    row_by_row(&x, rows, |row| Ok(mlx_on_widened_scales(row, &p))).expect("rows")
+                });
+                assert_eq!(differing(&kernel, &off_path), 0, "{vectors} vectors");
+            }
+            // One vector, or more than the range, is MLX's own matmul with the kernels off.
+            decode_qmv::with(false, || {
+                for vectors in [1, MAX_ROW_VECTORS + 1] {
+                    let x = activation(&[1, vectors, 4096], 3);
+                    assert_eq!(rows_without_kernels(&x, &p.weights()), None);
+                }
+            });
         });
     }
 
@@ -856,15 +1007,27 @@ mod tests {
                     assert_eq!(off, 0, "group {g}, {rows}x{inputs}: {off} outputs differ");
                 }
             }
-            // Several vectors on a GPU that runs them as `qmv_wide` are not the shared launch's.
+            // Several vectors share the launch when they run as `qmv_fast` (the row-exact range),
+            // each row then MLX's single-vector matvec, and not when they run as `qmv_wide`.
             let ps = [projection(512, 2048, 1), projection(32, 2048, 2)];
             let weights = [ps[0].weights(), ps[1].weights()];
             let x = activation(&[1, 3, 2048], 3);
-            let shared = matvec_shared(&x, &weights).expect("kernel");
-            assert_eq!(
-                shared.is_some(),
-                gpu().is_some_and(|g| g.kind(3, 2048, 512) == Some(Kind::Fast))
-            );
+            for rows_exact in [false, true] {
+                decode_qmv_rows::with(rows_exact, || {
+                    let shared = matvec_shared(&x, &weights).expect("kernel");
+                    assert_eq!(
+                        shared.is_some(),
+                        kind_for(3, 2048, 512) == Some(Kind::Fast),
+                        "rows exact {rows_exact}"
+                    );
+                    if rows_exact {
+                        let shared = shared.expect("three vectors row-exact share the launch");
+                        for (p, y) in ps.iter().zip(&shared) {
+                            assert_eq!(differing(&mlx_row_by_row(&x, p), y), 0);
+                        }
+                    }
+                });
+            }
             // Neither are projections of different input lengths, nor more than four.
             let mixed = [projection(64, 512, 4), projection(64, 1024, 5)];
             let x = activation(&[1, 1, 512], 6);
@@ -995,101 +1158,106 @@ mod tests {
 
     /// Bench: one matvec's time and GB/s, MLX's against the kernel's, over `layers` distinct
     /// projections (more bytes than the system cache), the variants interleaved round by round.
-    /// `QMV_BENCH_SHAPES=rowsxinputsxlayers,...`; run with `--release --ignored --nocapture`.
+    /// `QMV_BENCH_SHAPES=rowsxinputsxlayers,...`, `QMV_BENCH_VECTORS` (default 1) vectors through the
+    /// plan the kernels pick; run with `--release --ignored --nocapture`. The wall time includes the
+    /// host's work (the launches share a command buffer); read GPU time from a trace.
     #[test]
     #[ignore = "bench"]
     fn decode_matvec_bandwidth() {
-        use std::time::Instant;
-        let shapes: Vec<(i32, i32, usize)> = std::env::var("QMV_BENCH_SHAPES")
-            .unwrap_or_else(|_| "17408x5120x8,5120x17408x8,10240x5120x12,8192x2048x32".into())
-            .split(',')
-            .map(|s| {
-                let v: Vec<i64> = s.split('x').map(|t| t.parse().expect("num")).collect();
-                (v[0] as i32, v[1] as i32, v[2] as usize)
-            })
-            .collect();
-        for (rows, inputs, layers) in shapes {
-            let ps: Vec<Projection> = (0..layers)
-                .map(|i| projection(rows, inputs, i as u64))
-                .collect();
-            let wides: Vec<(Array, Array)> = ps
-                .iter()
-                .map(|p| {
-                    let (s, b) = (wide(&p.s), wide(&p.b));
-                    s.eval().expect("eval");
-                    b.eval().expect("eval");
-                    (s, b)
+        // The kernels under test, whatever the equivalence matrix flips.
+        decode_qmv::with(true, || {
+            use std::time::Instant;
+            let shapes: Vec<(i32, i32, usize)> = std::env::var("QMV_BENCH_SHAPES")
+                .unwrap_or_else(|_| "17408x5120x8,5120x17408x8,10240x5120x12,8192x2048x32".into())
+                .split(',')
+                .map(|s| {
+                    let v: Vec<i64> = s.split('x').map(|t| t.parse().expect("num")).collect();
+                    (v[0] as i32, v[1] as i32, v[2] as usize)
                 })
                 .collect();
-            let x = activation(&[1, 1, inputs], 7);
-            let x_bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
-            x.eval().expect("eval");
-            x_bf16.eval().expect("eval");
-            let one = Plan {
-                vectors: 1,
-                inputs,
-                outputs: rows,
-                kind: Kind::Fast,
-            };
-            let packed = (rows as f64) * (inputs as f64) / 2.0;
-            let groups = (rows as f64) * (inputs as f64) / 64.0;
-            let names = [
-                "mlx f32 scales",
-                "kernel bf16 scales",
-                "kernel f32 scales",
-                "mlx bf16 x+scales",
-            ];
-            let bytes = [
-                packed + groups * 8.0,
-                packed + groups * 4.0,
-                packed + groups * 8.0,
-                packed + groups * 4.0,
-            ];
-            let mut best = [f64::MAX; 4];
-            for _round in 0..12 {
-                for (v, best_v) in best.iter_mut().enumerate() {
-                    let t = Instant::now();
-                    let mut outs = Vec::with_capacity(layers);
-                    for (p, (s, b)) in ps.iter().zip(&wides) {
-                        let y = match v {
-                            0 => quantized_matmul_with_mode(
-                                &x,
-                                &p.w,
-                                s,
-                                Some(b),
-                                true,
-                                64,
-                                4,
-                                MODE_AFFINE,
-                            ),
-                            1 => matvec(&one, &x, &p.weights()),
-                            2 => matvec(&one, &x, &p.weights_with(s, b)),
-                            _ => quantized_matmul_with_mode(
-                                &x_bf16,
-                                &p.w,
-                                &p.s,
-                                Some(&p.b),
-                                true,
-                                64,
-                                4,
-                                MODE_AFFINE,
-                            ),
+            for (rows, inputs, layers) in shapes {
+                let ps: Vec<Projection> = (0..layers)
+                    .map(|i| projection(rows, inputs, i as u64))
+                    .collect();
+                let wides: Vec<(Array, Array)> = ps
+                    .iter()
+                    .map(|p| {
+                        let (s, b) = (wide(&p.s), wide(&p.b));
+                        s.eval().expect("eval");
+                        b.eval().expect("eval");
+                        (s, b)
+                    })
+                    .collect();
+                let vecs: i32 = std::env::var("QMV_BENCH_VECTORS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                let x = activation(&[1, vecs, inputs], 7);
+                let x_bf16 = x.as_dtype(Dtype::Bfloat16).expect("bf16");
+                x.eval().expect("eval");
+                x_bf16.eval().expect("eval");
+                let one = plan(&x, &ps[0].weights()).expect("plan");
+                eprintln!("[qmv-bench] vectors {vecs} kind {:?}", one.kind);
+                let packed = (rows as f64) * (inputs as f64) / 2.0;
+                let groups = (rows as f64) * (inputs as f64) / 64.0;
+                let names = [
+                    "mlx f32 scales",
+                    "kernel bf16 scales",
+                    "kernel f32 scales",
+                    "mlx bf16 x+scales",
+                ];
+                let bytes = [
+                    packed + groups * 8.0,
+                    packed + groups * 4.0,
+                    packed + groups * 8.0,
+                    packed + groups * 4.0,
+                ];
+                let mut best = [f64::MAX; 4];
+                for _round in 0..12 {
+                    for (v, best_v) in best.iter_mut().enumerate() {
+                        let t = Instant::now();
+                        let mut outs = Vec::with_capacity(layers);
+                        for (p, (s, b)) in ps.iter().zip(&wides) {
+                            let y = match v {
+                                0 => quantized_matmul_with_mode(
+                                    &x,
+                                    &p.w,
+                                    s,
+                                    Some(b),
+                                    true,
+                                    64,
+                                    4,
+                                    MODE_AFFINE,
+                                ),
+                                1 => matvec(&one, &x, &p.weights()),
+                                2 => matvec(&one, &x, &p.weights_with(s, b)),
+                                _ => quantized_matmul_with_mode(
+                                    &x_bf16,
+                                    &p.w,
+                                    &p.s,
+                                    Some(&p.b),
+                                    true,
+                                    64,
+                                    4,
+                                    MODE_AFFINE,
+                                ),
+                            }
+                            .expect("matvec");
+                            outs.push(y);
                         }
-                        .expect("matvec");
-                        outs.push(y);
+                        mlx_rs::transforms::eval(outs.iter()).expect("eval");
+                        *best_v = best_v.min(t.elapsed().as_secs_f64() / layers as f64);
                     }
-                    mlx_rs::transforms::eval(outs.iter()).expect("eval");
-                    *best_v = best_v.min(t.elapsed().as_secs_f64() / layers as f64);
+                }
+                for v in 0..4 {
+                    eprintln!(
+                        "[qmv-bench] {rows}x{inputs} {:<20} {:7.1} us  {:6.1} GB/s",
+                        names[v],
+                        best[v] * 1e6,
+                        bytes[v] / best[v] / 1e9
+                    );
                 }
             }
-            for v in 0..4 {
-                eprintln!(
-                    "[qmv-bench] {rows}x{inputs} {:<20} {:7.1} us  {:6.1} GB/s",
-                    names[v],
-                    best[v] * 1e6,
-                    bytes[v] / best[v] / 1e9
-                );
-            }
-        }
+        });
     }
 }

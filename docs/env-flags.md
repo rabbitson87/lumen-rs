@@ -43,6 +43,7 @@ value → on.
 | `LUMEN_NATIVE_COMPILE_ROUTING` | off | Optimization | `lumen_mlx::native_moe::imp::routing_compile` |
 | `LUMEN_NATIVE_CONV_SLICE` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::conv_slice` |
 | `LUMEN_NATIVE_DECODE_QMV` | on | Optimization | `lumen_mlx::native_qmv::decode_qmv` |
+| `LUMEN_NATIVE_DECODE_QMV_ROWS` | on | Behavior | `lumen_mlx::native_qmv::decode_qmv_rows` |
 | `LUMEN_NATIVE_FUSED_MOE_DECODE` | on | Optimization | `lumen_mlx::qwen3_5_moe::imp::fused_moe_decode` |
 | `LUMEN_NATIVE_FUSED_MOE_ROUTER` | on | Optimization | `lumen_mlx::native_moe_decode::fused_router` |
 | `LUMEN_NATIVE_FUSE_GATE_UP` | off | Optimization | `lumen_mlx::qwen3_5_moe::imp::fuse_gate_up_flag` |
@@ -518,10 +519,12 @@ Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 a
  a decode step, a batch of decode steps, an MTP verify. Larger matmuls (prefill) stay on MLX,
  which casts the bf16 scales per call there; against a matmul that size the cast is noise.
 
- Bit-identical: the kernels run MLX's own matvec for that many rows on this GPU (`qmv_fast`
- for one, `qmv_wide` or `qmv_fast` for more), its lane partition and order of adds, and
- widening a bf16 or f16 scale to f32 is exact. An `Optimization` flag. Default on; `=0` keeps
- MLX's matmul (and widens every affine projection's scales again).
+ Bit-identical: the kernels run MLX's own matvec arithmetic for that many rows on this GPU
+ (`qmv_fast` for one; for more, `qmv_wide` or `qmv_fast` as MLX would, or `qmv_fast` row by
+ row under `LUMEN_NATIVE_DECODE_QMV_ROWS`, which this flag's off path then also runs row by
+ row), its lane partition and order of adds, and widening a bf16 or f16 scale to f32 is
+ exact. An `Optimization` flag. Default on; `=0` keeps MLX's matmul (and widens every affine
+ projection's scales again).
 
  M3 Max, one matvec over projections larger than the system cache, best of 12: 17408x5120
  218 -> 200 us, 5120x17408 213 -> 200 us, 248320x2048 (lm_head) 1187 -> 1063 us against MLX
@@ -530,6 +533,27 @@ Run the matvecs of an affine 4-bit group-64 projection whose activation is f32 a
  Pipelined greedy decode against MLX on the widened copies, alternating runs, text identical
  in every run: Qwen3.6-27B 61.4 / 61.6 / 61.1 -> 56.6 / 57.2 / 56.7 ms/token, footprint 18.51
  -> 17.21 GB; Qwen3.6-35B-A3B 9.3 / 9.3 / 9.3 -> 9.2 / 9.2 / 9.2 ms/token, 20.65 -> 20.52 GB.
+
+### `LUMEN_NATIVE_DECODE_QMV_ROWS`
+
+*Behavior, default on.*
+
+Run a matvec of two to four vectors (an MTP verify, a few sequences decoded together, a
+ prompt of a few tokens) as `qmv_fast`'s arithmetic for each vector, all of them in the same
+ simdgroups, so each weight block is read once and dotted with every vector. Each row then
+ equals the single-vector matvec of that row in every bit. MLX runs that many vectors as
+ `qmv_wide` from GPU generation 15 on, whose lane partition differs.
+
+ **`Behavior`, not `Optimization`**: the low bits differ from MLX's matvec of that many rows
+ (not from a decode step). In exchange an MTP verify computes exactly what the decode steps it
+ stands in for would, and a sequence decoded beside others exactly what it would alone.
+ `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
+ same bits.
+
+ M3 Max, GPU time per launch of 17408x5120: one vector 94.9 us; two as `qmv_wide` on the f32
+ activation 135.1 us, two here 105.5 us. Qwen3.6-27B MTP K=1 (in-process bench): cycle 96.1
+ -> 81.2 ms, 17.4 -> 20.6 tok/s, acceptance unchanged (0.670). Default on; `=0` runs them as
+ MLX would.
 
 ### `LUMEN_NATIVE_FUSED_MOE_DECODE`
 
