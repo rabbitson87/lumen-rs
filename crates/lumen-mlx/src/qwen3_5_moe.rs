@@ -4652,15 +4652,14 @@ mod imp {
             // committed/correction token is verified as `verify_in[0]` instead
             // of forwarded separately, halving trunk forwards per cycle.
             //
-            // Accept-gated: 1-forward WINS in the high-accept regime and LOSES
-            // below it (removing Step A also removes a guaranteed token). A/B:
+            // Removing Step A also removes a guaranteed token, so this pays only
+            // when the verify of K+1 tokens costs little more than one step. A/B:
             // dense 9B (acc 0.63) 32.8->38.1 tok/s +16%, 27B (0.69) 14.8->17.4
-            // +18%; MoE 35B-A3B (0.56) 72.5->69.9 -4%. So DEFAULT 1-forward ON
-            // for Dense models, OFF for MoE. `LUMEN_MTP_ONE_FORWARD=0/1` overrides.
-            let one_forward = match std::env::var("LUMEN_MTP_ONE_FORWARD") {
-                Ok(v) => v != "0",
-                Err(_) => self.config.text_config.mlp_kind() == MlpKind::Dense,
-            };
+            // +18%. MoE 35B-A3B lost 4% once (0.56, 72.5->69.9) and now wins with
+            // the row-exact matvecs' cheaper verify: MTPLX head, K=1, acceptance
+            // 0.45, 68.4 -> 80.6 tok/s. Default ON; `LUMEN_MTP_ONE_FORWARD=0` keeps
+            // the two-forward cycle.
+            let one_forward = std::env::var("LUMEN_MTP_ONE_FORWARD").map_or(true, |v| v != "0");
             if one_forward {
                 return self.mtp_step_one_forward(
                     trunk_cache,

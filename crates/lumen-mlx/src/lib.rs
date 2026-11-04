@@ -4220,6 +4220,17 @@ impl MlxQwen35Backend {
             crate::qwen3_5_mtp::MtpMlpConfig::Dense { .. } => "Dense",
             crate::qwen3_5_mtp::MtpMlpConfig::Moe(_) => "MoE",
         };
+        // A MoE head is loaded only on request. Qwen3.6-35B-A3B-MTPLX, M3 Max, greedy: a K=1
+        // cycle took 18 ms for 1.45 tokens (acceptance 0.45), against the pipelined decode's 9 ms
+        // a token, and its two-token verify runs the experts through `gather_qmm`, whose low bits
+        // depend on the token count, so the text drifts from the plain decode's.
+        if matches!(mlp_cfg, crate::qwen3_5_mtp::MtpMlpConfig::Moe(_)) && !explicit_on {
+            eprintln!(
+                "[mlx] qwen3.5 MTP head found but left off: a MoE head is slower than the plain \
+                 decode and not exact (LUMEN_QWEN35_MTP=1 loads it)"
+            );
+            return Ok(());
+        }
         let label = format!(
             "{label} hidden={} heads={}/{} head_dim={}",
             dims.hidden_size, dims.num_attention_heads, dims.num_key_value_heads, dims.head_dim
