@@ -641,7 +641,7 @@ mod imp {
             if let Some(plan) = crate::native_qmv::plan(x, &weights) {
                 return crate::native_qmv::matvec(&plan, x, &weights);
             }
-            if let Some(rows) = crate::native_qmv::rows_without_kernels(x, &weights) {
+            if let Some(rows) = crate::native_qmv::rows_on_mlx(x, &weights) {
                 return crate::native_qmv::row_by_row(x, rows, |row| self.matmul(row));
             }
             self.matmul(x)

@@ -72,8 +72,9 @@ lumen_flags::flag! {
     /// **`Behavior`, not `Optimization`**: the low bits differ from MLX's matvec of that many rows
     /// (not from a decode step). In exchange an MTP verify computes exactly what the decode steps it
     /// stands in for would, and a sequence decoded beside others exactly what it would alone.
-    /// `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
-    /// same bits.
+    /// A projection the kernels do not read (a checkpoint's 8-bit layers, other group sizes, or
+    /// every projection under `LUMEN_NATIVE_DECODE_QMV=0`) runs such matvecs on MLX one row at a
+    /// time, which is what its decode step runs.
     ///
     /// M3 Max, 17408x5120, bench wall time: one vector 183 us; two, three, four 186 / 244 / 320 us
     /// here, 258 / 387 / 543 us as `qmv_wide` on the f32 activation. A Qwen3.6-27B forward of two,
@@ -500,30 +501,18 @@ fn kind_for(vectors: i32, inputs: i32, outputs: i32) -> Option<Kind> {
     }
 }
 
-/// The rows of a matvec that `decode_qmv_rows` makes row-exact while the kernels are off
-/// (`decode_qmv=0`): `x` f32, two to [`MAX_ROW_VECTORS`] rows, against an affine 4-bit group-32/64
-/// projection in `qmv_fast`'s lengths. The caller runs MLX's matmul on each row ([`row_by_row`]),
-/// which gives the kernels' bits. `None` otherwise.
-pub(crate) fn rows_without_kernels(x: &Array, w: &Weights<'_>) -> Option<i32> {
-    if decode_qmv::get() || !decode_qmv_rows::get() || x.dtype() != Dtype::Float32 {
+/// The rows of a matvec that `decode_qmv_rows` makes row-exact on MLX: `x` f32, two to
+/// [`MAX_ROW_VECTORS`] rows, against a projection the kernels do not run ([`plan`] declines it:
+/// another quantization, such as a checkpoint's 8-bit layers, other lengths, or the kernels off).
+/// The caller runs MLX's matmul on each row ([`row_by_row`]), which is what a decode step runs for
+/// that projection, so each row equals the step's. `None` otherwise.
+pub(crate) fn rows_on_mlx(x: &Array, w: &Weights<'_>) -> Option<i32> {
+    if !decode_qmv_rows::get() || x.dtype() != Dtype::Float32 || plan(x, w).is_some() {
         return None;
     }
-    let &[outputs, packed] = w.weight.shape() else {
-        return None;
-    };
-    let inputs = packed * 8;
-    let qmv_fast_lengths = w.mode == MODE_AFFINE
-        && w.bits == 4
-        && GROUP_SIZES.contains(&w.group_size)
-        && w.biases.is_some()
-        && w.weight.dtype() == Dtype::Uint32
-        && inputs % 512 == 0
-        && outputs % 8 == 0;
+    let inputs = *x.shape().last()?;
     let vectors = i32::try_from(x.size() / inputs.max(1) as usize).ok()?;
-    (qmv_fast_lengths
-        && x.shape().last() == Some(&inputs)
-        && (2..=MAX_ROW_VECTORS).contains(&vectors))
-    .then_some(vectors)
+    (2..=MAX_ROW_VECTORS).contains(&vectors).then_some(vectors)
 }
 
 /// `matmul` applied to each of `x`'s `rows` vectors alone, the outputs in `x`'s shape with the last
@@ -1126,13 +1115,13 @@ mod tests {
             for vectors in 2..=MAX_ROW_VECTORS {
                 let x = activation(&[1, vectors, 4096], 40 + vectors as u64);
                 let kernel = decode_qmv::with(true, || {
-                    assert_eq!(rows_without_kernels(&x, &p.weights()), None);
+                    assert_eq!(rows_on_mlx(&x, &p.weights()), None);
                     let plan = plan(&x, &p.weights()).expect("plan");
                     matvec(&plan, &x, &p.weights()).expect("kernel")
                 });
                 let off_path = decode_qmv::with(false, || {
                     assert_eq!(plan(&x, &p.weights()), None);
-                    let rows = rows_without_kernels(&x, &p.weights()).expect("row-exact range");
+                    let rows = rows_on_mlx(&x, &p.weights()).expect("row-exact range");
                     assert_eq!(rows, vectors);
                     row_by_row(&x, rows, |row| Ok(mlx_on_widened_scales(row, &p))).expect("rows")
                 });
@@ -1142,8 +1131,43 @@ mod tests {
             decode_qmv::with(false, || {
                 for vectors in [1, MAX_ROW_VECTORS + 1] {
                     let x = activation(&[1, vectors, 4096], 3);
-                    assert_eq!(rows_without_kernels(&x, &p.weights()), None);
+                    assert_eq!(rows_on_mlx(&x, &p.weights()), None);
                 }
+            });
+        });
+    }
+
+    /// A projection the kernels do not read (8-bit, as some layers of a mixed checkpoint are, or
+    /// a group size they lack) still gets the row-exact range, one MLX matvec a row, with the
+    /// kernels on: a verify of such a layer must add as the decode step's MLX matvec does.
+    #[test]
+    fn the_row_exact_range_covers_projections_the_kernels_do_not_read() {
+        decode_qmv::with(true, || {
+            decode_qmv_rows::with(true, || {
+                let w = activation(&[1024, 2048], 70);
+                let w = w.as_dtype(Dtype::Bfloat16).expect("bf16");
+                for (group, bits) in [(64, 8), (128, 4)] {
+                    let (qw, s, b) = quantize_with_mode(&w, group, bits, MODE_AFFINE).expect("q");
+                    let b = b.expect("affine biases");
+                    let weights = Weights {
+                        weight: &qw,
+                        scales: &s,
+                        biases: Some(&b),
+                        group_size: group,
+                        bits,
+                        mode: MODE_AFFINE,
+                    };
+                    for vectors in 1..=MAX_ROW_VECTORS + 1 {
+                        let x = activation(&[1, vectors, 2048], 71);
+                        assert_eq!(plan(&x, &weights), None, "group {group}, {bits} bits");
+                        let want = (2..=MAX_ROW_VECTORS).contains(&vectors).then_some(vectors);
+                        assert_eq!(rows_on_mlx(&x, &weights), want, "{vectors} vectors");
+                    }
+                }
+                // The kernels' own projections stay theirs.
+                let p = projection(1024, 2048, 72);
+                let x = activation(&[1, 2, 2048], 73);
+                assert_eq!(rows_on_mlx(&x, &p.weights()), None);
             });
         });
     }

@@ -547,8 +547,9 @@ Run a matvec of two to four vectors (an MTP verify, a few sequences decoded toge
  **`Behavior`, not `Optimization`**: the low bits differ from MLX's matvec of that many rows
  (not from a decode step). In exchange an MTP verify computes exactly what the decode steps it
  stands in for would, and a sequence decoded beside others exactly what it would alone.
- `LUMEN_NATIVE_DECODE_QMV=0` then runs such matvecs on MLX one row at a time, which gives the
- same bits.
+ A projection the kernels do not read (a checkpoint's 8-bit layers, other group sizes, or
+ every projection under `LUMEN_NATIVE_DECODE_QMV=0`) runs such matvecs on MLX one row at a
+ time, which is what its decode step runs.
 
  M3 Max, 17408x5120, bench wall time: one vector 183 us; two, three, four 186 / 244 / 320 us
  here, 258 / 387 / 543 us as `qmv_wide` on the f32 activation. A Qwen3.6-27B forward of two,
