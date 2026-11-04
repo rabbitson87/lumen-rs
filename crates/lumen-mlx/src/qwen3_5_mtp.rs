@@ -559,6 +559,7 @@ impl Qwen35MtpBlock {
                 group_size: w.sw_gs,
                 bits: w.sw_bits,
                 mode: w.sw_mode,
+                decode_views: None,
             },
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &w.se_gate_w,

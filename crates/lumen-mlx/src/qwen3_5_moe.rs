@@ -75,6 +75,7 @@ mod imp {
         SwitchExpertWeights, SwitchGluWeights, moe_block_forward, swiglu_fuse_enabled,
         swiglu_fused,
     };
+    use crate::native_moe_decode::ExpertViews;
     use crate::native_norm::rms_norm;
     use crate::native_quant::{
         MODE_AFFINE, MODE_MXFP4, MODE_NVFP4, dequantize_with_mode, quantize_with_mode,
@@ -792,6 +793,9 @@ mod imp {
         /// The experts are stacked, so single-token steps may run the decode kernels; whether they
         /// do is `fused_moe_decode`, read at each call so a harness can switch it.
         pub decode_kernels_ready: bool,
+        /// One-expert views of the stacks for the decode kernels to bind; `Some` for a stacked
+        /// layer whose experts carry biases.
+        pub decode_views: Option<ExpertViews>,
     }
 
     impl ResolvedMoeWeights {
@@ -820,6 +824,7 @@ mod imp {
                     group_size: self.sw_gs,
                     bits: self.sw_bits,
                     mode: self.sw_mode,
+                    decode_views: self.decode_views.as_ref(),
                 },
                 shared_expert: SharedMlpWeights {
                     gate_proj_w: &self.se_gate_w,
@@ -1293,6 +1298,18 @@ mod imp {
                 up: sw_up,
             }
         };
+        let decode_views = match &sw_gate_up {
+            ResolvedGateUp::Fused(gate_up) => ExpertViews::new(
+                &gate_up.view(),
+                &SwitchExpertWeights {
+                    weight: &sw_down_w,
+                    scales: &sw_down_s,
+                    biases: sw_down_b.as_ref(),
+                },
+            )
+            .with_context(|| format!("{prefix}: expert views for the decode kernels"))?,
+            ResolvedGateUp::Split { .. } => None,
+        };
 
         Ok(ResolvedMoeWeights {
             gate_w,
@@ -1327,6 +1344,7 @@ mod imp {
             top_k: cfg.num_experts_per_tok as i32,
             norm_topk_prob: cfg.norm_topk_prob,
             decode_kernels_ready: stack,
+            decode_views,
         })
     }
 

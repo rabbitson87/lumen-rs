@@ -501,6 +501,7 @@ impl MoeLayer {
                 group_size: self.switch_group_size,
                 bits: self.switch_bits,
                 mode: MODE_AFFINE,
+                decode_views: None,
             },
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &self.shared_gate_proj.weight,

@@ -302,6 +302,9 @@ mod imp {
         /// MXFP4 in the production checkpoint, but parameterised so a
         /// future affine MoE checkpoint can reuse the helper.
         pub mode: &'a CStr,
+        /// One-expert views of the stacked tensors for the decode kernels to bind instead of the
+        /// stacks ([`crate::native_moe_decode::ExpertViews`]); `None` binds the stacks.
+        pub decode_views: Option<&'a crate::native_moe_decode::ExpertViews>,
     }
 
     /// `SwitchGLU.__call__(x, indices)` — quantized expert dispatch with the
@@ -719,6 +722,7 @@ mod imp {
             group_size: like.group_size,
             bits: like.bits,
             mode: like.mode,
+            decode_views: None,
         })
     }
 

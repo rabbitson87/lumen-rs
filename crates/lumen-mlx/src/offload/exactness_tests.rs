@@ -79,6 +79,7 @@ fn glu_of(arrays: &Roles) -> SwitchGluWeights<'_> {
         group_size: GROUP,
         bits: 4,
         mode: MODE_AFFINE,
+        decode_views: None,
     }
 }
 
@@ -429,6 +430,7 @@ fn one_gather_over_stacked_gate_and_up_gives_the_bits_of_two() {
         group_size: GROUP,
         bits: 4,
         mode: MODE_AFFINE,
+        decode_views: None,
     };
     for rows in ROWS {
         let x = activations(rows);

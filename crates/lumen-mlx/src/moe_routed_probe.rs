@@ -21,7 +21,7 @@ use crate::native_moe::{
     AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
     SwitchExpertWeights, SwitchGluWeights, moe_block_forward, moe_router,
 };
-use crate::native_moe_decode::{route_logits, run_routed};
+use crate::native_moe_decode::{ExpertViews, route_logits, run_routed};
 use crate::native_norm::rms_norm;
 use crate::native_quant::{MODE_AFFINE, quantize_with_mode};
 
@@ -84,6 +84,8 @@ pub(crate) struct Layer {
     shared_gate: Quant,
     /// `[experts, 2 * inter, ..]`: gate rows then up rows of each expert.
     gate_up: Quant,
+    /// The views the loader gives a stacked layer, which the decode kernels bind.
+    pub(crate) views: Option<ExpertViews>,
 }
 
 impl Layer {
@@ -96,7 +98,7 @@ impl Layer {
             s: stack(&[&sw_gate.s, &sw_up.s], 1)?,
             b: stack(&[&sw_gate.b, &sw_up.b], 1)?,
         };
-        Ok(Self {
+        let mut layer = Self {
             hidden,
             gate: quant(&[experts, hidden], 8)?,
             sw_down: quant(&[experts, hidden, inter], 4)?,
@@ -107,7 +109,10 @@ impl Layer {
             sw_gate,
             sw_up,
             gate_up,
-        })
+            views: None,
+        };
+        layer.views = ExpertViews::new(&expert(&layer.gate_up), &expert(&layer.sw_down))?;
+        Ok(layer)
     }
 
     /// The same layer with a router whose experts come in runs of `copies` identical gate rows, so
@@ -156,6 +161,7 @@ impl Layer {
                 group_size: GROUP,
                 bits: 4,
                 mode: MODE_AFFINE,
+                decode_views: if stacked { self.views.as_ref() } else { None },
             },
             shared_expert: SharedMlpWeights {
                 gate_proj_w: &self.se_gate.w,

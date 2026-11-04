@@ -38,11 +38,13 @@
 use std::cell::OnceCell;
 
 use anyhow::{Context, Result, anyhow};
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::metal_kernel::{MetalKernel, MetalKernelConfig};
 use crate::native_moe::{
-    AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights, SwitchGluWeights,
+    AffineGateWeights, GateProj, GateUpWeights, MoeBlockWeights, SharedMlpWeights,
+    SwitchExpertWeights, SwitchGluWeights,
 };
 use crate::native_qmv::{QMV_8BIT, QMV_BF16, QMV_F32};
 use crate::native_quant::MODE_AFFINE;
@@ -597,6 +599,70 @@ fn need<'a>(b: Option<&'a Array>, what: &str) -> Result<&'a Array> {
     b.ok_or_else(|| anyhow!("missing {what} biases"))
 }
 
+/// One-expert views of a layer's stacked routed-expert tensors, for the kernels to bind.
+///
+/// MLX commits the open command buffer once the inputs bound since the last commit add up to more
+/// than ~50 M elements (`CommandEncoder::needs_commit` adds each buffer's `data_size()`), and a
+/// kernel bound to a whole expert stack crosses that by itself: a commit per MoE layer, about 43
+/// command buffers a token on the 35B-A3B. MLX also lets the host run at most 10 command buffers
+/// ahead of the GPU (`MAX_ACTIVE_TASKS`), so small buffers cap how far ahead the next step can be
+/// built; building it took longer than that lead, and the GPU went idle at every step boundary. A
+/// view of expert 0 starts at the same offset of the same buffer, so a kernel indexes every expert
+/// through it exactly as through the stack, and it counts as one expert.
+pub(crate) struct ExpertViews {
+    /// Gate/up weight, scales and biases.
+    gate_up: [Array; 3],
+    /// Down weight, scales and biases.
+    down: [Array; 3],
+}
+
+impl ExpertViews {
+    /// The views of the `gate_up` and `down` stacks; `None` when the experts carry no biases, which
+    /// the kernels need.
+    ///
+    /// Left unevaluated: the first step that binds a view evaluates it once, as a slice that shares
+    /// the stack's buffer. Evaluating it here would load the down stack while the loader still holds
+    /// the unstacked gate and up tensors, which raised the 35B-A3B's load peak by several GB (3.5 GB
+    /// swapped out, load 4.7 -> 14 s on a 36 GB Mac).
+    pub(crate) fn new(
+        gate_up: &SwitchExpertWeights<'_>,
+        down: &SwitchExpertWeights<'_>,
+    ) -> Result<Option<Self>> {
+        let (Some(gate_up_biases), Some(down_biases)) = (gate_up.biases, down.biases) else {
+            return Ok(None);
+        };
+        let first = |a: &Array| -> Result<Array> {
+            a.try_index(0..1)
+                .context("moe decode: view of the first expert")
+        };
+        Ok(Some(Self {
+            gate_up: [
+                first(gate_up.weight)?,
+                first(gate_up.scales)?,
+                first(gate_up_biases)?,
+            ],
+            down: [
+                first(down.weight)?,
+                first(down.scales)?,
+                first(down_biases)?,
+            ],
+        }))
+    }
+}
+
+/// What the kernels bind for one stacked projection: its views when the layer has them, else the
+/// stack itself.
+fn bound<'a>(
+    views: Option<&'a [Array; 3]>,
+    stack: &SwitchExpertWeights<'a>,
+    what: &str,
+) -> Result<[&'a Array; 3]> {
+    Ok(match views {
+        Some([weight, scales, biases]) => [weight, scales, biases],
+        None => [stack.weight, stack.scales, need(stack.biases, what)?],
+    })
+}
+
 /// Gate, up and SwiGLU of the eight routed experts and the shared expert: `[9 * inter]` f32, the
 /// shared expert's row last. `x` is `[hidden]` f32, `inds` `[8]` u32.
 pub(crate) fn gate_up_swiglu(
@@ -613,6 +679,7 @@ pub(crate) fn gate_up_swiglu(
     };
     let Dims { hidden, inter } = dims;
     let slots = TOP_K + 1;
+    let [w, sc, bi] = bound(glu.decode_views.map(|v| &v.gate_up), gate_up, "gate/up")?;
     with_kernels(|k| {
         let config = MetalKernelConfig::new();
         config.add_template_arg_int("H", hidden)?;
@@ -626,9 +693,9 @@ pub(crate) fn gate_up_swiglu(
             .apply(
                 &[
                     x,
-                    gate_up.weight,
-                    gate_up.scales,
-                    need(gate_up.biases, "gate/up")?,
+                    w,
+                    sc,
+                    bi,
                     shared.gate_proj_w,
                     shared.gate_proj_s,
                     need(shared.gate_proj_b, "shared gate")?,
@@ -664,6 +731,7 @@ fn gate_up_swiglu_routed(
     };
     let Dims { hidden, inter } = dims;
     let slots = TOP_K + 1;
+    let [w, sc, bi] = bound(glu.decode_views.map(|v| &v.gate_up), gate_up, "gate/up")?;
     with_kernels(|k| {
         let config = MetalKernelConfig::new();
         config.add_template_arg_int("H", hidden)?;
@@ -682,9 +750,9 @@ fn gate_up_swiglu_routed(
             .apply(
                 &[
                     x,
-                    gate_up.weight,
-                    gate_up.scales,
-                    need(gate_up.biases, "gate/up")?,
+                    w,
+                    sc,
+                    bi,
                     shared.gate_proj_w,
                     shared.gate_proj_s,
                     need(shared.gate_proj_b, "shared gate")?,
@@ -716,6 +784,7 @@ pub(crate) fn down_combine(
     dims: Dims,
 ) -> Result<Array> {
     let Dims { hidden, inter } = dims;
+    let [w, sc, bi] = bound(glu.decode_views.map(|v| &v.down), &glu.down_proj, "down")?;
     with_kernels(|k| {
         let config = MetalKernelConfig::new();
         config.add_template_arg_int("H", hidden)?;
@@ -730,9 +799,9 @@ pub(crate) fn down_combine(
             .apply(
                 &[
                     act,
-                    glu.down_proj.weight,
-                    glu.down_proj.scales,
-                    need(glu.down_proj.biases, "down")?,
+                    w,
+                    sc,
+                    bi,
                     shared.down_proj_w,
                     shared.down_proj_s,
                     need(shared.down_proj_b, "shared down")?,
@@ -958,6 +1027,86 @@ mod tests {
     fn kernels_match_the_composed_block_when_the_rows_outnumber_the_lanes() {
         // 4096 hidden = 8 blocks of 512 inputs; 1024 intermediate = 2.
         kernels_match_the_composed_block(4096, 1024, 16);
+    }
+
+    /// The kernels read every expert through one-expert views as through the whole stacks: the
+    /// block's output is the same in every bit, so a view starts at its stack's buffer (a copy of
+    /// expert 0 alone would hand every other expert's reads other memory). Views of the same stacks
+    /// with the experts in reverse order change the output, so the views are what the kernels bind.
+    #[test]
+    fn the_kernels_read_the_experts_through_one_expert_views() {
+        use mlx_rs::ops::indexing::take_axis;
+        let layer = Layer::build(2048, 512, 256).expect("layer");
+        let viewed = layer.view(true, true);
+        assert!(
+            viewed.switch_glu.decode_views.is_some(),
+            "a stacked affine layer binds views"
+        );
+        let mut stacked = layer.view(true, true);
+        stacked.switch_glu.decode_views = None;
+
+        let reverse = |a: &Array| -> Array {
+            let n = a.shape()[0];
+            let order: Vec<i32> = (0..n).rev().collect();
+            let r = take_axis(a, Array::from_slice(&order, &[n]), 0).expect("reverse the experts");
+            r.eval().expect("eval");
+            r
+        };
+        let GateUpWeights::Fused(gate_up) = &stacked.switch_glu.gate_up else {
+            panic!("the layer is stacked");
+        };
+        let down = &stacked.switch_glu.down_proj;
+        let gate_up = [
+            gate_up.weight,
+            gate_up.scales,
+            gate_up.biases.expect("biases"),
+        ]
+        .map(reverse);
+        let down = [down.weight, down.scales, down.biases.expect("biases")].map(reverse);
+        let reversed_views = ExpertViews::new(
+            &SwitchExpertWeights {
+                weight: &gate_up[0],
+                scales: &gate_up[1],
+                biases: Some(&gate_up[2]),
+            },
+            &SwitchExpertWeights {
+                weight: &down[0],
+                scales: &down[1],
+                biases: Some(&down[2]),
+            },
+        )
+        .expect("views")
+        .expect("the experts carry biases");
+        let mut reversed = layer.view(true, true);
+        reversed.switch_glu.decode_views = Some(&reversed_views);
+
+        for seed in 0..4u64 {
+            let x = layer.activation(300 + seed).expect("x");
+            assert!(
+                plan(&x, &viewed.switch_glu, &viewed.shared_expert, viewed.top_k).is_some(),
+                "the kernels must take this layer"
+            );
+            let want = host(&moe_block_forward(&x, &stacked).expect("stacks bound"));
+            let got = host(&moe_block_forward(&x, &viewed).expect("views bound"));
+            let off = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                off,
+                0,
+                "seed {seed}: {off} of {} elements differ",
+                want.len()
+            );
+            let other = host(&moe_block_forward(&x, &reversed).expect("reversed views bound"));
+            assert!(
+                want.iter()
+                    .zip(&other)
+                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                "seed {seed}: views of other experts left the output unchanged, so the kernels did not read through the views"
+            );
+        }
     }
 
     #[test]
