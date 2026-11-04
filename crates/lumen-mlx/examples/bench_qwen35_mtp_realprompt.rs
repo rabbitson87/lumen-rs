@@ -171,6 +171,7 @@ fn main() -> Result<()> {
     let quant = match std::env::var("MTP_QUANT").as_deref() {
         Ok("mxfp4") => MtpLoadQuant::Mxfp4,
         Ok("affine4_32") => MtpLoadQuant::Affine4 { group_size: 32 },
+        Ok("affine8_64") => MtpLoadQuant::Affine8 { group_size: 64 },
         _ => MtpLoadQuant::Affine4 { group_size: 64 },
     };
     println!(

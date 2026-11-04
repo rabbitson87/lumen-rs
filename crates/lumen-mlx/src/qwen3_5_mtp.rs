@@ -774,6 +774,8 @@ impl Qwen35MtpDrafter {
 pub enum MtpLoadQuant {
     /// AFFINE 4-bit, group_size=64 (or 32 to halve scale memory).
     Affine4 { group_size: i32 },
+    /// AFFINE 8-bit: a bf16 head at about half its bytes, closer to it than 4 bits.
+    Affine8 { group_size: i32 },
     /// MXFP4 block-scaled exponents, group_size=32. Production trunk format.
     Mxfp4,
     /// Keep bf16. Slower per step but no quant-time at load.
@@ -783,7 +785,9 @@ pub enum MtpLoadQuant {
 impl MtpLoadQuant {
     fn group_size(&self) -> i32 {
         match self {
-            MtpLoadQuant::Affine4 { group_size } => *group_size,
+            MtpLoadQuant::Affine4 { group_size } | MtpLoadQuant::Affine8 { group_size } => {
+                *group_size
+            }
             MtpLoadQuant::Mxfp4 => 32,
             MtpLoadQuant::Bf16 => 0,
         }
@@ -791,13 +795,14 @@ impl MtpLoadQuant {
     fn bits(&self) -> i32 {
         match self {
             MtpLoadQuant::Affine4 { .. } | MtpLoadQuant::Mxfp4 => 4,
+            MtpLoadQuant::Affine8 { .. } => 8,
             MtpLoadQuant::Bf16 => 16,
         }
     }
     fn mode_cstr(&self) -> Option<&'static std::ffi::CStr> {
         use crate::native_quant::{MODE_AFFINE, MODE_MXFP4};
         match self {
-            MtpLoadQuant::Affine4 { .. } => Some(MODE_AFFINE),
+            MtpLoadQuant::Affine4 { .. } | MtpLoadQuant::Affine8 { .. } => Some(MODE_AFFINE),
             MtpLoadQuant::Mxfp4 => Some(MODE_MXFP4),
             MtpLoadQuant::Bf16 => None,
         }
