@@ -651,29 +651,32 @@ mod imp {
         Ok(y)
     }
 
-    // ─── Fused linear-attn prework for one decode token ──────────────────
+    // ─── Fused linear-attn prework for a decode token or a verify ────────
     //
-    // Everything a gated-delta layer does between its in-projections and the recurrence, for a
-    // single token, in ONE dispatch: the conv window over `[conv_state; mixed_qkv]` (a depthwise
-    // conv with `K` taps), SiLU, the q/k/v split, the per-head q/k RMSNorm, the next conv state,
-    // and the two gates `beta = sigmoid(b)` and `g = exp(-exp(A_log) * softplus(a + dt_bias))`.
+    // Everything a gated-delta layer does between its in-projections and the recurrence, for `T`
+    // tokens, in ONE dispatch: the conv window over `[conv_state; mixed_qkv]` (a depthwise conv
+    // with `K` taps), SiLU, the q/k/v split, the per-head q/k RMSNorm, the next conv state, and
+    // the two gates `beta = sigmoid(b)` and `g = exp(-exp(A_log) * softplus(a + dt_bias))`.
     // The composed path is a concat, a slice, a conv1d, a SiLU, two RMS norms, a sigmoid and a
     // compiled `compute_g`: eight dispatches in a dependent chain, which is what costs (the chain
     // is not bandwidth). `examples/m2c_inproj_tail_fused.rs` is the standalone parity harness of
     // the first version, which left the concat, the slice and the gates outside.
     //
-    // Layout: `conv_state` [K-1, conv_dim] (the previous K-1 inputs), `mixed_qkv` [conv_dim],
-    // `conv_w` [conv_dim, K], `wq`/`wk` [dn] (scale folded). conv_dim = 2*key_dim + value_dim,
-    // key_dim = NK*DN, value_dim = NV*DV. grid (lane, row): row 0..NK = q heads, NK..2NK = k
-    // heads, 2NK..2NK+NV = v heads; lane = channel within head, so every channel of the conv
-    // state is owned by exactly one thread, which writes its column of the next state.
+    // Layout: `conv_state` [K-1, conv_dim] (the K-1 inputs before the first token), `mixed_qkv`
+    // [T, conv_dim], `conv_w` [conv_dim, K], `wq`/`wk` [dn] (scale folded), `b_pre`/`a_pre`
+    // [T, NV]. conv_dim = 2*key_dim + value_dim, key_dim = NK*DN, value_dim = NV*DV. grid (lane,
+    // row, token): row 0..NK = q heads, NK..2NK = k heads, 2NK..2NK+NV = v heads; lane = channel
+    // within head, so every channel of the conv state is owned by exactly one thread of each
+    // token, and the first token's writes the channel's column of the next state.
     //
     // The arithmetic is the composed ops' arithmetic: the window sum accumulates taps in order
     // (the concat's row order), and the gates use the functors MLX's kernels use (`Sigmoid`,
-    // `LogAddExp` for softplus, precise `exp`).
+    // `LogAddExp` for softplus, precise `exp`). Token t's sums are the sums one token would do
+    // with the window ending at t, so a verify's rows are a decode's rows, bit for bit.
     const LINATTN_PREWORK_SOURCE: &str = r#"
         uint d = thread_position_in_grid.x;
         uint row = thread_position_in_grid.y;
+        uint t = thread_position_in_grid.z;
         threadgroup float sh[128];
         uint nk = (uint)NK, nv = (uint)NV;
         uint dn = (uint)DN, dv = (uint)DV;
@@ -685,35 +688,41 @@ mod imp {
         else                  { region = 2u; head = row - 2u*nk; width = dv; ch_base = 2u*key_dim + head * dv; }
         if (d >= width) return;
         uint c = ch_base + d;
+        // Row r of the window [conv_state; mixed]: the state's K-1 rows, then the T tokens.
+        #define WINDOW(r) ((r) + 1u < (uint)K ? conv_state[(r) * conv_dim + c] \
+                                              : mixed[((r) + 1u - (uint)K) * conv_dim + c])
 
         float acc = 0.0f;
         for (uint k = 0u; k < (uint)K - 1u; ++k) {
-            acc += float(conv_state[k * conv_dim + c]) * float(conv_w[c * (uint)K + k]);
+            acc += float(WINDOW(t + k)) * float(conv_w[c * (uint)K + k]);
         }
-        acc += float(mixed[c]) * float(conv_w[c * (uint)K + (uint)K - 1u]);
-        for (uint t = 0u; t + 2u < (uint)K; ++t) {
-            new_state[t * conv_dim + c] = conv_state[(t + 1u) * conv_dim + c];
+        acc += float(mixed[t * conv_dim + c]) * float(conv_w[c * (uint)K + (uint)K - 1u]);
+        if (t == 0u) {
+            for (uint j = 0u; j + 1u < (uint)K; ++j) {
+                new_state[j * conv_dim + c] = WINDOW((uint)T + j);
+            }
         }
-        new_state[((uint)K - 2u) * conv_dim + c] = mixed[c];
+        #undef WINDOW
 
         if (region == 2u && d == 0u) {
-            float bv = float(b_pre[head]);
+            uint gi = t * nv + head;
+            float bv = float(b_pre[gi]);
             float ey = 1.0f / (1.0f + metal::precise::exp(metal::abs(bv)));
-            beta[head] = (bv < 0.0f) ? ey : 1.0f - ey;
-            float x = float(a_pre[head]) + float(dt_bias[head]);
+            beta[gi] = (bv < 0.0f) ? ey : 1.0f - ey;
+            float x = float(a_pre[gi]) + float(dt_bias[head]);
             float hi = metal::max(x, 0.0f);
             float lo = metal::min(x, 0.0f);
             float softplus = (lo == -INFINITY || hi == INFINITY)
                 ? hi
                 : (hi + log1p(metal::exp(lo - hi)));
             float decay = metal::precise::exp(float(a_log[head])) * softplus;
-            g[head] = metal::precise::exp(-decay);
+            g[gi] = metal::precise::exp(-decay);
         }
 
         // SiLU as MLX composes it: x * sigmoid(x), with its `Sigmoid` functor.
         float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(acc)));
         float s = acc * ((acc < 0.0f) ? sy : 1.0f - sy);
-        if (region == 2u) { out_v[head * dv + d] = static_cast<InT>(s); return; }
+        if (region == 2u) { out_v[(t * nv + head) * dv + d] = static_cast<InT>(s); return; }
 
         // The per-head RMS norm as MLX's `rms_single_row` does it for a row of at most 128: the
         // first simdgroup's lane l sums the squares of channels 4l..4l+3 in order, `simd_sum`
@@ -735,23 +744,23 @@ mod imp {
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         float wv = (region == 0u) ? float(wq[d]) : float(wk[d]);
         float y = wv * static_cast<InT>(s * inv_mean[0]);
-        if (region == 0u) out_q[head * dn + d] = static_cast<InT>(y);
-        else              out_k[head * dn + d] = static_cast<InT>(y);
+        if (region == 0u) out_q[(t * nk + head) * dn + d] = static_cast<InT>(y);
+        else              out_k[(t * nk + head) * dn + d] = static_cast<InT>(y);
     "#;
 
-    /// What [`linattn_prework_fused`] returns.
+    /// What [`linattn_prework_fused`] returns for `T` tokens.
     pub struct LinAttnPrework {
-        /// `[NK, DN]`, scale folded.
+        /// `[T, NK, DN]`, scale folded.
         pub q: Array,
-        /// `[NK, DN]`, scale folded.
+        /// `[T, NK, DN]`, scale folded.
         pub k: Array,
-        /// `[NV, DV]`.
+        /// `[T, NV, DV]`.
         pub v: Array,
-        /// `[K-1, conv_dim]`: the conv state after this token.
+        /// `[K-1, conv_dim]`: the conv state after the last token.
         pub new_state: Array,
-        /// `[NV]` f32: `sigmoid(b)`.
+        /// `[T, NV]` f32: `sigmoid(b)`.
         pub beta: Array,
-        /// `[NV]` f32: the decay `exp(-exp(A_log) * softplus(a + dt_bias))`.
+        /// `[T, NV]` f32: the decay `exp(-exp(A_log) * softplus(a + dt_bias))`.
         pub g: Array,
     }
 
@@ -762,10 +771,11 @@ mod imp {
             const { std::cell::OnceCell::new() };
     }
 
-    /// The fused prework of one decode token; see the comment above. `conv_state`:
-    /// `[K-1, conv_dim]`, `mixed_qkv`: `[conv_dim]` (both of one dtype, which the outputs take),
-    /// `conv_w`: `[conv_dim, K]`, `wq`/`wk`: `[DN]` (scale folded), `b_pre`/`a_pre`: `[NV]`
-    /// (the b and a in-projections), `a_log`/`dt_bias`: `[NV]`.
+    /// The fused prework of `T` consecutive tokens; see the comment above. `conv_state`:
+    /// `[K-1, conv_dim]`, `mixed_qkv`: `[T, conv_dim]`, or `[conv_dim]` for one token (both of one
+    /// dtype, which the outputs take), `conv_w`: `[conv_dim, K]`, `wq`/`wk`: `[DN]` (scale
+    /// folded), `b_pre`/`a_pre`: `T * NV` values, token-major (the b and a in-projections),
+    /// `a_log`/`dt_bias`: `[NV]`.
     #[allow(clippy::too_many_arguments)]
     pub fn linattn_prework_fused(
         conv_state: &Array,
@@ -798,6 +808,21 @@ mod imp {
         }
         let dtype = mixed_qkv.dtype();
         let conv_dim = 2 * nk * dn + nv * dv;
+        let tokens = mixed_qkv.size() as i32 / conv_dim;
+        if tokens < 1 || mixed_qkv.size() as i32 != tokens * conv_dim {
+            return Err(anyhow::anyhow!(
+                "linattn_prework_fused: mixed_qkv {:?} is not whole tokens of {conv_dim}",
+                mixed_qkv.shape()
+            ));
+        }
+        for (name, a) in [("b_pre", b_pre), ("a_pre", a_pre)] {
+            if a.size() as i32 != tokens * nv {
+                return Err(anyhow::anyhow!(
+                    "linattn_prework_fused: {name} {:?} is not {tokens} tokens of {nv} heads",
+                    a.shape()
+                ));
+            }
+        }
         let config = MetalKernelConfig::new();
         config.add_template_arg_dtype("InT", dtype)?;
         config.add_template_arg_int("NK", nk)?;
@@ -805,14 +830,15 @@ mod imp {
         config.add_template_arg_int("DN", dn)?;
         config.add_template_arg_int("DV", dv)?;
         config.add_template_arg_int("K", k_taps)?;
-        config.set_grid(dn.max(dv), nk + nk + nv, 1)?;
+        config.add_template_arg_int("T", tokens)?;
+        config.set_grid(dn.max(dv), nk + nk + nv, tokens)?;
         config.set_thread_group(dn.max(dv), 1, 1)?;
-        config.add_output_arg(&[nk, dn], dtype)?;
-        config.add_output_arg(&[nk, dn], dtype)?;
-        config.add_output_arg(&[nv, dv], dtype)?;
+        config.add_output_arg(&[tokens, nk, dn], dtype)?;
+        config.add_output_arg(&[tokens, nk, dn], dtype)?;
+        config.add_output_arg(&[tokens, nv, dv], dtype)?;
         config.add_output_arg(&[k_taps - 1, conv_dim], dtype)?;
-        config.add_output_arg(&[nv], mlx_rs::Dtype::Float32)?;
-        config.add_output_arg(&[nv], mlx_rs::Dtype::Float32)?;
+        config.add_output_arg(&[tokens, nv], mlx_rs::Dtype::Float32)?;
+        config.add_output_arg(&[tokens, nv], mlx_rs::Dtype::Float32)?;
         let eps_arr = Array::from_slice(&[eps], &[1]);
         // Each kernel is constructed with its name as a literal: `cargo xtask test` reads the
         // names off `MetalKernel::new` calls to check that every kernel ran in its Metal 3.1 pass.
@@ -1020,13 +1046,14 @@ mod fused_kernel_tests {
         );
     }
 
-    /// Inputs of the prework kernel, with the composed ops' result for each output.
+    /// Inputs of the prework kernel for `tokens` tokens.
     struct Prework {
         nk: usize,
         nv: usize,
         dn: usize,
         dv: usize,
         taps: usize,
+        tokens: usize,
         conv_state: Array,
         mixed: Array,
         conv_w: Array,
@@ -1042,8 +1069,21 @@ mod fused_kernel_tests {
 
     impl Prework {
         fn new(nk: usize, nv: usize, dn: usize, dv: usize, seed: f32, dt: Dtype) -> Self {
+            Self::tokens(nk, nv, dn, dv, 1, seed, dt)
+        }
+
+        fn tokens(
+            nk: usize,
+            nv: usize,
+            dn: usize,
+            dv: usize,
+            tokens: usize,
+            seed: f32,
+            dt: Dtype,
+        ) -> Self {
             let taps = 4usize;
             let conv_dim = 2 * nk * dn + nv * dv;
+            let t = tokens as i32;
             let scaled =
                 |n: usize, s: f32| -> Vec<f32> { mk(n, s).iter().map(|v| 1.0 + v).collect() };
             // Spread the gate inputs over the branches of sigmoid and softplus (negative and
@@ -1051,18 +1091,31 @@ mod fused_kernel_tests {
             let wide = |n: usize, s: f32, span: f32| -> Vec<f32> {
                 mk(n, s).iter().map(|v| v * span).collect()
             };
+            // One token's inputs keep the one-dimensional shapes a decode passes.
+            let per_token = |n: usize| -> Vec<i32> {
+                if tokens == 1 {
+                    vec![n as i32]
+                } else {
+                    vec![t, n as i32]
+                }
+            };
             Self {
                 nk,
                 nv,
                 dn,
                 dv,
                 taps,
+                tokens,
                 conv_state: array(
                     &mk((taps - 1) * conv_dim, 0.17 + seed),
                     &[(taps - 1) as i32, conv_dim as i32],
                     dt,
                 ),
-                mixed: array(&mk(conv_dim, 0.11 + seed), &[conv_dim as i32], dt),
+                mixed: array(
+                    &mk(tokens * conv_dim, 0.11 + seed),
+                    &per_token(conv_dim),
+                    dt,
+                ),
                 conv_w: array(
                     &mk(conv_dim * taps, 0.05 + seed),
                     &[conv_dim as i32, taps as i32],
@@ -1070,23 +1123,42 @@ mod fused_kernel_tests {
                 ),
                 wq: array(&scaled(dn, 0.23 + seed), &[dn as i32], dt),
                 wk: array(&scaled(dn, 0.29 + seed), &[dn as i32], dt),
-                b_pre: array(&wide(nv, 0.37 + seed, 24.0), &[nv as i32], Dtype::Float32),
-                a_pre: array(&wide(nv, 0.41 + seed, 40.0), &[nv as i32], Dtype::Float32),
+                b_pre: array(
+                    &wide(tokens * nv, 0.37 + seed, 24.0),
+                    &per_token(nv),
+                    Dtype::Float32,
+                ),
+                a_pre: array(
+                    &wide(tokens * nv, 0.41 + seed, 40.0),
+                    &per_token(nv),
+                    Dtype::Float32,
+                ),
                 a_log: array(&wide(nv, 0.43 + seed, 3.0), &[nv as i32], Dtype::Float32),
                 dt_bias: array(&wide(nv, 0.47 + seed, 2.0), &[nv as i32], dt),
             }
         }
 
         fn run(&self) -> super::imp::LinAttnPrework {
+            self.run_on(&self.conv_state, &self.mixed, &self.b_pre, &self.a_pre)
+        }
+
+        /// The kernel on this layer's weights with other token inputs.
+        fn run_on(
+            &self,
+            conv_state: &Array,
+            mixed: &Array,
+            b_pre: &Array,
+            a_pre: &Array,
+        ) -> super::imp::LinAttnPrework {
             linattn_prework_fused(
-                &self.conv_state,
-                &self.mixed,
+                conv_state,
+                mixed,
                 &self.conv_w,
                 &self.wq,
                 &self.wk,
                 EPS,
-                &self.b_pre,
-                &self.a_pre,
+                b_pre,
+                a_pre,
                 &self.a_log,
                 &self.dt_bias,
                 self.nk as i32,
@@ -1096,6 +1168,21 @@ mod fused_kernel_tests {
                 self.taps as i32,
             )
             .unwrap()
+        }
+
+        fn conv_dim(&self) -> usize {
+            2 * self.nk * self.dn + self.nv * self.dv
+        }
+
+        /// `[1, K-1+T, conv_dim]`: the conv state, then the tokens.
+        fn window(&self) -> Array {
+            let c = self.conv_dim() as i32;
+            let state3 = self
+                .conv_state
+                .reshape(&[1, self.taps as i32 - 1, c])
+                .unwrap();
+            let mixed3 = self.mixed.reshape(&[1, self.tokens as i32, c]).unwrap();
+            mlx_rs::ops::concatenate_axis(&[&state3, &mixed3], 1).unwrap()
         }
     }
 
@@ -1116,12 +1203,37 @@ mod fused_kernel_tests {
     #[test]
     fn linattn_prework_matches_the_composed_ops_at_the_a3b_shape() {
         for seed in [0.0, 0.31, 0.77, 1.9] {
-            linattn_prework_matches_the_composed_ops_with(Dtype::Float32, 16, 32, 128, 128, seed);
+            linattn_prework_matches_the_composed_ops_with(
+                Dtype::Float32,
+                16,
+                32,
+                128,
+                128,
+                1,
+                seed,
+            );
         }
     }
 
+    /// An MTP verify's widths, at the Qwen3.6/3.8-27B shape (16 key heads, 48 value heads).
+    #[test]
+    fn linattn_prework_of_a_verify_matches_the_composed_ops() {
+        for (tokens, seed) in [(2, 0.0), (3, 0.31), (4, 0.77)] {
+            linattn_prework_matches_the_composed_ops_with(
+                Dtype::Float32,
+                16,
+                48,
+                128,
+                128,
+                tokens,
+                seed,
+            );
+        }
+        linattn_prework_matches_the_composed_ops_with(Dtype::Bfloat16, 2, 4, 32, 32, 3, 0.0);
+    }
+
     fn linattn_prework_matches_the_composed_ops_as(dt: Dtype) {
-        linattn_prework_matches_the_composed_ops_with(dt, 2, 4, 32, 32, 0.0);
+        linattn_prework_matches_the_composed_ops_with(dt, 2, 4, 32, 32, 1, 0.0);
     }
 
     fn linattn_prework_matches_the_composed_ops_with(
@@ -1130,20 +1242,16 @@ mod fused_kernel_tests {
         nv: usize,
         dn: usize,
         dv: usize,
+        tokens: usize,
         seed: f32,
     ) {
         use mlx_rs::ops::indexing::TryIndexOp;
-        let w = Prework::new(nk, nv, dn, dv, seed, dt);
+        let w = Prework::tokens(nk, nv, dn, dv, tokens, seed, dt);
         let got = w.run();
 
-        let (key_dim, conv_dim) = (nk * dn, 2 * nk * dn + nv * dv);
-        let taps = w.taps as i32;
-        let state3 = w
-            .conv_state
-            .reshape(&[1, taps - 1, conv_dim as i32])
-            .unwrap();
-        let mixed3 = w.mixed.reshape(&[1, 1, conv_dim as i32]).unwrap();
-        let conv_input = mlx_rs::ops::concatenate_axis(&[&state3, &mixed3], 1).unwrap();
+        let (key_dim, conv_dim) = (nk * dn, w.conv_dim());
+        let (taps, t) = (w.taps as i32, tokens as i32);
+        let conv_input = w.window();
         let conv_w = w.conv_w.reshape(&[conv_dim as i32, taps, 1]).unwrap();
         let conv =
             crate::native_conv1d::conv1d(&conv_input, &conv_w, 1, 0, conv_dim as i32).unwrap();
@@ -1151,13 +1259,13 @@ mod fused_kernel_tests {
         let parts =
             mlx_rs::ops::split_sections(&conv, &[key_dim as i32, 2 * key_dim as i32], -1).unwrap();
         let qk = |part: &Array, weight: &Array| {
-            let r = part.reshape(&[1, 1, nk as i32, dn as i32]).unwrap();
+            let r = part.reshape(&[1, t, nk as i32, dn as i32]).unwrap();
             mlx_rs::fast::rms_norm(&r, weight, EPS).unwrap()
         };
         let want_q = qk(&parts[0], &w.wq);
         let want_k = qk(&parts[1], &w.wk);
         let want_v = parts[2].clone();
-        let want_state = conv_input.try_index((.., 1..taps, ..)).unwrap();
+        let want_state = conv_input.try_index((.., t..t + taps - 1, ..)).unwrap();
 
         for (name, got, want) in [
             ("q", &got.q, &want_q),
@@ -1185,6 +1293,48 @@ mod fused_kernel_tests {
             values(&want_state),
             "{dt:?}: the next conv state is a copy of the window's last rows"
         );
+    }
+
+    /// Every token of a several-token call is what one token gives with the window ending at it,
+    /// to the bit, in f32 and bf16: a verify's rows are the decode's rows, which is what keeps an
+    /// MTP verify lossless.
+    #[test]
+    fn each_token_of_a_verify_is_the_decode_of_that_token() {
+        use mlx_rs::ops::indexing::TryIndexOp;
+        for (dt, tokens) in [(Dtype::Float32, 4usize), (Dtype::Bfloat16, 3)] {
+            let w = Prework::tokens(16, 48, 128, 128, tokens, 0.53, dt);
+            let all = w.run();
+            let window = w.window();
+            let (c, nv, taps) = (w.conv_dim() as i32, w.nv as i32, w.taps as i32);
+            let bits = |a: &Array| -> Vec<u32> { values(a).iter().map(|v| v.to_bits()).collect() };
+            let row = |a: &Array, t: i32| a.try_index(t).unwrap();
+            for t in 0..tokens as i32 {
+                let state = window
+                    .try_index((0, t..t + taps - 1, ..))
+                    .unwrap()
+                    .reshape(&[taps - 1, c])
+                    .unwrap();
+                let one = w.run_on(
+                    &state,
+                    &row(&w.mixed, t),
+                    &row(&w.b_pre, t),
+                    &row(&w.a_pre, t),
+                );
+                for (name, got, want) in [
+                    ("q", row(&all.q, t), &one.q),
+                    ("k", row(&all.k, t), &one.k),
+                    ("v", row(&all.v, t), &one.v),
+                    ("beta", row(&all.beta, t), &one.beta),
+                    ("g", row(&all.g, t), &one.g),
+                ] {
+                    assert_eq!(bits(&got), bits(want), "{dt:?} token {t} {name}");
+                }
+                if t == tokens as i32 - 1 {
+                    assert_eq!(bits(&all.new_state), bits(&one.new_state), "{dt:?} state");
+                }
+            }
+            assert_eq!(values(&all.beta).len(), tokens * nv as usize);
+        }
     }
 
     /// The gates are the composed ops' gates to the bit, across the branches of sigmoid and

@@ -1906,23 +1906,24 @@ mod imp {
             .unwrap_or(false)
     }
 
-    // Fuse everything a decode (s=1) linear-attention layer does between its in-projections and
-    // the recurrence into ONE Metal kernel (`linattn_prework_fused`): the conv window over the
-    // cached state and the new input, SiLU, the q/k/v split, the per-head q/k RMSNorm, the next
+    // Fuse everything a decode or verify linear-attention layer does between its in-projections
+    // and the recurrence into ONE Metal kernel (`linattn_prework_fused`): the conv window over the
+    // cached state and the new inputs, SiLU, the q/k/v split, the per-head q/k RMSNorm, the next
     // conv state, and the two gates. Only valid on the scale-fused alloc-reuse path (it consumes
     // the pre-scaled rms_norm weights `scaled_w_q_dn`/`scaled_w_k_dn`).
     lumen_flags::flag! {
-        /// One kernel for a decode token's linear-attention prework: eight dependent dispatches
-        /// (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled `compute_g`) become one.
+        /// One kernel for the linear-attention prework of a decode token or an MTP verify: eight
+        /// dependent dispatches (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled
+        /// `compute_g`) become one.
         ///
         /// Bit-identical to the composed ops in f32, the dtype the model runs this in: the kernel
         /// repeats MLX's own sums in MLX's own order (its `Sigmoid` for SiLU, `rms_single_row`
         /// for the norm, `precise::rsqrt`, `LogAddExp` for the softplus of `compute_g`), and the
-        /// tests compare bits at the A3B shape. M3 Max, ABBA over four runs each, generated text
-        /// byte-identical with the flag on and off: Qwen3.6-35B-A3B affine 10.5 -> 10.1 ms/token,
-        /// A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B 67 -> 63. Only a decode
-        /// token (not prefill, not under MTP capture, not under the timing probes) takes it.
-        /// Default on; `=0` restores the composed ops.
+        /// tests compare bits at the A3B shape, one token and several. M3 Max, ABBA over four runs
+        /// each, generated text byte-identical with the flag on and off: Qwen3.6-35B-A3B affine
+        /// 10.5 -> 10.1 ms/token, A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B
+        /// 67 -> 63. Forwards of up to [`PREWORK_MAX_TOKENS`] tokens take it (not prefill, not
+        /// under the timing probes). Default on; `=0` restores the composed ops.
         pub(crate) fuse_linattn_in {
             env: "LUMEN_NATIVE_FUSE_LINATTN_IN",
             default: true,
@@ -1933,6 +1934,10 @@ mod imp {
     fn fuse_linattn_in_enabled() -> bool {
         fuse_linattn_in::get()
     }
+
+    /// The widest forward the fused prework takes: an MTP verify of the deepest exact draft. The
+    /// kernel is measured at these widths only; a prefill chunk keeps the composed ops.
+    const PREWORK_MAX_TOKENS: i32 = crate::mtp_depth::MAX_EXACT_DRAFTS as i32 + 1;
 
     /// Output of one MTP speculative step on the Qwen3.5/3.6 trunk.
     ///
@@ -3208,11 +3213,11 @@ mod imp {
                 return Self::to_f32(out_proj_raw, &format!("layer{layer_idx}.probe_out_proj"));
             }
 
-            // The whole conv / norm / gate chain of one decode token in a single kernel
+            // The whole conv / norm / gate chain of a decode token or a verify in a single kernel
             // (`LUMEN_NATIVE_FUSE_LINATTN_IN`): eight dependent dispatches become one. Anything
             // it does not cover takes the composed ops below.
             let prework = if fuse_linattn_in_enabled()
-                && s == 1
+                && (1..=PREWORK_MAX_TOKENS).contains(&s)
                 && b == 1
                 && dn <= 128
                 && dn % 4 == 0
@@ -3220,7 +3225,6 @@ mod imp {
                 && !timing_on
                 && !ablate.gdn_conv
                 && !ablate.gdn_gates
-                && !self.ssm_capture_enabled()
                 && alloc_reuse_enabled()
                 && linear_attn_scale_fuse_enabled()
                 && [&mixed_qkv, &b_pre, &a_pre]
@@ -3242,35 +3246,50 @@ mod imp {
                 if conv_state.dtype() == mlx_rs::Dtype::Float32 {
                     let conv_state_2d = mlx_rs::ops::reshape(conv_state, &[n_keep, conv_dim])
                         .context("prework: reshape conv_state")?;
-                    let mixed_1d = mlx_rs::ops::reshape(&mixed_qkv, &[conv_dim])
+                    let mixed_2d = mlx_rs::ops::reshape(&mixed_qkv, &[s, conv_dim])
                         .context("prework: reshape mixed_qkv")?;
                     let conv_w_2d =
                         mlx_rs::ops::reshape(&lw.conv1d_weight, &[conv_dim, kernel_size])
                             .context("prework: reshape conv_w")?;
-                    Some(crate::native_ssm::linattn_prework_fused(
-                        &conv_state_2d,
-                        &mixed_1d,
-                        &conv_w_2d,
-                        &self.linear_attn_constants.scaled_w_q_dn,
-                        &self.linear_attn_constants.scaled_w_k_dn,
-                        1e-6,
-                        &b_pre,
-                        &a_pre,
-                        &lw.a_log,
-                        &lw.dt_bias,
-                        nk,
-                        nv,
-                        dn,
-                        dv,
-                        kernel_size,
-                    )?)
+                    // An MTP verify keeps the window for a rollback to any of its positions. The
+                    // kernel does not read it, so it is computed only if a rollback asks for it.
+                    let window = if self.ssm_capture_enabled() {
+                        Some(
+                            mlx_rs::ops::concatenate_axis(&[conv_state, &mixed_qkv], 1)
+                                .context("prework: the window a rollback reads")?,
+                        )
+                    } else {
+                        None
+                    };
+                    Some((
+                        crate::native_ssm::linattn_prework_fused(
+                            &conv_state_2d,
+                            &mixed_2d,
+                            &conv_w_2d,
+                            &self.linear_attn_constants.scaled_w_q_dn,
+                            &self.linear_attn_constants.scaled_w_k_dn,
+                            1e-6,
+                            &b_pre,
+                            &a_pre,
+                            &lw.a_log,
+                            &lw.dt_bias,
+                            nk,
+                            nv,
+                            dn,
+                            dv,
+                            kernel_size,
+                        )?,
+                        window,
+                    ))
                 } else {
                     None
                 }
             } else {
                 None
             };
-            let (q_scaled, k_scaled, v_post, fused_gates, conv_input) = if let Some(p) = prework {
+            let (q_scaled, k_scaled, v_post, fused_gates, conv_input) = if let Some((p, window)) =
+                prework
+            {
                 cache.set(
                     0,
                     mlx_rs::ops::reshape(&p.new_state, &[b, n_keep, conv_dim])
@@ -3285,7 +3304,7 @@ mod imp {
                         mlx_rs::ops::reshape(&p.beta, &[b, s, nv])?,
                         mlx_rs::ops::reshape(&p.g, &[b, s, nv])?,
                     )),
-                    None,
+                    window,
                 )
             } else {
                 // (B: conv) conv_state load → concat → cache update via take_axis →
@@ -3534,7 +3553,7 @@ mod imp {
                     &q_scaled, &k_scaled, &v_post, &g, &beta, state_in,
                 )?;
                 let conv_input = conv_input.clone().ok_or_else(|| {
-                    anyhow!("layer_linear_attn_forward: capture needs the composed conv path")
+                    anyhow!("layer_linear_attn_forward: a capture without its conv window")
                 })?;
                 self.push_ssm_capture(layer_idx, state_per_pos, conv_input);
                 (y, ns)

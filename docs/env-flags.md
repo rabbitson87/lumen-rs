@@ -639,17 +639,18 @@ Fuse `gate_proj` + `up_proj` into one QMV when their quant params
 
 *Optimization, default on.*
 
-One kernel for a decode token's linear-attention prework: eight dependent dispatches
- (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled `compute_g`) become one.
+One kernel for the linear-attention prework of a decode token or an MTP verify: eight
+ dependent dispatches (concat, slice, conv1d, SiLU, two RMS norms, sigmoid, compiled
+ `compute_g`) become one.
 
  Bit-identical to the composed ops in f32, the dtype the model runs this in: the kernel
  repeats MLX's own sums in MLX's own order (its `Sigmoid` for SiLU, `rms_single_row`
  for the norm, `precise::rsqrt`, `LogAddExp` for the softplus of `compute_g`), and the
- tests compare bits at the A3B shape. M3 Max, ABBA over four runs each, generated text
- byte-identical with the flag on and off: Qwen3.6-35B-A3B affine 10.5 -> 10.1 ms/token,
- A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B 67 -> 63. Only a decode
- token (not prefill, not under MTP capture, not under the timing probes) takes it.
- Default on; `=0` restores the composed ops.
+ tests compare bits at the A3B shape, one token and several. M3 Max, ABBA over four runs
+ each, generated text byte-identical with the flag on and off: Qwen3.6-35B-A3B affine
+ 10.5 -> 10.1 ms/token, A3B mxfp4 11.2 -> 10.4, Qwen3.5-9B 27.9 -> 27.3, Qwen3.6-27B
+ 67 -> 63. Forwards of up to [`PREWORK_MAX_TOKENS`] tokens take it (not prefill, not
+ under the timing probes). Default on; `=0` restores the composed ops.
 
 ### `LUMEN_NATIVE_FUSE_MOE_GATE_UP`
 
